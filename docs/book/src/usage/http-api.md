@@ -796,7 +796,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/stream-detached` | 500 | SSE-only. A re-attached stream ended with no recorded outcome because the turn's task died; read `GET /messages` for what completed |
 | `/errors/provider` | 502 | An upstream call failed for a reason meka could not classify as transient. Usually permanent (a revoked credential, a `base_url` that is not the API), but it is a catch-all, so treat it as "no reason to expect a retry to help" rather than "a retry cannot help" |
 | `/errors/provider-unavailable` | 502 | The upstream failed in a way meka's classifier had already labeled transient. **Worth one backed-off resend.** Carries a `Retry-After` when the upstream gave one, which most of the time it did not |
-| `/errors/context-overflow` | 502 | The conversation exceeds the model's context window and could not be compacted further. **Do not retry unchanged**; shorten it first. Carries `provider_response` like the two above, since the upstream is what refused it |
+| `/errors/context-overflow` | 502 | The conversation exceeds the model's context window, and auto-compaction was off, already spent, or could not shorten it enough. **Do not retry unchanged**; `POST /compact` or send less first. Carries `provider_response` like the two above, since the upstream is what refused it |
 | `/errors/mcp-unavailable` | 503 | An MCP server marked `required` was not connected, so the turn was refused before reaching the provider. The `servers` extension names them; each one's reason is in the server log |
 | `/errors/internal` | 500 | Unhandled server error |
 

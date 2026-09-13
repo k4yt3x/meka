@@ -213,18 +213,13 @@ No deletion touches a session another meka process has open. Naming one by id fa
 
 See [Config file](../configuration/config-file.md#session) for details.
 
-## Context window limiting
+## Context management
 
-Long sessions can exceed the LLM's context window or become expensive. The `context_messages` setting (default: `200`) limits how many recent messages are sent to the API:
+Every request carries the whole conversation as it stands, tool calls and their results included. Nothing is dropped by count: the context ceiling and compaction are the only bound. Once the occupancy the provider last reported passes `context_ceiling_percent` of the profile's `context_window` (90% by default), auto-compaction summarizes the older turns and keeps the recent ones verbatim, between turns and between the tool rounds of one turn. See [`[session]`](../configuration/config-file.md#session) for the switch and the percent.
 
-```toml
-[session]
-context_messages = 100
-```
+The full history stays in the store either way. After a compaction a request carries the summary and the kept tail, and the tool catalog, skill list and MCP server instructions are restated in full on the next turn.
 
-The full history remains in the store for resumption. Only the API payload is truncated. The cap applies to every request in a turn, not just the first, so a long tool loop cannot grow the payload past it mid-turn, and the truncation preserves tool call chains (it never splits a tool use from its result). Removing the key restores the default of `200` rather than lifting the cap.
-
-The tool catalog and skill list travel in the conversation rather than the system prompt, so they are subject to this window too. meka tracks where it last stated them and restates them in full once that message scrolls out, which works out to roughly once per window. Setting `context_messages` very low therefore makes those restatements more frequent.
+With `auto_compact = false` the conversation grows until the provider rejects a request for exceeding its window, which fails that turn; `/compact` summarizes on demand.
 
 ### Compacting a session
 
@@ -478,7 +473,7 @@ meka session rewind 550e8400-e29b-41d4-a716-446655440000
 meka session rewind 550e8400-e29b-41d4-a716-446655440000 -n 3
 ```
 
-The cut lands on a turn boundary, so a tool call is never separated from its result, and nothing is deleted: the dropped turns stay in the event log and still appear in `meka session export`, marked at the point of the rewind. The model simply stops seeing them.
+The cut lands on a turn boundary, so a tool call is never separated from its result, and a compaction summary counts as a turn, so a rewind that reaches it removes the summary too. Nothing is deleted: the dropped turns stay in the event log and still appear in `meka session export`, marked at the point of the rewind. The model simply stops seeing them.
 
 The command takes the session lock, so it refuses to run while a REPL, `meka serve`, or `meka acp` holds the session; that process has its own copy of the conversation in memory and would write over the rewind on its next turn. In the REPL use `/rewind` instead. Under ACP or the HTTP API there is no in-session equivalent, so close the session in the editor (or stop the server) and run this command.
 

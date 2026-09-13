@@ -164,6 +164,7 @@ Session status
   Effort:          xhigh
   Thinking:        adaptive
   Turns:           23
+  Compactions:     2
   Input tokens:    234.5k  (cache hit: 92%)
   Output tokens:   12.1k
   Redactions:      2 (12 images, ~38.0 MiB freed)
@@ -180,6 +181,8 @@ and the `Thinking` mode. The rest are cumulative counters for the session.
 `Context` is the live context-window occupancy: the total tokens of the most recent exchange (all input tiers plus output, i.e. what the next request re-sends minus your new prompt), against the active model's context window, with the percent used and tokens remaining. Use it to decide whether to `/compact` before continuing; after `/compact` it drops to the compacted size immediately. It reflects this session only; sub-agents spawned via `agent_spawn` have their own context and are not counted (a sub-agent's returned result is counted only once it lands in this session as a tool result). It is shown from the start, at `0 / <window>` before the first turn, since the window is your `context_window` setting (or the documented default) and this is where you confirm it took effect; it is omitted only when the window is unknown. Set [`display.show_context_in_prompt`](../configuration/config-file.md#displayshow_context_in_prompt) to show the same gauge in the prompt itself.
 
 `Input tokens` (and the other cumulative counters) is the total billed across every turn of the whole session. These totals are persisted, so resuming a session with `meka -c` continues them rather than restarting at zero.
+
+`Compactions` is how many times the conversation has been summarized, whether automatically, by `/compact` or at the agent's request. It is counted from the session's history, so it survives a resume, and each one puts the earliest detail one more summary away from the original.
 
 `cache hit` is the share of input tokens served from the prompt cache rather than re-sent at full price. It should climb quickly and stay high: meka keeps everything that changes mid-session out of the cached prefix, so a steady session re-reads the cache instead of rewriting it. Expect it to drop once after a `/compact` (which rewrites the head of the conversation) and to recover on the following turns.
 
@@ -205,7 +208,7 @@ After compacting, the session continues with the summary as context. The pre-com
 
 ### `/rewind`
 
-`/rewind` drops the most recent turn from the conversation, so the model no longer sees it or your prompt that started it. `/rewind N` drops the last `N`. The cut always lands on a turn boundary, so a tool call is never separated from its result.
+`/rewind` drops the most recent turn from the conversation, so the model no longer sees it or your prompt that started it. `/rewind N` drops the last `N`. The cut always lands on a turn boundary, so a tool call is never separated from its result. A compaction summary opens a turn of its own, so rewinding past everything after a compaction takes the summary with it and leaves the conversation empty; the turns it replaced stay behind the boundary on disk.
 
 Like `/compact`, nothing is deleted: the dropped turns stay in the event log on disk, and `meka session export` still shows them with a marker where the rewind happened.
 

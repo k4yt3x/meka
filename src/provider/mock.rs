@@ -178,9 +178,9 @@ pub(crate) struct MockProvider {
     /// Messages handed to each [`Provider::complete`] call, in order.
     ///
     /// Recorded because some behavior is only observable in the *request*: whether the checkpoint
-    /// turn respects `context_messages`, or emits two consecutive user turns. A test that rebuilds
-    /// the expected list itself asserts on its own arithmetic and passes even when the production
-    /// path is reverted, which is worse than no test at all.
+    /// turn is handed the whole conversation, or emits two consecutive user turns. A test that
+    /// rebuilds the expected list itself asserts on its own arithmetic and passes even when the
+    /// production path is reverted, which is worse than no test at all.
     completions: Mutex<Vec<Vec<Message>>>,
     /// The thinking override each `complete` call carried, in call order.
     completion_thinking: Mutex<Vec<ThinkingOverride>>,
@@ -192,9 +192,9 @@ pub(crate) struct MockProvider {
     ///
     /// The streaming counterpart to [`Self::completions`], and added for the same reason plus one
     /// more: some behavior is only observable in the request and only on the streaming path.
-    /// Whether `[session].context_messages` is re-applied on every round of a turn, for instance,
-    /// cannot be seen in the response at all, so a test that did not record this had nothing to
-    /// assert against and passed with the production path reverted.
+    /// Whether every round of a turn carries the whole conversation, for instance, cannot be seen
+    /// in the response at all, so a test that did not record this had nothing to assert against
+    /// and passed with the production path reverted.
     streams: Mutex<Vec<StreamRequest>>,
 }
 

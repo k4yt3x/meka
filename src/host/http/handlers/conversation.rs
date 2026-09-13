@@ -534,7 +534,7 @@ pub(crate) async fn rewind(
     entry
         .agent
         .cells()
-        .record_context_tokens(crate::tokens::estimate_messages(conversation.as_slice()));
+        .seed_context_estimate(conversation.as_slice());
     drop(conversation);
     // See the note in `compact`. `save_event` has already moved `updated_at` on the row, so
     // without this the resident entry reports an older timestamp than `meka session list` does for

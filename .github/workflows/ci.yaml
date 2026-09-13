@@ -8,7 +8,7 @@ on:
       - "src/**"
       - "tests/**"
       - "docs/**"
-      - "contrib/**"
+      - "scripts/**"
       - "build.rs"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -19,7 +19,7 @@ on:
       - "src/**"
       - "tests/**"
       - "docs/**"
-      - "contrib/**"
+      - "scripts/**"
       - "build.rs"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -148,13 +148,3 @@ jobs:
 
       - name: Build the book
         run: mdbook build docs/book
-
-  docker:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Build the image
-        run: docker build -f contrib/container/Dockerfile -t meka:ci .

@@ -47,11 +47,7 @@ cargo install --locked --git https://github.com/k4yt3x/meka.git
 
 Building from source needs Rust 1.95 or newer and a C toolchain, which `rusqlite` uses to compile the bundled SQLite.
 
-Tagged releases also publish a container image, which the [`mekabox`](contrib/container/mekabox) wrapper uses to run the agent unrestricted against a disposable filesystem:
-
-```bash
-docker run --rm -it ghcr.io/k4yt3x/meka:latest --help
-```
+To let the agent do anything short of touching your machine, the [`mekabox`](scripts/mekabox) wrapper runs the installed binary at `unrestricted` inside a disposable `archlinux:latest` container, with your config mounted read-only.
 
 ## Quick start
 

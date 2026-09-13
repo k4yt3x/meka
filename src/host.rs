@@ -265,13 +265,23 @@ pub(crate) const COMMANDS: &[HostCommand] = &[
 /// default: reading config here reported the default profile's model and backend beside a window
 /// and an effort that came from the session's, so `/status` and `/profile` contradicted each
 /// other on any resume onto a non-default profile.
-pub(crate) fn format_status(
+pub(crate) async fn format_status(
     agent: &Agent,
     providers: &crate::provider::ProviderRegistry,
     message_count: usize,
 ) -> String {
     let snap = agent.session_stats_snapshot();
-    let (context_tokens, context_window) = agent.context_usage();
+    let (context_tokens, context_window, compactions) = match agent.session_id() {
+        Some(session_id) => {
+            let budget = agent.context_budget(session_id).await;
+            (budget.used, budget.window, budget.generation)
+        }
+        // The REPL's first turn has no row yet, so nothing could have been compacted.
+        None => {
+            let (context_tokens, context_window) = agent.context_usage();
+            (context_tokens, context_window, 0)
+        }
+    };
     let effort = agent.resolved_effort();
     let profile = agent.profile();
     let settings = providers.settings(&profile);
@@ -297,5 +307,6 @@ pub(crate) fn format_status(
         message_count,
         context_tokens,
         context_window,
+        compactions,
     )
 }

@@ -150,11 +150,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                         // The gauge described turns that are gone; an estimate of what is
                         // left stands in until the next measurement, or the next turn's
                         // check reads the dropped turns as still there.
-                        agent
-                            .cells()
-                            .record_context_tokens(crate::tokens::estimate_messages(
-                                messages.as_slice(),
-                            ));
+                        agent.cells().seed_context_estimate(messages.as_slice());
                         with_console(console, |console| {
                             console.hint(&format!("Rewound {turns} turn(s)."))
                         });
@@ -568,11 +564,9 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             }
         }
         SlashCommand::Status => {
-            render::render_session_status(&crate::host::format_status(
-                agent,
-                providers,
-                messages.len(),
-            ));
+            render::render_session_status(
+                &crate::host::format_status(agent, providers, messages.len()).await,
+            );
         }
         SlashCommand::Usage => match agent.fetch_usage().await {
             Ok(Some(usage)) => render::render_account_usage(&usage),

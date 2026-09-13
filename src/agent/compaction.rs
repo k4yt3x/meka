@@ -353,9 +353,9 @@ impl Agent {
         };
 
         // A trailing user message is one nobody has answered yet. `CompactOrigin::Proactive` fires
-        // after `run_turn` appends this turn's prompt and before `base_messages` is built from the
-        // compacted conversation, so honoring `keep_recent: false` there would delete the request
-        // the model is about to answer and have it answer the summary instead.
+        // after `run_turn` appends this turn's prompt and before the first request is sent, so
+        // honoring `keep_recent: false` there would delete the request the model is about to
+        // answer and have it answer the summary instead.
         //
         // Phrased as a property of the conversation rather than a check on the origin, so a future
         // call site cannot reintroduce it by picking a different one.
@@ -561,7 +561,7 @@ impl Agent {
         // Seed the live context gauge with an estimate of the compacted working set so `/status`
         // (and the prompt indicator) immediately reflect the smaller size; the next real turn
         // overwrites it with the exact provider-reported total.
-        self.record_context_tokens(crate::tokens::estimate_messages(messages.as_slice()))
+        self.record_context_tokens(self.cells.estimate_context_tokens(messages.as_slice()))
             .await;
 
         report_checkpoint_memories(&memories_written);
@@ -677,12 +677,7 @@ impl Agent {
             ),
         };
 
-        // Bounded by the same window a normal turn uses. Without this the checkpoint would be the
-        // largest request meka ever sends: the reactive trigger means "the last
-        // `context_messages`-bounded request already crossed the ceiling", so handing the whole
-        // log over invites an overflow whose only trace is a warn line and a silent fallback.
-        let mut checkpoint_messages: Vec<Message> =
-            truncate_messages_for_context(messages, self.options.context_messages);
+        let mut checkpoint_messages: Vec<Message> = messages.to_vec();
         for message in &mut checkpoint_messages {
             strip_images(&mut message.content);
         }
@@ -1019,14 +1014,15 @@ impl Agent {
         if cached != GENERATION_UNKNOWN {
             return cached;
         }
-        let counted = self
-            .store
-            .count_compactions(session_id)
-            .await
-            .unwrap_or_else(|error| {
-                tracing::debug!("failed to count compactions: {error}");
-                0
-            });
+        let counted = match self.store.count_compactions(session_id).await {
+            Ok(counted) => counted,
+            // Zero for this read alone. Cached, it would have `/status` and the context block count
+            // up from zero for the life of the process while the store holds the true figure.
+            Err(error) => {
+                tracing::warn!("failed to count compactions: {error}");
+                return 0;
+            }
+        };
         self.compaction_generation
             .store(counted, std::sync::atomic::Ordering::Relaxed);
         counted
@@ -1062,8 +1058,8 @@ mod tests {
     use super::*;
     use crate::{
         agent::tests::{
-            agent_for_test, agent_with_registry_for_test, assistant_message, assistant_tool_use,
-            tool_result_message, user_message,
+            agent_for_test, agent_with_registry_for_test, alternating_turns, assistant_message,
+            assistant_tool_use, tool_result_message, user_message,
         },
         permission::SharedPermission,
         provider::mock::{MockEvent, MockProvider, MockStopReason, text_round},
@@ -2154,9 +2150,9 @@ mod tests {
         // `TokenUsage::default()`, so there is nothing here for a total to grow by.
     }
 
-    /// The proactive trigger fires after this turn's user message is appended and before
-    /// `base_messages` is rebuilt, so a `keep_recent: false` there would delete the request the
-    /// model is about to answer, and it would answer the summary instead.
+    /// The proactive trigger fires after this turn's user message is appended and before the
+    /// first request is sent, so a `keep_recent: false` there would delete the request the model
+    /// is about to answer, and it would answer the summary instead.
     #[tokio::test]
     async fn a_trailing_unanswered_request_is_never_discarded() {
         let provider = Arc::new(MockProvider::from_rounds(vec![replace_round(
@@ -2211,17 +2207,15 @@ mod tests {
         assert!(messages.len() > 1);
     }
 
-    /// The checkpoint must never be the largest request meka sends. The reactive trigger means
-    /// the last `context_messages`-bounded request already filled the window, so handing over
-    /// the whole log would overflow and degrade to the summarizer precisely in the long
-    /// sessions the checkpoint exists for.
+    /// The checkpoint is the one moment the agent can save what is about to be destroyed, so it
+    /// has to see all of it. A request cut to the newest messages would have the agent summarize
+    /// a conversation whose opening brief it was never shown.
     #[tokio::test]
-    async fn the_checkpoint_respects_the_context_message_window() {
+    async fn the_checkpoint_sees_the_whole_conversation() {
         let recorded = Arc::new(MockProvider::from_rounds(vec![replace_round("ok", None)]));
-        let (mut agent, store) =
+        let (agent, store) =
             agent_with_checkpoint(Arc::clone(&recorded) as Arc<dyn Provider>, true).await;
-        agent.options.context_messages = Some(4);
-        let mut messages = conversation();
+        let mut messages = alternating_turns(150);
         let full = messages.len();
 
         compact(
@@ -2234,17 +2228,47 @@ mod tests {
 
         let sent = recorded.completions();
         let sent = sent.first().expect("the checkpoint made a call");
-        assert!(
-            sent.len() < full,
-            "checkpoint sent {} of {full} messages; the window was not applied",
-            sent.len()
+        // Every message, plus the instruction as a message of its own since the conversation ends
+        // on an assistant turn.
+        assert_eq!(
+            sent.len(),
+            full + 1,
+            "the checkpoint was handed a cut conversation"
         );
-        // The cap, plus the appended instruction when it lands as its own message. Snapping to
-        // a user boundary can only keep fewer, never more.
-        assert!(
-            sent.len() <= 5,
-            "checkpoint sent {} messages against a limit of 4",
-            sent.len()
+        assert_eq!(sent[0].text_content(), "question 0");
+    }
+
+    /// The seed that stands in for a measurement after a compaction has to count what the
+    /// measurement counts. The summary alone reads as a few percent of the window while the system
+    /// prompt and tool schemas still occupy what they did, and the model's next `context_check`
+    /// would plan against room it does not have.
+    #[tokio::test]
+    async fn the_gauge_after_a_compaction_counts_the_fixed_overhead() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![replace_round("ok", None)]));
+        let (agent, store) = agent_with_checkpoint(provider as Arc<dyn Provider>, true).await;
+        agent
+            .cells()
+            .context_overhead
+            .store(12_000, std::sync::atomic::Ordering::Relaxed);
+        let mut messages = conversation();
+
+        compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactOrigin::Manual),
+        )
+        .await;
+
+        let seeded = agent
+            .cells()
+            .context_tokens
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let conversation_alone = crate::tokens::estimate_messages(messages.as_slice());
+        assert_eq!(
+            seeded,
+            conversation_alone + 12_000,
+            "the seed must carry the overhead the measurement it replaces carried"
         );
     }
 

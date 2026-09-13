@@ -346,6 +346,15 @@ fn claude_image_block(source: &crate::image::ImageSource) -> serde_json::Value {
     }
 }
 
+/// The text block that stands in for an assistant message the encoder left empty, since the API
+/// rejects a message with no content.
+fn no_message_content() -> serde_json::Value {
+    serde_json::json!({
+        "type": "text",
+        "text": "[No message content]"
+    })
+}
+
 /// The conversation as the `messages` array of a Claude request, with the cache breakpoint on its
 /// last block.
 pub(super) fn convert_messages_to_claude_content(
@@ -363,8 +372,8 @@ pub(super) fn convert_messages_to_claude_content(
             let content: Vec<serde_json::Value> = message
                 .content
                 .iter()
-                .map(|block| {
-                    match block {
+                .filter_map(|block| {
+                    Some(match block {
                         // The turn's context block is text on this wire, ahead of the words.
                         ContentBlock::Text { text } | ContentBlock::TurnContext { text } => {
                             serde_json::json!({
@@ -404,19 +413,25 @@ pub(super) fn convert_messages_to_claude_content(
                                 "is_error": is_error,
                             })
                         }
-                        // Only a signature belongs on this wire. A `Sealed` block reaches here
-                        // when a session recorded against the Responses API is resumed under
-                        // Claude, and its encrypted content is not a Claude signature, so the
-                        // block goes out unsigned rather than carrying a foreign blob.
+                        // Only a block Claude signed goes back to Claude: the API makes
+                        // `signature` required and rejects the whole request without one. A block
+                        // with none, sealed by the Responses API or returned unsigned by an
+                        // Anthropic-compatible endpoint that does not sign (an empty string, on
+                        // OpenRouter), is left out rather than sent in a shape Claude rejects.
                         ContentBlock::Thinking { thinking, opaque } => {
-                            let mut obj = serde_json::json!({
+                            let signature = match opaque {
+                                Some(OpaqueReasoning::Signed { signature })
+                                    if !signature.is_empty() =>
+                                {
+                                    signature
+                                }
+                                _ => return None,
+                            };
+                            serde_json::json!({
                                 "type": "thinking",
-                                "thinking": thinking
-                            });
-                            if let Some(OpaqueReasoning::Signed { signature }) = opaque {
-                                obj["signature"] = serde_json::json!(signature);
-                            }
-                            obj
+                                "thinking": thinking,
+                                "signature": signature,
+                            })
                         }
                         // Replayed verbatim: the API needs the opaque `data` unchanged to continue
                         // the redacted reasoning chain.
@@ -426,9 +441,16 @@ pub(super) fn convert_messages_to_claude_content(
                                 "data": data,
                             })
                         }
-                    }
+                    })
                 })
                 .collect();
+            // An assistant turn that was unsigned thinking and nothing else is now empty, which
+            // the API rejects; it goes out as the placeholder the trailing strip below uses.
+            let content = if content.is_empty() {
+                vec![no_message_content()]
+            } else {
+                content
+            };
 
             serde_json::json!({
                 "role": role,
@@ -455,10 +477,7 @@ pub(super) fn convert_messages_to_claude_content(
             content.pop();
         }
         if content.is_empty() {
-            content.push(serde_json::json!({
-                "type": "text",
-                "text": "[No message content]"
-            }));
+            content.push(no_message_content());
         }
     }
 
@@ -1836,8 +1855,9 @@ mod tests {
     }
 
     /// The mirror of the Responses encoder's refusal, for a session recorded against OpenAI and
-    /// resumed under Claude. Sealed reasoning is not a Claude signature, so it must not be
-    /// serialized as one; the block goes out with its summary text and unsigned.
+    /// resumed under Claude. Sealed reasoning is not a Claude signature, and a thinking block
+    /// without one is rejected, so the block is left out: neither the blob nor an unsigned block
+    /// reaches the wire.
     #[test]
     fn sealed_reasoning_is_never_sent_to_claude_as_a_signature() {
         let message = crate::conversation::Message {
@@ -1858,16 +1878,101 @@ mod tests {
             ],
         };
         let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::OneHour);
-        let block = &converted[0]["content"].as_array().expect("content")[0];
+        let content = converted[0]["content"].as_array().expect("content");
 
-        assert_eq!(block["type"], "thinking");
-        assert_eq!(block["thinking"], "a summary");
-        assert!(block.get("signature").is_none(), "{block}");
+        assert_eq!(content.len(), 1, "{content:?}");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "answer");
         assert!(
             !serde_json::to_string(&converted)
                 .expect("serialize")
                 .contains("OPENAI_SEALED")
         );
+    }
+
+    /// An Anthropic-compatible endpoint that does not sign its thinking (the `synthetic` backend)
+    /// leaves `opaque` empty. Replayed as-is, such a block fails a strict endpoint's validation
+    /// with `signature: expected string` before any repair tier runs; left out, the session
+    /// resumes anywhere.
+    #[test]
+    fn an_unsigned_thinking_block_is_left_out_of_a_claude_request() {
+        let message = crate::conversation::Message {
+            role: crate::conversation::Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "unsigned reasoning".to_string(),
+                    opaque: None,
+                },
+                ContentBlock::Text {
+                    text: "answer".to_string(),
+                },
+            ],
+        };
+        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::OneHour);
+        let content = converted[0]["content"].as_array().expect("content");
+
+        assert_eq!(content.len(), 1, "{content:?}");
+        assert_eq!(content[0]["text"], "answer");
+        assert!(
+            !serde_json::to_string(&converted)
+                .expect("serialize")
+                .contains("unsigned reasoning")
+        );
+    }
+
+    /// OpenRouter answers for a non-Anthropic model with `signature: ""`, which the accumulator
+    /// keeps as the value the API returned. To Claude an empty signature is no signature, so the
+    /// block is left out the same way.
+    #[test]
+    fn an_empty_signature_is_no_signature_to_claude() {
+        let message = crate::conversation::Message {
+            role: crate::conversation::Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "openrouter reasoning".to_string(),
+                    opaque: Some(OpaqueReasoning::Signed {
+                        signature: String::new(),
+                    }),
+                },
+                ContentBlock::Text {
+                    text: "answer".to_string(),
+                },
+            ],
+        };
+        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::OneHour);
+        let content = converted[0]["content"].as_array().expect("content");
+
+        assert_eq!(content.len(), 1, "{content:?}");
+        assert_eq!(content[0]["text"], "answer");
+        assert!(
+            !serde_json::to_string(&converted)
+                .expect("serialize")
+                .contains("openrouter reasoning")
+        );
+    }
+
+    /// Leaving the block out must not leave the message empty, which the API rejects too. The
+    /// emptied turn sits ahead of a later assistant turn, so the trailing strip is not what fills
+    /// it.
+    #[test]
+    fn a_message_of_only_unsigned_thinking_goes_out_as_the_placeholder() {
+        let messages = [
+            crate::conversation::Message {
+                role: crate::conversation::Role::Assistant,
+                content: vec![ContentBlock::Thinking {
+                    thinking: "unsigned reasoning".to_string(),
+                    opaque: None,
+                }],
+            },
+            crate::conversation::Message::user("next"),
+            crate::conversation::Message::assistant_text("later"),
+        ];
+        let converted = convert_messages_to_claude_content(&messages, CacheBreakpoint::OneHour);
+        let content = converted[0]["content"].as_array().expect("content");
+
+        assert_eq!(content.len(), 1, "{content:?}");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "[No message content]");
     }
 
     #[test]

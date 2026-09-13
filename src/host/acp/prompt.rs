@@ -73,12 +73,7 @@ pub(super) async fn try_local_command(
 ) -> Option<String> {
     let (name, _extra) = split_acp_slash(prompt_text)?;
     match name.as_str() {
-        "status" => Some(build_status_text(
-            agent,
-            conversation_len,
-            permission,
-            shared,
-        )),
+        "status" => Some(build_status_text(agent, conversation_len, permission, shared).await),
         "mcp" => Some(build_mcp_list_text(shared).await),
         "usage" => Some(build_usage_text(agent).await),
         _ => None,
@@ -94,7 +89,7 @@ pub(super) async fn build_usage_text(agent: &crate::agent::Agent) -> String {
 }
 /// Plain-text `/status` output: the block the REPL prints, from [`crate::host::format_status`],
 /// under a heading and after the permission level, which an ACP client may not otherwise surface.
-pub(super) fn build_status_text(
+pub(super) async fn build_status_text(
     agent: &crate::agent::Agent,
     conversation_len: usize,
     permission: &crate::permission::SharedPermission,
@@ -103,7 +98,7 @@ pub(super) fn build_status_text(
     format!(
         "Session status\n  Permission:      {}\n{}",
         level_display_name(permission.get()),
-        crate::host::format_status(agent, &shared.providers, conversation_len)
+        crate::host::format_status(agent, &shared.providers, conversation_len).await
     )
     .trim_end()
     .to_string()

@@ -354,8 +354,16 @@ Rule 1 has two sanctioned exceptions, both of which converge on the current shap
 interpreting an old one: `classify_by_shape`, which runs once per store and stamps its answer, and
 `store::memory::reconcile_index`, which makes this database's FTS triggers the ones this build
 requires. Rule 1 is also about *the store*, which has a ledger. `config.toml` has none and gets no
-tolerance either: a shape change ships with a one-shot conversion script attached to the release, never
-a serde alias or a parse-door fallback. Tolerance for what a model might emit is out of scope entirely.
+tolerance either: a reader accepts the current shape alone, never a serde alias or a parse-door
+fallback. A retired or renamed key stops being modeled, `deny_unknown_fields` names it and its line,
+and the upgrade guide carries the remedy. Tolerance for what a model might emit is out of scope
+entirely.
+
+A standalone migration script exists only for a conversion the migration module cannot make on its
+own (the 0.42 script had to guess which provider wrote a thinking block, and a guess wants a human
+reading the counts before it writes). It is attached to the release as an asset, never checked in.
+Converting `config.toml` in a script is optional, and done only when that release ships a script
+for the store anyway; a config-only change never gets one.
 
 **Integrity guards are not compatibility.** A check that is equally true of a store created five
 minutes ago defends against corruption and hand-editing; deleting it turns a fail-closed path into a

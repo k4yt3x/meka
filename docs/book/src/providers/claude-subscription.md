@@ -70,7 +70,7 @@ the text, which the REPL draws as `Thinking... (150 tokens)`. `summarized` sends
 and replays them verbatim, so multi-turn reasoning continuity is maintained. With thinking off
 nothing is displayed and the redaction beta is sent, as Claude Code does.
 
-A stored block records that its signature is Claude's, so resuming the session under an OpenAI profile does not replay a Claude signature as encrypted reasoning. A session recorded by 0.41 holds its blocks under a shape that names no provider, and meka does not reshape them when it opens a session; the [one-shot upgrade script](../getting-started/upgrading.md) does. Until it runs, such a block keeps its readable text and loses its signature, so those turns are not replayed as verified reasoning.
+A stored block records that its signature is Claude's, so resuming the session under an OpenAI profile does not replay a Claude signature as encrypted reasoning. The rule runs the other way as well: a thinking block with no Claude signature, whether the Responses API sealed it or an Anthropic-compatible endpoint returned it unsigned or with an empty one, is left out of a Claude request, because the API rejects a thinking block without one. A session recorded by 0.41 holds its blocks under a shape that names no provider, and meka does not reshape them when it opens a session; the [one-shot upgrade script](../getting-started/upgrading.md) does. Until it runs, such a block keeps its readable text and loses its signature, so those turns are not replayed as verified reasoning.
 
 ### `device_id`
 

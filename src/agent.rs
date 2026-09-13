@@ -57,18 +57,10 @@ pub(crate) struct Agent {
     /// arguments, or a rewrite that changes nothing) doesn't re-render the list. Private to this
     /// `Agent`; sub-agents route through `Agent::new` and so get their own.
     last_rendered_todo: tokio::sync::RwLock<Option<crate::todo::TodoState>>,
-    /// The tool/skill/MCP picture the model was last shown, plus the conversation length at which
-    /// it was shown. `None` means "tell it everything": a fresh agent, or a compaction that may
-    /// have summarized the earlier rendering away. Same shape and reasoning as
-    /// [`Self::last_rendered_todo`].
-    ///
-    /// The length matters because the render lives in a single user message, and
-    /// [`truncate_messages_for_context`] sends only the most recent `context_messages` entries.
-    /// Once that message falls out of the window the model can no longer see the catalog,
-    /// the skill list, or any MCP server's instructions, so the picture has to be restated.
-    /// Tracking where it landed means that costs a full render roughly once per window rather
-    /// than once per turn.
-    last_rendered_world: tokio::sync::RwLock<Option<(crate::prompt::WorldSnapshot, usize)>>,
+    /// The tool/skill/MCP picture the model was last shown. `None` means "tell it everything": a
+    /// fresh agent, or a compaction that may have summarized the earlier rendering away. Same
+    /// shape and reasoning as [`Self::last_rendered_todo`].
+    last_rendered_world: tokio::sync::RwLock<Option<crate::prompt::WorldSnapshot>>,
     /// Shared skill cache. Re-checks the on-disk snapshot at the top of each turn and re-discovers
     /// when something changed, so adds / removes / frontmatter edits land without restart.
     /// Body-only edits take effect even sooner; `load_skill_body` re-reads from disk on every
@@ -121,7 +113,7 @@ pub(crate) struct Agent {
     /// `MekaError::InvalidRequest` is allowed to blame: the failing request differs from the last
     /// good one by exactly those messages, which is how `run_turn` locates the offending content
     /// without parsing the provider's error path (Anthropic's `messages.34.content.0…`), a shape
-    /// no other backend produces and none of them map cleanly back through context truncation.
+    /// no other backend produces.
     ///
     /// Carried across turns rather than reset per turn so a turn that failed *after* appending its
     /// user message leaves that message a suspect on the retry; a fresh-per-turn floor would put
@@ -322,9 +314,9 @@ impl Agent {
 
     /// Build an `Agent` configured for sub-agent use: silent, with no MCP readiness gate.
     ///
-    /// Inherits `sandboxed_shell`, `context_messages` and the auto-compaction settings from the
-    /// parent's options. `user_instructions` is deliberately *not* inherited: they describe the
-    /// root agent, and a worker handed one task by one of its turns is not that agent.
+    /// Inherits `sandboxed_shell` and the auto-compaction settings from the parent's options.
+    /// `user_instructions` is deliberately *not* inherited: they describe the root agent, and a
+    /// worker handed one task by one of its turns is not that agent.
     ///
     /// `sub_system_prompt` is the pre-built sub-agent system prompt (typically from
     /// `build_subagent_system_prompt`); `run_turn` uses it verbatim instead of building one
@@ -360,7 +352,6 @@ impl Agent {
             // A sub-agent has no `[Scheduled]` section: the jobs belong to the parent's
             // session, and `new_subagent` gives it a session of its own.
             gate_tools: None,
-            context_messages: parent_options.context_messages,
             // Deliberately not inherited. Instructions are installation-wide and describe the
             // root agent; a worker handed a task by another agent is not that agent. The
             // sub-agent's system prompt is built by
@@ -650,7 +641,6 @@ mod tests {
             streaming: true,
             sandboxed_shell: false,
             gate_tools: None,
-            context_messages: None,
             // 80 rather than the shipped default so the tests that switch compaction on keep
             // their round numbers: 160k of a 200k window.
             context_ceiling_percent: 80,
@@ -756,6 +746,17 @@ mod tests {
             .expect("register fixture");
         registry.mark_deferred("mcp__bridge__send_file");
         registry
+    }
+
+    /// `count` user turns with an answer each, long enough that a cap on the message count would
+    /// cut it, so a test built on it can fail if one comes back.
+    pub(super) fn alternating_turns(count: usize) -> Conversation {
+        let mut messages = Conversation::new();
+        for index in 0..count {
+            messages.append(Message::user(format!("question {index}")));
+            messages.append(Message::assistant_text(format!("answer {index}")));
+        }
+        messages
     }
 
     pub(super) fn user_message(text: &str) -> Message {

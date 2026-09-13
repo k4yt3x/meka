@@ -54,9 +54,9 @@ pub(crate) struct ToolBuilderParams {
     /// they just took away. Restrictions are combined, never replaced, so this can only ever
     /// narrow.
     pub(crate) config_denials: ToolDenials,
-    /// The spawning agent's options, from which a worker inherits `sandboxed_shell`,
-    /// `context_messages` and the auto-compaction settings inside [`Agent::new_subagent`].
-    /// `user_instructions` is deliberately *not* among them; see [`build_subagent_system_prompt`].
+    /// The spawning agent's options, from which a worker inherits `sandboxed_shell` and the
+    /// auto-compaction settings inside [`Agent::new_subagent`]. `user_instructions` is
+    /// deliberately *not* among them; see [`build_subagent_system_prompt`].
     pub(crate) parent_options: AgentOptions,
 }
 
@@ -2919,7 +2919,6 @@ mod tests {
                 streaming: false,
                 sandboxed_shell: false,
                 gate_tools: None,
-                context_messages: None,
                 context_ceiling_percent: 80,
                 auto_compact: false,
                 compact_checkpoint: false,

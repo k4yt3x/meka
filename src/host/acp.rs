@@ -158,8 +158,7 @@ fn acp_error_for(error: &MekaError, relay_provider_errors: bool) -> agent_client
             )
         }
         MekaError::ContextOverflow(message) => withhold_or_relay(
-            "compaction failed to bring the conversation under the model's context window; \
-             shorten it before retrying",
+            "the conversation exceeds the model's context window; shorten it before retrying",
             message,
         ),
         // The names travel and the reasons do not, which is the policy the arms above state. A

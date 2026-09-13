@@ -850,6 +850,45 @@ fn a_command_that_prints_for_itself_is_still_bracketed() {
     );
 }
 
+/// The count is read from the session's history rather than kept in the process, so `/status`
+/// after a resume reports the compactions of the session, not of this run. `compact_checkpoint`
+/// is off so each `/compact` is one summarizer round of the script.
+#[test]
+fn status_counts_the_session_s_compactions_across_a_resume() {
+    let install =
+        repl_install_with_extra(true, true, "", "\n[session]\ncompact_checkpoint = false\n");
+    let script = r#"[
+ [{"type":"text","text":"First answer."},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"text","text":"First summary."},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"text","text":"Second answer."},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"text","text":"Second summary."},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let counts = |rows: &[String]| -> Vec<String> {
+        rows.iter()
+            .filter_map(|row| row.trim().strip_prefix("Compactions:"))
+            .map(|count| count.trim().to_string())
+            .collect()
+    };
+
+    let rows = run_repl(&install, script, &[
+        "/status",
+        "first question",
+        "/compact",
+        "second question",
+        "/compact",
+        "/status",
+        "/exit",
+    ]);
+    assert_eq!(counts(&rows), vec!["0", "2"], "{rows:#?}");
+
+    let resumed = run_repl(&install, "[]", &["/status", "/exit"]);
+    assert_eq!(counts(&resumed), vec!["2"], "{resumed:#?}");
+}
+
 /// `/help` is answered by the REPL thread rather than the agent loop, through a printer the console
 /// cannot see. It is bracketed by the same rule as everything else.
 #[test]

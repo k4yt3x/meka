@@ -20,34 +20,15 @@ tar -xzf meka-*.tar.gz
 cp meka ~/.local/bin/
 ```
 
-## Container
+## `mekabox`
 
-Every tagged release publishes an image to the GitHub Container Registry:
-
-```bash
-docker run --rm -it ghcr.io/k4yt3x/meka:latest --help
-```
-
-The image carries the binary and nothing else, so a session inside it starts with no config and no
-`meka.db`. Mount both to reach an existing setup:
-
-```bash
-docker run --rm -it \
-    -v ~/.config/meka:/root/.config/meka:ro \
-    -v ~/.local/share/meka:/root/.local/share/meka:rw \
-    ghcr.io/k4yt3x/meka:latest
-```
-
-The data directory has to be writable: it holds `meka.db`, which is where sessions and every
-credential live.
-
-### `mekabox`
-
-[`contrib/container/mekabox`](https://github.com/k4yt3x/meka/blob/master/contrib/container/mekabox)
-does that mounting for you, against a stock `archlinux:latest` with your *host* binary bind-mounted
-in, and starts the agent at `unrestricted` with instructions saying it may install whatever the task
-needs. It is the answer to "let it do anything, just not to my machine": the container is disposable
-and the host config is mounted read-only. It picks podman over docker when both are present.
+[`scripts/mekabox`](https://github.com/k4yt3x/meka/blob/master/scripts/mekabox)
+runs the meka installed on the host inside a stock `archlinux:latest` container, with no image of
+its own to build or pull: the binary is bind-mounted in, `~/.config/meka` read-only, and
+`~/.local/share/meka` writable, since that is where `meka.db` keeps every session and credential.
+The agent starts at `unrestricted` with instructions saying it may install whatever the task needs.
+It is the answer to "let it do anything, just not to my machine": the container is disposable and
+the host config cannot be written. It picks podman over docker when both are present.
 
 ## Cargo install
 

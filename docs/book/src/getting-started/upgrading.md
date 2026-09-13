@@ -10,6 +10,28 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.52 to 0.53
+
+**`[session].context_messages` is gone.** Delete the key from `config.toml`; a file still carrying
+it is refused at startup, naming the key and the line. It cut every request to the newest 200
+messages, and a conversation that outgrew it lost its oldest messages from the request with no
+summary in their place: context usage fell instead of climbing, and the agent forgot what it had
+been told before the cut. Every request now carries the whole conversation, and the context
+ceiling (`[session].context_ceiling_percent`, 90% of the profile's `context_window` by default)
+with auto-compaction is the only bound. A long session reaches the ceiling and compacts where it
+used to slide; with `auto_compact = false` it grows until the provider rejects a request.
+
+Nothing in the store changes. A session already past 200 messages resumes with all of them in the
+request, so its first turn back may compact.
+
+**The container image is gone.** `ghcr.io/k4yt3x/meka` receives no new tags, and the Dockerfile
+went with it. What the image was for, running the agent unrestricted against a disposable
+filesystem, is what [`mekabox`](./installation.md#mekabox) does with the meka installed on the
+host, inside a stock `archlinux:latest` container with your config mounted read-only; install the
+binary from the release archive or with Cargo and run the wrapper. The wrapper itself moves from
+`contrib/container/mekabox` to `scripts/mekabox`, so a link or `PATH` entry that named the old
+path needs the new one.
+
 ## 0.49 to 0.50
 
 **`meka tools` is `meka tool`.** Every top-level command names the object it manages in the

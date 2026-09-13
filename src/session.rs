@@ -201,6 +201,29 @@ impl SessionCells {
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// What the gauge shows after a rewrite (a compaction, a rewind) until the provider measures
+    /// again: the conversation's estimate plus the fixed overhead the last round stamped, so the
+    /// figure stands in for the measurement it replaces. The estimate alone reads as the summary
+    /// and nothing else, a few percent right after a compaction that left the window a third full.
+    /// In memory alone: the row's own figure is the rewrite's to decide.
+    pub(crate) fn seed_context_estimate(&self, messages: &[crate::conversation::Message]) {
+        self.record_context_tokens(self.estimate_context_tokens(messages));
+    }
+
+    /// The figure [`Self::seed_context_estimate`] publishes; a compaction records it on the row as
+    /// well, through the agent, where a rewind leaves the row forgetting.
+    pub(crate) fn estimate_context_tokens(&self, messages: &[crate::conversation::Message]) -> u64 {
+        // An emptied conversation reads as turn zero: nothing has been sent, so nothing is in
+        // context, and the overhead becomes real with the first request, which measures it.
+        if messages.is_empty() {
+            return 0;
+        }
+        crate::tokens::estimate_messages(messages).saturating_add(
+            self.context_overhead
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     /// The same cells, bound to a session that already exists. Every host but the REPL's first
     /// turn knows the row before it builds the agent, and seeding it here is what lets a tool read
     /// the id before any turn has run.
@@ -345,20 +368,6 @@ pub(crate) struct AgentOptions {
     /// Whether `execute_command` calls at `read` run inside the platform sandbox. Forced off when
     /// no sandbox backend is available.
     pub(crate) sandboxed_shell: bool,
-    /// Cap on messages sent to the provider, re-applied on every round of a turn rather than once
-    /// at its start.
-    ///
-    /// A maximum, not a target: `truncate_messages_for_context` cuts *forward* to the first
-    /// message that neither splits a `tool_use` → `tool_result` chain nor starts the window on
-    /// a role the provider rejects, so a window ending inside a long tool loop can hold fewer
-    /// messages than asked for. It reaches backward only when the whole tail is one unbroken
-    /// chain, where exceeding the cap beats sending something that will be refused.
-    ///
-    /// `None` is unlimited, but nothing reaches it from `config.toml`: an absent
-    /// `[session].context_messages` resolves to a default, so removing the key lowers the cap
-    /// rather than lifting it. Only a directly-constructed `AgentOptions` (tests, and a sub-agent
-    /// inheriting one) can be `None`.
-    pub(crate) context_messages: Option<usize>,
     /// The share of the session's context window the conversation may fill on its own
     /// (`[session].context_ceiling_percent`): a whole read is cut at the line, and with
     /// [`Self::auto_compact`] on the conversation is compacted once past it.
@@ -497,7 +506,6 @@ impl AgentOptions {
             streaming: config.streaming,
             sandboxed_shell,
             gate_tools,
-            context_messages: config.context_messages,
             context_ceiling_percent: config.context_ceiling_percent,
             auto_compact: config.auto_compact,
             compact_checkpoint: config.compact_checkpoint,
@@ -514,7 +522,6 @@ impl AgentOptions {
             streaming: false,
             sandboxed_shell: false,
             gate_tools: None,
-            context_messages: None,
             context_ceiling_percent: crate::config::DEFAULT_CONTEXT_CEILING_PERCENT,
             auto_compact: false,
             compact_checkpoint: false,

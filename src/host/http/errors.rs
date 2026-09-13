@@ -376,7 +376,7 @@ impl ProblemDetail {
     pub(crate) fn for_error(error: &MekaError, relay_provider_errors: bool) -> Self {
         // An extension member rather than a replacement for `detail`, because the two carry
         // different things and neither substitutes for the other. `detail` is meka's own sentence
-        // and for a context overflow it is the entire remedy ("shorten it before retrying"), which
+        // and for a context overflow it is the entire remedy ("compact it before retrying"), which
         // relaying by overwrite would have deleted in exchange for a JSON blob. A client wanting to
         // branch on the upstream's error type also wants one well-known field, not prose to parse.
         //
@@ -539,8 +539,7 @@ impl ProblemDetail {
                 let problem = ProblemDetail::new(
                     ErrorKind::ContextOverflow,
                     StatusCode::BAD_GATEWAY,
-                    "the conversation exceeds the model's context window and compaction failed \
-                     to shorten it further; shorten it before retrying",
+                    "the conversation exceeds the model's context window; compact it before retrying",
                 );
                 attach(problem, message)
             }
@@ -680,7 +679,7 @@ mod tests {
                 "the upstream body reached the caller: {body}",
             );
             // The three provider arms point at the log; the overflow arm spends its `detail` on the
-            // remedy instead ("shorten it before retrying") and names no log, which is right and is
+            // remedy instead ("compact it before retrying") and names no log, which is right and is
             // why this is not asserted across the loop.
             let detail = withheld.detail.as_deref().unwrap_or_default().to_string();
             if !matches!(error, MekaError::ContextOverflow(_)) {
@@ -931,7 +930,7 @@ mod tests {
         );
         let detail = problem.detail.unwrap_or_default();
         assert!(
-            detail.contains("shorten it before retrying"),
+            detail.contains("compact it before retrying"),
             "the detail has to name the remedy, since the type alone is opaque: {detail}"
         );
         // Built from a provider response like every other arm, so it carries that body and must not

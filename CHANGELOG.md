@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.53.0] - 2026-09-13
+
+### Added
+
+- `/status` shows how many times the session has been compacted, in the REPL and under ACP.
+
+### Changed
+
+- Every request carries the whole conversation; the ceiling and compaction are its only bound.
+- **Breaking:** `mekabox` lives at `scripts/mekabox`, no longer under `contrib/container/`.
+
+### Removed
+
+- **Breaking:** `[session].context_messages` is gone; delete the key or the config is refused.
+- **Breaking:** no container image is published anymore; `mekabox` runs the host binary instead.
+
+### Fixed
+
+- A conversation past 200 messages no longer loses its oldest turns without a summary.
+- Context usage climbs to the ceiling and compacts instead of falling as history slid out.
+- Thinking with no Claude signature is left out of a Claude request instead of sent unsigned.
+- The context gauge after a compaction or rewind counts the last request's system prompt and tools.
+- The context-overflow error over HTTP and ACP no longer claims a compaction ran when none did.
+
 ## [0.52.0] - 2026-09-12
 
 ### Added
@@ -2188,7 +2212,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.52.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.53.0...HEAD
+[0.53.0]: https://github.com/k4yt3x/meka/compare/0.52.0...0.53.0
 [0.52.0]: https://github.com/k4yt3x/meka/compare/0.51.0...0.52.0
 [0.51.0]: https://github.com/k4yt3x/meka/compare/0.50.0...0.51.0
 [0.50.0]: https://github.com/k4yt3x/meka/compare/0.49.0...0.50.0

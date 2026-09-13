@@ -633,8 +633,6 @@ pub(crate) const DEFAULT_MCP_STDIO_CONCURRENCY: usize = 3;
 /// `[mcp].http_concurrency` when unset: a connect is a request, not a process.
 pub(crate) const DEFAULT_MCP_HTTP_CONCURRENCY: usize = 20;
 
-/// Max conversation messages kept in the per-turn API window by default.
-const DEFAULT_CONTEXT_MESSAGES: usize = 200;
 /// Default extended-thinking token budget.
 pub(crate) const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 16_000;
 /// `[session].context_ceiling_percent` when unset: the share of the window the conversation may
@@ -777,7 +775,6 @@ impl From<SandboxBackend> for String {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionConfig {
-    pub(crate) context_messages: Option<usize>,
     /// Delete sessions whose `updated_at` is older than this, at agent startup. Unset means keep
     /// everything: conversation history is not reproducible, so meka never discards it unasked.
     /// `"0s"` is refused at startup, since it would delete every session on each launch.
@@ -1164,7 +1161,6 @@ pub(crate) struct ResolvedConfig {
     pub(crate) tool_params: ToolParams,
     /// Resolved `[display].max_width`. `None`, the default, follows the terminal.
     pub(crate) max_width: Option<usize>,
-    pub(crate) context_messages: Option<usize>,
     /// Resolved `[session].retention`. `None`, the default, disables startup cleanup.
     pub(crate) retention: Option<std::time::Duration>,
     pub(crate) thinking: crate::config::ThinkingMode,
@@ -1942,9 +1938,6 @@ impl ResolvedConfig {
                 .unwrap_or_default(),
             tool_params: file_display.tool_params.unwrap_or_default(),
             max_width: file_display.max_width.map(clamp_max_width),
-            context_messages: file_session
-                .context_messages
-                .or(Some(DEFAULT_CONTEXT_MESSAGES)),
             retention: file_session.retention,
             thinking: active_settings
                 .as_ref()
@@ -2109,16 +2102,6 @@ impl ResolvedConfig {
                     "`[mcp].{key} = 0` would connect no server; remove the key for the default"
                 )));
             }
-        }
-        // `context_messages = 0` reads as "send no history", which is not a thing the provider APIs
-        // accept: a request needs at least the current user message. Indexing one past the end of
-        // the message slice on the first turn panics: fatal in the REPL, and under ACP it leaves
-        // the client's `session/prompt` waiting forever with no response.
-        if self.context_messages == Some(0) {
-            return Err(crate::error::MekaError::Config(format!(
-                "`[session].context_messages = 0` would send no conversation; remove the key for \
-                 the default of {DEFAULT_CONTEXT_MESSAGES}"
-            )));
         }
         // `tokio::time::interval` panics on a zero period, so this would be a config value taking
         // the process down rather than a setting behaving oddly.
@@ -3979,12 +3962,12 @@ path = \"/tmp\"
     fn session_config_deserialization() {
         let toml_str = r#"
 [session]
-context_messages = 100
+context_ceiling_percent = 85
 retention = "90d"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let session = config.session.expect("session should be present");
-        assert_eq!(session.context_messages, Some(100));
+        assert_eq!(session.context_ceiling_percent, Some(85));
         assert_eq!(
             session.retention,
             Some(std::time::Duration::from_secs(90 * 86_400))
@@ -4080,35 +4063,12 @@ command = "ida-mcp"
         assert!(resolved.retention.is_none(), "no cleanup by default");
     }
 
-    /// Zero is "delete everything, every startup". Refuse rather than discover it after the fact.
-    /// `context_messages = 0` would send an empty conversation, which no provider accepts, and the
-    /// assembly path indexes on the assumption that the window is non-empty. Rejecting it at load
-    /// is what keeps that from becoming a panic mid-turn; nothing asserted the rejection.
+    /// A config still carrying the key is refused by name, like every retired key, rather than
+    /// parsed and ignored: a user who set it would otherwise believe requests were still being cut.
     #[test]
-    fn context_messages_zero_is_rejected() {
-        let resolved = resolve_with_config(
-            r#"
-default_profile = "p"
-
-[accounts.p]
-backend = "openai-chat-completions"
-
-[profiles.p]
-account = "p"
-model = "m"
-
-[session]
-context_messages = 0
-"#,
-        );
-        assert_eq!(
-            resolved.context_messages,
-            Some(0),
-            "fixture must actually set it"
-        );
-        let error = resolved
-            .validate()
-            .expect_err("context_messages = 0 must not be accepted");
+    fn the_retired_context_messages_key_is_refused() {
+        let error = toml::from_str::<ConfigFile>("[session]\ncontext_messages = 200\n")
+            .expect_err("the retired key must not parse");
         assert!(error.to_string().contains("context_messages"), "{error}");
     }
 
@@ -4367,21 +4327,19 @@ claim_lease = {lease}
     fn session_config_partial() {
         let toml_str = r#"
 [session]
-context_messages = 50
+context_ceiling_percent = 50
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let session = config.session.expect("session should be present");
-        assert_eq!(session.context_messages, Some(50));
+        assert_eq!(session.context_ceiling_percent, Some(50));
         assert!(session.retention.is_none());
     }
 
     #[test]
     fn session_defaults_applied() {
         let file_session = SessionConfig::default();
-        let context_messages = file_session.context_messages.or(Some(200));
         let subagent_max_depth = file_session.subagent_max_depth.unwrap_or(3);
 
-        assert_eq!(context_messages, Some(200));
         assert_eq!(subagent_max_depth, 3);
         // Retention has no default: unset means keep every session forever.
         assert!(file_session.retention.is_none());
@@ -4435,16 +4393,15 @@ permission = "workspace"
     fn session_config_overrides_defaults() {
         let toml_str = r#"
 [session]
-context_messages = 50
+context_ceiling_percent = 50
 retention = "30d"
 subagent_max_depth = 5
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let file_session = config.session.unwrap_or_default();
-        let context_messages = file_session.context_messages.or(Some(200));
         let subagent_max_depth = file_session.subagent_max_depth.unwrap_or(3);
 
-        assert_eq!(context_messages, Some(50));
+        assert_eq!(file_session.context_ceiling_percent, Some(50));
         assert_eq!(
             file_session.retention,
             Some(std::time::Duration::from_secs(30 * 86_400))

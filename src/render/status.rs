@@ -57,6 +57,7 @@ pub(crate) fn format_session_status(
     message_count: usize,
     context_tokens: u64,
     context_window: u64,
+    compactions: u64,
 ) -> String {
     let total_in = snap.total_input_tokens();
     let mut out = String::new();
@@ -108,6 +109,7 @@ pub(crate) fn format_session_status(
         out.push_str(&format!("  Thinking:        {}\n", model.thinking.name()));
     }
     out.push_str(&format!("  Turns:           {}\n", snap.turns));
+    out.push_str(&format!("  Compactions:     {compactions}\n"));
     out.push_str(&format!(
         "  Input tokens:    {}  (cache hit: {}%)\n",
         format_token_count(total_in),
@@ -305,7 +307,7 @@ mod tests {
         };
 
         // Nothing sent yet: the window still has to appear, at zero occupancy.
-        let fresh = format_session_status(&snap, &model, 0, 0, 262_144);
+        let fresh = format_session_status(&snap, &model, 0, 0, 262_144, 0);
         assert!(fresh.contains("Context:"), "{fresh}");
         assert!(
             fresh.contains("0 / 262.1k"),
@@ -313,11 +315,11 @@ mod tests {
         );
 
         // Once a turn has run, the same line carries the occupancy.
-        let used = format_session_status(&snap, &model, 2, 65_536, 262_144);
+        let used = format_session_status(&snap, &model, 2, 65_536, 262_144, 0);
         assert!(used.contains("25% used"), "{used}");
 
         // An unknown window (sub-agents, tests) still has nothing to report.
-        let unknown = format_session_status(&snap, &model, 0, 0, 0);
+        let unknown = format_session_status(&snap, &model, 0, 0, 0, 0);
         assert!(!unknown.contains("Context:"), "{unknown}");
     }
 
@@ -341,6 +343,7 @@ mod tests {
             7,
             1_024,
             262_144,
+            3,
         );
 
         let labels: Vec<&str> = body
@@ -360,6 +363,7 @@ mod tests {
                 "Thinking",
                 // Then what the session has spent, which no profile field describes.
                 "Turns",
+                "Compactions",
                 "Input tokens",
                 "Output tokens",
                 "Redactions",
@@ -371,6 +375,10 @@ mod tests {
             body.contains("  Profile:         p\n")
                 && body.contains("  Account:         a (anthropic-messages)\n"),
             "the backend is the account's fact and sits beside it: {body}"
+        );
+        assert!(
+            body.contains("  Compactions:     3\n"),
+            "the count is a counter of the session, beside its turns: {body}"
         );
     }
 
@@ -396,6 +404,7 @@ mod tests {
                     effort,
                     thinking: ThinkingMode::Adaptive,
                 },
+                0,
                 0,
                 0,
                 0,

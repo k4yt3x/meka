@@ -104,7 +104,8 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
    read the words. It then sends a `CompletionRequest` and dispatches every tool call the response
    carries. `admit_arguments` type-checks the call's arguments and takes out `background`, the flag
    that detaches it; `admit_tool_call` decides run, ask or refuse. Each call gets a `ToolContext`:
-   the session id, the tool-use id, the prompt id, the frontend and the cancellation token.
+   the session id, the tool-use id, the prompt id, the frontend and the cancellation token. Every
+   request carries the conversation whole; the context ceiling and compaction are its only bound.
 4. **Recovery.** A failed request goes through `TurnRecovery`, which decides between a retry, a
    degraded resend and a reported failure. Compaction runs when the context gauge says so, when the
    model asks through `context_compact`, or when the user asks.

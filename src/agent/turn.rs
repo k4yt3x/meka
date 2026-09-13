@@ -125,91 +125,6 @@ impl TurnInput {
 /// context-window overflow before giving up. One pass shrinks the request dramatically; if it still
 /// overflows, looping won't help.
 pub(super) const MAX_OVERFLOW_RETRIES: u32 = 1;
-/// Whether a world-state render made when the conversation held `rendered_at` messages is still
-/// inside the window [`truncate_messages_for_context`] will send.
-///
-/// The render lives in exactly one user message, at index `rendered_at`. The window keeps the last
-/// `context_messages` entries, so that message survives while `current_len - rendered_at` stays
-/// within the limit. Once it falls out, the model can no longer see the tool catalog, the skill
-/// list, or any MCP server's instructions, and the picture has to be restated in full.
-///
-/// Deliberately one turn conservative (`<` rather than `<=`), for two reasons: `current_len` is
-/// read before this turn's own message is appended, and `truncate_messages_for_context` walks
-/// backward from the cut to land on a user-message boundary, which can only keep *more*. Restating
-/// a turn early costs tokens once per window; restating a turn late means a request with no
-/// catalog in it at all.
-pub(super) fn world_state_still_visible(
-    rendered_at: usize,
-    current_len: usize,
-    context_messages: Option<usize>,
-) -> bool {
-    context_messages.is_none_or(|limit| current_len.saturating_sub(rendered_at) < limit)
-}
-/// Assemble the message list for one provider call inside a turn: the turn's stable base plus
-/// whatever the tool loop has appended since, re-truncated as a whole.
-///
-/// A named function rather than four lines inline, so the tests that protect this windowing drive
-/// the real path rather than a copy that could omit the truncation.
-pub(super) fn assemble_api_messages(
-    messages: &[Message],
-    base_messages: &[Message],
-    turn_start_len: usize,
-    context_messages: Option<usize>,
-) -> Vec<Message> {
-    if messages.len() > turn_start_len {
-        let mut combined = base_messages.to_vec();
-        combined.extend_from_slice(&messages[turn_start_len..]);
-        truncate_messages_for_context(&combined, context_messages)
-    } else {
-        base_messages.to_vec()
-    }
-}
-pub(super) fn truncate_messages_for_context(
-    messages: &[Message],
-    context_messages: Option<usize>,
-) -> Vec<Message> {
-    let Some(limit) = context_messages else {
-        return messages.to_vec();
-    };
-
-    if messages.len() <= limit {
-        return messages.to_vec();
-    }
-
-    // Clamped to a valid index before the walk below reads `messages[start_index]`. `limit == 0` is
-    // rejected at config load, but this function is also called with the value threaded through
-    // `AgentOptions`, and an out-of-bounds index here is a panic that takes the process (or, under
-    // `serve`, the turn task) down. Costing one message is the right trade against that.
-    let mut start_index = messages
-        .len()
-        .saturating_sub(limit)
-        .min(messages.len().saturating_sub(1));
-
-    // A safe cut point is a user message that is NOT a tool_results message: it neither splits an
-    // assistant(ToolUse) → user(ToolResult) chain nor leaves the window starting on a role the
-    // Claude API rejects.
-    let is_safe_cut = |index: usize| {
-        messages.get(index).is_some_and(|message| {
-            message.role == Role::User && !has_tool_results(&message.content)
-        })
-    };
-
-    // Search forward first, which drops the leading tool chain whole rather than reaching back
-    // over it: reaching back alone makes the cap advisory, since one long tool loop with no plain
-    // user message inside it drags `start_index` to 0. Cutting forward can keep fewer messages than
-    // asked for, which is what a maximum means.
-    if let Some(index) = (start_index..messages.len()).find(|&index| is_safe_cut(index)) {
-        return messages[index..].to_vec();
-    }
-
-    // Nothing ahead is safe (the tail is one unbroken tool chain), so reach back for the last cut
-    // point that is. Exceeding the cap beats sending a conversation the provider will reject.
-    while start_index > 0 && !is_safe_cut(start_index) {
-        start_index -= 1;
-    }
-
-    messages[start_index..].to_vec()
-}
 pub(super) fn has_tool_results(content: &[ContentBlock]) -> bool {
     content
         .iter()
@@ -674,23 +589,11 @@ impl Agent {
             // compares that half against itself and says nothing about it; advancing to an empty
             // list would announce the whole store as deleted. Nothing to carry (the first turn of a
             // session) leaves the list empty, which renders no `[Memory]` section at all.
-            if !memories_readable && let Some((previous, _)) = last.as_ref() {
+            if !memories_readable && let Some(previous) = last.as_ref() {
                 current.carry_memories_from(previous);
             }
-            // Treat a render that has scrolled out of the API window as never having happened. The
-            // window keeps the last `context_messages` entries, so a render at index `i` is gone
-            // once the conversation grows past `i + limit`. Rendering in full then puts a fresh
-            // copy at the new tail, good for another window's worth of turns.
-            let still_visible = last.as_ref().filter(|(_, rendered_at)| {
-                world_state_still_visible(
-                    *rendered_at,
-                    messages.len(),
-                    self.options.context_messages,
-                )
-            });
-            let rendered = prompt::render_world_state(&current, still_visible.map(|(s, _)| s));
-            // This turn's user message is about to be appended, so that is where the render lands.
-            let previous = last.replace((current, messages.len()));
+            let rendered = prompt::render_world_state(&current, last.as_ref());
+            let previous = last.replace(current);
             drop(last);
             (rendered, previous)
         };
@@ -798,11 +701,6 @@ impl Agent {
         }
 
         let mut recovery = TurnRecovery {
-            base_messages: Arc::from(truncate_messages_for_context(
-                messages.as_slice(),
-                self.options.context_messages,
-            )),
-            turn_start_len: messages.len(),
             suspect_floor,
             prompt_only_events,
             overflow_retries: 0,
@@ -834,14 +732,14 @@ impl Agent {
                 // while a turn is stalled on a failing provider, which is when a repair is most
                 // likely to be in flight.
                 if cancellation.is_cancelled() {
-                    recovery.undo_rejected_repair(self, messages);
+                    recovery.undo_rejected_repair(messages);
                     break 'turn Err(MekaError::Interrupted);
                 }
                 // Bail out if the frontend has noticed its client went away (e.g. ACP stdio
                 // disconnect). No point burning more provider tokens for an audience that won't see
                 // the output. REPL frontends report `false` here, so this is a no-op for them.
                 if self.cells.frontend.client_disconnected() {
-                    recovery.undo_rejected_repair(self, messages);
+                    recovery.undo_rejected_repair(messages);
                     break 'turn Err(MekaError::Interrupted);
                 }
 
@@ -849,29 +747,14 @@ impl Agent {
                 // the provider takes it.
                 let sent_len = messages.len();
 
-                // Re-truncate the assembled request, not just the turn's starting point: everything
-                // the tool loop appends is spliced onto a `base_messages` capped once at turn
-                // start, so `[session] context_messages` would otherwise stop applying at the
-                // second provider call. This costs cache, since the cut walks forward to the first
-                // safe boundary and the prefix sent to the provider moves within one turn, but an
-                // unbounded request eventually hits the context limit the setting exists to avoid.
-                //
                 // Whatever a request that never reached this point reported is not about the view
                 // this request is built from.
                 crate::sync::lock(&self.pending_redactions).clear();
-                let api_messages: Arc<[Message]> = if messages.len() > recovery.turn_start_len {
-                    Arc::from(assemble_api_messages(
-                        messages.as_slice(),
-                        &recovery.base_messages,
-                        recovery.turn_start_len,
-                        self.options.context_messages,
-                    ))
-                } else {
-                    // What `assemble_api_messages` returns with nothing appended, reusing the
-                    // allocation instead of copying it. `base_messages` was truncated at turn
-                    // start, so there is nothing left for the cap to do.
-                    Arc::clone(&recovery.base_messages)
-                };
+                // The conversation as it stands, whole. The context ceiling and compaction are its
+                // only bound: a cap on the message count drops history nothing has summarized, and
+                // the model forgets it with no trace on any surface. Copied for the streaming path
+                // alone, whose spawned task needs an owned slice.
+                let api_messages: &[Message] = messages.as_slice();
 
                 // Recompute the active tool set every iteration so a `load_tool` call earlier in
                 // this turn becomes visible to the model on the very next request, without
@@ -921,7 +804,7 @@ impl Agent {
                 {
                     self.run_streaming(
                         Arc::clone(&system_prompt),
-                        api_messages,
+                        Arc::from(api_messages),
                         tools,
                         attribution.clone(),
                         cancellation.clone(),
@@ -938,7 +821,7 @@ impl Agent {
                         match self
                             .provider()
                             .complete(
-                                CompletionRequest::new(&system_prompt, &api_messages, &tools)
+                                CompletionRequest::new(&system_prompt, api_messages, &tools)
                                     .attributed(attribution.clone()),
                                 cancellation.clone(),
                             )
@@ -1002,7 +885,7 @@ impl Agent {
                         // the fix whatever happens next: another tier measures itself against the
                         // conversation as it really is, and a turn that gives up leaves memory and
                         // store agreeing.
-                        recovery.undo_rejected_repair(self, messages);
+                        recovery.undo_rejected_repair(messages);
                         if !refusal_may_blame_content(&error, progress.content_started) {
                             // The same treatment an interrupt gives a half-streamed answer: the
                             // text the user watched arrive is kept, without the tool calls that
@@ -1079,7 +962,7 @@ impl Agent {
                     // forbids. Undoing also restores the trailing `Event::Append` that the
                     // post-loop `pop_unsaved` looks for, which a trailing `Event::Repair` would
                     // have made it silently skip, stranding the prompt in memory too.
-                    recovery.undo_rejected_repair(self, messages);
+                    recovery.undo_rejected_repair(messages);
                     break 'turn Err(error);
                 }
 
@@ -1090,13 +973,10 @@ impl Agent {
                 // holds. Ahead of the interrupt and thinking-only exits below, because a redaction
                 // is a fact about the request the provider just accepted rather than about how the
                 // round ends. Before the round's own messages are appended, since the positions
-                // are relative to the tail of the view as the request saw it. The turn's base slice
-                // is rebuilt too, or the next request would be assembled from a copy that still
-                // carries the images.
+                // are relative to the tail of the view as the request saw it.
                 let redacted = std::mem::take(&mut *crate::sync::lock(&self.pending_redactions));
                 if !redacted.is_empty() {
                     let redaction = messages.redact_images(redacted);
-                    recovery.refresh_base_messages(self, messages);
                     // Its own write rather than part of the round's, which the exits below never
                     // reach. A failed write leaves the view redacted in memory, so the turn goes
                     // on; the cost is one more redaction after a resume.
@@ -1364,7 +1244,7 @@ impl Agent {
                             {
                                 // Every index the turn holds addresses the conversation this just
                                 // replaced.
-                                Ok(_) => recovery.after_conversation_rewrite(self, messages),
+                                Ok(_) => recovery.after_conversation_rewrite(),
                                 // An interrupt is not a failure to report: the loop's own check
                                 // breaks the turn on the next pass, and warning here would put a
                                 // line about compaction in front of every Ctrl+C that lands
@@ -1419,7 +1299,7 @@ impl Agent {
                                     )
                                     .await
                                 {
-                                    Ok(_) => recovery.after_conversation_rewrite(self, messages),
+                                    Ok(_) => recovery.after_conversation_rewrite(),
                                     Err(_) if cancellation.is_cancelled() => {}
                                     Err(error) => {
                                         tracing::warn!("compaction between rounds failed: {error}")
@@ -1953,8 +1833,7 @@ mod tests {
     use crate::{
         agent::tests::{
             REJECTION, agent_for_test, agent_that_compacts_for_test, agent_with_registry_for_test,
-            assistant_message, assistant_tool_use, build_test_agent, image_source,
-            send_file_registry, tool_result_message, user_message,
+            alternating_turns, build_test_agent, image_source, send_file_registry,
         },
         conversation::ToolResultContent,
         provider::mock::text_round,
@@ -6541,445 +6420,53 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn truncate_no_limit() {
-        let messages = vec![user_message("hello"), assistant_message("hi")];
-        let result = truncate_messages_for_context(&messages, None);
-        assert_eq!(result.len(), 2);
-    }
+    /// The request is the conversation, whole. A cap on the message count is the obvious way to
+    /// bound a request, and it was the wrong one: what it dropped had never been summarized, so a
+    /// long session forgot its opening brief with nothing on any surface to say so. Driven through
+    /// a tool round, since a cap applied only at the turn's start would pass a single-request test.
+    #[tokio::test]
+    async fn every_request_of_a_turn_carries_the_whole_conversation() {
+        use crate::provider::mock::MockStopReason;
 
-    #[test]
-    fn truncate_under_limit() {
-        let messages = vec![user_message("hello"), assistant_message("hi")];
-        let result = truncate_messages_for_context(&messages, Some(10));
-        assert_eq!(result.len(), 2);
-    }
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-0".to_string(),
+                    name: "does_not_exist".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            text_round("done"),
+        ]));
+        let (agent, _store) = agent_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        let mut messages = alternating_turns(150);
+        let history = messages.len();
 
-    #[test]
-    fn truncate_over_limit() {
-        let messages = vec![
-            user_message("first"),
-            assistant_message("response1"),
-            user_message("second"),
-            assistant_message("response2"),
-            user_message("third"),
-            assistant_message("response3"),
-        ];
-        let result = truncate_messages_for_context(&messages, Some(4));
-        assert_eq!(result.len(), 4);
-        assert_eq!(result[0].role, Role::User);
-    }
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
 
-    #[test]
-    fn truncate_does_not_split_tool_chain() {
-        let messages = vec![
-            user_message("first"),
-            assistant_message("response1"),
-            user_message("second"),
-            assistant_tool_use(),
-            tool_result_message(),
-            assistant_message("final"),
-        ];
-        // Limit 3 would naively start at index 3 (assistant_tool_use), but that splits the tool
-        // chain. It should walk back to index 2 (user "second").
-        let result = truncate_messages_for_context(&messages, Some(3));
-        assert_eq!(result[0].role, Role::User);
-        assert!(!has_tool_results(&result[0].content));
-        assert!(result.len() >= 3);
-    }
-
-    #[test]
-    fn truncate_starts_with_user() {
-        let messages = vec![
-            user_message("first"),
-            assistant_message("response1"),
-            assistant_message("response2"),
-            user_message("second"),
-            assistant_message("response3"),
-        ];
-        // Limit 2 would naively start at index 3, which is a user message
-        let result = truncate_messages_for_context(&messages, Some(2));
-        assert_eq!(result[0].role, Role::User);
-    }
-
-    #[test]
-    fn truncate_skips_forward_past_tool_result() {
-        let messages = vec![
-            user_message("first"),
-            assistant_tool_use(),
-            tool_result_message(),
-            assistant_message("response"),
-            user_message("second"),
-            assistant_message("response2"),
-        ];
-        // Limit 4 lands on index 2 (tool_result_message), which would orphan the tool_use above it.
-        // The next safe cut ahead is index 4 (user "second"); the pair is dropped whole.
-        let result = truncate_messages_for_context(&messages, Some(4));
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].role, Role::User);
-        assert!(!has_tool_results(&result[0].content));
-    }
-
-    /// `context_messages` is a maximum, and reaching back over a tool chain to find a cut point
-    /// would let one long tool loop ignore it entirely.
-    #[test]
-    fn a_long_tool_loop_cannot_carry_the_window_past_its_cap() {
-        let mut messages = vec![user_message("go")];
-        for _ in 0..5 {
-            messages.push(assistant_tool_use());
-            messages.push(tool_result_message());
-        }
-        messages.push(user_message("and now this"));
-
-        let result = truncate_messages_for_context(&messages, Some(4));
-        assert!(
-            result.len() <= 4,
-            "{} messages survived the cap",
-            result.len()
-        );
-        assert_eq!(result[0].role, Role::User);
-        assert!(!has_tool_results(&result[0].content));
-    }
-
-    /// When nothing ahead is a safe cut, reaching back is still right: an invalid conversation the
-    /// provider rejects is worse than one over the cap.
-    #[test]
-    fn an_unbroken_trailing_tool_chain_falls_back_to_reaching_back() {
-        let mut messages = vec![user_message("go")];
-        for _ in 0..5 {
-            messages.push(assistant_tool_use());
-            messages.push(tool_result_message());
-        }
-
-        let result = truncate_messages_for_context(&messages, Some(4));
-        assert_eq!(result.len(), messages.len());
-        assert_eq!(result[0].role, Role::User);
-        assert!(!has_tool_results(&result[0].content));
-    }
-
-    fn assistant_tool_use_named(id: &str, name: &str) -> Message {
-        Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: id.to_string(),
-                name: name.to_string(),
-                input: serde_json::json!({"path": "/tmp/test"}),
-            }],
-        }
-    }
-
-    fn tool_result_for(tool_use_id: &str, content: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: tool_use_id.to_string(),
-                content: vec![ToolResultContent::Text {
-                    text: content.to_string(),
-                }],
-                is_error: false,
-            }],
-        }
-    }
-
-    /// Compares two message slices for semantic equality (same role, same content blocks), which
-    /// is what determines whether the KV cache prefix is reusable.
-    fn assert_messages_equal(a: &[Message], b: &[Message], context: &str) {
-        assert_eq!(a.len(), b.len(), "{context}: length mismatch");
-        for (i, (ma, mb)) in a.iter().zip(b.iter()).enumerate() {
-            assert_eq!(ma.role, mb.role, "{context}: role mismatch at index {i}");
+        let requests = provider.streams();
+        assert_eq!(requests.len(), 2, "one tool round and the request after it");
+        // The history plus this turn's prompt, then plus the tool call and its result.
+        assert_eq!(requests[0].messages.len(), history + 1);
+        assert_eq!(requests[1].messages.len(), history + 3);
+        for request in &requests {
             assert_eq!(
-                ma.content.len(),
-                mb.content.len(),
-                "{context}: content block count mismatch at index {i}"
-            );
-            let json_a = serde_json::to_string(&ma.content).unwrap();
-            let json_b = serde_json::to_string(&mb.content).unwrap();
-            assert_eq!(json_a, json_b, "{context}: content mismatch at index {i}");
-        }
-    }
-
-    #[test]
-    fn stable_base_during_tool_loop() {
-        // A conversation with history, then a tool loop that adds 3 tool call/result pairs. The
-        // base prefix (everything before the tool loop) must be identical across all iterations.
-        let mut messages = vec![
-            user_message("first question"),
-            assistant_message("first answer"),
-            user_message("second question"),
-        ];
-
-        let base_messages = truncate_messages_for_context(&messages, None);
-        let turn_start_len = messages.len();
-
-        let api_iter0 = assemble_api_messages(&messages, &base_messages, turn_start_len, None);
-        assert_eq!(api_iter0.len(), 3);
-
-        // Iteration 1: model calls a tool
-        messages.push(assistant_tool_use_named("t1", "read_file"));
-        messages.push(tool_result_for("t1", "file contents"));
-
-        let api_iter1 = assemble_api_messages(&messages, &base_messages, turn_start_len, None);
-        assert_eq!(api_iter1.len(), 5);
-
-        // The first 3 messages (the base) must be identical.
-        assert_messages_equal(&api_iter0[..3], &api_iter1[..3], "iter0→iter1 base");
-
-        // Iteration 2: model calls another tool
-        messages.push(assistant_tool_use_named("t2", "execute_command"));
-        messages.push(tool_result_for("t2", "command output"));
-
-        let api_iter2 = assemble_api_messages(&messages, &base_messages, turn_start_len, None);
-        assert_eq!(api_iter2.len(), 7);
-
-        // Base is still identical.
-        assert_messages_equal(&api_iter0[..3], &api_iter2[..3], "iter0→iter2 base");
-        // And the first 5 (base + iter1's additions) are identical too.
-        assert_messages_equal(&api_iter1[..5], &api_iter2[..5], "iter1→iter2 prefix");
-
-        // Iteration 3: yet another tool call
-        messages.push(assistant_tool_use_named("t3", "read_file"));
-        messages.push(tool_result_for("t3", "more contents"));
-
-        let api_iter3 = assemble_api_messages(&messages, &base_messages, turn_start_len, None);
-        assert_eq!(api_iter3.len(), 9);
-
-        assert_messages_equal(&api_iter2[..7], &api_iter3[..7], "iter2→iter3 prefix");
-        assert_messages_equal(&api_iter0[..3], &api_iter3[..3], "iter0→iter3 base");
-    }
-
-    /// Once a tool loop pushes the assembled request past `context_messages`, the window moves
-    /// forward with it. This is the trade the per-round truncation makes.
-    ///
-    /// Applying the cap once at turn start would freeze the base for the whole turn, which is what
-    /// would make `context_messages` stop applying the moment a turn makes its second provider
-    /// call.
-    ///
-    /// The cost is real: a prefix that moves is a prefix the provider cannot serve from cache, so
-    /// a long tool loop re-reads its window several times per turn. The alternative is a cap that
-    /// does not hold, which is worse, since an unbounded request eventually hits the context limit
-    /// the setting exists to avoid.
-    #[test]
-    fn the_window_moves_forward_when_a_tool_loop_pushes_past_the_cap() {
-        let limit = Some(6);
-
-        let mut messages = vec![
-            user_message("msg-1"),
-            assistant_message("resp-1"),
-            user_message("msg-2"),
-            assistant_message("resp-2"),
-            user_message("msg-3"),
-        ];
-
-        let base_messages = truncate_messages_for_context(&messages, limit);
-        let turn_start_len = messages.len();
-        assert_eq!(base_messages.len(), 5, "five fits under a cap of six");
-
-        let api_iter0 = assemble_api_messages(&messages, &base_messages, turn_start_len, limit);
-        assert_eq!(api_iter0.len(), 5, "nothing appended yet");
-
-        // Round 1 takes the assembled request to seven, over the cap.
-        messages.push(assistant_tool_use_named("t1", "read_file"));
-        messages.push(tool_result_for("t1", "data"));
-        let api_iter1 = assemble_api_messages(&messages, &base_messages, turn_start_len, limit);
-
-        // Round 2 takes it to nine.
-        messages.push(assistant_tool_use_named("t2", "execute_command"));
-        messages.push(tool_result_for("t2", "output"));
-        let api_iter2 = assemble_api_messages(&messages, &base_messages, turn_start_len, limit);
-
-        for (round, request) in [(1, &api_iter1), (2, &api_iter2)] {
-            assert!(
-                request.len() <= 6,
-                "round {round} sent {} messages under a cap of 6",
-                request.len(),
-            );
-            assert_eq!(
-                request.first().map(|message| &message.role),
-                Some(&Role::User),
-                "round {round} must start on a role the provider accepts",
-            );
-            assert!(
-                !has_tool_results(&request.first().expect("non-empty").content),
-                "round {round} must not start mid tool chain",
-            );
-        }
-
-        // What the round costs: the request no longer opens on the same message it did before, so
-        // the cached prefix ends where the two diverge.
-        let first_of = |request: &[Message]| serde_json::to_string(&request[0].content).unwrap();
-        assert_ne!(
-            first_of(&api_iter1),
-            first_of(&api_iter2),
-            "the window is expected to move once the cap bites; if this ever holds, the cap has \
-             stopped applying inside the turn again",
-        );
-
-        // And the newest messages always survive: the cut only ever comes off the front.
-        let newest = serde_json::to_string(&messages[messages.len() - 1].content).unwrap();
-        assert_eq!(
-            serde_json::to_string(&api_iter2[api_iter2.len() - 1].content).unwrap(),
-            newest,
-        );
-    }
-
-    #[test]
-    fn truncation_with_tool_chain_near_boundary() {
-        // Verify that when the conversation includes a tool chain right at the truncation boundary,
-        // the base is computed correctly and stays stable.
-        let limit = Some(4);
-
-        let mut messages = vec![
-            user_message("old-msg"),
-            assistant_message("old-resp"),
-            user_message("current question"),
-            assistant_tool_use_named("t0", "read_file"),
-            tool_result_for("t0", "initial data"),
-            assistant_message("here is the data"),
-            user_message("follow-up"),
-        ];
-
-        let base_messages = truncate_messages_for_context(&messages, limit);
-        let turn_start_len = messages.len();
-
-        // The truncation should keep a safe cut point; verify it starts with a user message and
-        // doesn't split tool chains.
-        assert_eq!(base_messages[0].role, Role::User);
-        assert!(!has_tool_results(&base_messages[0].content));
-
-        let api_iter0 = assemble_api_messages(&messages, &base_messages, turn_start_len, limit);
-
-        // Add tool loop messages
-        messages.push(assistant_tool_use_named("t1", "read_file"));
-        messages.push(tool_result_for("t1", "more data"));
-
-        let api_iter1 = assemble_api_messages(&messages, &base_messages, turn_start_len, limit);
-
-        // The base portion must be identical.
-        let base_len = base_messages.len();
-        assert_messages_equal(
-            &api_iter0[..base_len],
-            &api_iter1[..base_len],
-            "base stable after tool loop",
-        );
-    }
-
-    /// The tool catalog, skill list and MCP instructions do not live in the system prompt, which
-    /// is sent unconditionally. They now live in one user message, which
-    /// `truncate_messages_for_context` will drop once the conversation outgrows `context_messages`
-    /// (200 by default). Without this check the snapshot would still claim the model had been told,
-    /// and a long session would run with no catalog at all.
-    #[test]
-    fn world_state_is_restated_once_it_scrolls_out_of_the_window() {
-        // Rendered at index 0, window of 200.
-        assert!(
-            world_state_still_visible(0, 10, Some(200)),
-            "a fresh render is visible"
-        );
-        assert!(
-            world_state_still_visible(0, 199, Some(200)),
-            "still inside the window one message before the cut"
-        );
-        assert!(
-            !world_state_still_visible(0, 200, Some(200)),
-            "the render has reached the edge and must be restated"
-        );
-        assert!(
-            !world_state_still_visible(0, 5_000, Some(200)),
-            "a long session must not run on a render that scrolled away"
-        );
-
-        // A restatement lands at the current tail and buys another window.
-        assert!(world_state_still_visible(4_900, 5_000, Some(200)));
-
-        // No limit means nothing is ever dropped, so a single render lasts the session.
-        assert!(world_state_still_visible(0, 100_000, None));
-    }
-
-    #[test]
-    fn no_limit_produces_full_prefix() {
-        // With no context_messages limit, base_messages includes everything, and tool loop
-        // additions are appended without any truncation.
-        let mut messages = vec![user_message("a"), assistant_message("b"), user_message("c")];
-
-        let base_messages = truncate_messages_for_context(&messages, None);
-        let turn_start_len = messages.len();
-
-        assert_eq!(base_messages.len(), 3);
-
-        let api_iter0 = assemble_api_messages(&messages, &base_messages, turn_start_len, None);
-        assert_eq!(api_iter0.len(), 3);
-
-        // Add many tool calls
-        for i in 0..5 {
-            messages.push(assistant_tool_use_named(&format!("t{i}"), "read_file"));
-            messages.push(tool_result_for(&format!("t{i}"), &format!("result {i}")));
-        }
-
-        let api_final = assemble_api_messages(&messages, &base_messages, turn_start_len, None);
-        assert_eq!(api_final.len(), 13); // 3 base + 10 tool messages
-
-        // Base prefix still matches.
-        assert_messages_equal(&api_iter0[..3], &api_final[..3], "full prefix stable");
-    }
-
-    #[test]
-    fn multi_turn_truncation_keeps_every_request_well_formed() {
-        // Two turns, each computing its own base. Turn 1 stays under the cap, so its base is
-        // stable across the loop; turn 2 crosses it, so the window moves and only the
-        // well-formedness invariants hold.
-        let limit = Some(6);
-
-        // -- Turn 1 --
-        let mut messages: Vec<Message> = vec![user_message("turn-1 question")];
-        let base_t1 = truncate_messages_for_context(&messages, limit);
-        let start_t1 = messages.len();
-
-        // Tool loop: 2 iterations
-        messages.push(assistant_tool_use_named("t1a", "read_file"));
-        messages.push(tool_result_for("t1a", "data-a"));
-        let api_t1_iter1 = assemble_api_messages(&messages, &base_t1, start_t1, limit);
-
-        messages.push(assistant_message("here's your answer"));
-        let api_t1_iter2 = assemble_api_messages(&messages, &base_t1, start_t1, limit);
-
-        // Base is stable within turn 1.
-        assert_messages_equal(
-            &api_t1_iter1[..base_t1.len()],
-            &api_t1_iter2[..base_t1.len()],
-            "turn 1 base stable",
-        );
-
-        // -- Turn 2 --
-        messages.push(user_message("turn-2 question"));
-
-        let base_t2 = truncate_messages_for_context(&messages, limit);
-        let start_t2 = messages.len();
-
-        messages.push(assistant_tool_use_named("t2a", "execute_command"));
-        messages.push(tool_result_for("t2a", "output"));
-        let api_t2_iter1 = assemble_api_messages(&messages, &base_t2, start_t2, limit);
-
-        messages.push(assistant_tool_use_named("t2b", "read_file"));
-        messages.push(tool_result_for("t2b", "more"));
-        let api_t2_iter2 = assemble_api_messages(&messages, &base_t2, start_t2, limit);
-
-        // Turn 2 is the one where the cap bites, and there the base is not stable: the request
-        // is re-truncated each round, so the window walks forward. What survives is the invariant
-        // that matters: the cap holds and the request stays well-formed.
-        for (round, request) in [(1, &api_t2_iter1), (2, &api_t2_iter2)] {
-            assert!(
-                request.len() <= 6,
-                "turn 2 round {round} sent {} messages under a cap of 6",
-                request.len(),
-            );
-            assert_eq!(
-                request.first().map(|message| &message.role),
-                Some(&Role::User),
-                "turn 2 round {round} must start on a role the provider accepts",
-            );
-            assert!(
-                !has_tool_results(&request.first().expect("non-empty").content),
-                "turn 2 round {round} must not start mid tool chain",
+                request.messages[0].text_content(),
+                "question 0",
+                "the request opens on the conversation's first message"
             );
         }
     }

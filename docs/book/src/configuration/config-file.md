@@ -942,19 +942,6 @@ approvals = true   # ask me about anything above the level instead of refusing i
 
 Settings for session history retention and context window management.
 
-### `session.context_messages`
-
-Maximum number of messages to send to the LLM API per request. Older messages are truncated from the beginning while preserving tool call chain integrity. The full history remains in the store; only the API payload is limited.
-
-The cap is applied to every request in a turn, not just the first, so a long tool loop cannot grow the payload past it mid-turn. It is a maximum rather than a target: the cut lands on the first message that is safe to start from, which means dropping a whole `tool_use` → `tool_result` pair rather than splitting one, and a request can end up under the limit as a result. A turn whose entire tail is one unbroken tool chain is the exception; there the payload runs over rather than be rejected by the provider.
-
-Default: `200`. `0` is refused at startup.
-
-```toml
-[session]
-context_messages = 100
-```
-
 ### `session.retention`
 
 Delete sessions not updated for longer than this, at agent startup. A duration string like `"30d"` or `"12h"`. Uses `updated_at`, so an actively-resumed session is preserved even if created long ago. Deletions are reported at `warn` level.

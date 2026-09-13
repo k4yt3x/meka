@@ -64,17 +64,8 @@ pub(super) const GENERATION_UNKNOWN: u64 = u64::MAX;
 /// withdrawal at the end of the turn is only safe while the log still measures what it measured
 /// before the first provider call.
 pub(super) struct TurnRecovery {
-    /// The turn's request base. Wrapped in `Arc` once so a round that appended nothing shares it
-    /// with a cheap `Arc::clone` instead of a deep `Vec` clone, and rebuilt from the conversation
-    /// by every recovery that rewrites what came before.
-    pub(super) base_messages: Arc<[Message]>,
-    /// Where the loop's own additions start, so each round re-truncates the assembled request
-    /// rather than trusting a cap applied before the tool loop spliced anything onto it.
-    pub(super) turn_start_len: usize,
     /// Where this turn's additions begin, captured before the prompt is appended so the user
     /// message (which may carry attached images) is inside the window a rejection can blame.
-    /// Distinct from [`Self::turn_start_len`], which marks the start of the *loop's* additions
-    /// and so excludes it.
     ///
     /// Reset to [`SUSPECT_FLOOR_AFTER_REWRITE`] by every compaction, because a number counted
     /// against the conversation the compaction replaced does not address any message in the one it
@@ -149,10 +140,7 @@ impl TurnRecovery {
     ) -> Result<()> {
         self.overflow_retries += 1;
         tracing::warn!("provider reported context overflow; compacting and retrying ({reason})");
-        // The rebuild this does is recomputed below from the compacted conversation, so it is
-        // redundant here rather than wrong; a second entry point that undoes without restoring
-        // the request base is the alternative.
-        self.undo_rejected_repair(agent, messages);
+        self.undo_rejected_repair(messages);
         if let Err(compact_error) = agent
             .compact_session(
                 messages,
@@ -171,7 +159,7 @@ impl TurnRecovery {
             tracing::warn!("emergency compaction failed: {compact_error}");
             return Err(MekaError::ContextOverflow(reason));
         }
-        self.after_conversation_rewrite(agent, messages);
+        self.after_conversation_rewrite();
         self.ceiling_compacted = true;
         Ok(())
     }
@@ -179,8 +167,7 @@ impl TurnRecovery {
     /// Re-anchor the turn against a conversation a compaction just replaced.
     ///
     /// Every number below addresses the *old* conversation, so leaving any of them costs the rest
-    /// of the turn: the request would be assembled from a base that no longer exists, and the
-    /// degrade-and-retry would measure itself against messages that are gone.
+    /// of the turn: the degrade-and-retry would measure itself against messages that are gone.
     ///
     /// Deliberately absent: `prompt_only_events`, whose staleness is exactly what stops a
     /// withdrawal from firing against a rewritten log, and `overflow_retries`, which bounds the
@@ -196,26 +183,10 @@ impl TurnRecovery {
     /// the kept tail or inside the boundary's summary, so the lazy save on the 2xx would write a
     /// second copy after the boundary, and the failure arm's `pop_unsaved` would take from memory
     /// a message the store keeps.
-    pub(super) fn after_conversation_rewrite(&mut self, agent: &Agent, messages: &Conversation) {
-        self.base_messages = Arc::from(truncate_messages_for_context(
-            messages.as_slice(),
-            agent.options.context_messages,
-        ));
-        self.turn_start_len = messages.len();
+    pub(super) fn after_conversation_rewrite(&mut self) {
         self.suspect_floor = SUSPECT_FLOOR_AFTER_REWRITE;
         self.tiers_tried = 0;
         self.user_saved = true;
-    }
-
-    /// Rebuild the turn's base slice from the view as it stands, after a redaction rewrote messages
-    /// the slice still held copies of. Nothing else moves: the turn's own messages are still the
-    /// ones after `turn_start_len`.
-    pub(super) fn refresh_base_messages(&mut self, agent: &Agent, messages: &Conversation) {
-        let base_end = self.turn_start_len.min(messages.len());
-        self.base_messages = Arc::from(truncate_messages_for_context(
-            &messages.as_slice()[..base_end],
-            agent.options.context_messages,
-        ));
     }
 
     /// Degrade the content appended since the last accepted request and retry, after the provider
@@ -327,11 +298,6 @@ impl TurnRecovery {
             )))
             .await;
         self.pending_repair = Some(messages.replace_tail(replaced_count, degraded));
-        self.base_messages = Arc::from(truncate_messages_for_context(
-            messages.as_slice(),
-            agent.options.context_messages,
-        ));
-        self.turn_start_len = messages.len();
         Ok(())
     }
 
@@ -413,17 +379,8 @@ impl TurnRecovery {
     /// A repair the turn then dies on was never vindicated, and leaving it applied in memory while
     /// [`Self::persist_vindicated_repair`] never runs would leave that session's conversation
     /// disagreeing with its own store until the process ends.
-    pub(super) fn undo_rejected_repair(&mut self, agent: &Agent, messages: &mut Conversation) {
+    pub(super) fn undo_rejected_repair(&mut self, messages: &mut Conversation) {
         if self.pending_repair.take().is_some() && messages.pop_repair() {
-            // Putting the conversation back is only half of it: `repair_rejected_content` also
-            // rebuilt `base_messages` from the degraded conversation, and that is the slice the
-            // request is assembled from, since both tiers preserve message count and the next
-            // round takes the branch that sends `base_messages` verbatim.
-            self.base_messages = Arc::from(truncate_messages_for_context(
-                messages.as_slice(),
-                agent.options.context_messages,
-            ));
-            self.turn_start_len = messages.len();
             tracing::warn!(
                 "degrading this turn's content did not satisfy the provider; restored it unchanged"
             );
@@ -926,7 +883,7 @@ pub(super) async fn complete_with_retry(
 mod tests {
     use super::*;
     use crate::{
-        agent::tests::{REJECTION, agent_for_test, agent_that_compacts_for_test, image_source},
+        agent::tests::{agent_for_test, agent_that_compacts_for_test, image_source},
         conversation::ToolResultContent,
         session::{CompactOrigin, CompactRequest},
     };
@@ -1071,8 +1028,6 @@ mod tests {
         );
 
         let mut recovery = TurnRecovery {
-            base_messages: Arc::from(messages.as_slice().to_vec()),
-            turn_start_len: messages.len(),
             suspect_floor: 0,
             prompt_only_events: 0,
             overflow_retries: 0,
@@ -1143,8 +1098,6 @@ mod tests {
             Some(messages.replace_tail(1, vec![Message::user("the degraded replacement")]));
 
         let mut recovery = TurnRecovery {
-            base_messages: Arc::from(messages.as_slice().to_vec()),
-            turn_start_len: messages.len(),
             suspect_floor: 0,
             prompt_only_events: 0,
             overflow_retries: 0,
@@ -1180,96 +1133,6 @@ mod tests {
         );
     }
 
-    /// Undoing a repair has to restore the *request base*, not just the conversation.
-    ///
-    /// `repair_rejected_content` rebuilds `base_messages` from the degraded conversation, because
-    /// that is the slice a request is assembled from, and both tiers preserve message count, so an
-    /// undo that restored only the conversation would leave the next round sending the degraded
-    /// body. `take_outage_reprieve` is the caller that re-sends after an undo, and a success there
-    /// would stamp `last_accepted_len` against the restored conversation, putting the content that
-    /// earned the original refusal permanently below every later suspect window.
-    ///
-    /// Stated as the inverse property rather than as that one path, because the property is what
-    /// every caller of the undo relies on.
-    #[tokio::test]
-    async fn undoing_a_repair_also_restores_the_request_base() {
-        use crate::provider::mock::MockProvider;
-
-        let (agent, _store) = agent_for_test(Arc::new(MockProvider::from_rounds(Vec::new()))).await;
-        let mut messages = Conversation::new();
-        messages.append(Message::user_with_images("look at this".to_string(), vec![
-            image_source(),
-        ]));
-        let original = messages.as_slice().to_vec();
-
-        let mut recovery = TurnRecovery {
-            base_messages: Arc::from(original.clone()),
-            turn_start_len: messages.len(),
-            suspect_floor: 0,
-            prompt_only_events: 0,
-            overflow_retries: 0,
-            requested_compactions: 0,
-            ceiling_compacted: false,
-            request_in_flight: None,
-            tiers_tried: 0,
-            pending_repair: None,
-            user_saved: true,
-            thinking_only_nudged: false,
-            outage_reprieve_used: false,
-        };
-
-        recovery
-            .repair_rejected_content(
-                &agent,
-                &mut messages,
-                MekaError::InvalidRequest(REJECTION.to_string()),
-                &CancellationToken::new(),
-            )
-            .await
-            .expect("the attachment tier had something to remove");
-        assert!(
-            recovery
-                .base_messages
-                .iter()
-                .flat_map(|message| message.content.iter())
-                .all(|block| !matches!(block, ContentBlock::Image { .. })),
-            "precondition: the degrade rebuilt the request base without the attachment"
-        );
-
-        recovery.undo_rejected_repair(&agent, &mut messages);
-
-        // `Message` has no `PartialEq`, so compare the shape that matters here: whether the
-        // attachment is present, and in the same place.
-        let images = |slice: &[Message]| -> Vec<usize> {
-            slice
-                .iter()
-                .enumerate()
-                .filter(|(_, message)| {
-                    message
-                        .content
-                        .iter()
-                        .any(|block| matches!(block, ContentBlock::Image { .. }))
-                })
-                .map(|(index, _)| index)
-                .collect()
-        };
-        assert_eq!(
-            images(messages.as_slice()),
-            images(&original),
-            "the conversation is restored"
-        );
-        assert_eq!(
-            images(&recovery.base_messages),
-            images(&original),
-            "and so is the slice the next request is built from, or the two disagree on the wire"
-        );
-        assert_eq!(
-            recovery.turn_start_len,
-            messages.len(),
-            "and the marker that decides which of the two a round reads"
-        );
-    }
-
     /// The wait is the length the provider asked for, not the constant.
     ///
     /// [`crate::provider::retry::outage_reprieve`] has its own unit tests, and they pin every
@@ -1288,8 +1151,6 @@ mod tests {
         let provider = Arc::new(MockProvider::from_rounds(Vec::new()));
         let (agent, _store) = agent_for_test(provider).await;
         let fresh = || TurnRecovery {
-            base_messages: Arc::from(Vec::new()),
-            turn_start_len: 0,
             suspect_floor: 0,
             prompt_only_events: 0,
             overflow_retries: 0,
@@ -1352,8 +1213,6 @@ mod tests {
         let provider = Arc::new(MockProvider::from_rounds(Vec::new()));
         let (agent, _store) = agent_for_test(provider).await;
         let mut recovery = TurnRecovery {
-            base_messages: Arc::from(Vec::new()),
-            turn_start_len: 0,
             suspect_floor: 0,
             prompt_only_events: 0,
             overflow_retries: 0,
@@ -1845,8 +1704,6 @@ mod tests {
     #[test]
     fn an_accepted_request_clears_what_the_turn_has_tried() {
         let mut recovery = TurnRecovery {
-            base_messages: Arc::from(Vec::new()),
-            turn_start_len: 0,
             suspect_floor: 0,
             prompt_only_events: 0,
             overflow_retries: 0,
