@@ -93,3 +93,5 @@ model   = "llama3"
 **Tool results:** Sent back as messages with `role: "tool"` and the corresponding `tool_call_id`.
 
 **Streaming:** Uses Server-Sent Events (SSE) with `data: {...}` lines. The stream ends with `data: [DONE]`.
+
+**Usage:** the `cached_tokens` an endpoint reports under `prompt_tokens_details` count as cache reads in `/status` and the per-turn usage line.

@@ -603,7 +603,10 @@ mod tests {
         }
     }
 
-    pub(super) const GATE_BUDGET: Duration = Duration::from_secs(10);
+    /// A ceiling for a test's gate, not the production budget. The first PowerShell start on a
+    /// fresh Windows CI runner has taken over a minute; CI warms it ahead of the suite, and this
+    /// covers a slow one after that.
+    pub(super) const GATE_BUDGET: Duration = Duration::from_secs(60);
 
     /// A probe result, without running anything. `apply_predicate` is pure, so every predicate can
     /// be exercised directly rather than through a command that has to produce the shape.

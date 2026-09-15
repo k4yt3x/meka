@@ -192,6 +192,11 @@ pub(crate) struct Attribution {
     /// (`t0E`); meka's conversation doesn't carry request ids, so the provider deposits them here.
     pub(crate) previous_request: Option<PreviousRequestSlot>,
     pub(crate) previous_message: Option<PreviousMessageSlot>,
+    /// The session the request serves, when it serves one. A ChatGPT request carries it as the
+    /// cache affinity the Codex client sends (`prompt_cache_key`, `session-id`, `thread-id`):
+    /// without it the endpoint spreads one conversation's requests across machines, and the prompt
+    /// cache answers a fraction of them.
+    pub(crate) session_id: Option<Uuid>,
 }
 
 impl Attribution {

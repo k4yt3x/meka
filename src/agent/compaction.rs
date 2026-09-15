@@ -621,6 +621,7 @@ impl Agent {
             // not become the conversation's previous message, and Claude Code's side queries
             // carry no `diagnostics` at all.
             previous_message: None,
+            session_id: self.cells.session_id.get(),
         }
     }
 
@@ -731,6 +732,13 @@ impl Agent {
                 notices,
                 ..
             } = completed;
+            tracing::debug!(
+                "checkpoint round usage: input={} cache_creation={} cache_read={} output={}",
+                usage.input_tokens,
+                usage.cache_creation_input_tokens,
+                usage.cache_read_input_tokens,
+                usage.output_tokens
+            );
             self.session_stats.record_untracked_tokens(&usage);
             for notice in notices {
                 self.forward_notice(notice).await;
@@ -987,6 +995,13 @@ impl Agent {
             &CancellationToken::new(),
         )
         .await?;
+        tracing::debug!(
+            "summary usage: input={} cache_creation={} cache_read={} output={}",
+            usage.input_tokens,
+            usage.cache_creation_input_tokens,
+            usage.cache_read_input_tokens,
+            usage.output_tokens
+        );
         self.session_stats.record_untracked_tokens(&usage);
         // Provider notices from the summary call (image redaction on a very large window), emitted
         // before the conversation is mutated so the user-facing order stays stable.

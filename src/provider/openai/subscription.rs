@@ -145,6 +145,7 @@ impl ChatGptSubscriptionProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
+        attribution: &crate::provider::Attribution,
     ) -> serde_json::Value {
         let mut body = build_request_body(
             &self.model,
@@ -161,6 +162,13 @@ impl ChatGptSubscriptionProvider {
         // the `reasoning` object the `include` keys off.
         request_reasoning_summary(&mut body);
         include_encrypted_reasoning(&mut body);
+        // The cache affinity Codex sends, its thread id as `prompt_cache_key`: the endpoint routes
+        // on it, so one conversation's requests reach the machine holding its cached prefix.
+        // Measured without it, the cache answered one request in four of a conversation whose
+        // prefix never changed.
+        if let Some(session_id) = attribution.session_id {
+            body["prompt_cache_key"] = serde_json::Value::String(session_id.to_string());
+        }
         body
     }
 
@@ -555,8 +563,9 @@ impl super::responses_wire::ResponsesBackend for ChatGptSubscriptionProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
+        attribution: &crate::provider::Attribution,
     ) -> serde_json::Value {
-        self.build_body(system_prompt, messages, tools)
+        self.build_body(system_prompt, messages, tools, attribution)
     }
 
     fn max_request_bytes(&self) -> Option<usize> {
@@ -566,9 +575,17 @@ impl super::responses_wire::ResponsesBackend for ChatGptSubscriptionProvider {
     async fn authenticated_request(
         &self,
         request: reqwest::RequestBuilder,
+        attribution: &crate::provider::Attribution,
     ) -> Result<reqwest::RequestBuilder> {
         let (access_token, account_id) = self.ensure_valid_credential().await?;
-        Ok(self.apply_headers(request, &access_token, account_id.as_deref()))
+        let mut request = self.apply_headers(request, &access_token, account_id.as_deref());
+        // Beside the body's `prompt_cache_key`, the two headers Codex sends with it; a root
+        // thread's are both its own id.
+        if let Some(session_id) = attribution.session_id {
+            let id = session_id.to_string();
+            request = request.header("session-id", &id).header("thread-id", id);
+        }
+        Ok(request)
     }
 }
 
@@ -968,11 +985,10 @@ mod tests {
         );
     }
 
-    /// The turn request names its content type once. `apply_headers` used to set it too, beside
-    /// the shared send that attaches the serialized body; `reqwest` appends rather than replaces,
-    /// and the backend refuses a request with two of them as an unsupported content type.
-    #[tokio::test]
-    async fn a_turn_request_carries_one_content_type_header() {
+    /// A mock endpoint that captures the head of the one request it receives, lowercased, and
+    /// refuses it: the request is the point of the tests that use it, not an answer.
+    async fn mock_endpoint_capturing_the_head()
+    -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind a mock responses endpoint");
@@ -1014,6 +1030,15 @@ mod tests {
             }
         });
 
+        (local, head_receiver)
+    }
+
+    /// The turn request names its content type once. `apply_headers` used to set it too, beside
+    /// the shared send that attaches the serialized body; `reqwest` appends rather than replaces,
+    /// and the backend refuses a request with two of them as an unsupported content type.
+    #[tokio::test]
+    async fn a_turn_request_carries_one_content_type_header() {
+        let (local, head_receiver) = mock_endpoint_capturing_the_head().await;
         let provider = ChatGptSubscriptionProvider::new(
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
@@ -1050,6 +1075,72 @@ mod tests {
             content_types, 1,
             "the turn request must carry exactly one Content-Type header; head:\n{head}"
         );
+    }
+
+    /// One conversation's requests have to reach the machine holding its cached prefix. Codex
+    /// names its thread in `prompt_cache_key`, and the endpoint routes on it; measured without
+    /// it, the cache answered one request in four of a conversation whose prefix never changed.
+    #[test]
+    fn a_turn_names_its_session_as_the_prompt_cache_key() {
+        let session_id = uuid::Uuid::new_v4();
+        let attribution = crate::provider::Attribution {
+            session_id: Some(session_id),
+            ..Default::default()
+        };
+        let body = provider_for_test().build_body("s", &[Message::user("hi")], &[], &attribution);
+        assert_eq!(body["prompt_cache_key"], session_id.to_string(), "{body}");
+
+        // A side query that serves no session sends no key rather than an empty one.
+        let bare =
+            provider_for_test().build_body("s", &[Message::user("hi")], &[], &Default::default());
+        assert!(bare.get("prompt_cache_key").is_none(), "{bare}");
+    }
+
+    /// The headers Codex sends beside the key: the endpoint derives cache affinity from
+    /// `session-id`, so a request that carries the key in the body alone is still spread.
+    #[tokio::test]
+    async fn a_turn_request_carries_its_session_in_the_affinity_headers() {
+        let (local, head_receiver) = mock_endpoint_capturing_the_head().await;
+        let provider = ChatGptSubscriptionProvider::new(
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::ChatGptSubscription,
+                credential_for_test(),
+                "gpt-5".to_string(),
+            )
+            .base_url(Some(format!("http://{local}")))
+            .client_id(None)
+            .oauth_token_url(None)
+            .token_store(None)
+            .credential_key(Some("test".to_string()))
+            .effort(Some("high".to_string()))
+            .max_output_tokens(None),
+        )
+        .expect("provider");
+        let session_id = uuid::Uuid::new_v4();
+        let attribution = crate::provider::Attribution {
+            session_id: Some(session_id),
+            ..Default::default()
+        };
+        let (sender, _receiver) = mpsc::channel(8);
+        // The refusal is the point of the mock, not of the test.
+        if let Ok(()) = provider
+            .stream(
+                CompletionRequest::new("", &[Message::user("hello")], &[]).attributed(attribution),
+                sender,
+                CancellationToken::new(),
+            )
+            .await
+        {
+            panic!("a 400 from the endpoint must not read as a completed stream");
+        }
+        let head = head_receiver.await.expect("the mock saw the request");
+        for header in ["session-id", "thread-id"] {
+            assert!(
+                head.lines()
+                    .any(|line| line == format!("{header}: {session_id}")),
+                "the turn request must carry `{header}`; head:\n{head}"
+            );
+        }
     }
 
     /// The history probe classifies a dead endpoint the same way the turn path does.
@@ -1102,7 +1193,8 @@ mod tests {
     /// without reasoning carried across turns.
     #[test]
     fn the_subscription_asks_chatgpt_to_round_trip_its_reasoning() {
-        let body = provider_for_test().build_body("s", &[Message::user("hi")], &[]);
+        let body =
+            provider_for_test().build_body("s", &[Message::user("hi")], &[], &Default::default());
         assert_eq!(body["reasoning"]["effort"], "high");
         let include = body["include"].as_array().expect("include");
         assert!(
@@ -1117,7 +1209,8 @@ mod tests {
     /// still thinks, the stream carries no summary deltas, and a long think renders as a hang.
     #[test]
     fn the_subscription_asks_chatgpt_to_summarize_its_reasoning() {
-        let body = provider_for_test().build_body("s", &[Message::user("hi")], &[]);
+        let body =
+            provider_for_test().build_body("s", &[Message::user("hi")], &[], &Default::default());
         assert_eq!(body["reasoning"]["summary"], "auto", "{body}");
     }
 
@@ -1142,7 +1235,7 @@ mod tests {
             .max_output_tokens(None),
         )
         .expect("provider");
-        let body = unconfigured.build_body("s", &[Message::user("hi")], &[]);
+        let body = unconfigured.build_body("s", &[Message::user("hi")], &[], &Default::default());
 
         assert!(body["reasoning"].get("effort").is_none(), "{body}");
         assert_eq!(body["reasoning"]["summary"], "auto", "{body}");

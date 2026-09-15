@@ -105,6 +105,14 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
+      # The gate and shell tests spawn Windows PowerShell, and its first start on a fresh runner
+      # has taken over a minute, which the first such test then pays inside its own budget. `run`
+      # steps use pwsh, so nothing else warms `powershell.exe` before the suite does.
+      - name: Warm Windows PowerShell
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: Write-Output warm
+
       - name: Run tests
         run: cargo test --locked --features mock-provider
 

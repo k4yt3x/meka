@@ -220,6 +220,9 @@ pub(crate) struct StreamRequest {
     /// nothing in the response reveals whether the attribution made it. Without this the wrapper
     /// that carries it over can be deleted and every test still passes.
     pub(crate) prompt_id: Option<uuid::Uuid>,
+    /// The session the request named, for the same reason: a ChatGPT request sends it as its
+    /// cache affinity, and a turn that reads it before the session exists sends none.
+    pub(crate) session_id: Option<uuid::Uuid>,
 }
 
 impl MockProvider {
@@ -423,6 +426,7 @@ impl Provider for MockProvider {
             messages: messages.to_vec(),
             tools: tools.to_vec(),
             prompt_id: attribution.prompt_id,
+            session_id: attribution.session_id,
         });
 
         let events = {

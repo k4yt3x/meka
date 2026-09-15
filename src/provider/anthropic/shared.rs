@@ -75,6 +75,7 @@ pub(super) const MAX_IMAGE_DIMENSION_PX: u32 = 2000;
 /// `cache_creation_input_tokens`, `cache_read_input_tokens`) in both places. Missing fields default
 /// to 0 (older API responses, or providers that don't surface cache stats).
 pub(super) fn parse_usage_object(usage: &serde_json::Value) -> TokenUsage {
+    tracing::debug!("claude usage: {usage}");
     let field = |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
     TokenUsage {
         input_tokens: field("input_tokens"),

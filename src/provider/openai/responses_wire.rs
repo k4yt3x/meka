@@ -640,17 +640,24 @@ pub(super) fn process_event(
 
 /// The `usage` object of a terminal response event, as the agent counts it.
 fn usage_from(usage: &serde_json::Value) -> TokenUsage {
-    TokenUsage {
-        input_tokens: usage
-            .get("input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        output_tokens: usage
-            .get("output_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        ..TokenUsage::default()
+    // Without the per-item `attribution` a ChatGPT response adds, which runs to kilobytes per
+    // request; the totals are the diagnostic.
+    if tracing::enabled!(tracing::Level::DEBUG)
+        && let Some(object) = usage.as_object()
+    {
+        let totals: serde_json::Map<String, serde_json::Value> = object
+            .iter()
+            .filter(|(key, _)| *key != "attribution")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        tracing::debug!("responses usage: {}", serde_json::Value::Object(totals));
     }
+    super::parse_usage(
+        usage,
+        "input_tokens",
+        "input_tokens_details",
+        "output_tokens",
+    )
 }
 
 fn parse_response_status(status: &str) -> StopReason {
@@ -680,6 +687,7 @@ pub(super) trait ResponsesBackend: crate::oauth::RefreshesCredential + Send + Sy
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
+        attribution: &crate::provider::Attribution,
     ) -> serde_json::Value;
     /// The profile's request ceiling, when it states one; see [`crate::provider::budget`]. `None`
     /// sends the body as built.
@@ -689,6 +697,7 @@ pub(super) trait ResponsesBackend: crate::oauth::RefreshesCredential + Send + Sy
     async fn authenticated_request(
         &self,
         request: reqwest::RequestBuilder,
+        attribution: &crate::provider::Attribution,
     ) -> Result<reqwest::RequestBuilder>;
 }
 
@@ -720,10 +729,11 @@ pub(super) async fn stream<B: ResponsesBackend>(
         system_prompt,
         messages,
         tools,
+        attribution,
         ..
     } = request;
     let (body_json, redaction_notice) =
-        body_within_budget(backend, system_prompt, messages, tools)?;
+        body_within_budget(backend, system_prompt, messages, tools, &attribution)?;
     // A send error here means the consumer hung up already, which the SSE driver reports itself.
     if let Some(notice) = redaction_notice
         && event_sender
@@ -742,7 +752,7 @@ pub(super) async fn stream<B: ResponsesBackend>(
         },
         || async {
             Ok(backend
-                .authenticated_request(backend.client().post(backend.endpoint()))
+                .authenticated_request(backend.client().post(backend.endpoint()), &attribution)
                 .await?
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body_json.clone()))
@@ -759,6 +769,7 @@ pub(super) fn body_within_budget<B: ResponsesBackend + ?Sized>(
     system_prompt: &str,
     messages: &[Message],
     tools: &[ToolDefinition],
+    attribution: &crate::provider::Attribution,
 ) -> Result<(String, Option<crate::frontend::Notice>)> {
     match backend.max_request_bytes() {
         Some(max_request_bytes) => {
@@ -767,6 +778,7 @@ pub(super) fn body_within_budget<B: ResponsesBackend + ?Sized>(
                     system_prompt,
                     messages,
                     tools,
+                    attribution,
                 ))
             })
         }
@@ -775,6 +787,7 @@ pub(super) fn body_within_budget<B: ResponsesBackend + ?Sized>(
                 system_prompt,
                 messages,
                 tools,
+                attribution,
             ))?,
             None,
         )),
@@ -1583,16 +1596,23 @@ mod tests {
             Message::user("and now this"),
         ];
 
-        let (body, notice) = body_within_budget(&with_ceiling(Some(4_000)), "", &messages, &[])
-            .expect("fits after redaction");
+        let (body, notice) = body_within_budget(
+            &with_ceiling(Some(4_000)),
+            "",
+            &messages,
+            &[],
+            &Default::default(),
+        )
+        .expect("fits after redaction");
         assert!(
             body.contains(crate::provider::budget::IMAGE_REDACTION_PLACEHOLDER),
             "the old image is redacted: {body}"
         );
         assert!(notice.is_some(), "the redaction is announced");
 
-        let (body, notice) = body_within_budget(&with_ceiling(None), "", &messages, &[])
-            .expect("no ceiling, no refusal");
+        let (body, notice) =
+            body_within_budget(&with_ceiling(None), "", &messages, &[], &Default::default())
+                .expect("no ceiling, no refusal");
         assert!(body.contains(&image), "sent as built without a ceiling");
         assert!(notice.is_none());
     }

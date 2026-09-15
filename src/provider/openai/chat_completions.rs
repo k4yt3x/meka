@@ -359,19 +359,17 @@ impl OpenAiChatCompletionsProvider {
             }
         }
 
-        let token_usage = TokenUsage {
-            input_tokens: response
-                .get("usage")
-                .and_then(|u| u.get("prompt_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            output_tokens: response
-                .get("usage")
-                .and_then(|u| u.get("completion_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            ..TokenUsage::default()
-        };
+        let token_usage = response
+            .get("usage")
+            .map(|usage| {
+                super::parse_usage(
+                    usage,
+                    "prompt_tokens",
+                    "prompt_tokens_details",
+                    "completion_tokens",
+                )
+            })
+            .unwrap_or_default();
 
         Ok((
             Message {
@@ -617,17 +615,13 @@ async fn handle_stream_chunk(
     }
 
     if let Some(usage) = data.get("usage") {
-        let token_usage = TokenUsage {
-            input_tokens: usage
-                .get("prompt_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            output_tokens: usage
-                .get("completion_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            ..TokenUsage::default()
-        };
+        tracing::debug!("chat completions usage: {usage}");
+        let token_usage = super::parse_usage(
+            usage,
+            "prompt_tokens",
+            "prompt_tokens_details",
+            "completion_tokens",
+        );
         if event_sender
             .send(StreamEvent::Usage(token_usage))
             .await

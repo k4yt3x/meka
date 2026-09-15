@@ -138,11 +138,12 @@ impl SessionStatsSnapshot {
 pub(crate) struct TokenUsage {
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,
-    /// Tokens billed at the cache-write tier (content newly cached this turn). Anthropic-only;
-    /// OpenAI providers leave this at 0.
+    /// Tokens billed at the cache-write tier (content newly cached this turn). Anthropic reports
+    /// it; the OpenAI wires fill their cache unbilled and leave this at 0.
     pub(crate) cache_creation_input_tokens: u64,
-    /// Tokens served from the prompt cache (cache-read tier). Anthropic returns this in
-    /// `usage.cache_read_input_tokens`; OpenAI providers leave it at 0 today.
+    /// Tokens served from the prompt cache (cache-read tier): Anthropic's
+    /// `usage.cache_read_input_tokens`, or the `cached_tokens` an OpenAI wire reports inside its
+    /// input total, which the OpenAI usage parser takes out of `input_tokens`.
     pub(crate) cache_read_input_tokens: u64,
 }
 impl TokenUsage {

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- RUSTSEC-2026-0285: `rustls` 0.23.45 closes a TLS 1.3 handshake flaw in the version shipped before.
+
+## [0.54.1] - 2026-09-15
+
+### Fixed
+
+- `/status` and the usage line report cache hits on the OpenAI backends, which read 0% before.
+- A `chatgpt-subscription` conversation hits the prompt cache on every request, not one in four.
+
 ## [0.54.0] - 2026-09-13
 
 ### Changed
@@ -2223,7 +2234,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.54.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.54.1...HEAD
+[0.54.1]: https://github.com/k4yt3x/meka/compare/0.54.0...0.54.1
 [0.54.0]: https://github.com/k4yt3x/meka/compare/0.53.0...0.54.0
 [0.53.0]: https://github.com/k4yt3x/meka/compare/0.52.0...0.53.0
 [0.52.0]: https://github.com/k4yt3x/meka/compare/0.51.0...0.52.0

@@ -91,3 +91,7 @@ The trade-off, stated plainly: against OpenAI itself this backend shows no think
 reasoning between a turn's own tool calls. Use `chatgpt-subscription` if you want either. Endpoints
 that stream reasoning unprompted (vLLM and Ollama emit `response.reasoning_text.delta` without
 being asked) still render their thinking here.
+
+The same rule keeps `prompt_cache_key` off the wire here: it is OpenAI's own routing hint, and
+`chatgpt-subscription` is where meka sends it. The `cached_tokens` an endpoint reports inside
+`input_tokens` are counted as cache reads, so `/status` shows a hit rate on this backend too.

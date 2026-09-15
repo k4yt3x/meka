@@ -71,9 +71,9 @@ Whatever your ChatGPT subscription tier exposes. For the current line-up, see [O
 
 Each request:
 
-1. **Auth header set**: `Authorization: Bearer <access_token>`, `ChatGPT-Account-ID: <workspace_id>` (extracted from the JWT id_token at login), `originator: meka_cli`, plus a `User-Agent` identifying meka.
+1. **Auth header set**: `Authorization: Bearer <access_token>`, `ChatGPT-Account-ID: <workspace_id>` (extracted from the JWT id_token at login), `originator: meka_cli`, plus a `User-Agent` identifying meka. A turn also carries `session-id` and `thread-id`, both the session's id; see [Prompt caching](#prompt-caching).
 2. **Cookie jar enabled**: `chatgpt.com` is fronted by Cloudflare; bot-clearance cookies (`__cf_bm` etc.) persist across requests automatically.
-3. **Body**: standard Responses API JSON: `instructions`, `input` (an array of `message` / `reasoning` / `function_call` / `function_call_output` items), `tools`, optional `reasoning.effort`, plus the two reasoning parameters Codex also sends: `reasoning.summary: "auto"` and `include: ["reasoning.encrypted_content"]`. Both are sent on every request, whether or not `effort` is configured.
+3. **Body**: standard Responses API JSON: `instructions`, `input` (an array of `message` / `reasoning` / `function_call` / `function_call_output` items), `tools`, optional `reasoning.effort`, plus the two reasoning parameters Codex also sends: `reasoning.summary: "auto"` and `include: ["reasoning.encrypted_content"]`. Both are sent on every request, whether or not `effort` is configured. A turn adds `prompt_cache_key`, the session's id.
 4. **Stream**: SSE events: `response.output_text.delta` for text, `response.output_item.added` / `…done` for tool calls, `response.reasoning_summary_text.delta` (and `response.reasoning_text.delta`) for thinking, `response.reasoning_summary_part.added` for the break between summary sections, `response.completed` for end-of-turn with token usage.
 
 ### Reasoning across turns
@@ -83,6 +83,10 @@ Requests are stateless (`store: false`), so the reasoning a model produced is on
 The encrypted content is opaque: meka cannot read it, only replay it. It is stored under a shape that records which provider it came from, so a session recorded here and resumed against Claude does not hand Claude an OpenAI blob (nor the reverse); a block from the wrong provider is simply not replayed. The summary is the readable part, and what the REPL shows as a thinking block (see [`[thinking]`](../configuration/config-file.md) for `show_content`).
 
 A session recorded by 0.41 holds its thinking blocks under a shape that names no provider, and meka does not reshape them when it opens a session. The [one-shot upgrade script](../getting-started/upgrading.md) does it, in a pass over the store you can watch finish, because it has to guess which provider each block came from and reports what it read before it writes. Until it runs, such a block keeps its readable summary and loses its encrypted half, so that reasoning is not replayed.
+
+### Prompt caching
+
+OpenAI's prompt cache is automatic and unbilled, but a hit needs the request to land on the machine that holds the prefix, and the endpoint routes on the session named in `prompt_cache_key` and the `session-id` header. meka names the session in both, as Codex does. Measured without them, a conversation whose prefix never changed was served from the cache on one request in four; with them, on nearly every request after the first. The endpoint fills its cache asynchronously, so a tool round that returns within a few seconds of the previous response can still miss. The cached share is the `cache hit` figure in `/status` and the per-turn usage line, read from the `cached_tokens` the endpoint reports inside its input count.
 5. **Token refresh**: when the access token is within 5 minutes of expiry, meka transparently refreshes it against `auth.openai.com/oauth/token` before the next request.
 
 ## Limitations

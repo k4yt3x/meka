@@ -125,11 +125,14 @@ impl super::responses_wire::ResponsesBackend for OpenAiResponsesProvider {
         self.responses_url()
     }
 
+    // No `prompt_cache_key` and no session headers: both are OpenAI's, and this backend reaches
+    // Ollama, vLLM, LM Studio and OpenRouter, where a rejected request is the cost of guessing.
     fn request_body(
         &self,
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
+        _attribution: &crate::provider::Attribution,
     ) -> serde_json::Value {
         self.build_body(system_prompt, messages, tools)
     }
@@ -141,6 +144,7 @@ impl super::responses_wire::ResponsesBackend for OpenAiResponsesProvider {
     async fn authenticated_request(
         &self,
         request: reqwest::RequestBuilder,
+        _attribution: &crate::provider::Attribution,
     ) -> Result<reqwest::RequestBuilder> {
         Ok(request
             .header("Authorization", crate::text::bearer(&self.api_key))

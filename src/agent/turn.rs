@@ -395,6 +395,7 @@ impl Agent {
             prompt_id: Some(self.role.inherited_prompt_id().unwrap_or_else(Uuid::new_v4)),
             previous_request: Some(Arc::clone(&self.previous_request)),
             previous_message: Some(Arc::clone(&self.previous_message)),
+            session_id: self.cells.session_id.get(),
         }
     }
 
@@ -423,7 +424,6 @@ impl Agent {
         let request_in_flight = words.clone();
         let outcomes = input.delivered_outcomes();
         let TurnInput { images, .. } = input;
-        let attribution = self.turn_attribution();
         // Gate on MCP readiness BEFORE touching session state / message history so a rejected turn
         // leaves no trace in the conversation.
         self.await_mcp_ready().await?;
@@ -460,6 +460,8 @@ impl Agent {
                 .await;
             id
         };
+        // After the session exists, so the first turn's requests name it as the others do.
+        let attribution = self.turn_attribution();
 
         self.cells.frontend.emit(FrontendEvent::TurnStarted).await;
 
@@ -951,6 +953,15 @@ impl Agent {
                 turn_usage.cache_read_input_tokens = turn_usage
                     .cache_read_input_tokens
                     .saturating_add(usage.cache_read_input_tokens);
+                tracing::debug!(
+                    "round usage: input={} cache_creation={} cache_read={} output={} \
+                     messages={sent_len} subagent={}",
+                    usage.input_tokens,
+                    usage.cache_creation_input_tokens,
+                    usage.cache_read_input_tokens,
+                    usage.output_tokens,
+                    !self.role.is_root()
+                );
 
                 if let Err(error) = recovery
                     .ensure_prompt_saved(self, session_id, &user_message)
@@ -3680,6 +3691,47 @@ mod tests {
         assert!(
             requests[0].prompt_id.is_some(),
             "the spawned request lost the prompt it was serving"
+        );
+    }
+
+    /// The first turn of a new session creates the session and then names it on every request,
+    /// the first included.
+    ///
+    /// The attribution used to be built before the session existed, so a fresh session's whole
+    /// first turn went out with no session id: on `chatgpt-subscription` that is a turn without
+    /// the cache affinity, and a second turn keyed to a prefix the cache filed under nothing.
+    #[tokio::test]
+    async fn a_new_sessions_first_request_names_the_session_the_turn_created() {
+        use crate::provider::mock::{MockEvent, MockProvider};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![MockEvent::Text {
+            text: "ok".to_string(),
+        }]]));
+        let provider_handle: Arc<dyn Provider> = Arc::clone(&provider) as Arc<dyn Provider>;
+        let (agent, _store) = agent_for_test(provider_handle).await;
+        assert!(
+            agent.session_id().is_none(),
+            "the session must not exist yet"
+        );
+
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("hello".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+
+        let created = agent.session_id().expect("the turn created the session");
+        let requests = provider.streams();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].session_id,
+            Some(created),
+            "the first request must name the session the turn created"
         );
     }
 
