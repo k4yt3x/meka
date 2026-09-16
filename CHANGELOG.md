@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.56.0] - 2026-09-16
+
 ### Changed
 
 - `agent_followup`, `agent_steer` and `agent_delete` take any prefix unique among the sub-agents.
+
+### Fixed
+
+- `meka tool list` showed `execute_command` at `unrestricted` where sessions run it at `read`.
 
 ## [0.55.0] - 2026-09-16
 
@@ -2263,7 +2269,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.55.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.56.0...HEAD
+[0.56.0]: https://github.com/k4yt3x/meka/compare/0.55.0...0.56.0
 [0.55.0]: https://github.com/k4yt3x/meka/compare/0.54.1...0.55.0
 [0.54.1]: https://github.com/k4yt3x/meka/compare/0.54.0...0.54.1
 [0.54.0]: https://github.com/k4yt3x/meka/compare/0.53.0...0.54.0

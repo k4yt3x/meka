@@ -324,6 +324,9 @@ pub(crate) enum WarnContext {
     InitialReadLevel,
     /// User pressed Shift+Tab and cycled into `Read`. Only Warn 1 fires.
     ReadModeEntry,
+    /// `meka tool list` probed the sandbox to print `execute_command` at the level a session here
+    /// would need. Only Warn 1 fires: it is the reason the row reads `unrestricted`.
+    ToolListing,
 }
 
 /// Emit any relevant sandbox warnings for the configured backend state.

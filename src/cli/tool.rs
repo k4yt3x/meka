@@ -46,13 +46,20 @@ pub(crate) fn run_tool_subcommand(
             ));
             let shared_permission =
                 SharedPermission::new(config.permission, config.enabled_permissions);
+            // Probed, though nothing here runs a shell: `execute_command` declares `read` only
+            // where the sandbox is on and usable, so a listing built with the sandbox off would
+            // print `unrestricted` on every machine whose sessions run the tool at `read`. The
+            // warning is the one a session start gives, and it explains an `unrestricted` row.
+            let sandbox = crate::sandbox::resolve_backend(config.sandbox_backend, config.sandbox);
+            crate::sandbox::warn_if_sandbox_issues(
+                &crate::sandbox::SandboxState::new(config.sandbox, &sandbox),
+                crate::sandbox::WarnContext::ToolListing,
+            );
             let materials = crate::session::SessionMaterials {
-                // Nothing here runs a shell, so the sandbox is not probed: the listing shows the
-                // tools a session would have, at the levels they declare.
                 core: crate::session::CoreMaterials::from_config(
                     &config,
                     crate::config::BuiltinToolFilter::default(),
-                    &crate::sandbox::resolve_backend(config.sandbox_backend, false),
+                    &sandbox,
                 ),
                 // `meka tool list` only prints the catalog, so neither store's metadata is read
                 // and the filesystem walk is skipped. The switches still have to be honored: this

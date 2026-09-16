@@ -96,7 +96,10 @@ See [MCP](../usage/mcp.md#meka-mcp-cli) for the `add` flags and what each comman
 
 Inspect the built-in tool filters. `meka tool list` prints every built-in with its `Permission`,
 the `Source` of that requirement (`builtin`, or `override` from `[tools]`), its `Status`
-(`enabled`, `deferred`, or `disabled`), and the start of its description.
+(`enabled`, `deferred`, or `disabled`), and the start of its description. The levels are the ones
+a session on this machine would enforce: `execute_command` is `read` where the shell sandbox is on
+and a backend is usable, and `unrestricted` otherwise, so the listing probes the sandbox the way a
+session start does and gives the same warning when none is usable.
 
 ```bash
 meka tool list [--format <FORMAT>]

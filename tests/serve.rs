@@ -7325,6 +7325,55 @@ fn session_tools_endpoint_lists_the_catalog_with_permissions() {
     );
 }
 
+/// `meka tool list` exists to show what a session would have, and `execute_command` is the one
+/// built-in whose level depends on the machine: `read` where the shell sandbox is on and usable,
+/// `unrestricted` otherwise. A listing that skipped the probe printed `unrestricted` everywhere.
+/// The oracle is a live session's own catalog on the same host and config, so the test holds
+/// wherever it runs.
+#[test]
+fn the_tool_listing_shows_execute_command_at_the_level_a_session_here_needs() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let id = create_session_id(&harness);
+    let response = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/tools"))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+    let catalog: serde_json::Value = response.json().expect("parse");
+    let session_level = catalog["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|tool| tool["name"] == "execute_command")
+        .expect("execute_command is registered")["required_permission"]
+        .clone();
+
+    let output = harness
+        .install
+        .meka(&["tool", "list", "--format", "json"])
+        .output()
+        .expect("run meka tool list");
+    assert!(
+        output.status.success(),
+        "meka tool list exited non-zero: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let listed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("tool list prints one JSON document");
+    let listed_level = listed["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|tool| tool["name"] == "execute_command")
+        .expect("execute_command is listed")["required_permission"]
+        .clone();
+    assert_eq!(
+        listed_level, session_level,
+        "the listing must print the level a session on this machine enforces"
+    );
+}
+
 /// The tool names a live session's registry ends up holding, which is what `assemble_agent`
 /// actually built rather than what a test assembled by hand.
 fn session_tool_names(harness: &ServeTestHarness, id: &str) -> Vec<String> {

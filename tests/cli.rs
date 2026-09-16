@@ -3220,7 +3220,7 @@ fn tool_list_prints_json_with_the_source_and_status_of_each_tool() {
     std::fs::write(
         config_dir.join("config.toml"),
         "[tools]\ndisabled_tools = [\"agent_spawn\"]\n\n[tools.tool_permissions]\nread_file = \
-         \"none\"\n",
+         \"none\"\n\n[shell]\nsandbox = false\n",
     )
     .expect("write config.toml");
 
@@ -3240,6 +3240,10 @@ fn tool_list_prints_json_with_the_source_and_status_of_each_tool() {
     assert_eq!(read_file["enabled"], true);
     let execute = find("execute_command");
     assert_eq!(execute["permission_source"], "builtin");
+    assert_eq!(
+        execute["required_permission"], "unrestricted",
+        "with the sandbox off the shell needs `unrestricted`, whatever this host could confine"
+    );
     assert!(
         execute["description"]
             .as_str()
