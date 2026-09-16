@@ -899,7 +899,7 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
     // addressed to rather than the thing it acts on, and the object is what a reader wants
     // (`mcp_resource_read` shows the URI, not which server holds it).
     let key = match name {
-        "agent_delete" | "agent_followup" => "id",
+        "agent_delete" | "agent_followup" | "agent_steer" => "id",
         "agent_spawn" => "prompt",
         "context_compact" => "instructions",
         "conversation_read" => "start",
@@ -1203,6 +1203,7 @@ mod tests {
             subagent::agent_spawn_definition(&[]),
             subagent::agent_list_definition(),
             subagent::agent_followup_definition(),
+            subagent::agent_steer_definition(),
             subagent::agent_delete_definition(),
         ] {
             registry

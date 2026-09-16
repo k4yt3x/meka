@@ -18,6 +18,25 @@ use crate::{
     store::{Store, background::BackgroundTask},
 };
 
+/// Who started a turn the host did not receive over its own door, for the host's own accounting:
+/// `serve` names it on the session feed's `turn.started`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TurnOrigin {
+    Schedule { job_id: String },
+    Background,
+    Inbox { item_ids: Vec<uuid::Uuid> },
+}
+
+/// First wait before a turn that failed on inbox items is tried again; doubles per attempt.
+const INBOX_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Longest wait between two attempts, and the wait for a session that could not be brought up
+/// at all, which no backoff from a first try would fit.
+const INBOX_RETRY_LONGEST_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// How long an item is retried for before it is given up on, from when it was enqueued. Long
+/// enough to ride out a provider blip; short enough that an outage is reported to whoever is
+/// waiting rather than left to look like silence.
+const INBOX_RETRY_CEILING: chrono::Duration = chrono::Duration::hours(1);
+
 /// A prompt the user did not type, shown where the host shows such things before it runs.
 pub(crate) enum OutOfBandPrompt<'a> {
     /// A batch of finished background work, rendered.
@@ -73,6 +92,35 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
     fn cancellation(&self) -> CancellationToken {
         CancellationToken::new()
     }
+
+    /// An out-of-band turn is about to run under `turn_id`. `serve` opens it on the session feed;
+    /// the others have no feed to open it on.
+    fn begin_turn(&self, _entry: &Self::Entry, _turn_id: uuid::Uuid, _origin: TurnOrigin) {}
+
+    /// An out-of-band turn has ended, before [`Self::finished`] announces it. `serve` records the
+    /// terminal on the feed, closes the turn there, and posts the turn webhooks an inbox turn
+    /// alone has nothing else to carry.
+    async fn turn_closed(
+        &self,
+        _entry: &Self::Entry,
+        _turn_id: uuid::Uuid,
+        _origin: &TurnOrigin,
+        _outcome: &Result<crate::agent::TurnOutcome, MekaError>,
+    ) {
+    }
+
+    /// An inbox item was given up on and withdrawn. `serve` tells the feed and the webhooks.
+    async fn inbox_given_up(
+        &self,
+        _entry: &Self::Entry,
+        _item: &crate::store::inbox::InboxItem,
+        _reason: &str,
+    ) {
+    }
+
+    /// An inbox item was withdrawn because the turn opened on it was canceled. `serve` tells the
+    /// feed, as it does for a withdrawal a client asked for.
+    async fn inbox_withdrawn(&self, _entry: &Self::Entry, _item_id: uuid::Uuid) {}
 
     fn shutting_down(&self) -> bool {
         false
@@ -155,7 +203,10 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
         return FireOutcome::Unrunnable;
     }
     let cancellation = hooks.cancellation();
-    let _published = entry.cancel.publish(cancellation.clone(), busy.admission);
+    let turn_id = uuid::Uuid::new_v4();
+    let _published = entry
+        .cancel
+        .publish_turn(cancellation.clone(), busy.admission, turn_id);
 
     // Admitted before any outcome is claimed. A claim is one-way, so a prompt refused after it
     // would leave the batch stamped delivered and never handed out again.
@@ -189,12 +240,17 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
     hooks.show_prompt(&entry, OutOfBandPrompt::Scheduled(&wakeup));
     let input = input.riding(riding);
 
+    let origin = TurnOrigin::Schedule {
+        job_id: job.id.clone(),
+    };
+    hooks.begin_turn(&entry, turn_id, origin.clone());
     let outcome = entry
         .agent
         .run_turn(&mut conversation, input, cancellation)
-        .await
-        .map(|_| ());
+        .await;
     entry.touch();
+    hooks.turn_closed(&entry, turn_id, &origin, &outcome).await;
+    let outcome = outcome.map(|_| ());
     // Before `finished`, not after: a fire the drain cut short is deferred and fires again on the
     // next start, so telling a webhook it failed announced one occurrence twice.
     if hooks.shutting_down() {
@@ -293,23 +349,211 @@ where
         let busy = entry.mark_busy();
         hooks.show_prompt(&entry, OutOfBandPrompt::Outcomes(&render_outcomes(&ready)));
         let cancellation = hooks.cancellation();
-        let _published = entry.cancel.publish(cancellation.clone(), busy.admission);
+        let turn_id = uuid::Uuid::new_v4();
+        let _published = entry
+            .cancel
+            .publish_turn(cancellation.clone(), busy.admission, turn_id);
+        let input = crate::agent::TurnInput::outcomes(ready);
+        hooks.begin_turn(&entry, turn_id, TurnOrigin::Background);
         let outcome = entry
             .agent
-            .run_turn(
-                &mut conversation,
-                crate::agent::TurnInput::outcomes(ready),
-                cancellation,
-            )
-            .await
-            .map(|_| ());
+            .run_turn(&mut conversation, input, cancellation)
+            .await;
         entry.touch();
+        hooks
+            .turn_closed(&entry, turn_id, &TurnOrigin::Background, &outcome)
+            .await;
+        let outcome = outcome.map(|_| ());
         hooks.finished(&entry, None, &outcome).await;
         if let Err(error) = outcome {
             tracing::warn!("background outcome turn for session {session_id} failed: {error}");
         }
     }
     ControlFlow::Continue(())
+}
+
+/// Run turns on a session's waiting inbox items until nothing is waiting, the session is busy,
+/// or a turn fails.
+///
+/// A busy session is waited for: the running turn reads steers itself at its round boundaries,
+/// and what it leaves pending opens a turn the moment it ends. Turns are chained while items keep
+/// arriving, each opening on everything waiting at that moment. A turn that fails before anything
+/// reached the conversation has withdrawn its prompt and put its items back; they are deferred by
+/// a backoff that doubles per attempt, and given up on past [`INBOX_RETRY_CEILING`], which is
+/// when whoever is waiting is told rather than left with silence. A turn that fails after a tool
+/// ran keeps its prompt, so its items are in the conversation already and the next turn, whoever
+/// starts it, delivers them. A turn canceled from outside withdraws the items it opened on, as a
+/// canceled client turn loses its prompt: a cancel that re-ran the same items would not be one.
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "the conversation guard is the turn's exclusivity and lives to the end on purpose"
+)]
+pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::Uuid) {
+    let entry = match hooks.resident(session_id).await {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            tracing::debug!("session {session_id} is held elsewhere; its inbox waits");
+            return;
+        }
+        Err(error) => {
+            // Counted as an attempt and waited out at the longest interval: a session that
+            // cannot be brought up is not a provider blip, and its items still expire.
+            let inbox = hooks.store().inbox_store();
+            let not_before = chrono::Utc::now()
+                + chrono::Duration::from_std(INBOX_RETRY_LONGEST_WAIT)
+                    .unwrap_or(chrono::Duration::zero());
+            tracing::warn!(
+                "inbox items for session {session_id} wait {INBOX_RETRY_LONGEST_WAIT:?}: session \
+                 unavailable: {error}"
+            );
+            if let Err(error) = inbox.defer_session_pending(session_id, not_before).await {
+                tracing::warn!("failed to defer inbox items: {error}");
+            }
+            return;
+        }
+    };
+    let inbox = hooks.store().inbox_store();
+    loop {
+        if hooks.shutting_down() {
+            return;
+        }
+        // Waited for rather than tried: the turn holding it ends with items still pending
+        // exactly when they arrived too late for its last boundary, and this is the turn that
+        // carries them next.
+        let cancellation = hooks.cancellation();
+        let mut conversation = tokio::select! {
+            guard = entry.conversation.lock() => guard,
+            _ = cancellation.cancelled() => return,
+        };
+        if !hooks.still_resident(&entry).await {
+            return;
+        }
+        let now = chrono::Utc::now();
+        let items = match inbox.take_pending(session_id, &[], now).await {
+            Ok(items) => items,
+            Err(error) => {
+                tracing::warn!("failed to read the inbox for session {session_id}: {error}");
+                return;
+            }
+        };
+        if items.is_empty() {
+            return;
+        }
+        // An item that has failed before and has waited past the ceiling is given up on. A fresh
+        // one is never expired: the ceiling bounds retrying, not queueing.
+        let (expired, items): (Vec<_>, Vec<_>) = items
+            .into_iter()
+            .partition(|item| item.attempts > 0 && now - item.created_at >= INBOX_RETRY_CEILING);
+        for item in expired {
+            let reason = format!(
+                "no turn could deliver it in {} attempt(s) over the last hour",
+                item.attempts
+            );
+            match inbox.withdraw(item.id, Some(reason.clone())).await {
+                Ok(crate::store::inbox::Withdrawal::Withdrawn) => {
+                    tracing::warn!("giving up on inbox item {}: {reason}", item.id);
+                    hooks.inbox_given_up(&entry, &item, &reason).await;
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!("failed to withdraw inbox item {}: {error}", item.id),
+            }
+        }
+        if items.is_empty() {
+            continue;
+        }
+        let attempts = items.iter().map(|item| item.attempts).max().unwrap_or(0);
+        let item_ids: Vec<uuid::Uuid> = items.iter().map(|item| item.id).collect();
+
+        entry.touch();
+        let busy = entry.mark_busy();
+        if let Err(error) = hooks.prepare(&entry).await {
+            tracing::warn!(
+                "inbox items for session {session_id} wait: the session's profile did not \
+                 resolve ({error})"
+            );
+            return;
+        }
+        let cancellation = hooks.cancellation();
+        let turn_id = uuid::Uuid::new_v4();
+        let _published = entry
+            .cancel
+            .publish_turn(cancellation.clone(), busy.admission, turn_id);
+        let Ok(input) = crate::agent::TurnInput::inbox(items) else {
+            return;
+        };
+        let input = input.retaining(crate::conversation::PromptRetention::Withdraw);
+        let riding = if hooks.background_enabled() {
+            claim_undelivered_outcomes(&entry.agent, hooks.store(), session_id).await
+        } else {
+            Vec::new()
+        };
+        if !riding.is_empty() && !hooks.announce(&riding).await {
+            tracing::warn!(
+                "an inbox turn carries {outcomes} background outcome(s) a webhook rejected; \
+                 delivering them anyway, since they are claimed",
+                outcomes = riding.len()
+            );
+        }
+        let input = input.riding(riding);
+        let origin = TurnOrigin::Inbox {
+            item_ids: item_ids.clone(),
+        };
+        hooks.begin_turn(&entry, turn_id, origin.clone());
+        let outcome = entry
+            .agent
+            .run_turn(&mut conversation, input, cancellation)
+            .await;
+        entry.touch();
+        hooks.turn_closed(&entry, turn_id, &origin, &outcome).await;
+        let outcome = outcome.map(|_| ());
+        if hooks.shutting_down() {
+            return;
+        }
+        hooks.finished(&entry, None, &outcome).await;
+        match outcome {
+            Ok(()) => tracing::info!("inbox turn on session {session_id} completed"),
+            // Every item it opened on was withdrawn while it was starting; nothing failed.
+            Err(MekaError::EmptyPrompt) => {}
+            Err(MekaError::Interrupted) => {
+                // Withdrawn rather than re-run: the withdrawal put them back pending, and a
+                // driver that opened the same turn again would undo the cancel.
+                for item_id in item_ids {
+                    match inbox
+                        .withdraw(
+                            item_id,
+                            Some("the turn opened on it was canceled".to_string()),
+                        )
+                        .await
+                    {
+                        Ok(crate::store::inbox::Withdrawal::Withdrawn) => {
+                            hooks.inbox_withdrawn(&entry, item_id).await;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!("failed to withdraw inbox item {item_id}: {error}");
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                // Only what the withdrawal put back is pending; what a tool round kept is in the
+                // conversation and waits for a turn of any kind.
+                let delay = INBOX_RETRY_BASE
+                    .saturating_mul(1u32 << attempts.min(16))
+                    .min(INBOX_RETRY_LONGEST_WAIT);
+                tracing::warn!(
+                    "inbox turn on session {session_id} failed: {error}; trying again in \
+                     {delay:?}"
+                );
+                let not_before = chrono::Utc::now()
+                    + chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::zero());
+                if let Err(error) = inbox.defer_pending(&item_ids, not_before).await {
+                    tracing::warn!("failed to defer inbox items: {error}");
+                }
+                return;
+            }
+        }
+    }
 }
 
 /// Whether the turn that would carry these outcomes can start at all.

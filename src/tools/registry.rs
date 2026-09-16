@@ -199,6 +199,7 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "agent_followup",
     "agent_list",
     "agent_spawn",
+    "agent_steer",
     "context_check",
     "context_compact",
     "conversation_read",
@@ -2589,6 +2590,7 @@ mod tests {
             "mcp_resource_read",
             "mcp_resource_updates_list",
             "agent_followup",
+            "agent_steer",
         ] {
             assert!(
                 known.contains(name),

@@ -193,8 +193,14 @@ pub(crate) fn spawn_background_poller(state: ServerState) -> tokio::task::JoinHa
 /// `meka serve` around an out-of-band turn: a session another process holds is deferred, webhooks
 /// announce and may veto a delivery, the turn runs under shutdown's token, and the frontend's
 /// events are drained afterwards because no client is attached to read them.
-struct HttpHooks {
+pub(super) struct HttpHooks {
     state: ServerState,
+}
+
+impl HttpHooks {
+    pub(super) fn new(state: ServerState) -> Self {
+        Self { state }
+    }
 }
 
 /// The `status` a `schedule.fired` webhook carries for a turn that ran. A stop is neither of the
@@ -260,6 +266,101 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
 
     fn shutting_down(&self) -> bool {
         self.state.shutdown.is_cancelled()
+    }
+
+    /// Unattended: the turn runs for the session whether or not anybody reads the feed.
+    fn begin_turn(
+        &self,
+        entry: &Self::Entry,
+        turn_id: uuid::Uuid,
+        origin: crate::host::scheduler::TurnOrigin,
+    ) {
+        let source = match origin {
+            crate::host::scheduler::TurnOrigin::Schedule { job_id } => {
+                crate::host::http::http_frontend::TurnSource::Schedule { job_id }
+            }
+            crate::host::scheduler::TurnOrigin::Background => {
+                crate::host::http::http_frontend::TurnSource::Background
+            }
+            crate::host::scheduler::TurnOrigin::Inbox { item_ids } => {
+                crate::host::http::http_frontend::TurnSource::Inbox { item_ids }
+            }
+        };
+        let (_feed, _ids) = entry.frontend.begin_turn(
+            turn_id,
+            source,
+            false,
+            self.state.config.stream_reattach_grace,
+            self.state.config.stream_replay_events,
+        );
+    }
+
+    /// The same terminal a client's turn records, so a feed subscriber sees an out-of-band turn
+    /// end the way it sees every other. The `turn.finished` / `turn.failed` webhook goes out for
+    /// an inbox turn alone: a fire is announced by `schedule.fired`, and an outcome turn by the
+    /// `task.finished` that preceded it, so either would be a second delivery for one event.
+    async fn turn_closed(
+        &self,
+        entry: &Self::Entry,
+        turn_id: uuid::Uuid,
+        origin: &crate::host::scheduler::TurnOrigin,
+        outcome: &Result<crate::agent::TurnOutcome, crate::error::MekaError>,
+    ) {
+        use crate::host::http::handlers::turn::{
+            CancelReason, message_withdrawn, notify_turn_end, terminal_event_parts, usage_from,
+        };
+        // Drained here rather than in `finished`, which runs after and finds it empty: the usage
+        // and the withdrawal ride the terminal.
+        let recorder = entry.frontend.drain();
+        let cancel_reason = if self.state.shutdown.is_cancelled() {
+            CancelReason::ServerShutdown
+        } else {
+            CancelReason::Client
+        };
+        let (event_type, data) = terminal_event_parts(
+            Ok(outcome),
+            cancel_reason,
+            usage_from(&recorder),
+            turn_id,
+            entry.id,
+            self.state.config.relay_provider_errors,
+            message_withdrawn(&recorder),
+        );
+        entry.frontend.record_terminal(event_type, data);
+        entry.frontend.end_turn();
+        if matches!(origin, crate::host::scheduler::TurnOrigin::Inbox { .. }) {
+            notify_turn_end(&self.state.webhooks, event_type, turn_id, entry.id);
+        }
+    }
+
+    async fn inbox_withdrawn(&self, entry: &Self::Entry, item_id: uuid::Uuid) {
+        entry.frontend.push_sse(
+            crate::host::http::sse::SseEventType::InboxWithdrawn,
+            serde_json::json!({
+                "item_id": item_id.to_string(),
+                "session_id": entry.id.to_string(),
+            }),
+        );
+    }
+
+    async fn inbox_given_up(
+        &self,
+        entry: &Self::Entry,
+        item: &crate::store::inbox::InboxItem,
+        reason: &str,
+    ) {
+        let data = serde_json::json!({
+            "item_id": item.id.to_string(),
+            "session_id": entry.id.to_string(),
+            "reason": reason,
+        });
+        entry.frontend.push_sse(
+            crate::host::http::sse::SseEventType::InboxFailed,
+            data.clone(),
+        );
+        self.state
+            .webhooks
+            .send(crate::host::http::webhook::WebhookEvent::InboxFailed, data);
     }
 
     /// A notice rather than a user message, since this surface has no user-message event. It

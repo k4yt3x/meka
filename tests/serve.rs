@@ -2186,8 +2186,14 @@ fn streaming_tool_call_announces_composition_before_it_executes() {
         composing < executing,
         "composition must be announced before the dispatch; body was:\n{body}",
     );
-    assert!(
-        body[composing..executing].contains("{\"id\":\"tu_1\",\"name\":\"list_directory\"}"),
+    let data = body[composing..executing]
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .unwrap_or_else(|| panic!("tool_call.composing carries a JSON payload; body was:\n{body}"));
+    assert_eq!(
+        (data["id"].as_str(), data["name"].as_str()),
+        (Some("tu_1"), Some("list_directory")),
         "tool_call.composing carries the id to pair on and the name, and nothing else has \
          streamed yet; body was:\n{body}",
     );
@@ -7584,6 +7590,865 @@ fn sse_event_ids(body: &str) -> Vec<u64> {
         .collect()
 }
 
+/// Open the session feed with a client whose read timeout is `wait`. The feed never ends on its
+/// own, so the timeout is how a test that expects nothing more stops reading.
+fn open_feed(
+    harness: &ServeTestHarness,
+    id: &str,
+    last_event_id: Option<u64>,
+    wait: Duration,
+) -> reqwest::blocking::Response {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(wait)
+        .build()
+        .expect("client");
+    let mut request = client
+        .get(format!("{}/v1/sessions/{id}/stream", harness.base_url))
+        .header("Authorization", format!("Bearer {}", harness.token));
+    if let Some(last) = last_event_id {
+        request = request.header("Last-Event-ID", last.to_string());
+    }
+    request.send().expect("send")
+}
+
+/// Read a feed until `done` sees what the test is waiting for, or the client's read timeout
+/// ends the wait; what arrived by then is the body.
+fn read_feed_until(
+    mut response: reqwest::blocking::Response,
+    done: impl Fn(&str) -> bool,
+) -> String {
+    let mut text = String::new();
+    let mut chunk = [0u8; 4096];
+    while !done(&text) {
+        match std::io::Read::read(&mut response, &mut chunk) {
+            Ok(0) => break,
+            Ok(read) => text.push_str(&String::from_utf8_lossy(&chunk[..read])),
+            Err(_) => break,
+        }
+    }
+    text
+}
+
+/// Parse the `data:` payload of the first event of `name` in an SSE body.
+fn sse_event_data(body: &str, name: &str) -> Option<serde_json::Value> {
+    let mut lines = body.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() == format!("event: {name}") {
+            return lines
+                .next()
+                .and_then(|data| data.strip_prefix("data: "))
+                .and_then(|data| serde_json::from_str(data).ok());
+        }
+    }
+    None
+}
+
+/// Wait until the running turn's opening message, carrying `needle`, is in the transcript: the
+/// point past which an item posted to the inbox is mid-turn rather than riding the opening.
+/// `wait_until_in_flight` returns at admission, which is earlier.
+fn wait_until_prompt_saved(harness: &ServeTestHarness, id: &str, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let transcript: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+            .send()
+            .expect("transcript probe")
+            .json()
+            .expect("parse");
+        let saved = transcript["messages"].as_array().is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["role"] == "user"
+                    && message["content"].as_array().is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block["text"]
+                                .as_str()
+                                .is_some_and(|text| text.contains(needle))
+                        })
+                    })
+            })
+        });
+        if saved {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("the turn's prompt was not saved within 10s");
+}
+
+// --------------------------------------------------------------------------- The session inbox.
+// ---------------------------------------------------------------------------
+
+/// The asynchronous door: an item on an idle session starts a turn of its own, and the feed says
+/// who started it and when the model read the item.
+#[test]
+fn an_inbox_item_on_an_idle_session_starts_a_turn_and_the_feed_reports_its_delivery() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let id = start_streaming_session(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+
+    let accepted = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .json(&serde_json::json!({"message": "are you there?", "class": "steer"}))
+        .send()
+        .expect("send");
+    assert_eq!(accepted.status(), 202);
+    let accepted: serde_json::Value = accepted.json().expect("parse");
+    assert_eq!(accepted["state"], "pending");
+    assert_eq!(accepted["replayed"], false);
+    let item_id = accepted["item_id"].as_str().expect("item id").to_string();
+
+    let body = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+    let started = sse_event_data(&body, "turn.started").expect("turn.started on the feed");
+    assert_eq!(started["source"], "inbox", "{body}");
+    assert_eq!(started["item_ids"][0], item_id, "{body}");
+    let delivered = sse_event_data(&body, "inbox.delivered").expect("inbox.delivered on the feed");
+    assert_eq!(delivered["item_ids"][0], item_id, "{body}");
+    assert_eq!(
+        delivered["turn_id"], started["turn_id"],
+        "delivery names the turn that carried the item: {body}"
+    );
+    let names = sse_event_names(&body);
+    let delivered_at = names
+        .iter()
+        .position(|name| name == "inbox.delivered")
+        .expect("delivered");
+    let finished_at = names
+        .iter()
+        .position(|name| name == "turn.finished")
+        .expect("finished");
+    assert!(
+        delivered_at < finished_at,
+        "delivery is reported when the provider accepts the request, before the turn ends: \
+         {names:?}"
+    );
+
+    let open: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/inbox"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert!(
+        open["items"].as_array().is_some_and(Vec::is_empty),
+        "a delivered item is no longer open: {open}"
+    );
+    let session: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(session["inbox_pending"], 0, "{session}");
+    let transcript = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send")
+        .text()
+        .expect("body");
+    assert!(
+        transcript.contains("[Message from mekabridge-test, arrived")
+            || transcript.contains("[Message from client, arrived"),
+        "the item opened the turn under meka's header: {transcript}"
+    );
+}
+
+/// The whole point of a steer: a message that lands while the turn works is read at the next
+/// round boundary, after that round's tool results, inside the same turn.
+#[test]
+fn a_steer_posted_mid_turn_is_read_at_the_next_round_boundary() {
+    let script = serde_json::json!([
+        [
+            { "type": "sleep", "ms": 1500 },
+            { "type": "tool_use_start", "id": "tu_1", "name": "list_directory" },
+            { "type": "tool_use_end", "input": {"path": std::env::temp_dir().to_string_lossy()} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "done, and yes I saw your message" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = start_streaming_session(&harness);
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let session = id.clone();
+    let turn = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{base_url}/v1/sessions/{session}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"message": "list it", "stream": true}))
+            .send()
+            .expect("send")
+            .text()
+            .expect("body")
+    });
+    harness.wait_until_in_flight(&id);
+    wait_until_prompt_saved(&harness, &id, "list it");
+    let accepted: serde_json::Value = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .json(&serde_json::json!({"message": "also check the dates", "class": "steer"}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let item_id = accepted["item_id"].as_str().expect("item id").to_string();
+
+    let body = turn.join().expect("turn thread");
+    let names = sse_event_names(&body);
+    let delivered = names
+        .iter()
+        .position(|name| name == "inbox.delivered")
+        .unwrap_or_else(|| panic!("the steer is delivered inside the running turn: {body}"));
+    let completed = names
+        .iter()
+        .position(|name| name == "tool_call.completed")
+        .expect("the tool ran");
+    let finished = names
+        .iter()
+        .position(|name| name == "turn.finished")
+        .expect("finished");
+    assert!(
+        completed < delivered && delivered < finished,
+        "read after the round's results and before the turn ends: {names:?}"
+    );
+    assert_eq!(
+        sse_event_data(&body, "inbox.delivered").expect("delivered")["item_ids"][0],
+        item_id
+    );
+
+    let transcript: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let with_results = transcript["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| {
+            message["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_result"))
+        })
+        .expect("the tool round is in the transcript");
+    let blocks = with_results["content"].as_array().expect("blocks");
+    assert_eq!(
+        blocks[0]["type"], "tool_result",
+        "the results lead: {with_results}"
+    );
+    assert!(
+        blocks.iter().any(|block| {
+            block["type"] == "text"
+                && block["text"].as_str().is_some_and(|text| {
+                    text.contains("while you were working]\nalso check the dates")
+                })
+        }),
+        "the steer is persisted with the round, after the results: {with_results}"
+    );
+}
+
+/// An interrupt cuts the answer being streamed and the turn carries on: one `turn.started`, a
+/// `notice` for the cut, the item delivered, one terminal; and the transcript keeps what had
+/// streamed ahead of the message.
+#[test]
+fn an_interrupt_cuts_the_streaming_answer_and_the_turn_carries_on() {
+    let script = serde_json::json!([
+        [
+            { "type": "text", "text": "the first half" },
+            { "type": "sleep", "ms": 5000 },
+            { "type": "text", "text": " and the rest, never sent" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "carrying on with your message" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = start_streaming_session(&harness);
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let session = id.clone();
+    let started = Instant::now();
+    let turn = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{base_url}/v1/sessions/{session}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"message": "write it", "stream": true}))
+            .send()
+            .expect("send")
+            .text()
+            .expect("body")
+    });
+    harness.wait_until_in_flight(&id);
+    wait_until_prompt_saved(&harness, &id, "write it");
+    // Long enough for the first text to have streamed, short against the stall.
+    std::thread::sleep(Duration::from_millis(300));
+    let accepted: serde_json::Value = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .json(&serde_json::json!({"message": "stop, do this instead", "class": "interrupt"}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let item_id = accepted["item_id"].as_str().expect("item id").to_string();
+
+    let body = turn.join().expect("turn thread");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the stall was cut, not waited out: {:?}",
+        started.elapsed()
+    );
+    let names = sse_event_names(&body);
+    assert_eq!(
+        names.iter().filter(|name| *name == "turn.started").count(),
+        1,
+        "one turn: {names:?}"
+    );
+    assert_eq!(
+        names.iter().filter(|name| *name == "turn.finished").count(),
+        1,
+        "one terminal: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name == "turn.canceled"),
+        "{names:?}"
+    );
+    let notice = names
+        .iter()
+        .position(|name| name == "notice")
+        .unwrap_or_else(|| panic!("the cut is announced: {body}"));
+    let delivered = names
+        .iter()
+        .position(|name| name == "inbox.delivered")
+        .unwrap_or_else(|| panic!("the interrupt is delivered inside the turn: {body}"));
+    let finished = names
+        .iter()
+        .position(|name| name == "turn.finished")
+        .expect("finished");
+    assert!(
+        notice < delivered && delivered < finished,
+        "cut, then read, then the turn ends: {names:?}"
+    );
+    assert_eq!(
+        sse_event_data(&body, "notice").expect("notice")["text"],
+        "Interrupted the answer to read a message from 'client'."
+    );
+    assert_eq!(
+        sse_event_data(&body, "inbox.delivered").expect("delivered")["item_ids"][0],
+        item_id
+    );
+
+    let transcript: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let messages = transcript["messages"].as_array().expect("messages");
+    let text_of = |message: &serde_json::Value| -> String {
+        message["content"]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|block| block["type"] == "text")
+                    .filter_map(|block| block["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    };
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|message| message["role"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["user", "assistant", "user", "assistant"],
+        "prompt, what streamed, the message, the answer: {transcript}"
+    );
+    assert_eq!(text_of(&messages[1]), "the first half");
+    assert!(
+        text_of(&messages[2]).contains("while you were working]\nstop, do this instead"),
+        "{}",
+        messages[2]
+    );
+    assert_eq!(text_of(&messages[3]), "carrying on with your message");
+}
+
+/// Canceling the turn the inbox opened withdraws the items it opened on, the way a canceled
+/// client turn loses its prompt: the item is not re-run, and the feed says it was withdrawn.
+#[test]
+fn canceling_an_inbox_turn_withdraws_its_items_instead_of_rerunning_them() {
+    let script = serde_json::json!([
+        [
+            { "type": "sleep", "ms": 20000 },
+            { "type": "text", "text": "never sent" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "a second turn would say this" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("\n[schedule]\npoll_interval = \"1s\"\n", script);
+    let id = start_streaming_session(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let accepted: serde_json::Value = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .json(&serde_json::json!({"message": "do the thing", "class": "steer"}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let item_id = accepted["item_id"].as_str().expect("item id").to_string();
+    harness.wait_until_in_flight(&id);
+    let cancel = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/cancel"))
+        .send()
+        .expect("send");
+    assert_eq!(cancel.status(), reqwest::StatusCode::NO_CONTENT);
+    // Either the withdrawal, or the turn a driver that put the item back would open again once
+    // its retry wait had passed: one of the two always arrives, so the wait always ends.
+    let body = read_feed_until(feed, |text| {
+        text.contains("event: inbox.withdrawn") || text.matches("event: turn.started").count() >= 2
+    });
+    let names = sse_event_names(&body);
+    assert_eq!(
+        names.iter().filter(|name| *name == "turn.started").count(),
+        1,
+        "the canceled turn is not opened again: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "turn.canceled"),
+        "{names:?}"
+    );
+    assert_eq!(
+        sse_event_data(&body, "inbox.withdrawn").expect("withdrawn")["item_id"],
+        item_id
+    );
+    let open: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/inbox"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert!(
+        open["items"].as_array().expect("items").is_empty(),
+        "{open}"
+    );
+}
+
+/// A scheduled fire is announced by `schedule.fired` alone; the feed's terminal for it does not
+/// become a second delivery to an endpoint that asked for `turn.finished`.
+#[test]
+fn a_scheduled_fire_posts_no_turn_webhook() {
+    let (port, rx) = spawn_webhook_listener();
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "schedule_create" },
+            { "type": "tool_use_end", "input": {
+                "prompt": "DELIVERED_PROMPT_MARKER",
+                "at": "2s"
+            }},
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "scheduled it" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "SCHEDULED_REPLY_MARKER" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let config = format!(
+        "\n[schedule]\npoll_interval = \"1s\"\n\n[[serve.webhooks]]\nurl = \
+         \"http://127.0.0.1:{port}/hook\"\nsecret = \"s\"\nevents = [\"turn.finished\"]\n"
+    );
+    let harness = ServeTestHarness::spawn(&config, script);
+    let id = start_streaming_session(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "remind me in two seconds"}))
+        .send()
+        .expect("send");
+    let body = read_feed_until(feed, |text| {
+        text.contains("SCHEDULED_REPLY_MARKER") && text.matches("event: turn.finished").count() >= 2
+    });
+    assert!(
+        body.contains("\"source\":\"schedule\""),
+        "the fire ran: {body}"
+    );
+
+    let mut delivered = Vec::new();
+    while let Ok(delivery) = rx.recv_timeout(Duration::from_secs(2)) {
+        delivered.push(delivery.event);
+    }
+    assert_eq!(
+        delivered,
+        vec!["turn.finished".to_string()],
+        "the client's turn and nothing else"
+    );
+}
+
+/// A followup never interrupts: it waits for the running turn to end, then opens one of its own,
+/// which the feed announces as the inbox's.
+#[test]
+fn a_followup_waits_for_the_running_turn_and_then_opens_one_of_its_own() {
+    let script = serde_json::json!([
+        [
+            { "type": "sleep", "ms": 1500 },
+            { "type": "tool_use_start", "id": "tu_1", "name": "list_directory" },
+            { "type": "tool_use_end", "input": {"path": std::env::temp_dir().to_string_lossy()} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "first turn done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "the followup's turn" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = start_streaming_session(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let session = id.clone();
+    let turn = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{base_url}/v1/sessions/{session}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"message": "list it", "stream": true}))
+            .send()
+            .expect("send")
+            .text()
+            .expect("body")
+    });
+    harness.wait_until_in_flight(&id);
+    wait_until_prompt_saved(&harness, &id, "list it");
+    harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .json(
+            &serde_json::json!({"message": "when you are done, also do this", "class": "followup"}),
+        )
+        .send()
+        .expect("send");
+
+    let first = turn.join().expect("turn thread");
+    assert!(
+        !first.contains("event: inbox.delivered"),
+        "a followup is not read mid-turn: {first}"
+    );
+
+    // Two `turn.finished` on the feed: the client's turn, then the followup's own.
+    let body = read_feed_until(feed, |text| {
+        text.matches("event: turn.finished").count() >= 2
+    });
+    let sources: Vec<String> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .filter_map(|data| data["source"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(sources, vec!["client", "inbox"], "{body}");
+    let names = sse_event_names(&body);
+    let first_end = names
+        .iter()
+        .position(|name| name == "turn.finished")
+        .expect("first terminal");
+    let delivered = names
+        .iter()
+        .position(|name| name == "inbox.delivered")
+        .expect("delivered");
+    assert!(
+        first_end < delivered,
+        "the followup is delivered by the turn after the client's: {names:?}"
+    );
+}
+
+/// The feed carries the turns nobody asked for over HTTP. A scheduled fire opens with its source
+/// and ends with a terminal, like any other.
+#[test]
+fn a_scheduled_fire_appears_on_the_feed() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "schedule_create" },
+            { "type": "tool_use_end", "input": {
+                "prompt": "DELIVERED_PROMPT_MARKER",
+                "at": "2s"
+            }},
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "scheduled it" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "SCHEDULED_REPLY_MARKER" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("\n[schedule]\npoll_interval = \"1s\"\n", script);
+    let id = start_streaming_session(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "remind me in two seconds"}))
+        .send()
+        .expect("send");
+
+    // The fire's terminal follows its reply, so read past the marker to the second terminal.
+    let body = read_feed_until(feed, |text| {
+        text.contains("SCHEDULED_REPLY_MARKER") && text.matches("event: turn.finished").count() >= 2
+    });
+    let fired = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .find(|data| data["source"] == "schedule")
+        .unwrap_or_else(|| panic!("the fire opens on the feed with its source: {body}"));
+    assert!(fired["job_id"].is_string(), "{fired}");
+    assert!(
+        body.matches("event: turn.finished").count() >= 2,
+        "the client's turn and the fire's both end on the feed: {body}"
+    );
+}
+
+/// A cancel that names a turn stops only that turn, so a client that watched one cannot stop the
+/// fire or the inbox turn that replaced it.
+#[test]
+fn cancel_with_a_stale_turn_id_is_refused_and_the_live_one_is_honored() {
+    let script = serde_json::json!([
+        [
+            { "type": "sleep", "ms": 5000 },
+            { "type": "text", "text": "never reached" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = start_streaming_session(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let session = id.clone();
+    let turn = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{base_url}/v1/sessions/{session}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"message": "slow", "stream": true}))
+            .send()
+            .expect("send")
+            .text()
+            .expect("body")
+    });
+    harness.wait_until_in_flight(&id);
+    let opening = read_feed_until(feed, |text| text.contains("event: turn.started"));
+    let live = sse_event_data(&opening, "turn.started").expect("started")["turn_id"]
+        .as_str()
+        .expect("turn id")
+        .to_string();
+
+    let stale = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/cancel"))
+        .json(&serde_json::json!({"turn_id": uuid::Uuid::new_v4().to_string()}))
+        .send()
+        .expect("send");
+    assert_eq!(stale.status(), 409);
+    let problem: serde_json::Value = stale.json().expect("parse");
+    assert_eq!(problem["type"], "https://meka.so/errors/turn-mismatch");
+    assert_eq!(
+        problem["turn_id"], live,
+        "the refusal names the turn that is running"
+    );
+
+    let honored = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/cancel"))
+        .json(&serde_json::json!({"turn_id": live}))
+        .send()
+        .expect("send");
+    assert_eq!(honored.status(), 204);
+    let body = turn.join().expect("turn thread");
+    assert!(body.contains("event: turn.canceled"), "{body}");
+}
+
+/// The row is the idempotency record, so a client's retry finds its earlier item; and only an
+/// item still waiting can be taken back, since one in the conversation is already the model's.
+#[test]
+fn inbox_items_replay_on_their_key_and_withdraw_only_while_pending() {
+    let script = serde_json::json!([
+        [
+            { "type": "sleep", "ms": 3000 },
+            { "type": "text", "text": "slow reply" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "the item's turn" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = start_streaming_session(&harness);
+
+    // Enqueued twice under one key while a turn runs, so both stay pending long enough to be
+    // compared and one of them withdrawn.
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let session = id.clone();
+    let turn = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{base_url}/v1/sessions/{session}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"message": "slow"}))
+            .send()
+            .expect("send")
+            .text()
+            .expect("body")
+    });
+    harness.wait_until_in_flight(&id);
+    let submit = |key: &str, message: &str| -> serde_json::Value {
+        harness
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+            .header("Idempotency-Key", key)
+            .json(&serde_json::json!({"message": message, "class": "followup"}))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse")
+    };
+    let first = submit("k-1", "one");
+    let again = submit("k-1", "one");
+    assert_eq!(
+        again["item_id"], first["item_id"],
+        "the key finds the earlier row"
+    );
+    assert_eq!(again["replayed"], true);
+    assert_eq!(
+        again["class"], "followup",
+        "the row's class, not the retry's"
+    );
+    // The same key with other words is a client bug, refused as `POST /turn` refuses it.
+    let mismatch = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .header("Idempotency-Key", "k-1")
+        .json(&serde_json::json!({"message": "not one", "class": "followup"}))
+        .send()
+        .expect("send");
+    assert_eq!(mismatch.status(), reqwest::StatusCode::CONFLICT);
+    let problem: serde_json::Value = mismatch.json().expect("problem");
+    assert_eq!(
+        problem["type"], "https://meka.so/errors/idempotency",
+        "{problem}"
+    );
+    let other = submit("k-2", "two");
+    assert_ne!(other["item_id"], first["item_id"]);
+
+    let listed: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/inbox"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        listed["items"].as_array().map(Vec::len),
+        Some(2),
+        "{listed}"
+    );
+
+    let withdrawn = harness
+        .request(
+            reqwest::Method::DELETE,
+            &format!(
+                "/v1/sessions/{id}/inbox/{}",
+                other["item_id"].as_str().expect("id")
+            ),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(withdrawn.status(), 204);
+    let gone = harness
+        .request(
+            reqwest::Method::DELETE,
+            &format!(
+                "/v1/sessions/{id}/inbox/{}",
+                other["item_id"].as_str().expect("id")
+            ),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(gone.status(), 404, "withdrawn once is withdrawn");
+
+    // The first item rides the turn that follows the slow one; once it is appended, it is the
+    // model's and cannot be taken back.
+    turn.join().expect("turn thread");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut state = String::new();
+    while Instant::now() < deadline {
+        let item: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/inbox"))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        state = item["items"]
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item["state"].as_str())
+            .unwrap_or("delivered")
+            .to_string();
+        if state != "pending" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let late = harness
+        .request(
+            reqwest::Method::DELETE,
+            &format!(
+                "/v1/sessions/{id}/inbox/{}",
+                first["item_id"].as_str().expect("id")
+            ),
+        )
+        .send()
+        .expect("send");
+    assert!(
+        late.status() == 409 || late.status() == 404,
+        "appended answers 409 and delivered 404, never 204; state was {state}, got {}",
+        late.status()
+    );
+}
+
 fn start_streaming_session(harness: &ServeTestHarness) -> String {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
@@ -7617,21 +8482,18 @@ fn reattach_after_the_turn_ends_replays_the_tail_and_the_terminal() {
     let original = first.text().expect("body");
     assert!(original.contains("event: turn.finished"), "{}", original);
 
-    let rejoined = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
-        .send()
-        .expect("send");
+    let rejoined = open_feed(&harness, &id, None, Duration::from_secs(30));
     assert_eq!(rejoined.status(), 200);
-    let body = rejoined.text().expect("body");
+    let body = read_feed_until(rejoined, |text| text.contains("event: turn.finished"));
     let names = sse_event_names(&body);
     assert_eq!(
         names.first().map(String::as_str),
         Some("turn.started"),
-        "a rejoin announces which turn it attached to first: {body}"
+        "the ring replays the turn from its opening: {body}"
     );
     assert!(
-        body.contains("\"resumed\":true"),
-        "the re-issued turn.started must be marked as a resume, not a new turn: {body}"
+        !body.contains("\"resumed\":true"),
+        "no turn is in flight, so nothing is re-issued as a resume: {body}"
     );
     assert!(
         names.iter().any(|name| name == "assistant_text.delta"),
@@ -7675,13 +8537,10 @@ fn reattach_with_last_event_id_skips_what_was_already_delivered() {
     );
     let resume_from = original_ids[1];
 
-    let body = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
-        .header("Last-Event-ID", resume_from.to_string())
-        .send()
-        .expect("send")
-        .text()
-        .expect("body");
+    let body = read_feed_until(
+        open_feed(&harness, &id, Some(resume_from), Duration::from_secs(30)),
+        |text| text.contains("event: turn.finished"),
+    );
     let replayed = sse_event_ids(&body);
     assert!(
         replayed.iter().all(|value| *value > resume_from),
@@ -7709,15 +8568,19 @@ fn reattach_accepts_last_event_id_as_a_query_parameter() {
     let ids = sse_event_ids(&original);
     let resume_from = ids.first().copied().expect("at least one event");
 
-    let body = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{id}/stream?last_event_id={resume_from}"),
-        )
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("client");
+    let response = client
+        .get(format!(
+            "{}/v1/sessions/{id}/stream?last_event_id={resume_from}",
+            harness.base_url
+        ))
+        .header("Authorization", format!("Bearer {}", harness.token))
         .send()
-        .expect("send")
-        .text()
-        .expect("body");
+        .expect("send");
+    let body = read_feed_until(response, |text| text.contains("event: turn.finished"));
     assert!(
         sse_event_ids(&body).iter().all(|v| *v > resume_from),
         "the query parameter must behave exactly like the header: {body}"
@@ -7748,40 +8611,40 @@ fn reattach_warns_when_the_replay_buffer_cannot_reach_back_far_enough() {
         .text()
         .expect("body");
 
-    let body = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
-        .header("Last-Event-ID", "0")
-        .send()
-        .expect("send")
-        .text()
-        .expect("body");
+    let body = read_feed_until(
+        open_feed(&harness, &id, Some(0), Duration::from_secs(30)),
+        |text| text.contains("replay does not reach"),
+    );
     assert!(
         body.contains("event: notice") && body.contains("replay does not reach"),
         "a truncated replay must be announced, not silently delivered: {body}"
     );
 }
 
+/// The feed exists as long as the session does, so a bridge can subscribe before it has anything
+/// to submit and see the first turn from its opening, whoever starts it.
 #[test]
-fn reattach_on_a_session_that_never_streamed_is_404() {
+fn reattach_on_a_session_that_never_streamed_opens_the_feed() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = start_streaming_session(&harness);
-    let response = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
-        .send()
-        .expect("send");
-    assert_eq!(response.status(), 404);
-    let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(
-        body["type"], "https://meka.so/errors/not-found",
-        "the session exists; it is the stream that does not, and `type` is what a client \
-         switches on",
+    let response = open_feed(&harness, &id, None, Duration::from_secs(2));
+    assert_eq!(response.status(), 200);
+    assert!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream")),
+        "the feed is an event stream from the first byte"
+    );
+    let body = read_feed_until(response, |_| false);
+    assert!(
+        body.starts_with("retry:"),
+        "the feed opens with the reconnect hint and nothing else: {body}"
     );
     assert!(
-        body["detail"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("submit a turn"),
-        "the 404 must say how to get a stream, not just that there isn't one: {body}"
+        !body.contains("event:"),
+        "nothing has happened on this session, so nothing is replayed or re-issued: {body}"
     );
 }
 
@@ -7899,12 +8762,10 @@ fn reattach_mid_turn_follows_the_live_stream() {
     // Join mid-turn: once the turn is admitted the mock is inside its sleep, so the stream is
     // installed and still open.
     harness.wait_until_in_flight(&id);
-    let rejoined = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
-        .send()
-        .expect("send")
-        .text()
-        .expect("body");
+    let rejoined = read_feed_until(
+        open_feed(&harness, &id, None, Duration::from_secs(30)),
+        |text| text.contains("event: turn.finished"),
+    );
     let original_body = original.join().expect("original stream thread");
 
     assert!(
@@ -9086,13 +9947,11 @@ fn reattach_does_not_redeliver_a_terminal_the_client_already_has() {
         "the last id must be the terminal's: {original}"
     );
 
-    let body = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
-        .header("Last-Event-ID", last.to_string())
-        .send()
-        .expect("send")
-        .text()
-        .expect("body");
+    // Nothing is owed, so nothing arrives; the read ends on the client's own timeout.
+    let body = read_feed_until(
+        open_feed(&harness, &id, Some(last), Duration::from_secs(2)),
+        |_| false,
+    );
     assert!(
         sse_event_ids(&body).iter().all(|value| *value > last),
         "nothing at or before id {last} may be replayed: {body}"
@@ -9107,12 +9966,12 @@ fn reattach_does_not_redeliver_a_terminal_the_client_already_has() {
     );
 }
 
-/// Ids restart at 0 every turn, so a `Last-Event-ID` from an earlier turn names a position this
-/// one never reached. Filtering against it would discard the entire backlog *and* the terminal as
-/// "already delivered", closing the stream with nothing at all -- and a browser `EventSource`
-/// re-sends its stored id automatically, so that is the default path, not an edge case.
+/// Ids run across the whole session and the ring spans turns, so a `Last-Event-ID` from an earlier
+/// turn is an ordinary position: everything the session emitted after it replays, the next turn's
+/// terminal included, with no gap to report. A browser `EventSource` re-sends its stored id
+/// automatically, so this is the default path, not an edge case.
 #[test]
-fn reattach_with_a_stale_cross_turn_last_event_id_still_delivers() {
+fn a_last_event_id_from_an_earlier_turn_resumes_across_turns() {
     let harness = ServeTestHarness::spawn("", mock_turns(3));
     let id = start_streaming_session(&harness);
 
@@ -9135,20 +9994,21 @@ fn reattach_with_a_stale_cross_turn_last_event_id_still_delivers() {
         .text()
         .expect("body");
 
-    let body = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
-        .header("Last-Event-ID", stale.to_string())
-        .send()
-        .expect("send")
-        .text()
-        .expect("body");
-    assert!(
-        body.contains("event: turn.finished"),
-        "a stale id must not swallow the terminal: {body}"
+    let body = read_feed_until(
+        open_feed(&harness, &id, Some(stale), Duration::from_secs(30)),
+        |text| text.contains("event: turn.finished"),
     );
     assert!(
-        body.contains("event: notice") && body.contains("replay does not reach"),
-        "and the client must be told its position was unreachable: {body}"
+        body.contains("event: turn.finished"),
+        "an earlier turn's id must not swallow the next turn's terminal: {body}"
+    );
+    assert!(
+        sse_event_ids(&body).iter().all(|value| *value > stale),
+        "nothing at or before the client's position comes back: {body}"
+    );
+    assert!(
+        !body.contains("replay does not reach"),
+        "the ring still holds the position, so there is no gap to report: {body}"
     );
 }
 

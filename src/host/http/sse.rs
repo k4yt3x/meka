@@ -16,7 +16,7 @@ use crate::{
 
 /// One SSE event emitted on the wire. Monotonic `id` per turn, which is what makes
 /// `Last-Event-ID` resumption work: a re-attaching client names the last id it saw and the replay
-/// ring hands back everything after it. See [`crate::host::http::http_frontend::TurnStream`].
+/// ring hands back everything after it. See [`crate::host::http::http_frontend::SessionFeed`].
 #[derive(Debug, Clone)]
 pub(crate) struct SseEvent {
     pub(crate) id: u64,
@@ -46,6 +46,9 @@ pub(crate) enum SseEventType {
     TurnFinished,
     TurnFailed,
     TurnCanceled,
+    InboxDelivered,
+    InboxFailed,
+    InboxWithdrawn,
 }
 
 impl SseEventType {
@@ -75,6 +78,9 @@ impl SseEventType {
             Self::TurnFinished => "turn.finished",
             Self::TurnFailed => "turn.failed",
             Self::TurnCanceled => "turn.canceled",
+            Self::InboxDelivered => "inbox.delivered",
+            Self::InboxFailed => "inbox.failed",
+            Self::InboxWithdrawn => "inbox.withdrawn",
         }
     }
 }
@@ -152,6 +158,10 @@ pub(crate) fn translate(
             // client reads those.
             return None;
         }
+        FrontendEvent::InboxDelivered { item_ids } => (
+            SseEventType::InboxDelivered,
+            serde_json::json!({ "item_ids": item_ids }),
+        ),
         FrontendEvent::AssistantTextDelta(text) => (
             SseEventType::AssistantTextDelta,
             serde_json::json!({ "text": text }),

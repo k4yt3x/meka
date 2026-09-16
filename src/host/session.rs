@@ -316,8 +316,24 @@ pub(crate) struct Sessions<K, E>(Arc<tokio::sync::RwLock<std::collections::HashM
 /// nothing and says so.
 #[derive(Clone, Default)]
 pub(crate) struct CancelCell {
-    token: Arc<std::sync::RwLock<Option<tokio_util::sync::CancellationToken>>>,
+    /// The live turn's id and token, or `None` between turns.
+    token: Arc<std::sync::RwLock<Option<(uuid::Uuid, tokio_util::sync::CancellationToken)>>>,
     epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Woken when a turn ends, whoever ran it. The one place every turn on a session passes
+    /// through on its way out, which is what lets a host wait for "the session went idle" without
+    /// polling and without each door remembering to say so.
+    turn_ended: Option<Arc<tokio::sync::Notify>>,
+}
+
+/// What [`CancelCell::cancel_turn`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancelOutcome {
+    /// The named turn was live and its token fired.
+    Canceled,
+    /// No turn is live, which from outside is the same as one that ended a moment ago.
+    NoTurn,
+    /// A different turn is live. Not canceled: the caller was aiming at one that is gone.
+    Mismatch,
 }
 /// The epoch a turn saw when it was admitted; [`CancelCell::publish`] compares it.
 #[derive(Clone, Copy, Debug)]
@@ -525,7 +541,15 @@ where
 
     /// Remove and return every session idle for `timeout`. Candidates are chosen under the read
     /// lock and re-checked under the write lock, so a turn admitted in between keeps its session.
-    pub(crate) async fn sweep_idle(&self, timeout: std::time::Duration) -> Vec<(K, E)> {
+    ///
+    /// `held_open` is what a host knows that the entry does not: `serve` keeps a session whose
+    /// feed somebody is reading, since evicting it would close their stream under them for a
+    /// session they are plainly still using.
+    pub(crate) async fn sweep_idle(
+        &self,
+        timeout: std::time::Duration,
+        held_open: impl Fn(&E) -> bool,
+    ) -> Vec<(K, E)> {
         // The background count is the one asynchronous fact, read under the read lock and carried
         // into the write pass, which then re-checks only what can be read without awaiting. The
         // map's lock is write-preferring, so an await held under the write guard queued every
@@ -536,7 +560,7 @@ where
             for (key, entry) in sessions.iter() {
                 let background_running =
                     entry.cells().background_tasks.running_count(entry.id).await;
-                if entry.is_idle_given(timeout, background_running) {
+                if entry.is_idle_given(timeout, background_running) && !held_open(entry) {
                     candidates.push((key.clone(), background_running));
                 }
             }
@@ -550,7 +574,9 @@ where
         let mut sessions = self.0.write().await;
         for (key, background_running) in candidates {
             let still_idle = match sessions.get(&key) {
-                Some(entry) => entry.is_idle_given(timeout, background_running),
+                Some(entry) => {
+                    entry.is_idle_given(timeout, background_running) && !held_open(entry)
+                }
                 None => false,
             };
             if still_idle && let Some(entry) = sessions.remove(&key) {
@@ -563,10 +589,21 @@ where
 impl Drop for Published {
     fn drop(&mut self) {
         self.cell.store(None);
+        if let Some(turn_ended) = &self.cell.turn_ended {
+            turn_ended.notify_one();
+        }
     }
 }
 impl CancelCell {
-    fn store(&self, token: Option<tokio_util::sync::CancellationToken>) {
+    /// A cell that wakes `turn_ended` whenever a turn on the session ends.
+    pub(crate) fn notifying(turn_ended: Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            turn_ended: Some(turn_ended),
+            ..Self::default()
+        }
+    }
+
+    fn store(&self, token: Option<(uuid::Uuid, tokio_util::sync::CancellationToken)>) {
         *crate::sync::write(&self.token) = token;
     }
 
@@ -584,7 +621,18 @@ impl CancelCell {
         token: tokio_util::sync::CancellationToken,
         admission: Admission,
     ) -> Published {
-        self.store(Some(token.clone()));
+        self.publish_turn(token, admission, uuid::Uuid::new_v4())
+    }
+
+    /// [`Self::publish`] under the id the host gave the turn, so a cancel aimed at that id can be
+    /// told from one aimed at whatever runs next.
+    pub(crate) fn publish_turn(
+        &self,
+        token: tokio_util::sync::CancellationToken,
+        admission: Admission,
+        turn_id: uuid::Uuid,
+    ) -> Published {
+        self.store(Some((turn_id, token.clone())));
         if self.epoch.load(std::sync::atomic::Ordering::SeqCst) != admission.epoch {
             tracing::debug!(
                 "a cancel arrived while this turn was being admitted; honoring it before the turn runs"
@@ -607,9 +655,31 @@ impl CancelCell {
         }
     }
 
+    /// Cancel the live turn only if it is `turn_id`. The epoch moves only on a hit: a caller that
+    /// named a turn is not asking for whatever is admitted next.
+    pub(crate) fn cancel_turn(&self, turn_id: uuid::Uuid) -> CancelOutcome {
+        let live = crate::sync::read(&self.token).clone();
+        match live {
+            Some((id, token)) if id == turn_id => {
+                self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                token.cancel();
+                CancelOutcome::Canceled
+            }
+            Some(_) => CancelOutcome::Mismatch,
+            None => CancelOutcome::NoTurn,
+        }
+    }
+
     /// The live turn's token, or `None` between turns. A poisoned lock still answers: a panicking
     /// turn has to stay cancelable.
     pub(crate) fn live(&self) -> Option<tokio_util::sync::CancellationToken> {
-        crate::sync::read(&self.token).clone()
+        crate::sync::read(&self.token)
+            .as_ref()
+            .map(|(_, token)| token.clone())
+    }
+
+    /// The live turn's id, or `None` between turns.
+    pub(crate) fn live_turn_id(&self) -> Option<uuid::Uuid> {
+        crate::sync::read(&self.token).as_ref().map(|(id, _)| *id)
     }
 }

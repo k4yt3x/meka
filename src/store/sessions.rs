@@ -1229,12 +1229,61 @@ impl Store {
         session_id: Uuid,
         event: &crate::conversation::Event,
     ) -> Result<()> {
+        self.save_event_marking_inbox(session_id, event, &[]).await
+    }
+
+    /// [`Self::save_event`], stamping `inbox_items` as appended in the same transaction. The
+    /// message carries their text, so the two facts have to land together: a stamp without the
+    /// row would claim the model was shown words it never saw, and a row without the stamp would
+    /// show them twice.
+    pub(crate) async fn save_event_marking_inbox(
+        &self,
+        session_id: Uuid,
+        event: &crate::conversation::Event,
+        inbox_items: &[Uuid],
+    ) -> Result<()> {
         let (event, blobs) = super::blobs::externalize_images(event);
         let references = super::blobs::blob_references(&event);
         let (kind, content) = encode_event_for_db(&event)
             .map_err(|error| MekaError::Database(format!("failed to encode event: {error}")))?;
-        self.save_row(session_id, kind, content, blobs, references)
+        let appended = inbox_items.iter().map(Uuid::to_string).collect();
+        self.save_row(session_id, kind, content, blobs, references, appended)
             .await
+    }
+
+    /// Persist the withdrawal of a prompt and offer the inbox items it carried again, in one
+    /// transaction: the inverse of [`Self::save_event_marking_inbox`], for the same reason. A
+    /// withdrawal written without the reset would leave the items claiming a place in a log that
+    /// no longer holds them, and the next accepted request would report them read.
+    pub(crate) async fn save_event_resetting_inbox(
+        &self,
+        session_id: Uuid,
+        event: &crate::conversation::Event,
+        inbox_items: &[Uuid],
+        not_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let (kind, content) = encode_event_for_db(event)
+            .map_err(|error| MekaError::Database(format!("failed to encode event: {error}")))?;
+        let ids: Vec<String> = inbox_items.iter().map(Uuid::to_string).collect();
+        let not_before = not_before.to_rfc3339();
+        let now = chrono::Utc::now().to_rfc3339();
+        let session_id = session_id.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let transaction = connection.transaction()?;
+                transaction.execute(
+                    "INSERT INTO messages (session_id, kind, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![session_id, kind, content, &now],
+                )?;
+                super::inbox::reset_pending_in(&transaction, &ids, &not_before)?;
+                transaction.execute(
+                    "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![now, session_id],
+                )?;
+                transaction.commit()
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to save message: {error}")))
     }
 
     /// Persist a batch of events in one SQLite transaction. The agent loop uses this to save the
@@ -1250,9 +1299,22 @@ impl Store {
         session_id: Uuid,
         events: Vec<crate::conversation::Event>,
     ) -> Result<()> {
+        self.save_events_atomic_marking_inbox(session_id, events, &[])
+            .await
+    }
+
+    /// [`Self::save_events_atomic`], stamping `inbox_items` as appended in the same transaction;
+    /// see [`Self::save_event_marking_inbox`] for why the two writes are one.
+    pub(crate) async fn save_events_atomic_marking_inbox(
+        &self,
+        session_id: Uuid,
+        events: Vec<crate::conversation::Event>,
+        inbox_items: &[Uuid],
+    ) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
+        let appended: Vec<String> = inbox_items.iter().map(Uuid::to_string).collect();
         // Encode all events upfront so a serialization failure aborts before any DB I/O.
         let mut encoded: Vec<(String, String, Vec<String>)> = Vec::with_capacity(events.len());
         let mut blobs = Vec::new();
@@ -1281,6 +1343,7 @@ impl Store {
                         super::blobs::link_message_blobs(&transaction, message_id, references)?;
                     }
                 }
+                super::inbox::stamp_appended(&transaction, &appended, &now)?;
                 transaction.execute(
                     "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
                     rusqlite::params![now, session_id_str],
@@ -1643,6 +1706,7 @@ impl Store {
             content.to_string(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )
         .await
     }
@@ -1656,6 +1720,7 @@ impl Store {
         content: String,
         blobs: Vec<super::blobs::NewBlob>,
         references: Vec<String>,
+        appended_inbox_items: Vec<String>,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -1672,6 +1737,7 @@ impl Store {
                 )?;
                 let message_id = transaction.last_insert_rowid();
                 super::blobs::link_message_blobs(&transaction, message_id, &references)?;
+                super::inbox::stamp_appended(&transaction, &appended_inbox_items, &now)?;
                 transaction.execute(
                     "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
                     rusqlite::params![now, session_id.to_string()],
@@ -1781,27 +1847,36 @@ impl Store {
             })
     }
 
-    /// Persist a rewind and forget the occupancy the row recorded: the turns that number counted
-    /// are gone, and a resume that seeded from it would compact against a conversation that no
-    /// longer exists. The next measurement records a fresh one.
+    /// Persist a rewind, forget the occupancy the row recorded, and offer again every inbox item
+    /// whose text the rewind took, in one transaction. The occupancy counted turns that are gone,
+    /// and a resume that seeded from it would compact against a conversation that no longer
+    /// exists; the items are the appended, undelivered ones, whose text sat in the tail no
+    /// accepted request had carried yet, which is what a rewind removes.
     pub(crate) async fn save_rewind(
         &self,
         session_id: Uuid,
         event: &crate::conversation::Event,
     ) -> Result<()> {
-        self.save_event(session_id, event).await?;
+        let (kind, content) = encode_event_for_db(event)
+            .map_err(|error| MekaError::Database(format!("failed to encode event: {error}")))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let session_id = session_id.to_string();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
-                    "UPDATE sessions SET context_tokens = NULL WHERE id = ?1",
-                    rusqlite::params![session_id.to_string()],
+                let transaction = connection.transaction()?;
+                transaction.execute(
+                    "INSERT INTO messages (session_id, kind, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![session_id, kind, content, &now],
                 )?;
-                Ok(())
+                super::inbox::reset_appended_in(&transaction, &session_id)?;
+                transaction.execute(
+                    "UPDATE sessions SET context_tokens = NULL, updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![now, session_id],
+                )?;
+                transaction.commit()
             })
             .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to forget the context occupancy: {error}"))
-            })
+            .map_err(|error| MekaError::Database(format!("failed to save the rewind: {error}")))
     }
 
     /// The context occupancy last recorded for a session, or `None` for a row no turn has recorded

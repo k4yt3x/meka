@@ -37,12 +37,18 @@ pub(crate) enum WebhookEvent {
     TurnFailed,
     TaskFinished,
     ScheduleFired,
+    /// The model was shown an inbox item: a request carrying its text was accepted.
+    InboxDelivered,
+    /// An inbox item was given up on after the retry ceiling, and withdrawn.
+    InboxFailed,
 }
 
 impl WebhookEvent {
     /// Every event name, for config validation. Kept sorted so the error text listing them is
     /// stable.
     pub(crate) const ALL: &'static [&'static str] = &[
+        "inbox.delivered",
+        "inbox.failed",
         "schedule.fired",
         "task.finished",
         "turn.failed",
@@ -55,6 +61,8 @@ impl WebhookEvent {
             Self::TurnFailed => "turn.failed",
             Self::TaskFinished => "task.finished",
             Self::ScheduleFired => "schedule.fired",
+            Self::InboxDelivered => "inbox.delivered",
+            Self::InboxFailed => "inbox.failed",
         }
     }
 }

@@ -639,7 +639,8 @@ impl Frontend for AcpFrontend {
             // than left to a catch-all so a variant added later has to be placed here on purpose.
             FrontendEvent::SessionStarted { .. }
             | FrontendEvent::TurnFinished
-            | FrontendEvent::PromptWithdrawn => return,
+            | FrontendEvent::PromptWithdrawn
+            | FrontendEvent::InboxDelivered { .. } => return,
         };
 
         self.send_update(update);

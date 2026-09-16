@@ -152,7 +152,10 @@ impl Conversation {
             .flat_map(|message| &message.content)
             .find_map(|block| match block {
                 ContentBlock::Text { text } if !is_harness_stand_in(text) => {
-                    let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let words = strip_inbox_header(text)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     (!words.is_empty()).then_some(words)
                 }
                 _ => None,
@@ -657,6 +660,21 @@ pub(crate) const HARNESS_NOTE: &str = "[meka harness]";
 /// the one shape every provider renders, so a reader after what the user typed has to ask.
 pub(crate) fn is_harness_stand_in(text: &str) -> bool {
     text == IMAGE_REDACTION_PLACEHOLDER || text.starts_with(HARNESS_NOTE)
+}
+
+/// How the header meka writes above an inbox item's body begins:
+/// `[Message from <source>, arrived <time>]`, then a newline, then the body verbatim. Rendered by
+/// `prompt::render_inbox_item`; read back by [`strip_inbox_header`].
+pub(crate) const INBOX_HEADER_PREFIX: &str = "[Message from ";
+
+/// The body of an inbox item as rendered into the conversation, without the header meka wrote
+/// above it; any other text unchanged. What a title reads, so a session opened on an item is
+/// named by the message and not by the header.
+pub(crate) fn strip_inbox_header(text: &str) -> &str {
+    if !text.starts_with(INBOX_HEADER_PREFIX) {
+        return text;
+    }
+    text.split_once("]\n").map_or(text, |(_, body)| body)
 }
 
 /// Replace every image whose bytes disagree with its declared `media_type` with a text note,
@@ -1368,6 +1386,21 @@ mod tests {
     /// What meka put in place of an attachment is a `Text` block like the words, and is not a
     /// title: a first turn that carried only an image has none, whether the image was redacted by
     /// the budget or replaced by a harness note, until a user says something.
+    /// A session opened on an inbox item is named by the message, not by the header meka wrote
+    /// above it.
+    #[test]
+    fn a_title_skips_the_header_above_an_inbox_item() {
+        let mut log = Conversation::new();
+        log.append(Message::user(format!(
+            "{INBOX_HEADER_PREFIX}telegram, arrived 2026-09-16 05:41 +00:00]\nWhat is 5+5?"
+        )));
+        assert_eq!(log.title(), "What is 5+5?");
+        assert_eq!(
+            strip_inbox_header("[Message from nobody"),
+            "[Message from nobody"
+        );
+    }
+
     #[test]
     fn a_title_skips_what_meka_put_in_place_of_an_attachment() {
         let image = ImageSource::Base64 {

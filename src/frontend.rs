@@ -349,6 +349,10 @@ pub(crate) enum FrontendEvent {
     /// ahead of the host's terminal event, so a client that resends can be told whether the
     /// conversation still holds the copy it sent.
     PromptWithdrawn,
+    /// Inbox items the model has now been shown: the provider accepted a request carrying their
+    /// text. Emitted at that request rather than when the text was appended, so whoever enqueued
+    /// an item learns when it was read and not merely written down.
+    InboxDelivered { item_ids: Vec<Uuid> },
     /// A streamed chunk of assistant text. Multiple deltas concatenate into one logical text run;
     /// any non-text event closes the run.
     AssistantTextDelta(String),

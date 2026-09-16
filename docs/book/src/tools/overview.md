@@ -15,9 +15,10 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`execute_command`](./shell.md#execute_command) | Read | Run a shell command (see the note below) |
 | [`todo`](./overview.md#todo) | Read | Manage and read a structured task list |
 | [`agent_spawn`](./overview.md#agent_spawn) | Read | Delegate tasks to a sub-agent |
-| [`agent_list`](./overview.md#agent_list--agent_followup--agent_delete) | Read | List the sub-agents this session spawned |
-| [`agent_followup`](./overview.md#agent_list--agent_followup--agent_delete) | Read | Ask a sub-agent another question |
-| [`agent_delete`](./overview.md#agent_list--agent_followup--agent_delete) | Read | Discard a sub-agent and its records |
+| [`agent_list`](./overview.md#agent_list--agent_followup--agent_steer--agent_delete) | Read | List the sub-agents this session spawned |
+| [`agent_followup`](./overview.md#agent_list--agent_followup--agent_steer--agent_delete) | Read | Ask a sub-agent another question |
+| [`agent_steer`](./overview.md#agent_list--agent_followup--agent_steer--agent_delete) | Read | Send a sub-agent a message without waiting for it |
+| [`agent_delete`](./overview.md#agent_list--agent_followup--agent_steer--agent_delete) | Read | Discard a sub-agent and its records |
 | [`scratchpad_write`](./scratchpad.md#scratchpad_write) | Read | Store content in the scratchpad |
 | [`scratchpad_read`](./scratchpad.md#scratchpad_read) | Read | Read a scratchpad entry |
 | [`scratchpad_edit`](./scratchpad.md#scratchpad_edit) | Read | Edit a scratchpad entry |
@@ -56,7 +57,7 @@ Tools are grouped by the minimum permission level required:
 **Read permission** (available at `read` and above):
 - `read_file`, `find_files`, `search_contents`, `fetch_url`
 - `execute_command` (sandboxed, filesystem write-protected)
-- `todo`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_delete`, `render_image`
+- `todo`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_steer`, `agent_delete`, `render_image`
 - All skill tools, including `skill_write` and `skill_delete` when they are enabled: like memory,
   skills live in meka's own config directory, not your working tree
 - `conversation_search`, `conversation_read`, `context_check`, `context_compact`
@@ -194,17 +195,18 @@ Neither can be granted beyond what you hold yourself, so authority only narrows 
 
 **Follow-up.** `agent_spawn` returns the sub-agent's id on the first line of its result, above the report. Keep it if you might have a second question: with it you can call `agent_followup` instead of re-spawning one that would have to rediscover everything.
 
-## `agent_list` / `agent_followup` / `agent_delete`
+## `agent_list` / `agent_followup` / `agent_steer` / `agent_delete`
 
 A sub-agent is not a one-shot. Its conversation persists under its own session, so you can go back to it.
 
 - **`agent_list`**: the sub-agents this session spawned, one per line as `<id>\t<cwd>\tturns=<n>\tlast_active=<timestamp>`. Direct children only: a sub-agent's own sub-agents belong to it and appear in *its* list.
-- **`agent_followup({id, prompt, scratchpad?})`**: asks a sub-agent another question. It still has its own conversation, so it can build on what it already found rather than starting from your summary of it. Returns its new report.
+- **`agent_followup({id, prompt, scratchpad?})`**: asks a sub-agent another question. It still has its own conversation, so it can build on what it already found rather than starting from your summary of it. Returns its new report. A sub-agent that is still running, because it was spawned or followed up with `background: true`, refuses a follow-up and says so: reach it with `agent_steer`, or follow up once it has finished.
+- **`agent_steer({id, message, interrupt?})`**: puts a message in the sub-agent's inbox and returns at once, with no answer. A sub-agent that is running reads it at its next round boundary, after that round's tool results; one that has finished reads it at the start of the next `agent_followup`, after the follow-up's own words. Either way it arrives under a header naming the parent as the sender and when it was sent. For a correction or a change of course while the work is under way; use `agent_followup` when you want a reply. With `interrupt: true` the sub-agent does not finish its current step first: the answer it is writing is cut and kept as far as it got, and the message is the next thing it reads, inside the same turn; a tool it is running still finishes, and the message follows that tool's result. The cost is the request sent again, so set it when the answer under way is being wasted, not merely when you have something to add. A profile that does not stream has no partial answer to keep: the reply being generated is dropped whole and the request goes again with the message.
 - **`agent_delete({id})`**: discards a sub-agent: its conversation, its scratchpad entries, and any sub-agents it spawned in turn. Nothing it wrote to disk is touched. Worth doing once you have what you needed, so a long session isn't carrying every sub-agent it ever ran.
 
-All three refuse an id that isn't a child of the current session, so one session can never drive or delete another's sub-agents.
+All four refuse an id that isn't a child of the current session, so one session can never drive, steer or delete another's sub-agents.
 
-**All four go together.** Denying `agent_spawn` in [`[tools].disabled_tools`](../configuration/config-file.md#tools-built-in-tool-filters), or setting [`session.subagent_max_depth = 0`](../configuration/config-file.md#sessionsubagent_max_depth), removes the three lifecycle tools too: an agent that cannot delegate has no sub-agents for them to act on, and leaving them behind would let it drive the ones a previous run left in the store. `meka tool list` reports all four as `disabled` in either case. Denying only `agent_list` removes just that one.
+**All five go together.** Denying `agent_spawn` in [`[tools].disabled_tools`](../configuration/config-file.md#tools-built-in-tool-filters), or setting [`session.subagent_max_depth = 0`](../configuration/config-file.md#sessionsubagent_max_depth), removes the four lifecycle tools too: an agent that cannot delegate has no sub-agents for them to act on, and leaving them behind would let it drive the ones a previous run left in the store. `meka tool list` reports all five as `disabled` in either case. Denying only `agent_list` removes just that one.
 
 **A follow-up runs under the terms of the spawn, not your current ones.** The permission level, the deny lists, the memory level and the inherited scratchpad names are recorded when the sub-agent is created and replayed on every follow-up. If you spawned a sub-agent at `read` and have since switched to `unrestricted`, following up on it still runs it at `read`. That is deliberate: otherwise a second question would be a way to escalate a sub-agent you deliberately restricted. A sub-agent that shares your workspace keeps the working directory it was spawned in; at `workspace`, a follow-up is refused once that directory lies outside your own boundary, the same check a sub-agent's `writable_roots` get.
 

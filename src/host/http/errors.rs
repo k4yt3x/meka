@@ -181,6 +181,13 @@ pub(crate) enum ErrorKind {
     SseLag,
     RequestNotFound,
     Idempotency,
+    /// The inbox item's text is already in the conversation, so only a turn can answer it now and
+    /// there is nothing to take back.
+    InboxAppended,
+    /// The cancel named a turn that is not the one in flight. Distinct from a 204 for "no turn",
+    /// because the caller was aiming at something specific and it is gone; whatever runs now is
+    /// somebody else's.
+    TurnMismatch,
     /// The named skill lives under a read-only root from `[skills] extra_paths`, so writing it
     /// here would create a shadowing copy in meka's own store rather than change the file.
     ///
@@ -288,6 +295,8 @@ impl ErrorKind {
             Self::SseLag => "https://meka.so/errors/sse-lag",
             Self::RequestNotFound => "https://meka.so/errors/request-not-found",
             Self::Idempotency => "https://meka.so/errors/idempotency",
+            Self::InboxAppended => "https://meka.so/errors/inbox-appended",
+            Self::TurnMismatch => "https://meka.so/errors/turn-mismatch",
             Self::StoreReadOnly => "https://meka.so/errors/store-read-only",
             Self::SessionNotDrivable => "https://meka.so/errors/session-not-drivable",
             Self::InvalidBody => "https://meka.so/errors/invalid-body",
@@ -317,6 +326,8 @@ impl ErrorKind {
             Self::SseLag => "SSE consumer lagged",
             Self::RequestNotFound => "Pending request not found",
             Self::Idempotency => "Idempotency-Key conflict",
+            Self::InboxAppended => "Inbox item already appended",
+            Self::TurnMismatch => "Turn is not the one in flight",
             Self::StoreReadOnly => "Skill is in a read-only root",
             Self::SessionNotDrivable => "Session is a sub-agent's conversation",
             Self::InvalidBody => "Invalid request body",

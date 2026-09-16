@@ -261,7 +261,41 @@ const MIGRATIONS: &[Migration] = &[
         name: NAMES_FOLLOW_THE_VOCABULARY,
         step: Step::Rust(names_follow_the_vocabulary),
     },
+    // A session has an inbox: messages from outside its turn, read by the running turn at a round
+    // boundary or carried by the next one.
+    Migration {
+        name: "sessions_have_an_inbox",
+        step: Step::Sql(INBOX_ITEMS),
+    },
 ];
+
+/// The inbox table. `appended_at` is written by the transaction that writes the conversation row
+/// the item rode; the partial unique index is what makes a client's retry find its earlier row.
+const INBOX_ITEMS: &str = "
+    CREATE TABLE IF NOT EXISTS inbox_items (
+        id              TEXT PRIMARY KEY,
+        session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        class           TEXT NOT NULL,
+        source          TEXT NOT NULL,
+        body            TEXT NOT NULL,
+        token_id        TEXT,
+        idempotency_key TEXT,
+        created_at      TEXT NOT NULL,
+        not_before      TEXT,
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        appended_at     TEXT,
+        delivered_at    TEXT,
+        withdrawn_at    TEXT,
+        failure         TEXT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_items_session_token_idempotency_key
+        ON inbox_items(session_id, token_id, idempotency_key)
+        WHERE idempotency_key IS NOT NULL;
+
+    CREATE INDEX IF NOT EXISTS idx_inbox_items_session_delivered_at
+        ON inbox_items(session_id, delivered_at);
+";
 
 /// The step after which a store has no `provider_credentials` object, named once because
 /// [`classify_by_shape`] classifies such a store at the version this entry leaves it.
@@ -494,6 +528,7 @@ const HEAD_TABLES: &[&str] = &[
     "account_credentials",
     "background_tasks",
     "blobs",
+    "inbox_items",
     "mcp_credentials",
     "memories",
     "message_blobs",
@@ -506,7 +541,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 13_283_620_546_103_602_683;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 4_960_450_522_591_915_780;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -2651,6 +2686,7 @@ mod tests {
                 878754235509908731_u64,
             ),
             ("names_follow_the_vocabulary", 13015232274362220399_u64),
+            ("sessions_have_an_inbox", 5664388226393763354_u64),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
         /// every column-zero function it calls, recursively. What a Rust step does is its body and
@@ -4804,13 +4840,15 @@ mod tests {
             .expect("lose the version");
 
         let replayed = plan(&connection).expect("classified by shape");
+        // Past the rename step, not past the ledger: the steps appended after it replay, which
+        // rule 3 makes safe, and is what a store that lost its version has to pay.
         assert_eq!(
             replayed.from,
-            MIGRATIONS.len() as u32,
+            version_after(NAMES_FOLLOW_THE_VOCABULARY).expect("the rename step is in the ledger"),
             "no `provider_credentials` object means the rename step has run"
         );
         apply(&mut connection, replayed, &Context::adopting(None))
-            .expect("nothing replays, so nothing queries the view");
+            .expect("the inbox step replays without touching the view");
         assert_eq!(before, fingerprint(&connection));
         assert_eq!(
             user_version(&connection).expect("version"),

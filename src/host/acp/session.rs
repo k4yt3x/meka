@@ -248,7 +248,11 @@ pub(super) fn spawn_idle_session_sweep(state: Arc<ServerState>) -> tokio::task::
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            for (id, entry) in state.sessions.sweep_idle(ACP_SESSION_IDLE_TIMEOUT).await {
+            for (id, entry) in state
+                .sessions
+                .sweep_idle(ACP_SESSION_IDLE_TIMEOUT, |_| false)
+                .await
+            {
                 // Same teardown `session/close` does, and for the same reason: without it the
                 // manager keeps fanning `tools/list_changed` out to a registry nobody reads.
                 entry.release(state.shared.mcp_manager.as_ref()).await;

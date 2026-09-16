@@ -91,6 +91,10 @@ somebody's deliberate act, and that somebody already knows, so it waits and is r
 whichever turn the session takes next (yours, or a scheduled job's), as part of that message
 rather than as one of its own. Canceling several tasks costs no turns at all.
 
+Under `meka serve` the turn that delivers an outcome is on the session's
+[event feed](./http-api.md#the-session-feed), opening with a `turn.started` whose `source` is
+`background`, so a client watching the session sees the report arrive and the agent act on it.
+
 Webhooks do not wait on any of that. Under `meka serve`, `task.finished` fires as soon as a task
 reaches a terminal state, rather than when a turn gets around to reporting it, so a canceled task
 is announced immediately, and one left running by a host that died is announced when the session is

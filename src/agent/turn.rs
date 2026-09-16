@@ -35,6 +35,10 @@ pub(crate) struct TurnInput {
     retention: PromptRetention,
     /// Finished background work folded in ahead of the prompt, already claimed.
     riding: Vec<crate::store::background::BackgroundTask>,
+    /// Inbox items carried after the words. Empty from every host door, and the turn then reads
+    /// what is waiting for itself once it knows its session, so no door can forget; a driver
+    /// that opens a turn on items it already read hands them over here instead.
+    inbox: Vec<crate::store::inbox::InboxItem>,
 }
 
 enum Prompt {
@@ -58,6 +62,22 @@ impl TurnInput {
             images,
             retention: PromptRetention::Keep,
             riding: Vec::new(),
+            inbox: Vec::new(),
+        })
+    }
+
+    /// A turn opened on inbox items alone, by a driver that found the session idle with them
+    /// waiting. Refused empty for the reason [`Self::from_parts`] refuses blank words.
+    pub(crate) fn inbox(items: Vec<crate::store::inbox::InboxItem>) -> crate::error::Result<Self> {
+        if items.is_empty() {
+            return Err(MekaError::EmptyPrompt);
+        }
+        Ok(Self {
+            prompt: Prompt::Typed(String::new()),
+            images: Vec::new(),
+            retention: PromptRetention::Keep,
+            riding: Vec::new(),
+            inbox: items,
         })
     }
 
@@ -79,6 +99,7 @@ impl TurnInput {
             images: Vec::new(),
             retention: PromptRetention::Keep,
             riding: Vec::new(),
+            inbox: Vec::new(),
         }
     }
 
@@ -125,6 +146,65 @@ impl TurnInput {
 /// context-window overflow before giving up. One pass shrinks the request dramatically; if it still
 /// overflows, looping won't help.
 pub(super) const MAX_OVERFLOW_RETRIES: u32 = 1;
+/// How often a provider call in flight asks the inbox whether an interrupt is waiting. A second is
+/// below what a person notices of a chat reply and costs one indexed count per streaming session.
+pub(super) const INTERRUPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A spawned task that is aborted when the handle is dropped, so it cannot outlive the scope
+/// that needed it.
+pub(super) struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Watch the inbox while a provider call is in flight, and cancel `round` the moment an
+/// `interrupt` item is waiting, so the call returns the way a stop makes it return and the loop
+/// can put the message in. Ends with the round: dropped once the call has returned.
+///
+/// `carried` is what the turn already holds, an item whose stamp waits on a prompt save that
+/// failed: still pending in the store, and not news.
+///
+/// Polled rather than signaled, because the store is the one place every producer writes, a
+/// parent's `agent_steer` on a running worker included: no registry of live turns is needed to
+/// reach one, and an item is durable before anyone could be told of it. A read that fails ends the
+/// watch for this round rather than warning once a second; the next round starts a fresh one.
+pub(super) fn watch_for_interrupts(
+    inbox: crate::store::inbox::InboxStore,
+    session_id: uuid::Uuid,
+    carried: Vec<uuid::Uuid>,
+    round: CancellationToken,
+) -> AbortOnDrop {
+    AbortOnDrop(tokio::spawn(async move {
+        loop {
+            match inbox
+                .has_pending(
+                    session_id,
+                    crate::store::inbox::InboxClass::Interrupt,
+                    chrono::Utc::now(),
+                    &carried,
+                )
+                .await
+            {
+                Ok(true) => {
+                    round.cancel();
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!("failed to read the inbox for an interrupt: {error}");
+                    return;
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(INTERRUPT_POLL_INTERVAL) => {}
+                _ = round.cancelled() => return,
+            }
+        }
+    }))
+}
 pub(super) fn has_tool_results(content: &[ContentBlock]) -> bool {
     content
         .iter()
@@ -318,6 +398,9 @@ pub(super) struct StreamProgress {
     /// What had streamed when the attempt failed, if any of it was text. The user watched it
     /// arrive, so it is theirs to keep whatever the stream did afterwards.
     pub(crate) partial: Option<Message>,
+    /// The stream was stopped after the provider had answered, so the message returned is what
+    /// had arrived by then and not the whole reply. Which token stopped it is the caller's to ask.
+    pub(crate) cut: bool,
 }
 
 impl Agent {
@@ -423,7 +506,7 @@ impl Agent {
         let words = input.words();
         let request_in_flight = words.clone();
         let outcomes = input.delivered_outcomes();
-        let TurnInput { images, .. } = input;
+        let TurnInput { images, inbox, .. } = input;
         // Gate on MCP readiness BEFORE touching session state / message history so a rejected turn
         // leaves no trace in the conversation.
         self.await_mcp_ready().await?;
@@ -624,10 +707,47 @@ impl Agent {
                 resumed,
             })
         };
+        // What arrived for the session since its last turn rides this one's opening, whoever
+        // started it: read here, where every turn passes, rather than at each host's door, and
+        // read as late as possible, right ahead of the save that stamps it, so a withdrawal has
+        // until then to take an item back. A driver that opened this turn on items hands them in
+        // as the fallback for a read that fails; they are still pending, so the read finds them
+        // itself, minus any withdrawn since.
+        let inbox = match self
+            .store
+            .inbox_store()
+            .take_pending(session_id, &[], chrono::Utc::now())
+            .await
+        {
+            Ok(items) => items,
+            Err(error) => {
+                tracing::warn!("failed to read the inbox at the turn's opening: {error}");
+                inbox
+            }
+        };
+        if words.is_empty() && images.is_empty() && inbox.is_empty() && outcomes.is_none() {
+            // Everything this turn was opened on was withdrawn while it was starting. Nothing
+            // to say, and a message that says nothing is not sent; the world-state snapshot
+            // rendered for it goes back to what the model has actually seen, as a withdrawn
+            // prompt's does.
+            *self.last_rendered_world.write().await = world_state_rollback;
+            if resumed {
+                messages.restore_resumed_notice();
+            }
+            return Err(MekaError::EmptyPrompt);
+        }
         // Build the user message once (context block, the words, any input images) and reuse it
         // for both the in-memory append and every persist path below, so attached images survive
         // resume.
-        let user_message = Message::user_turn(context_block, words, images);
+        let mut user_message = Message::user_turn(context_block, words, images);
+        // After the words, one block each: an item is somebody else's message, and joined to the
+        // words it would read as part of them.
+        user_message
+            .content
+            .extend(inbox.iter().map(|item| ContentBlock::Text {
+                text: prompt::render_inbox_item(item, false),
+            }));
+        let inbox_ids: Vec<Uuid> = inbox.iter().map(|item| item.id).collect();
         // Captured around the append rather than in the `TurnRecovery` literal below, which is
         // built after a proactive compaction may have moved the conversation under both. See their
         // field documentation for what each one is measured against. The compaction, if it runs,
@@ -639,7 +759,11 @@ impl Agent {
         // provider round trip would lose it from disk. On a transient database failure the lazy
         // save path below retries; `user_eagerly_saved` suppresses double-writes on the happy path.
         let user_event = crate::conversation::Event::Append(user_message.clone());
-        let mut user_eagerly_saved = match self.store.save_event(session_id, &user_event).await {
+        let mut user_eagerly_saved = match self
+            .store
+            .save_event_marking_inbox(session_id, &user_event, &inbox_ids)
+            .await
+        {
             Ok(()) => true,
             Err(error) => {
                 tracing::warn!(
@@ -695,6 +819,19 @@ impl Agent {
                     // the 2xx would put a second copy after the boundary.
                     Ok(_) => {
                         suspect_floor = SUSPECT_FLOOR_AFTER_REWRITE;
+                        // The rewrite carried the prompt to disk where the eager save could not,
+                        // and with it the items it holds; see `stamp_appended_after_rewrite`.
+                        if !user_eagerly_saved
+                            && let Err(error) = self
+                                .store
+                                .inbox_store()
+                                .stamp_appended_after_rewrite(&inbox_ids)
+                                .await
+                        {
+                            tracing::warn!(
+                                "failed to stamp the inbox items a rewrite persisted: {error}"
+                            );
+                        }
                         user_eagerly_saved = true;
                     }
                     Err(error) => tracing::warn!("proactive compaction failed: {error}"),
@@ -713,6 +850,7 @@ impl Agent {
             tiers_tried: 0,
             pending_repair: None,
             user_saved: user_eagerly_saved,
+            inbox_ids,
             thinking_only_nudged: false,
             outage_reprieve_used: false,
         };
@@ -800,6 +938,16 @@ impl Agent {
                 // we forward them to the frontend here so the user sees the same advisories the
                 // streaming path emits inline via `StreamEvent::Notice`.
                 let mut progress = StreamProgress::default();
+                // The round's own token, a child of the turn's: an inbox interrupt fires it, so
+                // the call returns the way a stop makes it return, and `cancellation` still says
+                // which of the two happened.
+                let round = cancellation.child_token();
+                let watcher = watch_for_interrupts(
+                    self.store.inbox_store(),
+                    session_id,
+                    recovery.inbox_ids.clone(),
+                    round.clone(),
+                );
                 let call_result: Result<(Message, StopReason, crate::stats::TokenUsage)> = if self
                     .options
                     .streaming
@@ -809,7 +957,7 @@ impl Agent {
                         Arc::from(api_messages),
                         tools,
                         attribution.clone(),
-                        cancellation.clone(),
+                        round.clone(),
                         &mut progress,
                     )
                     .await
@@ -825,7 +973,7 @@ impl Agent {
                             .complete(
                                 CompletionRequest::new(&system_prompt, api_messages, &tools)
                                     .attributed(attribution.clone()),
-                                cancellation.clone(),
+                                round.clone(),
                             )
                             .await
                         {
@@ -856,7 +1004,7 @@ impl Agent {
                                         );
                                         tokio::select! {
                                             _ = tokio::time::sleep(delay) => {}
-                                            _ = cancellation.cancelled() => break Err(MekaError::Interrupted),
+                                            _ = round.cancelled() => break Err(MekaError::Interrupted),
                                         }
                                     }
                                     None => break Err(error),
@@ -865,6 +1013,8 @@ impl Agent {
                         }
                     }
                 };
+                // Before the tools run, or the poll would go on for the length of the round.
+                drop(watcher);
 
                 let (mut assistant_message, stop_reason, usage) = match call_result {
                     Ok(value) => value,
@@ -875,6 +1025,28 @@ impl Agent {
                     {
                         if let Err(error) = recovery
                             .recover_from_context_overflow(self, messages, &cancellation, message)
+                            .await
+                        {
+                            break 'turn Err(error);
+                        }
+                        continue;
+                    }
+                    Err(MekaError::Interrupted)
+                        if round.is_cancelled() && !cancellation.is_cancelled() =>
+                    {
+                        // An inbox interrupt dropped the request before the provider answered, so
+                        // nothing was judged and nothing streamed: the message joins the prompt
+                        // and the request goes again with it. A repair riding the request is put
+                        // back without its tier being counted, since the provider never saw it.
+                        recovery.unjudge_repair(messages);
+                        if let Err(error) = self
+                            .absorb_interrupt(
+                                session_id,
+                                messages,
+                                &mut recovery,
+                                &user_message,
+                                None,
+                            )
                             .await
                         {
                             break 'turn Err(error);
@@ -979,6 +1151,25 @@ impl Agent {
 
                 recovery.persist_vindicated_repair(self, session_id).await;
 
+                // And the model has read whatever inbox items the body carried, which is the fact
+                // their producers are waiting on. One turn runs per session, so every appended,
+                // undelivered item of this session was in this body. After the prompt's save,
+                // which is what stamps the opening's items when the eager save had failed; asked
+                // before it, they would not be appended yet and would be reported read by some
+                // later request.
+                match self.store.inbox_store().mark_delivered(session_id).await {
+                    Ok(item_ids) if !item_ids.is_empty() => {
+                        self.cells
+                            .frontend
+                            .emit(FrontendEvent::InboxDelivered { item_ids })
+                            .await;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!("failed to mark inbox items delivered: {error}");
+                    }
+                }
+
                 // What the request budget took out of the body, recorded once, so the body that fit
                 // is the body every later request sends and the cache prefix ahead of this turn
                 // holds. Ahead of the interrupt and thinking-only exits below, because a redaction
@@ -1023,6 +1214,25 @@ impl Agent {
                         }
                     }
                     break 'turn Err(MekaError::Interrupted);
+                }
+                if progress.cut {
+                    // An inbox interrupt cut the stream after the provider had answered. What
+                    // arrived is kept as the answer so far, the message follows it, and the turn
+                    // goes on: same turn, no terminal, the way a person is cut off and told the
+                    // next thing.
+                    if let Err(error) = self
+                        .absorb_interrupt(
+                            session_id,
+                            messages,
+                            &mut recovery,
+                            &user_message,
+                            Some(assistant_message),
+                        )
+                        .await
+                    {
+                        break 'turn Err(error);
+                    }
+                    continue;
                 }
 
                 // Run tools based on the *presence* of tool-call blocks, not the reported stop
@@ -1186,6 +1396,41 @@ impl Agent {
                         tracing::warn!("failed to persist oversized tool results: {error}");
                     }
 
+                    // The round boundary is where a message that arrived while the tools ran is
+                    // read: after the results, in the same user message, which every wire accepts
+                    // and which keeps the cache prefix ahead of it intact. Steers and interrupts,
+                    // which nothing cuts a tool for; a followup waits for the turn to end. Read
+                    // here and stamped with the round below, so the text and the stamp are one
+                    // write.
+                    let steering = match self
+                        .store
+                        .inbox_store()
+                        .take_pending(
+                            session_id,
+                            &[
+                                crate::store::inbox::InboxClass::Steer,
+                                crate::store::inbox::InboxClass::Interrupt,
+                            ],
+                            chrono::Utc::now(),
+                        )
+                        .await
+                    {
+                        Ok(mut items) => {
+                            // Pending still, if the prompt's save failed and the lazy one is
+                            // yet to run; carried already, either way.
+                            items.retain(|item| !recovery.inbox_ids.contains(&item.id));
+                            items
+                        }
+                        Err(error) => {
+                            tracing::warn!("failed to read the inbox at a round boundary: {error}");
+                            Vec::new()
+                        }
+                    };
+                    tool_results.extend(steering.iter().map(|item| ContentBlock::Text {
+                        text: prompt::render_inbox_item(item, true),
+                    }));
+                    let steered: Vec<Uuid> = steering.iter().map(|item| item.id).collect();
+
                     let result_message = Message {
                         role: Role::User,
                         content: tool_results,
@@ -1207,7 +1452,7 @@ impl Agent {
                     messages.append(result_message);
                     if let Err(error) = self
                         .store
-                        .save_events_atomic(session_id, round_events)
+                        .save_events_atomic_marking_inbox(session_id, round_events, &steered)
                         .await
                     {
                         tracing::warn!(
@@ -1394,7 +1639,11 @@ impl Agent {
             }
             Err(MekaError::Interrupted) if !recovery.user_saved => {
                 let user_event = crate::conversation::Event::Append(user_message.clone());
-                if let Err(error) = self.store.save_event(session_id, &user_event).await {
+                if let Err(error) = self
+                    .store
+                    .save_event_marking_inbox(session_id, &user_event, &recovery.inbox_ids)
+                    .await
+                {
                     tracing::warn!("failed to save user message on interruption: {error}");
                 }
             }
@@ -1411,7 +1660,11 @@ impl Agent {
                     && retention == PromptRetention::Keep =>
             {
                 let user_event = crate::conversation::Event::Append(user_message.clone());
-                if let Err(error) = self.store.save_event(session_id, &user_event).await {
+                if let Err(error) = self
+                    .store
+                    .save_event_marking_inbox(session_id, &user_event, &recovery.inbox_ids)
+                    .await
+                {
                     tracing::warn!("failed to save user message after a failed turn: {error}");
                 }
             }
@@ -1526,6 +1779,155 @@ impl Agent {
         {
             tracing::warn!("failed to persist the partial assistant message: {error}");
         }
+    }
+
+    /// Put the inbox items that cut a provider call into the conversation, after whatever had
+    /// streamed, so the next request carries them.
+    ///
+    /// Read again rather than trusting the watcher: what it saw may have been withdrawn since, and
+    /// a steer that arrived in the meantime belongs here as much as at a tool round's boundary.
+    /// With nothing to put in, the partial is dropped and the request is repeated as it stood.
+    ///
+    /// The shape depends on what streamed. Text that did is kept as the assistant's message,
+    /// without the tool calls that never ran, and the items follow it as the next user message.
+    /// Nothing kept means the items join the user message that was cut, since meka never sends
+    /// two user turns in a row: it is withdrawn and appended again with them in one write. That
+    /// leaves the log ending on an appended turn opening, so a turn cut before the provider
+    /// accepted anything still withdraws its prompt if it then fails, and the items with it.
+    async fn absorb_interrupt(
+        &self,
+        session_id: uuid::Uuid,
+        messages: &mut Conversation,
+        recovery: &mut TurnRecovery,
+        prompt: &Message,
+        partial: Option<Message>,
+    ) -> Result<()> {
+        use crate::{conversation::Event, store::inbox::InboxClass};
+
+        let inbox = self.store.inbox_store();
+        let mut items = match inbox
+            .take_pending(
+                session_id,
+                &[InboxClass::Steer, InboxClass::Interrupt],
+                chrono::Utc::now(),
+            )
+            .await
+        {
+            Ok(items) => items,
+            Err(error) => {
+                // The cut is spent either way; the request is repeated as it stood, and the
+                // item waits for the next poll, as every other inbox read degrades.
+                tracing::warn!("failed to read the inbox after an interrupt: {error}");
+                Vec::new()
+            }
+        };
+        items.retain(|item| !recovery.inbox_ids.contains(&item.id));
+        if items.is_empty() {
+            return Ok(());
+        }
+        recovery
+            .ensure_prompt_saved(self, session_id, prompt)
+            .await?;
+        let ids: Vec<uuid::Uuid> = items.iter().map(|item| item.id).collect();
+        let blocks: Vec<ContentBlock> = items
+            .iter()
+            .map(|item| ContentBlock::Text {
+                text: prompt::render_inbox_item(item, true),
+            })
+            .collect();
+        let partial = partial
+            .map(|partial| partial.without_tool_use())
+            .filter(|partial| {
+                partial
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text { .. }))
+            });
+        let tail_is_user = messages
+            .as_slice()
+            .last()
+            .is_some_and(|last| last.role == Role::User);
+        match (partial, tail_is_user) {
+            (Some(partial), _) => {
+                let arrived = Message {
+                    role: Role::User,
+                    content: blocks,
+                };
+                self.store
+                    .save_events_atomic_marking_inbox(
+                        session_id,
+                        vec![
+                            Event::Append(partial.clone()),
+                            Event::Append(arrived.clone()),
+                        ],
+                        &ids,
+                    )
+                    .await?;
+                messages.append(partial);
+                messages.append(arrived);
+            }
+            (None, true) => {
+                let mut joined = messages
+                    .as_slice()
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| Message {
+                        role: Role::User,
+                        content: Vec::new(),
+                    });
+                joined.content.extend(blocks);
+                let prompt_stood_alone = messages.events_len() == recovery.prompt_only_events;
+                self.store
+                    .save_events_atomic_marking_inbox(
+                        session_id,
+                        vec![
+                            Event::Repair {
+                                replaced_count: 1,
+                                messages: Vec::new(),
+                            },
+                            Event::Append(joined.clone()),
+                        ],
+                        &ids,
+                    )
+                    .await?;
+                messages.replace_tail(1, Vec::new());
+                messages.append(joined);
+                if prompt_stood_alone {
+                    // The prompt moved and the items are part of it now, so a withdrawal takes
+                    // both back and offers the items again with it.
+                    recovery.prompt_only_events = messages.events_len();
+                    recovery.inbox_ids.extend(ids);
+                }
+            }
+            (None, false) => {
+                let arrived = Message {
+                    role: Role::User,
+                    content: blocks,
+                };
+                self.store
+                    .save_events_atomic_marking_inbox(
+                        session_id,
+                        vec![Event::Append(arrived.clone())],
+                        &ids,
+                    )
+                    .await?;
+                messages.append(arrived);
+            }
+        }
+        let count = items.len();
+        tracing::info!("an inbox interrupt cut the provider call; {count} item(s) appended");
+        let text = match items.as_slice() {
+            [item] => format!(
+                "Interrupted the answer to read a message from '{}'.",
+                item.source
+            ),
+            _ => format!("Interrupted the answer to read {count} messages."),
+        };
+        self.cells
+            .frontend
+            .emit(FrontendEvent::Notice(crate::frontend::Notice::info(text)))
+            .await;
+        Ok(())
     }
 
     /// Streaming provider call with bounded retry-with-backoff on transient failures
@@ -1814,8 +2216,9 @@ impl Agent {
                 return Err(MekaError::Interrupted);
             }
             Ok(Err(MekaError::Interrupted)) => {
-                // Interrupted mid-stream, after a 2xx. Fall through to return partial content. The
-                // caller detects interruption via the cancellation token.
+                // Interrupted mid-stream, after a 2xx. Fall through to return partial content; the
+                // caller asks its tokens which stop this was.
+                progress.cut = true;
             }
             Ok(Err(error)) => {
                 progress.partial = accumulator.partial();
@@ -1848,7 +2251,881 @@ mod tests {
         },
         conversation::ToolResultContent,
         provider::mock::text_round,
+        store::inbox::{InboxClass, InboxState, NewInboxItem},
     };
+
+    /// A tool that enqueues an inbox item for its own session while it runs: the one way to land
+    /// an item between a round's request and its results without a timer.
+    struct EnqueueWhileRunning {
+        store: Store,
+        class: InboxClass,
+        body: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for EnqueueWhileRunning {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "enqueue_while_running".to_string(),
+                description: "test".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+                ..Default::default()
+            }
+        }
+
+        fn required_permission(&self) -> crate::permission::Permission {
+            crate::permission::Permission::Read
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            context: crate::tools::ToolContext,
+        ) -> Result<crate::tools::ToolOutput> {
+            let session_id = context.session_id.expect("a tool runs inside a session");
+            self.store
+                .inbox_store()
+                .enqueue(NewInboxItem::from_parts(
+                    session_id, self.class, "test", self.body,
+                )?)
+                .await?;
+            Ok(crate::tools::ToolOutput::text("ran".to_string(), false))
+        }
+    }
+
+    /// One tool round calling `enqueue_while_running`, then a text reply.
+    fn a_tool_round_then_done() -> Vec<Vec<MockEvent>> {
+        vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-0".to_string(),
+                    name: "enqueue_while_running".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: crate::provider::mock::MockStopReason::ToolUse,
+                },
+            ],
+            text_round("done"),
+        ]
+    }
+
+    async fn agent_that_enqueues_while_running(
+        rounds: Vec<Vec<MockEvent>>,
+        class: InboxClass,
+        body: &'static str,
+    ) -> (Agent, Arc<MockProvider>, Store) {
+        let provider = Arc::new(MockProvider::from_rounds(rounds));
+        let store = Store::for_test().await;
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(EnqueueWhileRunning {
+                store: store.clone(),
+                class,
+                body,
+            }))
+            .expect("register the test tool");
+        let agent = build_test_agent(Arc::clone(&provider) as Arc<dyn Provider>, registry, &store);
+        (agent, provider, store)
+    }
+
+    fn text_blocks(message: &Message) -> Vec<&str> {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_steer_lands_after_the_rounds_tool_results_and_is_delivered_on_the_next_accepted_request()
+     {
+        let (agent, provider, store) = agent_that_enqueues_while_running(
+            a_tool_round_then_done(),
+            InboxClass::Steer,
+            "also, what is 17*3?",
+        )
+        .await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+
+        let requests = provider.streams();
+        assert_eq!(requests.len(), 2, "the tool round and the request after it");
+        let boundary = requests[1]
+            .messages
+            .last()
+            .expect("the second request ends on the round's results");
+        assert!(
+            matches!(
+                boundary.content.first(),
+                Some(ContentBlock::ToolResult { .. })
+            ),
+            "the results lead the message: {boundary:?}"
+        );
+        let injected = text_blocks(boundary);
+        assert_eq!(injected.len(), 1, "one item, one block: {boundary:?}");
+        assert!(
+            injected[0].starts_with("[Message from test, arrived ")
+                && injected[0].contains("while you were working]\nalso, what is 17*3?"),
+            "the header says who and when: {}",
+            injected[0]
+        );
+
+        let session_id = agent.session_id().expect("the turn created a session");
+        let items = store
+            .inbox_store()
+            .list_open(session_id)
+            .await
+            .expect("list");
+        assert!(items.is_empty(), "delivered items are no longer open");
+        // The round is on disk with the text in it, so a resume replays what the model saw.
+        let stored = store.load_events(session_id).await.expect("load events");
+        let persisted = stored
+            .iter()
+            .filter_map(|event| match event {
+                crate::conversation::Event::Append(message) => Some(message),
+                _ => None,
+            })
+            .find(|message| {
+                matches!(
+                    message.content.first(),
+                    Some(ContentBlock::ToolResult { .. })
+                )
+            })
+            .expect("the tool round was persisted");
+        assert_eq!(text_blocks(persisted).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_followup_is_never_injected_mid_turn() {
+        let (agent, provider, store) = agent_that_enqueues_while_running(
+            a_tool_round_then_done(),
+            InboxClass::Followup,
+            "when you are done, also do this",
+        )
+        .await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+
+        let requests = provider.streams();
+        let boundary = requests[1].messages.last().expect("the round's results");
+        assert!(
+            text_blocks(boundary).is_empty(),
+            "a followup waits for the turn to end: {boundary:?}"
+        );
+        let session_id = agent.session_id().expect("a session");
+        let items = store
+            .inbox_store()
+            .list_open(session_id)
+            .await
+            .expect("list");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].state(), InboxState::Pending);
+    }
+
+    #[tokio::test]
+    async fn items_ride_a_typed_prompt_after_its_words_and_open_the_turn_alone_when_there_are_none()
+    {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            text_round("first"),
+            text_round("second"),
+        ]));
+        let (agent, store) = agent_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session_id);
+        let inbox = store.inbox_store();
+        let steer = NewInboxItem::from_parts(session_id, InboxClass::Steer, "test", "a steer")
+            .expect("item");
+        let followup =
+            NewInboxItem::from_parts(session_id, InboxClass::Followup, "test", "a followup")
+                .expect("item");
+        inbox.enqueue(steer).await.expect("enqueue");
+        inbox.enqueue(followup).await.expect("enqueue");
+
+        // Nothing handed in: the turn reads the inbox for itself at its opening.
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("typed words".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+        let opening = provider.streams()[0]
+            .messages
+            .last()
+            .expect("the opening message")
+            .clone();
+        let blocks = text_blocks(&opening);
+        assert_eq!(
+            blocks.len(),
+            3,
+            "words, then one block per item: {opening:?}"
+        );
+        assert_eq!(blocks[0], "typed words");
+        assert!(blocks[1].ends_with("]\na steer") && !blocks[1].contains("while you were working"));
+        assert!(blocks[2].ends_with("]\na followup"));
+        assert!(
+            inbox.list_open(session_id).await.expect("list").is_empty(),
+            "the accepted request delivered both"
+        );
+
+        // With nothing typed, the items are the whole opening message.
+        inbox
+            .enqueue(
+                NewInboxItem::from_parts(session_id, InboxClass::Steer, "test", "alone")
+                    .expect("item"),
+            )
+            .await
+            .expect("enqueue");
+        let waiting = inbox
+            .take_pending(session_id, &[], chrono::Utc::now())
+            .await
+            .expect("pending");
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::inbox(waiting).expect("items"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+        let opening = provider.streams()[1]
+            .messages
+            .last()
+            .expect("the opening message")
+            .clone();
+        let blocks = text_blocks(&opening);
+        assert_eq!(blocks.len(), 1, "no words, one item: {opening:?}");
+        assert!(blocks[0].ends_with("]\nalone"));
+        assert!(matches!(
+            crate::agent::TurnInput::inbox(Vec::new()),
+            Err(MekaError::EmptyPrompt)
+        ));
+    }
+
+    /// The driver opens a turn on items with `Withdraw` retention. When the provider refuses
+    /// everything, the prompt leaves the conversation and the items are offered again, counted.
+    #[tokio::test]
+    async fn an_inbox_turn_that_fails_before_anything_is_appended_resets_its_items() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![MockEvent::Fail {
+            message: "provider down".to_string(),
+        }]]));
+        let (agent, store) = agent_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session_id);
+        let inbox = store.inbox_store();
+        inbox
+            .enqueue(
+                NewInboxItem::from_parts(session_id, InboxClass::Steer, "test", "hello?")
+                    .expect("item"),
+            )
+            .await
+            .expect("enqueue");
+        let waiting = inbox
+            .take_pending(session_id, &[], chrono::Utc::now())
+            .await
+            .expect("pending");
+        let id = waiting[0].id;
+
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::inbox(waiting)
+                    .expect("items")
+                    .retaining(PromptRetention::Withdraw),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(outcome.is_err(), "the provider refused: {outcome:?}");
+        assert_eq!(messages.len(), 0, "the prompt was withdrawn");
+        let item = inbox.get(id).await.expect("get").expect("row");
+        assert_eq!(item.state(), InboxState::Pending);
+        // Offered again, not counted: the driver that opened the turn counts the attempt when it
+        // defers the items, so a retry is measured where the retrying happens.
+        assert_eq!(item.attempts, 0);
+        let events = store.load_events(session_id).await.expect("events");
+        assert!(
+            matches!(
+                events.last(),
+                Some(crate::conversation::Event::Repair {
+                    replaced_count: 1,
+                    messages,
+                }) if messages.is_empty()
+            ),
+            "the withdrawal is on disk too, so a resume does not find the prompt: {events:?}"
+        );
+    }
+
+    /// Enqueue an item for `session_id` after `delay`, from a task of its own, while a turn runs.
+    fn enqueue_later(
+        store: &Store,
+        session_id: uuid::Uuid,
+        class: InboxClass,
+        body: &'static str,
+        delay: std::time::Duration,
+    ) -> tokio::task::JoinHandle<uuid::Uuid> {
+        let inbox = store.inbox_store();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            inbox
+                .enqueue(NewInboxItem::from_parts(session_id, class, "test", body).expect("item"))
+                .await
+                .expect("enqueue")
+                .id
+        })
+    }
+
+    /// An agent on `rounds` with a session of its own, so an item can be enqueued for it before
+    /// the turn opens.
+    async fn agent_with_session(
+        rounds: Vec<Vec<MockEvent>>,
+    ) -> (
+        Agent,
+        Arc<MockProvider>,
+        Store,
+        uuid::Uuid,
+        Arc<crate::frontend::testing::RecordingFrontend>,
+    ) {
+        let provider = Arc::new(MockProvider::from_rounds(rounds));
+        let (mut agent, store) = agent_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = frontend.clone();
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session_id);
+        (agent, provider, store, session_id, frontend)
+    }
+
+    fn a_stalled_answer(first: &str, rest: &str) -> Vec<MockEvent> {
+        vec![
+            MockEvent::Text {
+                text: first.to_string(),
+            },
+            MockEvent::Sleep { ms: 5000 },
+            MockEvent::Text {
+                text: rest.to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: crate::provider::mock::MockStopReason::EndTurn,
+            },
+        ]
+    }
+
+    fn notices(frontend: &crate::frontend::testing::RecordingFrontend) -> Vec<String> {
+        frontend
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                FrontendEvent::Notice(notice) => Some(notice.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An interrupt does not wait for the answer being streamed: the stream is dropped, the text
+    /// that had arrived is kept as the answer so far, the message follows it, and the same turn
+    /// carries on with a request that ends on the message.
+    #[tokio::test]
+    async fn an_interrupt_cuts_a_streaming_answer_and_the_turn_goes_on_with_it() {
+        let (agent, provider, store, session_id, frontend) = agent_with_session(vec![
+            a_stalled_answer("the first half", " and the rest, never sent"),
+            text_round("carrying on with your message"),
+        ])
+        .await;
+        let enqueued = enqueue_later(
+            &store,
+            session_id,
+            InboxClass::Interrupt,
+            "stop, do this instead",
+            std::time::Duration::from_millis(300),
+        );
+        let started = std::time::Instant::now();
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs on");
+        let item_id = enqueued.await.expect("enqueued");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the stalled answer was cut, not waited out: {:?}",
+            started.elapsed()
+        );
+
+        let conversation = messages.as_slice();
+        assert_eq!(
+            conversation.len(),
+            4,
+            "prompt, partial, message, answer: {conversation:?}"
+        );
+        assert_eq!(conversation[1].role, Role::Assistant);
+        assert_eq!(conversation[1].text_content(), "the first half");
+        assert_eq!(conversation[2].role, Role::User);
+        let injected = text_blocks(&conversation[2]);
+        assert_eq!(injected.len(), 1, "{:?}", conversation[2]);
+        assert!(
+            injected[0].starts_with("[Message from test, arrived ")
+                && injected[0].contains("while you were working]\nstop, do this instead"),
+            "{}",
+            injected[0]
+        );
+        assert_eq!(
+            conversation[3].text_content(),
+            "carrying on with your message"
+        );
+
+        let requests = provider.streams();
+        assert_eq!(requests.len(), 2, "the cut request and the one after it");
+        assert_eq!(
+            requests[1]
+                .messages
+                .last()
+                .map(|message| text_blocks(message)),
+            Some(injected.clone()),
+            "the second request ends on the message"
+        );
+        let item = store
+            .inbox_store()
+            .get(item_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(item.state(), InboxState::Delivered);
+        let stored = store.load_events(session_id).await.expect("events");
+        assert_eq!(stored.len(), 4, "four appends and no repair: {stored:?}");
+        assert!(
+            stored
+                .iter()
+                .all(|event| matches!(event, crate::conversation::Event::Append(_))),
+            "{stored:?}"
+        );
+        assert!(
+            notices(&frontend)
+                .iter()
+                .any(|text| text == "Interrupted the answer to read a message from 'test'."),
+            "the cut is announced: {:?}",
+            notices(&frontend)
+        );
+    }
+
+    /// Nothing had streamed when the interrupt landed, so there is no answer to put the message
+    /// after: it joins the prompt that was cut, and the log still ends on that one appended
+    /// opening.
+    #[tokio::test]
+    async fn an_interrupt_before_the_provider_answers_joins_the_prompt_it_cut() {
+        let (agent, provider, store, session_id, _frontend) = agent_with_session(vec![
+            vec![
+                MockEvent::Sleep { ms: 5000 },
+                MockEvent::Text {
+                    text: "late".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: crate::provider::mock::MockStopReason::EndTurn,
+                },
+            ],
+            text_round("carrying on"),
+        ])
+        .await;
+        let enqueued = enqueue_later(
+            &store,
+            session_id,
+            InboxClass::Interrupt,
+            "actually, this",
+            std::time::Duration::from_millis(300),
+        );
+        let started = std::time::Instant::now();
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs on");
+        let item_id = enqueued.await.expect("enqueued");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+
+        let conversation = messages.as_slice();
+        assert_eq!(
+            conversation.len(),
+            2,
+            "the joined prompt and the answer: {conversation:?}"
+        );
+        let joined = text_blocks(&conversation[0]);
+        assert_eq!(joined.len(), 2, "{:?}", conversation[0]);
+        assert_eq!(joined[0], "work");
+        assert!(
+            joined[1].contains("while you were working]\nactually, this"),
+            "{}",
+            joined[1]
+        );
+        let requests = provider.streams();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1]
+                .messages
+                .last()
+                .map(|message| text_blocks(message)),
+            Some(joined.clone())
+        );
+        let stored = store.load_events(session_id).await.expect("events");
+        assert!(
+            matches!(
+                stored.as_slice(),
+                [
+                    crate::conversation::Event::Append(_),
+                    crate::conversation::Event::Repair {
+                        replaced_count: 1,
+                        messages
+                    },
+                    crate::conversation::Event::Append(_),
+                    crate::conversation::Event::Append(_),
+                ] if messages.is_empty()
+            ),
+            "the prompt was taken back and put again with the message: {stored:?}"
+        );
+        assert_eq!(
+            store
+                .inbox_store()
+                .get(item_id)
+                .await
+                .expect("get")
+                .expect("row")
+                .state(),
+            InboxState::Delivered
+        );
+    }
+
+    /// The blocking path has nothing partial to keep, so a whole reply still being generated is
+    /// dropped and the turn goes on as the streaming path does when nothing had streamed.
+    #[tokio::test]
+    async fn an_interrupt_drops_a_blocking_reply_still_being_generated_and_goes_on() {
+        let (mut agent, provider, store, session_id, _frontend) = agent_with_session(vec![
+            vec![
+                MockEvent::Sleep { ms: 3000 },
+                MockEvent::Text {
+                    text: "never delivered".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: crate::provider::mock::MockStopReason::EndTurn,
+                },
+            ],
+            text_round("carrying on"),
+        ])
+        .await;
+        agent.options.streaming = false;
+        let enqueued = enqueue_later(
+            &store,
+            session_id,
+            InboxClass::Interrupt,
+            "now",
+            std::time::Duration::from_millis(50),
+        );
+        let started = std::time::Instant::now();
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs on");
+        enqueued.await.expect("enqueued");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(provider.completions().len(), 2);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(text_blocks(&messages.as_slice()[0]).len(), 2);
+        assert_eq!(messages.as_slice()[1].text_content(), "carrying on");
+    }
+
+    /// A tool is never cut: an interrupt that lands while one runs is read at the boundary after
+    /// its results, exactly as a steer is.
+    #[tokio::test]
+    async fn an_interrupt_during_a_tool_round_waits_for_its_results() {
+        let (agent, provider, store) = agent_that_enqueues_while_running(
+            a_tool_round_then_done(),
+            InboxClass::Interrupt,
+            "faster, please",
+        )
+        .await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+
+        let requests = provider.streams();
+        assert_eq!(requests.len(), 2, "the tool round and the request after it");
+        let boundary = requests[1]
+            .messages
+            .last()
+            .expect("the second request ends on the round's results");
+        assert!(
+            matches!(
+                boundary.content.first(),
+                Some(ContentBlock::ToolResult { .. })
+            ),
+            "the results lead the message: {boundary:?}"
+        );
+        let injected = text_blocks(boundary);
+        assert_eq!(injected.len(), 1, "{boundary:?}");
+        assert!(
+            injected[0].contains("while you were working]\nfaster, please"),
+            "{}",
+            injected[0]
+        );
+        let session_id = agent.session_id().expect("the turn created a session");
+        assert!(
+            store
+                .inbox_store()
+                .list_open(session_id)
+                .await
+                .expect("list")
+                .is_empty()
+        );
+        let stored = store.load_events(session_id).await.expect("events");
+        assert!(
+            stored
+                .iter()
+                .all(|event| matches!(event, crate::conversation::Event::Append(_))),
+            "nothing was cut or taken back: {stored:?}"
+        );
+    }
+
+    /// A driver-opened turn cut before the provider accepted anything still withdraws its prompt
+    /// when it then fails, and the interrupt that joined the prompt is offered again with it.
+    #[tokio::test]
+    async fn a_withdrawn_prompt_takes_the_interrupt_that_joined_it_back_too() {
+        let (agent, _provider, store, session_id, _frontend) = agent_with_session(vec![
+            vec![
+                MockEvent::Sleep { ms: 5000 },
+                MockEvent::Text {
+                    text: "late".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: crate::provider::mock::MockStopReason::EndTurn,
+                },
+            ],
+            vec![MockEvent::Fail {
+                message: "provider down".to_string(),
+            }],
+        ])
+        .await;
+        let inbox = store.inbox_store();
+        let opener = inbox
+            .enqueue(
+                NewInboxItem::from_parts(session_id, InboxClass::Steer, "test", "hello?")
+                    .expect("item"),
+            )
+            .await
+            .expect("enqueue")
+            .id;
+        let waiting = inbox
+            .take_pending(session_id, &[], chrono::Utc::now())
+            .await
+            .expect("pending");
+        let enqueued = enqueue_later(
+            &store,
+            session_id,
+            InboxClass::Interrupt,
+            "and this",
+            std::time::Duration::from_millis(300),
+        );
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::inbox(waiting)
+                    .expect("items")
+                    .retaining(PromptRetention::Withdraw),
+                CancellationToken::new(),
+            )
+            .await;
+        let interrupt = enqueued.await.expect("enqueued");
+        assert!(outcome.is_err(), "the provider refused: {outcome:?}");
+        assert_eq!(messages.len(), 0, "the prompt was withdrawn");
+        for id in [opener, interrupt] {
+            let item = inbox.get(id).await.expect("get").expect("row");
+            assert_eq!(item.state(), InboxState::Pending, "{item:?}");
+            assert_eq!(
+                item.attempts, 0,
+                "counted by the driver, not the withdrawal"
+            );
+        }
+        let events = store.load_events(session_id).await.expect("events");
+        assert!(
+            matches!(
+                events.last(),
+                Some(crate::conversation::Event::Repair {
+                    replaced_count: 1,
+                    messages,
+                }) if messages.is_empty()
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// A turn opened on items that were all withdrawn while it started has nothing to say, and
+    /// says nothing: no message, no request, no row.
+    #[tokio::test]
+    async fn a_turn_whose_items_were_all_withdrawn_while_it_started_sends_nothing() {
+        let (agent, provider, store, session_id, _frontend) =
+            agent_with_session(vec![text_round("unreachable")]).await;
+        let inbox = store.inbox_store();
+        let id = inbox
+            .enqueue(
+                NewInboxItem::from_parts(session_id, InboxClass::Steer, "test", "never mind")
+                    .expect("item"),
+            )
+            .await
+            .expect("enqueue")
+            .id;
+        let waiting = inbox
+            .take_pending(session_id, &[], chrono::Utc::now())
+            .await
+            .expect("pending");
+        // Between the driver's read and the turn's own: the window a DELETE can land in.
+        inbox.withdraw(id, None).await.expect("withdraw");
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::inbox(waiting)
+                    .expect("items")
+                    .retaining(PromptRetention::Withdraw),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(outcome, Err(MekaError::EmptyPrompt)),
+            "{outcome:?}"
+        );
+        assert_eq!(messages.len(), 0);
+        assert!(provider.streams().is_empty(), "no request went out");
+        assert!(
+            store
+                .load_events(session_id)
+                .await
+                .expect("events")
+                .is_empty()
+        );
+    }
+
+    /// A repair riding a request an interrupt cut was never judged, so the tier is tried again on
+    /// the next refusal rather than skipped for the one after, which destroys more.
+    #[tokio::test]
+    async fn an_interrupt_does_not_spend_the_degrade_tier_it_cut() {
+        use crate::provider::mock::MockStopReason;
+        let (agent, provider, store, session_id, _frontend) = agent_with_session(vec![
+            // Refused: the attachments tier strips the image and retries.
+            vec![MockEvent::FailInvalidRequest {
+                message: REJECTION.to_string(),
+            }],
+            // The retry, cut by an interrupt before it answers.
+            vec![
+                MockEvent::Sleep { ms: 5000 },
+                MockEvent::Text {
+                    text: "late".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+            // Refused again: only the attachments tier has anything to remove here, so a walk
+            // that had moved past it would fail the turn.
+            vec![MockEvent::FailInvalidRequest {
+                message: REJECTION.to_string(),
+            }],
+            text_round("I could not see that image."),
+        ])
+        .await;
+        let enqueued = enqueue_later(
+            &store,
+            session_id,
+            InboxClass::Interrupt,
+            "also, hurry",
+            std::time::Duration::from_millis(300),
+        );
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("look at this".to_string(), vec![
+                    image_source(),
+                ])
+                .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await;
+        enqueued.await.expect("enqueued");
+        assert!(
+            matches!(outcome, Ok(TurnOutcome::EndTurn)),
+            "the tier the cut put back is spent on the next refusal, and the turn gets through: \
+             {outcome:?}"
+        );
+        assert_eq!(provider.streams().len(), 4);
+        let user = &messages.as_slice()[0];
+        assert!(
+            user.content
+                .iter()
+                .all(|block| !matches!(block, ContentBlock::Image { .. })),
+            "the refused image is gone, replaced once: {user:?}"
+        );
+        assert!(
+            text_blocks(user)
+                .iter()
+                .any(|text| text.contains("while you were working]\nalso, hurry")),
+            "and the message that cut the retry rode the prompt: {user:?}"
+        );
+    }
+
     /// The text that streamed before the connection died is kept: it was on screen, and losing it
     /// from the conversation and the store makes the user re-ask for what they had already read.
     #[tokio::test]

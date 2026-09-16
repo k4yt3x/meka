@@ -183,6 +183,10 @@ pub(crate) struct SessionResponse {
     ///
     /// Always `false` for a GC-evicted session, since eviction requires an idle session.
     pub(crate) turn_in_flight: bool,
+    /// Inbox items waiting to be appended. Reported for a loaded session only, since it is what a
+    /// client asks a session it is driving; a listing does not pay a query per row for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) inbox_pending: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -354,7 +358,7 @@ pub(crate) async fn create_session(
         },
         crate::host::Opening::Fresh,
         session_lock,
-        crate::host::CancelCell::default(),
+        crate::host::CancelCell::notifying(Arc::clone(&state.inbox_wake)),
     )
     .await
     .map_err(|error| agent_build_problem(session_uuid, "failed to build session agent", error))?;
@@ -368,6 +372,12 @@ pub(crate) async fn create_session(
         capabilities,
         frontend: http_frontend,
     };
+    entry.frontend.install_feed(
+        session_uuid,
+        crate::host::http::http_frontend::FEED_BROADCAST_CAPACITY,
+        state.config.stream_replay_events,
+        Some(state.webhooks.clone()),
+    );
 
     state.sessions.write().await.insert(session_uuid, entry);
 
@@ -403,6 +413,7 @@ pub(crate) async fn create_session(
             last_turn_at: None,
             capabilities,
             turn_in_flight: false,
+            inbox_pending: None,
         }),
     ))
 }
@@ -639,6 +650,7 @@ pub(crate) async fn fork_session(
             last_turn_at: None,
             capabilities: entry.capabilities,
             turn_in_flight: false,
+            inbox_pending: None,
         }),
     ))
 }
@@ -741,6 +753,7 @@ pub(crate) async fn list_sessions(
                 last_turn_at,
                 capabilities,
                 turn_in_flight,
+                inbox_pending: None,
             }
         })
         .collect();
@@ -797,6 +810,16 @@ pub(crate) async fn get_session(
             .read()
             .ok()
             .and_then(|guard| guard.map(|ts| ts.to_rfc3339()));
+        let inbox_pending = state
+            .shared
+            .store
+            .inbox_store()
+            .pending_count(id)
+            .await
+            .map_err(|error| {
+                ProblemDetail::internal_sanitized("failed to count inbox items", error)
+                    .with("session_id", id.to_string())
+            })?;
         return Ok(Json(SessionResponse {
             session: SessionView {
                 id: entry.id,
@@ -812,6 +835,7 @@ pub(crate) async fn get_session(
             last_turn_at,
             capabilities: entry.capabilities,
             turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
+            inbox_pending: Some(inbox_pending),
         }));
     }
     let summary = state
@@ -828,6 +852,7 @@ pub(crate) async fn get_session(
         last_turn_at: None,
         capabilities,
         turn_in_flight: false,
+        inbox_pending: None,
     }))
 }
 
@@ -930,6 +955,7 @@ async fn repin_dormant_session(
         capabilities: capabilities_from_row(summary.capabilities_json.as_deref()),
         // Not resident, and nothing could have made it so while the reconstruction lock was held.
         turn_in_flight: false,
+        inbox_pending: None,
     })))
 }
 
@@ -1201,6 +1227,7 @@ pub(crate) async fn patch_session(
         last_turn_at,
         capabilities: entry.capabilities,
         turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
+        inbox_pending: None,
     }))
 }
 

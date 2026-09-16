@@ -7,9 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
+## [0.55.0] - 2026-09-16
 
-- RUSTSEC-2026-0285: `rustls` 0.23.45 closes a TLS 1.3 handshake flaw in the version shipped before.
+### Added
+
+- A session inbox: `POST /v1/sessions/{id}/inbox` hands the agent a message without waiting.
+- A `steer` item reaches a running turn at its next round boundary; a `followup` waits for it.
+- An `interrupt` item cuts the answer being streamed, keeps what arrived, and the turn carries on.
+- An item on an idle session opens a turn of its own; one that keeps failing is dropped in an hour.
+- `GET` and `DELETE` on the inbox, `inbox_pending` on the session, `Idempotency-Key` on the row.
+- `inbox.delivered`, `inbox.failed` and `inbox.withdrawn` on the feed; the first two as webhooks.
+- `POST /v1/sessions/{id}/cancel` takes a `turn_id` and refuses to stop any other turn.
+- `agent_steer` sends a sub-agent a message it reads at its next step, or on the next follow-up.
+- `agent_steer` takes `interrupt: true` to cut the answer a sub-agent is writing.
+- `agent_followup` on a sub-agent still running says so and points at `agent_steer`.
+
+### Changed
+
+- **Breaking:** `GET /v1/sessions/{id}/stream` is the session feed across turns; it no longer ends.
+- **Breaking:** a session that has not streamed yet opens its feed instead of answering 404.
+- Every SSE event carries `turn_id` and `session_id`; `turn.started` says who started the turn.
+- Scheduled fires and background-outcome turns appear on the session feed as they run.
+- A session with a live feed subscriber is not evicted for idleness.
+
+### Fixed
+
+- `openai-chat-completions` dropped user text sent beside tool results; it now follows them.
 
 ## [0.54.1] - 2026-09-15
 
@@ -2234,7 +2257,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.54.1...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.55.0...HEAD
+[0.55.0]: https://github.com/k4yt3x/meka/compare/0.54.1...0.55.0
 [0.54.1]: https://github.com/k4yt3x/meka/compare/0.54.0...0.54.1
 [0.54.0]: https://github.com/k4yt3x/meka/compare/0.53.0...0.54.0
 [0.53.0]: https://github.com/k4yt3x/meka/compare/0.52.0...0.53.0

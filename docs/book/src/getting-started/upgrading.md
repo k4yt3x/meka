@@ -10,6 +10,27 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.54 to 0.55
+
+**`GET /v1/sessions/{id}/stream` is the session's event feed and no longer ends with a turn.** It
+used to rejoin the current turn and close after that turn's terminal; it now carries every turn on
+the session, whoever started it, for as long as the connection is held, and opens the feed of a
+session that has not streamed yet instead of answering 404. A client that read the stream to its
+end must stop at the terminal it was waiting for. `POST /turn` with `stream: true` is unchanged and
+still closes after its own terminal. The replay ring spans turns, so a `Last-Event-ID` from an
+earlier turn resumes across them rather than reporting a gap.
+
+**Every SSE event carries `turn_id` and `session_id`**, and `turn.started` carries `source`. A
+client that compared an event's `data` whole sees two extra members; one that read named fields is
+unaffected.
+
+**Scheduled fires and background-outcome turns are on the feed.** They used to be invisible over
+HTTP until `GET /messages`. Nothing changes on the webhooks: a fire still posts `schedule.fired`
+and nothing else.
+
+**`agent_steer` is a new built-in tool.** A session that lists tools by name, or a skill that
+denies `agent_spawn` to take the lifecycle tools with it, now covers five names rather than four.
+
 ## 0.53 to 0.54
 
 **The store renames its tables and columns in place.** The upgrade runs on the first open, behind

@@ -949,6 +949,52 @@ mod tests {
         assert_eq!(input[1]["content"][0]["text"], "b");
     }
 
+    /// An inbox item read at a round boundary is text beside the round's tool results: every
+    /// `function_call_output` first, then one user item, in that order, or the API complains that
+    /// a call has no output.
+    #[test]
+    fn text_beside_tool_results_becomes_a_user_item_after_the_outputs() {
+        let messages = vec![
+            Message::user("read /tmp/x"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_abc".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/x"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_abc".to_string(),
+                        content: vec![ToolResultContent::Text {
+                            text: "contents".to_string(),
+                        }],
+                        is_error: false,
+                    },
+                    ContentBlock::Text {
+                        text: "[Message from test, arrived now]\nalso, what is 17*3?".to_string(),
+                    },
+                ],
+            },
+        ];
+
+        let body = build_request_body("gpt-5", "", &messages, &[], None, None, true);
+        let input = body["input"].as_array().expect("input array");
+
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call_abc");
+        assert_eq!(input[3]["type"], "message");
+        assert_eq!(input[3]["role"], "user");
+        assert_eq!(
+            input[3]["content"][0]["text"],
+            "[Message from test, arrived now]\nalso, what is 17*3?"
+        );
+        assert_eq!(input.len(), 4);
+    }
+
     #[test]
     fn request_body_tool_use_emits_function_call_item() {
         let messages = vec![

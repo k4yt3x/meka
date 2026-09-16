@@ -26,6 +26,7 @@ mod blobs;
 mod credentials;
 pub(crate) mod export;
 pub(crate) mod history;
+pub(crate) mod inbox;
 mod locks;
 pub(crate) mod memory;
 pub(crate) mod migrations;
@@ -431,6 +432,11 @@ impl Store {
     /// The background-tasks table, on this store's connection.
     pub(crate) fn background_store(&self) -> crate::store::background::BackgroundStore {
         crate::store::background::BackgroundStore::new(Arc::clone(&self.connection))
+    }
+
+    /// The inbox table, on this store's connection.
+    pub(crate) fn inbox_store(&self) -> crate::store::inbox::InboxStore {
+        crate::store::inbox::InboxStore::new(Arc::clone(&self.connection))
     }
 }
 

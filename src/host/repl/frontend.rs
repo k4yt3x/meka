@@ -120,6 +120,7 @@ pub(super) fn indicator_action(event: &FrontendEvent, renders_reasoning: bool) -
         | FrontendEvent::Notice(_)
         | FrontendEvent::McpProgress(_)
         | FrontendEvent::PromptWithdrawn
+        | FrontendEvent::InboxDelivered { .. }
         | FrontendEvent::Compacted { .. } => IndicatorAction::Commit,
     }
 }
@@ -222,6 +223,9 @@ impl Frontend for ReplFrontend {
             // withdrawal is the schedule's own bookkeeping, not news for the person at the
             // keyboard.
             FrontendEvent::PromptWithdrawn => {}
+            // Nothing to draw either: the REPL has no producer for the inbox, so an item here came
+            // from a parent agent steering this worker, whose report is what the person reads.
+            FrontendEvent::InboxDelivered { .. } => {}
             // Closed here so a completed turn does not hold its last paragraph until the prompt,
             // and closed again by the episode for a turn that died without reaching this.
             FrontendEvent::TurnFinished => {

@@ -210,6 +210,7 @@ mod tests {
     fn principal(scopes: &[&str]) -> Principal {
         Principal {
             token_id: "test".to_string(),
+            description: None,
             scopes: scopes
                 .iter()
                 .map(|s| (*s).to_string())

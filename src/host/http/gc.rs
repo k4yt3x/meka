@@ -45,7 +45,10 @@ pub(crate) fn spawn(state: ServerState) -> tokio::task::JoinHandle<()> {
 }
 
 async fn evict_idle(state: &ServerState, idle_timeout: Duration, delete_on_idle: bool) {
-    let evicted = state.sessions.sweep_idle(idle_timeout).await;
+    let evicted = state
+        .sessions
+        .sweep_idle(idle_timeout, |entry| entry.frontend.subscriber_count() > 0)
+        .await;
     if evicted.is_empty() {
         return;
     }

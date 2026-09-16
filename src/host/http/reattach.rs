@@ -409,7 +409,7 @@ pub(crate) async fn ensure_session_loaded_holding(
         },
         crate::host::Opening::Hydrate,
         session_lock,
-        crate::host::CancelCell::default(),
+        crate::host::CancelCell::notifying(Arc::clone(&state.inbox_wake)),
     )
     .await
     .map_err(|error| agent_build_problem(id, "failed to rebuild session agent", error))?;
@@ -430,6 +430,12 @@ pub(crate) async fn ensure_session_loaded_holding(
         capabilities,
         frontend: http_frontend,
     };
+    new_entry.frontend.install_feed(
+        id,
+        crate::host::http::http_frontend::FEED_BROADCAST_CAPACITY,
+        state.config.stream_replay_events,
+        Some(state.webhooks.clone()),
+    );
 
     // Re-checked before the write lock rather than under it: the map's lock is write-preferring,
     // and a store round trip held under the write guard queued every handler on this process

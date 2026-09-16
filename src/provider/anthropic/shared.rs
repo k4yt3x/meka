@@ -1431,6 +1431,41 @@ mod tests {
         );
     }
 
+    /// An inbox item read at a round boundary is text beside the round's tool results. The API
+    /// wants the results first in that message, and this encoder keeps blocks in the order the
+    /// loop appended them, which is what puts the text after them.
+    #[test]
+    fn text_beside_tool_results_stays_after_them_in_one_message() {
+        let message = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: vec![ToolResultContent::Text {
+                        text: "contents".to_string(),
+                    }],
+                    is_error: false,
+                },
+                ContentBlock::Text {
+                    text: "[Message from test, arrived now]\nalso, what is 17*3?".to_string(),
+                },
+            ],
+        };
+        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::Ephemeral);
+        let content = converted[0]["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "tool_result");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(
+            content[1]["text"],
+            "[Message from test, arrived now]\nalso, what is 17*3?"
+        );
+        assert!(
+            content[1].get("cache_control").is_some(),
+            "the moving breakpoint lands on the new last block"
+        );
+    }
+
     /// The breakpoint lands on the last block that is actually sent. Attached before the trailing
     /// thinking strip, it left with the block it was on.
     #[test]

@@ -4,9 +4,13 @@
 //! (permission approval, MCP elicitation) short-circuit to their safe defaults (`Deny`,
 //! `Decline`) and append a diagnostic `Notice` so the caller can detect the misconfiguration.
 //!
-//! Streaming mode (`stream: true`) additionally publishes translated `SseEvent`s on a per-turn
-//! `broadcast::Sender`, and the same pause primitives park on a `oneshot::Receiver` until the
-//! client POSTs to `/v1/sessions/{id}/responses/{request_id}`.
+//! Every event also goes out on the session's feed: one `broadcast::Sender` per resident session,
+//! installed when the session is loaded and living as long as it does, with a replay ring behind
+//! it. `POST /turn` with `stream: true` is a view of that feed scoped to one turn;
+//! `GET /v1/sessions/{id}/stream` is the feed itself, across turns, and is how a client sees the
+//! turns nobody asked for over HTTP: a scheduled fire, a background outcome, an inbox item. The
+//! pause primitives park on a `oneshot::Receiver` until the client POSTs to
+//! `/v1/sessions/{id}/responses/{request_id}`, but only for a turn a streaming client attends.
 //!
 //! The HTTP API deliberately omits frontend-tool delegation (`delegate_fs_read` / `_fs_write` /
 //! `_execute`). See the HTTP API docs. The
@@ -35,23 +39,22 @@ use crate::frontend::{
 /// enough to feel instant to a human operator while consuming negligible CPU.
 const DISCONNECT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How many events the feed's broadcast channel holds ahead of a slow consumer before it lags.
+pub(crate) const FEED_BROADCAST_CAPACITY: usize = 256;
+
 /// The HTTP host's frontend, one per resident session, held on its `SessionEntry` for as long as
 /// the session is resident. A turn handler reads the recorded events out of it to assemble the JSON
 /// response body.
 ///
 /// One HttpFrontend per session. The blocking-mode recorder is a [`Mutex`] around
-/// [`Recorder`]; in streaming mode a per-turn `tokio::sync::broadcast` channel is installed
-/// on top via [`Self::install_stream`], and `emit` fans events out to both the recorder and
-/// the channel.
+/// [`Recorder`]; the session feed is installed once by [`Self::install_feed`], and `emit` fans
+/// events out to both.
 pub(crate) struct HttpFrontend {
     recorder: Mutex<Recorder>,
-    /// The current (or most recent) turn's SSE stream. Set by the turn handler before calling
-    /// `run_turn` (via [`Self::install_stream`]) and ended after (via [`Self::end_stream`]). While
-    /// its sender is live, every emitted event is translated into an `SseEvent`, published on the
-    /// broadcast, and recorded in the replay ring. `None` means no streaming turn has run on this
-    /// session yet; a `Some` whose sender is `None` means the last one has finished and only its
-    /// tail is being held for a late reconnect.
-    stream: Mutex<Option<TurnStream>>,
+    /// The session's event feed, and the turn currently publishing on it. `None` only on a
+    /// frontend nobody installed a feed on, which no resident session is; the slot exists because
+    /// the capacities come from the server's config, not from this type.
+    feed: Mutex<Option<SessionFeed>>,
     /// In-memory parking lot for mid-turn pause primitives (`request_permission` and
     /// `handle_elicitation`). The HTTP turn handler emits an SSE event with the `request_id`,
     /// then `POST /v1/sessions/{id}/responses/{request_id}` pushes the resolution through the
@@ -117,41 +120,88 @@ impl Default for SessionCapabilities {
     }
 }
 
-/// One turn's SSE event stream, retained past the end of the turn so a client that reconnects can
-/// still collect the tail.
+/// Who started a turn, as `turn.started` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TurnSource {
+    /// `POST /v1/sessions/{id}/turn`.
+    Client,
+    /// The inbox driver, on these items.
+    Inbox { item_ids: Vec<uuid::Uuid> },
+    /// A scheduled job firing.
+    Schedule { job_id: String },
+    /// Finished background work delivered as a turn of its own.
+    Background,
+}
+
+impl TurnSource {
+    /// The one spelling of this value: the `source` member of `turn.started`.
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Inbox { .. } => "inbox",
+            Self::Schedule { .. } => "schedule",
+            Self::Background => "background",
+        }
+    }
+}
+
+/// The session's SSE event stream: one channel for the life of the resident session, and a replay
+/// ring behind it.
 ///
 /// The ring is what `Last-Event-ID` resumption is built on. Everything else on this stream is
 /// additive, so a client that misses an event still holds a prefix of the truth and could limp
 /// along; the *terminal* event is not, because a client that never receives one waits forever. So
 /// the terminal is recorded here too, by the spawned turn task rather than by the response stream.
 /// That distinction is load-bearing: in the case re-attach exists for, the client's connection has
-/// dropped and axum has already discarded the response stream, so anything only that future
-/// computes is computed for nobody.
-pub(crate) struct TurnStream {
-    turn_id: uuid::Uuid,
+/// already dropped and axum has discarded the response stream, so a terminal computed there would
+/// be computed for nobody.
+pub(crate) struct SessionFeed {
+    session_id: uuid::Uuid,
     ids: Arc<EventIdGenerator>,
-    /// `None` once the turn has ended. Dropping the sender is what closes every live subscriber,
-    /// and is also how [`HttpFrontend::is_streaming`] reports the turn as over while the ring is
-    /// still held for late reconnects.
-    sender: Option<broadcast::Sender<SseEvent>>,
+    sender: broadcast::Sender<SseEvent>,
     /// Recent events, oldest first, capped at `replay_capacity`.
     replay: std::collections::VecDeque<SseEvent>,
     replay_capacity: usize,
-    /// The turn's terminal event, once known.
-    terminal: Option<SseEvent>,
-    /// When the last subscriber went away, or `None` while one is attached.
-    ///
-    /// Zero subscribers does not mean "cancel the turn, nobody is listening". That is the right
-    /// instinct (a turn with no audience is burning provider tokens for nobody) and the wrong
-    /// deadline, because the case re-attach exists for looks identical for its first instant: a
-    /// client whose connection dropped and is about to come back. The stamp turns the check into a
-    /// grace period, so a reconnect inside the window finds the turn still running.
+    /// The turn publishing right now, if one is.
+    turn: Option<LiveTurn>,
+    /// The most recent turn's terminal, keyed by its id.
+    terminal: Option<(uuid::Uuid, SseEvent)>,
+    /// Where an `inbox.delivered` also goes. The agent emits the delivery as a frontend event,
+    /// and this is the one place that event is seen with the session's identity beside it.
+    webhooks: Option<super::webhook::WebhookDispatcher>,
+}
+
+/// What the feed knows about the turn in flight.
+struct LiveTurn {
+    turn_id: uuid::Uuid,
+    /// Whether a streaming client opened this turn, which is the only case where nobody reading
+    /// means nobody waiting: a turn a driver started runs for the session, not for a connection.
+    attended: bool,
     disconnected_since: Option<std::time::Instant>,
-    /// How long to hold a turn open for a reconnect before treating the client as gone.
     reattach_grace: Duration,
 }
 
-impl TurnStream {
+impl SessionFeed {
+    fn new(
+        session_id: uuid::Uuid,
+        ids: Arc<EventIdGenerator>,
+        capacity: usize,
+        replay_capacity: usize,
+        webhooks: Option<super::webhook::WebhookDispatcher>,
+    ) -> Self {
+        let (sender, _receiver) = broadcast::channel::<SseEvent>(capacity);
+        Self {
+            session_id,
+            ids,
+            sender,
+            replay: std::collections::VecDeque::with_capacity(replay_capacity.min(64)),
+            replay_capacity,
+            turn: None,
+            terminal: None,
+            webhooks,
+        }
+    }
+
     fn record(&mut self, event: SseEvent) {
         if self.replay_capacity == 0 {
             return;
@@ -161,26 +211,62 @@ impl TurnStream {
         }
         self.replay.push_back(event);
     }
+
+    /// Number, record and broadcast one event, under the lock the caller holds so ids stay
+    /// monotonic across concurrent emitters.
+    fn publish(&mut self, event_type: SseEventType, mut data: serde_json::Value) -> SseEvent {
+        // Every event names its turn and session, so a feed subscriber can file it without
+        // per-connection state; the terminals always did, the rest join them.
+        if let Some(object) = data.as_object_mut() {
+            if let Some(turn) = &self.turn {
+                object
+                    .entry("turn_id")
+                    .or_insert_with(|| serde_json::Value::String(turn.turn_id.to_string()));
+            }
+            object
+                .entry("session_id")
+                .or_insert_with(|| serde_json::Value::String(self.session_id.to_string()));
+        }
+        let event = SseEvent {
+            id: self.ids.next(),
+            event_type,
+            data,
+        };
+        self.record(event.clone());
+        if self.sender.send(event.clone()).is_err() {
+            tracing::trace!("no consumer is attached; the event is recorded for a re-attach");
+        }
+        if event_type == SseEventType::InboxDelivered
+            && let Some(webhooks) = &self.webhooks
+        {
+            webhooks.send(
+                super::webhook::WebhookEvent::InboxDelivered,
+                event.data.clone(),
+            );
+        }
+        event
+    }
 }
 
 /// What a re-attaching client gets: the backlog it missed, plus a live subscription, taken
 /// together under one lock so nothing can be emitted in the gap between them.
 pub(crate) struct StreamAttachment {
-    pub(crate) turn_id: uuid::Uuid,
+    /// The turn in flight when the client attached, if one was.
+    pub(crate) turn_id: Option<uuid::Uuid>,
     /// Buffered events with an id greater than the client's `Last-Event-ID`, oldest first.
     pub(crate) backlog: Vec<SseEvent>,
-    /// `None` when the turn has already ended; the backlog and `terminal` are then the whole
-    /// story.
-    pub(crate) receiver: Option<broadcast::Receiver<SseEvent>>,
-    /// Present once the turn is over. A client that reconnects after the fact gets it immediately
-    /// rather than waiting on a stream that will never produce another event.
+    /// The live subscription. Always present: the feed outlives every turn.
+    pub(crate) receiver: broadcast::Receiver<SseEvent>,
+    /// The most recent turn's terminal, when the client attached with no turn in flight. A client
+    /// that reconnects after the fact gets it immediately rather than waiting on a stream that
+    /// will never produce another event for that turn.
     pub(crate) terminal: Option<SseEvent>,
     /// True when the client's `Last-Event-ID` is older than the oldest event still buffered, so
     /// the replay has a hole in it. Reported rather than papered over: a transcript with a silent
     /// gap is worse than one the client knows is incomplete.
     pub(crate) gap: bool,
     /// The position resumption should actually use, after discarding a `Last-Event-ID` that this
-    /// turn never issued.
+    /// session never issued.
     ///
     /// `None` means "send everything you have".
     ///
@@ -230,6 +316,7 @@ pub(crate) enum PermissionResolution {
 pub(crate) type Recorder = Vec<FrontendEvent>;
 
 impl HttpFrontend {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::with_capabilities(SessionCapabilities::default())
     }
@@ -237,7 +324,7 @@ impl HttpFrontend {
     pub(crate) fn with_capabilities(capabilities: SessionCapabilities) -> Self {
         Self {
             recorder: Mutex::new(Recorder::default()),
-            stream: Mutex::new(None),
+            feed: Mutex::new(None),
             pending: Arc::new(Mutex::new(HashMap::new())),
             capabilities,
             sticky: StickyApprovals::default(),
@@ -252,7 +339,7 @@ impl HttpFrontend {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Whether the last cancel was for a lagging consumer. Cleared when a new stream is installed.
+    /// Whether the last cancel was for a lagging consumer. Cleared when a new turn begins.
     pub(crate) fn canceled_for_lag(&self) -> bool {
         self.canceled_for_lag
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -263,14 +350,16 @@ impl HttpFrontend {
         self.sticky.remembered(tool_name) == Some(PermissionOutcome::Allow)
     }
 
-    /// True when an SSE consumer is currently attached. Drives the mid-turn-pause branch
-    /// selection: streaming → park in `pending`, blocking → short-circuit to safe default.
+    /// True while a streaming client's turn is in flight. Drives the mid-turn-pause branch
+    /// selection: attended → park in `pending`, anything else → short-circuit to the safe default.
+    /// A feed subscriber is not enough: it may be a bridge or a UI that shows no prompts, and a
+    /// turn nobody opened over SSE has nobody to wait on.
     fn is_streaming(&self) -> bool {
-        let guard = crate::sync::lock(&self.stream);
-        // The sender, not the slot: a `TurnStream` outlives its turn so a late reconnect can still
-        // read the tail, and treating that as "streaming" would send the next blocking turn's
-        // permission prompt to a channel nobody is listening on.
-        guard.as_ref().is_some_and(|stream| stream.sender.is_some())
+        let guard = crate::sync::lock(&self.feed);
+        guard
+            .as_ref()
+            .and_then(|feed| feed.turn.as_ref())
+            .is_some_and(|turn| turn.attended)
     }
 
     /// Resolve a pending mid-turn permission request by `request_id`. Returns true iff the entry
@@ -329,10 +418,80 @@ impl HttpFrontend {
         std::mem::take(&mut *guard)
     }
 
-    /// Install a broadcast sink so subsequent `emit()` calls publish translated SSE events on
-    /// it (in addition to recording into the blocking-mode recorder). Returns a `Receiver` the
-    /// turn handler subscribes to *before* the broadcast is installed, so no events between
-    /// install and first subscribe are lost.
+    /// Install the session's feed. Once, when the session becomes resident; a second call is a
+    /// no-op, so the first turn on a frontend a test built bare can install one too.
+    pub(crate) fn install_feed(
+        &self,
+        session_id: uuid::Uuid,
+        capacity: usize,
+        replay_capacity: usize,
+        webhooks: Option<super::webhook::WebhookDispatcher>,
+    ) {
+        let mut guard = crate::sync::lock(&self.feed);
+        guard.get_or_insert_with(|| {
+            SessionFeed::new(
+                session_id,
+                Arc::clone(&self.ids),
+                capacity,
+                replay_capacity,
+                webhooks,
+            )
+        });
+    }
+
+    /// Open a turn on the feed: subscribe, then announce it with a numbered `turn.started` that
+    /// the subscription sees first. The receiver is taken before the announcement so a streaming
+    /// handler misses nothing between the two.
+    ///
+    /// `attended` is whether a streaming client opened the turn; only then does
+    /// [`Self::client_disconnected`] apply. Installs a feed if none is, since a turn on a
+    /// frontend nobody installed one on would otherwise publish nowhere.
+    pub(crate) fn begin_turn(
+        &self,
+        turn_id: uuid::Uuid,
+        source: TurnSource,
+        attended: bool,
+        reattach_grace: Duration,
+        replay_capacity: usize,
+    ) -> (broadcast::Receiver<SseEvent>, Arc<EventIdGenerator>) {
+        self.canceled_for_lag
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut guard = crate::sync::lock(&self.feed);
+        // A frontend nobody installed a feed on gets one here rather than publishing nowhere;
+        // every resident session's was installed with its session id when it was loaded.
+        let feed = guard.get_or_insert_with(|| {
+            SessionFeed::new(
+                uuid::Uuid::nil(),
+                Arc::clone(&self.ids),
+                FEED_BROADCAST_CAPACITY,
+                replay_capacity,
+                None,
+            )
+        });
+        feed.turn = Some(LiveTurn {
+            turn_id,
+            attended,
+            disconnected_since: None,
+            reattach_grace,
+        });
+        let receiver = feed.sender.subscribe();
+        let mut data = serde_json::json!({
+            "turn_id": turn_id.to_string(),
+            "started_at": chrono::Utc::now().to_rfc3339(),
+            "source": source.name(),
+        });
+        match &source {
+            TurnSource::Inbox { item_ids } => data["item_ids"] = serde_json::json!(item_ids),
+            TurnSource::Schedule { job_id } => data["job_id"] = serde_json::json!(job_id),
+            TurnSource::Client | TurnSource::Background => {}
+        }
+        feed.publish(SseEventType::TurnStarted, data);
+        let ids = Arc::clone(&self.ids);
+        drop(guard);
+        (receiver, ids)
+    }
+
+    /// [`Self::begin_turn`] for a streaming client's own turn, which is the attended case.
     pub(crate) fn install_stream(
         &self,
         capacity: usize,
@@ -340,78 +499,63 @@ impl HttpFrontend {
         reattach_grace: Duration,
         turn_id: uuid::Uuid,
     ) -> (broadcast::Receiver<SseEvent>, Arc<EventIdGenerator>) {
-        let (sender, receiver) = broadcast::channel::<SseEvent>(capacity);
-        // The session's generator, not a fresh one: see the field docs. Ids continue across turns.
-        let ids = Arc::clone(&self.ids);
-        let mut guard = crate::sync::lock(&self.stream);
-        // Replaces any retained previous turn outright: the previous turn's tail is superseded the
-        // moment a new one starts, and a client reconnecting now wants the live one.
-        *guard = Some(TurnStream {
+        self.install_feed(uuid::Uuid::nil(), capacity, replay_capacity, None);
+        self.begin_turn(
             turn_id,
-            ids: ids.clone(),
-            sender: Some(sender),
-            replay: std::collections::VecDeque::with_capacity(replay_capacity.min(64)),
-            replay_capacity,
-            terminal: None,
-            disconnected_since: None,
+            TurnSource::Client,
+            true,
             reattach_grace,
-        });
-        drop(guard);
-        (receiver, ids)
+            replay_capacity,
+        )
     }
 
-    /// Record the turn's terminal event, so a client that re-attaches learns how it ended.
-    ///
-    /// Called from the spawned turn task, deliberately, and not from the response stream: see the
-    /// note on [`TurnStream`]. Assigning the id here rather than at the call site keeps the
-    /// per-turn sequence dense even when the response stream was dropped long ago.
+    /// Record and broadcast a turn's terminal event. Kept as the feed's terminal for a client
+    /// that reconnects after the turn is over; see [`SessionFeed`].
     pub(crate) fn record_terminal(
         &self,
         event_type: SseEventType,
         data: serde_json::Value,
     ) -> SseEvent {
-        let mut guard = crate::sync::lock(&self.stream);
-        let Some(stream) = guard.as_mut() else {
-            // Unreachable today: the only caller is the streaming turn task, which installs a
-            // stream before it spawns. Still drawn from the session generator rather than
-            // hardcoded, because ids are session-scoped now and a fabricated `0` would collide
-            // with the session's genuine first event if this ever did fire.
+        let mut guard = crate::sync::lock(&self.feed);
+        let Some(feed) = guard.as_mut() else {
             return SseEvent {
                 id: self.ids.next(),
                 event_type,
                 data,
             };
         };
-        let event = SseEvent {
-            id: stream.ids.next(),
-            event_type,
-            data,
-        };
-        stream.record(event.clone());
-        stream.terminal = Some(event.clone());
+        let turn_id = feed.turn.as_ref().map(|turn| turn.turn_id);
+        let event = feed.publish(event_type, data);
+        if let Some(turn_id) = turn_id {
+            feed.terminal = Some((turn_id, event.clone()));
+        }
         drop(guard);
         event
     }
 
-    /// How many SSE consumers are attached to the live turn right now.
-    ///
-    /// Zero once the turn's stream has ended or was never installed. Read by the stream task to
-    /// decide whether one lagging consumer speaks for the whole turn.
-    pub(crate) fn subscriber_count(&self) -> usize {
-        let guard = crate::sync::lock(&self.stream);
-        guard
-            .as_ref()
-            .and_then(|stream| stream.sender.as_ref())
-            .map_or(0, |sender| sender.receiver_count())
+    /// Publish an event the host assembled itself, one no [`FrontendEvent`] describes: an inbox
+    /// item withdrawn or given up on.
+    pub(crate) fn push_sse(&self, event_type: SseEventType, data: serde_json::Value) {
+        let mut guard = crate::sync::lock(&self.feed);
+        if let Some(feed) = guard.as_mut() {
+            feed.publish(event_type, data);
+        }
     }
 
-    /// End the turn's stream: drop the sender so live subscribers see the close, keeping the ring
-    /// and the terminal for a late reconnect. Called by the streaming turn handler's guard after
-    /// `run_turn` returns.
-    pub(crate) fn end_stream(&self) {
-        let mut guard = crate::sync::lock(&self.stream);
-        if let Some(stream) = guard.as_mut() {
-            stream.sender = None;
+    /// How many consumers are reading the feed right now.
+    pub(crate) fn subscriber_count(&self) -> usize {
+        let guard = crate::sync::lock(&self.feed);
+        guard
+            .as_ref()
+            .map_or(0, |feed| feed.sender.receiver_count())
+    }
+
+    /// Close the turn's view of the feed. The feed itself stays open: the next turn, whoever
+    /// starts it, publishes on the same channel and a subscriber keeps its position.
+    pub(crate) fn end_turn(&self) {
+        let mut guard = crate::sync::lock(&self.feed);
+        if let Some(feed) = guard.as_mut() {
+            feed.turn = None;
         }
     }
 
@@ -419,47 +563,46 @@ impl HttpFrontend {
     ///
     /// Re-read after a live subscription closes rather than trusted from the attachment snapshot:
     /// a client that attached mid-turn captured `terminal: None` because the turn had not ended
-    /// yet, and [`Self::record_terminal`] deliberately does not broadcast (the primary stream
-    /// yields its own copy from the join handle, and a broadcast one would race it into a
-    /// duplicate). So the only way a live re-attacher learns the outcome is to ask again.
-    /// Scoped to `turn_id`, because `install_stream` replaces the whole [`TurnStream`], terminal
-    /// included. A re-attacher wakes on its broadcast closing and asks again; if the next turn has
-    /// already started by then, an unscoped read would hand it the new turn's terminal (or `None`
-    /// for a turn that actually succeeded). Returning `None` on a mismatch lets the caller say what
-    /// is true: the turn ended and its outcome is no longer held here.
+    /// yet. Scoped to `turn_id`: a re-attacher that wakes after the next turn has already started
+    /// must not be handed that turn's terminal, or `None` for a turn that actually succeeded.
+    /// Returning `None` on a mismatch lets the caller say what is true: the turn ended and its
+    /// outcome is no longer held here.
     pub(crate) fn recorded_terminal(&self, turn_id: uuid::Uuid) -> Option<SseEvent> {
-        let guard = crate::sync::lock(&self.stream);
+        let guard = crate::sync::lock(&self.feed);
         guard
             .as_ref()
-            .filter(|stream| stream.turn_id == turn_id)
-            .and_then(|stream| stream.terminal.clone())
+            .and_then(|feed| feed.terminal.as_ref())
+            .filter(|(recorded, _)| *recorded == turn_id)
+            .map(|(_, event)| event.clone())
     }
 
-    /// Attach to the current turn's stream, replaying anything after `last_event_id`.
+    /// Attach to the feed, replaying anything after `last_event_id`.
     ///
     /// The backlog snapshot and the `subscribe()` happen under one lock, and [`Self::emit`] takes
     /// the same lock to append. That is what makes the replay gap-free: without it an event
     /// emitted between the snapshot and the subscribe would be in neither.
     ///
-    /// `None` when no turn has ever streamed on this session.
+    /// `None` when no feed is installed.
     pub(crate) fn attach_stream(&self, last_event_id: Option<u64>) -> Option<StreamAttachment> {
-        let mut guard = crate::sync::lock(&self.stream);
-        let stream = guard.as_mut()?;
+        let mut guard = crate::sync::lock(&self.feed);
+        let feed = guard.as_mut()?;
         // Someone is listening again, so the grace clock restarts. Cleared here and not only in
         // `client_disconnected`, which the agent loop reaches at provider-round boundaries: a
         // client that reconnects and drops again before the next boundary would otherwise have its
         // second grace measured from the *first* disconnect, and so get almost none of it.
-        stream.disconnected_since = None;
+        if let Some(turn) = feed.turn.as_mut() {
+            turn.disconnected_since = None;
+        }
         // Ids are session-monotonic, so an id at or above the high-water mark was never issued
         // here at all -- a fabricated value, or one carried over from a different session. Discard
         // it rather than filter against it, which would silently deliver nothing.
-        let stale = last_event_id.is_some_and(|last| last >= stream.ids.peek());
+        let stale = last_event_id.is_some_and(|last| last >= feed.ids.peek());
         let resume_from = if stale { None } else { last_event_id };
-        // Taking `pending` while holding `stream` is safe in this order only: `request_permission`
-        // releases `pending` before it acquires `stream` (see `park_permission` / `emit_pause`),
-        // and `resolve_permission` never touches `stream` at all, so there is no inversion.
+        // Taking `pending` while holding `feed` is safe in this order only: `request_permission`
+        // releases `pending` before it acquires `feed` (see `park_permission` / `emit_pause`),
+        // and `resolve_permission` never touches `feed` at all, so there is no inversion.
         let still_pending = crate::sync::lock(&self.pending);
-        let backlog: Vec<SseEvent> = stream
+        let backlog: Vec<SseEvent> = feed
             .replay
             .iter()
             .filter(|event| resume_from.is_none_or(|last| event.id > last))
@@ -484,23 +627,30 @@ impl HttpFrontend {
         // resuming from exactly the oldest retained id is contiguous.
         //
         // A client that names no `Last-Event-ID` is joining, not resuming, and has lost nothing:
-        // warning it about the events before it arrived would fire on every first attach, since
-        // the ring never holds the `turn.started` the response stream generates for itself. A
+        // warning it about the events before it arrived would fire on every first attach. A
         // *stale* id is always a gap, because whatever the client was following has ended.
         let gap = stale
-            || match (resume_from, stream.replay.front()) {
+            || match (resume_from, feed.replay.front()) {
                 (Some(last), Some(oldest)) => oldest.id > last.saturating_add(1),
                 // Replay is switched off (`stream_replay_events = 0`), so a client resuming from a
                 // position has been handed nothing between there and now. Reporting no gap would
                 // be the silent truncation the notice exists to rule out.
-                (Some(_), None) => stream.replay_capacity == 0,
+                (Some(_), None) => feed.replay_capacity == 0,
                 _ => false,
             };
+        let turn_id = feed.turn.as_ref().map(|turn| turn.turn_id);
+        // Handed over only when no turn is running: with one in flight, the live subscription is
+        // where its terminal will arrive, and the previous turn's is history the ring already
+        // replays.
+        let terminal = match turn_id {
+            Some(_) => None,
+            None => feed.terminal.as_ref().map(|(_, event)| event.clone()),
+        };
         let attachment = StreamAttachment {
-            turn_id: stream.turn_id,
+            turn_id,
             backlog,
-            receiver: stream.sender.as_ref().map(|sender| sender.subscribe()),
-            terminal: stream.terminal.clone(),
+            receiver: feed.sender.subscribe(),
+            terminal,
             gap,
             resume_from,
         };
@@ -521,58 +671,29 @@ impl HttpFrontend {
         }
     }
 
-    /// Surface a `warn`-level diagnostic notice from a safe-default short-circuit (an approval
-    /// refused without asking, an MCP elicitation declined). The notice ends up in *both* sinks
-    /// (recorder for blocking-mode JSON, broadcast for SSE).
+    /// Record a warn-level notice in the recorder (and broadcast it if streaming) without
+    /// going through the `Frontend::emit` trait method, so it can be called from a context that
+    /// already holds `&self` in a non-async fashion.
     async fn record_warn_notice(&self, notice: Notice) {
         self.emit(FrontendEvent::Notice(notice)).await;
     }
-}
 
-impl Default for HttpFrontend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl HttpFrontend {
-    /// Deliver one event to the live stream, when there is one, and to the recorder.
-    ///
-    /// The whole of [`Frontend::emit`], synchronous, for the scheduler hooks: they run under a
-    /// trait method that is not `async`, and nothing in here awaits.
+    /// Publish an event to the feed and the recorder. Public so a host can push a frontend event
+    /// it assembled itself, such as the prompt of a scheduled fire.
     pub(crate) fn push_event(&self, event: FrontendEvent) {
-        // Push to the broadcast (if streaming) BEFORE recording, so a slow blocking-mode Mutex
-        // can't delay live subscribers.
+        // Push to the broadcast BEFORE recording, so a slow blocking-mode Mutex can't delay live
+        // subscribers.
         //
-        // The stream lock is held across the entire broadcast block (`ids.next()` + `send`) so
-        // concurrent emitters can't reorder monotonic ids. `broadcast::Sender::send` is
-        // synchronous, so there's no await-under-lock hazard.
+        // The feed lock is held across the entire publish (`ids.next()` + `send`) so concurrent
+        // emitters can't reorder monotonic ids. `broadcast::Sender::send` is synchronous, so
+        // there's no await-under-lock hazard.
         {
-            let mut guard = crate::sync::lock(&self.stream);
-            if let Some(stream) = guard.as_mut()
-                && let Some(sender) = stream.sender.clone()
+            let mut guard = crate::sync::lock(&self.feed);
+            if let Some(feed) = guard.as_mut()
                 && self.event_passes_capability_filter(&event)
                 && let Some((event_type, data)) = translate(event.clone(), self.capabilities)
             {
-                let sse = SseEvent {
-                    id: stream.ids.next(),
-                    event_type,
-                    data,
-                };
-                // Recorded before sending, so an event is in the replay ring by the time any
-                // subscriber can observe it. The reverse order would let a client re-attach in
-                // the window between and miss it in both places.
-                stream.record(sse.clone());
-                // `send` returns Err only when there are no subscribers: that means the SSE
-                // client has disconnected. The recorder still gets the event so the turn
-                // handler can produce the blocking-mode JSON fallback (or in the streaming
-                // case, just discard the events after run_turn returns). The ring keeps it
-                // either way, which is what a re-attaching client reads back.
-                if sender.send(sse).is_err() {
-                    tracing::trace!(
-                        "no consumer is attached; the event is recorded for a re-attach"
-                    );
-                }
+                feed.publish(event_type, data);
             }
         }
 
@@ -588,15 +709,11 @@ impl Frontend for HttpFrontend {
     }
 
     async fn request_permission(&self, request: PermissionRequest) -> PermissionOutcome {
-        // Honor sticky decisions recorded earlier this session; they short-circuit before any SSE
-        // pause event so the client never sees the same tool prompted twice.
         if let Some(remembered) = self.sticky.remembered(&request.tool_name) {
             return remembered;
         }
 
         if !self.is_streaming() {
-            // Blocking mode: no SSE channel to ask through. Refuse without asking and surface the
-            // misconfiguration signal in the response so the operator notices.
             self.record_warn_notice(Notice::approval_refused_without_asking_because(
                 &request.tool_name,
                 "a blocking turn has no channel to approve on; use `stream: true`",
@@ -606,8 +723,6 @@ impl Frontend for HttpFrontend {
         }
 
         if !self.capabilities.supports_permission_prompts {
-            // Streaming, but the client told us it has nowhere to show a prompt. Parking would
-            // burn the full timeout and refuse anyway; do it now and say why.
             self.record_warn_notice(Notice::approval_refused_without_asking_because(
                 &request.tool_name,
                 "the session declared supports_permission_prompts=false; raise its permission \
@@ -617,9 +732,6 @@ impl Frontend for HttpFrontend {
             return PermissionOutcome::Deny;
         }
 
-        // Streaming mode: emit a permission_required event and park on a oneshot for the
-        // matching POST /responses/{request_id}. Race against per-turn cancellation and the
-        // approval timeout so the agent loop never blocks indefinitely.
         let request_id = format!("req_{}", uuid::Uuid::new_v4());
         let (sender, receiver) = oneshot::channel::<PermissionOutcome>();
         {
@@ -630,13 +742,11 @@ impl Frontend for HttpFrontend {
             });
         }
 
-        // Hold the stream lock across `ids.next()` + `sender.send()` to preserve monotonic id
+        // Hold the feed lock across `ids.next()` + `sender.send()` to preserve monotonic id
         // ordering, mirroring `emit()`.
         {
-            let mut guard = crate::sync::lock(&self.stream);
-            if let Some(stream) = guard.as_mut()
-                && let Some(sender) = stream.sender.clone()
-            {
+            let mut guard = crate::sync::lock(&self.feed);
+            if let Some(feed) = guard.as_mut() {
                 let payload = serde_json::to_value(PermissionRequiredEvent {
                     request_id: request_id.clone(),
                     tool_name: request.tool_name.clone(),
@@ -647,19 +757,9 @@ impl Frontend for HttpFrontend {
                     tracing::warn!("failed to serialize the permission_required payload: {error}");
                     serde_json::Value::Null
                 });
-                let event = SseEvent {
-                    id: stream.ids.next(),
-                    event_type: SseEventType::PermissionRequired,
-                    data: payload,
-                };
                 // Recorded like any other event: a client that reconnects mid-pause has to learn
                 // that the turn is waiting on it, or the turn sits there until the timeout.
-                stream.record(event.clone());
-                if sender.send(event).is_err() {
-                    tracing::trace!(
-                        "no consumer is attached; the event is recorded for a re-attach"
-                    );
-                }
+                feed.publish(SseEventType::PermissionRequired, payload);
             }
         }
 
@@ -730,11 +830,9 @@ impl Frontend for HttpFrontend {
     /// one re-emits a whole message only once the provider call has returned `Ok`, past its own
     /// retry loop.
     ///
-    /// The second half is [`Self::is_streaming`] rather than a slot test of its own, for exactly
-    /// the reason that method's own comment gives: a `TurnStream` outlives its turn so a late
-    /// reconnect can read the tail, so the slot stays occupied for the rest of the session once any
-    /// turn has streamed. Asking whether the slot is filled answers "yes" for every later blocking
-    /// turn on that session.
+    /// The second half is [`Self::is_streaming`], which asks about the turn in flight rather than
+    /// about the feed: the feed is always there, and a feed subscriber may well be reading whole
+    /// blocks off `GET /messages` afterwards.
     fn retains_reasoning(&self) -> bool {
         self.capabilities.supports_reasoning_stream && self.is_streaming()
     }
@@ -743,31 +841,37 @@ impl Frontend for HttpFrontend {
     ///
     /// Zero remaining subscribers means the SSE consumer has dropped, and the agent loop
     /// short-circuits so we don't keep burning provider tokens for an audience that has gone away.
-    /// It reports the disconnect only once the count has been zero for
-    /// [`TurnStream::reattach_grace`], because a client whose connection dropped a moment ago and
-    /// one that is never coming back are the same observation until the window expires. A
-    /// reconnect through [`Self::attach_stream`] clears the stamp on its next poll.
+    /// It reports the disconnect only once the count has been zero for the turn's reattach grace,
+    /// because a client whose connection dropped a moment ago and one that is never coming back
+    /// are the same observation until the window expires. A reconnect through
+    /// [`Self::attach_stream`] clears the stamp on its next poll.
     ///
-    /// Blocking mode (no stream installed) has no transport-level disconnect to observe until the
-    /// response writes complete, so the trait default `false` stands there.
+    /// Only an attended turn can be disconnected from. A blocking turn has no transport-level
+    /// disconnect to observe until the response writes complete, and a turn a driver started runs
+    /// for the session whether or not anybody is reading, so the trait default `false` stands for
+    /// both.
     fn client_disconnected(&self) -> bool {
-        let mut guard = crate::sync::lock(&self.stream);
-        let Some(stream) = guard.as_mut() else {
+        let mut guard = crate::sync::lock(&self.feed);
+        let Some(feed) = guard.as_mut() else {
             return false;
         };
-        let Some(sender) = stream.sender.as_ref() else {
+        let receivers = feed.sender.receiver_count();
+        let Some(turn) = feed.turn.as_mut() else {
             return false;
         };
-        if sender.receiver_count() > 0 {
-            stream.disconnected_since = None;
+        if !turn.attended {
+            return false;
+        }
+        if receivers > 0 {
+            turn.disconnected_since = None;
             return false;
         }
         // Stamped and evaluated in one step so a zero grace means exactly no grace, rather than
         // "one poll interval": the first observation would otherwise always report `false`.
-        let since = *stream
+        let since = *turn
             .disconnected_since
             .get_or_insert_with(std::time::Instant::now);
-        let grace = stream.reattach_grace;
+        let grace = turn.reattach_grace;
         drop(guard);
         since.elapsed() >= grace
     }
@@ -1050,18 +1154,20 @@ mod tests {
             .emit(FrontendEvent::AssistantTextDelta("answer".into()))
             .await;
         // Drop the stream to close the broadcast and drain.
-        frontend.end_stream();
+        frontend.end_turn();
         let mut events = Vec::new();
         while let Ok(event) = receiver.try_recv() {
             events.push(event);
         }
+        // The feed opens every turn with its `turn.started`; after it, only the assistant delta.
         assert_eq!(
             events.len(),
-            1,
+            2,
             "only the assistant delta should reach the SSE stream when reasoning is off"
         );
+        assert_eq!(events[0].event_type, super::SseEventType::TurnStarted);
         assert_eq!(
-            events[0].event_type,
+            events[1].event_type,
             super::SseEventType::AssistantTextDelta
         );
 
@@ -1081,7 +1187,9 @@ mod tests {
         frontend
             .emit(FrontendEvent::ThinkingDelta("musing".into()))
             .await;
-        frontend.end_stream();
+        frontend.end_turn();
+        let opening = receiver.try_recv().expect("the turn's opening is first");
+        assert_eq!(opening.event_type, super::SseEventType::TurnStarted);
         let event = receiver.try_recv().expect("thinking event should stream");
         assert_eq!(event.event_type, super::SseEventType::ThinkingDelta);
     }
@@ -1173,6 +1281,8 @@ mod tests {
         });
         wait_for_pending(&frontend, 1).await;
 
+        let opening = receiver.try_recv().expect("the turn's opening is first");
+        assert_eq!(opening.event_type, SseEventType::TurnStarted);
         let event = receiver
             .try_recv()
             .expect("the pause event is on the stream");
@@ -1295,7 +1405,7 @@ mod tests {
         assert!(!frontend.client_disconnected(), "grace period starts");
 
         let attachment = frontend.attach_stream(None).expect("a stream is installed");
-        let _receiver = attachment.receiver.expect("the turn is still live");
+        let _receiver = attachment.receiver;
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(
             !frontend.client_disconnected(),
@@ -1322,8 +1432,9 @@ mod tests {
             3,
             "the ring holds its capacity, not the history"
         );
+        // Id 0 is the turn's own `turn.started`; the five chunks are 1 to 5.
         assert_eq!(
-            all.backlog[0].id, 2,
+            all.backlog[0].id, 3,
             "oldest-first eviction keeps the newest three"
         );
         assert!(
@@ -1331,18 +1442,18 @@ mod tests {
             "a client naming no Last-Event-ID is joining, not resuming, so it has lost nothing"
         );
 
-        let resumed = frontend.attach_stream(Some(3)).expect("stream installed");
+        let resumed = frontend.attach_stream(Some(4)).expect("stream installed");
         let ids: Vec<u64> = resumed.backlog.iter().map(|event| event.id).collect();
-        assert_eq!(ids, vec![4], "resume delivers strictly after the given id");
+        assert_eq!(ids, vec![5], "resume delivers strictly after the given id");
         assert!(
             !resumed.gap,
-            "id 3 is still buffered, so the replay is contiguous"
+            "id 4 is still buffered, so the replay is contiguous"
         );
 
         let stale = frontend.attach_stream(Some(0)).expect("stream installed");
         assert!(
             stale.gap,
-            "resuming from id 0 when the ring starts at 2 skips event 1, and must say so"
+            "resuming from id 0 when the ring starts at 3 skips events 1 and 2, and must say so"
         );
     }
 
@@ -1359,14 +1470,14 @@ mod tests {
             SseEventType::TurnFinished,
             serde_json::json!({"stop_reason": "end_turn"}),
         );
-        frontend.end_stream();
+        frontend.end_turn();
 
         let attachment = frontend
             .attach_stream(None)
             .expect("stream retained past the turn");
         assert!(
-            attachment.receiver.is_none(),
-            "the turn is over; there is nothing live left to subscribe to"
+            attachment.turn_id.is_none(),
+            "the turn is over; the feed stays open for the next one"
         );
         let terminal = attachment.terminal.expect("terminal must be retained");
         assert_eq!(terminal.event_type, SseEventType::TurnFinished);
@@ -1440,7 +1551,7 @@ mod tests {
         let (_receiver, _ids) =
             frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
         assert!(frontend.is_streaming());
-        frontend.end_stream();
+        frontend.end_turn();
         assert!(
             !frontend.is_streaming(),
             "the ring outlives the turn; the streaming mode must not"

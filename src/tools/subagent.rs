@@ -899,6 +899,12 @@ pub(crate) fn register_subagent_tools(
         }),
     ));
     tools.push((
+        "agent_steer",
+        Arc::new(AgentSteerTool {
+            tool_builder_params: params.clone(),
+        }),
+    ));
+    tools.push((
         "agent_delete",
         Arc::new(AgentDeleteTool {
             tool_builder_params: params,
@@ -906,7 +912,7 @@ pub(crate) fn register_subagent_tools(
         }),
     ));
 
-    // All four or none, gated on `agent_spawn`. The three lifecycle tools only ever operate on what
+    // All five or none, gated on `agent_spawn`. The four lifecycle tools only ever operate on what
     // `agent_spawn` produced, so an agent that cannot delegate has nothing for them to act on, and
     // `disabled_tools = ["agent_spawn"]` means "no delegation", not "no new delegation while
     // keeping the ability to drive workers a previous run left behind".
@@ -940,10 +946,11 @@ pub(crate) fn agent_tools_registered(
 }
 
 /// The family [`agent_tools_registered`] decides about, for a listing that shows it as denied.
-pub(crate) const AGENT_TOOL_NAMES: [&str; 4] = [
+pub(crate) const AGENT_TOOL_NAMES: [&str; 5] = [
     "agent_spawn",
     "agent_list",
     "agent_followup",
+    "agent_steer",
     "agent_delete",
 ];
 
@@ -1021,8 +1028,9 @@ pub(crate) fn agent_list_definition() -> ToolDefinition {
         name: "agent_list".to_string(),
         description: "List the sub-agents you have spawned in this session, with each one's \
                       id, working directory, turn count, and last activity. Pass an id to \
-                      `agent_followup` to ask it another question, or to `agent_delete` to \
-                      discard it and free what it held."
+                      `agent_followup` to ask it another question, to `agent_steer` to send it \
+                      a message without waiting, or to `agent_delete` to discard it and free \
+                      what it held."
             .to_string(),
         parameters: serde_json::json!({ "type": "object", "properties": {} }),
         ..Default::default()
@@ -1108,6 +1116,107 @@ impl Tool for AgentListTool {
             ));
         }
         Ok(ToolOutput::text(lines.join("\n"), false))
+    }
+}
+
+/// Puts a message in a sub-agent's inbox without waiting on it.
+///
+/// The child runs the same loop as its parent, so the message is read where any inbox item is:
+/// at the child's next round boundary while it runs, or at the opening of its next follow-up
+/// once it has finished. Which of the two happens is not this tool's to know, and it does not
+/// need to: nothing is stranded either way.
+pub(crate) struct AgentSteerTool {
+    pub(crate) tool_builder_params: ToolBuilderParams,
+}
+
+/// `agent_steer`'s schema. Free-standing for the reason [`agent_spawn_definition`] is.
+pub(crate) fn agent_steer_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "agent_steer".to_string(),
+        description: "Send a message to a sub-agent you already spawned, without waiting for it: \
+                      a correction, a change of course, something it should know. A sub-agent \
+                      that is running reads it at its next step, or at once with `interrupt`; \
+                      one that has finished reads it at the start of your next `agent_followup` \
+                      to it. Returns at once, with no answer. Use `agent_followup` when you want \
+                      the sub-agent's reply."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "The sub-agent's id, as returned by `agent_spawn` or \
+                                    `agent_list`."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "What to tell it."
+                },
+                "interrupt": {
+                    "type": "boolean",
+                    "description": "Cut the answer the sub-agent is writing so it reads this \
+                                    now rather than after its current step; a tool it is running \
+                                    still finishes first. Only when that answer is being wasted. \
+                                    Default false."
+                }
+            },
+            "required": ["id", "message"]
+        }),
+        ..Default::default()
+    }
+}
+
+#[async_trait]
+impl Tool for AgentSteerTool {
+    fn definition(&self) -> ToolDefinition {
+        agent_steer_definition()
+    }
+
+    fn required_permission(&self) -> Permission {
+        Permission::Read
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        _context: crate::tools::ToolContext,
+    ) -> Result<ToolOutput> {
+        let message = super::util::require_str(&input, "message", "agent_steer")?;
+        let interrupt = input["interrupt"].as_bool().unwrap_or(false);
+        let (_parent_sid, row) =
+            require_child_session(&self.tool_builder_params, "agent_steer", &input).await?;
+        let class = if interrupt {
+            crate::store::inbox::InboxClass::Interrupt
+        } else {
+            crate::store::inbox::InboxClass::Steer
+        };
+        let item = crate::store::inbox::NewInboxItem::from_parts(
+            row.id,
+            class,
+            "your parent agent",
+            message,
+        )?;
+        self.tool_builder_params
+            .materials
+            .store
+            .inbox_store()
+            .enqueue(item)
+            .await
+            .map_err(|error| MekaError::ToolExecution {
+                tool_name: "agent_steer".to_string(),
+                message: format!("failed to record the message: {error}"),
+            })?;
+        let when = if interrupt {
+            "It stops the answer it is writing to read this, finishes a tool it is running first, \
+             or reads it at the start of your next `agent_followup` to it if it has finished."
+        } else {
+            "It reads this at its next step if it is running, or at the start of your next \
+             `agent_followup` to it."
+        };
+        Ok(ToolOutput::text(
+            format!("Queued for sub-agent {}. {when}", row.id),
+            false,
+        ))
     }
 }
 
@@ -1440,7 +1549,16 @@ impl Tool for AgentFollowupTool {
             .lock_session(agent_id)
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "agent_followup".to_string(),
-                message: format!("cannot follow up on sub-agent {agent_id}: {error}"),
+                message: match error {
+                    // The holder is a turn on this worker: its spawn or follow-up detached with
+                    // `background: true`, still running. The model wants to reach it, and the
+                    // door for that is the inbox, not a second turn.
+                    MekaError::SessionLocked(_) => format!(
+                        "sub-agent '{agent_id}' is still running; reach it with `agent_steer` \
+                         until it finishes."
+                    ),
+                    error => format!("cannot follow up on sub-agent {agent_id}: {error}"),
+                },
             })?;
 
         // The row has to follow the build, for the reason `agent_spawn` writes it from the same
@@ -3158,8 +3276,9 @@ mod tests {
             .await
             .expect_err("a worker somebody else is running must not be run again");
         assert!(
-            refused.to_string().contains("cannot follow up"),
-            "and the refusal has to name the worker: {refused}"
+            refused.to_string().contains(&worker.to_string())
+                && refused.to_string().contains("still running"),
+            "and the refusal has to name the worker and what it is doing: {refused}"
         );
     }
 
@@ -3214,13 +3333,18 @@ mod tests {
             tool_builder_params: params.clone().on_provider(Arc::clone(&provider)),
             in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
-        followup
+        let error = followup
             .execute(
                 serde_json::json!({ "id": worker.to_string(), "prompt": "carry on" }),
                 crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("the held lock refuses the follow-up");
+        assert!(
+            error.to_string().contains("still running")
+                && error.to_string().contains("`agent_steer`"),
+            "the refusal says what is happening and names the door that is open: {error}"
+        );
 
         assert_eq!(
             store
@@ -4119,6 +4243,7 @@ mod tests {
             "agent_list",
             "agent_followup",
             "agent_delete",
+            "agent_steer",
         ] {
             assert!(permitted.get(name).is_some(), "expected '{name}'");
         }
@@ -4134,6 +4259,7 @@ mod tests {
             "agent_list",
             "agent_followup",
             "agent_delete",
+            "agent_steer",
         ] {
             assert!(
                 filtered.get(name).is_none(),
@@ -4537,6 +4663,396 @@ mod tests {
 
     /// A session may only drive its own workers. This also covers a forked parent, whose copied
     /// conversation names children that are still linked to the original session.
+    /// The text blocks of the last user message of a request, in order.
+    fn last_user_text_blocks(request: &[crate::conversation::Message]) -> Vec<String> {
+        request
+            .iter()
+            .rev()
+            .find(|message| message.role == crate::conversation::Role::User)
+            .map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        crate::conversation::ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A steer written to a worker that has finished waits in its inbox; the next follow-up's
+    /// opening carries it after the follow-up's own words, so nothing is stranded.
+    #[tokio::test]
+    async fn a_steer_written_after_a_worker_finished_opens_its_next_followup() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent session");
+        let parent_session = crate::session::SharedSessionId::new(Some(parent_sid));
+        let mock = Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
+            text_round("first answer"),
+            text_round("second answer"),
+        ]));
+        let provider: Arc<dyn Provider> = Arc::clone(&mock) as Arc<dyn Provider>;
+        let params = params_for_test(store.clone(), parent_session.clone());
+        let permission = SharedPermission::new(Permission::Unrestricted, EnabledPermissions::ALL);
+
+        let spawn = AgentSpawnTool {
+            parent_permission: permission.clone(),
+            tool_builder_params: params.clone().on_provider(Arc::clone(&provider)),
+            inherited_denials: ToolDenials::default(),
+            remaining_depth: 1,
+            absolute_depth: 0,
+        };
+        let text = spawn
+            .execute(
+                serde_json::json!({ "prompt": "look into it", "permission": "read" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds")
+            .text_content();
+        let agent_id: Uuid = text
+            .lines()
+            .find_map(|line| line.strip_prefix("agent: "))
+            .and_then(|id| Uuid::parse_str(id.trim()).ok())
+            .unwrap_or_else(|| panic!("spawn must return a usable agent id, got: {text}"));
+
+        let steer = AgentSteerTool {
+            tool_builder_params: params.clone(),
+        };
+        let queued = steer
+            .execute(
+                serde_json::json!({ "id": agent_id.to_string(), "message": "check the dates too" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("steer succeeds")
+            .text_content();
+        assert!(queued.contains("Queued for sub-agent"), "{queued}");
+        assert_eq!(
+            store
+                .inbox_store()
+                .list_open(agent_id)
+                .await
+                .expect("list")
+                .len(),
+            1,
+            "the message waits in the worker's inbox"
+        );
+
+        let followup = AgentFollowupTool {
+            parent_permission: permission,
+            tool_builder_params: params.clone().on_provider(Arc::clone(&provider)),
+            in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+        followup
+            .execute(
+                serde_json::json!({ "id": agent_id.to_string(), "prompt": "and then?" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("followup succeeds");
+
+        let requests = mock.completions();
+        let blocks = last_user_text_blocks(&requests[1]);
+        assert_eq!(blocks.len(), 2, "the words, then the steer: {blocks:?}");
+        // A worker's words carry its environment context ahead of them.
+        assert!(blocks[0].ends_with("and then?"), "{}", blocks[0]);
+        assert!(
+            blocks[1].starts_with("[Message from your parent agent, arrived ")
+                && blocks[1].ends_with("]\ncheck the dates too"),
+            "{}",
+            blocks[1]
+        );
+        assert!(
+            store
+                .inbox_store()
+                .list_open(agent_id)
+                .await
+                .expect("list")
+                .is_empty(),
+            "the follow-up's accepted request delivered it"
+        );
+    }
+
+    /// A steer written while the worker runs lands at its next round boundary, after that
+    /// round's tool results, without the parent waiting for anything.
+    #[tokio::test]
+    async fn a_steer_written_while_a_worker_runs_lands_after_its_next_round() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent session");
+        let parent_session = crate::session::SharedSessionId::new(Some(parent_sid));
+        // The worker's first round waits long enough for the steer to be written before its tool
+        // runs; the boundary after that tool is where the steer lands.
+        let mock = Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
+            vec![
+                crate::provider::mock::MockEvent::Sleep { ms: 800 },
+                crate::provider::mock::MockEvent::ToolUseStart {
+                    id: "call-0".to_string(),
+                    name: "does_not_exist".to_string(),
+                },
+                crate::provider::mock::MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                crate::provider::mock::MockEvent::MessageEnd {
+                    stop_reason: crate::provider::mock::MockStopReason::ToolUse,
+                },
+            ],
+            text_round("done"),
+        ]));
+        let provider: Arc<dyn Provider> = Arc::clone(&mock) as Arc<dyn Provider>;
+        let mut params = params_for_test(store.clone(), parent_session.clone());
+        params.parent_options.streaming = true;
+
+        let spawn = AgentSpawnTool {
+            parent_permission: SharedPermission::new(
+                Permission::Unrestricted,
+                EnabledPermissions::ALL,
+            ),
+            tool_builder_params: params.clone().on_provider(Arc::clone(&provider)),
+            inherited_denials: ToolDenials::default(),
+            remaining_depth: 1,
+            absolute_depth: 0,
+        };
+        let running = tokio::spawn(async move {
+            spawn
+                .execute(
+                    serde_json::json!({ "prompt": "look into it", "permission": "read" }),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
+                .await
+                .expect("spawn succeeds")
+                .text_content()
+        });
+
+        // The worker's row exists before its turn runs, which is when the parent can name it.
+        let mut child = None;
+        for _ in 0..250 {
+            let tree = store.load_session_tree(parent_sid).await.expect("tree");
+            child = tree
+                .iter()
+                .find(|row| row.parent_id == Some(parent_sid))
+                .map(|row| row.id);
+            if child.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let child = child.expect("the worker's row appears while it runs");
+        let steer = AgentSteerTool {
+            tool_builder_params: params.clone(),
+        };
+        steer
+            .execute(
+                serde_json::json!({ "id": child.to_string(), "message": "narrow it to 2026" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("steer succeeds");
+
+        let text = running.await.expect("the spawn task");
+        assert!(text.contains("done"), "{text}");
+        let requests = mock.streams();
+        assert_eq!(requests.len(), 2, "the tool round and the request after it");
+        let boundary = requests[1]
+            .messages
+            .last()
+            .expect("the second request ends on the round's results");
+        assert!(
+            matches!(
+                boundary.content.first(),
+                Some(crate::conversation::ContentBlock::ToolResult { .. })
+            ),
+            "the results lead the message: {boundary:?}"
+        );
+        let blocks = last_user_text_blocks(&requests[1].messages);
+        assert_eq!(blocks.len(), 1, "one steer, one block: {blocks:?}");
+        assert!(
+            blocks[0].contains("while you were working]\nnarrow it to 2026"),
+            "{}",
+            blocks[0]
+        );
+    }
+
+    /// With `interrupt`, the parent does not wait for the worker's current answer either: the
+    /// stream is cut, what had streamed stays as the worker's answer so far, and the message is
+    /// the next thing the worker reads, all inside the worker's one turn.
+    #[tokio::test]
+    async fn an_interrupt_from_the_parent_cuts_the_answer_a_worker_is_writing() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent session");
+        let parent_session = crate::session::SharedSessionId::new(Some(parent_sid));
+        let mock = Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
+            vec![
+                crate::provider::mock::MockEvent::Text {
+                    text: "half of the report".to_string(),
+                },
+                crate::provider::mock::MockEvent::Sleep { ms: 5000 },
+                crate::provider::mock::MockEvent::Text {
+                    text: " and the rest, never sent".to_string(),
+                },
+                crate::provider::mock::MockEvent::MessageEnd {
+                    stop_reason: crate::provider::mock::MockStopReason::EndTurn,
+                },
+            ],
+            text_round("done"),
+        ]));
+        let provider: Arc<dyn Provider> = Arc::clone(&mock) as Arc<dyn Provider>;
+        let mut params = params_for_test(store.clone(), parent_session.clone());
+        params.parent_options.streaming = true;
+
+        let spawn = AgentSpawnTool {
+            parent_permission: SharedPermission::new(
+                Permission::Unrestricted,
+                EnabledPermissions::ALL,
+            ),
+            tool_builder_params: params.clone().on_provider(Arc::clone(&provider)),
+            inherited_denials: ToolDenials::default(),
+            remaining_depth: 1,
+            absolute_depth: 0,
+        };
+        let running = tokio::spawn(async move {
+            spawn
+                .execute(
+                    serde_json::json!({ "prompt": "write the report", "permission": "read" }),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
+                .await
+                .expect("spawn succeeds")
+                .text_content()
+        });
+
+        let mut child = None;
+        for _ in 0..250 {
+            let tree = store.load_session_tree(parent_sid).await.expect("tree");
+            child = tree
+                .iter()
+                .find(|row| row.parent_id == Some(parent_sid))
+                .map(|row| row.id);
+            if child.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let child = child.expect("the worker's row appears while it runs");
+        // Past the first text, so there is an answer under way to cut.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let steer = AgentSteerTool {
+            tool_builder_params: params.clone(),
+        };
+        let queued = steer
+            .execute(
+                serde_json::json!({
+                    "id": child.to_string(),
+                    "message": "stop, summarize instead",
+                    "interrupt": true
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("steer succeeds")
+            .text_content();
+        assert!(
+            queued.contains("stops the answer it is writing"),
+            "{queued}"
+        );
+        let cut_at = std::time::Instant::now();
+
+        let text = running.await.expect("the spawn task");
+        assert!(text.contains("done"), "{text}");
+        assert!(
+            cut_at.elapsed() < std::time::Duration::from_secs(3),
+            "the worker did not wait out its stalled answer: {:?}",
+            cut_at.elapsed()
+        );
+        let requests = mock.streams();
+        assert_eq!(requests.len(), 2, "the cut request and the one after it");
+        let tail = &requests[1].messages;
+        let partial = &tail[tail.len() - 2];
+        assert_eq!(partial.role, crate::conversation::Role::Assistant);
+        assert_eq!(partial.text_content(), "half of the report");
+        let blocks = last_user_text_blocks(tail);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "the message is the next thing it reads: {blocks:?}"
+        );
+        assert!(
+            blocks[0].starts_with("[Message from your parent agent, arrived ")
+                && blocks[0].contains("while you were working]\nstop, summarize instead"),
+            "{}",
+            blocks[0]
+        );
+        assert!(
+            store
+                .inbox_store()
+                .list_open(child)
+                .await
+                .expect("list")
+                .is_empty(),
+            "the request after the cut delivered it"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_steer_refuses_a_session_that_is_not_the_parent() {
+        let store = store_for_test().await;
+        let owner = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("owner");
+        let stranger = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("stranger");
+        let child = store
+            .create_child_session(
+                owner,
+                None,
+                Vec::new(),
+                Some("{\"permission\":\"read\"}".to_string()),
+                "read".to_string(),
+                "test-profile".to_string(),
+            )
+            .await
+            .expect("child")
+            .0;
+        let params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(stranger)),
+        );
+        let steer = AgentSteerTool {
+            tool_builder_params: params,
+        };
+        let error = steer
+            .execute(
+                serde_json::json!({ "id": child.to_string(), "message": "hello" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a stranger's worker must be refused");
+        assert!(error.to_string().contains("belongs to this session"));
+        assert!(
+            store
+                .inbox_store()
+                .list_open(child)
+                .await
+                .expect("list")
+                .is_empty(),
+            "a refused steer writes nothing"
+        );
+    }
+
     #[tokio::test]
     async fn followup_and_delete_refuse_a_session_that_is_not_the_parent() {
         let store = store_for_test().await;

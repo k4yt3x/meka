@@ -68,11 +68,11 @@ retry: 3000
 
 event: turn.started
 id: 0
-data: {"turn_id":"...","session_id":"...","started_at":"2026-05-26T13:45:12Z"}
+data: {"turn_id":"...","session_id":"...","started_at":"2026-05-26T13:45:12Z","source":"client"}
 
 event: assistant_text.delta
 id: 1
-data: {"text":"This project is "}
+data: {"text":"This project is ","turn_id":"...","session_id":"..."}
 
 event: assistant_text.delta
 id: 2
@@ -94,6 +94,8 @@ event: turn.finished
 id: 12
 data: {"turn_id":"...","session_id":"...","stop_reason":"end_turn","usage":{"input_tokens":12340,"output_tokens":567,...}}
 ```
+
+Every payload carries `turn_id` and `session_id`; the later events above elide them.
 
 ## Core concepts
 
@@ -312,7 +314,9 @@ POST   /v1/sessions/{id}/turn     Submit a turn
 POST   /v1/sessions/{id}/cancel   Cancel an in-flight turn
 ```
 
-**One turn at a time per session.** A second `POST /turn` while another is running returns `409 Conflict`. Across sessions, turns run fully concurrently.
+**One turn at a time per session.** A second `POST /turn` while another is running returns `409 Conflict`. Across sessions, turns run fully concurrently. A client that would rather hand the message over and be told when the model read it uses the [inbox](#the-inbox) instead of waiting for the session to be free.
+
+`POST /cancel` takes an optional body `{"turn_id": "..."}`. Without one it stops whatever is running, as it always did. With one it stops only that turn, and answers `409` `turn-mismatch` naming the turn actually in flight when it is another, so a client that watched a turn cannot stop the scheduled fire or the inbox turn that replaced it. Every `turn.started` on the [session feed](#the-session-feed) carries the id to name.
 
 The turn request body accepts five fields:
 
@@ -323,6 +327,38 @@ The turn request body accepts five fields:
 | `stream` | bool | `false` | `false` → single JSON response; `true` → SSE stream |
 | `options.skill` | string \| null | `null` | When set, activates the named [skill](./skills.md) for this turn (equivalent to `/skill <name>` in the REPL). With an empty `message` the skill body runs alone, as `--skill` does; a turn with no text, no image and no skill is a `422` |
 | `options.unanswered_message` | string | `keep` | What becomes of `message` if the turn ends, failed or canceled, before anything from the model reached the conversation. `keep` leaves it in place, as the REPL does with a typed prompt. `withdraw` takes it back, for a client that resends a failed turn; see [Resending a failed turn](#resending-a-failed-turn) |
+
+### The inbox
+
+`POST /turn` is synchronous: one request, one turn, the response scoped to it, and a `409` while the session is busy. The inbox is the asynchronous door beside it, for a client that lives with a session rather than driving one turn at a time: a chat bridge, a UI, a parent process with something to say while the agent works.
+
+```
+POST   /v1/sessions/{id}/inbox              Enqueue a message
+GET    /v1/sessions/{id}/inbox              Items the model has not been shown
+DELETE /v1/sessions/{id}/inbox/{item_id}    Withdraw an item still waiting
+```
+
+The body is `{"message": "...", "class": "steer" | "followup" | "interrupt", "source": "..."}`. `class` is required and is the whole contract:
+
+- **`steer`** reaches a turn that is already running. The loop reads the inbox at every round boundary, after a round's tool results and before the next request, and appends what it finds to that same message, so the model sees it as soon as it next asks the provider anything. This is what lets you correct or redirect the agent ten seconds into a ten-minute task, the way a person glances at a message mid-task.
+- **`followup`** waits for the running turn to end.
+- **`interrupt`** does not wait for the answer being written. While the provider is streaming, the stream is dropped within a second, the text that had arrived is kept as the answer so far, and the message follows it as the next thing the model reads; the same turn carries on, with no terminal in between, and the feed says so with a `notice`. A cut can land inside a thinking block or after a tool call was announced and never run: the `notice` is what closes those. While a tool runs, nothing is cut: the message is read at the round boundary after the tool's results, exactly as a `steer` is. A profile that does not stream has nothing partial to keep: the reply being generated is dropped whole and the request goes again with the message. The cost is the request sent again, which the prompt cache mostly absorbs, and the part of the answer that was never written. For "stop, do this instead"; a `steer` is enough for "also, when you get to it".
+
+Every class rides the opening of the next turn when nothing is running, whoever starts that turn, and opens a turn of its own when nothing else does. A turn that has been admitted but has not yet sent its first request is not running yet in this sense: an item that lands in that moment rides its opening, whatever its class. The model reads each item under a header meka writes: `[Message from <source>, arrived <time>]`, with `while you were working` added when it landed mid-turn. `source` defaults to the token's `description`, then to `client`; the body is verbatim, so a client relaying text from strangers fences it itself.
+
+The answer is `202` with the item and its state:
+
+```json
+{"item_id": "...", "session_id": "...", "class": "steer", "state": "pending", "replayed": false}
+```
+
+An item is `pending` until its text is in the conversation, `appended` until the provider accepts a request carrying it, then `delivered`; `withdrawn` is a `DELETE`, a canceled turn, or meka giving up. **Delivered means the model read it**, not that it was written down: the feed's `inbox.delivered` fires when the provider accepts the request, and names the turn that carried the item. A rewind that takes an `appended` item's text out of the conversation before it was delivered offers the item again. `GET /v1/sessions/{id}` reports `inbox_pending` beside `turn_in_flight` while the session is loaded.
+
+`Idempotency-Key` works here as on `POST /turn`: the same key with another `message` or `class` is refused with `409` `idempotency`. One difference matters to a bridge: the key is recorded on the row rather than in memory, so a retry that lands after a meka restart still finds its earlier item and answers it with `replayed: true`, and the key stays bound to that item for the session's life, withdrawn or delivered. The item is durable before the `202`; a session evicted for idleness is revived to run it, and a process that restarts finds it waiting.
+
+A turn opened on inbox items that fails before anything from the model reached the conversation withdraws its prompt and offers the items again, waiting 10 seconds, then twice that per attempt, up to five minutes between attempts. After an hour from when an item was enqueued it is given up on: withdrawn, with `inbox.failed` on the feed and the webhook, so whoever is waiting is told rather than left with silence. An item a tool round already carried into the conversation is not retried: it is history, and the next turn of any kind delivers it.
+
+Only a `pending` item can be withdrawn. `DELETE` on one that is already in the conversation answers `409` `inbox-appended`, since only a turn can answer it now; a delivered or withdrawn one is `404`. A `DELETE` that lands in the instant between a turn reading the item and writing it may still be read by the model. Canceling a turn the inbox opened, with `POST /cancel`, withdraws the items it opened on, the way a canceled client turn loses its prompt, and the feed reports each as `inbox.withdrawn`. The endpoint refuses a sub-agent's session exactly as `POST /turn` does: a worker's inbox is its parent's, written with the `agent_steer` tool. No images in this release.
 
 ### Image attachments
 
@@ -461,7 +497,7 @@ Key fields:
 
 ## Streaming response
 
-With `stream: true`, the response is a `text/event-stream`. Every event has a monotonic `id`, a named `event` type, and a JSON `data` payload.
+Every resident session has one event feed. Everything a turn emits goes on it, whoever started the turn: a `POST /turn`, a scheduled fire, a background outcome, an inbox item. `POST /turn` with `stream: true` answers with a view of that feed scoped to the one turn it started, as `text/event-stream`, and closes after the turn's terminal. `GET /v1/sessions/{id}/stream` is the feed itself, across turns; see [The session feed](#the-session-feed). Every event has a monotonic `id`, a named `event` type, and a JSON `data` payload, and every payload carries `turn_id` and `session_id`, so a client holding several feeds can file an event without per-connection state.
 
 ### Event types
 
@@ -469,12 +505,22 @@ With `stream: true`, the response is a `text/event-stream`. Every event has a mo
 
 | Event | Payload | When |
 |-------|---------|------|
-| `turn.started` | `turn_id`, `session_id`, `started_at` | Turn begins |
+| `turn.started` | `turn_id`, `session_id`, `started_at`, `source` (`"client"`, `"inbox"` with `item_ids`, `"schedule"` with `job_id`, or `"background"`) | Turn begins |
 | `turn.finished` | `turn_id`, `session_id`, `stop_reason`, `usage`, optional `refusal_text` | Turn completed successfully |
 | `turn.failed` | `turn_id`, `session_id`, `error` (Problem Detail shape), `message_withdrawn` when the turn began | Turn failed mid-stream |
 | `turn.canceled` | `turn_id`, `session_id`, `reason` (`"client"`, `"server_shutdown"`, or `"sse_lag"` when the only consumer fell behind and the turn was stopped for it), `message_withdrawn` when the turn began | Turn was canceled |
 
-`turn.finished`, `turn.failed`, and `turn.canceled` are **terminal**; the connection closes immediately after. Every terminal carries `turn_id` and `session_id`, so a client holding several streams can file it without keeping per-connection state. `turn.failed` and `turn.canceled` also carry `message_withdrawn` when the turn began, whether it took the message it was sent back out of the conversation; see [Resending a failed turn](#resending-a-failed-turn).
+`turn.finished`, `turn.failed`, and `turn.canceled` are **terminal** for the turn: a `POST /turn` stream closes immediately after its own, and the feed carries on to the next turn. `turn.failed` and `turn.canceled` also carry `message_withdrawn` when the turn began, whether it took the message it was sent back out of the conversation; see [Resending a failed turn](#resending-a-failed-turn).
+
+#### Inbox
+
+| Event | Payload | When |
+|-------|---------|------|
+| `inbox.delivered` | `item_ids`, `turn_id`, `session_id` | The provider accepted a request carrying these items, so the model has read them |
+| `inbox.failed` | `item_id`, `session_id`, `reason` | meka gave up on the item after the retry ceiling and withdrew it |
+| `inbox.withdrawn` | `item_id`, `session_id` | A client withdrew the item with `DELETE`, or the turn it opened was canceled; `turn_id` names the turn in flight at the time, if any |
+
+`inbox.delivered` arrives inside the turn that read the item, before that turn's terminal: for a `steer` read at a round boundary, after the `tool_call.completed` of that round; for an `interrupt` that cut the answer, after the `notice` announcing the cut. See [The inbox](#the-inbox).
 
 #### Content deltas
 
@@ -528,11 +574,13 @@ The server buffers up to 256 events per SSE stream. If a consumer reads too slow
 - **Nobody else was reading.** The turn is canceled to stop burning provider tokens, and the stream ends with a terminal `turn.failed` carrying error type `https://meka.so/errors/sse-lag`. That event is the stream's, sent before the turn has unwound, so it carries no `message_withdrawn`; the outcome recorded for a later re-attach is a `turn.canceled` with `reason: "sse_lag"` and does. Retry by submitting a new turn.
 - **Another consumer was keeping up.** The turn keeps running for them, so nothing has failed. The lagging stream ends with a `warn` `notice` explaining the drop (the usual `level` and `text`, plus `turn_id` and `session_id`) and closes. **Re-attach with `Last-Event-ID`** rather than retrying: the turn is still in flight, so a new turn would be refused with `409 turn-in-flight`, and re-attaching recovers the dropped events instead of redoing the work.
 
-Turn events are broadcast, so a re-attached client or a second consumer counts as a separate reader. Use `GET /messages` to inspect what the agent completed either way.
+Turn events are broadcast, so a re-attached client or a second consumer counts as a separate reader. Use `GET /messages` to inspect what the agent completed either way. A reader of the [session feed](#the-session-feed) that falls behind gets the `notice` and keeps its connection; a turn is never canceled for a feed reader, because the turn was not run for it.
 
-### Reconnection
+### The session feed
 
-`GET /v1/sessions/{id}/stream` rejoins the current turn. Send the last id you received as a `Last-Event-ID` header (browser `EventSource` does this automatically) or as a `?last_event_id=` query parameter, and the server replays what you missed before following the live stream.
+`GET /v1/sessions/{id}/stream` is the session's feed: every event of every turn, across turns, for as long as the connection is held. It is how a client sees the turns nobody asked for over HTTP, a scheduled job firing at three in the morning or a background task reporting back, and it is where a client that submits through the [inbox](#the-inbox) learns what became of its items. Subscribe once, and file events by the `turn_id` they carry. Loading the session is part of opening the feed, so a bridge can subscribe before it has anything to submit, and a reconnect to an evicted session gets its feed back rather than a 404.
+
+Send the last id you received as a `Last-Event-ID` header (browser `EventSource` does this automatically) or as a `?last_event_id=` query parameter, and the server replays what you missed before following the live feed.
 
 ```bash
 curl -N -H "Authorization: Bearer $TOKEN" \
@@ -540,13 +588,17 @@ curl -N -H "Authorization: Bearer $TOKEN" \
      "http://localhost:8080/v1/sessions/$SESSION/stream"
 ```
 
-The stream opens with a `turn.started` carrying `"resumed": true` and the `turn_id` you actually rejoined, which is the only way to tell "my stream resumed" from "a newer turn started while I was away". That opening event is synthesized by the reconnect rather than replayed, so unlike the original it carries no `started_at` and no `id:`, since a resumed stream must not move your stored resume position backwards before the replay has run. Every event after it is the real thing, ids included. The stream always terminates: if the turn has already finished, the buffered tail and its terminal event are delivered and the connection closes.
+Ids run across the whole session and the ring spans turns, so an id from an earlier turn is an ordinary position: everything after it replays, the later turns' terminals included. When a turn is in flight as you attach, the feed opens with a `turn.started` carrying `"resumed": true` and the `turn_id` you joined, which is how to tell "my stream resumed" from "a newer turn started while I was away"; that event is synthesized rather than replayed, so it carries no `id:`, no `source` and no `started_at`, and everything after it is the real thing. With no turn in flight there is nothing to re-issue, and the most recent turn's terminal is handed over when the ring no longer holds it, so a client that reconnects late still learns the outcome.
+
+**The feed does not end with a turn.** A client that wants one turn's outcome stops reading at that turn's terminal. The old contract, a stream that closed after the turn it rejoined, is what `POST /turn` with `stream: true` still gives.
 
 Three limits, all deliberate:
 
 - **The replay buffer is bounded** by `[serve] stream_replay_events` (default 256). If your `Last-Event-ID` is older than the oldest retained event, you get a `notice` saying the replay has a hole rather than a transcript that silently skips. Read `GET /messages` to fill it.
-- **Only the most recent turn is retained.** Reconnecting after a newer turn started gives you that turn.
-- **A disconnected turn is not canceled immediately.** It keeps running for `[serve] stream_reattach_grace` (default 30s) waiting for you to come back; after that the agent loop stops, since nobody is listening. Set `"0s"` to restore the older behavior where a dropped stream cancels the turn at once, which spends fewer provider tokens on abandoned work.
+- **Only the most recent turn's terminal is retained** past the ring. Everything else a late client needs is in `GET /messages`.
+- **A turn opened by `POST /turn` with `stream: true` is not canceled immediately when its client disconnects.** It keeps running for `[serve] stream_reattach_grace` (default 30s) waiting for the client to come back; after that the agent loop stops, since nobody is listening. Set `"0s"` to restore the older behavior where a dropped stream cancels the turn at once. The rule is only for turns a streaming client opened: a turn the server started for a fire, an outcome or an inbox item runs for the session and is never stopped for want of a reader.
+
+A session with a live feed subscriber is not idle, so the [idle sweep](#idle-timeout-and-gc) leaves it resident. Opening the feed loads the session if it was not, exactly as submitting a turn does, so a `sessions:r` token can bring one into memory and keep it there, and the route answers `409` `session-locked` and `422` `session-not-drivable` where `POST /turn` would.
 
 ## Webhooks
 
@@ -556,7 +608,7 @@ Three limits, all deliberate:
 [[serve.webhooks]]
 url = "https://bridge.example/meka-hook"
 secret = "${MEKA_WEBHOOK_SECRET}"     # or secret_file = "/etc/meka/hook.secret"
-events = ["turn.finished", "turn.failed", "task.finished", "schedule.fired"]
+events = ["turn.finished", "turn.failed", "task.finished", "schedule.fired", "inbox.delivered", "inbox.failed"]
 timeout = "10s"                        # per attempt, default 10s; "0s" is refused at startup
 max_retries = 3                        # after the first attempt, default 3, at most 10
 ```
@@ -567,7 +619,9 @@ max_retries = 3                        # after the first attempt, default 3, at 
 
 `task.finished` is not a turn event. It fires when a background task reaches a terminal state, whether or not any turn reports it: a canceled task fires it with no turn at all, and its outcome then rides whichever turn the session takes next. Expect it alongside a `turn.finished` when a client's own `POST /turn` is what carries the outcome, and expect it on its own for a task interrupted by a host that died, which no turn ever ran.
 
-A client that wants to know about everything the agent did should subscribe to all four.
+`inbox.delivered` and `inbox.failed` are the [inbox](#the-inbox)'s two outcomes: the model read an item, or meka gave up on it. A turn the server runs on inbox items posts `turn.finished` or `turn.failed` like a client's, since nothing else carries it.
+
+A client that wants to know about everything the agent did should subscribe to all six.
 
 ### Payloads
 
@@ -660,8 +714,8 @@ Each token carries a set of scopes that control what it can access:
 
 | Scope | Permits |
 |-------|---------|
-| `sessions:r` | List sessions, get details, read messages, context occupancy, export, tools, background tasks, re-attach a stream |
-| `sessions:w` | Create, modify, delete sessions; submit and cancel turns; compact, rewind, import; respond to permission prompts; cancel background tasks |
+| `sessions:r` | List sessions, get details, read messages, context occupancy, export, tools, background tasks, the inbox, the session feed |
+| `sessions:w` | Create, modify, delete sessions; submit and cancel turns; enqueue and withdraw inbox items; compact, rewind, import; respond to permission prompts; cancel background tasks |
 | `skills:r` | Read installed skills, including bodies |
 | `skills:w` | Create, update, delete skills |
 | `memory:r` | Read the memory store |
@@ -733,7 +787,8 @@ Idempotency keys are **ignored for streaming responses**; streaming clients shou
 | Endpoint | Retry-safe | On a duplicate |
 |---|---|---|
 | `POST /turn` (blocking, with a key) | yes | cached response returned |
-| `POST /cancel`, `DELETE /v1/sessions/{id}`, `DELETE /v1/sessions/{id}/tasks/{task_id}` | yes | already-done is the same state |
+| `POST /v1/sessions/{id}/inbox` (with a key) | yes | the earlier item is answered, `replayed: true`; the key is on the row, so this holds across a restart |
+| `POST /cancel`, `DELETE /v1/sessions/{id}`, `DELETE /v1/sessions/{id}/tasks/{task_id}`, `DELETE /v1/sessions/{id}/inbox/{item_id}` | yes | already-done is the same state; a withdrawn item answers **404** on the retry |
 | `DELETE /v1/skills/{name}`, `/v1/memory/{name}`, `/v1/schedule/{job_id}` | yes, but | the resource is gone, so the retry answers **404**. Expected, not a failure; treat it as success if you are retrying blind |
 | `PUT /v1/skills/{name}`, `PUT /v1/memory/{name}` | yes | same body writes the same skill file or memory row |
 | `POST /compact` | mostly | a second compaction summarizes the summary; fidelity drops, nothing is lost |
@@ -779,11 +834,13 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/auth-scope` | 403 | Token lacks the required scope |
 | `/errors/session-permission` | 403 | The token is fine; the *session* sits too low. Raise it with `PATCH /v1/sessions/{id}`; a better token will not help |
 | `/errors/session-not-found` | 404 | Unknown session id |
-| `/errors/not-found` | 404 | Unknown skill, memory, MCP server, background task, scheduled job, image blob, or turn stream; also a skill or memory store that is disabled, or a server with `[schedule] enabled = false`, since there is nowhere to write |
+| `/errors/not-found` | 404 | Unknown skill, memory, MCP server, background task, scheduled job, image blob, or inbox item; also a skill or memory store that is disabled, or a server with `[schedule] enabled = false`, since there is nowhere to write |
 | `/errors/session-not-loaded` | 409 | The session exists but is not in memory; submit a turn to load it. Do **not** retry `POST /cancel`: there is no turn to cancel |
 | `/errors/session-locked` | 409 | Another meka process holds the session's lock (e.g. two `meka serve` instances sharing one store); wait or restart the other process |
 | `/errors/turn-in-flight` | 409 | A turn is already running on this session within *this* process; cancel it via `POST /cancel` first |
 | `/errors/turn-canceled` | 409 | Turn was canceled |
+| `/errors/turn-mismatch` | 409 | `POST /cancel` named a turn that is not the one in flight; the `turn_id` member names the one that is. Nothing was canceled |
+| `/errors/inbox-appended` | 409 | The inbox item is already in the conversation, so only a turn can answer it now; nothing to withdraw |
 | `/errors/store-read-only` | 409 | The skill lives under a `[skills] extra_paths` root; meka reads those but never writes to them, so writing here would shadow the file rather than change it |
 | `/errors/session-not-drivable` | 422 | The id names a sub-agent's conversation, which only its parent drives. Reading it is unaffected; the message names the parent and what to do there: `agent_followup` for a turn or a fork, `POST /v1/sessions/{parent}/responses/{request_id}` for an approval, and the parent itself for a scheduled job. **Do not retry with a corrected payload**: no body addressed at this id is accepted |
 | `/errors/request-not-found` | 404 | Unknown or expired `request_id` |
@@ -897,7 +954,7 @@ shutdown_drain_timeout = "30s"
 
 ## Concurrency
 
-- **Per session:** one turn at a time. A second `POST /turn` returns 409.
+- **Per session:** one turn at a time. A second `POST /turn` returns 409; a message that should not wait for the session to be free goes through the [inbox](#the-inbox), which a running turn reads at its next round boundary.
 - **Across sessions:** fully concurrent. Multiple sessions can run turns in parallel.
 - **Process-wide cap (optional):** set `max_concurrent_turns` to limit total in-flight turns. Exceeding the cap returns 429 with a `Retry-After` header.
 
@@ -945,41 +1002,56 @@ scopes = ["sessions:r", "sessions:w", "mcp:r", "skills:r"]
 
 ### Telegram bridge (Python)
 
+A bridge lives with the session, so it submits through the inbox and watches the feed rather than holding a turn open per message. The agent's replies go out through whatever tool the bridge exposes to it; the feed tells the bridge when each message was read.
+
 ```python
 import httpx
 
 MEKA_URL = "http://localhost:8080"
 MEKA_TOKEN = os.environ["MEKA_TOKEN"]
+HEADERS = {"Authorization": f"Bearer {MEKA_TOKEN}"}
 
-async def handle_message(chat_id: str, text: str):
+async def handle_message(chat_id: str, message_id: str, text: str):
     session_id = await get_or_create_session(chat_id)
-
     resp = await httpx.AsyncClient().post(
-        f"{MEKA_URL}/v1/sessions/{session_id}/turn",
-        headers={"Authorization": f"Bearer {MEKA_TOKEN}"},
-        json={"message": text},
-        timeout=httpx.Timeout(600.0, connect=5.0),
+        f"{MEKA_URL}/v1/sessions/{session_id}/inbox",
+        headers={**HEADERS, "Idempotency-Key": f"{chat_id}:{message_id}"},
+        json={"message": text, "class": "steer", "source": "telegram"},
     )
     resp.raise_for_status()
-    return resp.json()["final_text"]
+    return resp.json()["item_id"]  # 202: durable, read at the next boundary
+
+async def follow(session_id: str):
+    async with httpx.AsyncClient(timeout=None).stream(
+        "GET", f"{MEKA_URL}/v1/sessions/{session_id}/stream", headers=HEADERS
+    ) as feed:
+        async for event in parse_sse(feed):
+            if event.name == "inbox.delivered":
+                mark_read(event.data["item_ids"])
+            elif event.name == "inbox.failed":
+                tell_chat(event.data["item_id"], event.data["reason"])
 ```
 
 ### Web UI (TypeScript, streaming)
 
-```typescript
-const resp = await fetch(`${MEKA_URL}/v1/sessions/${sessionId}/turn`, {
-  method: "POST",
-  headers: {
-    Authorization: `Bearer ${token}`,
-    "Content-Type": "application/json",
-  },
-  body: JSON.stringify({ message: input, stream: true }),
-});
+A UI that renders the whole session subscribes to the feed once and files events by `turn_id`, so it also shows the turns it did not start: a scheduled fire, a background task reporting, a message the user typed while the agent was working and the agent answering it in place.
 
-const reader = resp.body!.getReader();
-const decoder = new TextDecoder();
-// ... parse SSE events from the stream
+```typescript
+const feed = new EventSource(`${MEKA_URL}/v1/sessions/${sessionId}/stream`);
+feed.addEventListener("turn.started", (e) => openTurn(JSON.parse(e.data)));
+feed.addEventListener("assistant_text.delta", (e) => append(JSON.parse(e.data)));
+feed.addEventListener("turn.finished", (e) => closeTurn(JSON.parse(e.data)));
+
+async function send(input: string) {
+  await fetch(`${MEKA_URL}/v1/sessions/${sessionId}/inbox`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ message: input, class: "steer" }),
+  });
+}
 ```
+
+A UI that wants one turn per request, with the response scoped to it, keeps `POST /turn` with `stream: true`; that stream still closes at its own terminal.
 
 ### Shell script
 
@@ -1072,9 +1144,12 @@ Key points:
 | GET | `/v1/sessions/{id}/messages` | `sessions:r` | List messages |
 | GET | `/v1/sessions/{id}/blobs/{hash}` | `sessions:r` | Image bytes behind a content block |
 | POST | `/v1/sessions/{id}/turn` | `sessions:w` | Submit turn |
-| POST | `/v1/sessions/{id}/cancel` | `sessions:w` | Cancel turn |
+| POST | `/v1/sessions/{id}/cancel` | `sessions:w` | Cancel turn (optionally one named `turn_id`) |
+| POST | `/v1/sessions/{id}/inbox` | `sessions:w` | Enqueue a message: `steer` reaches the running turn, `interrupt` cuts its answer, `followup` waits |
+| GET | `/v1/sessions/{id}/inbox` | `sessions:r` | Inbox items the model has not been shown |
+| DELETE | `/v1/sessions/{id}/inbox/{item_id}` | `sessions:w` | Withdraw an item still waiting |
 | POST | `/v1/sessions/{id}/responses/{request_id}` | `sessions:w` | Resolve permission prompt |
-| GET | `/v1/sessions/{id}/stream` | `sessions:r` | Re-attach to the current turn's SSE stream |
+| GET | `/v1/sessions/{id}/stream` | `sessions:r` | The session's event feed, across turns |
 | POST | `/v1/sessions/{id}/compact` | `sessions:w` | Summarize the conversation now |
 | GET | `/v1/sessions/{id}/context` | `sessions:r` | Context occupancy and cumulative usage |
 | POST | `/v1/sessions/{id}/rewind` | `sessions:w` | Drop trailing turns |

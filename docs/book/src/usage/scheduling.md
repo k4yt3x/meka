@@ -181,6 +181,11 @@ rely on one:
 | `--oneshot` | Never | The process exits; jobs stay on disk for a later run |
 
 If you want a job to fire reliably whether or not you are sitting at a terminal, run `meka serve`.
+There a fire's turn is on the session's [event feed](./http-api.md#the-session-feed) like any other,
+opening with a `turn.started` whose `source` is `schedule` and which names the `job_id`, so a client
+watching the session sees the agent act on its own schedule as it happens. A message posted to the
+session's [inbox](./http-api.md#the-inbox) while a fire runs is read at the fire's next round
+boundary, and a `followup` waits for it to end.
 In the REPL, a job created in one session resumes only when that session does; `meka --continue`
 picks up where you left off.
 

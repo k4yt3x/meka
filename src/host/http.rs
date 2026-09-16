@@ -14,6 +14,7 @@ pub(crate) mod gc;
 pub(crate) mod handlers;
 pub(crate) mod http_frontend;
 pub(crate) mod idempotency;
+pub(crate) mod inbox;
 pub(crate) mod openapi;
 pub(crate) mod reattach;
 pub(crate) mod schedule;
@@ -101,6 +102,7 @@ pub(crate) async fn run_serve(
     let gc_handle = gc::spawn(state.clone());
     let scheduler_handle = schedule::spawn(state.clone());
     let background_handle = schedule::spawn_background_poller(state.clone());
+    let inbox_handle = inbox::spawn_inbox_driver(state.clone());
     let pruner_handle = idempotency_cache.spawn_pruner();
 
     let router = build_router(state.clone(), auth, max_body_bytes);
@@ -146,6 +148,7 @@ pub(crate) async fn run_serve(
     gc_handle.abort();
     scheduler_handle.abort();
     background_handle.abort();
+    inbox_handle.abort();
     pruner_handle.abort();
     // Close the MCP servers before the exit paths below: the drain-timeout arm of the match ends
     // in `std::process::exit(1)`, so anything after it is skipped exactly when a hung shutdown
@@ -251,6 +254,12 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
             post(handlers::sessions::fork_session),
         )
         .route("/v1/sessions/{id}/turn", post(handlers::turn::submit_turn))
+        .route("/v1/sessions/{id}/inbox", post(handlers::inbox::enqueue))
+        .route("/v1/sessions/{id}/inbox", get(handlers::inbox::list))
+        .route(
+            "/v1/sessions/{id}/inbox/{item_id}",
+            delete(handlers::inbox::withdraw),
+        )
         .route(
             "/v1/sessions/{id}/cancel",
             post(handlers::turn::cancel_turn),

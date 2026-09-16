@@ -28,6 +28,9 @@ pub(crate) struct Principal {
     /// token, which we don't want appearing in observability output).
     pub(crate) token_id: String,
     pub(crate) scopes: Arc<[String]>,
+    /// The token's configured description, which is what an inbox item names as its source when
+    /// the client names nothing.
+    pub(crate) description: Option<String>,
 }
 
 impl Principal {
@@ -78,6 +81,7 @@ impl AuthRegistry {
                 principal: Principal {
                     token_id: token_fingerprint(&entry.token),
                     scopes: entry.scopes.into(),
+                    description: entry.description,
                 },
                 token: entry.token,
             })
@@ -245,6 +249,7 @@ mod tests {
         let p = Principal {
             token_id: "abc".into(),
             scopes: vec!["sessions:r".into(), "mcp:r".into()].into(),
+            description: None,
         };
         assert!(p.has_scope("sessions:r"));
         assert!(p.has_scope("mcp:r"));

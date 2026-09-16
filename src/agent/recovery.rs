@@ -108,6 +108,9 @@ pub(super) struct TurnRecovery {
     /// the first provider call succeeded; otherwise the lazy path retries it against the first
     /// response.
     pub(super) user_saved: bool,
+    /// The inbox items the prompt carries, stamped appended by whichever write persists it and
+    /// offered again by a withdrawal, so the two facts move together.
+    pub(super) inbox_ids: Vec<Uuid>,
     /// Set once the model has been nudged for a user-visible response this turn, so the recovery
     /// fires at most once and can't loop (see [`should_nudge_thinking_only`]).
     pub(super) thinking_only_nudged: bool,
@@ -140,6 +143,7 @@ impl TurnRecovery {
     ) -> Result<()> {
         self.overflow_retries += 1;
         tracing::warn!("provider reported context overflow; compacting and retrying ({reason})");
+        let prompt_was_unsaved = !self.user_saved;
         self.undo_rejected_repair(messages);
         if let Err(compact_error) = agent
             .compact_session(
@@ -161,6 +165,18 @@ impl TurnRecovery {
         }
         self.after_conversation_rewrite();
         self.ceiling_compacted = true;
+        if prompt_was_unsaved {
+            // The rewrite carried the prompt to disk where the eager save could not, and with it
+            // the items it holds; the stamp follows, as it does after a proactive compaction.
+            if let Err(error) = agent
+                .store
+                .inbox_store()
+                .stamp_appended_after_rewrite(&self.inbox_ids)
+                .await
+            {
+                tracing::warn!("failed to stamp inbox items after the compaction: {error}");
+            }
+        }
         Ok(())
     }
 
@@ -387,6 +403,16 @@ impl TurnRecovery {
         }
     }
 
+    /// Put back a repair the provider never judged, because the request carrying it was dropped
+    /// before an answer came. Unlike [`Self::undo_rejected_repair`], the tier is not counted as
+    /// tried: nothing disproved it, and the next refusal should try it again rather than skip to
+    /// the one after and destroy more than it had to.
+    pub(super) fn unjudge_repair(&mut self, messages: &mut Conversation) {
+        if self.pending_repair.take().is_some() && messages.pop_repair() {
+            self.tiers_tried = self.tiers_tried.saturating_sub(1);
+        }
+    }
+
     /// Forget what this turn has already tried, because the provider just accepted a request.
     ///
     /// Both counters exist to stop a turn re-running a recovery that has already been disproved,
@@ -440,7 +466,10 @@ impl TurnRecovery {
             return Ok(());
         }
         let event = crate::conversation::Event::Append(prompt.clone());
-        agent.store.save_event(session_id, &event).await?;
+        agent
+            .store
+            .save_event_marking_inbox(session_id, &event, &self.inbox_ids)
+            .await?;
         self.user_saved = true;
         Ok(())
     }
@@ -500,9 +529,17 @@ impl TurnRecovery {
         session_id: Uuid,
         messages: &mut Conversation,
     ) {
+        // The items rode the message that is leaving, so they are owed to the next turn. Offered
+        // at once, in the same write as the withdrawal where there is one, so the two facts cannot
+        // come apart; the driver that opened this turn on them decides how long to wait before it.
+        let not_before = chrono::Utc::now();
         if self.user_saved {
             let withdrawal = messages.replace_tail(1, Vec::new());
-            if let Err(error) = agent.store.save_event(session_id, &withdrawal).await {
+            if let Err(error) = agent
+                .store
+                .save_event_resetting_inbox(session_id, &withdrawal, &self.inbox_ids, not_before)
+                .await
+            {
                 tracing::warn!(
                     "failed to persist the withdrawal of an unanswered prompt; it will reappear \
                      if this session is resumed: {error}"
@@ -511,6 +548,14 @@ impl TurnRecovery {
         } else {
             // Reached only when a database write failed, which no test here can provoke.
             messages.pop_unsaved();
+            if let Err(error) = agent
+                .store
+                .inbox_store()
+                .reset_pending(&self.inbox_ids, not_before)
+                .await
+            {
+                tracing::warn!("failed to offer withdrawn inbox items again: {error}");
+            }
         }
         agent
             .cells
@@ -1037,6 +1082,7 @@ mod tests {
             tiers_tried: 1,
             pending_repair,
             user_saved: false,
+            inbox_ids: Vec::new(),
             thinking_only_nudged: false,
             outage_reprieve_used: false,
         };
@@ -1107,6 +1153,7 @@ mod tests {
             tiers_tried: 1,
             pending_repair,
             user_saved: false,
+            inbox_ids: Vec::new(),
             thinking_only_nudged: false,
             outage_reprieve_used: false,
         };
@@ -1160,6 +1207,7 @@ mod tests {
             tiers_tried: 0,
             pending_repair: None,
             user_saved: true,
+            inbox_ids: Vec::new(),
             thinking_only_nudged: false,
             outage_reprieve_used: false,
         };
@@ -1222,6 +1270,7 @@ mod tests {
             tiers_tried: 0,
             pending_repair: None,
             user_saved: true,
+            inbox_ids: Vec::new(),
             thinking_only_nudged: false,
             outage_reprieve_used: false,
         };
@@ -1713,6 +1762,7 @@ mod tests {
             tiers_tried: 1,
             pending_repair: None,
             user_saved: true,
+            inbox_ids: Vec::new(),
             thinking_only_nudged: false,
             outage_reprieve_used: true,
         };

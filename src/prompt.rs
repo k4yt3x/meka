@@ -1840,6 +1840,29 @@ pub(crate) fn build_environment_context(
 // Each argument is one independent slice of turn state with its own source; bundling them into a
 // struct would only move the same list somewhere else and add a name for a thing that never exists
 // apart from this call.
+/// One inbox item as the model reads it: a header naming who sent it and when, then the body as
+/// it was submitted.
+///
+/// The header is what tells the model this is not the person it is answering continuing their
+/// thought, and `mid_turn` is what tells it the message landed while it was working, which is the
+/// difference between "answer this now" and "you may already have addressed this". The body is
+/// verbatim: a producer that relays untrusted text fences it itself, as the bridge does with its
+/// nonce, and meka adds nothing that could be mistaken for the producer's own framing.
+pub(crate) fn render_inbox_item(item: &crate::store::inbox::InboxItem, mid_turn: bool) -> String {
+    let arrived = crate::text::format_timestamp(item.created_at, crate::text::Precision::Minutes);
+    let when = if mid_turn {
+        format!("arrived {arrived} while you were working")
+    } else {
+        format!("arrived {arrived}")
+    };
+    format!(
+        "{}{}, {when}]\n{}",
+        crate::conversation::INBOX_HEADER_PREFIX,
+        item.source,
+        item.body
+    )
+}
+
 /// What the per-turn preamble describes: the session as it stands when the turn starts.
 pub(crate) struct TurnContext<'a> {
     pub(crate) permission: Permission,

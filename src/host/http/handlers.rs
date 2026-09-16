@@ -3,6 +3,7 @@
 
 pub(crate) mod conversation;
 pub(crate) mod discovery;
+pub(crate) mod inbox;
 pub(crate) mod info;
 pub(crate) mod jobs;
 pub(crate) mod messages;

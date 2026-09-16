@@ -1785,7 +1785,7 @@ max_retries = 3
 | `url` | `string` | required | `https://` or `http://`; supports `${ENV_VAR}` |
 | `secret` | `string` | none | HMAC key for `X-Meka-Signature`; supports `${ENV_VAR}` |
 | `secret_file` | `path` | none | Mutually exclusive with `secret`; chmod 0600 |
-| `events` | `array` | required | One or more of the four names above |
+| `events` | `array` | required | One or more of `turn.finished`, `turn.failed`, `task.finished`, `schedule.fired`, `inbox.delivered`, `inbox.failed` |
 | `timeout` | `duration` | `"10s"` | Per attempt; `"0s"` is refused at startup |
 | `max_retries` | `integer` | `3` | Retries after the first attempt, capped at 10 |
 

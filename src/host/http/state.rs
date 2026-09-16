@@ -39,6 +39,12 @@ pub(crate) struct ServerState {
     pub(crate) webhooks: super::webhook::WebhookDispatcher,
     /// One reconstruction of an unloaded session at a time, per id.
     pub(crate) reconstruction_locks: super::reattach::ReconstructionLocks,
+    /// Woken when an inbox item is enqueued and when any turn ends, which are the two moments a
+    /// session may have become able to take a turn on what is waiting.
+    pub(crate) inbox_wake: Arc<tokio::sync::Notify>,
+    /// Sessions a driver task is draining right now, so a wake that arrives mid-drain does not
+    /// start a second driver on the same session.
+    pub(crate) inbox_draining: Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
 }
 
 /// One session `meka serve` holds open: the shared [`ResidentSession`] plus what only the HTTP
@@ -84,6 +90,8 @@ impl ServerState {
             shutdown: tokio_util::sync::CancellationToken::new(),
             webhooks: super::webhook::WebhookDispatcher::new(config_webhooks),
             reconstruction_locks: super::reattach::ReconstructionLocks::default(),
+            inbox_wake: Arc::new(tokio::sync::Notify::new()),
+            inbox_draining: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 }

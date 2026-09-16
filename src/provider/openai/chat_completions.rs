@@ -164,15 +164,21 @@ impl OpenAiChatCompletionsProvider {
                                 openai_messages.push(tool_message);
                             }
                         }
-                    } else {
-                        // No `match` on `ContentBlock` here means the compiler can't force this
-                        // path to handle `Image`; it must be done by hand. When the user message
-                        // carries images, Chat Completions wants a `content` array of `text` +
-                        // `image_url` parts (vision is user-role only); otherwise a plain string.
-                        let has_images = message
-                            .content
-                            .iter()
-                            .any(|block| matches!(block, ContentBlock::Image { .. }));
+                    }
+                    // No `match` on `ContentBlock` here means the compiler can't force this
+                    // path to handle `Image`; it must be done by hand. When the user message
+                    // carries images, Chat Completions wants a `content` array of `text` +
+                    // `image_url` parts (vision is user-role only); otherwise a plain string.
+                    let has_images = message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::Image { .. }));
+                    // Text beside tool results is a message that arrived while the tools ran (an
+                    // inbox item), and this wire has no place for it inside a `tool` message: it
+                    // follows them as a `user` message, which the spec allows after the run of
+                    // tool messages a call demands. A message of tool results alone adds nothing.
+                    let has_text = !message.wire_text().is_empty();
+                    if !has_tool_results || has_text || has_images {
                         if has_images {
                             let mut parts: Vec<serde_json::Value> = Vec::new();
                             // The context block and the words, as one text part.
@@ -1326,6 +1332,72 @@ mod tests {
         assert!(openai_messages[1].get("tool_calls").is_some());
         assert_eq!(openai_messages[2]["role"], "tool");
         assert_eq!(openai_messages[2]["tool_call_id"], "call_1");
+    }
+
+    /// An inbox item read at a round boundary is text beside the round's tool results. This wire
+    /// has no room for it inside a `tool` message, so it follows them as a `user` message; before
+    /// this the branch that emitted tool messages dropped every text block beside them.
+    #[test]
+    fn text_beside_tool_results_follows_the_tool_messages_as_a_user_message() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
+        .expect("build test provider");
+        let messages = vec![
+            Message::user("read /tmp/test.txt"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/test.txt"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: vec![ToolResultContent::Text {
+                            text: "file contents here".to_string(),
+                        }],
+                        is_error: false,
+                    },
+                    ContentBlock::Text {
+                        text: "[Message from test, arrived now]\nalso, what is 17*3?".to_string(),
+                    },
+                ],
+            },
+        ];
+
+        let body = provider.build_request_body("", &messages, &[], false);
+        let openai_messages = body["messages"]
+            .as_array()
+            .expect("messages should be array");
+
+        assert_eq!(openai_messages[2]["role"], "tool");
+        assert_eq!(openai_messages[2]["tool_call_id"], "call_1");
+        assert_eq!(openai_messages[3]["role"], "user");
+        assert_eq!(
+            openai_messages[3]["content"],
+            "[Message from test, arrived now]\nalso, what is 17*3?"
+        );
+        assert_eq!(
+            openai_messages.len(),
+            4,
+            "tool results alone add no user message"
+        );
     }
 
     #[test]

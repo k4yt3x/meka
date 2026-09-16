@@ -248,11 +248,32 @@ the three rows marked `for_editors` (`/mcp`, `/status`, `/usage`) as `available_
 Only HTTP and ACP can receive a request while a turn holds the session, and the two answer
 differently by design.
 
-- **HTTP refuses.** `PATCH`, `DELETE`, fork, compact and rewind check `in_flight` (or fail
-  `claim_idle`) and return 409 with `type` `https://meka.so/errors/turn-in-flight`, through
-  `turn_in_flight_conflict` and `ProblemDetail::for_error(MekaError::TurnInFlight)`. A second
-  `POST /turn` on the session gets the same 409. The `detail` names what was refused (`doing`), and
-  a `session_id` member carries the id.
+- **HTTP refuses, with one door that does not.** `PATCH`, `DELETE`, fork, compact and rewind check
+  `in_flight` (or fail `claim_idle`) and return 409 with `type`
+  `https://meka.so/errors/turn-in-flight`, through `turn_in_flight_conflict` and
+  `ProblemDetail::for_error(MekaError::TurnInFlight)`. A second `POST /turn` on the session gets
+  the same 409. The `detail` names what was refused (`doing`), and a `session_id` member carries
+  the id. `POST /v1/sessions/{id}/inbox` never refuses for a turn in flight: it writes an
+  `inbox_items` row (`store/inbox.rs`) and wakes the driver (`host/http/inbox.rs`). The row reaches
+  the model at one of four places, all in `Agent::run_attributed_turn` so no host door can forget
+  one: a `steer` or an `interrupt` at the round boundary after a tool round's results, in the same
+  user message and stamped `appended_at` by the same transaction
+  (`save_events_atomic_marking_inbox`); an `interrupt` the moment it lands while a provider call
+  is in flight; any class at the next turn's opening, after the words, whoever started the turn;
+  or as the opening message of a turn the driver starts (`host::scheduler::run_inbox_turns`) when
+  the session is idle. The item is `delivered` where `last_accepted_len` is stamped, which is the
+  request the provider accepted, and `FrontendEvent::InboxDelivered` is what the feed and the
+  webhook relay.
+- **An interrupt is decided by the loop, never by a host.** Each provider call runs under a child
+  of the turn's token, and `watch_for_interrupts` polls the inbox once a second
+  (`INTERRUPT_POLL_INTERVAL`) and cancels the child when an `interrupt` row is pending: polled
+  rather than signaled, so a parent's `agent_steer` on a running worker needs no registry to reach
+  it. The call returns as it does on a stop, and `absorb_interrupt` reads the tokens to tell the
+  two apart. What streamed is kept through `without_tool_use`, the items follow as the next user
+  message, and the loop `continue`s in the same turn. Nothing streamed means the items join the
+  user message that was cut, as a withdrawal and a re-append in one write, so the log still ends
+  on an appended turn opening and `withdraw_unanswered_prompt` takes the items back with the prompt
+  if the turn then fails before the provider accepts anything. A tool round is never cut.
 - **ACP applies the level and the switch, and refuses the rest.** `session/set_mode` and the
   permission and approvals options of `session/set_config_option` write the cells without taking the
   conversation mutex, so an editor toggle takes effect on the very next tool call, and then record
