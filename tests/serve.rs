@@ -12302,6 +12302,69 @@ fn a_relayed_upstream_body_is_size_bounded() {
 /// copy taken mid-turn ends on a message nothing answered. The probe lives in the store's one fork
 /// door, so the HTTP door gets it without remembering to ask. A second descriptor from this test
 /// stands in for the other process: `flock` conflicts across descriptors either way.
+/// A due item on a session another process holds is put off, not asked about in a loop. The
+/// sweeper wakes itself whenever due items remain after a pass, so a driver that returned with
+/// them still due would be spawned again at once, probe the lock, and return, for as long as the
+/// holder kept the session: a REPL open beside `serve`, after a restart left items pending.
+#[test]
+fn an_item_on_a_session_another_process_holds_waits_instead_of_spinning() {
+    let harness = ServeTestHarness::spawn_with(
+        "[schedule]\npoll_interval = \"1s\"\n",
+        "idle_timeout = \"1s\"\ngc_scan_interval = \"1s\"\n",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+    );
+    let id = create_session_id(&harness);
+    harness.wait_until_evicted(&id);
+
+    let lock_path = harness
+        .install
+        .data_dir()
+        .join("locks")
+        .join(format!("{id}.lock"));
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap_or_else(|error| panic!("open {}: {error}", lock_path.display()));
+    held.try_lock()
+        .expect("the evicted session's lock is free for this test to take");
+
+    // Written to the store directly: the door refuses a held session, and the case is an item
+    // that was already pending when the holder took the session.
+    let store = rusqlite::Connection::open(harness.install.database()).expect("open the store");
+    let item_id = uuid::Uuid::new_v4().to_string();
+    store
+        .execute(
+            "INSERT INTO inbox_items (id, session_id, class, source, body, created_at) \
+             VALUES (?1, ?2, 'followup', 'test', 'hello', ?3)",
+            rusqlite::params![item_id, id, chrono::Utc::now().to_rfc3339()],
+        )
+        .expect("insert the item");
+
+    std::thread::sleep(Duration::from_secs(3));
+    let (attempts, not_before): (i64, Option<String>) = store
+        .query_row(
+            "SELECT attempts, not_before FROM inbox_items WHERE id = ?1",
+            [&item_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read the item");
+    assert_eq!(
+        attempts, 1,
+        "one pass found the session held and put the item off once; zero means the driver left \
+         it due for the sweeper to retry at once, more means it spun"
+    );
+    assert!(
+        not_before.is_some(),
+        "the item carries the time it will be asked about again"
+    );
+    drop(held);
+}
+
 #[test]
 fn fork_refuses_a_source_another_process_holds() {
     let harness = ServeTestHarness::spawn_with(

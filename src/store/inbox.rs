@@ -144,6 +144,9 @@ pub(crate) struct InboxItem {
 }
 
 impl InboxItem {
+    /// Where the item is in its life, read off its stamps: `pending` until its text is in the
+    /// conversation, `appended` until a provider accepted a request carrying it, then
+    /// `delivered`; `withdrawn` once taken back, whatever it was before.
     pub(crate) fn state(&self) -> InboxState {
         if self.withdrawn_at.is_some() {
             InboxState::Withdrawn

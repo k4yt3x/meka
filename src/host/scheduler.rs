@@ -28,6 +28,7 @@ pub(crate) enum TurnOrigin {
 }
 
 /// First wait before a turn that failed on inbox items is tried again; doubles per attempt.
+/// Also the wait for a session another process holds, asked again at this pace until it lets go.
 const INBOX_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(10);
 /// Longest wait between two attempts, and the wait for a session that could not be brought up
 /// at all, which no backoff from a first try would fit.
@@ -372,6 +373,25 @@ where
     ControlFlow::Continue(())
 }
 
+/// Put every due item of a session off by `wait`, counting the attempt. A failure to write it is
+/// warned about and nothing else: the items stay due and the sweeper retries on its next tick.
+async fn defer_session_inbox<H: HostHooks>(
+    hooks: &H,
+    session_id: uuid::Uuid,
+    wait: std::time::Duration,
+) {
+    let not_before =
+        chrono::Utc::now() + chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::zero());
+    if let Err(error) = hooks
+        .store()
+        .inbox_store()
+        .defer_session_pending(session_id, not_before)
+        .await
+    {
+        tracing::warn!("failed to defer inbox items for session {session_id}: {error}");
+    }
+}
+
 /// Run turns on a session's waiting inbox items until nothing is waiting, the session is busy,
 /// or a turn fails.
 ///
@@ -391,24 +411,25 @@ where
 pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::Uuid) {
     let entry = match hooks.resident(session_id).await {
         Ok(Some(entry)) => entry,
+        // Put off rather than left due, in both arms: the sweeper wakes itself whenever due items
+        // remain after a pass, so a return that leaves them due is asked again at once, and a
+        // session another process keeps for an hour would be probed in a hot loop for the hour.
+        // The holder's own turns drain the inbox while it has the session, so its items wait the
+        // short interval; a session that cannot be brought up is not a provider blip and waits the
+        // longest. Each wait counts as an attempt, so neither holds an item past the ceiling.
         Ok(None) => {
-            tracing::debug!("session {session_id} is held elsewhere; its inbox waits");
+            tracing::debug!(
+                "session {session_id} is held elsewhere; its inbox waits {INBOX_RETRY_BASE:?}"
+            );
+            defer_session_inbox(hooks, session_id, INBOX_RETRY_BASE).await;
             return;
         }
         Err(error) => {
-            // Counted as an attempt and waited out at the longest interval: a session that
-            // cannot be brought up is not a provider blip, and its items still expire.
-            let inbox = hooks.store().inbox_store();
-            let not_before = chrono::Utc::now()
-                + chrono::Duration::from_std(INBOX_RETRY_LONGEST_WAIT)
-                    .unwrap_or(chrono::Duration::zero());
             tracing::warn!(
                 "inbox items for session {session_id} wait {INBOX_RETRY_LONGEST_WAIT:?}: session \
                  unavailable: {error}"
             );
-            if let Err(error) = inbox.defer_session_pending(session_id, not_before).await {
-                tracing::warn!("failed to defer inbox items: {error}");
-            }
+            defer_session_inbox(hooks, session_id, INBOX_RETRY_LONGEST_WAIT).await;
             return;
         }
     };
@@ -449,13 +470,14 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
                 "no turn could deliver it in {} attempt(s) over the last hour",
                 item.attempts
             );
-            match inbox.withdraw(item.id, Some(reason.clone())).await {
+            let item_id = item.id;
+            match inbox.withdraw(item_id, Some(reason.clone())).await {
                 Ok(crate::store::inbox::Withdrawal::Withdrawn) => {
-                    tracing::warn!("giving up on inbox item {}: {reason}", item.id);
+                    tracing::warn!("giving up on inbox item {item_id}: {reason}");
                     hooks.inbox_given_up(&entry, &item, &reason).await;
                 }
                 Ok(_) => {}
-                Err(error) => tracing::warn!("failed to withdraw inbox item {}: {error}", item.id),
+                Err(error) => tracing::warn!("failed to withdraw inbox item {item_id}: {error}"),
             }
         }
         if items.is_empty() {
@@ -479,6 +501,10 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
             .cancel
             .publish_turn(cancellation.clone(), busy.admission, turn_id);
         let Ok(input) = crate::agent::TurnInput::inbox(items) else {
+            // Unreachable while the door refuses an empty message; left due, the sweeper would
+            // ask again at once.
+            tracing::warn!("inbox items for session {session_id} carry no words; they wait");
+            defer_session_inbox(hooks, session_id, INBOX_RETRY_LONGEST_WAIT).await;
             return;
         };
         let input = input.retaining(crate::conversation::PromptRetention::Withdraw);
