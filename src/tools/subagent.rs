@@ -1499,35 +1499,20 @@ impl Tool for AgentFollowupTool {
         )
         .await?;
 
-        // Rehydrate the worker's own conversation: the same three calls the REPL's resume path
-        // makes. `from_events` arms the resume notice, and it is left armed deliberately: every
+        // Rehydrate the worker's own conversation through the door every resume uses.
+        // `from_events` arms the resume notice, and it is left armed deliberately: every
         // follow-up really is a fresh registry, a fresh read tracker and an empty todo list, so the
         // worker is being told something true each time rather than a stale banner.
-        let store = &self.tool_builder_params.materials.store;
-        let mut events =
-            store
-                .load_events(agent_id)
-                .await
-                .map_err(|error| MekaError::ToolExecution {
-                    tool_name: "agent_followup".to_string(),
-                    message: format!("failed to load sub-agent conversation: {error}"),
-                })?;
-        // Bytes back into every image reference, as the root agent's hydration does.
-        store
-            .inline_blobs(&mut events)
+        let mut messages = self
+            .tool_builder_params
+            .materials
+            .store
+            .load_conversation(agent_id)
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "agent_followup".to_string(),
-                message: format!("failed to load the sub-agent's images: {error}"),
+                message: format!("failed to load sub-agent conversation: {error}"),
             })?;
-        let mut messages = Conversation::from_events(events);
-        for dropped in messages.sanitize_orphans() {
-            let count = dropped.content.len();
-            tracing::warn!(
-                "sub-agent {agent_id}: dropped an assistant message with {count} orphaned tool_use \
-                 block(s) while rehydrating"
-            );
-        }
 
         let environment_context =
             build_environment_context(effective_permission, &sub_cwd_snapshot, &roots_snapshot);

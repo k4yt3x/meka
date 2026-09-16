@@ -6238,6 +6238,70 @@ fn acp_reports_a_compaction_as_a_meka_notice() {
     assert_eq!(response["result"]["stopReason"], "end_turn");
 }
 
+/// A session compacted before it was closed is titled by its first prompt when it is loaded
+/// again, as `session/list` titles it. The resident log begins at the compaction boundary, which
+/// is past that prompt, so the title has to come from the row.
+#[test]
+fn loading_a_compacted_session_titles_it_by_its_first_prompt() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "context_compact" },
+            { "type": "tool_use_end", "input": {} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "a summary" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "the reply" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let config = format!("{ACP_INVALID_PARAMS_CONFIG}\n[session]\ncompact_checkpoint = false\n");
+    let mut harness = AcpTestHarness::spawn(&config, Some(script));
+    let cwd = harness.work_dir();
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "explain the build system");
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    assert!(
+        updates
+            .iter()
+            .any(
+                |value| value["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+                    && value["params"]["update"]["content"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("[meka] compacted"))
+            ),
+        "the turn must have compacted: {updates:?}"
+    );
+
+    let closed = harness.request(
+        "session/close",
+        serde_json::json!({ "sessionId": session_id }),
+    );
+    assert!(closed["result"].is_object(), "close must succeed: {closed}");
+
+    let id = harness.send_request(
+        "session/load",
+        serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    let (updates, response) = harness.collect_updates(&session_id, id);
+    assert!(
+        response["result"].is_object(),
+        "load must succeed: {response}"
+    );
+    let info = updates
+        .iter()
+        .find(|value| value["params"]["update"]["sessionUpdate"] == "session_info_update")
+        .unwrap_or_else(|| panic!("the load must title the session; updates: {updates:?}"));
+    assert_eq!(
+        info["params"]["update"]["title"],
+        "explain the build system"
+    );
+}
+
 /// The same, through `session/resume` rather than `session/load`.
 ///
 /// `handle_resume_session` carries its own copy of the permission restore, and nothing exercised

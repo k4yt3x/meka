@@ -267,6 +267,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "sessions_have_an_inbox",
         step: Step::Sql(INBOX_ITEMS),
     },
+    // A resume starts at the session's last boundary row and the context block counts them, and
+    // both ask by kind; without this the count reads every row the session ever wrote.
+    Migration {
+        name: "messages_are_indexed_by_kind",
+        step: Step::Sql(MESSAGES_KIND_INDEX),
+    },
 ];
 
 /// The inbox table. `appended_at` is written by the transaction that writes the conversation row
@@ -295,6 +301,12 @@ const INBOX_ITEMS: &str = "
 
     CREATE INDEX IF NOT EXISTS idx_inbox_items_session_delivered_at
         ON inbox_items(session_id, delivered_at);
+";
+
+/// The index behind the two questions asked of a session's rows by kind: where its last
+/// `compact_boundary` row is, and how many it has.
+const MESSAGES_KIND_INDEX: &str = "
+    CREATE INDEX IF NOT EXISTS idx_messages_session_id_kind ON messages(session_id, kind);
 ";
 
 /// The step after which a store has no `provider_credentials` object, named once because
@@ -2687,6 +2699,7 @@ mod tests {
             ),
             ("names_follow_the_vocabulary", 13015232274362220399_u64),
             ("sessions_have_an_inbox", 5664388226393763354_u64),
+            ("messages_are_indexed_by_kind", 3120448634739482323_u64),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
         /// every column-zero function it calls, recursively. What a Rust step does is its body and

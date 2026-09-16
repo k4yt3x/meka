@@ -544,7 +544,7 @@ pub(super) async fn run_prompt_turn(
         &frontend.connection,
         &frontend.session_id,
         &entry.title_sent,
-        messages,
+        messages.title(),
     );
 
     responder.respond(PromptResponse::new(stop_reason).usage(session_usage(agent)))

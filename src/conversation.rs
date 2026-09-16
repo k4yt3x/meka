@@ -435,7 +435,9 @@ impl Conversation {
     /// session.
     ///
     /// Persistence is unaffected: every event was already written to its own row by `save_event`,
-    /// so the on-disk log stays complete.
+    /// so the on-disk log stays complete. A resume starts from the same place:
+    /// `Store::load_view_events` reads the last boundary row and what follows, so a log in memory
+    /// begins at a boundary whether this process compacted it or an earlier one did.
     pub(crate) fn prune_compacted_events(&mut self) {
         let last_boundary = self
             .events

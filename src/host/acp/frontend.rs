@@ -1377,20 +1377,21 @@ pub(super) fn send_session_update(
     }
 }
 /// Emit a `session_info_update` carrying the session title exactly once. The title is
-/// [`Conversation::title`], which never changes once the first user words are in, so `title_sent`
-/// guards against re-emission across the first prompt and any later load/resume of the same
-/// session.
+/// [`Conversation::title`]'s definition applied by whoever holds the first user words: the
+/// resident log after a first prompt, the session row on a load, resume or fork, since a hydrated
+/// log begins at the last compaction boundary. It never changes once those words are in, so
+/// `title_sent` guards against re-emission across the first prompt and any later reopening of
+/// the same session.
 pub(super) fn maybe_emit_session_title(
     connection: &ConnectionTo<Client>,
     session_id: &SessionId,
     title_sent: &std::sync::atomic::AtomicBool,
-    messages: &Conversation,
+    title: String,
 ) {
     use std::sync::atomic::Ordering;
     if title_sent.load(Ordering::Acquire) {
         return;
     }
-    let title = messages.title();
     if title.is_empty() {
         return;
     }

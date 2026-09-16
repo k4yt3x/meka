@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Every SSE event carries `turn_id` and `session_id`; `turn.started` says who started the turn.
 - Scheduled fires and background-outcome turns appear on the session feed as they run.
 - A session with a live feed subscriber is not evicted for idleness.
+- Resuming a session reads only the conversation since its last compaction, so it opens fast.
+- The store gains an index on message kinds; the migration runs on open behind the usual backup.
 
 ### Fixed
 

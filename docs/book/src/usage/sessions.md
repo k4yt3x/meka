@@ -247,7 +247,7 @@ Note that an *automatic* compaction runs a checkpoint too, unattended, and can w
 
 Compaction preserves scratchpad entries and the todo list, and re-injects environment context so the agent isn't disoriented afterwards. The tool catalog, skill list, and MCP server instructions are restated in full on the next turn, since the messages that carried them may have been summarized away. Tools loaded via `load_tool` stay loaded; the deferred-tool active set is snapshotted into the compaction boundary. If a detail was dropped, the model can `conversation_search` / `conversation_read` the full pre-compaction history, which stays on disk.
 
-Internally, compaction does not delete pre-compaction rows from the store. It appends a `compact_boundary` row to the `messages` table; the materialized view is reconstructed from the event log, so the persisted log itself stays append-only.
+Internally, compaction does not delete pre-compaction rows from the store. It appends a `compact_boundary` row to the `messages` table; the materialized view is reconstructed from the event log, so the persisted log itself stays append-only. A resume reads that log from its last `compact_boundary` row: nothing before it can reach the view, so opening a session costs the same however long its history is. `conversation_search`, `conversation_read`, `GET /messages`, a rewind and an export still read the whole log.
 
 #### When the summarizer runs instead
 

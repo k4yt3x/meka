@@ -449,6 +449,46 @@ pub(super) fn decode_event_from_row(
 /// Pagination cursor for [`Store::list_sessions`]: encodes the `(updated_at, id)` of the
 /// last row in a page as base64-url JSON. The shape is opaque to clients; they only round-trip it
 /// back as `next_cursor`.
+/// Which rows of a session's log a read takes.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum RowRange {
+    /// Every row: the readers that want history.
+    All,
+    /// The last `compact_boundary` row and everything after it, or every row when there is none:
+    /// the rows that produce the model's view. See [`Store::load_view_events`].
+    FromLastBoundary,
+}
+
+/// The `WHERE` clause that starts a read at the session's last boundary row. `?1` is the session
+/// id and `?2` is [`COMPACT_BOUNDARY_KIND`]; `MAX(id)` walks the session's index backward and
+/// stops at the first boundary it meets, so the lookup costs the rows since it, not the log.
+const VIEW_FLOOR_SQL: &str =
+    "AND id >= COALESCE((SELECT MAX(id) FROM messages WHERE session_id = ?1 AND kind = ?2), 0)";
+
+/// Decode rows into `(created_at, event)` pairs in the order they were stored, skipping with a
+/// warning any row this build cannot read, so one bad row costs itself and not the session.
+fn decode_rows(stored: Vec<StoredMessage>) -> Vec<(String, crate::conversation::Event)> {
+    let mut events = Vec::with_capacity(stored.len());
+    for row in stored {
+        match decode_event_from_row(&row) {
+            Ok(Some(event)) => events.push((row.created_at, event)),
+            Ok(None) => {
+                tracing::warn!(
+                    "dropping a session row with unknown kind '{kind}'",
+                    kind = row.kind
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "failed to decode a session row of kind '{kind}': {error}",
+                    kind = row.kind
+                );
+            }
+        }
+    }
+    events
+}
+
 #[derive(Serialize, Deserialize)]
 pub(super) struct ListSessionsCursor {
     #[serde(rename = "u")]
@@ -1575,30 +1615,93 @@ impl Store {
     /// `Event::Append`, so reading them back as `Event::Append` closes that round trip rather than
     /// falling back to anything; `compact_boundary` and `repair` rows are deserialized from their
     /// JSON envelope. Unknown roles are skipped with a warning.
+    ///
+    /// The whole log, for the readers that want history: `conversation_search` and
+    /// `conversation_read`, `GET /messages`, an export, a rewind. A resume wants the view instead;
+    /// see [`Self::load_view_events`].
     pub(crate) async fn load_events(
         &self,
         session_id: Uuid,
     ) -> Result<Vec<crate::conversation::Event>> {
-        let stored = self.load_messages(session_id).await?;
-        let mut events = Vec::with_capacity(stored.len());
-        for row in stored {
-            match decode_event_from_row(&row) {
-                Ok(Some(event)) => events.push(event),
-                Ok(None) => {
-                    tracing::warn!(
-                        "dropping a session row with unknown kind '{kind}'",
-                        kind = row.kind
-                    );
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "failed to decode a session row of kind '{kind}': {error}",
-                        kind = row.kind
-                    );
-                }
-            }
+        let stored = self.load_messages(session_id, RowRange::All).await?;
+        Ok(decode_rows(stored)
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect())
+    }
+
+    /// The events that produce the model's view: the last `compact_boundary` row and everything
+    /// after it, or the whole log when no compaction has run.
+    ///
+    /// Nothing before that row can reach the view, since a boundary replaces every message before
+    /// it with its summary and carries the loaded-tool snapshot itself, so a resume that read the
+    /// rows before it would decode, clone and inline images for history it then discards, at a
+    /// cost that grew with the session's whole life rather than its window. The result is the log
+    /// [`crate::conversation::Conversation::prune_compacted_events`] leaves behind, so a session
+    /// looks the same whether it was compacted in this process or an earlier one.
+    ///
+    /// The floor is the boundary row's existence, not its content: one this build cannot decode
+    /// is dropped with a warning like any other row, and the view is then the tail alone, without
+    /// the summary. Reading past it would mean trusting the rows a compaction meant to replace.
+    pub(crate) async fn load_view_events(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::conversation::Event>> {
+        let stored = self
+            .load_messages(session_id, RowRange::FromLastBoundary)
+            .await?;
+        Ok(decode_rows(stored)
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect())
+    }
+
+    /// The conversation a resume runs on: the view's events with their images inlined, replayed,
+    /// and stripped of assistant messages whose `tool_use` blocks a crash left unanswered.
+    ///
+    /// The one door for making a persisted conversation resident, whichever host or tool asks:
+    /// `host::hydrate_conversation` for every resume and re-attach, and the sub-agent follow-up.
+    /// What it repairs is said once, here, at `warn`.
+    pub(crate) async fn load_conversation(
+        &self,
+        session_id: Uuid,
+    ) -> Result<crate::conversation::Conversation> {
+        let mut events = self.load_view_events(session_id).await?;
+        // The rows hold image references; a turn needs the bytes, so they come back here, once,
+        // and only for images the view still shows.
+        self.inline_blobs(&mut events).await?;
+        let mut conversation = crate::conversation::Conversation::from_events(events);
+
+        // Anthropic's API rejects an orphaned `tool_use`, so a log a crash cut mid-tool-call is
+        // repaired on the way in.
+        for message in conversation.sanitize_orphans() {
+            let tool_use_ids: Vec<String> = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    crate::conversation::ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect();
+            tracing::warn!(
+                "session {session_id}: dropping an assistant message with orphaned tool_use ids: \
+                 {tool_use_ids:?}"
+            );
         }
-        Ok(events)
+
+        // Materializing the log also replaces images whose bytes contradict their declared media
+        // type. Providers sniff and reject those with a 400, and since the block is already in the
+        // log that 400 would repeat on every request, leaving the session unusable. A stored
+        // session carrying such a block heals on the way in, for free; all that is left is to say
+        // so.
+        let replaced = conversation.invalid_images_replaced();
+        if replaced > 0 {
+            tracing::warn!(
+                "session {session_id}: replaced {replaced} image(s) whose bytes did not match \
+                 their declared media type"
+            );
+        }
+        Ok(conversation)
     }
 
     /// Variant of [`Self::load_events`] that also returns the persisted `created_at` timestamp for
@@ -1609,26 +1712,8 @@ impl Store {
         &self,
         session_id: Uuid,
     ) -> Result<Vec<(String, crate::conversation::Event)>> {
-        let stored = self.load_messages(session_id).await?;
-        let mut events = Vec::with_capacity(stored.len());
-        for row in stored {
-            match decode_event_from_row(&row) {
-                Ok(Some(event)) => events.push((row.created_at, event)),
-                Ok(None) => {
-                    tracing::warn!(
-                        "dropping a session row with unknown kind '{kind}'",
-                        kind = row.kind
-                    );
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "failed to decode a session row of kind '{kind}': {error}",
-                        kind = row.kind
-                    );
-                }
-            }
-        }
-        Ok(events)
+        let stored = self.load_messages(session_id, RowRange::All).await?;
+        Ok(decode_rows(stored))
     }
 
     /// Load a session together with every descendant sub-agent session (recursively via
@@ -1901,17 +1986,29 @@ impl Store {
             })
     }
 
-    /// Fetch raw rows for a session. Internal helper for [`Self::load_events`]; external consumers
-    /// go through the event API.
-    pub(super) async fn load_messages(&self, session_id: Uuid) -> Result<Vec<StoredMessage>> {
+    /// Fetch raw rows for a session, in insert order. Internal helper for [`Self::load_events`]
+    /// and [`Self::load_view_events`]; external consumers go through the event API.
+    pub(super) async fn load_messages(
+        &self,
+        session_id: Uuid,
+        range: RowRange,
+    ) -> Result<Vec<StoredMessage>> {
+        let (floor, parameters) = match range {
+            RowRange::All => ("", vec![session_id.to_string()]),
+            RowRange::FromLastBoundary => (VIEW_FLOOR_SQL, vec![
+                session_id.to_string(),
+                COMPACT_BOUNDARY_KIND.to_string(),
+            ]),
+        };
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
-                let mut statement = connection.prepare(
-                    "SELECT kind, content, created_at FROM messages WHERE session_id = ?1 ORDER BY id ASC",
-                )?;
+                let mut statement = connection.prepare(&format!(
+                    "SELECT kind, content, created_at FROM messages WHERE session_id = ?1 {floor} \
+                     ORDER BY id ASC"
+                ))?;
 
                 let messages = statement
-                    .query_map(rusqlite::params![session_id.to_string()], |row| {
+                    .query_map(rusqlite::params_from_iter(parameters), |row| {
                         Ok(StoredMessage {
                             kind: row.get(0)?,
                             content: row.get(1)?,
@@ -1928,10 +2025,10 @@ impl Store {
 
     /// How many times this session has been compacted, i.e. its compaction *generation*.
     ///
-    /// Read from the database rather than the in-memory log because
-    /// [`crate::conversation::Conversation::prune_compacted_events`] drains every event preceding
-    /// the most recent boundary, so the log in memory holds at most one no matter how many
-    /// compactions have run. Every boundary is still its own row here.
+    /// Read from the database rather than the in-memory log because that log begins at the most
+    /// recent boundary, whether [`Self::load_view_events`] hydrated it there or
+    /// [`crate::conversation::Conversation::prune_compacted_events`] cut it there, so it holds at
+    /// most one no matter how many compactions have run. Every boundary is still its own row here.
     ///
     /// Worth surfacing to the model: a fourth summary-of-a-summary has lost far more than a first,
     /// and an agent that knows its generation can compensate by writing to memory more readily.
@@ -4169,7 +4266,10 @@ mod tests {
 
         // Stored kinds: the image-bearing turn is JSON under `user_blocks`; the text-only turn
         // stays plaintext under `user`.
-        let rows = store.load_messages(sid).await.expect("load messages");
+        let rows = store
+            .load_messages(sid, RowRange::All)
+            .await
+            .expect("load messages");
         assert_eq!(rows[0].kind, "user_blocks");
         assert_eq!(rows[1].kind, "user");
         assert_eq!(rows[1].content, "plain text only");
@@ -4241,6 +4341,137 @@ mod tests {
         let events = store.load_events(sid).await.expect("load events");
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|e| matches!(e, Event::Append(_))));
+    }
+
+    /// Resume reads the last boundary row and what follows, and nothing before it: the view it
+    /// produces is the one the whole log produces, and the boundary's own tool snapshot rides
+    /// along, since the rows that would have said which tools were loaded are exactly the ones
+    /// left behind.
+    #[tokio::test]
+    async fn a_resume_reads_from_the_last_boundary_and_sees_the_same_view() {
+        use crate::conversation::{Conversation, Event, Message};
+
+        let store = Store::for_test().await;
+        let sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        let boundary = |summary: &str, tools: &[&str]| Event::CompactBoundary {
+            summary: Message::user(summary),
+            replaced_count: 2,
+            loaded_tools_snapshot: tools.iter().map(|tool| tool.to_string()).collect(),
+        };
+        for event in [
+            Event::Append(Message::user("first")),
+            Event::Append(Message::assistant_text("reply one")),
+            boundary("[summary one]", &["mcp__a__x"]),
+            Event::Append(Message::user("second")),
+            Event::Append(Message::assistant_text("reply two")),
+            boundary("[summary two]", &["mcp__b__y"]),
+            Event::Append(Message::user("third")),
+            Event::Append(Message::assistant_text("reply three")),
+        ] {
+            store.save_event(sid, &event).await.expect("save event");
+        }
+
+        let whole = store.load_events(sid).await.expect("load events");
+        let view = store.load_view_events(sid).await.expect("load view events");
+        assert_eq!(whole.len(), 8);
+        assert_eq!(view.len(), 3, "the last boundary and the two rows after it");
+        assert!(
+            matches!(&view[0], Event::CompactBoundary { summary, .. } if summary.text_content() == "[summary two]"),
+            "the view opens on the last boundary: {view:?}"
+        );
+        let texts = |conversation: &Conversation| -> Vec<String> {
+            conversation
+                .as_slice()
+                .iter()
+                .map(Message::text_content)
+                .collect()
+        };
+        assert_eq!(
+            texts(&Conversation::from_events(view.clone())),
+            texts(&Conversation::from_events(whole)),
+        );
+        assert_eq!(
+            crate::tools::load_tool::extract_loaded_tool_names_from_events(&view),
+            vec!["mcp__b__y".to_string()],
+            "the boundary carries the loaded tools the dropped rows would have named"
+        );
+
+        // A session nobody has compacted reads whole.
+        let plain = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        for event in [
+            Event::Append(Message::user("only")),
+            Event::Append(Message::assistant_text("reply")),
+        ] {
+            store.save_event(plain, &event).await.expect("save event");
+        }
+        assert_eq!(store.load_view_events(plain).await.expect("view").len(), 2);
+    }
+
+    /// The conversation a resume runs on has its images' bytes back and no assistant message a
+    /// crash left with an unanswered `tool_use`.
+    #[tokio::test]
+    async fn a_loaded_conversation_inlines_the_views_images_and_drops_orphans() {
+        use crate::{
+            conversation::{ContentBlock, Event, Message, Role},
+            image::ImageSource,
+        };
+
+        let store = Store::for_test().await;
+        let sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        // The PNG signature, so the repair for mismatched bytes has nothing to say.
+        let png = "iVBORw0KGgo=";
+        let image = ImageSource::Base64 {
+            media_type: "image/png".to_string(),
+            data: png.to_string(),
+        };
+        for event in [
+            Event::CompactBoundary {
+                summary: Message::user("[summary]"),
+                replaced_count: 4,
+                loaded_tools_snapshot: Default::default(),
+            },
+            Event::Append(Message::user_with_images("look", vec![image])),
+            Event::Append(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "u9".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/x"}),
+                }],
+            }),
+        ] {
+            store.save_event(sid, &event).await.expect("save event");
+        }
+        assert_eq!(store.blob_count().await.expect("count"), 1);
+
+        let conversation = store.load_conversation(sid).await.expect("load");
+        let view = conversation.as_slice();
+        assert_eq!(
+            view.len(),
+            2,
+            "summary and the prompt; the orphan is gone: {view:?}"
+        );
+        assert!(
+            view.iter().all(|message| message.role == Role::User),
+            "{view:?}"
+        );
+        assert!(
+            view[1].content.iter().any(|block| matches!(
+                block,
+                ContentBlock::Image { source: ImageSource::Base64 { data, .. } } if data == png
+            )),
+            "the image comes back with its bytes: {:?}",
+            view[1]
+        );
     }
 
     /// A row with an unknown kind should be skipped (with a warning) so a future schema bump that
@@ -4405,7 +4636,7 @@ mod tests {
             .expect("failed to save message");
 
         let messages = store
-            .load_messages(session_id)
+            .load_messages(session_id, RowRange::All)
             .await
             .expect("failed to load messages");
 
@@ -5093,8 +5324,14 @@ mod tests {
             .await
             .expect("failed");
 
-        let messages1 = store.load_messages(session1).await.expect("failed");
-        let messages2 = store.load_messages(session2).await.expect("failed");
+        let messages1 = store
+            .load_messages(session1, RowRange::All)
+            .await
+            .expect("failed");
+        let messages2 = store
+            .load_messages(session2, RowRange::All)
+            .await
+            .expect("failed");
 
         assert_eq!(messages1.len(), 1);
         assert_eq!(messages1[0].content, "msg1");
@@ -5135,7 +5372,10 @@ mod tests {
         assert_eq!(deleted.deleted, 1);
         assert!(!store.session_exists(session_id).await.expect("failed"));
 
-        let messages = store.load_messages(session_id).await.expect("failed");
+        let messages = store
+            .load_messages(session_id, RowRange::All)
+            .await
+            .expect("failed");
         assert!(messages.is_empty());
     }
 
@@ -5364,7 +5604,10 @@ mod tests {
             .await
             .expect("failed");
 
-        let messages = store.load_messages(session_id).await.expect("failed");
+        let messages = store
+            .load_messages(session_id, RowRange::All)
+            .await
+            .expect("failed");
         assert_eq!(messages.len(), 2);
 
         store
@@ -5372,7 +5615,10 @@ mod tests {
             .await
             .expect("failed to clear");
 
-        let messages = store.load_messages(session_id).await.expect("failed");
+        let messages = store
+            .load_messages(session_id, RowRange::All)
+            .await
+            .expect("failed");
         assert!(messages.is_empty());
 
         // Session itself should still exist

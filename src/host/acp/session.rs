@@ -478,15 +478,13 @@ pub(super) async fn handle_load_session(
 
     let permission = runtime.resident.cells().permission.clone();
     let frontend = Arc::clone(&runtime.frontend);
-    // History already carries the first user message, so the title is known; push it once now,
-    // sharing the flag with the entry so a later prompt won't re-emit it.
+    // The row already knows the session's first words, so the title is pushed once now, sharing
+    // the flag with the entry so a later prompt won't re-emit it. From the store, not the resident
+    // log: hydration starts at the last compaction boundary, and the first prompt is usually
+    // behind it, so a resident log would title a compacted session by some later prompt while
+    // `session/list` names the first.
     let title_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    maybe_emit_session_title(
-        &cx,
-        &session_id,
-        &title_sent,
-        &*runtime.resident.conversation.lock().await,
-    );
+    maybe_emit_session_title(&cx, &session_id, &title_sent, summary.title.clone());
     let entry = SessionEntry {
         resident: runtime.resident,
         title_sent,
@@ -659,15 +657,13 @@ pub(super) async fn handle_resume_session(
 
     let permission = runtime.resident.cells().permission.clone();
     let frontend = Arc::clone(&runtime.frontend);
-    // History already carries the first user message, so the title is known; push it once now,
-    // sharing the flag with the entry so a later prompt won't re-emit it.
+    // The row already knows the session's first words, so the title is pushed once now, sharing
+    // the flag with the entry so a later prompt won't re-emit it. From the store, not the resident
+    // log: hydration starts at the last compaction boundary, and the first prompt is usually
+    // behind it, so a resident log would title a compacted session by some later prompt while
+    // `session/list` names the first.
     let title_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    maybe_emit_session_title(
-        &cx,
-        &session_id,
-        &title_sent,
-        &*runtime.resident.conversation.lock().await,
-    );
+    maybe_emit_session_title(&cx, &session_id, &title_sent, summary.title.clone());
     let entry = SessionEntry {
         resident: runtime.resident,
         title_sent,
@@ -852,7 +848,7 @@ pub(super) async fn handle_fork_session(
     // The copy's row carries the source's level and switch; the runtime is seeded from them so the
     // fork runs under what it copied, with a level this configuration no longer enables dropping to
     // the default as on every other door.
-    let (permission, approvals) = match state.shared.store.session_info(session_uuid).await {
+    let (permission, approvals, title) = match state.shared.store.session_info(session_uuid).await {
         Ok(Some(copied)) => (
             state
                 .shared
@@ -861,12 +857,14 @@ pub(super) async fn handle_fork_session(
                 .admit_recorded(copied.permission, &format!("session {session_uuid}"))
                 .unwrap_or(state.shared.config.permission),
             copied.approvals,
+            Some(copied.title),
         ),
         Ok(None) => {
             tracing::warn!("session/fork: the copy {session_uuid} has no row to read");
             (
                 state.shared.config.permission,
                 state.shared.config.approvals,
+                None,
             )
         }
         Err(error) => {
@@ -874,6 +872,7 @@ pub(super) async fn handle_fork_session(
             (
                 state.shared.config.permission,
                 state.shared.config.approvals,
+                None,
             )
         }
     };
@@ -912,13 +911,15 @@ pub(super) async fn handle_fork_session(
     let permission = runtime.resident.cells().permission.clone();
     let frontend = Arc::clone(&runtime.frontend);
     // The copied history already carries the first user message, so the title is known now.
+    // The copy's row names the source's first words; see `session/load` for why the row and not
+    // the resident log. A row that could not be read above leaves the resident log as the only
+    // holder, and the words it has are better than none.
+    let title = match title {
+        Some(title) => title,
+        None => runtime.resident.conversation.lock().await.title(),
+    };
     let title_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    maybe_emit_session_title(
-        &cx,
-        &session_id,
-        &title_sent,
-        &*runtime.resident.conversation.lock().await,
-    );
+    maybe_emit_session_title(&cx, &session_id, &title_sent, title);
     let entry = SessionEntry {
         resident: runtime.resident,
         title_sent,

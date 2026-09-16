@@ -786,6 +786,8 @@ pub(crate) async fn apply_session_repin(
     );
     Ok(())
 }
+/// Make a persisted conversation resident for a host: retire whatever the last process left
+/// running on the session, then load the view through `Store::load_conversation`.
 pub(crate) async fn hydrate_conversation(
     store: &Store,
     session_id: uuid::Uuid,
@@ -793,47 +795,7 @@ pub(crate) async fn hydrate_conversation(
     // Retire whatever the last process left running before hydrating anything else; see
     // `crate::host::claim_session`.
     crate::host::claim_session(store, session_id).await;
-
-    // Hydrate the event log directly: `load_events` decodes each stored row back into the `Event`
-    // that wrote it, so resume rebuilds the log the last process ended with rather than a flattened
-    // approximation of it.
-    let mut events = store.load_events(session_id).await?;
-    // The rows hold image references; a turn needs the bytes, so they come back here, once.
-    store.inline_blobs(&mut events).await?;
-    let mut log = crate::conversation::Conversation::from_events(events);
-
-    // Drop assistant messages whose tool_use blocks lack matching tool_result blocks in the next
-    // message. Anthropic's API rejects orphans; this sanitizes the log after a crash mid-tool-call.
-    let dropped = log.sanitize_orphans();
-    for message in &dropped {
-        let tool_use_ids: Vec<String> = message
-            .content
-            .iter()
-            .filter_map(|block| {
-                if let crate::conversation::ContentBlock::ToolUse { id, .. } = block {
-                    Some(id.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        tracing::warn!(
-            "dropping an assistant message with orphaned tool_use ids: {tool_use_ids:?}"
-        );
-    }
-
-    // Materializing the log also replaces images whose bytes contradict their declared media type.
-    // Providers sniff and reject those with a 400, and since the block is already in the log that
-    // 400 would repeat on every request, leaving the session unusable. A stored session carrying
-    // such a block heals on the way in, for free; all that is left to do is say so.
-    let replaced = log.invalid_images_replaced();
-    if replaced > 0 {
-        tracing::warn!(
-            "replaced {replaced} image(s) whose bytes did not match their declared media type"
-        );
-    }
-
-    Ok(log)
+    Ok(store.load_conversation(session_id).await?)
 }
 
 impl SharedDeps {
