@@ -954,34 +954,15 @@ pub(crate) const AGENT_TOOL_NAMES: [&str; 5] = [
     "agent_delete",
 ];
 
-/// Parse the `id` argument, without checking ownership.
-///
-/// Split out so a caller can claim the per-worker guard *before* verifying ownership: verifying
-/// first leaves an await boundary between the check and the claim, which is exactly long enough for
-/// a concurrent `agent_delete` to remove the row the caller just validated.
-fn parse_agent_id(input: &serde_json::Value, tool_name: &'static str) -> Result<Uuid> {
-    let raw = super::util::require_str(input, "id", tool_name)?;
-    Uuid::parse_str(raw.trim()).map_err(|_| MekaError::ToolExecution {
-        tool_name: tool_name.to_string(),
-        message: format!("'{raw}' is not a valid agent id"),
-    })
-}
-
-/// Refuse an `id` argument that isn't a live child of the session running the tool.
-///
-/// One check, three failures it has to catch: an id that was never a sub-agent (a fabricated or
-/// mistyped UUID), a sub-agent belonging to a *different* parent, and a fork holding ids it does
-/// not own (`fork_session` copies the conversation, which names the children, but not the children
-/// themselves, so a forked parent's log advertises sessions that are still linked to the original).
-/// Letting any of those through would let one session drive or delete another's workers.
-async fn require_child_session(
+/// The sub-agents this session spawned: the rows of its tree that name it as their parent.
+/// Grandchildren belong to the worker that spawned them and are left out, so a row this returns is
+/// always one the session may drive.
+async fn direct_children(
     params: &ToolBuilderParams,
     tool_name: &'static str,
-    input: &serde_json::Value,
-) -> Result<(Uuid, crate::store::SessionMetaRow)> {
-    let agent_id = parse_agent_id(input, tool_name)?;
+) -> Result<(Uuid, Vec<crate::store::SessionMetaRow>)> {
     let parent_sid = current_session_id(params, tool_name)?;
-    let children = params
+    let rows = params
         .materials
         .store
         .load_session_tree(parent_sid)
@@ -990,17 +971,79 @@ async fn require_child_session(
             tool_name: tool_name.to_string(),
             message: format!("failed to list sub-agents: {error}"),
         })?;
-    children
-        .into_iter()
-        .find(|row| row.id == agent_id && row.parent_id == Some(parent_sid))
-        .map(|row| (parent_sid, row))
-        .ok_or_else(|| MekaError::ToolExecution {
+    Ok((
+        parent_sid,
+        rows.into_iter()
+            .filter(|row| row.parent_id == Some(parent_sid))
+            .collect(),
+    ))
+}
+
+/// Pick the one of `children` that `wanted` names: its full id, or a prefix no other child shares.
+///
+/// Matching among this session's own sub-agents and nowhere else is what makes the lookup the
+/// ownership check. An id that was never a sub-agent (a fabricated or mistyped UUID), a sub-agent
+/// belonging to a *different* parent, and a fork holding ids it does not own (`fork_session` copies
+/// the conversation, which names the children, but not the children themselves, so a forked
+/// parent's log advertises sessions that are still linked to the original) all come out as no such
+/// sub-agent, and letting any of them through would let one session drive or delete another's
+/// workers. The same scope keeps a prefix honest: another session's worker can neither make it
+/// ambiguous nor be what it resolves to.
+fn match_child(
+    children: Vec<crate::store::SessionMetaRow>,
+    wanted: &str,
+    tool_name: &'static str,
+) -> Result<crate::store::SessionMetaRow> {
+    let wanted = wanted.trim();
+    let mut matches: Vec<crate::store::SessionMetaRow> = if let Ok(id) = Uuid::parse_str(wanted) {
+        children.into_iter().filter(|row| row.id == id).collect()
+    } else if crate::text::is_usable_id_prefix(wanted) {
+        let prefix = crate::text::id_prefix_for_matching(wanted);
+        children
+            .into_iter()
+            .filter(|row| row.id.to_string().starts_with(&prefix))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if matches.len() > 1 {
+        let listing: Vec<String> = matches.iter().map(|row| row.id.to_string()).collect();
+        return Err(MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
             message: format!(
-                "no sub-agent '{agent_id}' belongs to this session. Use `agent_list` to see the ones that \
-                 do."
+                "'{wanted}' names {} of this session's sub-agents: {}. Pass more of the id.",
+                matches.len(),
+                listing.join(", ")
             ),
-        })
+        });
+    }
+    matches.pop().ok_or_else(|| MekaError::ToolExecution {
+        tool_name: tool_name.to_string(),
+        message: format!(
+            "no sub-agent '{wanted}' belongs to this session. Use `agent_list` to see the ones that \
+             do."
+        ),
+    })
+}
+
+/// Resolve `wanted` to one of this session's sub-agents, refusing anything else.
+async fn resolve_child_session(
+    params: &ToolBuilderParams,
+    tool_name: &'static str,
+    wanted: &str,
+) -> Result<(Uuid, crate::store::SessionMetaRow)> {
+    let (parent_sid, children) = direct_children(params, tool_name).await?;
+    Ok((parent_sid, match_child(children, wanted, tool_name)?))
+}
+
+/// [`resolve_child_session`] for the `id` argument.
+async fn require_child_session(
+    params: &ToolBuilderParams,
+    tool_name: &'static str,
+    input: &serde_json::Value,
+) -> Result<(Uuid, crate::store::SessionMetaRow)> {
+    let raw = super::util::require_str(input, "id", tool_name)?;
+    resolve_child_session(params, tool_name, &raw).await
 }
 
 /// The session id of the agent running the tool. By the time a tool runs, `Agent::run_turn` has
@@ -1146,7 +1189,7 @@ pub(crate) fn agent_steer_definition() -> ToolDefinition {
                 "id": {
                     "type": "string",
                     "description": "The sub-agent's id, as returned by `agent_spawn` or \
-                                    `agent_list`."
+                                    `agent_list`; a unique prefix is enough."
                 },
                 "message": {
                     "type": "string",
@@ -1308,7 +1351,7 @@ pub(crate) fn agent_followup_definition() -> ToolDefinition {
                 "id": {
                     "type": "string",
                     "description": "The sub-agent's id, as returned by `agent_spawn` or \
-                                    `agent_list`."
+                                    `agent_list`; a unique prefix is enough."
                 },
                 "prompt": {
                     "type": "string",
@@ -1343,10 +1386,10 @@ impl Tool for AgentFollowupTool {
     ) -> Result<ToolOutput> {
         let cancellation = context.cancellation.clone();
         let prompt = super::util::require_str(&input, "prompt", "agent_followup")?;
-        // Claimed before the ownership check, not after: the check awaits, and a concurrent
-        // `agent_delete` finishing inside that window would leave this turn writing to a session
-        // that no longer exists.
-        let agent_id = parse_agent_id(&input, "agent_followup")?;
+        let agent_id = require_child_session(&self.tool_builder_params, "agent_followup", &input)
+            .await?
+            .1
+            .id;
         let Some(_guard) = FollowupGuard::claim(&self.in_flight, agent_id) else {
             return Err(MekaError::ToolExecution {
                 tool_name: "agent_followup".to_string(),
@@ -1356,9 +1399,15 @@ impl Tool for AgentFollowupTool {
                 ),
             });
         };
-        let (parent_sid, row) =
-            require_child_session(&self.tool_builder_params, "agent_followup", &input).await?;
-        debug_assert_eq!(row.id, agent_id);
+        // Resolving the id awaited, and a concurrent `agent_delete` finishing inside that window
+        // would leave this turn writing to a session that no longer exists. Asked again under the
+        // guard, by the full id, the row is either still there or the refusal is honest.
+        let (parent_sid, row) = resolve_child_session(
+            &self.tool_builder_params,
+            "agent_followup",
+            &agent_id.to_string(),
+        )
+        .await?;
 
         // The terms come off the session row, never from this agent's current state. See
         // `SubagentSpec`.
@@ -1628,7 +1677,7 @@ pub(crate) fn agent_delete_definition() -> ToolDefinition {
                 "id": {
                     "type": "string",
                     "description": "The sub-agent's id, as returned by `agent_spawn` or \
-                                    `agent_list`."
+                                    `agent_list`; a unique prefix is enough."
                 }
             },
             "required": ["id"]
@@ -1652,12 +1701,15 @@ impl Tool for AgentDeleteTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        // Claimed before the ownership check, mirroring `agent_followup`, so the two serialize on
-        // one worker whichever arrives first. Parallel tool calls in a single turn make this
-        // reachable: without it, a delete completing inside a follow-up's ownership check leaves
-        // that follow-up writing to a deleted session and failing on a foreign-key violation, a
-        // raw database error, on a path where the model did nothing wrong.
-        let agent_id = parse_agent_id(&input, "agent_delete")?;
+        // Claimed between resolving the id and confirming the row, mirroring `agent_followup`, so
+        // the two serialize on one worker whichever arrives first. Parallel tool calls in a single
+        // turn make this reachable: without it, a delete completing inside a follow-up's ownership
+        // check leaves that follow-up writing to a deleted session and failing on a foreign-key
+        // violation, a raw database error, on a path where the model did nothing wrong.
+        let agent_id = require_child_session(&self.tool_builder_params, "agent_delete", &input)
+            .await?
+            .1
+            .id;
         let Some(_guard) = FollowupGuard::claim(&self.in_flight, agent_id) else {
             return Err(MekaError::ToolExecution {
                 tool_name: "agent_delete".to_string(),
@@ -1667,8 +1719,12 @@ impl Tool for AgentDeleteTool {
                 ),
             });
         };
-        let (_parent_sid, row) =
-            require_child_session(&self.tool_builder_params, "agent_delete", &input).await?;
+        let (_parent_sid, row) = resolve_child_session(
+            &self.tool_builder_params,
+            "agent_delete",
+            &agent_id.to_string(),
+        )
+        .await?;
         // One statement; `sessions.parent_session_id`, `messages.session_id` and
         // `scratchpad_entries.session_id` all carry `ON DELETE CASCADE`, so the worker's messages,
         // its scratchpad entries and its own descendants go with it.
@@ -5110,6 +5166,138 @@ mod tests {
                 .expect("tree")
                 .iter()
                 .any(|row| row.id == child)
+        );
+    }
+
+    fn child_row_for_test(id: Uuid, parent: Uuid) -> crate::store::SessionMetaRow {
+        crate::store::SessionMetaRow {
+            id,
+            parent_id: Some(parent),
+            created_at: String::new(),
+            updated_at: String::new(),
+            cwd: None,
+            permission: None,
+            approvals: false,
+            capabilities_json: None,
+            additional_roots: Vec::new(),
+            subagent_spec_json: None,
+            profile: "test-profile".to_string(),
+        }
+    }
+
+    /// The three id-taking tools resolve one way: the full id, or a prefix no other sub-agent of
+    /// this session shares, folded for case like every other id meka resolves.
+    #[test]
+    fn a_sub_agent_id_resolves_in_full_or_by_a_prefix_unique_among_the_children() {
+        let parent = Uuid::from_u128(0x1);
+        let first = Uuid::from_u128(0xaaaaaaaa_0000_4000_8000_000000000001);
+        let second = Uuid::from_u128(0xaaaabbbb_0000_4000_8000_000000000002);
+        let children = || {
+            vec![
+                child_row_for_test(first, parent),
+                child_row_for_test(second, parent),
+            ]
+        };
+
+        let resolved = |wanted: &str| match_child(children(), wanted, "agent_steer");
+        assert_eq!(resolved(&first.to_string()).expect("full id").id, first);
+        assert_eq!(
+            resolved(&first.to_string().to_uppercase())
+                .expect("uppercase full id")
+                .id,
+            first
+        );
+        assert_eq!(resolved("aaaaa").expect("unique prefix").id, first);
+        assert_eq!(resolved("AAAAB").expect("uppercase prefix").id, second);
+
+        let ambiguous = resolved("aaaa").expect_err("a shared prefix names two");
+        let text = ambiguous.to_string();
+        assert!(text.contains("2 of this session's sub-agents"), "{text}");
+        assert!(
+            text.contains(&first.to_string()) && text.contains(&second.to_string()),
+            "both are named so the model can pick: {text}"
+        );
+
+        let outsider = Uuid::from_u128(0xcccccccc_0000_4000_8000_000000000003);
+        for wanted in ["my-agent", "cccc", &outsider.to_string()] {
+            let error = resolved(wanted).expect_err("nothing here is a child");
+            assert!(
+                error.to_string().contains("belongs to this session"),
+                "{error}"
+            );
+        }
+    }
+
+    /// The resolution reaches every door that takes an id: a steer by the printed short form lands
+    /// in the inbox of the sub-agent it names, and a delete by it removes that one.
+    #[tokio::test]
+    async fn a_steer_and_a_delete_by_id_prefix_act_on_the_sub_agent_named() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let child = store
+            .create_child_session(
+                parent_sid,
+                None,
+                Vec::new(),
+                Some("{\"permission\":\"read\"}".to_string()),
+                "read".to_string(),
+                "test-profile".to_string(),
+            )
+            .await
+            .expect("child")
+            .0;
+        let short = child.to_string()[..crate::text::ID_PREFIX].to_string();
+        let params = || {
+            params_for_test(
+                store.clone(),
+                crate::session::SharedSessionId::new(Some(parent_sid)),
+            )
+        };
+
+        let steer = AgentSteerTool {
+            tool_builder_params: params(),
+        };
+        let queued = steer
+            .execute(
+                serde_json::json!({ "id": short, "message": "hello" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("a steer by prefix")
+            .text_content();
+        assert!(queued.contains(&child.to_string()), "{queued}");
+        assert_eq!(
+            store
+                .inbox_store()
+                .list_open(child)
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+
+        let delete = AgentDeleteTool {
+            tool_builder_params: params(),
+            in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+        delete
+            .execute(
+                serde_json::json!({ "id": short }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("a delete by prefix");
+        assert!(
+            store
+                .load_session_tree(parent_sid)
+                .await
+                .expect("tree")
+                .iter()
+                .all(|row| row.id != child),
+            "the sub-agent the prefix named is gone"
         );
     }
 
