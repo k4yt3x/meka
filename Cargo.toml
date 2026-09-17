@@ -1,6 +1,6 @@
 [package]
 name = "meka"
-version = "0.57.0"
+version = "0.58.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -58,7 +58,7 @@ tokio-rusqlite = "0.7"
 tokio-util = { version = "0.7", features = ["compat"] }
 toml = "1.1"
 toml_edit = "0.25"
-tower-http = { version = "0.7", features = ["limit", "trace"], optional = true }
+tower-http = { version = "0.7", features = ["cors", "limit", "trace"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.2"

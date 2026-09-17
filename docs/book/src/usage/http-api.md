@@ -718,7 +718,7 @@ When `stream: false` and approvals are on, and no feed reader is attending, ther
 
 ## Authentication
 
-Every request requires `Authorization: Bearer <token>`, except the two health probes and, when `[serve].docs` is enabled, `/v1/openapi.json` and `/v1/docs`. Both of those are off by default, so on a default deployment they answer 404 rather than serving anything unauthenticated. A `401` carries `WWW-Authenticate: Bearer realm="meka"`, as RFC 9110 requires.
+Every request requires `Authorization: Bearer <token>`, except the two health probes and, when `[serve].docs` is enabled, `/v1/openapi.json` and `/v1/docs`. Both of those are off by default, so on a default deployment they answer 404 rather than serving anything unauthenticated. A `401` carries `WWW-Authenticate: Bearer realm="meka"`, as RFC 9110 requires. A browser's CORS preflight is the one other exception, and only where [`cors_allowed_origins`](#browser-clients) is set.
 
 ### Scopes
 
@@ -769,6 +769,19 @@ scopes = ["sessions:r", "sessions:w"]
 ```
 
 Token comparison uses constant-time equality to prevent timing side-channel attacks. Tokens never appear in logs; only a truncated SHA-256 fingerprint is used for diagnostics.
+
+### Browser clients
+
+A web application served from another origin, a static site or a development server, calls the API directly from the browser once [`[serve].cors_allowed_origins`](../configuration/config-file.md#servecors_allowed_origins) lists its origin, or `*`. The reference page covers the setting; this is what the grant covers.
+
+- **Preflights need no token.** The browser's `OPTIONS` request is answered ahead of authentication and runs nothing: it loads no session, takes no lock and enqueues nothing. The real request that follows needs the same bearer token and scopes as ever.
+- **Request headers.** `Authorization`, `Content-Type`, `Idempotency-Key` and `Last-Event-ID` are granted by name, on top of the headers a browser may always send. `Authorization` has to be named because a wildcard grant never covers it.
+- **Methods.** `GET`, `HEAD`, `POST`, `PUT`, `PATCH` and `DELETE`. A method a route does not implement is still a `405`.
+- **Response headers.** `Retry-After` and `WWW-Authenticate` are exposed to page script. Errors carry the grant like successes do, so a `401`, a `403`, a `413` or a `429` is a Problem Detail the page can read rather than an opaque failure.
+- **No cookies.** `Access-Control-Allow-Credentials` is never sent. Send the bearer header on every request and use `credentials: "omit"`.
+- **Streams.** The feed and a streaming turn are granted like any other response and are not buffered. A native `EventSource` cannot send a header, so read SSE with `fetch` and a streaming parser, and send `Last-Event-ID` yourself on a reconnect. Fetch an image or an export the same way and hand the bytes to an object URL.
+
+CORS is the browser's policy on sharing a response, not authorization: an allowed origin still needs a token, and a refused origin only stops the page from reading the answer. It does not make an endpoint reachable, provide TLS, or bypass a browser's local-network permission; a remote deployment is exposed through HTTPS as before. Set the policy in one place: a reverse proxy that adds CORS headers of its own on top of meka's gives the browser two grants, and it refuses both.
 
 ## Idempotency
 
@@ -990,6 +1003,7 @@ Full example:
 ```toml
 [serve]
 bind = "0.0.0.0:8080"
+cors_allowed_origins = ["https://owner.github.io"]   # a browser UI's origin; omit for none
 max_body_bytes = 10485760           # 10 MiB (default)
 max_concurrent_turns = 20
 idle_timeout = "24h"
@@ -1046,13 +1060,18 @@ async def follow(session_id: str):
 
 ### Web UI (TypeScript, streaming)
 
-A UI that renders the whole session subscribes to the feed once and files events by `turn_id`, so it also shows the turns it did not start: a scheduled fire, a background task reporting, a message the user typed while the agent was working and the agent answering it in place.
+A UI that renders the whole session subscribes to the feed once and files events by `turn_id`, so it also shows the turns it did not start: a scheduled fire, a background task reporting, a message the user typed while the agent was working and the agent answering it in place. The feed is read with `fetch` and an SSE parser rather than a native `EventSource`, which cannot send the bearer header; a UI served from another origin also needs [`cors_allowed_origins`](#browser-clients) to name it.
 
 ```typescript
-const feed = new EventSource(`${MEKA_URL}/v1/sessions/${sessionId}/stream`);
-feed.addEventListener("turn.started", (e) => openTurn(JSON.parse(e.data)));
-feed.addEventListener("assistant_text.delta", (e) => append(JSON.parse(e.data)));
-feed.addEventListener("turn.finished", (e) => closeTurn(JSON.parse(e.data)));
+const feed = await fetch(`${MEKA_URL}/v1/sessions/${sessionId}/stream`, {
+  headers: { Authorization: `Bearer ${token}` },
+});
+for await (const event of parseSse(feed.body)) { // any SSE parser over a ReadableStream
+  const data = JSON.parse(event.data);
+  if (event.event === "turn.started") openTurn(data);
+  if (event.event === "assistant_text.delta") append(data);
+  if (event.event === "turn.finished") closeTurn(data);
+}
 
 async function send(input: string) {
   await fetch(`${MEKA_URL}/v1/sessions/${sessionId}/inbox`, {

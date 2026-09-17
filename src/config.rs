@@ -2795,6 +2795,15 @@ pub(crate) struct ServeConfig {
     /// accidentally world-reachable. Operators front with a reverse proxy (nginx, caddy) for
     /// TLS termination and put a public address there.
     pub(crate) bind: Option<String>,
+    /// Browser origins allowed to call the API cross-origin. Omitted or empty (the default) means
+    /// no CORS headers at all; `["*"]` allows any origin; otherwise each entry is one exact
+    /// origin, `scheme://host[:port]`, normalized at startup.
+    ///
+    /// Safe to relax because the API authenticates with a bearer header the page sets itself and
+    /// never with a cookie, so a page that lacks the token gets a 401 from any origin, and a page
+    /// that holds it can use it from anywhere regardless. The allowlist guards only what needs no
+    /// token: the health probes, the opt-in OpenAPI document and the body of a 401.
+    pub(crate) cors_allowed_origins: Option<Vec<String>>,
     /// Idle-timeout for session eviction. Sessions with no turn activity for this long are dropped
     /// from the in-memory map by the GC scanner. Accepts humantime strings like `"24h"`, `"30m"`,
     /// `"86400s"`. Default `"24h"`.

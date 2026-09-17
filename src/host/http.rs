@@ -30,13 +30,13 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, patch, post, put},
 };
-use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 
 use crate::{
     config::ResolvedConfig,
     host::http::{
         auth::AuthRegistry,
-        config::ResolvedServeConfig,
+        config::{CorsOrigins, ResolvedServeConfig},
         errors::{ErrorKind, ProblemDetail},
         state::ServerState,
     },
@@ -344,7 +344,7 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
         Router::new()
     };
 
-    authenticated
+    let router = authenticated
         .merge(public)
         .merge(documentation)
         // `RequestBodyLimitLayer` is the only authority on body size. Without disabling axum's
@@ -358,9 +358,62 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
             rewrite_payload_too_large,
         ))
         .layer(middleware::from_fn(rewrite_plain_bad_request))
-        .layer(middleware::from_fn(inject_problem_instance))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .layer(middleware::from_fn(inject_problem_instance));
+    // Outside every rewrite and the bearer middleware, so a preflight stops here before
+    // authentication and before any handler can load a session or touch the inbox, while a 401,
+    // a scope 403, the body-limit 413 and the router's own 404 and 405 all pass through on their
+    // way out. `Router::layer` wraps the fallback too, which is what covers the 404.
+    let router = match cors_layer(state.config.cors_allowed_origins.as_ref()) {
+        Some(cors) => router.layer(cors),
+        None => router,
+    };
+    router.layer(TraceLayer::new_for_http()).with_state(state)
+}
+
+/// The CORS policy `[serve].cors_allowed_origins` asks for, or none when the key is unset, so a
+/// deployment that never opted in answers exactly as before, `OPTIONS` included.
+///
+/// Credentials stay off: the API authenticates with a bearer header the page sets itself and
+/// never with a cookie. That is why `Authorization` is listed by name, since no wildcard grant
+/// covers it, and why `*` is a safe origin here. `Content-Disposition` is not exposed because no
+/// response carries one.
+fn cors_layer(origins: Option<&CorsOrigins>) -> Option<CorsLayer> {
+    use axum::http::{HeaderName, HeaderValue, Method, header};
+    use tower_http::cors::AllowOrigin;
+
+    let allow_origin = match origins? {
+        CorsOrigins::Any => AllowOrigin::any(),
+        CorsOrigins::Exact(list) => AllowOrigin::list(list.iter().filter_map(|origin| {
+            match HeaderValue::from_str(origin) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    // Unreachable for an origin the config validated, whose ASCII serialization
+                    // is printable ASCII by construction; logged rather than dropped in silence.
+                    tracing::warn!("failed to grant CORS origin '{origin}': {error}");
+                    None
+                }
+            }
+        })),
+    };
+    Some(
+        CorsLayer::new()
+            .allow_origin(allow_origin)
+            .allow_methods([
+                Method::GET,
+                Method::HEAD,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+            ])
+            .allow_headers([
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                HeaderName::from_static("idempotency-key"),
+                HeaderName::from_static("last-event-id"),
+            ])
+            .expose_headers([header::RETRY_AFTER, header::WWW_AUTHENTICATE]),
+    )
 }
 
 /// Convert tower-http's plain-text 413 response to a Problem Detail. Runs as a middleware so the

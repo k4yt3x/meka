@@ -1583,6 +1583,26 @@ bind = "0.0.0.0:8080"
 
 > **Security:** Binding to `0.0.0.0` exposes the server on all interfaces. In production, keep `127.0.0.1` and front with a TLS-terminating reverse proxy.
 
+### `serve.cors_allowed_origins`
+
+Browser origins allowed to call the API cross-origin, for a web application served from somewhere other than meka itself. Omitted or empty, the server sends no CORS headers at all, and a browser refuses every cross-origin call.
+
+| Type | Default |
+|------|---------|
+| `array` of `string` | `[]` (cross-origin access off) |
+
+```toml
+[serve]
+cors_allowed_origins = [
+    "https://owner.github.io",
+    "http://localhost:5173",
+]
+```
+
+An origin is a scheme, a host and a port, and nothing else: `https://owner.github.io/mekaweb/` has the origin `https://owner.github.io`, and a path cannot narrow the grant. Each entry is normalized at startup to what a browser sends in `Origin` (lowercase host, default port dropped, a trailing root slash tolerated), and a request is granted only when its origin matches an entry exactly: another scheme, port or subdomain is another origin. An entry with a path, query, fragment or credentials, a non-HTTP scheme, `null`, or a pattern such as `https://*.example.com` is refused at startup.
+
+`["*"]`, alone, grants any origin. That is safe here because the API authenticates with a bearer header the page sets itself and never with a cookie: a page without the token gets a `401` from any origin, and a page holding it can use it from anywhere regardless. The allowlist guards only what needs no token: the two health probes, the opt-in OpenAPI document and the body of a `401`. Name your origins where you can; use `*` for a LAN deployment reached from several device addresses. [Browser clients](../usage/http-api.md#browser-clients) describes what the grant covers.
+
 ### `serve.max_body_bytes`
 
 Maximum request body size in bytes. Requests exceeding this limit are refused with `413 Payload Too Large`. `0` is refused at startup; omit the field for the default.

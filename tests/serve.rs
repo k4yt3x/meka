@@ -10921,6 +10921,538 @@ fn zero_valued_serve_knobs_are_rejected_at_startup() {
     }
 }
 
+/// The origins the browser-facing tests allow, as `[serve]` config.
+const CORS_CONFIG: &str =
+    "cors_allowed_origins = [\"https://ui.example\", \"http://localhost:5173\"]\n";
+
+/// A response header as text, every value joined, for the CORS assertions.
+fn header(response: &reqwest::blocking::Response, name: &str) -> Option<String> {
+    let values: Vec<&str> = response
+        .headers()
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    (!values.is_empty()).then(|| values.join(", "))
+}
+
+/// The feed opened as a browser would open it: with an `Origin` header.
+fn open_feed_from_origin(
+    harness: &ServeTestHarness,
+    id: &str,
+    last_event_id: Option<u64>,
+    origin: &str,
+    wait: Duration,
+) -> reqwest::blocking::Response {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(wait)
+        .build()
+        .expect("client");
+    let mut request = client
+        .get(format!("{}/v1/sessions/{id}/stream", harness.base_url))
+        .header("Authorization", format!("Bearer {}", harness.token))
+        .header("Origin", origin);
+    if let Some(last) = last_event_id {
+        request = request.header("Last-Event-ID", last.to_string());
+    }
+    request.send().expect("send")
+}
+
+/// An entry the URL parser accepts and a browser never sends is refused at startup, naming the
+/// key and the fault, rather than kept as an allowlist entry no request can match.
+///
+/// Watched rather than waited on: a server that wrongly accepts the entry runs until killed, and
+/// waiting for its exit would turn a regression into a hung test instead of a failed one.
+#[test]
+fn an_invalid_cors_origin_is_refused_at_startup() {
+    for (list, probe) in [
+        ("[\"https://*.example.com\"]", "pattern"),
+        ("[\"*\", \"https://ui.example\"]", "only entry"),
+    ] {
+        let install = Install::new();
+        let bind = format!("127.0.0.1:{}", support::ephemeral_port());
+        install.write_config(&format!(
+            "[accounts.mock]\nbackend = \"anthropic-messages\"\n\n[profiles.mock]\naccount = \
+             \"mock\"\nmodel = \"claude-sonnet-4-5\"\n\n\
+             [serve]\nbind = \"{bind}\"\ncors_allowed_origins = {list}\n\n\
+             [[serve.tokens]]\ntoken = \"t\"\nscopes = [\"sessions:r\"]\n"
+        ));
+        let mut child = install
+            .meka(&["serve"])
+            // The announcement the waiter matches is an `info` line.
+            .env("RUST_LOG", "meka=info")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn meka serve");
+        support::drain(child.stdout.take().expect("stdout"));
+        let stderr_pipe = child.stderr.take().expect("stderr");
+        match support::wait_for_serve(&bind, &mut child, stderr_pipe, Duration::from_secs(20)) {
+            support::Started::Exited(status, logs) => {
+                assert!(!status.success(), "{list} must fail startup: {logs}");
+                assert!(
+                    logs.contains("cors_allowed_origins") && logs.contains(probe),
+                    "the error must name the key and the fault for {list}: {logs}"
+                );
+            }
+            support::Started::Ready(_) | support::Started::TimedOut(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{list} must fail startup, but the server came up");
+            }
+        }
+    }
+}
+
+/// A preflight is the browser asking whether it may send the real request, and it carries no
+/// token by design. It is answered ahead of authentication and does nothing: the session it asks
+/// about creating is not created.
+#[test]
+fn a_preflight_from_an_allowed_origin_needs_no_token_and_creates_nothing() {
+    let harness = ServeTestHarness::spawn(CORS_CONFIG, mock_simple_turn());
+    let preflight = harness
+        .client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/v1/sessions", harness.base_url),
+        )
+        .header("Origin", "https://ui.example")
+        .header("Access-Control-Request-Method", "POST")
+        .header(
+            "Access-Control-Request-Headers",
+            "authorization, content-type, idempotency-key, last-event-id",
+        )
+        .send()
+        .expect("send");
+    assert!(preflight.status().is_success(), "{}", preflight.status());
+    assert_eq!(
+        header(&preflight, "access-control-allow-origin").as_deref(),
+        Some("https://ui.example")
+    );
+    let methods = header(&preflight, "access-control-allow-methods")
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    for method in ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] {
+        assert!(
+            methods.contains(method),
+            "{method} must be granted: {methods}"
+        );
+    }
+    let headers = header(&preflight, "access-control-allow-headers")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    for name in [
+        "authorization",
+        "content-type",
+        "idempotency-key",
+        "last-event-id",
+    ] {
+        assert!(headers.contains(name), "{name} must be granted: {headers}");
+    }
+    assert!(
+        header(&preflight, "access-control-allow-credentials").is_none(),
+        "credentials are never enabled: the bearer header is not a credential in CORS terms"
+    );
+    // The method and header grants are fixed lists, so the answer depends on the origin alone,
+    // and that is what a cache is told.
+    let vary = header(&preflight, "vary")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        vary.contains("origin"),
+        "the answer varies by origin: {vary}"
+    );
+
+    let listed: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/sessions")
+        .send()
+        .expect("list")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        listed["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "a preflight creates nothing: {listed}"
+    );
+}
+
+/// Each allowed origin is answered with its own grant, never the list or a wildcard, and an origin
+/// that merely resembles one gets none at all. The request itself still runs either way: CORS
+/// decides what the browser may read, not what the server does.
+#[test]
+fn each_allowed_origin_gets_its_own_grant_and_lookalikes_get_none() {
+    let harness = ServeTestHarness::spawn(CORS_CONFIG, mock_simple_turn());
+    for origin in ["https://ui.example", "http://localhost:5173"] {
+        let response = harness
+            .request(reqwest::Method::GET, "/v1/info")
+            .header("Origin", origin)
+            .send()
+            .expect("send");
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            header(&response, "access-control-allow-origin").as_deref(),
+            Some(origin),
+            "{origin} is answered with itself"
+        );
+    }
+    for origin in [
+        "https://ui.example.evil",
+        "https://evil-ui.example",
+        "https://app.ui.example",
+        "https://ui.example:8443",
+        "http://ui.example",
+        "http://localhost:5174",
+        "null",
+    ] {
+        let response = harness
+            .request(reqwest::Method::GET, "/v1/info")
+            .header("Origin", origin)
+            .send()
+            .expect("send");
+        assert_eq!(response.status(), 200, "the request itself still runs");
+        assert!(
+            header(&response, "access-control-allow-origin").is_none(),
+            "{origin} must get no grant"
+        );
+    }
+}
+
+/// A browser can read a Problem Detail only when the error carries the grant too, so every error
+/// the router or a middleware produces ahead of a handler has to pass through the policy on its
+/// way out: the bearer 401 with its challenge, the router's own 404 and 405, the body-limit 413,
+/// a validation 422, and the concurrency 429 with a `Retry-After` the page may read.
+#[test]
+fn errors_from_an_allowed_origin_keep_their_cors_headers() {
+    let script = serde_json::json!([
+        [
+            { "type": "sleep", "ms": 3000 },
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn(
+        &format!("{CORS_CONFIG}max_body_bytes = 1024\nmax_concurrent_turns = 1\n"),
+        script,
+    );
+    let granted = |response: &reqwest::blocking::Response| {
+        header(response, "access-control-allow-origin").as_deref() == Some("https://ui.example")
+    };
+    let exposed = |response: &reqwest::blocking::Response, name: &str| {
+        header(response, "access-control-expose-headers")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains(name)
+    };
+
+    let unauthorized = harness
+        .client
+        .get(format!("{}/v1/sessions", harness.base_url))
+        .header("Origin", "https://ui.example")
+        .send()
+        .expect("send");
+    assert_eq!(unauthorized.status(), 401);
+    assert!(granted(&unauthorized), "the 401 carries the grant");
+    assert_eq!(
+        header(&unauthorized, "www-authenticate").as_deref(),
+        Some(r#"Bearer realm="meka""#)
+    );
+    assert!(
+        exposed(&unauthorized, "www-authenticate"),
+        "the challenge is exposed to the page"
+    );
+    let body: serde_json::Value = unauthorized.json().expect("parse");
+    assert_eq!(body["type"], "https://meka.so/errors/auth");
+
+    let missing = harness
+        .request(reqwest::Method::GET, "/v1/no-such-route")
+        .header("Origin", "https://ui.example")
+        .send()
+        .expect("send");
+    assert_eq!(missing.status(), 404);
+    assert!(granted(&missing), "the router's 404 carries the grant");
+
+    let wrong_method = harness
+        .request(reqwest::Method::PUT, "/v1/sessions")
+        .header("Origin", "https://ui.example")
+        .send()
+        .expect("send");
+    assert_eq!(wrong_method.status(), 405);
+    assert!(granted(&wrong_method), "the router's 405 carries the grant");
+
+    let oversize = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .header("Origin", "https://ui.example")
+        .json(&serde_json::json!({
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "permission": "x".repeat(4096),
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(oversize.status(), 413);
+    assert!(granted(&oversize), "the body-limit 413 carries the grant");
+    let body: serde_json::Value = oversize.json().expect("parse");
+    assert_eq!(body["type"], "https://meka.so/errors/payload-too-large");
+
+    let malformed = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .header("Origin", "https://ui.example")
+        .json(&serde_json::json!({
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "permission": "not-a-permission",
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(malformed.status(), 422);
+    assert!(granted(&malformed), "a validation 422 carries the grant");
+
+    let first_id = create_session_id(&harness);
+    let second_id = create_session_id(&harness);
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let first = std::thread::spawn({
+        let first_id = first_id.clone();
+        move || {
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("client")
+                .post(format!("{base_url}/v1/sessions/{first_id}/turn"))
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&serde_json::json!({"message": "hold the cap"}))
+                .send()
+                .expect("first send")
+        }
+    });
+    harness.wait_until_in_flight(&first_id);
+    let capped = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{second_id}/turn"),
+        )
+        .header("Origin", "https://ui.example")
+        .json(&serde_json::json!({"message": "over the cap"}))
+        .send()
+        .expect("send");
+    assert_eq!(capped.status(), 429);
+    assert!(granted(&capped), "the 429 carries the grant");
+    assert!(header(&capped, "retry-after").is_some());
+    assert!(
+        exposed(&capped, "retry-after"),
+        "Retry-After is exposed to the page"
+    );
+    let _ = first.join().expect("join").error_for_status();
+}
+
+/// A read-only token that asks to attend is refused on scope before the session is looked up,
+/// and the browser can read that refusal.
+#[test]
+fn a_read_only_token_attending_from_an_allowed_origin_is_refused_before_the_session_loads() {
+    let harness =
+        ServeTestHarness::spawn_with("", CORS_CONFIG, mock_simple_turn(), "sk_test_token", &[
+            "sessions:r",
+        ]);
+    let id = "00000000-0000-4000-8000-000000000000";
+    let refused = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{id}/stream?attend=true"),
+        )
+        .header("Origin", "https://ui.example")
+        .send()
+        .expect("send");
+    assert_eq!(refused.status(), 403);
+    assert_eq!(
+        header(&refused, "access-control-allow-origin").as_deref(),
+        Some("https://ui.example")
+    );
+    let body: serde_json::Value = refused.json().expect("parse");
+    assert_eq!(body["type"], "https://meka.so/errors/auth-scope");
+
+    let looked_up = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
+        .header("Origin", "https://ui.example")
+        .send()
+        .expect("send");
+    assert_eq!(looked_up.status(), 404);
+    assert_eq!(
+        header(&looked_up, "access-control-allow-origin").as_deref(),
+        Some("https://ui.example")
+    );
+}
+
+/// The feed is the one response a browser holds open, and the policy must not buffer it: the
+/// first event arrives while the turn is still running, and a reconnect with `Last-Event-ID`
+/// replays from where the reader left off, grant included.
+#[test]
+fn a_feed_opened_from_an_allowed_origin_streams_and_reconnects() {
+    let script = serde_json::json!([
+        [
+            { "type": "sleep", "ms": 3000 },
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn(CORS_CONFIG, script);
+    let id = create_session_id(&harness);
+    let feed = open_feed_from_origin(
+        &harness,
+        &id,
+        None,
+        "https://ui.example",
+        Duration::from_secs(30),
+    );
+    assert_eq!(feed.status(), 200);
+    assert_eq!(
+        header(&feed, "access-control-allow-origin").as_deref(),
+        Some("https://ui.example")
+    );
+    assert!(
+        header(&feed, "content-type").is_some_and(|value| value.starts_with("text/event-stream")),
+        "still an event stream"
+    );
+
+    let accepted = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .json(&serde_json::json!({"message": "go", "class": "followup"}))
+        .send()
+        .expect("send");
+    assert_eq!(accepted.status(), 202);
+
+    let (opening, feed) = read_feed_until_open(feed, |text| text.contains("event: turn.started"));
+    let session: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("probe")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        session["turn_in_flight"], true,
+        "the first event arrived before the turn finished, so nothing buffered the stream"
+    );
+    let started_id = opening
+        .lines()
+        .filter_map(|line| line.strip_prefix("id: "))
+        .filter_map(|value| value.trim().parse::<u64>().ok())
+        .max()
+        .expect("the opening event carries an id");
+    let rest = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+    assert!(rest.contains("event: turn.finished"), "{rest}");
+
+    let again = open_feed_from_origin(
+        &harness,
+        &id,
+        Some(started_id),
+        "https://ui.example",
+        Duration::from_secs(3),
+    );
+    assert_eq!(
+        header(&again, "access-control-allow-origin").as_deref(),
+        Some("https://ui.example"),
+        "the reconnect carries the grant too"
+    );
+    let replay = read_feed_until(again, |text| text.contains("event: turn.finished"));
+    assert!(
+        !replay.contains("event: turn.started"),
+        "the event the reader already had is not replayed: {replay}"
+    );
+    assert!(
+        replay.contains("event: turn.finished"),
+        "what it missed is: {replay}"
+    );
+}
+
+/// A request with no `Origin` is not a browser's, and gets no grant; the CLI and a bridge keep
+/// their answers exactly as before.
+#[test]
+fn a_request_without_an_origin_gets_no_grant() {
+    let harness = ServeTestHarness::spawn(CORS_CONFIG, mock_simple_turn());
+    let response = harness
+        .request(reqwest::Method::GET, "/v1/info")
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+    assert!(
+        header(&response, "access-control-allow-origin").is_none(),
+        "no origin, no grant"
+    );
+}
+
+/// A deployment that never configured origins carries no CORS middleware at all: a preflight
+/// meets the bearer middleware first, as any tokenless request always has, nothing varies, and no
+/// header names a policy.
+#[test]
+fn a_server_without_a_policy_carries_no_cors_middleware() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let preflight = harness
+        .client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/v1/sessions", harness.base_url),
+        )
+        .header("Origin", "https://ui.example")
+        .header("Access-Control-Request-Method", "POST")
+        .send()
+        .expect("send");
+    assert_eq!(
+        preflight.status(),
+        401,
+        "no policy, so no preflight handling"
+    );
+    assert!(header(&preflight, "access-control-allow-origin").is_none());
+    assert!(header(&preflight, "vary").is_none());
+
+    let real = harness
+        .request(reqwest::Method::GET, "/v1/info")
+        .header("Origin", "https://ui.example")
+        .send()
+        .expect("send");
+    assert_eq!(real.status(), 200);
+    assert!(header(&real, "access-control-allow-origin").is_none());
+    assert!(header(&real, "vary").is_none());
+}
+
+/// `["*"]` grants any origin, as a bearer-authenticated API safely can, and the preflight still
+/// names `Authorization` explicitly because a wildcard header grant never covers it.
+#[test]
+fn a_star_grants_any_origin_and_still_names_the_bearer_header() {
+    let harness = ServeTestHarness::spawn("cors_allowed_origins = [\"*\"]\n", mock_simple_turn());
+    let preflight = harness
+        .client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/v1/sessions", harness.base_url),
+        )
+        .header("Origin", "https://anything.example")
+        .header("Access-Control-Request-Method", "POST")
+        .header("Access-Control-Request-Headers", "authorization")
+        .send()
+        .expect("send");
+    assert!(preflight.status().is_success(), "{}", preflight.status());
+    assert_eq!(
+        header(&preflight, "access-control-allow-origin").as_deref(),
+        Some("*")
+    );
+    assert!(
+        header(&preflight, "access-control-allow-headers")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains("authorization"),
+        "the bearer header is granted by name"
+    );
+
+    let real = harness
+        .request(reqwest::Method::GET, "/v1/info")
+        .header("Origin", "https://anything.example")
+        .send()
+        .expect("send");
+    assert_eq!(real.status(), 200);
+    assert_eq!(
+        header(&real, "access-control-allow-origin").as_deref(),
+        Some("*")
+    );
+}
+
 /// Canceling a slow turn and then compacting is an ordinary sequence: the turn is going nowhere,
 /// so free the window. It broke silently, because `POST /compact` cloned whatever token the last
 /// turn left in the session's cell, and a canceled turn leaves that token fired. The checkpoint

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.58.0] - 2026-09-17
+
+### Added
+
+- `[serve] cors_allowed_origins` lets a web application call the API from a listed origin, or any.
+
 ## [0.57.0] - 2026-09-17
 
 ### Added
@@ -2283,7 +2289,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.57.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.58.0...HEAD
+[0.58.0]: https://github.com/k4yt3x/meka/compare/0.57.0...0.58.0
 [0.57.0]: https://github.com/k4yt3x/meka/compare/0.56.0...0.57.0
 [0.56.0]: https://github.com/k4yt3x/meka/compare/0.55.0...0.56.0
 [0.55.0]: https://github.com/k4yt3x/meka/compare/0.54.1...0.55.0

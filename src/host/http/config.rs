@@ -153,12 +153,103 @@ impl ResolvedWebhook {
         })
     }
 }
+/// `[serve].cors_allowed_origins` once validated: which browser origins are answered with a CORS
+/// grant. Absent (the key omitted or empty) means no CORS middleware at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CorsOrigins {
+    /// `["*"]`: every origin, sent as the literal wildcard.
+    Any,
+    /// Exact origins in their ASCII serialization, deduplicated and sorted.
+    Exact(Vec<String>),
+}
+impl CorsOrigins {
+    fn resolve(raw: Option<Vec<String>>) -> Result<Option<Self>, String> {
+        let raw = raw.unwrap_or_default();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        if raw.iter().any(|entry| entry.trim() == "*") {
+            // The named entries beside a `*` would be dead, and a list written that way suggests
+            // the operator expected something narrower than "any origin".
+            if raw.iter().any(|entry| entry.trim() != "*") {
+                return Err(
+                    "[serve] `cors_allowed_origins` lists `*` beside other origins; `*` \
+                            must be the only entry"
+                        .into(),
+                );
+            }
+            return Ok(Some(Self::Any));
+        }
+        let mut origins = raw
+            .iter()
+            .map(|entry| resolve_cors_origin(entry))
+            .collect::<Result<Vec<_>, _>>()?;
+        origins.sort();
+        origins.dedup();
+        Ok(Some(Self::Exact(origins)))
+    }
+}
+/// One `cors_allowed_origins` entry as a browser sends it in `Origin`.
+///
+/// The URL parser accepts more than an origin: a path, a query, userinfo and a `*` inside the host
+/// all parse, and each would normalize into an entry no browser ever presents. Refused by name so
+/// the operator learns at startup that the entry is dead, rather than from a browser's opaque
+/// failure. The ASCII serialization is what browsers send: lowercase host, default port dropped,
+/// IPv6 compacted, IDNA punycoded.
+fn resolve_cors_origin(raw: &str) -> Result<String, String> {
+    let entry = raw.trim();
+    if entry.is_empty() {
+        return Err("[serve] `cors_allowed_origins` has an empty entry".into());
+    }
+    if entry == "null" {
+        return Err(
+            "[serve] `cors_allowed_origins` entry 'null' is the opaque origin and cannot be granted"
+                .into(),
+        );
+    }
+    let parsed = url::Url::parse(entry).map_err(|error| {
+        format!("[serve] `cors_allowed_origins` entry '{entry}' is not an origin: {error}")
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "[serve] `cors_allowed_origins` entry '{entry}' must start with https:// or http://"
+        ));
+    }
+    if parsed.host_str().is_some_and(|host| host.contains('*')) {
+        return Err(format!(
+            "[serve] `cors_allowed_origins` entry '{entry}' is a pattern; list each origin in full"
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "[serve] `cors_allowed_origins` entry '{entry}' carries credentials; an origin is a \
+             scheme, host and port"
+        ));
+    }
+    let extra = if parsed.path() != "/" {
+        Some("a path")
+    } else if parsed.query().is_some() {
+        Some("a query")
+    } else if parsed.fragment().is_some() {
+        Some("a fragment")
+    } else {
+        None
+    };
+    if let Some(extra) = extra {
+        return Err(format!(
+            "[serve] `cors_allowed_origins` entry '{entry}' has {extra}; an origin is a scheme, \
+             host and port"
+        ));
+    }
+    Ok(parsed.origin().ascii_serialization())
+}
 /// Validated, defaults-filled view of [`ServeConfig`]. Constructed at config-load time by
 /// [`ResolvedServeConfig::resolve`].
 // Individual fields mirror [`ServeConfig`]; see its per-field documentation.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedServeConfig {
     pub(crate) bind: String,
+    pub(crate) cors_allowed_origins: Option<CorsOrigins>,
     pub(crate) idle_timeout: std::time::Duration,
     pub(crate) gc_scan_interval: std::time::Duration,
     pub(crate) delete_on_idle: bool,
@@ -264,6 +355,7 @@ impl ResolvedServeConfig {
             .into_iter()
             .map(ResolvedWebhook::resolve)
             .collect::<Result<Vec<_>, _>>()?;
+        let cors_allowed_origins = CorsOrigins::resolve(raw.cors_allowed_origins)?;
         for webhook in &webhooks {
             if webhook.secret.is_none() {
                 tracing::warn!(
@@ -283,6 +375,7 @@ impl ResolvedServeConfig {
         }
         Ok(Self {
             bind: raw.bind.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
+            cors_allowed_origins,
             idle_timeout: raw.idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT),
             gc_scan_interval: raw.gc_scan_interval.unwrap_or(DEFAULT_GC_SCAN_INTERVAL),
             delete_on_idle: raw.delete_on_idle.unwrap_or(false),
@@ -374,6 +467,76 @@ fn warn_if_world_readable(path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each configured origin ends up as the string a browser sends in `Origin`, so the exact
+    /// match at the router compares like with like.
+    #[test]
+    fn a_cors_origin_is_normalized_to_what_a_browser_sends() {
+        for (raw, expected) in [
+            ("https://owner.github.io/", "https://owner.github.io"),
+            ("HTTPS://MekaWeb.Example:443", "https://mekaweb.example"),
+            ("http://localhost:80", "http://localhost"),
+            ("http://localhost:5173", "http://localhost:5173"),
+            ("https://[0:0:0:0:0:0:0:1]:8443/", "https://[::1]:8443"),
+            ("https://bücher.example", "https://xn--bcher-kva.example"),
+            ("  https://x.example  ", "https://x.example"),
+        ] {
+            assert_eq!(
+                resolve_cors_origin(raw).as_deref(),
+                Ok(expected),
+                "normalizing {raw}"
+            );
+        }
+    }
+
+    /// What the URL parser accepts and a browser never sends is refused, and the message names
+    /// what is wrong with the entry.
+    #[test]
+    fn a_cors_entry_that_is_not_an_exact_origin_is_refused() {
+        for (raw, probe) in [
+            ("", "empty"),
+            ("   ", "empty"),
+            ("null", "opaque"),
+            ("not an origin at all", "not an origin"),
+            ("https://x.example:65536", "not an origin"),
+            ("ws://x.example", "https://"),
+            ("file:///tmp", "https://"),
+            ("https://*.example.com", "pattern"),
+            ("https://user:pw@x.example", "credentials"),
+            ("https://x.example/app", "a path"),
+            ("https://x.example/?q", "a query"),
+            ("https://x.example/#f", "a fragment"),
+        ] {
+            let error = resolve_cors_origin(raw).expect_err(raw);
+            assert!(error.contains(probe), "{raw:?}: {error}");
+        }
+    }
+
+    /// The list resolves to off, any, or an exact set; `*` hiding inside a list is refused.
+    #[test]
+    fn the_cors_list_resolves_to_off_any_or_exact() {
+        assert_eq!(CorsOrigins::resolve(None), Ok(None));
+        assert_eq!(CorsOrigins::resolve(Some(Vec::new())), Ok(None));
+        assert_eq!(
+            CorsOrigins::resolve(Some(vec!["*".to_string()])),
+            Ok(Some(CorsOrigins::Any))
+        );
+        assert_eq!(
+            CorsOrigins::resolve(Some(vec![
+                "https://b.example/".to_string(),
+                "https://a.example".to_string(),
+                "https://B.example".to_string(),
+            ])),
+            Ok(Some(CorsOrigins::Exact(vec![
+                "https://a.example".to_string(),
+                "https://b.example".to_string(),
+            ])))
+        );
+        let error =
+            CorsOrigins::resolve(Some(vec!["*".to_string(), "https://a.example".to_string()]))
+                .expect_err("mixed");
+        assert!(error.contains("only entry"), "{error}");
+    }
 
     /// The webhook redactor keeps the scheme, host and port, and nothing else.
     ///
