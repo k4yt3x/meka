@@ -14,12 +14,15 @@ use crate::{
     host::http::http_frontend::SessionCapabilities,
 };
 
-/// One SSE event emitted on the wire. Monotonic `id` per turn, which is what makes
+/// One SSE event emitted on the wire. Monotonic `id` per session, which is what makes
 /// `Last-Event-ID` resumption work: a re-attaching client names the last id it saw and the replay
 /// ring hands back everything after it. See [`crate::host::http::http_frontend::SessionFeed`].
 #[derive(Debug, Clone)]
 pub(crate) struct SseEvent {
-    pub(crate) id: u64,
+    /// `None` on a transient event ([`SseEventType::is_transient`]), which is progress rather
+    /// than history: never recorded, so never resumable, and a client's `Last-Event-ID` never
+    /// names one.
+    pub(crate) id: Option<u64>,
     pub(crate) event_type: SseEventType,
     pub(crate) data: serde_json::Value,
 }
@@ -38,6 +41,8 @@ pub(crate) enum SseEventType {
     ToolCallComposing,
     ToolCallExecuting,
     ToolCallCompleted,
+    ToolCallOutputDelta,
+    SubAgentActivity,
     Progress,
     Notice,
     PermissionRequired,
@@ -60,6 +65,14 @@ impl SseEventType {
             Self::TurnFinished | Self::TurnFailed | Self::TurnCanceled
         )
     }
+
+    /// Whether this event is progress rather than history: broadcast to whoever is reading now,
+    /// given no id and kept out of the replay ring. A reconnecting client is then handed neither
+    /// the deltas of a command that has since completed nor a hole where a chatty one pushed the
+    /// events it needs out of the ring.
+    pub(crate) const fn is_transient(self) -> bool {
+        matches!(self, Self::ToolCallOutputDelta | Self::SubAgentActivity)
+    }
 }
 
 impl SseEventType {
@@ -70,6 +83,8 @@ impl SseEventType {
             Self::ToolCallComposing => "tool_call.composing",
             Self::ToolCallExecuting => "tool_call.executing",
             Self::ToolCallCompleted => "tool_call.completed",
+            Self::ToolCallOutputDelta => "tool_call.output_delta",
+            Self::SubAgentActivity => "subagent.activity",
             Self::Progress => "progress",
             Self::Notice => "notice",
             Self::PermissionRequired => "permission_required",
@@ -88,8 +103,13 @@ impl SseEventType {
 impl SseEvent {
     /// Convert to an `axum::response::sse::Event` ready for the SSE response stream.
     pub(crate) fn into_axum(self) -> Event {
-        Event::default()
-            .id(self.id.to_string())
+        // Fields are written in call order, and clients read `event:` then `data:` as a pair, so
+        // the id goes first, where it always was; a transient event simply has none.
+        let mut event = Event::default();
+        if let Some(id) = self.id {
+            event = event.id(id.to_string());
+        }
+        event
             .event(self.event_type.as_str())
             .json_data(self.data)
             .unwrap_or_else(|error| {
@@ -231,17 +251,25 @@ pub(crate) fn translate(
         ),
         // Metadata-only events: the recorder captures them for the blocking JSON / terminal
         // SSE payload but they don't get their own wire events.
-        // `SubAgentActivity` is a progressive rewrite of one tool call's display, which only makes
-        // sense against a stateful view like ACP's; the SSE stream already carries the sub-agent's
-        // `agent_spawn` tool result when it lands.
-        // `ToolCallOutputDelta` is left out for the same reason as `SubAgentActivity`: both are
-        // progressive rewrites of one tool call's display, and the SSE stream carries the tool
-        // result once, when it lands. Surfacing partial output here would add a wire event whose
-        // consumers have to reassemble it, for a stream that already delivers the whole thing.
-        FrontendEvent::TodoListUpdated { .. }
-        | FrontendEvent::TokenUsage(_)
-        | FrontendEvent::SubAgentActivity { .. }
-        | FrontendEvent::ToolCallOutputDelta { .. } => return None,
+        FrontendEvent::TodoListUpdated { .. } | FrontendEvent::TokenUsage(_) => return None,
+        // Progress on one tool call, transient on the wire (`SseEventType::is_transient`): a
+        // client appends the chunk to what it shows for the call, and the whole output still
+        // arrives with `tool_call.completed`. Coalesced per call before it gets here, by
+        // `HttpFrontend::wire_events`.
+        FrontendEvent::ToolCallOutputDelta { id, chunk } => (
+            SseEventType::ToolCallOutputDelta,
+            serde_json::json!({ "id": id, "chunk": chunk }),
+        ),
+        // The rolling block replaces the one before it for the same `id`, the parent's
+        // `agent_spawn` call. That is how its producer shapes it, because ACP replaces a call's
+        // content, and sending the block whole keeps one shape for both hosts.
+        FrontendEvent::SubAgentActivity {
+            tool_call_id,
+            summary,
+        } => (
+            SseEventType::SubAgentActivity,
+            serde_json::json!({ "id": tool_call_id, "summary": summary }),
+        ),
         // Not a rewrite of anything: each update is a fact about the call's progress the client
         // did not have, and an MCP call can be minutes long with `tool_call.completed` the only
         // other sign of life. Dropped by the blocking recorder, which has no live reader.
@@ -353,6 +381,43 @@ mod tests {
         assert_eq!(event_type.as_str(), "tool_call.composing");
         assert_eq!(data["id"], "tu_1");
         assert_eq!(data["name"], "read_file");
+    }
+
+    /// Output streams under the call's own id, so a client appends it to that call; the shape is
+    /// the coalesced chunk and nothing else.
+    #[test]
+    fn translate_tool_call_output_delta() {
+        let event = FrontendEvent::ToolCallOutputDelta {
+            id: "tu_1".into(),
+            chunk: "one\ntwo\n".into(),
+        };
+        let (event_type, data) =
+            translate(event, SessionCapabilities::default()).expect("translates");
+        assert_eq!(event_type, SseEventType::ToolCallOutputDelta);
+        assert_eq!(event_type.as_str(), "tool_call.output_delta");
+        assert!(event_type.is_transient());
+        assert_eq!(data["id"], "tu_1");
+        assert_eq!(data["chunk"], "one\ntwo\n");
+    }
+
+    /// A sub-agent's activity is filed under the parent's `agent_spawn` call, which is the only
+    /// call the client has been told about, and the block is sent whole.
+    #[test]
+    fn translate_sub_agent_activity() {
+        let event = FrontendEvent::SubAgentActivity {
+            tool_call_id: "tu_1".into(),
+            summary: "read_file: notes.txt\nsearch_contents: todo".into(),
+        };
+        let (event_type, data) =
+            translate(event, SessionCapabilities::default()).expect("translates");
+        assert_eq!(event_type, SseEventType::SubAgentActivity);
+        assert_eq!(event_type.as_str(), "subagent.activity");
+        assert!(event_type.is_transient());
+        assert_eq!(data["id"], "tu_1");
+        assert_eq!(
+            data["summary"],
+            "read_file: notes.txt\nsearch_contents: todo"
+        );
     }
 
     #[test]

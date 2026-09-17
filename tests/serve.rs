@@ -559,6 +559,79 @@ fn fork_copies_the_conversation_into_a_new_session() {
     );
 }
 
+/// The level and the approvals switch are the brake a person reaches for while the agent is
+/// working, so they land during the turn, as the REPL's Shift+Tab and ACP's `session/set_mode` do.
+/// The working directory is snapshotted when a turn opens, so a body naming it still waits.
+#[test]
+fn the_level_and_approvals_change_under_a_running_turn() {
+    let script = serde_json::json!([
+        [
+            { "type": "sleep", "ms": 2000 },
+            { "type": "text", "text": "slow one done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = create_session_id(&harness);
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let id_for_turn = id.clone();
+    let turn = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{base_url}/v1/sessions/{id_for_turn}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"message": "slow one"}))
+            .send()
+            .expect("turn send")
+    });
+    harness.wait_until_in_flight(&id);
+
+    let patched = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"permission": "read", "approvals": true}))
+        .send()
+        .expect("send");
+    assert_eq!(patched.status(), 200, "the level lands while the turn runs");
+    let session: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(session["permission"], "read");
+    assert_eq!(session["approvals"], true);
+    assert_eq!(
+        session["turn_in_flight"], true,
+        "and it landed under the turn, not after it: {session}"
+    );
+
+    let moved = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        moved.status(),
+        409,
+        "the working directory waits for the turn"
+    );
+    let body: serde_json::Value = moved.json().expect("parse");
+    assert_eq!(body["type"], "https://meka.so/errors/turn-in-flight");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("working directory"),
+        "the detail names what was refused: {body}"
+    );
+    assert_eq!(turn.join().expect("join").status(), 200);
+}
+
 /// A fork of a source with a turn in flight is refused, like every other write to it. The turn
 /// persisted its prompt before the provider answered, so the copy would end on a prompt nothing
 /// answered and restore as an unusable session, which is the copy the probe already refuses
@@ -2761,6 +2834,23 @@ fn info_reports_the_vision_capability() {
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().expect("parse");
     assert_eq!(body["vision"], true);
+}
+
+/// A client shows only the controls its token allows, and the token is the one thing about the
+/// caller the server knows. Sorted, so two tokens configured in different orders read the same.
+#[test]
+fn info_reports_the_scopes_the_calling_token_holds() {
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "sessions:r",
+        "mcp:r",
+    ]);
+    let body: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/info")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(body["scopes"], serde_json::json!(["mcp:r", "sessions:r"]));
 }
 
 /// `/v1/info` carries no provider or model, and `/v1/profiles` answers both.
@@ -7647,12 +7737,26 @@ fn open_feed(
     last_event_id: Option<u64>,
     wait: Duration,
 ) -> reqwest::blocking::Response {
+    open_feed_with(harness, id, "", last_event_id, wait)
+}
+
+/// [`open_feed`] with a query string, for a reader that attends.
+fn open_feed_with(
+    harness: &ServeTestHarness,
+    id: &str,
+    query: &str,
+    last_event_id: Option<u64>,
+    wait: Duration,
+) -> reqwest::blocking::Response {
     let client = reqwest::blocking::Client::builder()
         .timeout(wait)
         .build()
         .expect("client");
     let mut request = client
-        .get(format!("{}/v1/sessions/{id}/stream", harness.base_url))
+        .get(format!(
+            "{}/v1/sessions/{id}/stream{query}",
+            harness.base_url
+        ))
         .header("Authorization", format!("Bearer {}", harness.token));
     if let Some(last) = last_event_id {
         request = request.header("Last-Event-ID", last.to_string());
@@ -7662,10 +7766,16 @@ fn open_feed(
 
 /// Read a feed until `done` sees what the test is waiting for, or the client's read timeout
 /// ends the wait; what arrived by then is the body.
-fn read_feed_until(
+fn read_feed_until(response: reqwest::blocking::Response, done: impl Fn(&str) -> bool) -> String {
+    read_feed_until_open(response, done).0
+}
+
+/// [`read_feed_until`] that hands the connection back, for a reader whose presence is the point:
+/// an attendee that hung up would cancel the very prompt it is reading.
+fn read_feed_until_open(
     mut response: reqwest::blocking::Response,
     done: impl Fn(&str) -> bool,
-) -> String {
+) -> (String, reqwest::blocking::Response) {
     let mut text = String::new();
     let mut chunk = [0u8; 4096];
     while !done(&text) {
@@ -7675,7 +7785,7 @@ fn read_feed_until(
             Err(_) => break,
         }
     }
-    text
+    (text, response)
 }
 
 /// Parse the `data:` payload of the first event of `name` in an SSE body.
@@ -7722,6 +7832,384 @@ fn wait_until_prompt_saved(harness: &ServeTestHarness, id: &str, needle: &str) {
         std::thread::sleep(Duration::from_millis(25));
     }
     panic!("the turn's prompt was not saved within 10s");
+}
+
+/// A gated call on a turn nobody opened over SSE parks for a feed reader that said it would
+/// answer, so a UI that submits through the inbox and watches the feed is asked the way a streaming
+/// client is. The session was created with `supports_permission_prompts: false`, as a bridge
+/// creates the one it drives: that flag speaks for the streaming client, and the attendee made its
+/// own declaration. Both the write's argument and the file on disk are asserted: a prompt that did
+/// not show what is written would ask for a write blind, and a tool that never ran reports as
+/// convincingly as one that did.
+#[test]
+fn an_attending_feed_reader_is_asked_to_approve_a_gated_call_the_inbox_started() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let path = workspace.path().join("attended.txt");
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_end", "input": {"path": path, "content": "hi"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "written" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": workspace.path().to_string_lossy(),
+            "permission": "read",
+            "approvals": true,
+            "capabilities": {"supports_permission_prompts": false},
+        }))
+        .send()
+        .expect("create");
+    assert_eq!(create.status(), 201);
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let feed = open_feed_with(&harness, &id, "?attend=true", None, Duration::from_secs(30));
+
+    let accepted = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .json(&serde_json::json!({"message": "write it", "class": "followup"}))
+        .send()
+        .expect("send");
+    assert_eq!(accepted.status(), 202);
+
+    // Or the terminal: a turn that was not parked ends, and the wait has to end with it rather
+    // than ride the keep-alives forever.
+    let (until_prompt, feed) = read_feed_until_open(feed, |text| {
+        text.contains("event: permission_required") || text.contains("event: turn.finished")
+    });
+    let prompt = sse_event_data(&until_prompt, "permission_required")
+        .unwrap_or_else(|| panic!("the attendee is asked: {until_prompt}"));
+    assert_eq!(prompt["tool_name"], "write_file", "{prompt}");
+    assert_eq!(
+        prompt["input"]["content"], "hi",
+        "the prompt shows the write: {prompt}"
+    );
+    let request_id = prompt["request_id"].as_str().expect("request id");
+    let answered = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{id}/responses/{request_id}"),
+        )
+        .json(&serde_json::json!({"outcome": "allow"}))
+        .send()
+        .expect("send");
+    assert_eq!(answered.status(), 204);
+
+    let rest = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+    let whole = format!("{until_prompt}{rest}");
+    assert_eq!(
+        sse_event_data(&whole, "turn.started").expect("turn.started")["source"],
+        "inbox",
+        "{whole}"
+    );
+    let completed = sse_event_data(&whole, "tool_call.completed")
+        .unwrap_or_else(|| panic!("the approved call ran: {whole}"));
+    assert_eq!(completed["is_error"], false, "{completed}");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the approved write landed"),
+        "hi"
+    );
+}
+
+/// A feed reader that did not attend may be a bridge with nothing to show a prompt on, so the
+/// gated call is refused without asking and the feed says why. Nothing is written.
+#[test]
+fn a_feed_reader_that_does_not_attend_gets_the_refusal_notice() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let path = workspace.path().join("unattended.txt");
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_end", "input": {"path": path, "content": "hi"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "gave up" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": workspace.path().to_string_lossy(),
+            "permission": "read",
+            "approvals": true,
+        }))
+        .send()
+        .expect("create");
+    assert_eq!(create.status(), 201);
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+
+    let accepted = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .json(&serde_json::json!({"message": "write it", "class": "followup"}))
+        .send()
+        .expect("send");
+    assert_eq!(accepted.status(), 202);
+
+    let body = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+    assert!(
+        !body.contains("event: permission_required"),
+        "a bare subscriber is not asked: {body}"
+    );
+    let notice =
+        sse_event_data(&body, "notice").unwrap_or_else(|| panic!("the feed says why: {body}"));
+    assert_eq!(notice["level"], "warn", "{notice}");
+    assert!(
+        notice["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("attend")),
+        "the remedy is named: {notice}"
+    );
+    assert!(!path.exists(), "a refused write leaves nothing behind");
+}
+
+/// Attending is answering, so it takes the scope that answers, and it is refused before the
+/// session is looked up: the same token without `attend` reaches the lookup and gets the 404.
+#[test]
+fn attending_the_feed_needs_the_write_scope() {
+    let harness =
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &["sessions:r"]);
+    let id = "00000000-0000-4000-8000-000000000000";
+    let refused = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{id}/stream?attend=true"),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(refused.status(), 403);
+    let looked_up = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
+        .send()
+        .expect("send");
+    assert_eq!(looked_up.status(), 404);
+}
+
+/// A command's output reaches the feed while it runs, under the call's id, and the result still
+/// arrives whole. The deltas are progress: no `id:` line, so a reconnect from the last durable
+/// id neither replays them nor reports a hole where they were.
+#[cfg(unix)]
+#[test]
+fn a_commands_output_streams_live_and_the_result_still_arrives_whole() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_end", "input": {"command": "printf 'one\\ntwo\\nthree\\n'"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "ran" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = create_session_id(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let accepted = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .json(&serde_json::json!({"message": "run it", "class": "followup"}))
+        .send()
+        .expect("send");
+    assert_eq!(accepted.status(), 202);
+
+    let body = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+    let blocks: Vec<&str> = body.split("\n\n").collect();
+    let deltas: Vec<&&str> = blocks
+        .iter()
+        .filter(|block| {
+            block
+                .lines()
+                .any(|line| line.trim() == "event: tool_call.output_delta")
+        })
+        .collect();
+    assert!(!deltas.is_empty(), "the output streams: {body}");
+    for block in &deltas {
+        assert!(
+            !block.lines().any(|line| line.starts_with("id:")),
+            "a transient event carries no id: {block}"
+        );
+    }
+    let names = sse_event_names(&body);
+    let first_delta = names
+        .iter()
+        .position(|name| name == "tool_call.output_delta")
+        .expect("delta");
+    let completed = names
+        .iter()
+        .position(|name| name == "tool_call.completed")
+        .expect("completed");
+    assert!(
+        first_delta < completed,
+        "output precedes the result: {names:?}"
+    );
+    let streamed: String = deltas
+        .iter()
+        .filter_map(|block| block.lines().find_map(|line| line.strip_prefix("data: ")))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .filter_map(|data| data["chunk"].as_str().map(str::to_string))
+        .collect();
+    assert!(streamed.contains("one\ntwo\nthree"), "{streamed:?}");
+    let result = sse_event_data(&body, "tool_call.completed").expect("completed");
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("three")),
+        "the result still carries the whole output: {result}"
+    );
+
+    let last_durable = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("id: "))
+        .filter_map(|value| value.trim().parse::<u64>().ok())
+        .max()
+        .expect("durable ids");
+    // Nothing is due after the terminal, so the read ends on the client's timeout.
+    let again = open_feed(&harness, &id, Some(last_durable), Duration::from_secs(2));
+    let replay = read_feed_until(again, |_| false);
+    assert!(
+        !replay.contains("event: tool_call.output_delta"),
+        "a delta is never replayed: {replay}"
+    );
+    assert!(
+        !replay.contains("Last-Event-ID"),
+        "and no hole is reported where the deltas were: {replay}"
+    );
+}
+
+/// A command run with `background: true` returns its task id at once and keeps writing for as long
+/// as it runs, into turns it has nothing to do with. That output is not streamed: it would be
+/// stamped with whatever turn is running then, or none, and its tail would never be flushed. It
+/// arrives with the task's outcome instead.
+#[cfg(unix)]
+#[test]
+fn a_detached_commands_output_is_not_streamed_after_its_turn() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_end", "input": {
+                "command": "sleep 0.5; echo late; sleep 0.5; echo later",
+                "background": true
+            } },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "started" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("\n[background]\nenabled = true\n", script);
+    let id = create_session_id(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let accepted = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .json(&serde_json::json!({"message": "run it detached", "class": "followup"}))
+        .send()
+        .expect("send");
+    assert_eq!(accepted.status(), 202);
+    let body = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+    assert!(
+        body.contains("event: tool_call.completed"),
+        "the call returned its task id inside the turn: {body}"
+    );
+
+    // The command is still printing for about a second after the turn ended. A reader joining
+    // now sees none of it: the read ends on its own timeout, with no output delta in what came.
+    let last_durable = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("id: "))
+        .filter_map(|value| value.trim().parse::<u64>().ok())
+        .max()
+        .expect("durable ids");
+    let after = open_feed(&harness, &id, Some(last_durable), Duration::from_secs(3));
+    let later = read_feed_until(after, |_| false);
+    assert!(
+        !later.contains("event: tool_call.output_delta"),
+        "a detached command's output is not filed under a later turn or none: {later}"
+    );
+}
+
+/// What a sub-agent is doing shows on the parent's feed under the parent's `agent_spawn` call,
+/// the only call the client has been told about, as the rolling block ACP shows.
+#[test]
+fn a_sub_agents_tool_calls_show_as_activity_on_the_parents_feed() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let notes = workspace.path().join("notes.txt");
+    std::fs::write(&notes, "hello").expect("write notes");
+    // The parent's spawn, the worker's read and its reply, then the parent's closing text.
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
+            { "type": "tool_use_end", "input": {"prompt": "read the notes"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "tool_use_start", "id": "tu_w", "name": "read_file" },
+            { "type": "tool_use_end", "input": {"path": notes} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "worker done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "dispatched" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": workspace.path().to_string_lossy()}))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let accepted = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .json(&serde_json::json!({"message": "delegate it", "class": "followup"}))
+        .send()
+        .expect("send");
+    assert_eq!(accepted.status(), 202);
+
+    let body = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+    let activity = sse_event_data(&body, "subagent.activity")
+        .unwrap_or_else(|| panic!("the worker's tool call shows on the parent's feed: {body}"));
+    assert_eq!(
+        activity["id"], "tu_1",
+        "filed under the parent's call: {activity}"
+    );
+    assert!(
+        activity["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("read_file")),
+        "{activity}"
+    );
+    let block = body
+        .split("\n\n")
+        .find(|block| block.contains("event: subagent.activity"))
+        .expect("the activity block");
+    assert!(
+        !block.lines().any(|line| line.starts_with("id:")),
+        "progress carries no id: {block}"
+    );
 }
 
 // --------------------------------------------------------------------------- The session inbox.

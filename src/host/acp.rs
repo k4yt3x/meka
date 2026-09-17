@@ -623,7 +623,10 @@ mod tests {
     use base64::Engine as _;
 
     use super::*;
-    use crate::frontend::PermissionOutcome;
+    use crate::{
+        frontend::PermissionOutcome,
+        host::{LIVE_OUTPUT_INTERVAL, LIVE_OUTPUT_TAIL_BYTES, LiveOutput, LiveOutputMode},
+    };
 
     // `AcpFrontend` itself can't be unit-tested (requires a live `ConnectionTo<Client>`);
     // per-session behavior is covered end-to-end in `tests/acp.rs`. The pure helpers below are

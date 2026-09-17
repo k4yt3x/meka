@@ -1496,7 +1496,7 @@ mod tests {
             Uuid::from_u128(0xfeed),
         );
         let _reattached = frontend
-            .attach_stream(None)
+            .attach_stream(None, false)
             .expect("a live stream accepts a re-attach");
 
         let cancellation = CancellationToken::new();
@@ -1834,6 +1834,11 @@ pub(crate) struct StreamQuery {
     /// The header wins when both are present.
     #[serde(default)]
     pub(crate) last_event_id: Option<u64>,
+    /// Attend the session: show `permission_required` events and answer them. While an attending
+    /// reader is connected, a gated call on any turn parks for an answer instead of being refused
+    /// without asking. Needs `sessions:w`, the scope that answers.
+    #[serde(default)]
+    pub(crate) attend: bool,
 }
 
 /// `GET /v1/sessions/{id}/stream`: rejoin the current turn's SSE stream.
@@ -1869,11 +1874,16 @@ pub(crate) struct StreamQuery {
 )]
 pub(crate) async fn stream_turn(
     State(state): State<ServerState>,
-    _scoped: scope::Scoped<scope::SessionsRead>,
+    scoped: scope::Scoped<scope::SessionsRead>,
     Path(id): Path<Uuid>,
     Query(query): Query<StreamQuery>,
     headers: axum::http::HeaderMap,
 ) -> Result<axum::response::Response, ProblemDetail> {
+    // Attending is answering, so it takes the scope answering takes; refused before the session
+    // is loaded, so a token that may not attend loads nothing by asking.
+    if query.attend {
+        scope::require(&scoped.principal, "sessions:w")?;
+    }
     // Loaded rather than looked up: a subscriber may arrive before any turn, and a bridge that
     // reconnects to an evicted session wants its feed back, not a 404 that tells it to run a
     // turn it has no message for.
@@ -1885,7 +1895,7 @@ pub(crate) async fn stream_turn(
         .and_then(|value| value.trim().parse::<u64>().ok())
         .or(query.last_event_id);
 
-    let Some(attachment) = entry.frontend.attach_stream(last_event_id) else {
+    let Some(attachment) = entry.frontend.attach_stream(last_event_id, query.attend) else {
         return Err(no_stream_to_join(id));
     };
 
@@ -1930,16 +1940,22 @@ fn build_reattach_stream(
     frontend: Arc<crate::host::http::http_frontend::HttpFrontend>,
 ) -> impl Stream<Item = Result<Event, Infallible>> + Send {
     async_stream::stream! {
+        // Held for the life of the response: the client attends until it hangs up.
+        let _attendance = attachment.attendance;
         yield Ok::<_, Infallible>(Event::default().retry(std::time::Duration::from_secs(3)));
 
         if let Some(turn_id) = attachment.turn_id {
+            let mut data = serde_json::json!({
+                "turn_id": turn_id,
+                "session_id": session_id,
+                "resumed": true,
+            });
+            if let Some(source) = &attachment.turn_source {
+                source.describe(&mut data);
+            }
             yield Ok(Event::default()
                 .event("turn.started")
-                .json_data(serde_json::json!({
-                    "turn_id": turn_id,
-                    "session_id": session_id,
-                    "resumed": true,
-                }))
+                .json_data(data)
                 .unwrap_or_else(|_| Event::default().comment("resumed turn.started serialize-failed")));
         }
 
@@ -1973,7 +1989,7 @@ fn build_reattach_stream(
             && let Some(terminal) = attachment.terminal.filter(|terminal| {
                 attachment
                     .resume_from
-                    .is_none_or(|last| terminal.id > last)
+                    .is_none_or(|last| terminal.id.is_some_and(|id| id > last))
             })
         {
             yield Ok(terminal.into_axum());

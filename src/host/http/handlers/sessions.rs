@@ -976,7 +976,7 @@ async fn repin_dormant_session(
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
-        (status = 409, description = "A turn is in flight; cancel first (`/errors/turn-in-flight`). Or another meka process holds the session, so only that process may move it (`/errors/session-locked`)", body = ProblemDetail),
+        (status = 409, description = "A turn is in flight and the body names `cwd` or `profile`; cancel first (`/errors/turn-in-flight`). Or another meka process holds the session, so only that process may move it (`/errors/session-locked`)", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid body, or the id names a sub-agent's conversation, whose permission, cwd and profile come from the terms its parent spawned it with (`/errors/session-not-drivable`)", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
@@ -1021,9 +1021,10 @@ pub(crate) async fn patch_session(
 
     let entry = ensure_session_loaded(&state, id).await?;
 
-    // Reject PATCH while a turn is in-flight: the agent snapshots cwd/permission at turn
-    // start, but tools read them live, creating a split-brain within one iteration.
-    //
+    // The level and the approvals switch apply during a turn: tool dispatch reads both cells live,
+    // which is what makes the level a brake, and the REPL's Shift+Tab and ACP's `session/set_mode`
+    // move them mid-turn for that reason. The working directory is snapshotted when the turn opens
+    // and the profile is a turn's wire, so a body naming either waits for the turn to end.
     //
     // A read and not an `InFlightGuard`, deliberately. That guard means "this session is busy with
     // turn-like work", and claiming it here would make two concurrent PATCHes conflict when they
@@ -1031,8 +1032,13 @@ pub(crate) async fn patch_session(
     // doing anything wrong. The cost is that a turn admitted between this load and the agent swap
     // below makes that swap wait for it, which is slow rather than wrong: the row has already
     // moved, and the swap lands correctly afterwards.
-    if entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0 {
-        return Err(turn_in_flight_conflict(id, "patch the session"));
+    if (body.cwd.is_some() || body.profile.is_some())
+        && entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0
+    {
+        return Err(turn_in_flight_conflict(
+            id,
+            "change the session's working directory or profile",
+        ));
     }
 
     // Validate all fields up-front before any DB write so a mixed valid/invalid request

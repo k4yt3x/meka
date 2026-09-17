@@ -310,3 +310,101 @@ pub(crate) async fn format_status(
         compactions,
     )
 }
+
+/// How a reader shows a running command's output, which decides what one update carries.
+///
+/// The two modes are not cosmetic variants of each other. In [`Self::Terminal`] the reader owns a
+/// scrollback that meka appends to, so an update carries only the bytes not yet sent and the whole
+/// output is available at the far end: an ACP client rendering agent-owned terminals, or the HTTP
+/// feed's `tool_call.output_delta`. In [`Self::Text`] the reader can only replace a block of text,
+/// so meka keeps the running output itself and re-sends a window of it: an ACP client without
+/// terminal rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveOutputMode {
+    /// The reader appends what it is sent.
+    Terminal,
+    /// The reader replaces what it shows with what it is sent.
+    Text,
+}
+/// Whether a tool's output is relayed while it runs. Only `execute_command` emits
+/// [`crate::frontend::FrontendEvent::ToolCallOutputDelta`], and it is the one tool whose result
+/// can be minutes away; a live view opened for anything else would show nothing. One answer for
+/// both hosts, so a second tool that starts streaming is wired up in one place.
+pub(crate) fn streams_output(tool_name: &str) -> bool {
+    tool_name == "execute_command"
+}
+/// Per-tool-call state for relaying a running command's output.
+pub(crate) struct LiveOutput {
+    pub(crate) mode: LiveOutputMode,
+    /// Text still to show. In [`LiveOutputMode::Text`] this is the whole (tail-capped) output,
+    /// re-sent every tick. In [`LiveOutputMode::Terminal`] it is only the bytes not yet appended,
+    /// and it is drained on each send, because the client keeps the scrollback.
+    pub(crate) text: String,
+    /// `None` until the first update goes out, so the first chunk is never delayed.
+    pub(crate) last_sent: Option<std::time::Instant>,
+}
+/// Shortest gap between two `tool_call_update`s for the same tool call. A chatty build writes
+/// thousands of small chunks a second, and one notification per read syscall would spend more time
+/// on the wire than on the build. Coalescing is why both modes need a buffer at all.
+pub(crate) const LIVE_OUTPUT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+/// How much of the tail to keep visible while a command runs, in [`LiveOutputMode::Text`] only.
+/// That mode re-sends its whole buffer on every tick, so an uncapped buffer would make a chatty
+/// command cost quadratic in its own output. The terminal mode appends and needs no cap.
+pub(crate) const LIVE_OUTPUT_TAIL_BYTES: usize = 8 * crate::text::KIB;
+impl LiveOutput {
+    pub(crate) fn new(mode: LiveOutputMode) -> Self {
+        Self {
+            mode,
+            text: String::new(),
+            last_sent: None,
+        }
+    }
+
+    /// Append a delta and return what to send now, or `None` while throttled.
+    pub(crate) fn push(&mut self, chunk: &str, now: std::time::Instant) -> Option<String> {
+        self.text.push_str(chunk);
+        if self.mode == LiveOutputMode::Text && self.text.len() > LIVE_OUTPUT_TAIL_BYTES {
+            let mut cut = self.text.len() - LIVE_OUTPUT_TAIL_BYTES;
+            // A byte count can land inside a multi-byte character, and both slicing and draining
+            // there panic. Advance to a boundary before either.
+            while cut < self.text.len() && !self.text.is_char_boundary(cut) {
+                cut += 1;
+            }
+            // Prefer opening the view at a line start rather than mid-line.
+            if let Some(offset) = self.text[cut..].find('\n') {
+                cut += offset + 1;
+            }
+            self.text.drain(..cut);
+        }
+        if let Some(last) = self.last_sent
+            && now.duration_since(last) < LIVE_OUTPUT_INTERVAL
+        {
+            return None;
+        }
+        self.last_sent = Some(now);
+        match self.mode {
+            // Appending: hand over what has accumulated and start empty again, so the same bytes
+            // are never sent twice.
+            LiveOutputMode::Terminal => {
+                if self.text.is_empty() {
+                    None
+                } else {
+                    Some(std::mem::take(&mut self.text))
+                }
+            }
+            LiveOutputMode::Text => Some(self.text.clone()),
+        }
+    }
+
+    /// Whatever is still buffered, for the final flush before a call completes. The throttle can
+    /// swallow the last chunk of a command that exits right after printing, and in terminal mode
+    /// those bytes exist nowhere else.
+    pub(crate) fn take_pending(&mut self) -> Option<String> {
+        match self.mode {
+            LiveOutputMode::Terminal if !self.text.is_empty() => {
+                Some(std::mem::take(&mut self.text))
+            }
+            _ => None,
+        }
+    }
+}

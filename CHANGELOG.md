@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.57.0] - 2026-09-17
+
+### Added
+
+- `GET /v1/info` reports the scopes the calling token holds.
+- A feed reader that opens the stream with `attend=true` is asked to approve gated calls.
+- The `turn.started` a feed synthesizes for a client attaching mid-turn names the turn's source.
+- `tool_call.output_delta` streams a running command's output on the feed ahead of its result.
+- `subagent.activity` shows on the parent's feed which tool a sub-agent is running.
+
+### Changed
+
+- `PATCH /v1/sessions/{id}` changes the level and approvals during a turn; `cwd` and `profile` wait.
+
 ## [0.56.0] - 2026-09-16
 
 ### Changed
@@ -2269,7 +2283,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.56.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.57.0...HEAD
+[0.57.0]: https://github.com/k4yt3x/meka/compare/0.56.0...0.57.0
 [0.56.0]: https://github.com/k4yt3x/meka/compare/0.55.0...0.56.0
 [0.55.0]: https://github.com/k4yt3x/meka/compare/0.54.1...0.55.0
 [0.54.1]: https://github.com/k4yt3x/meka/compare/0.54.0...0.54.1

@@ -179,10 +179,12 @@ To move a live session onto another profile, `PATCH /v1/sessions/{id}` with `{"p
 That rewrites the session's row, so it holds for a resume from any surface rather than for this
 request. Switching mid-conversation is allowed and is your call: a thinking block is tagged with the
 backend that produced it and is not replayed to a different one, so from the next turn the model no
-longer sees the reasoning recorded under the old profile. Like the other `PATCH` fields, it is a
-`409` when a turn is already in flight; cancel first. (One admitted between the check and the agent
-swap makes the swap wait for that turn rather than fail, so the request can take as long as the turn
-does. The row has already moved by then, and the agent follows when the turn ends.)
+longer sees the reasoning recorded under the old profile. Like `cwd`, it is a `409` when a turn is
+already in flight; cancel first. `permission` and `approvals` are the two fields that apply during
+a turn; see [Permission levels over HTTP](#permission-levels-over-http). (One admitted between the
+check and the agent swap makes the swap wait for that turn rather than fail, so the request can take
+as long as the turn does. The row has already moved by then, and the agent follows when the turn
+ends.)
 
 A `PATCH` naming a profile moves the session to that profile, and the profile is the whole story:
 the model, the account and every model-tied setting come from it, so there is nothing else on the
@@ -230,6 +232,8 @@ prompt on, which is the normal case for a service-to-service client streaming fo
 tools are then denied immediately with an explanatory `notice`, the same as blocking mode. Leaving it
 `true` means every gated call parks for 30 minutes and then denies anyway, which is hard to tell
 apart from a hang. Better still, create the session with `permission: "workspace"` so nothing is gated.
+The flag speaks for the streaming client: a feed reader that opened the stream with `attend=true`
+is asked regardless, since attending is that declaration made per connection.
 
 #### Forking a session
 
@@ -539,8 +543,12 @@ Reasoning streams in chunks, one event per chunk, the way `assistant_text.delta`
 | `tool_call.executing` | `id`, `name`, `input`, `display_summary` | Tool call starts |
 | `tool_call.completed` | `id`, `is_error`, `content` | Tool call finishes |
 | `progress` | `server_name`, `tool_name`, `tool_use_id`, `progress`, `total`, `message` | An MCP tool reported progress while running |
+| `tool_call.output_delta` | `id`, `chunk` | A running `execute_command` produced output; append `chunk` to what you show for the call |
+| `subagent.activity` | `id`, `summary` | A sub-agent under the `agent_spawn` call `id` started a tool call; `summary` is its rolling activity block and replaces the previous one |
 
-`progress` relays an MCP server's `notifications/progress` for a call that is still running: `progress` is the server's counter, `total` its target when it gave one, `message` its text, and `tool_use_id` the `tool_call.executing` the update belongs to. The three optional fields are omitted when the server did not send them. Only MCP tools report progress; a built-in's next sign of life is its `tool_call.completed`.
+`progress` relays an MCP server's `notifications/progress` for a call that is still running: `progress` is the server's counter, `total` its target when it gave one, `message` its text, and `tool_use_id` the `tool_call.executing` the update belongs to. The three optional fields are omitted when the server did not send them. Only MCP tools report progress; a built-in's next sign of life is its `tool_call.completed`, except `execute_command`, whose output streams as `tool_call.output_delta`.
+
+`tool_call.output_delta` and `subagent.activity` are progress rather than history, and the feed treats them so: they carry no `id`, are never replayed after a reconnect, and never displace the events a `Last-Event-ID` resumption depends on. Command output is coalesced to about one event per 150 ms per call, whatever is left is flushed just ahead of the call's `tool_call.completed`, and that event still carries the whole output. The activity block holds the sub-agent's last 20 tool calls. A command run with `background: true` is not streamed: its call returns at once with a task id, and its output arrives with the task's outcome.
 
 The arguments are written between `tool_call.composing` and `tool_call.executing` on the same `id`, which makes that interval the only thing on the stream that separates the agent *writing a message* from the agent doing anything else. Assistant text is usually narration around a call rather than the reply itself, and by `tool_call.executing` the arguments are already finished. A client drawing a typing indicator for a tool like an MCP `send_message` raises it on the first and drops it on the second. The payload is the id and the name because nothing else has streamed yet: which conversation a message is for is not known until `tool_call.executing`.
 
@@ -582,13 +590,15 @@ Turn events are broadcast, so a re-attached client or a second consumer counts a
 
 Send the last id you received as a `Last-Event-ID` header (browser `EventSource` does this automatically) or as a `?last_event_id=` query parameter, and the server replays what you missed before following the live feed.
 
+Add `?attend=true` to say that this reader shows approval prompts and answers them. It needs `sessions:w`, and while at least one attending reader is connected a gated call on any turn parks as `permission_required` instead of being refused without asking; when the last one disconnects, a parked prompt is canceled. See [Approvals](#approvals). A reader that attends also counts as a renderer of reasoning deltas, so on a session with `supports_reasoning_stream` its turns lose their retry the way a streaming client's do.
+
 ```bash
 curl -N -H "Authorization: Bearer $TOKEN" \
      -H "Last-Event-ID: 42" \
      "http://localhost:8080/v1/sessions/$SESSION/stream"
 ```
 
-Ids run across the whole session and the ring spans turns, so an id from an earlier turn is an ordinary position: everything after it replays, the later turns' terminals included. When a turn is in flight as you attach, the feed opens with a `turn.started` carrying `"resumed": true` and the `turn_id` you joined, which is how to tell "my stream resumed" from "a newer turn started while I was away"; that event is synthesized rather than replayed, so it carries no `id:`, no `source` and no `started_at`, and everything after it is the real thing. With no turn in flight there is nothing to re-issue, and the most recent turn's terminal is handed over when the ring no longer holds it, so a client that reconnects late still learns the outcome.
+Ids run across the whole session and the ring spans turns, so an id from an earlier turn is an ordinary position: everything after it replays, the later turns' terminals included. When a turn is in flight as you attach, the feed opens with a `turn.started` carrying `"resumed": true` and the `turn_id` you joined, which is how to tell "my stream resumed" from "a newer turn started while I was away"; that event is synthesized rather than replayed, so it carries no `id:` and no `started_at`, but it names the turn's `source` (with its `item_ids` or `job_id`), and everything after it is the real thing. With no turn in flight there is nothing to re-issue, and the most recent turn's terminal is handed over when the ring no longer holds it, so a client that reconnects late still learns the outcome.
 
 **The feed does not end with a turn.** A client that wants one turn's outcome stops reading at that turn's terminal. The old contract, a stream that closed after the turn it rejoined, is what `POST /turn` with `stream: true` still gives.
 
@@ -674,9 +684,11 @@ Delivery is fire-and-forget on a detached task, so a slow or dead receiver never
 
 The same four [permission levels](./permissions.md) apply: `none`, `read`, `workspace`, `unrestricted`. Set the level at session creation or update it via `PATCH /v1/sessions/{id}`; `approvals` sits beside it on both, and `{"approvals": true}` in a `PATCH` body turns it on for a live session.
 
+Both apply during a turn: the next tool call is checked against the new level and the new switch, as the REPL's Shift+Tab and ACP's `session/set_mode` do, so dropping a running session to `read` is a brake and not a request to stop. `cwd` and `profile` wait for the turn to end, and a body naming either answers `409` `turn-in-flight` meanwhile.
+
 ### Approvals
 
-With `approvals: true` and `stream: true`, the agent emits a `permission_required` SSE event when it needs to run a tool above the session's level. The stream stays open while waiting. Your client resolves it by POSTing to the responses endpoint:
+With `approvals: true`, a tool call above the session's level parks as a `permission_required` SSE event whenever someone is there to answer it: the client of a `POST /turn` with `stream: true`, or a feed reader that opened `GET /v1/sessions/{id}/stream?attend=true` (which needs `sessions:w`, the scope that answers). Any turn qualifies, an inbox turn, a scheduled fire or a background outcome included, so a UI that submits through the inbox and watches the feed is asked like a streaming client is. With nobody attending, the call is refused without asking and a `notice` says so. The stream stays open while waiting. Your client resolves it by POSTing to the responses endpoint:
 
 ```
 POST /v1/sessions/{id}/responses/{request_id}
@@ -694,15 +706,15 @@ Possible outcomes:
 | `allow_always` | Allow this and all future calls to this tool (session-scoped) |
 | `deny_always` | Deny this and all future calls to this tool (session-scoped) |
 
-`input` is every argument the call was made with, and a prompt should show it: `tool_name` alone asks you to approve a write without showing what is written. If no response arrives within 30 minutes the request is denied; `expires_in_seconds` on the event carries that figure, and it is the same backstop an ACP client's prompt gets. An approved call still runs at the session's level: approval never widens reach, so an approved write at `read` lands only under the session's `cwd`.
+`input` is every argument the call was made with, and a prompt should show it: `tool_name` alone asks you to approve a write without showing what is written. If no response arrives within 30 minutes the request is denied; `expires_in_seconds` on the event carries that figure, and it is the same backstop an ACP client's prompt gets. When the last client that could answer disconnects, the request is canceled at once rather than left to that timeout. An approved call still runs at the session's level: approval never widens reach, so an approved write at `read` lands only under the session's `cwd`.
 
 ### Approvals with blocking turns
 
-When `stream: false` and approvals are on, there is no SSE channel for permission prompts. Every call that would need approval is **refused without asking**; each refused tool appends a `notice` to the response saying so and pointing at `stream: true`.
+When `stream: false` and approvals are on, and no feed reader is attending, there is no channel for permission prompts. Every call that would need approval is **refused without asking**; each refused tool appends a `notice` to the response saying so and pointing at `stream: true` and `attend=true`.
 
 **MCP elicitations** (interactive form prompts from MCP servers) are always auto-declined over HTTP; there is no channel for interactive input. A `notice` event is emitted when this happens.
 
-**Recommendation:** non-interactive callers (bots, bridges, scripts) should leave approvals off and create sessions at the level they need, so nothing is refused without asking. Use `stream: true` with approvals on if you need approval flow.
+**Recommendation:** non-interactive callers (bots, bridges, scripts) should leave approvals off and create sessions at the level they need, so nothing is refused without asking. Use `stream: true`, or attend the feed, with approvals on if you need approval flow.
 
 ## Authentication
 
@@ -904,7 +916,7 @@ These endpoints help clients inspect the server's capabilities at runtime.
 | `GET /v1/health/live` | None | Liveness probe: 200 if the process is up |
 | `GET /v1/health/ready` | None | Readiness probe: 200 if the store is healthy, at least one profile is configured, and no `required` MCP server has failed. A failed *optional* server doesn't affect readiness, since it can't stop a turn either. Returns `status`, `session_db`, `profile_configured`, and `mcp_servers_healthy` (boolean, no server names). **`profile_configured` means a profile exists in `config.toml`, not that it has a usable credential**: a profile's credential is checked when a session first needs it, so a server can be ready and still answer 422 to `POST /v1/sessions`. |
 | `GET /v1/profiles` | Any read scope | Configured profiles, as `{"profiles": [...]}`. Each carries `name`, `account`, `backend` (omitted when the profile names an account that is not configured), `model` (omitted when the profile names none) and `active: true` on the one a session gets when it names none. Read-only; profiles come from `config.toml` |
-| `GET /v1/info` | Any read scope | Server version and permission surface. `vision` reports whether the *default* profile accepts [image attachments](#image-attachments); a session on another profile follows that one. Carries no profile or model: `GET /v1/profiles` reports both per profile and marks the default with `active` |
+| `GET /v1/info` | Any read scope | Server version and permission surface, and `scopes`, the ones the calling token holds, so a client can show only the controls it may use. `vision` reports whether the *default* profile accepts [image attachments](#image-attachments); a session on another profile follows that one. Carries no profile or model: `GET /v1/profiles` reports both per profile and marks the default with `active` |
 | `GET /v1/skills` | Any read scope | Installed skills |
 | `GET /v1/mcp` | Any read scope | MCP server connection status |
 | `GET /v1/openapi.json` | None, and off unless `[serve].docs` is set | OpenAPI 3 spec |
@@ -1132,7 +1144,7 @@ Key points:
 |--------|------|------|-------------|
 | GET | `/v1/health/live` | None | Liveness probe |
 | GET | `/v1/health/ready` | None | Readiness probe |
-| GET | `/v1/info` | read | Server version and permission surface |
+| GET | `/v1/info` | read | Server version, permission surface, and the caller's scopes |
 | GET | `/v1/skills` | read | Installed skills |
 | GET | `/v1/mcp` | read | MCP server status |
 | POST | `/v1/sessions` | `sessions:w` | Create session |
@@ -1149,7 +1161,7 @@ Key points:
 | GET | `/v1/sessions/{id}/inbox` | `sessions:r` | Inbox items the model has not been shown |
 | DELETE | `/v1/sessions/{id}/inbox/{item_id}` | `sessions:w` | Withdraw an item still waiting |
 | POST | `/v1/sessions/{id}/responses/{request_id}` | `sessions:w` | Resolve permission prompt |
-| GET | `/v1/sessions/{id}/stream` | `sessions:r` | The session's event feed, across turns |
+| GET | `/v1/sessions/{id}/stream` | `sessions:r` | The session's event feed, across turns; `?attend=true` (needs `sessions:w`) to be asked to approve gated calls |
 | POST | `/v1/sessions/{id}/compact` | `sessions:w` | Summarize the conversation now |
 | GET | `/v1/sessions/{id}/context` | `sessions:r` | Context occupancy and cumulative usage |
 | POST | `/v1/sessions/{id}/rewind` | `sessions:w` | Drop trailing turns |

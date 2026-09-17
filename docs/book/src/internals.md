@@ -236,8 +236,8 @@ with `--oneshot`.
 | Export | `/export` (Markdown) | no | no | `GET /{id}/export` | `export` |
 | Import | no | no | no | `POST /v1/sessions/import` | `import` |
 | Profile switch | `/profile` | `--profile` at launch | `session/set_config_option` | `PATCH` `profile` | no; `meka -r --profile` repins |
-| Level switch | `/permission`, Shift+Tab | `--permission` at launch | `session/set_mode`, config option | `PATCH` `permission` | no |
-| Approvals | `/approvals` | config only | `session/set_config_option` | `PATCH` `approvals` | no |
+| Level switch | `/permission`, Shift+Tab | `--permission` at launch | `session/set_mode`, config option | `PATCH` `permission`, live | no |
+| Approvals | `/approvals` | config only | `session/set_config_option` | `PATCH` `approvals`, live | no |
 | List, show | `/session`, `/status` | no | `session/list` | `GET`, `GET /{id}` | `list`, `show` |
 | Cancel a turn | Ctrl+C | Ctrl+C | `session/cancel` | `POST /{id}/cancel` | no |
 
@@ -249,12 +249,13 @@ the three rows marked `for_editors` (`/mcp`, `/status`, `/usage`) as `available_
 Only HTTP and ACP can receive a request while a turn holds the session, and the two answer
 differently by design.
 
-- **HTTP refuses, with one door that does not.** `PATCH`, `DELETE`, fork, compact and rewind check
-  `in_flight` (or fail `claim_idle`) and return 409 with `type`
+- **HTTP refuses what needs the turn to end.** A `PATCH` naming `cwd` or `profile`, `DELETE`,
+  fork, compact and rewind check `in_flight` (or fail `claim_idle`) and return 409 with `type`
   `https://meka.so/errors/turn-in-flight`, through `turn_in_flight_conflict` and
   `ProblemDetail::for_error(MekaError::TurnInFlight)`. A second `POST /turn` on the session gets
   the same 409. The `detail` names what was refused (`doing`), and a `session_id` member carries
-  the id. `POST /v1/sessions/{id}/inbox` never refuses for a turn in flight: it writes an
+  the id. A `PATCH` naming only `permission` or `approvals` writes the cells and the row without
+  waiting, the same three steps ACP takes below. `POST /v1/sessions/{id}/inbox` never refuses for a turn in flight: it writes an
   `inbox_items` row (`store/inbox.rs`) and wakes the driver (`host/http/inbox.rs`). The row reaches
   the model at one of four places, all in `Agent::run_attributed_turn` so no host door can forget
   one: a `steer` or an `interrupt` at the round boundary after a tool round's results, in the same
@@ -299,7 +300,7 @@ to the parent's frontend and drops the rest). Where they differ:
 | `Notice` info / warn | `console.notice`, dim or warn-colored | agent-message chunk prefixed `[meka]` / `[meka warn]` | `notice` event (`NoticeView`) | `notices[]` | `notices[]` | dropped |
 | `McpProgress` | inline status line | `tracing::info!` | `progress` event | dropped | dropped | dropped |
 | `Compacted` | nothing (`/compact` prints `render::compaction_summary`) | info notice | `context.compacted` event | dropped; `GET /messages` carries the marker | dropped | dropped |
-| Approval with nobody to ask | warn `approval_refused_without_asking`, deny (REPL thread gone) | asks the client; deny after `APPROVAL_TIMEOUT`, `Canceled` on cancel | `permission_required` event; deny after `APPROVAL_TIMEOUT` or on disconnect | warn notice in its own words (`stream=false has no channel`), deny | warn `approval_refused_without_asking`, deny | deny; the notice goes nowhere |
+| Approval with nobody to ask | warn `approval_refused_without_asking`, deny (REPL thread gone) | asks the client; deny after `APPROVAL_TIMEOUT`, `Canceled` on cancel | `permission_required` event while a streaming client or a feed reader with `attend=true` is there; deny after `APPROVAL_TIMEOUT`, `Canceled` when the last of them leaves; refused with a warn notice otherwise | as HTTP stream: a feed attendee answers a blocking turn's prompt too; without one, warn notice, deny | warn `approval_refused_without_asking`, deny | deny; the notice goes nowhere |
 | Elicitation | asks through the REPL thread; warn `elicitation_declined` and decline when it is gone | `elicitation/create`; warn `elicitation_declined` and decline when the client lacks the mode | warn `elicitation_declined`, decline | same | trait default: warn `elicitation_declined`, decline | same, dropped |
 | Scheduled fire prompt | dim info notice on the console | `UserMessageChunk` | info notice into the stream | info notice, drained after the turn | no scheduler | n/a |
 | Scheduled fire failure | `console.error`; "interrupted" annotation on a cancel | warn notice `scheduled job '<id>' failed: ...`; info on a cancel | `schedule.fired` webhook, `status` `completed`, `canceled` or `failed`; nothing on the frontend | same webhook | no scheduler | n/a |

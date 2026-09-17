@@ -37,6 +37,9 @@ pub(crate) struct InfoResponse {
     /// session created without naming a `profile`. `POST /turn` asks the session itself
     /// (`ResidentSession::accepts_images`), so a session on another profile can differ.
     pub(crate) vision: bool,
+    /// The scopes the calling token holds, sorted. A client otherwise learns what it may do by
+    /// collecting 403s.
+    pub(crate) scopes: Vec<String>,
 }
 
 /// `GET /v1/info`: server identity and the permission surface. Authenticated; admits any token
@@ -60,9 +63,11 @@ pub(crate) struct InfoResponse {
 )]
 pub(crate) async fn info(
     State(state): State<ServerState>,
-    _scoped: scope::Scoped<scope::AnyRead>,
+    scoped: scope::Scoped<scope::AnyRead>,
 ) -> Result<Json<InfoResponse>, ProblemDetail> {
     let config = &state.shared.config;
+    let mut scopes: Vec<String> = scoped.principal.scopes.to_vec();
+    scopes.sort_unstable();
     Ok(Json(InfoResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         default_permission: config.permission.to_string(),
@@ -72,6 +77,7 @@ pub(crate) async fn info(
             .map(|p| p.to_string())
             .collect(),
         vision: config.vision,
+        scopes,
     }))
 }
 
