@@ -2838,14 +2838,16 @@ impl Store {
     ///
     /// Deliberately does *not* consult the session lock, because every caller here is holding it
     /// already or is acting on a row nothing can have locked: the HTTP handler evicting its own
-    /// entry, the GC dropping a session it served, a sub-agent tool removing a child row it
-    /// created moments ago. Taking the lock in those cases would *refuse* the caller its own
-    /// session (`flock` is per open file description rather than per process, so a second
-    /// descriptor contends with the first), and `try_write` is non-blocking, so what it produces
-    /// is a spurious [`MekaError::SessionLocked`] rather than a hang.
+    /// entry, the GC dropping a session it served. Taking the lock in those cases would *refuse*
+    /// the caller its own session (`flock` is per open file description rather than per process,
+    /// so a second descriptor contends with the first), and `try_write` is non-blocking, so what
+    /// it produces is a spurious [`MekaError::SessionLocked`] rather than a hang.
     ///
     /// A caller acting on a session it has never met wants
-    /// [`Self::delete_session_unless_attached`] instead.
+    /// [`Self::delete_session_unless_attached`] instead. A sub-agent tool is not an owner either:
+    /// the child it created may be running in the background under its own lock, and so may a
+    /// sub-agent of that child, which is what [`Self::delete_session_tree_unless_attached`] is
+    /// for.
     pub(crate) async fn delete_session(&self, session_id: Uuid) -> Result<bool> {
         let deleted = self.delete_session_row(session_id).await?;
         self.prune_orphan_lock_files().await;
@@ -2888,6 +2890,24 @@ impl Store {
         // Released before the sweep: it will not unlink a file it cannot lock, and that file is
         // this one.
         drop(lock);
+        self.prune_orphan_lock_files().await;
+        Ok(deleted)
+    }
+
+    /// Delete a session and every sub-agent under it, refusing with [`MekaError::SessionLocked`]
+    /// while any of them is held. The door for `agent_delete`: a child spawned with
+    /// `background: true` keeps its lock for as long as it runs, and a sub-agent running under an
+    /// idle child does the same one level down, where the cascade would take its row from under
+    /// it. Every id is locked before the one statement runs, root first, so the refusal names the
+    /// session that is busy and nothing is deleted ahead of it.
+    pub(crate) async fn delete_session_tree_unless_attached(&self, root: Uuid) -> Result<bool> {
+        let mut held = Vec::new();
+        for row in self.load_session_tree(root).await? {
+            held.push(self.lock_session(row.id)?);
+        }
+        let deleted = self.delete_session_row(root).await?;
+        // Released before the sweep, for the reason `delete_session_unless_attached` gives.
+        drop(held);
         self.prune_orphan_lock_files().await;
         Ok(deleted)
     }
@@ -4787,6 +4807,68 @@ mod tests {
         );
     }
 
+    /// `agent_delete`'s door. A sub-agent spawned with `background: true` holds its own lock for
+    /// as long as it runs, and so does a sub-agent of its own, whose row the cascade from deleting
+    /// the child would otherwise take from under it.
+    #[tokio::test]
+    async fn a_tree_delete_refuses_while_a_descendant_is_held() {
+        let store = Store::for_test().await;
+        let parent = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let child = store
+            .create_child_session(
+                parent,
+                None,
+                Vec::new(),
+                None,
+                "read".to_string(),
+                "test-profile".to_string(),
+            )
+            .await
+            .expect("child")
+            .0;
+        let grandchild = store
+            .create_child_session(
+                child,
+                None,
+                Vec::new(),
+                None,
+                "read".to_string(),
+                "test-profile".to_string(),
+            )
+            .await
+            .expect("grandchild")
+            .0;
+
+        let held = store.lock_session(grandchild).expect("hold the grandchild");
+        match store.delete_session_tree_unless_attached(child).await {
+            Err(MekaError::SessionLocked(id)) => assert_eq!(id, grandchild),
+            other => panic!("expected SessionLocked, got {:?}", other.map(|_| "Ok(_)")),
+        }
+        assert!(
+            store.session_exists(grandchild).await.expect("exists"),
+            "nothing is deleted ahead of the refusal"
+        );
+
+        drop(held);
+        assert!(
+            store
+                .delete_session_tree_unless_attached(child)
+                .await
+                .expect("delete once nothing under it is held")
+        );
+        assert!(
+            !store.session_exists(grandchild).await.expect("exists"),
+            "the cascade takes the descendant with the child"
+        );
+        assert!(
+            store.session_exists(parent).await.expect("exists"),
+            "and stops at the child"
+        );
+    }
+
     /// The sweep that runs on every start, against a session someone is sitting in.
     ///
     /// Only turns bump `updated_at` -- resuming does not touch it -- so a REPL left at its prompt
@@ -5210,17 +5292,20 @@ mod tests {
             .expect("create");
         store
             .schedule_store()
-            .create_scheduled_job(&crate::schedule::ScheduledJob {
-                attempts: 0,
-                id: "job-1".to_string(),
-                session_id: scheduled,
-                schedule: crate::schedule::Schedule::parse_every("1h").expect("parses"),
-                prompt: "check the thing".to_string(),
-                gate: None,
-                created_at: chrono::Utc::now(),
-                last_fired_at: None,
-                next_fire_at: chrono::Utc::now() + chrono::Duration::hours(1),
-            })
+            .create_scheduled_job(
+                &crate::schedule::ScheduledJob {
+                    attempts: 0,
+                    id: "job-1".to_string(),
+                    session_id: scheduled,
+                    schedule: crate::schedule::Schedule::parse_every("1h").expect("parses"),
+                    prompt: "check the thing".to_string(),
+                    gate: None,
+                    created_at: chrono::Utc::now(),
+                    last_fired_at: None,
+                    next_fire_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                },
+                usize::MAX,
+            )
             .await
             .expect("create the job");
 
@@ -5423,7 +5508,7 @@ mod tests {
         };
         store
             .schedule_store()
-            .create_scheduled_job(&job)
+            .create_scheduled_job(&job, usize::MAX)
             .await
             .expect("save job");
 
@@ -5478,7 +5563,7 @@ mod tests {
         };
         store
             .schedule_store()
-            .create_scheduled_job(&job)
+            .create_scheduled_job(&job, usize::MAX)
             .await
             .expect("save job");
 

@@ -169,4 +169,4 @@ Both are tuning knobs: rarely needed, but useful if you're running ~30 stdio ser
 
 | Feature | meka behavior |
 |---------|----------------|
-| `elicitation/create` | Routed to the calling session's frontend (REPL / ACP form or URL prompt) with a 60s timeout. Auto-declines when no in-flight tool call's frontend is registered or the user doesn't answer in time. |
+| `elicitation/create` | Routed to the calling session's frontend (REPL / ACP form or URL prompt) with a 60s timeout, when the server's in-flight tool calls all come from one session. Declined, with a warning, when no tool call is in flight, when the user does not answer in time, or when two sessions have calls in flight on the same server: the protocol ties an elicitation to nothing that names the call that provoked it, so routing it would be a guess. |

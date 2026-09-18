@@ -740,7 +740,7 @@ pub(super) async fn complete<B: ClaudeBackend>(
     let retry_after = crate::error::parse_retry_after(response.headers());
     backend.remember_request_id(&attribution, response.headers());
     let response_text =
-        crate::provider::read_whole_reply(response, retry_after, &cancellation).await?;
+        crate::error::read_whole_reply(response, retry_after, &cancellation).await?;
     if !status.is_success() {
         return Err(crate::error::provider_http_error(
             status,

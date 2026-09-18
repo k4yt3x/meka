@@ -8,6 +8,7 @@
 //! driver a scheduled fire and a background outcome go through.
 
 use super::{schedule::HttpHooks, state::ServerState};
+use crate::host::scheduler::InboxDrain;
 
 /// Start the inbox driver. Independent of the scheduler's switch: the inbox exists whenever the
 /// server does.
@@ -47,13 +48,24 @@ pub(crate) fn spawn_inbox_driver(state: ServerState) -> tokio::task::JoinHandle<
                     let drain = std::panic::AssertUnwindSafe(
                         crate::host::scheduler::run_inbox_turns(&hooks, session_id),
                     );
-                    if let Err(panic) = futures::FutureExt::catch_unwind(drain).await {
-                        tracing::warn!(
-                            "inbox driver for session {session_id} panicked ({panic}); continuing",
-                            panic = crate::error::panic_message(&*panic)
-                        );
-                    }
+                    let ended = match futures::FutureExt::catch_unwind(drain).await {
+                        Ok(ended) => ended,
+                        Err(panic) => {
+                            tracing::warn!(
+                                "inbox driver for session {session_id} panicked ({panic}); \
+                                 continuing",
+                                panic = crate::error::panic_message(&*panic)
+                            );
+                            InboxDrain::Done
+                        }
+                    };
                     crate::sync::lock(&state.inbox_draining).remove(&session_id);
+                    // Not when the drain stepped back for capacity: the items are pending on
+                    // purpose, and a wake over them would spin until a slot freed. The turn whose
+                    // end frees one wakes the driver itself.
+                    if ended == InboxDrain::AtCapacity {
+                        return;
+                    }
                     // A wake for an item enqueued during the drain found the id still in the set
                     // and was spent on nothing; one more look, and a wake of its own if there is
                     // work, rather than leaving it to the tick.

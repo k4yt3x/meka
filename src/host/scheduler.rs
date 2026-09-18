@@ -70,6 +70,18 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
         true
     }
 
+    /// Admit an out-of-band turn on `entry`. Counted on the process where the host caps
+    /// concurrency, so `serve`'s `max_concurrent_turns` covers every turn and not only the ones a
+    /// client submits; the default counts on the session alone. A door refused steps back ahead
+    /// of anything it would have claimed and leaves the work for the next tick or the next turn's
+    /// end, since unlike a client it has nobody to answer 429 to.
+    fn admit(
+        &self,
+        entry: &Self::Entry,
+    ) -> Result<crate::host::TurnGuard, crate::host::TurnRefused> {
+        entry.admit_turn(None)
+    }
+
     /// What the host does with the session before a turn, under the conversation lock. ACP moves
     /// the agent onto the profile the row records; an error here makes the fire unrunnable rather
     /// than failed.
@@ -195,7 +207,17 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
         );
         return FireOutcome::Deferred;
     }
-    let busy = entry.mark_busy();
+    let busy = match hooks.admit(&entry) {
+        Ok(busy) => busy,
+        Err(refused) => {
+            tracing::debug!(
+                "scheduled job {job_id} waits: the process is at its cap of {cap} concurrent \
+                 turns; deferring",
+                cap = refused.cap
+            );
+            return FireOutcome::Deferred;
+        }
+    };
     if let Err(error) = hooks.prepare(&entry).await {
         tracing::warn!(
             "scheduled job {job_id} did not run: its session's profile did not resolve \
@@ -310,6 +332,19 @@ where
         if !a_turn_can_carry_them(&entry.agent).await {
             continue;
         }
+        // Admitted ahead of the stamp below, which is one-way: a batch refused for capacity stays
+        // undelivered for the next tick rather than stamped and never handed out.
+        let busy = match hooks.admit(&entry) {
+            Ok(busy) => busy,
+            Err(refused) => {
+                tracing::debug!(
+                    "background outcomes for session {session_id} wait: the process is at its cap \
+                     of {cap} concurrent turns",
+                    cap = refused.cap
+                );
+                continue;
+            }
+        };
         if let Err(error) = hooks.prepare(&entry).await {
             tracing::warn!(
                 "holding a background outcome report for session {session_id} until its profile \
@@ -347,7 +382,6 @@ where
         }
 
         entry.touch();
-        let busy = entry.mark_busy();
         hooks.show_prompt(&entry, OutOfBandPrompt::Outcomes(&render_outcomes(&ready)));
         let cancellation = hooks.cancellation();
         let turn_id = uuid::Uuid::new_v4();
@@ -392,6 +426,18 @@ async fn defer_session_inbox<H: HostHooks>(
     }
 }
 
+/// How a drain ended, for the driver that started it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InboxDrain {
+    /// Nothing waits that this driver could run now: the inbox is empty, the session is busy or
+    /// gone, or a turn failed and its items were put off.
+    Done,
+    /// The process is at its concurrent-turn cap. The items are untouched and wait for a turn's
+    /// end, which wakes the driver, or the next tick; a driver that woke itself over them would
+    /// spin until a slot freed.
+    AtCapacity,
+}
+
 /// Run turns on a session's waiting inbox items until nothing is waiting, the session is busy,
 /// or a turn fails.
 ///
@@ -408,7 +454,7 @@ async fn defer_session_inbox<H: HostHooks>(
     clippy::significant_drop_tightening,
     reason = "the conversation guard is the turn's exclusivity and lives to the end on purpose"
 )]
-pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::Uuid) {
+pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::Uuid) -> InboxDrain {
     let entry = match hooks.resident(session_id).await {
         Ok(Some(entry)) => entry,
         // Put off rather than left due, in both arms: the sweeper wakes itself whenever due items
@@ -422,7 +468,7 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
                 "session {session_id} is held elsewhere; its inbox waits {INBOX_RETRY_BASE:?}"
             );
             defer_session_inbox(hooks, session_id, INBOX_RETRY_BASE).await;
-            return;
+            return InboxDrain::Done;
         }
         Err(error) => {
             tracing::warn!(
@@ -430,13 +476,13 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
                  unavailable: {error}"
             );
             defer_session_inbox(hooks, session_id, INBOX_RETRY_LONGEST_WAIT).await;
-            return;
+            return InboxDrain::Done;
         }
     };
     let inbox = hooks.store().inbox_store();
     loop {
         if hooks.shutting_down() {
-            return;
+            return InboxDrain::Done;
         }
         // Waited for rather than tried: the turn holding it ends with items still pending
         // exactly when they arrived too late for its last boundary, and this is the turn that
@@ -444,21 +490,35 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
         let cancellation = hooks.cancellation();
         let mut conversation = tokio::select! {
             guard = entry.conversation.lock() => guard,
-            _ = cancellation.cancelled() => return,
+            _ = cancellation.cancelled() => return InboxDrain::Done,
         };
         if !hooks.still_resident(&entry).await {
-            return;
+            return InboxDrain::Done;
         }
+        // Admitted ahead of the items, which are read rather than taken: a refusal for capacity
+        // leaves them pending exactly as they were, for the next turn's end or the next tick, and
+        // the driver is told so it does not wake itself over them at once.
+        let busy = match hooks.admit(&entry) {
+            Ok(busy) => busy,
+            Err(refused) => {
+                tracing::debug!(
+                    "inbox items for session {session_id} wait: the process is at its cap of \
+                     {cap} concurrent turns",
+                    cap = refused.cap
+                );
+                return InboxDrain::AtCapacity;
+            }
+        };
         let now = chrono::Utc::now();
         let items = match inbox.take_pending(session_id, &[], now).await {
             Ok(items) => items,
             Err(error) => {
                 tracing::warn!("failed to read the inbox for session {session_id}: {error}");
-                return;
+                return InboxDrain::Done;
             }
         };
         if items.is_empty() {
-            return;
+            return InboxDrain::Done;
         }
         // An item that has failed before and has waited past the ceiling is given up on. A fresh
         // one is never expired: the ceiling bounds retrying, not queueing.
@@ -487,13 +547,12 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
         let item_ids: Vec<uuid::Uuid> = items.iter().map(|item| item.id).collect();
 
         entry.touch();
-        let busy = entry.mark_busy();
         if let Err(error) = hooks.prepare(&entry).await {
             tracing::warn!(
                 "inbox items for session {session_id} wait: the session's profile did not \
                  resolve ({error})"
             );
-            return;
+            return InboxDrain::Done;
         }
         let cancellation = hooks.cancellation();
         let turn_id = uuid::Uuid::new_v4();
@@ -505,7 +564,7 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
             // ask again at once.
             tracing::warn!("inbox items for session {session_id} carry no words; they wait");
             defer_session_inbox(hooks, session_id, INBOX_RETRY_LONGEST_WAIT).await;
-            return;
+            return InboxDrain::Done;
         };
         let input = input.retaining(crate::conversation::PromptRetention::Withdraw);
         let riding = if hooks.background_enabled() {
@@ -533,7 +592,7 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
         hooks.turn_closed(&entry, turn_id, &origin, &outcome).await;
         let outcome = outcome.map(|_| ());
         if hooks.shutting_down() {
-            return;
+            return InboxDrain::Done;
         }
         hooks.finished(&entry, None, &outcome).await;
         match outcome {
@@ -576,7 +635,7 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
                 if let Err(error) = inbox.defer_pending(&item_ids, not_before).await {
                     tracing::warn!("failed to defer inbox items: {error}");
                 }
-                return;
+                return InboxDrain::Done;
             }
         }
     }

@@ -1591,24 +1591,32 @@ impl Agent {
             }
         };
 
+        // Rolled into the session-level counters surfaced by `/status` here rather than inside
+        // the inner loop, so a single reading reflects whole turns. A completed turn counts as
+        // one; a turn that failed or was canceled still spent what its finished rounds reported,
+        // and that spend is kept the way compaction's is, without counting a turn.
         if result.is_ok() {
-            // Roll the turn into the session-level counters surfaced by `/status`. Done here (not
-            // inside the inner loop) so a single `/status` reading reflects whole turns, not
-            // partial state.
             self.session_stats.record_turn(&turn_usage);
-            // Persist the cumulative counters onto the session row so `/status` survives resume.
-            // Best-effort: a DB hiccup must not fail the turn. Only the root agent writes; a
-            // sub-agent shares the parent's `SessionStats` (rolling its usage into the parent's
-            // totals) but owns a child session row, so letting it write would stamp the
-            // parent-inclusive totals onto the child.
-            if self.role.is_root()
-                && let Err(error) = self
-                    .store
-                    .save_session_stats(session_id, &self.session_stats.snapshot())
-                    .await
-            {
-                tracing::warn!("failed to persist session stats: {error}");
-            }
+        } else {
+            self.session_stats.record_untracked_tokens(&turn_usage);
+        }
+        // Persist the cumulative counters onto the session row so `/status` survives resume.
+        // Best-effort: a DB hiccup must not fail the turn. Only the root agent writes; a sub-agent
+        // shares the parent's `SessionStats` (rolling its usage into the parent's totals) but owns
+        // a child session row, so letting it write would stamp the parent-inclusive totals onto
+        // the child.
+        if (result.is_ok() || !turn_usage.is_empty())
+            && self.role.is_root()
+            && let Err(error) = self
+                .store
+                .save_session_stats(session_id, &self.session_stats.snapshot())
+                .await
+        {
+            tracing::warn!("failed to persist session stats: {error}");
+        }
+        if result.is_ok() {
+            // The usage event doubles as the completed turn's summary (the HTTP blocking response
+            // carries it); a failed turn answers with its error, and `/status` reads the stats.
             self.cells
                 .frontend
                 .emit(FrontendEvent::TokenUsage(turn_usage))
@@ -5232,6 +5240,61 @@ mod tests {
         assert_eq!(snapshot.redactions, 1);
         assert_eq!(snapshot.redacted_images, 2);
         assert_eq!(snapshot.redacted_bytes, 4_000_000);
+    }
+
+    /// A turn's rounds report their usage as they complete, and a later round failing does not
+    /// unspend them: the tokens are kept on the session, as compaction's are, without counting a
+    /// turn that never finished.
+    #[tokio::test]
+    async fn a_failed_turn_keeps_the_usage_its_rounds_reported() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::Usage { input_tokens: 1234 },
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "todo".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            vec![MockEvent::Fail {
+                message: "fixture failure after a paid round".to_string(),
+            }],
+        ]));
+        let provider_handle: Arc<dyn Provider> = Arc::clone(&provider) as Arc<dyn Provider>;
+        let (agent, store) = agent_for_test(provider_handle).await;
+
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("the second round fails the turn");
+
+        let snapshot = agent.session_stats_snapshot();
+        assert_eq!(
+            snapshot.input_tokens, 1234,
+            "the first round's spend is kept"
+        );
+        assert_eq!(
+            snapshot.turns, 0,
+            "without counting a turn that never finished"
+        );
+        let persisted = store
+            .load_session_stats(agent.session_id().expect("a session"))
+            .await
+            .expect("the row's stats");
+        assert_eq!(persisted.input_tokens, 1234, "and it reached the row");
     }
 
     /// What a turn stores: one user message of two blocks, the context meka injected and the words

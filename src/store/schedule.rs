@@ -3,6 +3,14 @@
 use super::*;
 use crate::schedule::*;
 
+/// What creating a job did: the row is in, or the session already holds as many as the cap allows
+/// and nothing was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobCreation {
+    Created,
+    AtCapacity { existing: usize },
+}
+
 /// Scheduling's slice of the session database, handed out by
 /// [`crate::store::Store::schedule_store`].
 #[derive(Clone)]
@@ -19,12 +27,16 @@ impl ScheduleStore {
         Self { connection, memory }
     }
 
-    /// Persist a new scheduled job. The caller owns computing `next_fire_at` from the job's anchor
-    /// (see `ScheduledJob::anchor`).
+    /// Persist a new scheduled job, unless the session already holds `max_jobs`, in which case
+    /// nothing is written. The count and the insert are one immediate transaction: two creates
+    /// racing for the last slot cannot both find it free, whatever their doors counted ahead of
+    /// the call. The caller owns computing `next_fire_at` from the job's anchor (see
+    /// `ScheduledJob::anchor`).
     pub(crate) async fn create_scheduled_job(
         &self,
         job: &ScheduledJob,
-    ) -> crate::error::Result<()> {
+        max_jobs: usize,
+    ) -> crate::error::Result<JobCreation> {
         let id = job.id.clone();
         let session_id = job.session_id.to_string();
         let kind = job.schedule.kind_str().to_string();
@@ -43,7 +55,18 @@ impl ScheduleStore {
 
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let existing = transaction.query_row(
+                    "SELECT count(*) FROM scheduled_jobs WHERE session_id = ?1",
+                    rusqlite::params![session_id],
+                    |row| row.get::<_, u64>(0),
+                )?;
+                let existing = usize::try_from(existing).unwrap_or(usize::MAX);
+                if existing >= max_jobs {
+                    return Ok(JobCreation::AtCapacity { existing });
+                }
+                transaction.execute(
                     "INSERT INTO scheduled_jobs (id, session_id, kind, spec, prompt, gate_kind, \
                      gate_spec_json, gate_last_output, gate_permission, created_at, \
                      last_fired_at, next_fire_at) \
@@ -63,7 +86,8 @@ impl ScheduleStore {
                         next_fire_at
                     ],
                 )?;
-                Ok(())
+                transaction.commit()?;
+                Ok(JobCreation::Created)
             })
             .await
             .map_err(|error| {
@@ -652,10 +676,66 @@ mod tests {
         };
         store
             .schedule_store()
-            .create_scheduled_job(&job)
+            .create_scheduled_job(&job, usize::MAX)
             .await
             .expect("create scheduled job");
         job
+    }
+
+    /// The cap is held in the transaction that writes the row, so no door's count-then-insert can
+    /// let a race past it, and a refusal writes nothing.
+    #[tokio::test]
+    async fn the_job_cap_is_enforced_where_the_row_is_written() {
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        let job = |prompt: &str| {
+            let now = chrono::Utc::now();
+            crate::schedule::ScheduledJob {
+                attempts: 0,
+                id: Uuid::new_v4().to_string(),
+                session_id,
+                schedule: crate::schedule::Schedule::parse_every("1h").expect("parses"),
+                prompt: prompt.to_string(),
+                gate: None,
+                created_at: now,
+                last_fired_at: None,
+                next_fire_at: now + chrono::Duration::hours(1),
+            }
+        };
+        let schedule = store.schedule_store();
+        assert_eq!(
+            schedule
+                .create_scheduled_job(&job("first"), 1)
+                .await
+                .expect("first"),
+            JobCreation::Created
+        );
+        assert_eq!(
+            schedule
+                .create_scheduled_job(&job("second"), 1)
+                .await
+                .expect("second"),
+            JobCreation::AtCapacity { existing: 1 }
+        );
+        assert_eq!(
+            schedule
+                .list_scheduled_jobs(session_id)
+                .await
+                .expect("list")
+                .len(),
+            1,
+            "nothing is written past the cap"
+        );
+        assert_eq!(
+            schedule
+                .create_scheduled_job(&job("third"), usize::MAX)
+                .await
+                .expect("third"),
+            JobCreation::Created
+        );
     }
 
     #[tokio::test]

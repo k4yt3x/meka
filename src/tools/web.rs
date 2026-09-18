@@ -264,14 +264,19 @@ impl Tool for FetchUrlTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _context: crate::tools::ToolContext,
+        context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let url = require_str(&input, "url", "fetch_url")?;
+        // Every wait below is raced against the turn's cancellation, as `execute_command` races
+        // its child: the agent awaits every tool future, so a fetch that ignored the token held a
+        // canceled turn until the peer answered or `[web] request_timeout` ran out. Dropping the
+        // send or the body read aborts the request; a conversion already running off the runtime
+        // finishes on its own and is discarded.
+        let cancellation = context.cancellation;
 
         let request = apply_headers(self.client.get(&url), &input);
-        let response = request
-            .send()
-            .await
+        let response = unless_canceled(&cancellation, request.send())
+            .await?
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "fetch_url".to_string(),
                 message: format!(
@@ -298,7 +303,7 @@ impl Tool for FetchUrlTool {
         // the type matches `html_to_markdown` regardless of reqwest's `url` re-export.
         let document_url: Option<url::Url> = url::Url::parse(response.url().as_str()).ok();
 
-        let body_bytes = read_body_capped(response).await?;
+        let body_bytes = unless_canceled(&cancellation, read_body_capped(response)).await??;
 
         // A response the server labeled as an image becomes a multimodal Image block rather than
         // going through html2md. `Content-Type` only gates whether to try: the media type comes
@@ -316,10 +321,13 @@ impl Tool for FetchUrlTool {
                 // multi-megapixel image is tens of milliseconds of pure CPU, and on the runtime it
                 // blocks every other task on that worker.
                 let marker = marker.clone();
-                return tokio::task::spawn_blocking(move || {
-                    build_image_tool_output(&marker, sniffed, &body_bytes)
-                })
-                .await
+                return unless_canceled(
+                    &cancellation,
+                    tokio::task::spawn_blocking(move || {
+                        build_image_tool_output(&marker, sniffed, &body_bytes)
+                    }),
+                )
+                .await?
                 .map_err(|error| MekaError::ToolExecution {
                     tool_name: "fetch_url".to_string(),
                     message: format!("image decode task failed: {error}"),
@@ -336,12 +344,15 @@ impl Tool for FetchUrlTool {
             html
         } else {
             let document_url = document_url.clone();
-            tokio::task::spawn_blocking(move || html_to_markdown(&html, &document_url))
-                .await
-                .map_err(|error| MekaError::ToolExecution {
-                    tool_name: "fetch_url".to_string(),
-                    message: format!("HTML conversion task failed: {error}"),
-                })?
+            unless_canceled(
+                &cancellation,
+                tokio::task::spawn_blocking(move || html_to_markdown(&html, &document_url)),
+            )
+            .await?
+            .map_err(|error| MekaError::ToolExecution {
+                tool_name: "fetch_url".to_string(),
+                message: format!("HTML conversion task failed: {error}"),
+            })?
         };
 
         // When the caller redirects to the scratchpad we produce full content regardless of
@@ -374,16 +385,36 @@ impl Tool for FetchUrlTool {
         };
         let content = matched.unwrap_or(body);
 
-        let content = if limit > 0 && content.len() > limit {
-            format!(
-                "{}\n\n... (truncated, showing first {limit} characters)",
-                &content[..content.floor_char_boundary(limit)],
-            )
-        } else {
-            content
-        };
+        Ok(ToolOutput::text(truncate_to_chars(content, limit), false))
+    }
+}
 
-        Ok(ToolOutput::text(content, false))
+/// `content` cut to its first `limit` characters with a note saying so, or whole when it fits or
+/// `limit` is zero. Characters, as the schema promises: a count of bytes cut non-ASCII text far
+/// short of the number asked for, and a small limit could return none of it.
+fn truncate_to_chars(content: String, limit: usize) -> String {
+    if limit == 0 {
+        return content;
+    }
+    match content.char_indices().nth(limit) {
+        Some((cut, _)) => format!(
+            "{}\n\n... (truncated, showing first {limit} characters)",
+            &content[..cut]
+        ),
+        None => content,
+    }
+}
+
+/// `future`'s output, or [`MekaError::Interrupted`] the moment the turn is canceled, whichever
+/// comes first. The future is dropped on a stop, which is what aborts a request in flight.
+async fn unless_canceled<T>(
+    cancellation: &tokio_util::sync::CancellationToken,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(MekaError::Interrupted),
+        output = future => Ok(output),
     }
 }
 
@@ -779,6 +810,67 @@ mod tests {
         assert!(props.get("headers").is_some());
         assert!(props.get("regex").is_some());
         assert!(props.get("raw").is_some());
+    }
+
+    /// The agent awaits every tool future, so a fetch that ignores the turn's token holds a
+    /// canceled turn until the peer answers or `[web] request_timeout` runs out. The peer here
+    /// accepts the connection and never answers.
+    #[tokio::test]
+    async fn a_fetch_stops_when_the_turn_is_canceled() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let peer = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+        let tool = FetchUrlTool {
+            client: build_web_client(&WebClientConfig::default()).expect("client"),
+        };
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let stop = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                cancellation.cancel();
+            }
+        });
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tool.execute(
+                serde_json::json!({ "url": format!("http://{address}/") }),
+                crate::tools::ToolContext::detached(cancellation),
+            ),
+        )
+        .await
+        .expect("the stop must end the fetch, not the test's own deadline");
+        stop.await.expect("the stop landed");
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "a stop is reported as the interruption it is: {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the stop must end the fetch at once: {:?}",
+            started.elapsed()
+        );
+        peer.abort();
+    }
+
+    #[test]
+    fn the_limit_counts_characters_not_bytes() {
+        assert_eq!(
+            truncate_to_chars("你好吗".to_string(), 2),
+            "你好\n\n... (truncated, showing first 2 characters)"
+        );
+        assert_eq!(truncate_to_chars("你好吗".to_string(), 3), "你好吗");
+        assert_eq!(
+            truncate_to_chars("abcd".to_string(), 2),
+            "ab\n\n... (truncated, showing first 2 characters)"
+        );
+        assert_eq!(truncate_to_chars("abcd".to_string(), 0), "abcd");
     }
 
     /// A canary on the response cap, which `fetch_url` reads through. It catches an accidental

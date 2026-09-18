@@ -1220,7 +1220,7 @@ mod tests {
             };
             self.manager
                 .schedule_store()
-                .create_scheduled_job(&job)
+                .create_scheduled_job(&job, usize::MAX)
                 .await
                 .expect("create job");
             job
@@ -1447,7 +1447,7 @@ mod tests {
             harness
                 .manager
                 .schedule_store()
-                .create_scheduled_job(&written)
+                .create_scheduled_job(&written, usize::MAX)
                 .await
                 .expect("write");
 

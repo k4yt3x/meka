@@ -238,14 +238,25 @@ impl ClientHandler for MekaClientHandler {
 
             // The frontend is the in-flight call's, found through the progress registry. With no
             // call from `server` in flight (the server elicited outside a tool call, or the
-            // progress guard already dropped) there is no human to ask, and declining is the safe
-            // answer.
-            let frontend = context.progress.find_frontend_for_server(server.as_ref());
-            let Some(frontend) = frontend else {
-                tracing::warn!(
-                    "MCP server '{server}' requested elicitation with no tool call in flight; declining"
-                );
-                return Ok(ElicitationResponse::Decline.into_result());
+            // progress guard already dropped) there is no human to ask, and with calls from two
+            // sessions in flight there is no telling which human, so declining is the answer in
+            // both cases rather than a guess that lands the prompt in the wrong session.
+            let frontend = match context.progress.elicitation_route(server.as_ref()) {
+                crate::mcp::progress::ElicitationRoute::To(frontend) => frontend,
+                crate::mcp::progress::ElicitationRoute::Nobody => {
+                    tracing::warn!(
+                        "MCP server '{server}' requested elicitation with no tool call in flight; \
+                         declining"
+                    );
+                    return Ok(ElicitationResponse::Decline.into_result());
+                }
+                crate::mcp::progress::ElicitationRoute::Ambiguous => {
+                    tracing::warn!(
+                        "MCP server '{server}' requested elicitation while calls from more than \
+                         one session are in flight; declining"
+                    );
+                    return Ok(ElicitationResponse::Decline.into_result());
+                }
             };
 
             // Bounded so an unanswered prompt cannot stall an MCP tool call forever; an approval

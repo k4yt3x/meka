@@ -283,24 +283,17 @@ mod tests {
 pub(crate) struct TurnRefused {
     pub(crate) cap: usize,
 }
-/// A turn's claim on its session, and on the process when the host caps concurrency. Dropped when
-/// the turn ends, which is what lets the idle sweep and `turn_in_flight` see the truth.
+/// A claim on a session, and on the process when the host caps concurrency and the work is a
+/// turn: a client's, or an inbox, scheduled or outcome turn, since the cap covers every turn. A
+/// compaction or rewind claims the session alone. Dropped when the work ends, which is what lets
+/// the idle sweep and `turn_in_flight` see the truth.
 #[must_use = "dropping the guard immediately defeats the in-flight tracking"]
 pub(crate) struct TurnGuard {
     process: Option<Arc<std::sync::atomic::AtomicUsize>>,
     session: Arc<std::sync::atomic::AtomicUsize>,
-    /// Sampled after the session started reporting the turn in flight; see [`CancelCell`].
-    pub(crate) admission: Admission,
-}
-/// An out-of-band run's claim on its session: a scheduled fire, an outcome delivery, a compaction.
-/// Counts as in flight for the idle sweep and for anything that must not overlap a turn, without
-/// counting against the process cap.
-#[must_use = "dropping the guard immediately defeats the in-flight tracking"]
-pub(crate) struct BusyGuard {
-    session: Arc<std::sync::atomic::AtomicUsize>,
-    /// Sampled after the session started reporting the work in flight, like a turn's; a cancel
-    /// that lands between the claim and the publish is then honored rather than lost. Sampling
-    /// at publish time compared the epoch with itself.
+    /// Sampled after the session started reporting the work in flight; see [`CancelCell`]. A
+    /// cancel that lands between the claim and the publish is then honored rather than lost.
+    /// Sampling at publish time compared the epoch with itself.
     pub(crate) admission: Admission,
 }
 /// The sessions a host holds open, keyed the way that host addresses them, with the one idle-sweep
@@ -452,12 +445,6 @@ impl Drop for TurnGuard {
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
-impl Drop for BusyGuard {
-    fn drop(&mut self) {
-        self.session
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    }
-}
 impl ResidentSession {
     /// Admit a turn: counted on the process first, against `cap` when the host has one, then on
     /// the session, then the cancel epoch is sampled. That order matters: from the moment the
@@ -489,19 +476,9 @@ impl ResidentSession {
         })
     }
 
-    /// Count an out-of-band run as in flight.
-    pub(crate) fn mark_busy(&self) -> BusyGuard {
-        self.in_flight
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        BusyGuard {
-            session: Arc::clone(&self.in_flight),
-            admission: self.cancel.admit(),
-        }
-    }
-
     /// Claim the session for something that must not overlap a turn, or `None` while one is in
-    /// flight.
-    pub(crate) fn claim_idle(&self) -> Option<BusyGuard> {
+    /// flight. Counted on the session alone: a compaction or a rewind is not a turn.
+    pub(crate) fn claim_idle(&self) -> Option<TurnGuard> {
         self.in_flight
             .compare_exchange(
                 0,
@@ -510,7 +487,8 @@ impl ResidentSession {
                 std::sync::atomic::Ordering::Acquire,
             )
             .ok()
-            .map(|_| BusyGuard {
+            .map(|_| TurnGuard {
+                process: None,
                 session: Arc::clone(&self.in_flight),
                 admission: self.cancel.admit(),
             })

@@ -1667,7 +1667,7 @@ docs = true
 
 ### `serve.max_concurrent_turns`
 
-Process-wide cap on in-flight turns across all sessions. When the cap is reached, new turn submissions return `429 Too Many Requests` with a `Retry-After` header. Leave it **unset** for no limit; `0` is refused at startup, because a cap of zero would 429 every turn rather than mean "unlimited".
+Process-wide cap on in-flight turns across all sessions, counting every turn: one a client submits and one the server starts on its own for an inbox item, a scheduled job or a finished background task. When the cap is reached, a new turn submission returns `429 Too Many Requests` with a `Retry-After` header, and an autonomous turn waits for a free slot (the next turn's end or the next tick) rather than running past the cap. Leave it **unset** for no limit; `0` is refused at startup, because a cap of zero would 429 every turn rather than mean "unlimited".
 
 | Type | Default |
 |------|---------|

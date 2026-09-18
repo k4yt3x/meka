@@ -372,6 +372,27 @@ pub(crate) fn provider_transport_error(
     }
 }
 
+/// Read a whole reply's body, or stop reading the moment the turn is canceled.
+///
+/// The other half of the race in `crate::oauth::send_with_one_refresh`. A provider may answer the
+/// headers at once and spend the whole generation inside the body, which is exactly what a proxy
+/// that keeps the connection warm does, so a stop that only dropped the send would still wait out a
+/// reply already announced. Every whole-reply body is read here, a refused status's included; a
+/// stream's body is read by `crate::provider::sse::drive`, which races the token on every event.
+pub(crate) async fn read_whole_reply(
+    response: reqwest::Response,
+    retry_after: Option<Duration>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<String> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(MekaError::Interrupted),
+        text = response.text() => text.map_err(|error| {
+            provider_transport_error("failed to read response", &error, retry_after)
+        }),
+    }
+}
+
 /// A mid-stream error event, classified by the code the backend put on it. The codes each backend
 /// documents as transient are retryable; anything else, including a code this build does not know,
 /// is permanent, so a real problem surfaces at once instead of burning the retry budget first.

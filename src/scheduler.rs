@@ -77,9 +77,10 @@ pub(crate) fn format_late(late_by: chrono::Duration) -> String {
 pub(crate) enum FireOutcome {
     /// The turn ran, or failed in a way that re-running would not fix.
     Ran,
-    /// This host could not take the job and another one should. The concrete case is `meka serve`
-    /// finding the session's file lock held by a REPL: that REPL has its own watcher and will run
-    /// the job itself, so the occurrence is restored rather than burnt.
+    /// This host could not take the job now and the occurrence is restored rather than burnt. The
+    /// concrete cases are `meka serve` finding the session's file lock held by a REPL, which has
+    /// its own watcher and will run the job itself, and a process at its concurrent-turn cap,
+    /// which takes the job on a later sweep.
     Deferred,
     /// This host owns the job and could not run it, and trying again immediately would not help.
     ///

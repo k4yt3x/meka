@@ -180,11 +180,10 @@ That rewrites the session's row, so it holds for a resume from any surface rathe
 request. Switching mid-conversation is allowed and is your call: a thinking block is tagged with the
 backend that produced it and is not replayed to a different one, so from the next turn the model no
 longer sees the reasoning recorded under the old profile. Like `cwd`, it is a `409` when a turn is
-already in flight; cancel first. `permission` and `approvals` are the two fields that apply during
-a turn; see [Permission levels over HTTP](#permission-levels-over-http). (One admitted between the
-check and the agent swap makes the swap wait for that turn rather than fail, so the request can take
-as long as the turn does. The row has already moved by then, and the agent follows when the turn
-ends.)
+already in flight; cancel first. A `PATCH` naming either field holds the session while it writes,
+the way compact does, so a turn arriving meanwhile answers `409` rather than starting under it, and
+so does a second such `PATCH`. `permission` and `approvals` are the two fields that apply during
+a turn; see [Permission levels over HTTP](#permission-levels-over-http).
 
 A `PATCH` naming a profile moves the session to that profile, and the profile is the whole story:
 the model, the account and every model-tied setting come from it, so there is nothing else on the
@@ -981,7 +980,7 @@ shutdown_drain_timeout = "30s"
 
 - **Per session:** one turn at a time. A second `POST /turn` returns 409; a message that should not wait for the session to be free goes through the [inbox](#the-inbox), which a running turn reads at its next round boundary.
 - **Across sessions:** fully concurrent. Multiple sessions can run turns in parallel.
-- **Process-wide cap (optional):** set `max_concurrent_turns` to limit total in-flight turns. Exceeding the cap returns 429 with a `Retry-After` header.
+- **Process-wide cap (optional):** set `max_concurrent_turns` to limit total in-flight turns, autonomous ones (inbox, scheduled, background outcomes) included. A client turn past the cap returns 429 with a `Retry-After` header; an autonomous one waits for a free slot.
 
 ## Configuration
 

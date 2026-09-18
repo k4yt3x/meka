@@ -146,8 +146,8 @@ const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// is found by the keepalives instead (reqwest's TCP defaults and [`HTTP2_KEEPALIVE_INTERVAL`]); a
 /// stream that carries nothing is bounded by [`STREAM_IDLE_TIMEOUT`] at the SSE layer, the one
 /// place silence means something; and a stop drops a pending request in
-/// `crate::oauth::send_with_one_refresh` and its body in [`read_whole_reply`], the one place every
-/// request a turn makes is sent and the one place every whole reply is read.
+/// `crate::oauth::send_with_one_refresh` and its body in `crate::error::read_whole_reply`, the one
+/// place every request a turn makes is sent and the one place every whole reply is read.
 pub(crate) fn build_http_client(
     backend: &str,
     configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
@@ -356,43 +356,32 @@ struct ToolCallAccumulator {
 pub(crate) async fn succeeded(
     response: reqwest::Response,
     what: &str,
+    cancellation: &CancellationToken,
 ) -> Result<reqwest::Response> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
     let retry_after = crate::error::parse_retry_after(response.headers());
-    let response_text = response.text().await.unwrap_or_else(|error| {
-        tracing::warn!("failed to read the {what} error response body: {error}");
-        String::new()
-    });
+    // Under the token, as every body read is: the client runs no clock on a reply, so a peer that
+    // sends the status and withholds the body would otherwise hold a canceled turn for as long as
+    // it pleased. A body that fails to arrive for any other reason leaves the error to describe
+    // itself by its status.
+    let response_text =
+        match crate::error::read_whole_reply(response, retry_after, cancellation).await {
+            Ok(text) => text,
+            Err(MekaError::Interrupted) => return Err(MekaError::Interrupted),
+            Err(error) => {
+                tracing::warn!("failed to read the {what} error response body: {error}");
+                String::new()
+            }
+        };
     Err(crate::error::provider_http_error(
         status,
         &response_text,
         retry_after,
         crate::error::ProviderRequest::Completion,
     ))
-}
-
-/// Read a whole reply's body, or stop reading the moment the turn is canceled.
-///
-/// The other half of the race in `crate::oauth::send_with_one_refresh`. A provider may answer the
-/// headers at once and spend the whole generation inside the body, which is exactly what a proxy
-/// that keeps the connection warm does, so a stop that only dropped the send would still wait out a
-/// reply already announced. Every whole-reply body is read here; a stream's body is read by
-/// [`sse::drive`], which races the token on every event.
-pub(crate) async fn read_whole_reply(
-    response: reqwest::Response,
-    retry_after: Option<std::time::Duration>,
-    cancellation: &CancellationToken,
-) -> Result<String> {
-    tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => Err(MekaError::Interrupted),
-        text = response.text() => text.map_err(|error| {
-            crate::error::provider_transport_error("failed to read response", &error, retry_after)
-        }),
-    }
 }
 
 /// What a tool call's raw argument text becomes, for every driver. An empty body is a legitimate
@@ -663,7 +652,68 @@ mod tests {
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            read_whole_reply(response, None, &cancellation),
+            crate::error::read_whole_reply(response, None, &cancellation),
+        )
+        .await
+        .expect("the stop must end the read, not the test's own deadline");
+        stop.await.expect("the stop landed");
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "a stop is reported as the interruption it is: {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the stop must end the read at once: {:?}",
+            started.elapsed()
+        );
+        peer.abort();
+    }
+
+    /// A refused status can arrive with its body withheld, and the client runs no clock on a
+    /// reply, so that body is read under the token like every other: a peer that sent the status
+    /// and nothing more held a canceled turn for as long as it pleased.
+    #[tokio::test]
+    async fn a_stop_ends_the_wait_for_a_refused_replys_body_at_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !head.ends_with(b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.expect("the request arrives");
+                assert!(read > 0, "the client closed the connection");
+                head.extend_from_slice(&chunk[..read]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 4\r\n\r\n",
+                )
+                .await
+                .expect("announce the refusal");
+            std::future::pending::<()>().await;
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/v1/messages"))
+            .send()
+            .await
+            .expect("the headers arrive at once");
+        let cancellation = CancellationToken::new();
+        let stop = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                cancellation.cancel();
+            }
+        });
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            succeeded(response, "test", &cancellation),
         )
         .await
         .expect("the stop must end the read, not the test's own deadline");

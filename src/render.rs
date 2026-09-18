@@ -3135,6 +3135,7 @@ mod tests {
     /// colors. Nothing else here would notice the two being swapped.
     #[test]
     fn reasoning_is_painted_by_the_dim_skin() {
+        force_colors();
         let mut renderer =
             super::StreamingRenderer::for_thinking(RenderMode::Termimad).capturing(80);
         renderer
@@ -4844,6 +4845,12 @@ mod tests {
         );
     }
 
+    /// crossterm consults `NO_COLOR` on every colored write and a test about colors then sees
+    /// none; this switch overrides it, and nothing else in the suite reads the variable.
+    fn force_colors() {
+        crossterm::style::force_color_output(true);
+    }
+
     fn termimad_render(markdown: &str) -> String {
         let mut renderer = StreamingRenderer::new(RenderMode::Termimad).with_width(76);
         renderer.started = true;
@@ -4859,6 +4866,7 @@ mod tests {
     /// must now carry a distinct color from the theme.
     #[test]
     fn markdown_skin_is_not_greyscale() {
+        force_colors();
         let rendered = termimad_render(
             "# Title\n\nText with **bold**, *italic*, and `code`.\n\n> quoted\n\n* item\n",
         );
@@ -4881,6 +4889,7 @@ mod tests {
     /// is the one that exposes this.
     #[test]
     fn inline_code_resolves_through_the_markdown_context() {
+        force_colors();
         let rendered = termimad_render("uses `inline_code` here\n");
         assert!(
             fg_color_set(&rendered).contains("236;53;51"),

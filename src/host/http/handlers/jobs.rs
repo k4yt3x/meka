@@ -360,30 +360,6 @@ pub(crate) async fn create(
         }
     };
 
-    let existing = state
-        .shared
-        .store
-        .schedule_store()
-        .list_scheduled_jobs(id)
-        .await
-        .map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to count scheduled jobs", error)
-                .with("session_id", id.to_string())
-        })?
-        .len();
-    let max_jobs = state.shared.config.schedule.max_jobs;
-    if existing >= max_jobs {
-        return Err(ProblemDetail::new(
-            ErrorKind::InvalidBody,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "session already has {existing} scheduled jobs, the configured limit; cancel one \
-                 first"
-            ),
-        )
-        .with("session_id", id.to_string()));
-    }
-
     let next_fire_at = schedule.next_after(now).ok_or_else(|| {
         ProblemDetail::new(
             ErrorKind::InvalidBody,
@@ -403,16 +379,29 @@ pub(crate) async fn create(
         next_fire_at,
         attempts: 0,
     };
-    state
+    // The cap is held where the row is written, in one transaction with the count, so two creates
+    // racing for the last slot cannot both be told yes.
+    let created = state
         .shared
         .store
         .schedule_store()
-        .create_scheduled_job(&job)
+        .create_scheduled_job(&job, state.shared.config.schedule.max_jobs)
         .await
         .map_err(|error| {
             ProblemDetail::internal_sanitized("failed to create scheduled job", error)
                 .with("session_id", id.to_string())
         })?;
+    if let crate::store::schedule::JobCreation::AtCapacity { existing } = created {
+        return Err(ProblemDetail::new(
+            ErrorKind::InvalidBody,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "session already has {existing} scheduled jobs, the configured limit; cancel one \
+                 first"
+            ),
+        )
+        .with("session_id", id.to_string()));
+    }
 
     tracing::info!(
         "created scheduled job {job_id} on session {id} via HTTP, next fire {next_fire}",

@@ -115,23 +115,32 @@ impl ProgressRegistry {
         }
     }
 
-    /// Best-effort lookup: the frontend of any in-flight tool call targeting `server_name`, for
-    /// the elicitation handler, which has no `progressToken` correlation of its own. The server's
-    /// elicitation request lands on the rmcp handler task with only its own request id and the
-    /// originating server identity, so a scan for a matching in-flight call is all there is.
-    ///
-    /// Returns the first match (HashMap iteration order is arbitrary). In a multi-session ACP
-    /// process where two sessions race calls to the same server, an elicitation arriving during
-    /// both calls routes to whichever entry the scan picks. `AcpFrontend` issues a real
-    /// `elicitation/create` on its own connection, so a mis-pick surfaces the prompt in the wrong
-    /// session's editor. Narrowing it needs protocol-level help: MCP's elicitation is a
-    /// server-initiated request with no link back to the tool call that provoked it, so there is
-    /// nothing here to correlate on.
-    pub(crate) fn find_frontend_for_server(&self, server_name: &str) -> Option<Arc<dyn Frontend>> {
-        crate::sync::lock(&self.entries)
+    /// Where an elicitation from `server_name` goes: the frontend of the tool calls in flight on
+    /// that server, when they all belong to one. The server's request lands on the rmcp handler
+    /// task with only its own request id and the originating server, and MCP's elicitation is a
+    /// server-initiated request with no link back to the tool call that provoked it, so the
+    /// in-flight calls are all there is to go on. One session with parallel calls to the server is
+    /// unambiguous; two sessions on the same server are not, and picking one would surface the
+    /// prompt in the wrong editor and answer the other session's call with what this one typed.
+    pub(crate) fn elicitation_route(&self, server_name: &str) -> ElicitationRoute {
+        let frontends: Vec<Arc<dyn Frontend>> = crate::sync::lock(&self.entries)
             .values()
-            .find(|entry| entry.server_name == server_name)
-            .and_then(|entry| entry.frontend.clone())
+            .filter(|entry| entry.server_name == server_name)
+            .filter_map(|entry| entry.frontend.clone())
+            .collect();
+        let mut route = ElicitationRoute::Nobody;
+        for frontend in frontends {
+            route = match route {
+                ElicitationRoute::Nobody => ElicitationRoute::To(frontend),
+                ElicitationRoute::To(known)
+                    if std::ptr::addr_eq(Arc::as_ptr(&known), Arc::as_ptr(&frontend)) =>
+                {
+                    ElicitationRoute::To(known)
+                }
+                _ => return ElicitationRoute::Ambiguous,
+            };
+        }
+        route
     }
 
     /// Test helper: check whether a specific progress-token key is in the registry.
@@ -139,6 +148,17 @@ impl ProgressRegistry {
     pub(crate) fn is_registered(&self, key: &str) -> bool {
         crate::sync::lock(&self.entries).contains_key(key)
     }
+}
+
+/// Where an elicitation goes, from [`ProgressRegistry::elicitation_route`].
+pub(crate) enum ElicitationRoute {
+    /// The one frontend with calls in flight on the server.
+    To(Arc<dyn Frontend>),
+    /// No call on the server is in flight: it elicited outside a tool call, or the call's guard
+    /// is already gone.
+    Nobody,
+    /// Calls from more than one frontend are in flight on the server.
+    Ambiguous,
 }
 
 /// RAII guard that removes the progress-token entry when dropped.
@@ -323,11 +343,10 @@ mod tests {
         );
     }
 
-    /// `find_frontend_for_server` returns the frontend from any in-flight entry that matches the
-    /// server name. Used by the elicitation handler when it can't correlate via the progress
-    /// token.
+    /// An elicitation routes to the frontend whose call is in flight on the server, observed by
+    /// emitting through the route and finding the event on the recorder registered with.
     #[tokio::test]
-    async fn find_frontend_for_server_returns_matching_entry() {
+    async fn an_elicitation_routes_to_the_frontend_with_a_call_in_flight() {
         let recorder: Arc<RecordingFrontend> = Arc::new(RecordingFrontend::new());
         let frontend: Arc<dyn Frontend> = recorder.clone();
         let registry = ProgressRegistry::default();
@@ -337,11 +356,9 @@ mod tests {
             None,
             Some(frontend),
         );
-        let found = registry
-            .find_frontend_for_server("unique-srv-for-test")
-            .expect("entry should be findable");
-        // We can't easily compare `Arc<dyn Frontend>` for identity, but we *can* observe that
-        // emitting through `found` lands on the recorder we registered with.
+        let ElicitationRoute::To(found) = registry.elicitation_route("unique-srv-for-test") else {
+            panic!("one frontend with a call in flight is the route");
+        };
         found
             .emit(FrontendEvent::Notice(crate::frontend::Notice::info(
                 "probe",
@@ -354,5 +371,55 @@ mod tests {
                 .any(|e| matches!(e, FrontendEvent::Notice(n) if n.text == "probe")),
             "the found frontend must be the one originally registered",
         );
+    }
+
+    /// Routed only when every call in flight on the server belongs to one frontend: parallel
+    /// calls from one session route, calls from two sessions do not, and the handler declines
+    /// rather than guess which editor to ask. Another server's calls do not count.
+    #[test]
+    fn an_elicitation_with_calls_from_two_frontends_in_flight_is_not_routed() {
+        let frontend_a: Arc<dyn Frontend> = Arc::new(RecordingFrontend::new());
+        let frontend_b: Arc<dyn Frontend> = Arc::new(RecordingFrontend::new());
+        let registry = ProgressRegistry::default();
+        assert!(matches!(
+            registry.elicitation_route("srv"),
+            ElicitationRoute::Nobody
+        ));
+
+        let (_token_a, _guard_a) = registry.register(
+            "srv".into(),
+            "tool".into(),
+            Some("ta".into()),
+            Some(Arc::clone(&frontend_a)),
+        );
+        let (_token_a2, _guard_a2) = registry.register(
+            "srv".into(),
+            "tool".into(),
+            Some("ta2".into()),
+            Some(Arc::clone(&frontend_a)),
+        );
+        assert!(
+            matches!(
+                registry.elicitation_route("srv"),
+                ElicitationRoute::To(ref found)
+                    if std::ptr::addr_eq(Arc::as_ptr(found), Arc::as_ptr(&frontend_a))
+            ),
+            "parallel calls from one frontend route to it"
+        );
+
+        let (_token_b, _guard_b) = registry.register(
+            "srv".into(),
+            "tool".into(),
+            Some("tb".into()),
+            Some(Arc::clone(&frontend_b)),
+        );
+        assert!(matches!(
+            registry.elicitation_route("srv"),
+            ElicitationRoute::Ambiguous
+        ));
+        assert!(matches!(
+            registry.elicitation_route("other"),
+            ElicitationRoute::Nobody
+        ));
     }
 }

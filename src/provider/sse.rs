@@ -85,7 +85,7 @@ pub(crate) async fn drive<P: Protocol>(
     cancellation: &CancellationToken,
     protocol: &mut P,
 ) -> Result<End> {
-    let response = super::succeeded(response, what).await?;
+    let response = super::succeeded(response, what, cancellation).await?;
     let mut event_stream = response.bytes_stream().eventsource();
     loop {
         tokio::select! {

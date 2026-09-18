@@ -73,6 +73,19 @@ impl ServeTestHarness {
         token: &str,
         scopes: &[&str],
     ) -> Self {
+        Self::spawn_with_env(prelude, extra_config, script, token, scopes, |_| Vec::new())
+    }
+
+    /// [`Self::spawn_with`] with variables added to the server's environment, computed from the
+    /// install so a test can name a path under it before the server exists.
+    fn spawn_with_env(
+        prelude: &str,
+        extra_config: &str,
+        script: serde_json::Value,
+        token: &str,
+        scopes: &[&str],
+        environment: impl Fn(&Install) -> Vec<(String, String)>,
+    ) -> Self {
         let install = Install::new();
         install.write_script(&script);
 
@@ -125,6 +138,7 @@ scopes = [{scopes_str}]
             let mut child = install
                 .meka(&["serve"])
                 .env("RUST_LOG", "meka=info")
+                .envs(environment(&install))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -926,6 +940,113 @@ fn patch_session_updates_permission_and_cwd() {
     let body: serde_json::Value = patched.json().expect("parse");
     assert_eq!(body["permission"], "read");
     assert_eq!(body["cwd"], canonical_spelling(&new_cwd));
+}
+
+/// A request sent from its own thread, for a test that needs two in flight at once. Answers the
+/// status and the parsed body, `Null` for a body that is not JSON.
+fn request_on_a_thread(
+    harness: &ServeTestHarness,
+    method: reqwest::Method,
+    path: &str,
+    body: serde_json::Value,
+) -> std::thread::JoinHandle<(u16, serde_json::Value)> {
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let path = path.to_string();
+    std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("client");
+        let response = client
+            .request(method, format!("{base_url}{path}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&body)
+            .send()
+            .expect("send");
+        let status = response.status().as_u16();
+        let body = response
+            .json::<serde_json::Value>()
+            .unwrap_or(serde_json::Value::Null);
+        (status, body)
+    })
+}
+
+/// A `PATCH` naming `cwd` claims the session for as long as it writes, so a turn cannot start
+/// under it. The row write is parked behind a write transaction the test holds, which is the
+/// window a bare in-flight read let a turn through: it was admitted, and the cell moved under it.
+#[test]
+fn a_cwd_patch_cannot_be_overtaken_by_a_turn() {
+    let harness = ServeTestHarness::spawn(
+        "",
+        serde_json::json!([
+            [
+                { "type": "text", "text": "ran" },
+                { "type": "message_end", "stop_reason": "end_turn" }
+            ],
+            [
+                { "type": "text", "text": "ran" },
+                { "type": "message_end", "stop_reason": "end_turn" }
+            ]
+        ]),
+    );
+    let id = create_session_id(&harness);
+    let other = std::env::temp_dir().join(format!("meka-patch-race-{id}"));
+    std::fs::create_dir_all(&other).expect("create the other cwd");
+
+    let store =
+        rusqlite::Connection::open(harness.install.database()).expect("open the server's store");
+    store
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("hold the store's write lock");
+
+    let patch = request_on_a_thread(
+        &harness,
+        reqwest::Method::PATCH,
+        &format!("/v1/sessions/{id}"),
+        serde_json::json!({ "cwd": other.to_string_lossy() }),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let turn = request_on_a_thread(
+        &harness,
+        reqwest::Method::POST,
+        &format!("/v1/sessions/{id}/turn"),
+        serde_json::json!({ "message": "stay where you are", "stream": false }),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    store
+        .execute_batch("ROLLBACK")
+        .expect("release the write lock");
+
+    let (patch_status, patch_body) = patch.join().expect("patch thread");
+    assert_eq!(patch_status, 200, "{patch_body}");
+    let (turn_status, turn_body) = turn.join().expect("turn thread");
+    assert_eq!(
+        turn_status, 409,
+        "a turn must not be admitted while the PATCH holds the session: {turn_body}"
+    );
+    assert!(
+        turn_body["type"]
+            .as_str()
+            .is_some_and(|kind| kind.ends_with("/turn-in-flight")),
+        "{turn_body}"
+    );
+
+    // The session is free again once the PATCH has answered, and it runs where the PATCH put it.
+    let after = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({ "message": "now", "stream": false }))
+        .send()
+        .expect("send");
+    assert_eq!(after.status(), 200);
+    let session: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(session["cwd"], canonical_spelling(&other));
+    std::fs::remove_dir_all(&other).ok();
 }
 
 /// `approvals` is a row field like the level: `PATCH` writes it and the session reads it back, so a
@@ -1791,6 +1912,242 @@ fn cancel_during_in_flight_turn_emits_canceled_event() {
     );
 }
 
+/// `[schedule] max_jobs` is held where the row is written, in one transaction with the count, so
+/// creates racing for the last slot cannot all be told yes.
+#[test]
+fn parallel_job_creates_respect_max_jobs() {
+    let harness = ServeTestHarness::spawn_with(
+        "\n[schedule]\nmax_jobs = 1\npoll_interval = \"60s\"\n",
+        "",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "sessions:w", "schedule:r", "schedule:w"],
+    );
+    let id = create_session_id(&harness);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(12));
+    let creates: Vec<std::thread::JoinHandle<u16>> = (0..12)
+        .map(|index| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let base_url = harness.base_url.clone();
+            let token = harness.token.clone();
+            let id = id.clone();
+            std::thread::spawn(move || {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .expect("client");
+                barrier.wait();
+                client
+                    .post(format!("{base_url}/v1/sessions/{id}/schedule"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .json(&serde_json::json!({ "prompt": format!("job {index}"), "every": "1h" }))
+                    .send()
+                    .expect("send")
+                    .status()
+                    .as_u16()
+            })
+        })
+        .collect();
+    let statuses: Vec<u16> = creates
+        .into_iter()
+        .map(|thread| thread.join().expect("create thread"))
+        .collect();
+    assert_eq!(
+        statuses.iter().filter(|status| **status == 201).count(),
+        1,
+        "exactly one create may win the last slot: {statuses:?}"
+    );
+    assert_eq!(
+        statuses.iter().filter(|status| **status == 422).count(),
+        11,
+        "{statuses:?}"
+    );
+    let jobs: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/schedule"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(jobs["jobs"].as_array().map_or(0, Vec::len), 1, "{jobs}");
+}
+
+/// `max_concurrent_turns` counts every turn: an inbox turn takes the same process slot a client's
+/// does, and one refused for capacity waits for the next turn's end instead of running past the
+/// cap. Two sessions with items, one slot: neither runs while the client's turn holds it, and
+/// afterwards they run one at a time.
+#[test]
+fn autonomous_turns_share_the_process_cap() {
+    let script = serde_json::json!([
+        [
+            { "type": "sleep", "ms": 3000 },
+            { "type": "text", "text": "client turn done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "sleep", "ms": 1000 },
+            { "type": "text", "text": "inbox turn done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "sleep", "ms": 1000 },
+            { "type": "text", "text": "inbox turn done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "max_concurrent_turns = 1\n",
+        script,
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+    );
+    let ids: Vec<String> = (0..3).map(|_| create_session_id(&harness)).collect();
+    let view = |id: &str| -> serde_json::Value {
+        harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse")
+    };
+
+    let client_turn = request_on_a_thread(
+        &harness,
+        reqwest::Method::POST,
+        &format!("/v1/sessions/{}/turn", ids[0]),
+        serde_json::json!({ "message": "hold the slot", "stream": false }),
+    );
+    harness.wait_until_in_flight(&ids[0]);
+    for id in &ids[1..] {
+        let accepted = harness
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+            .json(&serde_json::json!({ "message": "run", "class": "followup" }))
+            .send()
+            .expect("send");
+        assert_eq!(accepted.status(), 202);
+    }
+
+    // Held, not run: the client's turn has the only slot.
+    std::thread::sleep(Duration::from_millis(500));
+    for id in &ids[1..] {
+        let session = view(id);
+        assert_eq!(session["turn_in_flight"], false, "{session}");
+        assert_eq!(session["inbox_pending"], 1, "{session}");
+    }
+
+    let (status, body) = client_turn.join().expect("client turn");
+    assert_eq!(status, 200, "{body}");
+
+    // Then both run. Not asserted: that they never overlap, which two `GET`s cannot observe at
+    // one instant; the hold above is what a session-only count would have failed.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let views: Vec<serde_json::Value> = ids[1..].iter().map(|id| view(id)).collect();
+        if views
+            .iter()
+            .all(|session| session["inbox_pending"] == 0 && session["turn_in_flight"] == false)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the inbox turns never ran once the slot freed: {views:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// The scheduled door counts on the process too: a job due while a client's turn on another
+/// session holds the only slot is deferred, occurrence intact, and fires once the slot frees.
+#[test]
+fn a_scheduled_fire_waits_for_a_free_slot() {
+    let script = serde_json::json!([
+        // Session A schedules a one-shot a second out.
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "schedule_create" },
+            { "type": "tool_use_end", "input": {
+                "prompt": "DELIVERED_PROMPT_MARKER",
+                "at": "1s"
+            }},
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "scheduled it" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        // Session B's turn holds the slot for four seconds.
+        [
+            { "type": "sleep", "ms": 4000 },
+            { "type": "text", "text": "held the slot" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        // The fire, once the slot is free.
+        [
+            { "type": "text", "text": "SCHEDULED_REPLY_MARKER" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn_with(
+        "\n[schedule]\npoll_interval = \"1s\"\n",
+        "max_concurrent_turns = 1\n",
+        script,
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+    );
+    let scheduling = create_session_id(&harness);
+    let holding = create_session_id(&harness);
+    let messages_of = |id: &str| -> String {
+        harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+            .send()
+            .expect("messages")
+            .text()
+            .expect("body")
+    };
+
+    let scheduled = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{scheduling}/turn"),
+        )
+        .json(&serde_json::json!({ "message": "remind me in a second" }))
+        .send()
+        .expect("send");
+    assert_eq!(scheduled.status(), 200);
+    let holder = request_on_a_thread(
+        &harness,
+        reqwest::Method::POST,
+        &format!("/v1/sessions/{holding}/turn"),
+        serde_json::json!({ "message": "hold the slot", "stream": false }),
+    );
+    harness.wait_until_in_flight(&holding);
+
+    // Due after a second and swept every second, so by three seconds the fire has been found due
+    // at least once; without a slot it is deferred, not run.
+    std::thread::sleep(Duration::from_millis(3000));
+    let while_held = messages_of(&scheduling);
+    assert!(
+        !while_held.contains("SCHEDULED_REPLY_MARKER"),
+        "the fire ran past the cap while another session's turn held the only slot"
+    );
+
+    let (status, body) = holder.join().expect("holding turn");
+    assert_eq!(status, 200, "{body}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut body = String::new();
+    while Instant::now() < deadline {
+        body = messages_of(&scheduling);
+        if body.contains("SCHEDULED_REPLY_MARKER") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        body.contains("SCHEDULED_REPLY_MARKER"),
+        "the deferred fire never ran once the slot freed: {body}"
+    );
+}
+
 /// Process-wide `max_concurrent_turns = 1` rejects the second concurrent turn (across distinct
 /// sessions) with 429 + concurrency-limit. Validates the `TurnGuard` admission check.
 #[test]
@@ -2405,6 +2762,164 @@ fn blocking_turn_accepts_inline_image_attachment() {
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().expect("parse");
     assert_eq!(body["final_text"], "hello from agent");
+}
+
+/// Where a held turn waits, under the install: the path the server's `MEKA_MOCK_TURN_HOLD` names.
+/// The server marks reaching the gap with `.waiting` appended; creating the path releases it.
+fn turn_hold_path(install: &Install) -> std::path::PathBuf {
+    install.root().join("turn-hold")
+}
+
+/// The environment that holds every turn at the gap between its validation and its admission.
+fn turn_hold(install: &Install) -> Vec<(String, String)> {
+    vec![(
+        "MEKA_MOCK_TURN_HOLD".to_string(),
+        turn_hold_path(install).to_string_lossy().into_owned(),
+    )]
+}
+
+/// The entry admitted is the one the map holds once the body is validated, not the one resolved
+/// before: a DELETE inside that window removes the session, and admitting the stale clone ran the
+/// turn against a row that was gone and failed it on a foreign key. The window is held open by
+/// the mock hold rather than found by timing, which no build can be trusted to leave wide enough.
+#[test]
+fn a_session_deleted_while_its_turn_is_validated_is_not_run() {
+    let harness = ServeTestHarness::spawn_with_env(
+        "",
+        "",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+        turn_hold,
+    );
+    let id = create_session_id(&harness);
+    let hold = turn_hold_path(&harness.install);
+    let turn = request_on_a_thread(
+        &harness,
+        reqwest::Method::POST,
+        &format!("/v1/sessions/{id}/turn"),
+        serde_json::json!({
+            "message": "look",
+            "images": [{ "media_type": "image/png", "data": TINY_PNG_BASE64 }],
+            "stream": false,
+        }),
+    );
+    support::wait_until("the turn reaches the hold", Duration::from_secs(10), || {
+        hold.with_extension("waiting").exists()
+    });
+
+    let deleted = harness
+        .request(reqwest::Method::DELETE, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send");
+    assert_eq!(deleted.status(), 204);
+    std::fs::write(&hold, b"").expect("release the hold");
+
+    let (status, body) = turn.join().expect("turn thread");
+    assert_eq!(status, 404, "{body}");
+    assert!(
+        body["type"]
+            .as_str()
+            .is_some_and(|kind| kind.ends_with("/session-not-found")),
+        "{body}"
+    );
+}
+
+/// A session the idle sweep evicts while a turn stands between its validation and its admission
+/// is re-attached and run. The clone resolved ahead of the validation held the session's file lock
+/// through its agent, so the re-attach refused this process's own claim with `session-locked`.
+#[test]
+fn a_session_evicted_while_its_turn_is_validated_is_reattached_and_run() {
+    let harness = ServeTestHarness::spawn_with_env(
+        "",
+        "idle_timeout = \"1s\"\ngc_scan_interval = \"1s\"\n",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+        turn_hold,
+    );
+    let id = create_session_id(&harness);
+    let hold = turn_hold_path(&harness.install);
+    let turn = request_on_a_thread(
+        &harness,
+        reqwest::Method::POST,
+        &format!("/v1/sessions/{id}/turn"),
+        serde_json::json!({ "message": "look", "stream": false }),
+    );
+    support::wait_until("the turn reaches the hold", Duration::from_secs(10), || {
+        hold.with_extension("waiting").exists()
+    });
+    harness.wait_until_evicted(&id);
+    // The sweep drops the evicted entries, and with them the session's file lock, moments after
+    // the map stops listing the session; the lock itself is not observable from outside.
+    std::thread::sleep(Duration::from_millis(250));
+    std::fs::write(&hold, b"").expect("release the hold");
+
+    let (status, body) = turn.join().expect("turn thread");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["final_text"], "hello from agent");
+}
+
+/// The images are judged against the profile the turn is admitted on, not only the one the decode
+/// was judged against: a session evicted and moved onto a text-only profile while the turn stood
+/// in the gap is refused as the next request would be, rather than handing the model images the
+/// row says it cannot take.
+#[test]
+fn an_image_is_judged_again_against_the_profile_the_turn_is_admitted_on() {
+    let harness = ServeTestHarness::spawn_with_env(
+        "default_profile = \"mock\"\n",
+        "idle_timeout = \"1s\"\ngc_scan_interval = \"1s\"\n\n[accounts.blind]\n\
+         backend = \"anthropic-messages\"\n\n[profiles.blind]\naccount = \"blind\"\n\
+         model = \"model-without-eyes\"\nvision = false\n",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+        turn_hold,
+    );
+    let id = create_session_id(&harness);
+    let hold = turn_hold_path(&harness.install);
+    let with_image = serde_json::json!({
+        "message": "what is this?",
+        "images": [{ "media_type": "image/png", "data": TINY_PNG_BASE64 }],
+        "stream": false,
+    });
+    let turn = request_on_a_thread(
+        &harness,
+        reqwest::Method::POST,
+        &format!("/v1/sessions/{id}/turn"),
+        with_image,
+    );
+    support::wait_until("the turn reaches the hold", Duration::from_secs(10), || {
+        hold.with_extension("waiting").exists()
+    });
+    harness.wait_until_evicted(&id);
+    let moved = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({ "profile": "blind" }))
+        .send()
+        .expect("send");
+    assert_eq!(moved.status(), 200);
+    // The sweep drops the evicted entries, and with them the session's file lock, moments after
+    // the map stops listing the session; the lock itself is not observable from outside.
+    std::thread::sleep(Duration::from_millis(250));
+    std::fs::write(&hold, b"").expect("release the hold");
+
+    let (status, problem) = turn.join().expect("turn thread");
+    assert_eq!(status, 422, "{problem}");
+    assert!(
+        problem["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("vision")),
+        "the refusal names why: {problem}"
+    );
+
+    // Refused, not broken: the session runs a text turn on its new profile.
+    let text = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({ "message": "words only", "stream": false }))
+        .send()
+        .expect("send");
+    assert_eq!(text.status(), 200);
 }
 
 /// An image a turn attached is served back by its hash to the session that carries it and to no

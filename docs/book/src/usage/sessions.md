@@ -407,7 +407,7 @@ Pass `--format json` for a structured export instead of rendered Markdown:
 meka session export 550e8400-e29b-41d4-a716-446655440000 --format json
 ```
 
-This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, and scratchpad entries. The archive carries `format_version: 2`, and an import refuses any other version rather than guessing at its shape. Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
+This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, and scratchpad entries. The archive carries `format_version: 3`, and an import refuses any other version rather than guessing at its shape. Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
 
 ## Importing a session
 
@@ -475,7 +475,7 @@ meka session rewind 550e8400-e29b-41d4-a716-446655440000 -n 3
 
 The cut lands on a turn boundary, so a tool call is never separated from its result, and a compaction summary counts as a turn, so a rewind that reaches it removes the summary too. Nothing is deleted: the dropped turns stay in the event log and still appear in `meka session export`, marked at the point of the rewind. The model simply stops seeing them.
 
-The command takes the session lock, so it refuses to run while a REPL, `meka serve`, or `meka acp` holds the session; that process has its own copy of the conversation in memory and would write over the rewind on its next turn. In the REPL use `/rewind` instead. Under ACP or the HTTP API there is no in-session equivalent, so close the session in the editor (or stop the server) and run this command.
+The command takes the session lock, so it refuses to run while a REPL, `meka serve`, or `meka acp` holds the session; that process has its own copy of the conversation in memory and would write over the rewind on its next turn. In the REPL use `/rewind` instead. Under ACP there is no in-session equivalent, so close the session in the editor and run this command; over HTTP, `POST /v1/sessions/{id}/rewind` does the same to a live session.
 
 Its main use is recovering a session a provider has started rejecting. A provider validates the whole conversation on every request, so one piece of content it rejects fails every later turn too.
 

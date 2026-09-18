@@ -147,6 +147,14 @@ pub(crate) struct TokenUsage {
     pub(crate) cache_read_input_tokens: u64,
 }
 impl TokenUsage {
+    /// Whether nothing was reported spent.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_creation_input_tokens == 0
+            && self.cache_read_input_tokens == 0
+    }
+
     /// Fold a streamed usage update into the running per-round total, taking each field from
     /// `update` only when it is non-zero. Providers split usage across events: Anthropic reports
     /// the input/cache tiers on `message_start` and the final `output_tokens` on

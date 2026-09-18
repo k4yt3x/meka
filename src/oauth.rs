@@ -84,8 +84,9 @@ pub(crate) trait RefreshesCredential {
 /// backend that refreshes does it there. `transport_error` names a send that never got an answer;
 /// any status other than a rejection is the caller's to read.
 ///
-/// `cancellation` ends the wait for the response headers, and only that;
-/// `crate::provider::read_whole_reply` is the other half. Dropping the send is what aborts a
+/// `cancellation` ends the wait for the response headers, and the read of a reply that refused the
+/// credential for good; `crate::error::read_whole_reply` is the other half for every other body.
+/// Dropping the send is what aborts a
 /// request on the wire, so a stop reaches a whole reply the provider is still generating as fast as
 /// it reaches a stream, and this is the one place every request a turn makes goes out. `build` is
 /// deliberately outside the race: a backend may be refreshing its credential there, an exchange
@@ -121,9 +122,7 @@ where
             continue;
         }
         let retry_after = crate::error::parse_retry_after(response.headers());
-        let text = response.text().await.map_err(|error| {
-            crate::error::provider_transport_error("failed to read response", &error, retry_after)
-        })?;
+        let text = crate::error::read_whole_reply(response, retry_after, cancellation).await?;
         return Err(
             refresher.with_login_remedy(crate::error::provider_http_error(
                 status,
@@ -508,6 +507,70 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "the stop must end the wait at once, not when the peer gives up: {:?}",
+            started.elapsed()
+        );
+        peer.abort();
+    }
+
+    /// A credential the backend refuses for good has its reply read here, and that read is raced
+    /// against the token like the send: a peer that sent the 401 and withheld the body held a
+    /// canceled turn for as long as it pleased.
+    #[tokio::test]
+    async fn a_stop_ends_the_wait_for_a_rejections_body_at_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct NoRefresh;
+        impl RefreshesCredential for NoRefresh {}
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !head.ends_with(b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.expect("the request arrives");
+                assert!(read > 0, "the client closed the connection");
+                head.extend_from_slice(&chunk[..read]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 4\r\n\r\n")
+                .await
+                .expect("announce the rejection");
+            std::future::pending::<()>().await;
+        });
+        let client = reqwest::Client::new();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let stop = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                cancellation.cancel();
+            }
+        });
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send_with_one_refresh(
+                &NoRefresh,
+                crate::error::ProviderRequest::Completion,
+                |error| MekaError::Provider(error.to_string()),
+                || async { Ok(client.get(format!("http://{address}/v1/messages"))) },
+                &cancellation,
+            ),
+        )
+        .await
+        .expect("the stop must end the read, not the test's own deadline");
+        stop.await.expect("the stop landed");
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "a stop is reported as the interruption it is: {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the stop must end the read at once, not when the peer gives up: {:?}",
             started.elapsed()
         );
         peer.abort();

@@ -1019,27 +1019,45 @@ pub(crate) async fn patch_session(
         return Ok(response);
     }
 
-    let entry = ensure_session_loaded(&state, id).await?;
-
     // The level and the approvals switch apply during a turn: tool dispatch reads both cells live,
     // which is what makes the level a brake, and the REPL's Shift+Tab and ACP's `session/set_mode`
-    // move them mid-turn for that reason. The working directory is snapshotted when the turn opens
-    // and the profile is a turn's wire, so a body naming either waits for the turn to end.
+    // move them mid-turn for that reason. The working directory and the profile are different. The
+    // file tools resolve every path against the live cwd cell, so a directory moved under a
+    // running turn moves its write fence, and the profile is a turn's wire. A body naming either
+    // claims the session the way compact and rewind do: `claim_idle` under the sessions read-lock,
+    // so DELETE's re-check sees it, then the conversation mutex, both held to the end of the
+    // handler across the row write, the cell writes and the agent swap. A turn arriving meanwhile
+    // finds the mutex held and answers 409, and so does a second PATCH naming these fields, which
+    // is accepted. A body naming only the level or the approvals switch claims nothing.
     //
-    // A read and not an `InFlightGuard`, deliberately. That guard means "this session is busy with
-    // turn-like work", and claiming it here would make two concurrent PATCHes conflict when they
-    // should simply serialize -- metadata edits are not turns, and a client that sends two is not
-    // doing anything wrong. The cost is that a turn admitted between this load and the agent swap
-    // below makes that swap wait for it, which is slow rather than wrong: the row has already
-    // moved, and the swap lands correctly afterwards.
-    if (body.cwd.is_some() || body.profile.is_some())
-        && entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0
-    {
-        return Err(turn_in_flight_conflict(
-            id,
-            "change the session's working directory or profile",
-        ));
-    }
+    // A claim and not a read of `in_flight`: three awaits separate this point from the cell write,
+    // and a turn admitted inside them ran in the new directory.
+    //
+    // An entry missing from the map under the lock was evicted or deleted since it was loaded;
+    // `ensure_session_loaded` answers 404 for a row that is gone and re-attaches the other, and the
+    // next pass finds it.
+    const DOING: &str = "change the session's working directory or profile";
+    let (entry, _turn_exclusive) = loop {
+        let entry = ensure_session_loaded(&state, id).await?;
+        if body.cwd.is_none() && body.profile.is_none() {
+            break (entry, None);
+        }
+        let map = state.sessions.read().await;
+        let entry = match map.get(&id).cloned() {
+            Some(entry) => entry,
+            None => {
+                drop(map);
+                continue;
+            }
+        };
+        let idle = entry
+            .claim_idle()
+            .ok_or_else(|| turn_in_flight_conflict(id, DOING))?;
+        let conversation = std::sync::Arc::clone(&entry.conversation)
+            .try_lock_owned()
+            .map_err(|_| turn_in_flight_conflict(id, DOING))?;
+        break (entry, Some((idle, conversation)));
+    };
 
     // Validate all fields up-front before any DB write so a mixed valid/invalid request
     // (e.g. valid permission + invalid cwd) doesn't leave a half-applied state.
@@ -1172,21 +1190,16 @@ pub(crate) async fn patch_session(
         }
     }
 
-    // The live agent moves last, and only after the row it must agree with. An `await` and not a
-    // `try_lock`: the row has already moved, and a resident session's next turn runs on the agent
-    // rather than re-reading the row, so refusing to swap would leave the two disagreeing until
-    // eviction. See the in-flight note at the top of the handler.
+    // The live agent moves last, and only after the row it must agree with, under the conversation
+    // mutex the claim at the top of the handler took: a turn is a conversation with one profile,
+    // and moving the agent under a running one would hand the next round to a different wire.
     //
     // Outside the `mutated` block, because "the row already says this" is exactly when a repair is
     // wanted and never a reason to skip one. Re-publishing the profile the agent already runs on
-    // costs one lock and changes nothing.
+    // changes nothing.
     if let Some(resolved) = new_profile {
         // One call, not three. The window and the vision flag the entry reports both come off the
         // cell `set_profile` publishes into, so moving the agent moves them.
-        // Under the conversation lock, so the switch lands between turns: a turn is a conversation
-        // with one profile, and moving the agent under a running one would hand the next round to
-        // a different wire.
-        let _turn_exclusive = entry.conversation.lock().await;
         entry.agent.set_provider(resolved);
     }
 

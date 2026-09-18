@@ -1531,6 +1531,38 @@ impl Tool for AgentFollowupTool {
         } else {
             None
         };
+        // Held for this turn, as `agent_spawn` holds it for the spawn. A follow-up runs a full turn
+        // against a row nothing else claims, so without this the worker would sit unlocked for
+        // seconds to minutes and a concurrent `meka session delete --all` could take it and cascade
+        // the conversation away mid-run.
+        //
+        // Taken ahead of the build and the hydration below, so the conversation this turn loads is
+        // the one the lock protects: a spawn still finishing would otherwise commit its last events
+        // between the load and the lock, and the follow-up would continue from a copy without them.
+        //
+        // A refusal here, where spawn only warns, and the asymmetry is the point: spawn's id is
+        // brand new, so a failure can only be a filesystem problem, while this id already exists
+        // and a refusal genuinely means somebody else is running a turn on this worker. Two turns
+        // interleaved into one conversation is the thing the lock is for.
+        let _worker_lock = self
+            .tool_builder_params
+            .materials
+            .store
+            .lock_session(agent_id)
+            .map_err(|error| MekaError::ToolExecution {
+                tool_name: "agent_followup".to_string(),
+                message: match error {
+                    // The holder is a turn on this worker: its spawn or follow-up detached with
+                    // `background: true`, still running. The model wants to reach it, and the
+                    // door for that is the inbox, not a second turn.
+                    MekaError::SessionLocked(_) => format!(
+                        "sub-agent '{agent_id}' is still running; reach it with `agent_steer` \
+                         until it finishes."
+                    ),
+                    error => format!("cannot follow up on sub-agent {agent_id}: {error}"),
+                },
+            })?;
+
         let binding = worker_binding(
             &self.tool_builder_params,
             pinned.as_deref(),
@@ -1566,34 +1598,6 @@ impl Tool for AgentFollowupTool {
         let environment_context =
             build_environment_context(effective_permission, &sub_cwd_snapshot, &roots_snapshot);
         let augmented_prompt = format!("{environment_context}\n{prompt}");
-
-        // Held for this turn, as `agent_spawn` holds it for the spawn. A follow-up runs a full turn
-        // against a row nothing else claims, so without this the worker would sit unlocked for
-        // seconds to minutes and a concurrent `meka session delete --all` could take it and cascade
-        // the conversation away mid-run.
-        //
-        // A refusal here, where spawn only warns, and the asymmetry is the point: spawn's id is
-        // brand new, so a failure can only be a filesystem problem, while this id already exists
-        // and a refusal genuinely means somebody else is running a turn on this worker. Two turns
-        // interleaved into one conversation is the thing the lock is for.
-        let _worker_lock = self
-            .tool_builder_params
-            .materials
-            .store
-            .lock_session(agent_id)
-            .map_err(|error| MekaError::ToolExecution {
-                tool_name: "agent_followup".to_string(),
-                message: match error {
-                    // The holder is a turn on this worker: its spawn or follow-up detached with
-                    // `background: true`, still running. The model wants to reach it, and the
-                    // door for that is the inbox, not a second turn.
-                    MekaError::SessionLocked(_) => format!(
-                        "sub-agent '{agent_id}' is still running; reach it with `agent_steer` \
-                         until it finishes."
-                    ),
-                    error => format!("cannot follow up on sub-agent {agent_id}: {error}"),
-                },
-            })?;
 
         // The row has to follow the build, for the reason `agent_spawn` writes it from the same
         // binding: an unpinned worker runs on the parent's profile now, and a follow-up after a
@@ -1727,15 +1731,24 @@ impl Tool for AgentDeleteTool {
         .await?;
         // One statement; `sessions.parent_session_id`, `messages.session_id` and
         // `scratchpad_entries.session_id` all carry `ON DELETE CASCADE`, so the worker's messages,
-        // its scratchpad entries and its own descendants go with it.
+        // its scratchpad entries and its own descendants go with it. Through the locked door,
+        // because the guard above serializes this against this registry's follow-ups only: a spawn
+        // detached with `background: true` holds the worker's own lock while it runs and never
+        // enters the guard, and neither does a sub-agent of the worker's own.
         self.tool_builder_params
             .materials
             .store
-            .delete_session(row.id)
+            .delete_session_tree_unless_attached(row.id)
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "agent_delete".to_string(),
-                message: format!("failed to delete sub-agent: {error}"),
+                message: match error {
+                    MekaError::SessionLocked(_) => format!(
+                        "sub-agent '{agent_id}' is still running; wait for it to finish before \
+                         deleting it."
+                    ),
+                    error => format!("failed to delete sub-agent: {error}"),
+                },
             })?;
         let id = row.id;
         tracing::info!("deleted sub-agent session {id}");
@@ -4407,6 +4420,63 @@ mod tests {
             ),
             3
         ));
+    }
+
+    /// A worker spawned with `background: true` holds its own session lock for as long as it runs
+    /// and never enters the follow-up guard, so the lock is what has to refuse the delete.
+    #[tokio::test]
+    async fn a_delete_is_refused_while_the_worker_is_held() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let child = store
+            .create_child_session(
+                parent_sid,
+                None,
+                Vec::new(),
+                Some(r#"{"permission":"read"}"#.to_string()),
+                "read".to_string(),
+                "test-profile".to_string(),
+            )
+            .await
+            .expect("child")
+            .0;
+        let params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+        );
+        let delete = AgentDeleteTool {
+            tool_builder_params: params,
+            in_flight: InFlightFollowups::default(),
+        };
+
+        // Stands in for the worker's own running turn, which holds this lock from inside the
+        // spawn's task.
+        let held = store.lock_session(child).expect("hold the worker");
+        let error = delete
+            .execute(
+                serde_json::json!({ "id": child.to_string() }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a running worker must not be deleted");
+        assert!(error.to_string().contains("still running"), "{error}");
+        assert!(
+            store.session_exists(child).await.expect("exists"),
+            "and its row is untouched"
+        );
+
+        drop(held);
+        delete
+            .execute(
+                serde_json::json!({ "id": child.to_string() }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("delete succeeds once the worker has finished");
+        assert!(!store.session_exists(child).await.expect("exists"));
     }
 
     /// `agent_delete` shares the follow-up guard, so the two cannot run on one worker at once.

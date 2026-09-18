@@ -68,7 +68,7 @@ below, never in `host`. A new module fails the test until it is given a rank.
 |--------|-------|
 | `src/main.rs` | Dispatch only: parse arguments, pick a host or a CLI handler, map the exit code. |
 | `src/cli.rs`, `src/cli/` | The clap definitions and one handler file per subcommand group: `account`, `profile`, `session`, `history`, `mcp`, `tool`, `skills`, `memory`, `instructions`, `schedule`, `background`. Everything that owns the stdout/stderr contract lives here. |
-| `src/host.rs`, `src/host/` | `host/assembly.rs` builds a session: `SharedDeps`, `build_session_agent`, `hydrate_conversation`, `resolve_profile_switch`, `record_session_change`. `host/session.rs` runs one: `ResidentSession`, `TurnGuard`, `BusyGuard`, the `CancelCell`, the `Sessions` registry and its idle sweep, `fork_and_lock`, outcome claiming. `host/scheduler.rs` is `HostHooks` and `run_wakeup`, the out-of-band turn every host runs the same way. `host/terminal.rs` is what the REPL and one-shot share: Ctrl+C, the interruptible turn. `host.rs` keeps `COMMANDS`, the slash-command table the REPL offers and ACP advertises the `for_editors` rows of. `host/repl`, `host/oneshot`, `host/acp` and `host/http` are the hosts. |
+| `src/host.rs`, `src/host/` | `host/assembly.rs` builds a session: `SharedDeps`, `build_session_agent`, `hydrate_conversation`, `resolve_profile_switch`, `record_session_change`. `host/session.rs` runs one: `ResidentSession`, `TurnGuard`, the `CancelCell`, the `Sessions` registry and its idle sweep, `fork_and_lock`, outcome claiming. `host/scheduler.rs` is `HostHooks` and `run_wakeup`, the out-of-band turn every host runs the same way. `host/terminal.rs` is what the REPL and one-shot share: Ctrl+C, the interruptible turn. `host.rs` keeps `COMMANDS`, the slash-command table the REPL offers and ACP advertises the `for_editors` rows of. `host/repl`, `host/oneshot`, `host/acp` and `host/http` are the hosts. |
 | `src/agent.rs`, `src/agent/` | The `Agent` and its options; `turn.rs` runs a turn and owns `TurnInput`, `dispatch.rs` executes tool calls and owns `admit_tool_call`, `compaction.rs` summarizes, `recovery.rs` decides what a failed request becomes. |
 | `src/view.rs` | The record shapes `--format json` prints and the HTTP API serves, each defined once with its `From` conversion from the store or config type it shows: `SessionView`, `ProfileView`, `AccountView`, `McpServerView`, `McpToolView`, `ScheduledJobView`, `GateView`, `MemoryDetail`, `ToolView`, `SkillView`, `SkillDetail`. A host adds what only it can answer around the shared core by `#[serde(flatten)]`: the HTTP `SessionResponse` flattens `SessionView` under `last_turn_at`, `capabilities` and `turn_in_flight`; the CLI's `InstalledSkillView` and `ConfiguredToolView` flatten a core under what only a terminal should see, such as a path on this machine. Every `Option` field is omitted when absent, never `null`. |
 | `src/session.rs` | What a session is made of: `CoreMaterials` and `SessionMaterials` (what every agent and registry of a session is built from), `SessionCells` (permission, cwd, roots, session id, todo list, the published profile, the context gauge, background tasks, the frontend, the session lock slot, a pending compaction), `ToolSite` (the four cells a built-in reads), `AgentOptions` and `CompactRequest`. No host and no SQL. |
@@ -89,10 +89,12 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
 1. **Admission.** A `ResidentSession` counts its work in one cell, `in_flight`, and holding the
    conversation mutex is what "a turn is in flight" means. HTTP and ACP admit a typed prompt with
    `admit_turn`, which hands back a `TurnGuard` and samples the cancel epoch; HTTP wraps it in
-   `host::http::state::admit_turn` to add the process-wide cap. A scheduled fire or an outcome
-   delivery takes `mark_busy`; HTTP compact and rewind take `claim_idle`, which refuses while
-   anything is in flight. The REPL and the one-shot drive one session from one thread, so they
-   sample `cancel.admit()` themselves and take the conversation lock.
+   `host::http::state::admit_turn` to add the process-wide cap. A scheduled fire, an outcome
+   delivery or an inbox turn goes through `HostHooks::admit`, which under `serve` counts on the
+   same cap and steps back for the next tick when it is full; HTTP compact and rewind take
+   `claim_idle`, which refuses while anything is in flight. The REPL and the one-shot drive one
+   session from one thread, so they sample `cancel.admit()` themselves and take the conversation
+   lock.
 2. **Input.** The host builds a `TurnInput`: the typed prompt or the outcomes it carries, images,
    and the retention, which the scheduler sets per job and the HTTP turn takes from the request.
    `TurnInput::from_parts` is the empty-prompt rule, raising
@@ -149,7 +151,7 @@ they guard. When adding a path, call the predicate rather than restating the rul
 
 | Rule | Predicate | Doors |
 |------|-----------|-------|
-| Whether a turn may start | `ResidentSession::admit_turn`, `mark_busy`, `claim_idle` on the one `in_flight` cell | `admit_turn`: HTTP `POST /turn` (under the process cap, `host::http::state::admit_turn`) and ACP `session/prompt`; `mark_busy`: scheduled fires and outcome deliveries in `host/scheduler.rs`; `claim_idle`: HTTP compact and rewind. The REPL and one-shot sample `cancel.admit()` directly. |
+| Whether a turn may start | `ResidentSession::admit_turn` and `claim_idle` on the one `in_flight` cell | `admit_turn`: HTTP `POST /turn` (under the process cap, `host::http::state::admit_turn`) and ACP `session/prompt`, and through `HostHooks::admit` the scheduled fires, outcome deliveries and inbox turns in `host/scheduler.rs` (under the same cap in `serve`); `claim_idle`: HTTP compact and rewind. The REPL and one-shot sample `cancel.admit()` directly. |
 | Whether a second turn is refused | the conversation mutex, `try_lock` | HTTP `POST /turn` (`try_lock_owned`, 409), ACP `session/prompt` (`InvalidParams`) |
 | Whether a session is idle enough to evict | `host::session::idle_on`, behind `ResidentSession::is_idle_given` and `Sessions::sweep_idle` | the HTTP GC and the ACP idle sweep |
 | Whether a prompt is empty | `TurnInput::from_parts` | every host, before admission |
@@ -301,7 +303,7 @@ to the parent's frontend and drops the rest). Where they differ:
 | `McpProgress` | inline status line | `tracing::info!` | `progress` event | dropped | dropped | dropped |
 | `Compacted` | nothing (`/compact` prints `render::compaction_summary`) | info notice | `context.compacted` event | dropped; `GET /messages` carries the marker | dropped | dropped |
 | Approval with nobody to ask | warn `approval_refused_without_asking`, deny (REPL thread gone) | asks the client; deny after `APPROVAL_TIMEOUT`, `Canceled` on cancel | `permission_required` event while a streaming client or a feed reader with `attend=true` is there; deny after `APPROVAL_TIMEOUT`, `Canceled` when the last of them leaves; refused with a warn notice otherwise | as HTTP stream: a feed attendee answers a blocking turn's prompt too; without one, warn notice, deny | warn `approval_refused_without_asking`, deny | deny; the notice goes nowhere |
-| Elicitation | asks through the REPL thread; warn `elicitation_declined` and decline when it is gone | `elicitation/create`; warn `elicitation_declined` and decline when the client lacks the mode | warn `elicitation_declined`, decline | same | trait default: warn `elicitation_declined`, decline | same, dropped |
+| Elicitation | asks through the REPL thread; warn `elicitation_declined` and decline when it is gone | `elicitation/create`; warn `elicitation_declined` and decline when the client lacks the mode or two sessions have calls in flight on the server | warn `elicitation_declined`, decline | same | trait default: warn `elicitation_declined`, decline | same, dropped |
 | Scheduled fire prompt | dim info notice on the console | `UserMessageChunk` | info notice into the stream | info notice, drained after the turn | no scheduler | n/a |
 | Scheduled fire failure | `console.error`; "interrupted" annotation on a cancel | warn notice `scheduled job '<id>' failed: ...`; info on a cancel | `schedule.fired` webhook, `status` `completed`, `canceled` or `failed`; nothing on the frontend | same webhook | no scheduler | n/a |
 

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `agent_delete` refuses a sub-agent that is still running instead of deleting it mid-run.
+- A turn whose session was deleted while its images decoded is refused instead of running.
+- `PATCH /v1/sessions/{id}` naming `cwd` or `profile` holds the session, so no turn starts under it.
+- A canceled turn no longer waits for a provider error reply whose body never arrives.
+- `fetch_url` stops when the turn is canceled instead of waiting for the server or its timeout.
+- `[serve] max_concurrent_turns` now covers inbox, scheduled and background-outcome turns.
+- `[schedule] max_jobs` holds under concurrent creates.
+- `read_file` past its ceiling keeps a window's leading blank lines and reports the right range.
+- `read_file` no longer holds a line larger than its ceiling in memory before refusing it.
+- Token usage from a turn's completed rounds is kept when a later round fails or it is canceled.
+- `fetch_url`'s `limit` counts characters as documented, not bytes.
+- An MCP elicitation is declined, not guessed, when two sessions have calls in flight on one server.
+
 ## [0.59.0] - 2026-09-18
 
 ### Changed

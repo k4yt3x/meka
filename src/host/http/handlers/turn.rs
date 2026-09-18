@@ -294,12 +294,21 @@ pub(crate) async fn submit_turn(
     // Resolved before anything is admitted, because the rest of the body's validation needs it:
     // whether an attachment is admissible is a fact about *this session's* profile. Loading an
     // evicted session is the one side effect, and it is one a refused request may leave behind.
-    let resident = state.sessions.read().await.get(&session_id).cloned();
-    let entry = match resident {
-        Some(entry) => entry,
-        None => ensure_session_loaded(&state, session_id).await?,
+    //
+    // Scoped to that one question. The entry holds the session's file lock through its agent, and
+    // a clone kept across the decode would keep the lock after the idle sweep evicted the session,
+    // so the re-attach the admission below then needs would refuse this process's own claim with
+    // `session-locked`.
+    let accepts_images = {
+        let resident = state.sessions.read().await.get(&session_id).cloned();
+        let entry = match resident {
+            Some(entry) => entry,
+            None => ensure_session_loaded(&state, session_id).await?,
+        };
+        entry.accepts_images()
     };
-    let images = decode_turn_images(&body.images, entry.accepts_images()).await?;
+    let image_count = body.images.len();
+    let images = decode_turn_images(&body.images, accepts_images).await?;
     // An image with no text passes; against prior context "look at this" is a complete request.
     //
     // The retention is stated before any outcome rides along: a carried outcome overrides the
@@ -313,12 +322,26 @@ pub(crate) async fn submit_turn(
     // malformed body answer 409 on the session's own PATCH, DELETE, compact and rewind for as long
     // as the guard lived, and answered 409 to a malformed body whenever a real turn was running.
     //
-    // Hold the sessions read-lock across `TurnGuard::acquire` to close the TOCTOU gap: DELETE's
-    // write-lock blocks behind any reader, so by the time it fires we've already bumped
-    // `in_flight > 0` and DELETE's re-check returns 409.
-    let turn_guard = {
-        let _map = state.sessions.read().await;
-        crate::host::http::state::admit_turn(&state, &entry)?
+    // Under the sessions read-lock, and against the entry the map holds *now* rather than the one
+    // resolved above: the image decoding awaited in between, and a DELETE landing in that window
+    // has removed the entry, so admitting the earlier clone would run the turn against a row that
+    // is gone and fail it on a foreign key after the provider had been asked. An entry missing
+    // here is either that or an eviction; `ensure_session_loaded` tells the two apart, answering
+    // 404 for a row that is gone and re-attaching the other, and the next pass finds it under the
+    // lock. From admission on the lock does the rest: DELETE's write-lock blocks behind any
+    // reader, so by the time it fires `in_flight > 0` and its re-check returns 409.
+    #[cfg(any(debug_assertions, feature = "mock-provider"))]
+    hold_before_admission().await;
+    let (entry, turn_guard) = loop {
+        {
+            let map = state.sessions.read().await;
+            if let Some(current) = map.get(&session_id) {
+                let entry = current.clone();
+                let turn_guard = crate::host::http::state::admit_turn(&state, &entry)?;
+                break (entry, turn_guard);
+            }
+        }
+        ensure_session_loaded(&state, session_id).await?;
     };
 
     // Taken here rather than inside the two arms below, and *before* the claim: it is the only
@@ -329,6 +352,12 @@ pub(crate) async fn submit_turn(
     let conversation = Arc::clone(&entry.conversation)
         .try_lock_owned()
         .map_err(|_| turn_in_flight_conflict(session_id, "run a turn"))?;
+
+    // Asked again of the entry admitted, not only of the one the decode was judged against: the
+    // session may have been evicted and moved onto a text-only profile in between, and the
+    // images would otherwise reach a model the row says cannot take them. Ahead of the outcome
+    // claim below, which is the first thing here a refusal could not undo.
+    refuse_images_without_vision(image_count, entry.accepts_images())?;
 
     // An outcome that did not warrant a turn of its own rides on this one, ahead of the caller's
     // message rather than as a message of its own: see `background::render_outcomes_riding`. Both
@@ -370,6 +399,45 @@ pub(crate) async fn submit_turn(
         )
         .await
         .map(IntoResponse::into_response)
+    }
+}
+
+/// The refusal for attachments on a session whose profile does not accept them. Asked twice of a
+/// turn that carries any: of the entry resolved before the decode, so a text-only profile is
+/// refused without decoding anything, and of the entry admitted after it, which may run on
+/// another profile by then (the session evicted and moved with `PATCH` in between), so what the
+/// decode was told is never the last word on what the model is sent.
+fn refuse_images_without_vision(images: usize, vision: bool) -> Result<(), ProblemDetail> {
+    if images > 0 && !vision {
+        return Err(ProblemDetail::new(
+            ErrorKind::InvalidBody,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "image attachments require a profile with vision enabled; set `vision = true` under \
+             `[profiles.<name>]`",
+        ));
+    }
+    Ok(())
+}
+
+/// A test's hand on the gap between a turn's validation and its admission. Only where the mock
+/// provider exists, and only when `MEKA_MOCK_TURN_HOLD` names a path: the handler marks that it
+/// has reached the gap by creating that path with `.waiting` appended, then waits until the path
+/// itself exists. A test can then act on the session (delete it, let the idle sweep evict it)
+/// while a turn stands in exactly this window, which no amount of image decoding can guarantee in
+/// a build where decoding is fast. Bounded, so a test that never releases the hold fails on its
+/// own clock rather than hanging the server.
+#[cfg(any(debug_assertions, feature = "mock-provider"))]
+async fn hold_before_admission() {
+    let Ok(path) = std::env::var("MEKA_MOCK_TURN_HOLD") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    if let Err(error) = tokio::fs::write(path.with_extension("waiting"), b"").await {
+        tracing::warn!("MEKA_MOCK_TURN_HOLD: failed to mark the hold: {error}");
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !path.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
@@ -528,14 +596,7 @@ async fn decode_turn_images(
     if images.is_empty() {
         return Ok(Vec::new());
     }
-    if !vision {
-        return Err(ProblemDetail::new(
-            ErrorKind::InvalidBody,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "image attachments require a profile with vision enabled; set `vision = true` under \
-             `[profiles.<name>]`",
-        ));
-    }
+    refuse_images_without_vision(images.len(), vision)?;
     let owned: Vec<(String, String)> = images
         .iter()
         .map(|image| (image.data.clone(), image.media_type.clone()))

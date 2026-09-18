@@ -203,12 +203,11 @@ async fn drain_active_sessions(state: &ServerState) {
 /// round already produced, and the frontend teardown. That tail is what a drain exists to protect,
 /// and it is measured in database round-trips, not instants.
 ///
-/// Both counters are consulted because neither covers everything. The process-wide one still counts
-/// a client turn whose session has since been evicted from the map. The per-session one counts the
-/// work that never takes a [`crate::host::TurnGuard`]: a scheduled fire, a
-/// background-outcome delivery, a compaction or rewind. The latter run on the scheduler and poller
-/// tasks that the caller aborts as soon as this returns, so leaving them out would abandon
-/// precisely the unattended turns nobody is watching.
+/// Both counters are consulted because neither covers everything. The process-wide one counts
+/// every turn, a client's or an autonomous one, including one whose session has since been
+/// evicted from the map. The per-session one counts what claims the session alone, a compaction
+/// or a rewind, which run on tasks the caller aborts as soon as this returns, so leaving them out
+/// would abandon precisely the unattended work nobody is watching.
 async fn wait_for_turns_to_unwind(state: &ServerState) {
     loop {
         let idle = state

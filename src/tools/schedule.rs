@@ -174,22 +174,6 @@ impl Tool for ScheduleCreateTool {
         let schedule = parse_schedule(&input, now, tool_name)?;
         let gate = self.parse_gate(&input, tool_name)?;
 
-        let existing = self
-            .store
-            .schedule_store()
-            .list_scheduled_jobs(session_id)
-            .await?
-            .len();
-        if existing >= self.config.max_jobs {
-            return Err(MekaError::ToolExecution {
-                tool_name: tool_name.to_string(),
-                message: format!(
-                    "this session already has {existing} scheduled jobs (the limit). Cancel one with \
-                     schedule_cancel first."
-                ),
-            });
-        }
-
         let next_fire_at = schedule
             .next_after(now)
             .ok_or_else(|| MekaError::ToolExecution {
@@ -210,10 +194,22 @@ impl Tool for ScheduleCreateTool {
             next_fire_at,
             attempts: 0,
         };
-        self.store
+        // The cap is held where the row is written, in one transaction with the count, so two
+        // calls racing for the last slot cannot both be told yes.
+        if let crate::store::schedule::JobCreation::AtCapacity { existing } = self
+            .store
             .schedule_store()
-            .create_scheduled_job(&job)
-            .await?;
+            .create_scheduled_job(&job, self.config.max_jobs)
+            .await?
+        {
+            return Err(MekaError::ToolExecution {
+                tool_name: tool_name.to_string(),
+                message: format!(
+                    "this session already has {existing} scheduled jobs (the limit). Cancel one with \
+                     schedule_cancel first."
+                ),
+            });
+        }
 
         let short_id = job.short_id();
         let schedule = job.schedule.describe();
@@ -675,25 +671,28 @@ mod tests {
         let now = Utc::now();
         manager
             .schedule_store()
-            .create_scheduled_job(&ScheduledJob {
-                attempts: 0,
-                id: uuid::Uuid::new_v4().to_string(),
-                session_id: id,
-                schedule: schedule.clone(),
-                prompt: "watch it".to_string(),
-                gate: Some(Gate {
-                    probe: GateProbe::Tool {
-                        name: "mcp__bridge__unseen".to_string(),
-                        arguments: serde_json::json!({"folder": "sentinel-9c3f"}),
-                    },
-                    predicate: GatePredicate::Succeeded,
-                    last_output: None,
-                    permission: Permission::Read,
-                }),
-                created_at: now,
-                last_fired_at: None,
-                next_fire_at: schedule.next_after(now).expect("has a next fire"),
-            })
+            .create_scheduled_job(
+                &ScheduledJob {
+                    attempts: 0,
+                    id: uuid::Uuid::new_v4().to_string(),
+                    session_id: id,
+                    schedule: schedule.clone(),
+                    prompt: "watch it".to_string(),
+                    gate: Some(Gate {
+                        probe: GateProbe::Tool {
+                            name: "mcp__bridge__unseen".to_string(),
+                            arguments: serde_json::json!({"folder": "sentinel-9c3f"}),
+                        },
+                        predicate: GatePredicate::Succeeded,
+                        last_output: None,
+                        permission: Permission::Read,
+                    }),
+                    created_at: now,
+                    last_fired_at: None,
+                    next_fire_at: schedule.next_after(now).expect("has a next fire"),
+                },
+                usize::MAX,
+            )
             .await
             .expect("plants the job");
 

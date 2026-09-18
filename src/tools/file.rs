@@ -387,15 +387,11 @@ async fn read_file_to_string(path: &Path) -> std::io::Result<String> {
 fn render_windowed_read(
     path: &str,
     window: String,
+    shown_lines: usize,
     offset: usize,
     total_lines: usize,
     cut_by_ceiling: bool,
 ) -> String {
-    let shown_lines = if window.is_empty() {
-        0
-    } else {
-        window.lines().count()
-    };
     if shown_lines == 0 {
         // Two different facts, and reporting the ceiling as the other misdescribes the file. A
         // minified JSON blob or a base64 capture is one enormous line, so the window is empty
@@ -445,42 +441,142 @@ fn render_windowed_read(
 
 /// Read one line window out of a file, streaming past everything outside it.
 ///
-/// Returns the window, the file's total line count, and whether the window itself was cut short by
-/// the residency ceiling.
+/// Returns the window, the number of lines it holds, the file's total line count, and whether the
+/// window was cut short by `ceiling`.
 ///
-/// The ceiling bounds what this keeps, not how large a file it will look at: `execute_command`'s
-/// spill notice tells the model a capture larger than the ceiling is still reachable with
-/// `read_file`, and a window is a bounded amount of memory whatever the file's size.
+/// The ceiling bounds what this keeps, not how large a file or a line it will look at: the bytes
+/// are scanned a buffer at a time and only the window's lines are retained, so a line larger than
+/// the ceiling costs nothing to pass when it is outside the window and is refused without ever
+/// being held whole when it is inside. `execute_command`'s spill notice tells the model a capture
+/// larger than the ceiling is still reachable with `read_file`, and a window is a bounded amount
+/// of memory whatever the file holds.
+///
+/// A line ends at `\n`, with a `\r` before it dropped, and a final unterminated line counts when
+/// it is non-empty, which is what `tokio::io::Lines` yields; the window is UTF-8 or the read fails
+/// as a whole-file read would.
 async fn read_file_window(
     path: &Path,
     offset: usize,
     limit: usize,
-) -> std::io::Result<(String, usize, bool)> {
+    ceiling: usize,
+) -> std::io::Result<(String, usize, usize, bool)> {
     use tokio::io::AsyncBufReadExt;
 
     let file = open_read_nofollow(path).await?;
-    let mut lines = tokio::io::BufReader::new(file).lines();
-    let mut window = String::new();
-    let mut total_lines = 0usize;
-    let mut cut_by_ceiling = false;
-
-    while let Some(line) = lines.next_line().await? {
-        let inside_window = total_lines >= offset && total_lines - offset < limit;
-        if inside_window && !cut_by_ceiling {
-            // `+ 1` for the separator this line would carry.
-            if window.len() + line.len() + 1 > MAX_READ_FILE_BYTES {
-                cut_by_ceiling = true;
-            } else {
-                if !window.is_empty() {
-                    window.push('\n');
-                }
-                window.push_str(&line);
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut scan = WindowScan {
+        offset,
+        limit,
+        ceiling,
+        window: Vec::new(),
+        shown_lines: 0,
+        total_lines: 0,
+        cut_by_ceiling: false,
+        current: Vec::new(),
+        current_len: 0,
+    };
+    loop {
+        let consumed = {
+            let buffer = reader.fill_buf().await?;
+            if buffer.is_empty() {
+                break;
             }
-        }
-        total_lines += 1;
+            let mut consumed = 0;
+            while consumed < buffer.len() {
+                let rest = &buffer[consumed..];
+                match rest.iter().position(|&byte| byte == b'\n') {
+                    Some(at) => {
+                        scan.push(&rest[..at]);
+                        scan.end_line(true);
+                        consumed += at + 1;
+                    }
+                    None => {
+                        scan.push(rest);
+                        consumed += rest.len();
+                    }
+                }
+            }
+            consumed
+        };
+        reader.consume(consumed);
+    }
+    if scan.current_len > 0 {
+        scan.end_line(false);
+    }
+    let window = String::from_utf8(scan.window)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok((
+        window,
+        scan.shown_lines,
+        scan.total_lines,
+        scan.cut_by_ceiling,
+    ))
+}
+
+/// The state of one pass over a file for [`read_file_window`]: the window so far, the counts, and
+/// the line under the cursor, kept only while it is a window line that can still fit.
+struct WindowScan {
+    offset: usize,
+    limit: usize,
+    ceiling: usize,
+    window: Vec<u8>,
+    shown_lines: usize,
+    total_lines: usize,
+    cut_by_ceiling: bool,
+    current: Vec<u8>,
+    current_len: usize,
+}
+
+impl WindowScan {
+    fn inside_window(&self) -> bool {
+        self.total_lines >= self.offset && self.total_lines - self.offset < self.limit
     }
 
-    Ok((window, total_lines, cut_by_ceiling))
+    /// More of the line under the cursor, short of its end.
+    fn push(&mut self, bytes: &[u8]) {
+        self.current_len += bytes.len();
+        if !self.inside_window() || self.cut_by_ceiling {
+            return;
+        }
+        // The raw bytes may end in a `\r` that the `\n` will remove, so a line may run to one byte
+        // more than the window has room for and is judged on its normalized length when it ends;
+        // what is held stays within `ceiling` either way. The first line to overflow ends
+        // retention for good: a window cut once must not resume after a gap.
+        let room = self.ceiling.saturating_sub(self.window.len());
+        if self.current.len() + bytes.len() > room {
+            self.cut_by_ceiling = true;
+            self.current.clear();
+        } else {
+            self.current.extend_from_slice(bytes);
+        }
+    }
+
+    /// The line under the cursor ended: at a `\n` when `terminated`, else at the end of the file.
+    fn end_line(&mut self, terminated: bool) {
+        if self.inside_window() && !self.cut_by_ceiling {
+            // A `\r` goes only with the `\n` that ended the line. One at the end of the file is the
+            // file's own last byte, kept as a whole read keeps it.
+            if terminated && self.current.last() == Some(&b'\r') {
+                self.current.pop();
+            }
+            // `+ 1` for the separator this line would carry, judged on the line as it is kept.
+            if self.window.len() + self.current.len() + 1 > self.ceiling {
+                self.cut_by_ceiling = true;
+                self.current.clear();
+            } else {
+                // On the count, not on the window being non-empty, or a blank line at the front
+                // of the window leaves no separator behind and vanishes.
+                if self.shown_lines > 0 {
+                    self.window.push(b'\n');
+                }
+                self.window.append(&mut self.current);
+                self.shown_lines += 1;
+            }
+        }
+        self.current.clear();
+        self.current_len = 0;
+        self.total_lines += 1;
+    }
 }
 
 /// Replace `path`'s contents atomically: write a sibling temp file, fsync it, then rename over the
@@ -1123,9 +1219,9 @@ impl Tool for ReadFileTool {
                 {
                     let start = offset.unwrap_or(0);
                     let span = limit.unwrap_or(DEFAULT_LINE_LIMIT);
-                    let (window, total_lines, cut_by_ceiling) = tokio::select! {
+                    let (window, shown_lines, total_lines, cut_by_ceiling) = tokio::select! {
                         _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
-                        result = read_file_window(&canonical, start, span) => {
+                        result = read_file_window(&canonical, start, span, MAX_READ_FILE_BYTES) => {
                             result.map_err(|error| MekaError::ToolExecution {
                                 tool_name: "read_file".to_string(),
                                 message: format!("failed to read '{path}': {error}"),
@@ -1137,7 +1233,14 @@ impl Tool for ReadFileTool {
                     // change. The whole-document stamping the delegated path does exists for the
                     // same reason, and a file this size is not an edit target anyway.
                     return Ok(ToolOutput::text(
-                        render_windowed_read(&path, window, start, total_lines, cut_by_ceiling),
+                        render_windowed_read(
+                            &path,
+                            window,
+                            shown_lines,
+                            start,
+                            total_lines,
+                            cut_by_ceiling,
+                        ),
                         false,
                     ));
                 }
@@ -3838,6 +3941,81 @@ mod tests {
             shown.contains(&format!("of {line}")),
             "with the file's real line count disclosed: {shown}"
         );
+    }
+
+    /// The window keeps every line it was asked for, blank ones included, and reports how many it
+    /// holds: a separator pushed only when the window was already non-empty dropped each blank
+    /// line at the front, and counting the shortened text then understated the range.
+    #[tokio::test]
+    async fn a_windows_leading_blank_lines_survive_and_are_counted() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("blank-led.txt");
+        std::fs::write(&path, "\n\nKEEP\nmore\n").expect("write");
+
+        let (window, shown, total, cut) = read_file_window(&path, 0, 3, 64).await.expect("read");
+        assert_eq!(window, "\n\nKEEP");
+        assert_eq!((shown, total, cut), (3, 4, false));
+        let rendered = render_windowed_read("blank-led.txt", window, shown, 0, total, cut);
+        assert!(
+            rendered.ends_with("(showing lines 1-3 of 4, use offset/limit to read more)"),
+            "{rendered}"
+        );
+    }
+
+    /// A line larger than the ceiling is counted and passed over when it is outside the window,
+    /// and cuts the window when it is inside; a `\r\n` ending and a final unterminated line read
+    /// as `tokio::io::Lines` would have read them.
+    #[tokio::test]
+    async fn a_line_past_the_ceiling_is_passed_over_outside_the_window_and_cuts_it_inside() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("long.txt");
+        let long = "x".repeat(300);
+        std::fs::write(&path, format!("{long}\nshort\r\nlast")).expect("write");
+
+        let (window, shown, total, cut) = read_file_window(&path, 1, 2, 64).await.expect("read");
+        assert_eq!(window, "short\nlast");
+        assert_eq!((shown, total, cut), (2, 3, false));
+
+        let (window, shown, total, cut) = read_file_window(&path, 0, 3, 64).await.expect("read");
+        assert_eq!(window, "");
+        assert_eq!((shown, total, cut), (0, 3, true));
+        let rendered = render_windowed_read("long.txt", window, shown, 0, total, cut);
+        assert!(
+            rendered.starts_with("(no lines: the first line at offset 0"),
+            "{rendered}"
+        );
+    }
+
+    /// A `\r` goes only with the `\n` that ended its line: one at the end of the file is the
+    /// file's own last byte, kept as a whole read keeps it.
+    #[tokio::test]
+    async fn a_final_carriage_return_without_a_newline_is_kept() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("cr.txt");
+        std::fs::write(&path, "first\r\nKEEP\r").expect("write");
+
+        let (window, shown, total, cut) = read_file_window(&path, 0, 2, 64).await.expect("read");
+        assert_eq!(window, "first\nKEEP\r");
+        assert_eq!((shown, total, cut), (2, 2, false));
+    }
+
+    /// The ceiling judges a line as it is kept: a `\r\n` ending is not counted against it, while
+    /// a line of the ceiling's own length is still refused, as the whole-line reader refused it.
+    #[tokio::test]
+    async fn a_crlf_line_that_fits_once_normalized_is_kept() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let fits = temp_dir.path().join("fits.txt");
+        std::fs::write(&fits, format!("{}\r\nnext\n", "x".repeat(63))).expect("write");
+        let (window, shown, total, cut) = read_file_window(&fits, 0, 1, 64).await.expect("read");
+        assert_eq!(window, "x".repeat(63));
+        assert_eq!((shown, total, cut), (1, 2, false));
+
+        let overflows = temp_dir.path().join("overflows.txt");
+        std::fs::write(&overflows, format!("{}\r\nnext\n", "x".repeat(64))).expect("write");
+        let (window, shown, total, cut) =
+            read_file_window(&overflows, 0, 1, 64).await.expect("read");
+        assert_eq!(window, "");
+        assert_eq!((shown, total, cut), (0, 2, true));
     }
 
     /// The other half of the same boundary: a read that asks for the whole of an oversized file

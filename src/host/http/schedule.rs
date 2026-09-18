@@ -252,6 +252,17 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
             .is_some_and(|held| std::sync::Arc::ptr_eq(&held.agent, &entry.agent))
     }
 
+    /// The same count a client's turn takes, so `max_concurrent_turns` means every turn.
+    fn admit(
+        &self,
+        entry: &Self::Entry,
+    ) -> Result<crate::host::TurnGuard, crate::host::TurnRefused> {
+        entry.admit_turn(Some((
+            &self.state.concurrent_turns,
+            self.state.config.max_concurrent_turns,
+        )))
+    }
+
     async fn announce(&self, tasks: &[crate::store::background::BackgroundTask]) -> bool {
         self.state
             .webhooks

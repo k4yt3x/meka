@@ -598,7 +598,7 @@ mod tests {
         job.session_id = theirs;
         manager
             .schedule_store()
-            .create_scheduled_job(&job)
+            .create_scheduled_job(&job, usize::MAX)
             .await
             .expect("create");
 
