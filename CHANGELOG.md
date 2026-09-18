@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.59.0] - 2026-09-18
+
+### Changed
+
+- **Breaking:** meka is licensed under AGPL-3.0-or-later; earlier releases stay under MIT.
+- **Breaking:** Problem `type` URIs moved to `https://meka.run/errors/`.
+
 ## [0.58.0] - 2026-09-17
 
 ### Added
@@ -2289,7 +2296,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.58.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.59.0...HEAD
+[0.59.0]: https://github.com/k4yt3x/meka/compare/0.58.0...0.59.0
 [0.58.0]: https://github.com/k4yt3x/meka/compare/0.57.0...0.58.0
 [0.57.0]: https://github.com/k4yt3x/meka/compare/0.56.0...0.57.0
 [0.56.0]: https://github.com/k4yt3x/meka/compare/0.55.0...0.56.0

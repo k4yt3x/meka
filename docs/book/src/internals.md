@@ -198,7 +198,7 @@ maps the enum once, and no handler rewrites the sentence:
   `session-locked`); `EmptyPrompt`, `DisabledLevel`, `ProfileNotConfigured`, `Usage` and `Config`
   are all 422 under `invalid-body`, so a client tells them apart by `detail`; `RequestTooLarge` is
   422 under its own `request-too-large`, because meka refused it and there is no provider response
-  behind it. The `type` URIs live under `https://meka.so/errors/`.
+  behind it. The `type` URIs live under `https://meka.run/errors/`.
 - ACP: `acp_error_for` in `host/acp.rs`. Everything the caller can act on is `InvalidParams`
   (`-32602`) with the `Display` as `data`; everything else is `InternalError`.
 - REPL: `console.error(&error)`, the `Display` on stderr.
@@ -251,7 +251,7 @@ differently by design.
 
 - **HTTP refuses what needs the turn to end.** A `PATCH` naming `cwd` or `profile`, `DELETE`,
   fork, compact and rewind check `in_flight` (or fail `claim_idle`) and return 409 with `type`
-  `https://meka.so/errors/turn-in-flight`, through `turn_in_flight_conflict` and
+  `https://meka.run/errors/turn-in-flight`, through `turn_in_flight_conflict` and
   `ProblemDetail::for_error(MekaError::TurnInFlight)`. A second `POST /turn` on the session gets
   the same 409. The `detail` names what was refused (`doing`), and a `session_id` member carries
   the id. A `PATCH` naming only `permission` or `approvals` writes the cells and the row without

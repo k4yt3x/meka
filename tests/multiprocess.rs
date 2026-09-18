@@ -1077,7 +1077,7 @@ fn an_http_delete_cannot_take_a_session_another_process_holds() {
         "a session another process holds must be refused, not deleted"
     );
     let problem: serde_json::Value = response.json().expect("problem body");
-    assert_eq!(problem["type"], "https://meka.so/errors/session-locked");
+    assert_eq!(problem["type"], "https://meka.run/errors/session-locked");
     assert_eq!(
         cluster.session_count(),
         1,

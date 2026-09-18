@@ -28,7 +28,7 @@ use crate::host::http::{handlers, state::ServerState};
         description = "Service-to-service API for driving meka agent turns programmatically. \
                        Mirrors the wire format described in the HTTP API docs. A field that has \
                        no value is omitted from every response and event, never sent as `null`.",
-        license(name = "MIT")
+        license(name = "AGPL-3.0-or-later")
     ),
     paths(
         handlers::sessions::create_session,

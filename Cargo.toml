@@ -1,9 +1,9 @@
 [package]
 name = "meka"
-version = "0.58.0"
+version = "0.59.0"
 edition = "2024"
 rust-version = "1.95"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 description = "A general-purpose AI agent harness"
 repository = "https://github.com/k4yt3x/meka"
 

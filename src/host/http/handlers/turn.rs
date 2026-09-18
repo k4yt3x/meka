@@ -1058,18 +1058,18 @@ pub(crate) fn terminal_event_parts(
         }
         Err(panic) => {
             tracing::error!("streaming turn task panicked: {panic:?}");
+            let problem = ProblemDetail::new(
+                ErrorKind::Internal,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "turn task panicked",
+            )
+            .instance(format!("/v1/sessions/{session_id}/turn"));
             (
                 crate::host::http::sse::SseEventType::TurnFailed,
                 serde_json::json!({
                     "turn_id": turn_id.to_string(),
                     "session_id": session_id.to_string(),
-                    "error": {
-                        "type": "https://meka.so/errors/internal",
-                        "title": "Internal server error",
-                        "status": 500,
-                        "detail": "turn task panicked",
-                        "instance": format!("/v1/sessions/{}/turn", session_id),
-                    },
+                    "error": serde_json::to_value(problem).unwrap_or(serde_json::Value::Null),
                 }),
             )
         }

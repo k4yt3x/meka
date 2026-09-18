@@ -10,6 +10,19 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.58 to 0.59
+
+**meka is licensed under the GNU Affero General Public License, version 3 or later.** Releases up
+to 0.58.0 were published under MIT and remain so. From 0.59.0 on, conveying meka or a modified
+copy, and offering a modified copy to users over a network, carries the AGPL's obligation to make
+the corresponding source available.
+
+**The problem `type` URIs moved to `meka.run`.** Every error document meka returns now names a
+`type` under `https://meka.run/errors/` where it used to sit under `https://meka.so/errors/`. The
+identifier after the last slash is unchanged, as are the HTTP status, the `title` and every other
+member of the document. A client that matches the whole URI must update its table; one that reads
+only the final segment is unaffected.
+
 ## 0.54 to 0.55
 
 **`GET /v1/sessions/{id}/stream` is the session's event feed and no longer ends with a turn.** It
@@ -267,7 +280,7 @@ key whose value is not a whole number is left under its old name and reported, w
 - **A gate's pointer test is `not_empty`** (was `not-empty`) in `schedule_create`, `POST
   /v1/sessions/{id}/schedule` and `meka schedule add`; stored jobs are converted by the store.
 - **`canceled`, one `l`, on every wire meka owns.** Match `turn.canceled` as the SSE terminal event,
-  `https://meka.so/errors/turn-canceled` as the problem `type`, and `status == "canceled"` in task
+  `https://meka.run/errors/turn-canceled` as the problem `type`, and `status == "canceled"` in task
   views (`GET /v1/sessions/{id}/tasks`, `DELETE .../tasks/{task_id}`), `task_list` output and
   `schedule.fired` webhook bodies; the `reason` values are unchanged. The store rewrites its stored
   task rows on first open (the tenth ledger step). ACP's `stopReason: "cancelled"` and MCP's

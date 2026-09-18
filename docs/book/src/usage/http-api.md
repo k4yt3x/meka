@@ -579,7 +579,7 @@ A `: keep-alive` comment is sent every 20 seconds. SSE clients ignore these auto
 
 The server buffers up to 256 events per SSE stream. If a consumer reads too slowly and falls behind, the server closes that consumer's stream, and what it sends first depends on whether anyone else was still reading:
 
-- **Nobody else was reading.** The turn is canceled to stop burning provider tokens, and the stream ends with a terminal `turn.failed` carrying error type `https://meka.so/errors/sse-lag`. That event is the stream's, sent before the turn has unwound, so it carries no `message_withdrawn`; the outcome recorded for a later re-attach is a `turn.canceled` with `reason: "sse_lag"` and does. Retry by submitting a new turn.
+- **Nobody else was reading.** The turn is canceled to stop burning provider tokens, and the stream ends with a terminal `turn.failed` carrying error type `https://meka.run/errors/sse-lag`. That event is the stream's, sent before the turn has unwound, so it carries no `message_withdrawn`; the outcome recorded for a later re-attach is a `turn.canceled` with `reason: "sse_lag"` and does. Retry by submitting a new turn.
 - **Another consumer was keeping up.** The turn keeps running for them, so nothing has failed. The lagging stream ends with a `warn` `notice` explaining the drop (the usual `level` and `text`, plus `turn_id` and `session_id`) and closes. **Re-attach with `Last-Event-ID`** rather than retrying: the turn is still in flight, so a new turn would be refused with `409 turn-in-flight`, and re-attaching recovers the dropped events instead of redoing the work.
 
 Turn events are broadcast, so a re-attached client or a second consumer counts as a separate reader. Use `GET /messages` to inspect what the agent completed either way. A reader of the [session feed](#the-session-feed) that falls behind gets the `notice` and keeps its connection; a turn is never canceled for a feed reader, because the turn was not run for it.
@@ -829,7 +829,7 @@ All HTTP error responses use [RFC 9457 Problem Details](https://www.rfc-editor.o
 
 ```json
 {
-  "type": "https://meka.so/errors/session-not-found",
+  "type": "https://meka.run/errors/session-not-found",
   "title": "Session not found",
   "status": 404,
   "detail": "session '2f0c9b6e-4d1a-4c0e-9b7f-3a5d8e1c2b4f' not found",

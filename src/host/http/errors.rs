@@ -1,6 +1,6 @@
 //! RFC 9457 Problem Details for HTTP APIs. Every error response from `meka serve` uses this
 //! shape, with content type `application/problem+json`. Stable `type` URIs under
-//! `https://meka.so/errors/` act as machine-readable error codes that survive HTTP-status
+//! `https://meka.run/errors/` act as machine-readable error codes that survive HTTP-status
 //! collisions (multiple 404 meanings, multiple 409 meanings); see the HTTP API docs for the full
 //! catalog.
 //!
@@ -282,32 +282,32 @@ pub(crate) enum ErrorKind {
 impl ErrorKind {
     pub(crate) const fn type_uri(self) -> &'static str {
         match self {
-            Self::Auth => "https://meka.so/errors/auth",
-            Self::AuthScope => "https://meka.so/errors/auth-scope",
-            Self::SessionNotFound => "https://meka.so/errors/session-not-found",
-            Self::NotFound => "https://meka.so/errors/not-found",
-            Self::SessionPermission => "https://meka.so/errors/session-permission",
-            Self::SessionLocked => "https://meka.so/errors/session-locked",
-            Self::SessionNotLoaded => "https://meka.so/errors/session-not-loaded",
-            Self::TurnInFlight => "https://meka.so/errors/turn-in-flight",
-            Self::TurnCanceled => "https://meka.so/errors/turn-canceled",
-            Self::StreamDetached => "https://meka.so/errors/stream-detached",
-            Self::SseLag => "https://meka.so/errors/sse-lag",
-            Self::RequestNotFound => "https://meka.so/errors/request-not-found",
-            Self::Idempotency => "https://meka.so/errors/idempotency",
-            Self::InboxAppended => "https://meka.so/errors/inbox-appended",
-            Self::TurnMismatch => "https://meka.so/errors/turn-mismatch",
-            Self::StoreReadOnly => "https://meka.so/errors/store-read-only",
-            Self::SessionNotDrivable => "https://meka.so/errors/session-not-drivable",
-            Self::InvalidBody => "https://meka.so/errors/invalid-body",
-            Self::RequestTooLarge => "https://meka.so/errors/request-too-large",
-            Self::PayloadTooLarge => "https://meka.so/errors/payload-too-large",
-            Self::ConcurrencyLimit => "https://meka.so/errors/concurrency-limit",
-            Self::Provider => "https://meka.so/errors/provider",
-            Self::ProviderUnavailable => "https://meka.so/errors/provider-unavailable",
-            Self::ContextOverflow => "https://meka.so/errors/context-overflow",
-            Self::McpUnavailable => "https://meka.so/errors/mcp-unavailable",
-            Self::Internal => "https://meka.so/errors/internal",
+            Self::Auth => "https://meka.run/errors/auth",
+            Self::AuthScope => "https://meka.run/errors/auth-scope",
+            Self::SessionNotFound => "https://meka.run/errors/session-not-found",
+            Self::NotFound => "https://meka.run/errors/not-found",
+            Self::SessionPermission => "https://meka.run/errors/session-permission",
+            Self::SessionLocked => "https://meka.run/errors/session-locked",
+            Self::SessionNotLoaded => "https://meka.run/errors/session-not-loaded",
+            Self::TurnInFlight => "https://meka.run/errors/turn-in-flight",
+            Self::TurnCanceled => "https://meka.run/errors/turn-canceled",
+            Self::StreamDetached => "https://meka.run/errors/stream-detached",
+            Self::SseLag => "https://meka.run/errors/sse-lag",
+            Self::RequestNotFound => "https://meka.run/errors/request-not-found",
+            Self::Idempotency => "https://meka.run/errors/idempotency",
+            Self::InboxAppended => "https://meka.run/errors/inbox-appended",
+            Self::TurnMismatch => "https://meka.run/errors/turn-mismatch",
+            Self::StoreReadOnly => "https://meka.run/errors/store-read-only",
+            Self::SessionNotDrivable => "https://meka.run/errors/session-not-drivable",
+            Self::InvalidBody => "https://meka.run/errors/invalid-body",
+            Self::RequestTooLarge => "https://meka.run/errors/request-too-large",
+            Self::PayloadTooLarge => "https://meka.run/errors/payload-too-large",
+            Self::ConcurrencyLimit => "https://meka.run/errors/concurrency-limit",
+            Self::Provider => "https://meka.run/errors/provider",
+            Self::ProviderUnavailable => "https://meka.run/errors/provider-unavailable",
+            Self::ContextOverflow => "https://meka.run/errors/context-overflow",
+            Self::McpUnavailable => "https://meka.run/errors/mcp-unavailable",
+            Self::Internal => "https://meka.run/errors/internal",
         }
     }
 
@@ -637,7 +637,7 @@ mod tests {
         .with("session_id", "s_abc");
         let body = serde_json::to_value(&problem).expect("serializable");
         assert_eq!(
-            body["type"], "https://meka.so/errors/session-not-found",
+            body["type"], "https://meka.run/errors/session-not-found",
             "type URI must match the catalog entry exactly",
         );
         assert_eq!(body["status"], 404);
@@ -653,7 +653,7 @@ mod tests {
         let error = MekaError::Provider("upstream 529".into());
         let problem = ProblemDetail::for_error(&error, false);
         assert_eq!(problem.status, 502);
-        assert_eq!(problem.type_uri, "https://meka.so/errors/provider");
+        assert_eq!(problem.type_uri, "https://meka.run/errors/provider");
     }
 
     /// The operator's switch decides whether a 502 carries the provider's own response text.
@@ -733,7 +733,7 @@ mod tests {
         let error = MekaError::InvalidRequest("400 invalid_request_error".into());
         let problem = ProblemDetail::for_error(&error, false);
         assert_eq!(problem.status, 502);
-        assert_eq!(problem.type_uri, "https://meka.so/errors/provider");
+        assert_eq!(problem.type_uri, "https://meka.run/errors/provider");
     }
 
     /// An upstream failure reaches the caller as one rather than as an internal fault, and says it
@@ -764,7 +764,7 @@ mod tests {
             let problem = ProblemDetail::for_error(&error, false);
             assert_eq!(problem.status, 502, "{error}");
             assert_eq!(
-                problem.type_uri, "https://meka.so/errors/provider-unavailable",
+                problem.type_uri, "https://meka.run/errors/provider-unavailable",
                 "{error}"
             );
         }
@@ -805,9 +805,9 @@ mod tests {
         );
         assert_eq!(
             transient.type_uri,
-            "https://meka.so/errors/provider-unavailable"
+            "https://meka.run/errors/provider-unavailable"
         );
-        assert_eq!(permanent.type_uri, "https://meka.so/errors/provider");
+        assert_eq!(permanent.type_uri, "https://meka.run/errors/provider");
 
         // The titles too, for the reason `a_context_overflow_is_502_under_its_own_type` asserts
         // its own: `type` is what a client switches on, but `title` is what a UI renders, and
@@ -845,7 +845,7 @@ mod tests {
         let problem = ProblemDetail::for_error(&error, true);
 
         assert_eq!(problem.status, 503);
-        assert_eq!(problem.type_uri, "https://meka.so/errors/mcp-unavailable");
+        assert_eq!(problem.type_uri, "https://meka.run/errors/mcp-unavailable");
         let detail = problem.detail.clone().expect("a detail naming the servers");
         assert!(detail.contains("ida") && detail.contains("exa"), "{detail}");
         assert_eq!(
@@ -929,7 +929,7 @@ mod tests {
         );
         assert_eq!(problem.status, 502);
         assert_eq!(
-            problem.type_uri, "https://meka.so/errors/context-overflow",
+            problem.type_uri, "https://meka.run/errors/context-overflow",
             "sharing `/errors/provider` sends a correct client into a retry loop"
         );
         // The title is a wire field too, and RFC 9457 asks it to be stable for a given type, so a
@@ -960,7 +960,7 @@ mod tests {
         let id = uuid::Uuid::nil();
         let problem = ProblemDetail::for_error(&MekaError::SessionLocked(id), false);
         assert_eq!(problem.status, 409);
-        assert_eq!(problem.type_uri, "https://meka.so/errors/session-locked");
+        assert_eq!(problem.type_uri, "https://meka.run/errors/session-locked");
         assert_eq!(
             problem.extensions.get("session_id"),
             Some(&Value::String(id.to_string()))
@@ -1003,7 +1003,10 @@ mod tests {
         );
         let problem = ProblemDetail::for_error(&error, true);
         assert_eq!(problem.status, 422);
-        assert_eq!(problem.type_uri, "https://meka.so/errors/request-too-large");
+        assert_eq!(
+            problem.type_uri,
+            "https://meka.run/errors/request-too-large"
+        );
         assert_eq!(problem.detail.as_deref(), Some(error.to_string().as_str()));
         assert!(
             !problem.extensions.contains_key("provider_response"),
@@ -1018,7 +1021,10 @@ mod tests {
         let id = uuid::Uuid::nil();
         let missing = ProblemDetail::for_error(&MekaError::SessionNotFound(id), false);
         assert_eq!(missing.status, 404);
-        assert_eq!(missing.type_uri, "https://meka.so/errors/session-not-found");
+        assert_eq!(
+            missing.type_uri,
+            "https://meka.run/errors/session-not-found"
+        );
         assert_eq!(
             missing.extensions.get("session_id"),
             Some(&Value::String(id.to_string()))
@@ -1030,7 +1036,7 @@ mod tests {
 
         let busy = ProblemDetail::for_error(&MekaError::TurnInFlight { doing: "patch" }, false);
         assert_eq!(busy.status, 409);
-        assert_eq!(busy.type_uri, "https://meka.so/errors/turn-in-flight");
+        assert_eq!(busy.type_uri, "https://meka.run/errors/turn-in-flight");
         let detail = busy.detail.clone().unwrap_or_default();
         assert!(detail.contains("cannot patch"), "{detail}");
 
@@ -1048,7 +1054,7 @@ mod tests {
             let problem = ProblemDetail::for_error(&error, false);
             assert_eq!(problem.status, 422, "{error}");
             assert_eq!(
-                problem.type_uri, "https://meka.so/errors/invalid-body",
+                problem.type_uri, "https://meka.run/errors/invalid-body",
                 "{error}"
             );
             assert_eq!(problem.detail.as_deref(), Some(error.to_string().as_str()));

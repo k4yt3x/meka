@@ -291,7 +291,7 @@ fn missing_authorization_returns_401_problem_detail() {
     );
     let body: serde_json::Value = response.json().expect("parse");
     assert_eq!(
-        body["type"], "https://meka.so/errors/auth",
+        body["type"], "https://meka.run/errors/auth",
         "missing Authorization should land on auth error"
     );
 }
@@ -307,7 +307,7 @@ fn invalid_bearer_token_returns_401_auth_invalid() {
         .expect("send");
     assert_eq!(response.status(), 401);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/auth");
+    assert_eq!(body["type"], "https://meka.run/errors/auth");
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn insufficient_scope_returns_403() {
         .expect("send");
     assert_eq!(response.status(), 403);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/auth-scope");
+    assert_eq!(body["type"], "https://meka.run/errors/auth-scope");
     // Every Problem Detail must carry the request URI as `instance` per RFC 9457.
     assert_eq!(
         body["instance"], "/v1/sessions",
@@ -621,7 +621,7 @@ fn the_level_and_approvals_change_under_a_running_turn() {
         "the working directory waits for the turn"
     );
     let body: serde_json::Value = moved.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/turn-in-flight");
+    assert_eq!(body["type"], "https://meka.run/errors/turn-in-flight");
     assert!(
         body["detail"]
             .as_str()
@@ -681,7 +681,7 @@ fn fork_during_an_in_flight_turn_is_refused_with_409() {
         .expect("send");
     assert_eq!(fork.status(), 409, "a fork mid-turn must 409");
     let body: serde_json::Value = fork.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/turn-in-flight");
+    assert_eq!(body["type"], "https://meka.run/errors/turn-in-flight");
     assert!(
         body["detail"].as_str().unwrap_or_default().contains("fork"),
         "the detail names what was refused: {body}"
@@ -857,7 +857,7 @@ fn fork_requires_write_scope() {
         .expect("send");
     assert_eq!(response.status(), 403);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/auth-scope");
+    assert_eq!(body["type"], "https://meka.run/errors/auth-scope");
 }
 
 #[test]
@@ -1088,7 +1088,7 @@ fn idempotency_key_with_different_body_returns_409_conflict() {
         .expect("send");
     assert_eq!(second.status(), 409);
     let body: serde_json::Value = second.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/idempotency");
+    assert_eq!(body["type"], "https://meka.run/errors/idempotency");
 }
 
 #[test]
@@ -1363,7 +1363,7 @@ fn second_turn_on_same_session_returns_409_turn_in_flight() {
         .expect("second send");
     assert_eq!(second.status(), 409, "concurrent turn must return 409");
     let body: serde_json::Value = second.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/turn-in-flight");
+    assert_eq!(body["type"], "https://meka.run/errors/turn-in-flight");
 
     // Drain the first turn so the harness Drop doesn't leave a zombie.
     let first_response = first.join().expect("join").error_for_status();
@@ -1419,7 +1419,7 @@ fn concurrent_streaming_turns_return_409() {
         "concurrent streaming turn must return 409"
     );
     let body: serde_json::Value = second.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/turn-in-flight");
+    assert_eq!(body["type"], "https://meka.run/errors/turn-in-flight");
 
     // Drain the first stream so the harness drop is clean. The SSE body is consumed lazily,
     // so we just have to read it.
@@ -1481,7 +1481,7 @@ fn oversize_body_returns_413() {
         "413 must serialize as Problem Detail, not plain text",
     );
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/payload-too-large");
+    assert_eq!(body["type"], "https://meka.run/errors/payload-too-large");
     assert_eq!(body["status"], 413);
     assert!(
         body["max_body_bytes"].is_number(),
@@ -1579,7 +1579,7 @@ fn patch_without_write_scope_returns_403() {
         .expect("send");
     assert_eq!(response.status(), 403);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/auth-scope");
+    assert_eq!(body["type"], "https://meka.run/errors/auth-scope");
 }
 
 /// After GC evicts an idle session, a subsequent `POST /turn` on the same session id rebuilds
@@ -1864,7 +1864,7 @@ fn max_concurrent_turns_returns_429_across_sessions() {
     );
     let body: serde_json::Value = second.json().expect("parse");
     assert_eq!(
-        body["type"], "https://meka.so/errors/concurrency-limit",
+        body["type"], "https://meka.run/errors/concurrency-limit",
         "process-wide cap must surface the concurrency-limit type, not rate-limit-exceeded",
     );
 
@@ -2310,7 +2310,7 @@ fn unknown_session_returns_404_on_every_mutating_endpoint() {
         );
         let problem: serde_json::Value = response.json().expect("parse");
         assert_eq!(
-            problem["type"], "https://meka.so/errors/session-not-found",
+            problem["type"], "https://meka.run/errors/session-not-found",
             "404 must carry the session-not-found Problem Detail type",
         );
     }
@@ -2342,7 +2342,7 @@ fn malformed_create_body_returns_422() {
         .expect("send");
     assert_eq!(response.status(), 422);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/invalid-body");
+    assert_eq!(body["type"], "https://meka.run/errors/invalid-body");
 }
 
 /// Missing required `message` field on POST /turn returns 422 with the `invalid-body`
@@ -2366,7 +2366,7 @@ fn malformed_turn_body_missing_message_returns_422() {
         .expect("send");
     assert_eq!(response.status(), 422);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/invalid-body");
+    assert_eq!(body["type"], "https://meka.run/errors/invalid-body");
 }
 
 /// A 1x1 transparent PNG, base64-encoded. Hardcoded rather than synthesized because the `image`
@@ -2555,7 +2555,7 @@ fn turn_with_unparseable_image_returns_422() {
         .expect("send");
     assert_eq!(response.status(), 422);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/invalid-body");
+    assert_eq!(body["type"], "https://meka.run/errors/invalid-body");
     assert!(
         body["detail"]
             .as_str()
@@ -3287,7 +3287,7 @@ fn streaming_provider_failure_emits_turn_failed_event() {
     // `the_turn_failed_payload_tells_a_transient_failure_from_a_permanent_one` exists to tell
     // apart. The `fail` kind is `MekaError::Provider`, so this one is the permanent type.
     assert!(
-        body.contains("\"https://meka.so/errors/provider\""),
+        body.contains("\"https://meka.run/errors/provider\""),
         "turn.failed payload must carry the provider error type; body was:\n{body}",
     );
     // The default retention keeps the message, and the terminal says so.
@@ -3349,16 +3349,16 @@ fn a_streaming_failure_says_whether_the_message_was_withdrawn() {
 #[test]
 fn the_turn_failed_payload_tells_a_transient_failure_from_a_permanent_one() {
     for (kind, rounds, expected) in [
-        ("fail", 1, "https://meka.so/errors/provider"),
+        ("fail", 1, "https://meka.run/errors/provider"),
         (
             "fail_retryable",
             3,
-            "https://meka.so/errors/provider-unavailable",
+            "https://meka.run/errors/provider-unavailable",
         ),
         (
             "fail_stream",
             3,
-            "https://meka.so/errors/provider-unavailable",
+            "https://meka.run/errors/provider-unavailable",
         ),
     ] {
         let round = serde_json::json!([
@@ -3603,7 +3603,7 @@ fn unknown_request_id_returns_404_request_not_found() {
         .expect("send");
     assert_eq!(response.status(), 404);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/request-not-found");
+    assert_eq!(body["type"], "https://meka.run/errors/request-not-found");
 }
 
 /// Answering a prompt at a sub-agent's id is refused as undrivable, not reported as an unknown
@@ -3665,7 +3665,7 @@ fn answering_a_prompt_at_a_worker_id_is_refused_as_undrivable() {
     let problem: serde_json::Value = refused.json().expect("parse");
     assert_eq!(
         problem["type"].as_str(),
-        Some("https://meka.so/errors/session-not-drivable"),
+        Some("https://meka.run/errors/session-not-drivable"),
         "and it says so, rather than inviting a retry with another request id: {problem}"
     );
     let detail = problem["detail"].as_str().unwrap_or_default();
@@ -3827,7 +3827,7 @@ fn answering_a_prompt_on_an_evicted_session_does_not_revive_it() {
         .expect("send");
     assert_eq!(response.status(), 404);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/request-not-found");
+    assert_eq!(body["type"], "https://meka.run/errors/request-not-found");
 
     // Still evicted: `/context` answers with no `message_count` for a session that is not resident.
     let context: serde_json::Value = harness
@@ -3896,7 +3896,7 @@ fn idempotency_key_in_flight_returns_409() {
         "concurrent same-keyed request must receive 409 idempotency-in-flight",
     );
     let body: serde_json::Value = second.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/idempotency");
+    assert_eq!(body["type"], "https://meka.run/errors/idempotency");
 
     // Let the first request finish; it commits the Pending entry into a Cached one.
     let first_response = first.join().expect("join");
@@ -3926,7 +3926,7 @@ fn turn_options_unknown_skill_returns_422() {
         .expect("send");
     assert_eq!(response.status(), 422);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/invalid-body");
+    assert_eq!(body["type"], "https://meka.run/errors/invalid-body");
 }
 
 /// `options.skill` naming a broken `SKILL.md` says so, rather than "unknown skill".
@@ -4054,7 +4054,7 @@ fn turn_options_unknown_field_returns_422() {
         .expect("send");
     assert_eq!(response.status(), 422);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/invalid-body");
+    assert_eq!(body["type"], "https://meka.run/errors/invalid-body");
 }
 
 /// DELETE on a session with an active turn returns 409 turn-in-flight. Clients are expected to POST
@@ -4107,7 +4107,7 @@ fn delete_while_turn_in_flight_returns_409() {
         "DELETE during in-flight turn must 409"
     );
     let body: serde_json::Value = delete.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/turn-in-flight");
+    assert_eq!(body["type"], "https://meka.run/errors/turn-in-flight");
 
     // Drain the in-flight turn so the harness Drop is clean.
     let _ = turn_handle.join().expect("join");
@@ -4134,7 +4134,7 @@ fn delete_without_write_scope_returns_403() {
         .expect("send");
     assert_eq!(response.status(), 403);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/auth-scope");
+    assert_eq!(body["type"], "https://meka.run/errors/auth-scope");
 }
 
 /// A GC-evicted session re-attached on a subsequent request must report its original
@@ -4293,7 +4293,7 @@ fn turn_request_unknown_top_level_field_returns_422() {
         .expect("send");
     assert_eq!(response.status(), 422);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/invalid-body");
+    assert_eq!(body["type"], "https://meka.run/errors/invalid-body");
 }
 
 /// A PATCH that mixes a valid field with an invalid one must reject the request without applying
@@ -4324,7 +4324,7 @@ fn patch_session_atomic_rejects_when_cwd_is_invalid() {
         .expect("patch");
     assert_eq!(patch.status(), 422, "invalid cwd must reject the PATCH");
     let problem: serde_json::Value = patch.json().expect("problem");
-    assert_eq!(problem["type"], "https://meka.so/errors/invalid-body");
+    assert_eq!(problem["type"], "https://meka.run/errors/invalid-body");
 
     // GET the session and verify the permission change did NOT leak through.
     let get = harness
@@ -4416,7 +4416,7 @@ fn delete_on_idle_true_removes_db_row_on_eviction() {
         get.status(),
     );
     let body: serde_json::Value = get.json().expect("problem");
-    assert_eq!(body["type"], "https://meka.so/errors/session-not-found");
+    assert_eq!(body["type"], "https://meka.run/errors/session-not-found");
 }
 
 /// A pre-attempt `turn-in-flight` 409 from `run_blocking_turn`'s `try_lock` must NOT be
@@ -4480,7 +4480,7 @@ fn idempotency_cache_does_not_persist_turn_in_flight_409() {
         "concurrent turn must hit run_blocking_turn try_lock and 409 with turn-in-flight",
     );
     let problem: serde_json::Value = second.json().expect("parse");
-    assert_eq!(problem["type"], "https://meka.so/errors/turn-in-flight");
+    assert_eq!(problem["type"], "https://meka.run/errors/turn-in-flight");
 
     // Let turn A finish so the runtime lock is free.
     let first_response = first.join().expect("join");
@@ -4589,7 +4589,7 @@ fn write_only_token_cannot_read_sessions() {
         "sessions:w-only token must be rejected on GET /v1/sessions",
     );
     let problem: serde_json::Value = response.json().expect("parse");
-    assert_eq!(problem["type"], "https://meka.so/errors/auth-scope");
+    assert_eq!(problem["type"], "https://meka.run/errors/auth-scope");
 }
 
 /// `stop_reason = refusal` flows through the blocking response.  The mock provider emits
@@ -4916,7 +4916,7 @@ fn cancel_during_blocking_turn_returns_409_turn_canceled() {
         "blocking-mode cancel must surface as 409 turn-canceled, not 500 internal",
     );
     let problem: serde_json::Value = response.json().expect("parse");
-    assert_eq!(problem["type"], "https://meka.so/errors/turn-canceled");
+    assert_eq!(problem["type"], "https://meka.run/errors/turn-canceled");
 }
 
 /// The auto-deny path itself: a scripted tool call above the level, with approvals on and
@@ -5098,7 +5098,7 @@ fn responses_body_unknown_field_returns_422() {
         "ResponseBody must reject unknown top-level fields with 422",
     );
     let problem: serde_json::Value = response.json().expect("parse");
-    assert_eq!(problem["type"], "https://meka.so/errors/invalid-body");
+    assert_eq!(problem["type"], "https://meka.run/errors/invalid-body");
 }
 
 /// A cancel that lands while the model is still composing a tool call must not leave that
@@ -5163,7 +5163,7 @@ fn cancel_mid_tool_call_leaves_no_orphaned_tool_use_in_the_store() {
         "a turn canceled mid-composition is reported as canceled"
     );
     let problem: serde_json::Value = response.json().expect("parse");
-    assert_eq!(problem["type"], "https://meka.so/errors/turn-canceled");
+    assert_eq!(problem["type"], "https://meka.run/errors/turn-canceled");
 
     let messages: serde_json::Value = harness
         .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
@@ -5696,7 +5696,7 @@ fn context_endpoint_requires_sessions_read_scope() {
         .expect("send");
     assert_eq!(response.status(), 403);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/auth-scope");
+    assert_eq!(body["type"], "https://meka.run/errors/auth-scope");
     assert!(
         body["detail"]
             .as_str()
@@ -5878,7 +5878,7 @@ fn rewind_past_the_start_is_422() {
         .expect("send");
     assert_eq!(response.status(), 422);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/invalid-body");
+    assert_eq!(body["type"], "https://meka.run/errors/invalid-body");
 }
 
 #[test]
@@ -6062,7 +6062,7 @@ fn canceling_a_scheduled_job_takes_a_prefix_and_reports_a_miss() {
         "an id that matches no job must not report a cancellation"
     );
     let body: serde_json::Value = missing.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/not-found");
+    assert_eq!(body["type"], "https://meka.run/errors/not-found");
 
     let short = &job_id[..8];
     let cancel = harness
@@ -6124,7 +6124,7 @@ fn creating_a_job_is_refused_when_scheduling_is_disabled() {
     // condition two different ways.
     assert_eq!(created.status(), 404);
     let problem: serde_json::Value = created.json().expect("parse");
-    assert_eq!(problem["type"], "https://meka.so/errors/not-found");
+    assert_eq!(problem["type"], "https://meka.run/errors/not-found");
 
     // Listing and canceling stay open: clearing out jobs left from before the flag was flipped is
     // exactly what an operator does next.
@@ -6646,7 +6646,7 @@ fn a_gate_below_write_permission_is_not_reported_as_a_scope_failure() {
     assert_eq!(response.status(), 403);
     let body: serde_json::Value = response.json().expect("parse");
     assert_eq!(
-        body["type"], "https://meka.so/errors/session-permission",
+        body["type"], "https://meka.run/errors/session-permission",
         "the remedy is PATCH the session, not a better token: {body}"
     );
 }
@@ -6844,7 +6844,7 @@ fn capability_endpoints_404_on_unknown_session() {
             .expect("send");
         assert_eq!(response.status(), 404, "{path} should 404");
         let body: serde_json::Value = response.json().expect("parse");
-        assert_eq!(body["type"], "https://meka.so/errors/session-not-found");
+        assert_eq!(body["type"], "https://meka.run/errors/session-not-found");
     }
 }
 
@@ -7061,7 +7061,7 @@ fn a_skill_in_a_read_only_root_is_refused_by_put_and_delete() {
             .expect("send")
             .json()
             .expect("parse");
-        assert_eq!(problem["type"], "https://meka.so/errors/store-read-only");
+        assert_eq!(problem["type"], "https://meka.run/errors/store-read-only");
         let detail = problem["detail"].as_str().unwrap_or_default();
         // The skill, and the class of root it came from -- not the path. Whoever holds this token
         // is not necessarily whoever wrote `config.toml`, and an absolute path out of it is a fact
@@ -8820,7 +8820,7 @@ fn cancel_with_a_stale_turn_id_is_refused_and_the_live_one_is_honored() {
         .expect("send");
     assert_eq!(stale.status(), 409);
     let problem: serde_json::Value = stale.json().expect("parse");
-    assert_eq!(problem["type"], "https://meka.so/errors/turn-mismatch");
+    assert_eq!(problem["type"], "https://meka.run/errors/turn-mismatch");
     assert_eq!(
         problem["turn_id"], live,
         "the refusal names the turn that is running"
@@ -8905,7 +8905,7 @@ fn inbox_items_replay_on_their_key_and_withdraw_only_while_pending() {
     assert_eq!(mismatch.status(), reqwest::StatusCode::CONFLICT);
     let problem: serde_json::Value = mismatch.json().expect("problem");
     assert_eq!(
-        problem["type"], "https://meka.so/errors/idempotency",
+        problem["type"], "https://meka.run/errors/idempotency",
         "{problem}"
     );
     let other = submit("k-2", "two");
@@ -9197,7 +9197,7 @@ fn reattach_on_an_unknown_session_is_404() {
         .expect("send");
     assert_eq!(response.status(), 404);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/session-not-found");
+    assert_eq!(body["type"], "https://meka.run/errors/session-not-found");
 }
 
 #[test]
@@ -10427,7 +10427,7 @@ fn missing_store_resources_report_not_found_rather_than_session_not_found() {
         assert_eq!(response.status(), 404, "{path}");
         let body: serde_json::Value = response.json().expect("parse");
         assert_eq!(
-            body["type"], "https://meka.so/errors/not-found",
+            body["type"], "https://meka.run/errors/not-found",
             "{path} must not claim the session is gone: {body}"
         );
     }
@@ -10863,7 +10863,7 @@ fn read_only_endpoints_do_not_revive_an_evicted_session() {
     );
     let problem: serde_json::Value = tools.json().expect("parse");
     assert_eq!(
-        problem["type"], "https://meka.so/errors/session-not-loaded",
+        problem["type"], "https://meka.run/errors/session-not-loaded",
         "not `turn-in-flight`: that type tells a client to cancel a turn, and `POST /cancel` \
          would return 204 forever because there is no turn. The remedy is the opposite -- submit \
          one. Body was: {problem}"
@@ -11162,7 +11162,7 @@ fn errors_from_an_allowed_origin_keep_their_cors_headers() {
         "the challenge is exposed to the page"
     );
     let body: serde_json::Value = unauthorized.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/auth");
+    assert_eq!(body["type"], "https://meka.run/errors/auth");
 
     let missing = harness
         .request(reqwest::Method::GET, "/v1/no-such-route")
@@ -11192,7 +11192,7 @@ fn errors_from_an_allowed_origin_keep_their_cors_headers() {
     assert_eq!(oversize.status(), 413);
     assert!(granted(&oversize), "the body-limit 413 carries the grant");
     let body: serde_json::Value = oversize.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/payload-too-large");
+    assert_eq!(body["type"], "https://meka.run/errors/payload-too-large");
 
     let malformed = harness
         .request(reqwest::Method::POST, "/v1/sessions")
@@ -11267,7 +11267,7 @@ fn a_read_only_token_attending_from_an_allowed_origin_is_refused_before_the_sess
         Some("https://ui.example")
     );
     let body: serde_json::Value = refused.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/auth-scope");
+    assert_eq!(body["type"], "https://meka.run/errors/auth-scope");
 
     let looked_up = harness
         .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
@@ -11947,7 +11947,7 @@ fn a_malformed_body_is_refused_as_malformed_even_while_a_turn_runs() {
         "an empty message is a body problem, and stays one while the session is busy"
     );
     let body: serde_json::Value = rejected.json().expect("parse");
-    assert_eq!(body["type"], "https://meka.so/errors/invalid-body");
+    assert_eq!(body["type"], "https://meka.run/errors/invalid-body");
 
     running.join().expect("join").error_for_status().ok();
 }
@@ -12154,7 +12154,7 @@ fn deleting_an_invalid_skill_name_is_refused_before_the_filesystem_is_probed() {
              whether the path exists: {body}"
         );
         assert_eq!(
-            body["type"], "https://meka.so/errors/invalid-body",
+            body["type"], "https://meka.run/errors/invalid-body",
             "'{name}' must be refused as an invalid name: {status} {body}"
         );
     }
@@ -12793,7 +12793,7 @@ fn a_locked_worker_is_refused_as_undrivable_rather_than_as_busy() {
     let problem: serde_json::Value = refused.json().expect("parse");
     assert_eq!(
         problem["type"].as_str(),
-        Some("https://meka.so/errors/session-not-drivable"),
+        Some("https://meka.run/errors/session-not-drivable"),
         "and it says which kind it is, rather than `session-locked`: {problem}"
     );
 }
@@ -12941,7 +12941,7 @@ fn a_worker_session_refuses_a_turn_posted_straight_at_it() {
     let problem: serde_json::Value = patched.json().expect("parse");
     assert_eq!(
         problem["type"].as_str(),
-        Some("https://meka.so/errors/session-not-drivable"),
+        Some("https://meka.run/errors/session-not-drivable"),
         "and it says which kind of 422 it is, so a client stops rewriting its payload: {problem}"
     );
 }
@@ -13079,7 +13079,7 @@ fn an_unopenable_lock_is_a_server_fault_rather_than_a_conflict() {
              {problem}"
         );
         assert_eq!(
-            problem["type"], "https://meka.so/errors/internal",
+            problem["type"], "https://meka.run/errors/internal",
             "{problem}"
         );
         assert!(
@@ -13473,7 +13473,7 @@ fn fork_refuses_a_source_another_process_holds() {
         "a source another process holds must be refused, not copied half-written"
     );
     let problem: serde_json::Value = refused.json().expect("problem body");
-    assert_eq!(problem["type"], "https://meka.so/errors/session-locked");
+    assert_eq!(problem["type"], "https://meka.run/errors/session-locked");
     let listing: serde_json::Value = harness
         .request(reqwest::Method::GET, "/v1/sessions")
         .send()
@@ -13763,7 +13763,7 @@ grace = "0s"
         .expect("send");
     assert_eq!(refused.status().as_u16(), 503);
     let problem: serde_json::Value = refused.json().expect("parse");
-    assert_eq!(problem["type"], "https://meka.so/errors/mcp-unavailable");
+    assert_eq!(problem["type"], "https://meka.run/errors/mcp-unavailable");
     assert!(
         problem.get("message_withdrawn").is_none(),
         "a turn that never began has no message to report on: {problem}"

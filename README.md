@@ -72,7 +72,7 @@ meka ~/project [r] > find all TODO comments in this project
 meka ~/project [u] > install and start nginx
 ```
 
-See the [documentation](https://docs.meka.so) for the full usage guide.
+See the [documentation](https://docs.meka.run) for the full usage guide.
 
 ## Tools
 
@@ -96,7 +96,7 @@ The agent has access to the following built-in tools:
 - `mcp_resource_*` / `mcp_prompt_*`: read or render content from MCP servers
 - `load_tool`: fetch the full schema for a tool held back to keep the prompt small
 
-Run `meka tool list` for the current set with descriptions. Long-output tools take an optional `scratchpad` parameter to save their output there instead of returning it. See the [tool reference](https://docs.meka.so/tools/overview.html).
+Run `meka tool list` for the current set with descriptions. Long-output tools take an optional `scratchpad` parameter to save their output there instead of returning it. See the [tool reference](https://docs.meka.run/tools/overview.html).
 
 ## Permissions
 
@@ -135,5 +135,7 @@ AI tools were used to assist the design and implementation of this project. All 
 
 ## License
 
-This project is licensed under the [MIT License](https://opensource.org/licenses/MIT).\
+This project is licensed under the [GNU Affero General Public License v3.0 or later](https://www.gnu.org/licenses/agpl-3.0.html).\
 Copyright 2026 K4YT3X.
+
+![AGPLv3](https://www.gnu.org/graphics/agplv3-155x51.png)
