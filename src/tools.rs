@@ -385,11 +385,11 @@ pub(crate) fn schema_disagreement(
     if lines.is_empty() {
         return None;
     }
-    // Only point at `load_tool` when the schema is genuinely still hidden; telling a model to load
+    // Only point at `tool_load` when the schema is genuinely still hidden; telling a model to load
     // something it already loaded reads as noise and trains it to skim these.
     if report_unused {
         lines.push(format!(
-            "Call `load_tool` with \"{tool_name}\" for the full contract.",
+            "Call `tool_load` with \"{tool_name}\" for the full contract.",
         ));
     }
     Some(format!(
@@ -424,12 +424,14 @@ pub(crate) fn did_you_mean_hint<'a>(
     let mut by_segment: Vec<&str> = Vec::new();
     let mut by_distance: Vec<(usize, &str)> = Vec::new();
     let needle_chars = needle.chars().count();
+    let needle_words = sorted_words(&needle);
     for candidate in candidates {
         let lowered = candidate.to_ascii_lowercase();
         if lowered == needle
             || lowered.rsplit("__").next() == Some(needle.as_str())
             || lowered == needle_tail
             || lowered.starts_with(&family_prefix)
+            || sorted_words(&lowered) == needle_words
         {
             by_segment.push(candidate);
             continue;
@@ -469,6 +471,16 @@ pub(crate) fn did_you_mean_hint<'a>(
     format!(" Did you mean {}?", rendered.join(" or "))
 }
 
+/// A name's `_`-separated words in sorted order, so two names that differ only in word order
+/// compare equal: a rename that moves the noun first puts the old name as many edits from the new
+/// one as the words are long, past any threshold, while a resumed session or a config list
+/// reaching for the old order is the case a rename most needs to cover.
+fn sorted_words(name: &str) -> Vec<&str> {
+    let mut words: Vec<&str> = name.split('_').filter(|word| !word.is_empty()).collect();
+    words.sort_unstable();
+    words
+}
+
 /// Whether a tool name reads as one that destroys something, by its verb.
 ///
 /// Only used to order suggestions. A suggestion list is read by a model about to retry, so which
@@ -487,39 +499,101 @@ fn is_destructive(name: &str) -> bool {
 pub(crate) static EDIT_DISTANCE_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Levenshtein distance in chars, two-row. Only ever runs on an error path, so the quadratic cost
-/// over the registry is not worth optimizing away.
+/// Edit distance in chars: `strsim`'s optimal string alignment, which is Levenshtein with a
+/// transposition counted as one edit, since the commonest typo (`Tokoy` for `Tokyo`) is one. Only
+/// ever runs on an error path or inside a search, so the quadratic cost over the registry is not
+/// worth optimizing away.
 ///
-/// Shared with `memory_search`, whose last-resort tier is the same idea applied to memory names
-/// and descriptions instead of tool names: when full-text matching finds nothing, the query was
-/// probably misspelled rather than absent.
+/// Shared with `memory_search` and `tool_search`, whose last-resort tiers are the same idea applied
+/// to names and descriptions instead of tool names: when full-text matching finds nothing, the
+/// query was probably misspelled rather than absent.
 pub(crate) fn edit_distance(left: &str, right: &str) -> usize {
     #[cfg(test)]
     EDIT_DISTANCE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let left: Vec<char> = left.chars().collect();
-    let right: Vec<char> = right.chars().collect();
-    if left.is_empty() {
-        return right.len();
-    }
-    if right.is_empty() {
-        return left.len();
-    }
-    let mut previous: Vec<usize> = (0..=right.len()).collect();
-    let mut current: Vec<usize> = vec![0; right.len() + 1];
-    for (i, left_char) in left.iter().enumerate() {
-        current[0] = i + 1;
-        for (j, right_char) in right.iter().enumerate() {
-            let substitution = usize::from(left_char != right_char);
-            current[j + 1] = (previous[j + 1] + 1)
-                .min(current[j] + 1)
-                .min(previous[j] + substitution);
-        }
-        std::mem::swap(&mut previous, &mut current);
-    }
-    previous[right.len()]
+    strsim::osa_distance(left, right)
 }
 
-/// What a file looked like when a tool last read it, so a later `edit_file` can tell "you never
+/// Largest edit distance a search's last-resort tier accepts between a query term and a word in a
+/// name or description.
+///
+/// Two for anything five characters or longer, so a second slip in a long word is still caught; a
+/// threshold of one, which is what [`did_you_mean_hint`] uses for tool names, is right for a name
+/// the model typed as a call and too strict for a search term. Short words stay at one, where two
+/// edits would match almost anything.
+pub(crate) fn fuzzy_threshold(term: &str) -> usize {
+    let length = term.chars().count();
+    if length < 5 {
+        return 1;
+    }
+    (length / 3).clamp(2, 4)
+}
+
+/// What the door decided about one tool call.
+pub(crate) enum Admission {
+    /// Within the level: run it.
+    Run,
+    /// Above the level, and the session submits such calls for approval.
+    Ask,
+    /// Above the level, with nobody to ask: the result the model gets instead.
+    ///
+    /// Boxed because a `ToolOutput` alone crosses clippy's `large_enum_variant` threshold on
+    /// Windows, where `PathBuf` is eight bytes wider.
+    Refuse(Box<ToolOutput>),
+}
+
+/// The one rule for whether a tool call runs, is submitted for approval, or is refused.
+///
+/// Dispatch, the checkpoint, and the two registry meta-tools (`tool_search` and `tool_load`, which
+/// tell the model what a call would do before it makes one) all ask this, so no two doors can
+/// disagree. The level bounds what runs unattended and the approvals switch decides what happens
+/// at the edge of it. An approved call still runs *at the level*: the write fence and the shell's
+/// confinement read the same cell, so approval never widens reach, it only turns a refusal into a
+/// question.
+///
+/// `unconfinable` is the door `Permission::allows` cannot provide for a tool meka cannot confine.
+/// `allows` treats `workspace` and `unrestricted` as equal on purpose, so a tool requiring
+/// `unrestricted` dispatches at `workspace` with no prompt; every built-in that matters has its
+/// own door downstream (the write fence, or `shell_execute`'s refusal when it cannot be
+/// sandboxed), and an MCP adapter has neither. Such a call is a question when approvals are on and
+/// a refusal otherwise, the way the shell refuses when its sandbox is unavailable: half a boundary
+/// reported as a whole one is worse than an error saying so. Only `workspace` promises a boundary
+/// it might fail to apply, so only there does the flag matter.
+pub(crate) fn admit_tool_call(
+    name: &str,
+    required: Permission,
+    permission: Permission,
+    approvals: bool,
+    unconfinable: bool,
+) -> Admission {
+    if !permission.allows(required) {
+        if approvals {
+            return Admission::Ask;
+        }
+        return Admission::Refuse(Box::new(ToolOutput::text(
+            format!(
+                "'{name}' requires `{required}`; the session is at `{permission}`. Ask the user to \
+                 raise it to `{required}`."
+            ),
+            true,
+        )));
+    }
+    if permission == Permission::Workspace && !required.is_within(permission) && unconfinable {
+        if approvals {
+            return Admission::Ask;
+        }
+        return Admission::Refuse(Box::new(ToolOutput::text(
+            format!(
+                "'{name}' runs inside its MCP server's own process, which meka does not sandbox, so \
+                 `workspace` cannot confine what it writes. Ask the user for `unrestricted`, or \
+                 grant it explicitly with `[mcp.servers.*].tool_permissions` in the config."
+            ),
+            true,
+        )));
+    }
+    Admission::Run
+}
+
+/// What a file looked like when a tool last read it, so a later `file_edit` can tell "you never
 /// read this" from "this moved under you".
 ///
 /// Compared against whatever the same source says at edit time, which is why this is an enum: a
@@ -662,7 +736,7 @@ impl ToolOutput {
     }
 
     /// Attach structured frontend metadata to an existing output, e.g. the pre/post text from a
-    /// successful `edit_file`. Chains after any other builder so the call site reads as
+    /// successful `file_edit`. Chains after any other builder so the call site reads as
     /// `ToolOutput::text(...).with_metadata(diff)`.
     #[must_use]
     pub(crate) fn with_metadata(mut self, metadata: crate::frontend::ToolOutputMetadata) -> Self {
@@ -829,6 +903,7 @@ pub(crate) const BUILTINS_WITHOUT_ARGUMENTS: &[&str] = &[
     "schedule_list",
     "scratchpad_list",
     "task_list",
+    "todo_read",
 ];
 /// The argument a tool-call indicator shows next to the tool's name.
 ///
@@ -837,9 +912,9 @@ pub(crate) const BUILTINS_WITHOUT_ARGUMENTS: &[&str] = &[
 /// [`resolve_primary_param`]'s other half needs the tool's JSON Schema, and replayed history has
 /// none, so a built-in missing from here renders bare in `/history` having rendered fully live.
 fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String> {
-    // `render_image` accepts either `from_scratchpad` or inline `base64`. Show the scratchpad name
+    // `image_render` accepts either `from_scratchpad` or inline `base64`. Show the scratchpad name
     // when present; for inline base64 the payload is opaque so there's nothing useful to display.
-    if name == "render_image" {
+    if name == "image_render" {
         if let Some(from) = input.get("from_scratchpad").and_then(|v| v.as_str()) {
             return Some(from.to_string());
         }
@@ -849,34 +924,21 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         return None;
     }
 
-    // `todo` has no single primary key. Surface what the agent is doing, preferring the status
-    // transitions, then the `title` of a list it is building, then the list size, and finally
-    // "read" for an argument-less read.
-    if name == "todo" {
-        if let Some(set) = input.get("set").and_then(|v| v.as_object()) {
-            let parts: Vec<String> = set
-                .iter()
-                .filter_map(|(id, status)| status.as_str().map(|status| format!("#{id} {status}")))
-                .collect();
-            if !parts.is_empty() {
-                return Some(parts.join(", "));
-            }
-        }
-        if let Some(title) = input.get("title").and_then(|v| v.as_str()) {
-            let title = title.trim();
-            if !title.is_empty() {
-                return Some(title.to_string());
-            }
-        }
-        if let Some(items) = input.get("items").and_then(|v| v.as_array()) {
-            let count = items.len();
-            return Some(format!(
-                "{} task{}",
-                count,
-                if count == 1 { "" } else { "s" }
-            ));
-        }
-        return Some("read".to_string());
+    // `todo_edit` has no single primary key: what the agent is doing is the set of status
+    // transitions, so those are shown.
+    if name == "todo_edit" {
+        let parts: Vec<String> = input
+            .get("set")
+            .and_then(|value| value.as_object())
+            .map(|set| {
+                set.iter()
+                    .filter_map(|(id, status)| {
+                        status.as_str().map(|status| format!("#{id} {status}"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        return (!parts.is_empty()).then(|| parts.join(", "));
     }
 
     // `task_cancel` takes either an id or `all`, and declares neither as required, so there is no
@@ -904,11 +966,9 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         "context_compact" => "instructions",
         "conversation_read" => "start",
         "conversation_search" => "query",
-        "edit_file" | "read_file" | "write_file" => "path",
-        "execute_command" => "command",
-        "fetch_url" => "url",
-        "find_files" => "glob",
-        "load_tool" => "name",
+        "file_edit" | "file_read" | "file_write" => "path",
+        "file_find" => "glob",
+        "file_search" => "pattern",
         "mcp_prompt_get" => "name",
         "mcp_prompt_list" | "mcp_resource_list" => "server",
         "mcp_resource_read" | "mcp_resource_subscribe" | "mcp_resource_unsubscribe" => "uri",
@@ -916,17 +976,24 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         "memory_search" => "queries",
         "schedule_cancel" => "id",
         "schedule_create" => "prompt",
-        "scratchpad_delete" | "scratchpad_edit" | "scratchpad_read" | "scratchpad_write" => "name",
+        "scratchpad_delete"
+        | "scratchpad_edit"
+        | "scratchpad_read"
+        | "scratchpad_save_file"
+        | "scratchpad_write" => "name",
         "scratchpad_load_file" => "path",
         "scratchpad_merge" => "sources",
         "scratchpad_rename" => "old",
-        "scratchpad_save_file" => "name",
-        "search_contents" => "pattern",
+        "shell_execute" => "command",
         "skill_delete" | "skill_read" | "skill_write" => "name",
         "skill_search" => "pattern",
+        "todo_write" => "title",
+        "tool_load" => "name",
+        "tool_search" => "query",
+        "web_fetch" => "url",
         _ => return None,
     };
-    // Coerced rather than read as a string: `load_tool` takes a name or a list of them,
+    // Coerced rather than read as a string: `tool_load` takes a name or a list of them,
     // `memory_search` takes a list of phrasings, and `conversation_read` takes a number, and
     // `as_str` alone would leave all three replaying bare.
     input.get(key).and_then(coerce_display_value)
@@ -982,7 +1049,7 @@ impl ToolOutput {
 }
 
 /// A no-op tool for the deferred-loading tests: registered after `build_default` and then
-/// deferred, so `load_tool` is exercised against a tool that is genuinely deferred rather than by
+/// deferred, so `tool_load` is exercised against a tool that is genuinely deferred rather than by
 /// re-deferring a production tool that ships active.
 #[cfg(test)]
 pub(crate) struct FixtureDeferredTool {
@@ -1037,7 +1104,7 @@ mod tests {
             "{refused:?}"
         );
         let (_, detach) = super::admit_arguments(
-            "read_file",
+            "file_read",
             &serde_json::json!({"background": true}),
             &schema,
         )
@@ -1370,7 +1437,7 @@ mod tests {
         );
         assert!(advisory.contains("viewable photo"), "{advisory}");
         assert!(advisory.contains("caption"), "{advisory}");
-        assert!(advisory.contains("load_tool"), "{advisory}");
+        assert!(advisory.contains("tool_load"), "{advisory}");
         // Parameters the call did supply are not worth repeating back.
         assert!(!advisory.contains("\n  path ("), "{advisory}");
     }
@@ -1406,7 +1473,7 @@ mod tests {
         );
         assert!(advisory.contains("as_photo"), "{advisory}");
         // Nothing to load: this tool's schema is already in hand.
-        assert!(!advisory.contains("load_tool"), "{advisory}");
+        assert!(!advisory.contains("tool_load"), "{advisory}");
     }
 
     /// `scratchpad` works on every tool and is consumed by the agent loop, so an MCP schema that
@@ -1463,7 +1530,7 @@ mod tests {
     }
 
     /// Undocumented parameters are skipped: naming a knob without saying what it does is not enough
-    /// to act on, and the schema is one `load_tool` away.
+    /// to act on, and the schema is one `tool_load` away.
     #[test]
     fn schema_disagreement_skips_undocumented_parameters() {
         let schema = serde_json::json!({
@@ -1665,23 +1732,116 @@ mod tests {
             "properties": {"command": {"type": "string", "description": "Shell command"}},
         });
         let input = serde_json::json!({"command": "make", "background": true});
-        assert!(schema_disagreement("execute_command", &input, &schema, false).is_none());
+        assert!(schema_disagreement("shell_execute", &input, &schema, false).is_none());
     }
 
     /// The commonest slip: naming the tool without its `mcp__<server>__` prefix. Edit distance
     /// alone puts the answer seventeen operations away, so the segment match has to carry it.
+    fn decide(required: Permission, level: Permission, approvals: bool) -> &'static str {
+        match admit_tool_call("t", required, level, approvals, false) {
+            Admission::Run => "run",
+            Admission::Ask => "ask",
+            Admission::Refuse(_) => "refuse",
+        }
+    }
+
+    /// The one rule, at every level: within the level runs, above it is refused, and the switch
+    /// turns that refusal into a question. Nothing sits above `unrestricted`, so it never asks.
+    #[test]
+    fn a_call_above_the_level_is_refused_or_asked_and_never_run() {
+        assert_eq!(
+            decide(Permission::Workspace, Permission::Read, false),
+            "refuse"
+        );
+        assert_eq!(decide(Permission::Workspace, Permission::Read, true), "ask");
+        assert_eq!(decide(Permission::Read, Permission::Read, true), "run");
+        assert_eq!(decide(Permission::Read, Permission::None, true), "ask");
+        assert_eq!(decide(Permission::Read, Permission::None, false), "refuse");
+        assert_eq!(
+            decide(Permission::Unrestricted, Permission::Unrestricted, true),
+            "run"
+        );
+        // `workspace` runs a tool that requires `unrestricted` when meka can confine it; the
+        // approval question is never asked for a call the level already covers.
+        assert_eq!(
+            decide(Permission::Unrestricted, Permission::Workspace, true),
+            "run"
+        );
+    }
+
+    /// A tool meka cannot confine is the one case where `workspace` covers the requirement and
+    /// still cannot deliver it: refused, or asked about when the switch is on.
+    #[test]
+    fn an_unconfinable_call_at_workspace_is_asked_about_when_approvals_are_on() {
+        let refused = admit_tool_call(
+            "mcp__x__t",
+            Permission::Unrestricted,
+            Permission::Workspace,
+            false,
+            true,
+        );
+        assert!(matches!(refused, Admission::Refuse(_)));
+        let asked = admit_tool_call(
+            "mcp__x__t",
+            Permission::Unrestricted,
+            Permission::Workspace,
+            true,
+            true,
+        );
+        assert!(matches!(asked, Admission::Ask));
+        // Not at `unrestricted`, which promises no boundary to fail to apply.
+        let run = admit_tool_call(
+            "mcp__x__t",
+            Permission::Unrestricted,
+            Permission::Unrestricted,
+            true,
+            true,
+        );
+        assert!(matches!(run, Admission::Run));
+    }
+
+    /// The refusal names the level it would take, which is what the model relays to the user.
+    #[test]
+    fn a_refusal_names_the_required_level() {
+        let Admission::Refuse(output) = admit_tool_call(
+            "file_write",
+            Permission::Workspace,
+            Permission::Read,
+            false,
+            false,
+        ) else {
+            panic!("a call above the level with approvals off is refused");
+        };
+        let text = output.text_content();
+        assert!(output.is_error);
+        assert!(text.contains("requires `workspace`"), "{text}");
+        assert!(text.contains("the session is at `read`"), "{text}");
+        // meka's own decision is a refusal; "denied" is the user's answer at the prompt.
+        assert!(!text.contains("denied"), "{text}");
+    }
+
     #[test]
     fn did_you_mean_matches_on_the_final_segment() {
-        let registered = ["mcp__mekabridge__send_file", "read_file"];
+        let registered = ["mcp__mekabridge__send_file", "file_read"];
         let hint = did_you_mean_hint("send_file", registered.into_iter());
         assert_eq!(hint, " Did you mean `mcp__mekabridge__send_file`?");
     }
 
     #[test]
     fn did_you_mean_catches_a_typo() {
-        let registered = ["read_file", "write_file"];
-        let hint = did_you_mean_hint("raed_file", registered.into_iter());
-        assert_eq!(hint, " Did you mean `read_file`?");
+        let registered = ["file_read", "file_write"];
+        let hint = did_you_mean_hint("flie_read", registered.into_iter());
+        assert_eq!(hint, " Did you mean `file_read`?");
+    }
+
+    /// A name typed with its words in another order is a near miss the distance cannot see: the
+    /// words are all there, and a config list or a resumed session holding the other order would
+    /// otherwise get a bare "matches nothing" with no direction.
+    #[test]
+    fn did_you_mean_catches_reordered_words() {
+        let registered = ["beta_alpha", "beta_gamma", "file_read"];
+        let hint = did_you_mean_hint("alpha_beta", registered.into_iter());
+        assert_eq!(hint, " Did you mean `beta_alpha`?");
     }
 
     /// The `skill` -> `skill_read` rename in miniature, and the reason the prefix rule exists.
@@ -1691,11 +1851,17 @@ mod tests {
     /// resumed session reaching for the old name gets a bare unknown-tool error and no direction.
     #[test]
     fn did_you_mean_points_a_bare_noun_at_its_family() {
-        let registered = ["skill_read", "skill_write", "read_file"];
+        let registered = ["skill_read", "skill_write", "file_read"];
         let hint = did_you_mean_hint("skill", registered.into_iter());
         assert!(hint.contains("`skill_read`"), "{hint}");
         assert!(hint.contains("`skill_write`"), "{hint}");
-        assert!(!hint.contains("read_file"), "{hint}");
+        assert!(!hint.contains("file_read"), "{hint}");
+        // A bare noun that is a family of three shows the whole family.
+        let registered = ["gamma_edit", "gamma_read", "gamma_write", "file_read"];
+        let hint = did_you_mean_hint("gamma", registered.into_iter());
+        for member in ["gamma_edit", "gamma_read", "gamma_write"] {
+            assert!(hint.contains(member), "{hint}");
+        }
     }
 
     /// A whole family can exceed `MAX_SUGGESTIONS`, so which members survive truncation matters.
@@ -1709,7 +1875,7 @@ mod tests {
             "skill_read",
             "skill_search",
             "skill_write",
-            "read_file",
+            "file_read",
         ];
         let hint = did_you_mean_hint("skill", registered.into_iter());
         let delete = hint.find("skill_delete");
@@ -1721,7 +1887,7 @@ mod tests {
         assert!(hint.contains("`skill_write`"), "{hint}");
     }
 
-    /// The prefix has to be a *name segment*, not any shared start, or `search_contents` would
+    /// The prefix has to be a *name segment*, not any shared start, or `file_search` would
     /// answer for `search` alongside genuinely-related tools and `scratchpad_read` would answer
     /// for `scratch`.
     #[test]
@@ -1732,7 +1898,7 @@ mod tests {
 
     #[test]
     fn did_you_mean_is_silent_when_nothing_is_close() {
-        let registered = ["read_file", "run_shell"];
+        let registered = ["file_read", "run_shell"];
         assert_eq!(
             did_you_mean_hint("frobnicate_widget", registered.into_iter()),
             ""
@@ -1752,14 +1918,14 @@ mod tests {
     #[tokio::test]
     async fn the_test_registry_holds_every_core_tool() {
         let registry = tool_registry_for_test().await;
-        assert!(registry.get("read_file").is_some());
-        assert!(registry.get("write_file").is_some());
-        assert!(registry.get("edit_file").is_some());
-        assert!(registry.get("find_files").is_some());
-        assert!(registry.get("search_contents").is_some());
-        assert!(registry.get("execute_command").is_some());
-        assert!(registry.get("fetch_url").is_some());
-        assert!(registry.get("todo").is_some());
+        assert!(registry.get("file_read").is_some());
+        assert!(registry.get("file_write").is_some());
+        assert!(registry.get("file_edit").is_some());
+        assert!(registry.get("file_find").is_some());
+        assert!(registry.get("file_search").is_some());
+        assert!(registry.get("shell_execute").is_some());
+        assert!(registry.get("web_fetch").is_some());
+        assert!(registry.get("todo_write").is_some());
         assert!(registry.get("scratchpad_write").is_some());
         assert!(registry.get("scratchpad_read").is_some());
         assert!(registry.get("scratchpad_edit").is_some());
@@ -1770,8 +1936,8 @@ mod tests {
         assert!(registry.get("memory_read").is_some());
         assert!(registry.get("memory_search").is_some());
         assert!(registry.get("memory_delete").is_some());
-        assert!(registry.get("render_image").is_some());
-        assert!(registry.get("load_tool").is_some());
+        assert!(registry.get("image_render").is_some());
+        assert!(registry.get("tool_load").is_some());
         assert!(registry.get("nonexistent").is_none());
     }
 
@@ -1823,9 +1989,9 @@ mod tests {
     async fn approvals_list_the_tools_above_the_level() {
         let registry = tool_registry_for_test().await;
         let listed = registry.definitions_for_permission(Permission::Read, true);
-        assert!(listed.iter().any(|t| t.name == "write_file"));
+        assert!(listed.iter().any(|t| t.name == "file_write"));
         let hidden = registry.definitions_for_permission(Permission::Read, false);
-        assert!(!hidden.iter().any(|t| t.name == "write_file"));
+        assert!(!hidden.iter().any(|t| t.name == "file_write"));
     }
 
     #[tokio::test]
@@ -1872,35 +2038,35 @@ mod tests {
     async fn registry_filter_drops_disabled_tools() {
         let filter = BuiltinToolFilter::from_config(
             None,
-            vec!["render_image".to_string(), "fetch_url".to_string()],
+            vec!["image_render".to_string(), "web_fetch".to_string()],
             HashMap::new(),
         );
         let registry = tool_registry_for_test_with_filter(filter).await;
-        assert!(registry.get("read_file").is_some());
-        assert!(registry.get("write_file").is_some());
+        assert!(registry.get("file_read").is_some());
+        assert!(registry.get("file_write").is_some());
         assert!(
-            registry.get("render_image").is_none(),
-            "render_image should be filtered out"
+            registry.get("image_render").is_none(),
+            "image_render should be filtered out"
         );
         assert!(
-            registry.get("fetch_url").is_none(),
-            "fetch_url should be filtered out"
+            registry.get("web_fetch").is_none(),
+            "web_fetch should be filtered out"
         );
     }
 
     #[tokio::test]
     async fn registry_filter_allow_list_keeps_only_listed() {
         let filter = BuiltinToolFilter::from_config(
-            Some(vec!["read_file".to_string(), "find_files".to_string()]),
+            Some(vec!["file_read".to_string(), "file_find".to_string()]),
             Vec::new(),
             HashMap::new(),
         );
         let registry = tool_registry_for_test_with_filter(filter).await;
-        assert!(registry.get("read_file").is_some());
-        assert!(registry.get("find_files").is_some());
-        assert!(registry.get("write_file").is_none());
-        assert!(registry.get("execute_command").is_none());
-        assert!(registry.get("fetch_url").is_none());
+        assert!(registry.get("file_read").is_some());
+        assert!(registry.get("file_find").is_some());
+        assert!(registry.get("file_write").is_none());
+        assert!(registry.get("shell_execute").is_none());
+        assert!(registry.get("web_fetch").is_none());
     }
 
     /// Stub tool that sleeps for a known duration before returning a payload derived from its
@@ -2077,35 +2243,27 @@ mod tests {
 
     #[test]
     fn builtin_primary_param_todo() {
-        // set transitions take priority.
+        // An edit shows its status transitions; an empty one has nothing to show.
         assert_eq!(
             builtin_primary_param(
-                "todo",
-                &serde_json::json!({ "title": "Build", "set": {"2": "in_progress"} })
+                "todo_edit",
+                &serde_json::json!({ "set": {"2": "in_progress", "3": "completed"} })
             )
             .as_deref(),
-            Some("#2 in_progress")
+            Some("#2 in_progress, #3 completed")
         );
-        // title when building a list.
+        assert!(builtin_primary_param("todo_edit", &serde_json::json!({ "set": {} })).is_none());
+        // A write shows the title of the list it builds.
         assert_eq!(
             builtin_primary_param(
-                "todo",
+                "todo_write",
                 &serde_json::json!({ "title": "Refactor auth", "items": ["a", "b", "c"] })
             )
             .as_deref(),
             Some("Refactor auth")
         );
-        // items size as a fallback when there's no title.
-        assert_eq!(
-            builtin_primary_param("todo", &serde_json::json!({ "items": ["a", "b", "c"] }))
-                .as_deref(),
-            Some("3 tasks")
-        );
-        // empty argument-less call reads.
-        assert_eq!(
-            builtin_primary_param("todo", &serde_json::json!({})).as_deref(),
-            Some("read")
-        );
+        // A read takes nothing and shows nothing.
+        assert!(builtin_primary_param("todo_read", &serde_json::json!({})).is_none());
     }
 
     #[test]
@@ -2228,11 +2386,11 @@ mod tests {
     fn builtin_primary_param_names_each_tool_s_primary_argument() {
         let input = serde_json::json!({"command": "ls", "path": "/tmp"});
         assert_eq!(
-            builtin_primary_param("execute_command", &input).as_deref(),
+            builtin_primary_param("shell_execute", &input).as_deref(),
             Some("ls")
         );
         assert_eq!(
-            builtin_primary_param("read_file", &input).as_deref(),
+            builtin_primary_param("file_read", &input).as_deref(),
             Some("/tmp")
         );
         assert_eq!(builtin_primary_param("unknown_tool", &input), None);
@@ -2241,14 +2399,14 @@ mod tests {
     #[test]
     fn builtin_primary_param_missing() {
         let input = serde_json::json!({"other": "value"});
-        assert_eq!(builtin_primary_param("execute_command", &input), None);
+        assert_eq!(builtin_primary_param("shell_execute", &input), None);
     }
 
     #[test]
     fn builtin_primary_param_render_image_from_scratchpad() {
         let input = serde_json::json!({"from_scratchpad": "frame4"});
         assert_eq!(
-            builtin_primary_param("render_image", &input).as_deref(),
+            builtin_primary_param("image_render", &input).as_deref(),
             Some("frame4")
         );
     }
@@ -2257,7 +2415,7 @@ mod tests {
     fn builtin_primary_param_render_image_inline_base64() {
         let input = serde_json::json!({"base64": "iVBOR..."});
         assert_eq!(
-            builtin_primary_param("render_image", &input).as_deref(),
+            builtin_primary_param("image_render", &input).as_deref(),
             Some("<inline base64>")
         );
     }
@@ -2266,7 +2424,7 @@ mod tests {
     fn builtin_primary_param_render_image_from_scratchpad_takes_precedence() {
         let input = serde_json::json!({"from_scratchpad": "frame4", "base64": "iVBOR..."});
         assert_eq!(
-            builtin_primary_param("render_image", &input).as_deref(),
+            builtin_primary_param("image_render", &input).as_deref(),
             Some("frame4")
         );
     }
@@ -2274,7 +2432,7 @@ mod tests {
     #[test]
     fn builtin_primary_param_render_image_empty() {
         let input = serde_json::json!({});
-        assert_eq!(builtin_primary_param("render_image", &input), None);
+        assert_eq!(builtin_primary_param("image_render", &input), None);
     }
 
     #[test]
@@ -2356,7 +2514,7 @@ mod tests {
         let schema = serde_json::json!({"required": ["path"]});
         let input = serde_json::json!({"command": "ls -la", "path": "/ignored"});
         assert_eq!(
-            resolve_primary_param("execute_command", &input, Some(&schema)).as_deref(),
+            resolve_primary_param("shell_execute", &input, Some(&schema)).as_deref(),
             Some("ls -la")
         );
     }

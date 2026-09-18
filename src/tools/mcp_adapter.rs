@@ -99,7 +99,7 @@ impl ServerToolsObserver for ToolRegistry {
 /// delegate through `ServerEntry::require_connected` themselves and so tolerate servers that are
 /// still Pending or have Failed until a specific one is called.
 ///
-/// Takes the manager by `Arc` so the registry can hold a `Weak` back to it. `load_tool` needs that
+/// Takes the manager by `Arc` so the registry can hold a `Weak` back to it. `tool_load` needs that
 /// to explain that a name it cannot find belongs to a server that is not connected, rather than
 /// reporting it as unknown.
 pub(crate) async fn attach_session_registry(

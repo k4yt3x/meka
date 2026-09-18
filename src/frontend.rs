@@ -411,7 +411,7 @@ pub(crate) enum FrontendEvent {
     /// A tool call is about to be dispatched. `id` is the `tool_use_id` assigned by the provider;
     /// frontends use it to correlate this announcement with the matching
     /// [`Self::ToolCallCompleted`]. `display_summary` is the agent-resolved primary argument for
-    /// display (e.g. the path for `read_file`, the command for `execute_command`), pre-computed via
+    /// display (e.g. the path for `file_read`, the command for `shell_execute`), pre-computed via
     /// [`crate::tools::resolve_primary_param`] so frontends don't need the tool's JSON Schema to
     /// render the indicator. `None` means "no obvious primary arg". Render the bare tool name.
     ToolCallStarted {
@@ -427,17 +427,17 @@ pub(crate) enum FrontendEvent {
     ToolCallCompleted {
         id: String,
         /// Tool name (matches the [`Self::ToolCallStarted`] `name`). Lets a frontend format the
-        /// output per tool, e.g. wrapping `execute_command` output in a console code block.
+        /// output per tool, e.g. wrapping `shell_execute` output in a console code block.
         name: String,
         is_error: bool,
         content: Vec<crate::conversation::ToolResultContent>,
-        /// Tool-specific structured side-channel. `edit_file` / `write_file` populate
+        /// Tool-specific structured side-channel. `file_edit` / `file_write` populate
         /// [`ToolOutputMetadata::Diff`] so ACP can emit a proper `diff` content block (and Zed can
         /// render its apply-diff UI). `None` for tools that have nothing extra.
         metadata: Option<ToolOutputMetadata>,
     },
     /// Output a still-running tool has produced so far, as it arrives. `id` matches the
-    /// [`Self::ToolCallStarted`] `id`. Only `execute_command` emits these today: a build or a test
+    /// [`Self::ToolCallStarted`] `id`. Only `shell_execute` emits these today: a build or a test
     /// run is silent for its whole duration otherwise, since [`Self::ToolCallCompleted`] can't fire
     /// until the process exits.
     ///
@@ -449,7 +449,7 @@ pub(crate) enum FrontendEvent {
     /// stdout and stderr arrive interleaved in production order, the way a terminal shows them.
     /// The model-facing result assembled at completion still separates the two streams.
     ToolCallOutputDelta { id: String, chunk: String },
-    /// The shared todo list changed via the `todo` tool. Emitted by the agent loop after the tool
+    /// The shared todo list changed via a `todo_*` tool. Emitted by the agent loop after the tool
     /// succeeds and only when the rendered state actually changed; the REPL renders the list and
     /// the agent's per-turn `OutputSpacing` is advanced. `title` is the heading the agent set
     /// for the list.
@@ -510,14 +510,14 @@ pub(crate) enum FrontendEvent {
 /// `content` text is still the source of truth for the model and the REPL).
 #[derive(Debug, Clone)]
 pub(crate) enum ToolOutputMetadata {
-    /// Pre/post file content produced by `edit_file` / `write_file`. `old_text == None` means the
+    /// Pre/post file content produced by `file_edit` / `file_write`. `old_text == None` means the
     /// file did not exist before the call (the write created it).
     Diff {
         path: std::path::PathBuf,
         old_text: Option<String>,
         new_text: String,
     },
-    /// How an `execute_command` child ended. The exit code is already spelled out in the tool text
+    /// How a `shell_execute` child ended. The exit code is already spelled out in the tool text
     /// for the model, but a frontend rendering a terminal needs it as a number, and parsing it back
     /// out of the prose would be a guess. `exit_code == None` with a `signal` means the process was
     /// killed; both `None` means it never got far enough to have either (timeout, spawn failure).
@@ -532,7 +532,7 @@ pub(crate) enum ToolOutputMetadata {
 pub(crate) struct PermissionRequest {
     pub(crate) tool_name: String,
     /// The most user-meaningful argument for display in the prompt (e.g. the file path for
-    /// `read_file`, the command for `execute_command`). Resolved via
+    /// `file_read`, the command for `shell_execute`). Resolved via
     /// [`crate::tools::resolve_primary_param`]. Still the right shape for a client that wants one
     /// line: the ACP frontend builds its permission title from it.
     pub(crate) primary_param: Option<String>,
@@ -542,8 +542,8 @@ pub(crate) struct PermissionRequest {
     /// decides whether the call outlives the turn, so it is put back for the asking.
     ///
     /// `primary_param` alone is not enough to authorize a call. It resolves to the *destination*
-    /// for every write-shaped tool -- `path` for `write_file` and `edit_file`, `url` for
-    /// `fetch_url`, `name` for `scratchpad_write` -- so a prompt built from it asks the user
+    /// for every write-shaped tool -- `path` for `file_write` and `file_edit`, `url` for
+    /// `web_fetch`, `name` for `scratchpad_write` -- so a prompt built from it asks the user
     /// to approve a write without showing them what is being written. A frontend that gates on
     /// human judgment should render this instead.
     pub(crate) input: serde_json::Value,
@@ -939,7 +939,7 @@ mod tests {
         let frontend = SilentFrontend;
         let outcome = frontend
             .request_permission(PermissionRequest {
-                tool_name: "read_file".to_string(),
+                tool_name: "file_read".to_string(),
                 primary_param: Some("/tmp/foo".to_string()),
                 input: serde_json::json!({"path": "/tmp/foo"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
@@ -979,21 +979,21 @@ mod tests {
     #[test]
     fn a_sticky_answer_covers_every_later_call_to_the_tool_until_cleared() {
         let sticky = StickyApprovals::default();
-        assert_eq!(sticky.remembered("write_file"), None);
-        sticky.remember_allow("write_file");
-        sticky.remember_deny("execute_command");
+        assert_eq!(sticky.remembered("file_write"), None);
+        sticky.remember_allow("file_write");
+        sticky.remember_deny("shell_execute");
         assert_eq!(
-            sticky.remembered("write_file"),
+            sticky.remembered("file_write"),
             Some(PermissionOutcome::Allow)
         );
         assert_eq!(
-            sticky.remembered("execute_command"),
+            sticky.remembered("shell_execute"),
             Some(PermissionOutcome::Deny)
         );
-        assert_eq!(sticky.remembered("read_file"), None);
+        assert_eq!(sticky.remembered("file_read"), None);
         sticky.clear();
-        assert_eq!(sticky.remembered("write_file"), None);
-        assert_eq!(sticky.remembered("execute_command"), None);
+        assert_eq!(sticky.remembered("file_write"), None);
+        assert_eq!(sticky.remembered("shell_execute"), None);
     }
 
     /// The activity record is a display aid; a panic that poisoned its lock elsewhere must not
@@ -1012,8 +1012,8 @@ mod tests {
         assert!(frontend.activity.is_poisoned());
 
         assert_eq!(
-            frontend.record_activity("read_file: a.txt".to_string()),
-            "read_file: a.txt"
+            frontend.record_activity("file_read: a.txt".to_string()),
+            "file_read: a.txt"
         );
     }
 
@@ -1039,12 +1039,12 @@ mod tests {
     async fn tool_call_started_carries_resolved_display_summary() {
         let recorder = RecordingFrontend::new();
         let input = serde_json::json!({"path": "/etc/hosts"});
-        let display_summary = crate::tools::resolve_primary_param("read_file", &input, None);
+        let display_summary = crate::tools::resolve_primary_param("file_read", &input, None);
         assert_eq!(display_summary.as_deref(), Some("/etc/hosts"));
         recorder
             .emit(FrontendEvent::ToolCallStarted {
                 id: "call_1".to_string(),
-                name: "read_file".to_string(),
+                name: "file_read".to_string(),
                 input: input.clone(),
                 display_summary: display_summary.clone(),
             })
@@ -1066,7 +1066,7 @@ mod tests {
         let frontend = RecordingFrontend::with_permission(PermissionOutcome::Deny);
         let outcome = frontend
             .request_permission(PermissionRequest {
-                tool_name: "execute_command".to_string(),
+                tool_name: "shell_execute".to_string(),
                 primary_param: Some("rm -rf /".to_string()),
                 input: serde_json::json!({"command": "rm -rf /"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
@@ -1101,9 +1101,9 @@ mod tests {
         let forwarder = PermissionForwardingFrontend::new(delegate, Some("toolu_parent".into()));
 
         for (name, summary) in [
-            ("read_file", Some("/etc/hosts".to_string())),
-            ("find_files", Some("**/*.rs".to_string())),
-            ("todo", None),
+            ("file_read", Some("/etc/hosts".to_string())),
+            ("file_find", Some("**/*.rs".to_string())),
+            ("todo_read", None),
         ] {
             forwarder
                 .emit(FrontendEvent::ToolCallStarted {
@@ -1124,7 +1124,10 @@ mod tests {
                 summary,
             } => {
                 assert_eq!(tool_call_id, "toolu_parent");
-                assert_eq!(summary, "read_file: /etc/hosts\nfind_files: **/*.rs\ntodo");
+                assert_eq!(
+                    summary,
+                    "file_read: /etc/hosts\nfile_find: **/*.rs\ntodo_read"
+                );
             }
             other => panic!("expected SubAgentActivity; got {other:?}"),
         }
@@ -1141,7 +1144,7 @@ mod tests {
             forwarder
                 .emit(FrontendEvent::ToolCallStarted {
                     id: format!("toolu_{i}"),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({}),
                     display_summary: Some(format!("/file{i}")),
                 })
@@ -1161,7 +1164,7 @@ mod tests {
         assert_eq!(
             lines[0],
             format!(
-                "read_file: /file{}",
+                "file_read: /file{}",
                 total - PermissionForwardingFrontend::MAX_ACTIVITY_LINES
             ),
             "the oldest lines are dropped, not the newest"
@@ -1179,7 +1182,7 @@ mod tests {
         forwarder
             .emit(FrontendEvent::ToolCallStarted {
                 id: "toolu_1".into(),
-                name: "read_file".into(),
+                name: "file_read".into(),
                 input: serde_json::json!({}),
                 display_summary: Some("/etc/hosts".into()),
             })
@@ -1200,7 +1203,7 @@ mod tests {
         forwarder
             .emit(FrontendEvent::SubAgentActivity {
                 tool_call_id: "toolu_nested".into(),
-                summary: "read_file: /deep".into(),
+                summary: "file_read: /deep".into(),
             })
             .await;
 
@@ -1221,7 +1224,7 @@ mod tests {
         forwarder
             .emit(FrontendEvent::ToolCallComposing {
                 id: "toolu_child".into(),
-                name: "read_file".into(),
+                name: "file_read".into(),
             })
             .await;
         forwarder
@@ -1297,7 +1300,7 @@ mod tests {
         let forwarder = PermissionForwardingFrontend::new(delegate, None);
         let outcome = forwarder
             .request_permission(PermissionRequest {
-                tool_name: "write_file".into(),
+                tool_name: "file_write".into(),
                 primary_param: Some("/tmp/foo".into()),
                 input: serde_json::json!({"path": "/tmp/foo"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),

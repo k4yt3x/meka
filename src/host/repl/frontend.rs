@@ -500,7 +500,7 @@ mod tests {
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             frontend.request_permission(crate::frontend::PermissionRequest {
-                tool_name: "write_file".to_string(),
+                tool_name: "file_write".to_string(),
                 primary_param: Some("/tmp/x".to_string()),
                 input: serde_json::json!({"path": "/tmp/x"}),
                 cancellation,
@@ -544,7 +544,7 @@ mod tests {
             ("the turn finished", FrontendEvent::TurnFinished),
             ("a tool call followed", FrontendEvent::ToolCallStarted {
                 id: "1".into(),
-                name: "read_file".into(),
+                name: "file_read".into(),
                 input: serde_json::json!({"path": "/etc/hosts"}),
                 display_summary: None,
             }),
@@ -723,7 +723,7 @@ mod tests {
         });
         let outcome = frontend_on(Arc::clone(&console))
             .request_permission(crate::frontend::PermissionRequest {
-                tool_name: "execute_command".to_string(),
+                tool_name: "shell_execute".to_string(),
                 primary_param: Some("rm -rf /".to_string()),
                 input: serde_json::json!({"command": "rm -rf /"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
@@ -783,7 +783,7 @@ mod tests {
             let frontend = Arc::clone(&frontend);
             async move {
                 frontend
-                    .request_permission(permission_request("write_file"))
+                    .request_permission(permission_request("file_write"))
                     .await
             }
         });
@@ -796,7 +796,7 @@ mod tests {
         // and hang rather than fail.
         let remembered = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            frontend.request_permission(permission_request("write_file")),
+            frontend.request_permission(permission_request("file_write")),
         )
         .await
         .expect("a remembered answer resolves without a prompt");
@@ -809,7 +809,7 @@ mod tests {
             let frontend = Arc::clone(&frontend);
             async move {
                 frontend
-                    .request_permission(permission_request("execute_command"))
+                    .request_permission(permission_request("shell_execute"))
                     .await
             }
         });
@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(other.await.expect("task"), PermissionOutcome::Deny);
         let remembered = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            frontend.request_permission(permission_request("execute_command")),
+            frontend.request_permission(permission_request("shell_execute")),
         )
         .await
         .expect("a remembered denial resolves without a prompt");
@@ -834,7 +834,7 @@ mod tests {
             let frontend = Arc::clone(&frontend);
             async move {
                 frontend
-                    .request_permission(permission_request("write_file"))
+                    .request_permission(permission_request("file_write"))
                     .await
             }
         });
@@ -900,14 +900,14 @@ mod tests {
             (
                 E::ToolCallComposing {
                     id: "1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                 },
                 IndicatorAction::Commit,
             ),
             (
                 E::ToolCallStarted {
                     id: "1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({}),
                     display_summary: None,
                 },
@@ -916,7 +916,7 @@ mod tests {
             (
                 E::ToolCallCompleted {
                     id: "1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     is_error: false,
                     content: Vec::new(),
                     metadata: None,

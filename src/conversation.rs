@@ -1499,7 +1499,7 @@ mod tests {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: use_id.to_string(),
-                name: "read_file".to_string(),
+                name: "file_read".to_string(),
                 input: serde_json::json!({"path": "/tmp/x"}),
             }],
         }
@@ -2200,7 +2200,7 @@ mod tests {
                 },
                 ContentBlock::ToolUse {
                     id: "u1".to_string(),
-                    name: "execute_command".to_string(),
+                    name: "shell_execute".to_string(),
                     input: serde_json::json!({"command": "git diff"}),
                 },
                 ContentBlock::ToolUse {
@@ -2334,7 +2334,7 @@ mod tests {
 
     #[test]
     fn extract_loaded_tool_names_recovers_snapshot_across_boundary() {
-        // Pre-boundary: load_tool(scratchpad_read) succeeds. After the boundary swallows it, the
+        // Pre-boundary: tool_load(scratchpad_read) succeeds. After the boundary swallows it, the
         // snapshot must restore scratchpad_read in the active set.
         let mut log = Conversation::new();
         log.append(load_tool_use("u1", "scratchpad_read"));
@@ -2402,7 +2402,7 @@ mod tests {
 
     #[test]
     fn extract_loaded_tool_names_pending_use_wiped_at_boundary() {
-        // load_tool tool_use lives on one side of the boundary, its tool_result on the other; both
+        // tool_load tool_use lives on one side of the boundary, its tool_result on the other; both
         // vanish from the materialized view, so the scanner must NOT count the pending pair across
         // the boundary.
         let mut log = Conversation::new();

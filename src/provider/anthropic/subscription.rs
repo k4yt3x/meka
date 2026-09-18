@@ -1311,7 +1311,7 @@ mod tests {
         let provider = provider_for_test();
 
         let tools = vec![ToolDefinition::new(
-            "read_file".to_string(),
+            "file_read".to_string(),
             "Read a file".to_string(),
             serde_json::json!({
                 "type": "object",
@@ -1332,7 +1332,7 @@ mod tests {
         );
         let claude_tools = body["tools"].as_array().expect("tools should be array");
         assert_eq!(claude_tools.len(), 1);
-        assert_eq!(claude_tools[0]["name"], "read_file");
+        assert_eq!(claude_tools[0]["name"], "file_read");
         assert_eq!(claude_tools[0]["description"], "Read a file");
         assert!(claude_tools[0].get("input_schema").is_some());
         // Tools carry no cache_control (matches the captured CLI wire).
@@ -1349,7 +1349,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
                     id: "toolu_1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/test.txt"}),
                 }],
             },
@@ -1386,7 +1386,7 @@ mod tests {
             .expect("content should be array");
         assert_eq!(assistant_content[0]["type"], "tool_use");
         assert_eq!(assistant_content[0]["id"], "toolu_1");
-        assert_eq!(assistant_content[0]["name"], "read_file");
+        assert_eq!(assistant_content[0]["name"], "file_read");
 
         assert_eq!(claude_messages[2]["role"], "user");
         let result_content = claude_messages[2]["content"]
@@ -1438,7 +1438,7 @@ mod tests {
                 {
                     "type": "tool_use",
                     "id": "toolu_abc",
-                    "name": "read_file",
+                    "name": "file_read",
                     "input": {"path": "/tmp/test.txt"}
                 }
             ],
@@ -1457,7 +1457,7 @@ mod tests {
 
         if let ContentBlock::ToolUse { id, name, input } = &tool_uses[0] {
             assert_eq!(id, "toolu_abc");
-            assert_eq!(name, "read_file");
+            assert_eq!(name, "file_read");
             assert_eq!(input["path"], "/tmp/test.txt");
         } else {
             panic!("expected ToolUse block");
@@ -1541,7 +1541,7 @@ mod tests {
             "role": "assistant",
             "content": [{
                 "type": "tool_use",
-                "name": "read_file",
+                "name": "file_read",
                 "input": {"path": "/tmp/test.txt"}
             }],
             "stop_reason": "tool_use"
@@ -2818,7 +2818,7 @@ mod tests {
     fn cache_control_uses_one_hour_ttl_everywhere() {
         let provider = provider_for_test();
         let tools = vec![ToolDefinition::new(
-            "read_file",
+            "file_read",
             "Read a file",
             serde_json::json!({"type": "object"}),
         )];
@@ -2972,12 +2972,12 @@ mod tests {
     fn tools_for_test() -> Vec<ToolDefinition> {
         vec![
             ToolDefinition::new(
-                "read_file".to_string(),
+                "file_read".to_string(),
                 "Read a file".to_string(),
                 serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
             ),
             ToolDefinition::new(
-                "execute_command".to_string(),
+                "shell_execute".to_string(),
                 "Run a shell command".to_string(),
                 serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
             ),
@@ -3199,8 +3199,8 @@ mod tests {
         assert_ne!(u1_text, u2_text);
     }
 
-    /// `load_tool` activation must NOT mutate the cacheable system prompt. This is the regression
-    /// guard for the deferred-tool refactor: when the model invokes `load_tool` to expose a
+    /// `tool_load` activation must NOT mutate the cacheable system prompt. This is the regression
+    /// guard for the deferred-tool refactor: when the model invokes `tool_load` to expose a
     /// deferred tool's schema, the system prompt block stays byte-identical (so breakpoint 2 cache
     /// hits); the tools array is what grows, append-only, so its prior entries also cache
     /// (breakpoint 3).
@@ -3300,7 +3300,7 @@ mod tests {
             "fixture_deferred should be deferred in turn 1"
         );
 
-        // Turn 2: the model has called `load_tool` for fixture_deferred, so the next request should
+        // Turn 2: the model has called `tool_load` for fixture_deferred, so the next request should
         // expose its schema.
         let messages_t2 = vec![
             Message::user(&u1_text),
@@ -3308,7 +3308,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
                     id: "toolu_1".to_string(),
-                    name: "load_tool".to_string(),
+                    name: "tool_load".to_string(),
                     input: serde_json::json!({"name": "fixture_deferred"}),
                 }],
             },
@@ -3324,7 +3324,7 @@ mod tests {
             },
         ];
         // System prompt is rebuilt the same way every turn; its content is a function of the
-        // catalog, not the messages, so it must not shift when load_tool is invoked.
+        // catalog, not the messages, so it must not shift when tool_load is invoked.
         let system_t2 = build_system_prompt(true, None);
         let tools_t2 = registry.definitions_active(&messages_t2);
         let body_t2 = provider.build_request_body(
@@ -3339,18 +3339,18 @@ mod tests {
         // 1. The system prompt is byte-identical. (Breakpoint 2 cache-hit.)
         assert_eq!(
             body_t1["system"], body_t2["system"],
-            "system prompt diverged across load_tool invocation: cache prefix invalidated"
+            "system prompt diverged across tool_load invocation: cache prefix invalidated"
         );
 
         // 2. The tools array gained fixture_deferred (append-only growth).
         assert!(
             tools_t2.iter().any(|t| t.name == "fixture_deferred"),
-            "fixture_deferred should be active in turn 2 after load_tool"
+            "fixture_deferred should be active in turn 2 after tool_load"
         );
         assert_eq!(
             tools_t2.len(),
             tools_t1.len() + 1,
-            "tools array should grow by exactly one entry after load_tool"
+            "tools array should grow by exactly one entry after tool_load"
         );
 
         // 3. The prior tools (turn-1 set) are present in turn-2 in the same relative order, i.e.,
@@ -3497,9 +3497,9 @@ mod tests {
     }
 
     /// Compaction must not silently drop the deferred-tool active set. Pre-compaction, the model
-    /// loads a deferred fixture via `load_tool`; post-compaction, the
+    /// loads a deferred fixture via `tool_load`; post-compaction, the
     /// `Event::CompactBoundary::loaded_tools_snapshot` must keep the loaded tool in the API tools
-    /// array even though the pre-compaction `load_tool` rows have moved below the materialized
+    /// array even though the pre-compaction `tool_load` rows have moved below the materialized
     /// view's logical start.
     #[tokio::test]
     async fn compaction_preserves_loaded_tools_active_set() {
@@ -3557,14 +3557,14 @@ mod tests {
         .expect("default web client config should build cleanly");
         registry.register_deferred_fixture("fixture_deferred");
 
-        // Pre-compaction: load fixture_deferred via load_tool.
+        // Pre-compaction: load fixture_deferred via tool_load.
         let mut log = Conversation::new();
         log.append(Message::user("question 1"));
         log.append(Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: "u1".to_string(),
-                name: "load_tool".to_string(),
+                name: "tool_load".to_string(),
                 input: serde_json::json!({"name": "fixture_deferred"}),
             }],
         });
@@ -3742,7 +3742,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
                     id: "toolu_1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/test.txt"}),
                 }],
             },
@@ -3773,7 +3773,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
                     id: "toolu_1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/test.txt"}),
                 }],
             },
@@ -3791,7 +3791,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
                     id: "toolu_2".to_string(),
-                    name: "execute_command".to_string(),
+                    name: "shell_execute".to_string(),
                     input: serde_json::json!({"command": "wc -l /tmp/test.txt"}),
                 }],
             },
@@ -3862,7 +3862,7 @@ mod tests {
                     role: Role::Assistant,
                     content: vec![ContentBlock::ToolUse {
                         id: "t1".to_string(),
-                        name: "read_file".to_string(),
+                        name: "file_read".to_string(),
                         input: serde_json::json!({"path": "/tmp/x"}),
                     }],
                 },
@@ -4044,7 +4044,7 @@ mod tests {
                 },
                 ContentBlock::ToolUse {
                     id: "toolu_1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/x"}),
                 },
             ],
@@ -4144,7 +4144,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
                     id: format!("toolu_{i}"),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({"path": format!("/tmp/file{}", i)}),
                 }],
             });
@@ -4200,7 +4200,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
                     id: "t1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/x"}),
                 }],
             },
@@ -4279,12 +4279,12 @@ mod tests {
 
         let tools = vec![
             ToolDefinition::new(
-                "read_file".to_string(),
+                "file_read".to_string(),
                 "Read a file".to_string(),
                 serde_json::json!({"type": "object"}),
             ),
             ToolDefinition::new(
-                "write_file".to_string(),
+                "file_write".to_string(),
                 "Write a file".to_string(),
                 serde_json::json!({"type": "object"}),
             ),

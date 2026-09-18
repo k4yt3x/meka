@@ -4,7 +4,7 @@ Both tools default to sweeping every [workspace root](../usage/acp.md#multi-root
 working directory, plus any extra folders an ACP client supplied. Passing `path` searches exactly
 that tree instead.
 
-## `find_files`
+## `file_find`
 
 Find files matching a glob pattern.
 
@@ -40,7 +40,7 @@ Find files matching a glob pattern.
 
 ---
 
-## `search_contents`
+## `file_search`
 
 Search file contents using a regex pattern. Powered by the ripgrep library.
 
@@ -61,7 +61,7 @@ Search file contents using a regex pattern. Powered by the ripgrep library.
 - Searches recursively through directories.
 - Skips hidden files (starting with `.`), the `target` and `node_modules` directories, and, below
   `unrestricted`, meka's own private directories: the config directory, the data directory holding
-  `meka.db`, and the command-output captures. `find_files` steps around the same three.
+  `meka.db`, and the command-output captures. `file_find` steps around the same three.
 - **`.gitignore` is not honored.** Only the matcher comes from ripgrep; the walk is meka's own, and
   those four exclusions are all of it. A build directory that is ignored but not named above is
   searched, so pass `glob` or `path` to stay out of one.

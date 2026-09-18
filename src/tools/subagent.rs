@@ -260,7 +260,7 @@ pub(crate) fn agent_spawn_definition(profile_choices: &[String]) -> ToolDefiniti
                       consume large captured output via `scratchpad_read` without you \
                       re-inlining it in the prompt. Tip: when you expect to hand output to a \
                       sub-agent later, set the `scratchpad` parameter on the originating \
-                      tool call (e.g. `execute_command({command: \"...\", scratchpad: \
+                      tool call (e.g. `shell_execute({command: \"...\", scratchpad: \
                       \"build_log\"})`) so the entry has a semantic name you can pass \
                       through `inherit_scratchpad`. Sub-agents may themselves spawn further \
                       sub-agents up to a configured depth; tune a subtree's depth with \
@@ -363,7 +363,7 @@ pub(crate) fn agent_spawn_definition(profile_choices: &[String]) -> ToolDefiniti
                 "type": "array",
                 "items": { "type": "string" },
                 "description": "Individual tool names the sub-agent must not see, as they \
-                                appear in your own tool list (e.g. \"write_file\", \
+                                appear in your own tool list (e.g. \"file_write\", \
                                 \"mcp__notion__create_page\"). For a whole server, prefer \
                                 `deny_servers`."
             },
@@ -1847,7 +1847,7 @@ async fn build_subagent(
         InstructionAccess::Inherit => params.parent_options.user_instructions.clone(),
         InstructionAccess::None => None,
     };
-    // A fresh, private todo list so the worker's `todo` calls don't touch the parent's task
+    // A fresh, private todo list so the worker's `todo_*` calls don't touch the parent's task
     // tracking. Not persisted, so a follow-up starts with an empty one; the resume notice the
     // rehydrated conversation carries is what tells the worker its tool state is gone.
     let sub_todo_list = crate::todo::SharedTodoList::default();
@@ -1995,9 +1995,11 @@ async fn build_subagent(
     } else {
         String::new()
     };
+    let catalog = sub_registry.tool_catalog();
     let sub_system_prompt = build_subagent_system_prompt(
         effective_permission,
         &tools,
+        &catalog,
         &spec.inherited_scratchpad,
         granted_instructions.as_deref(),
         &memory_index,
@@ -2263,6 +2265,7 @@ fn render_subagent_memory_index(memories: &[crate::memory::Memory]) -> String {
 fn build_subagent_system_prompt(
     permission: Permission,
     tools: &[ToolDefinition],
+    catalog: &[crate::prompt::ToolCatalogEntry],
     inherited_scratchpad: &[String],
     user_instructions: Option<&str>,
     memory_index: &str,
@@ -2272,10 +2275,10 @@ fn build_subagent_system_prompt(
         "You are a research sub-agent. Complete the assigned task using the \
          available tools, then produce a concise final report summarizing your \
          findings. Do not ask follow-up questions. Work with what you have. \
-         For multi-step work, use the `todo` tool to plan and track progress: \
-         pass `items` together with a `title` to (re)write the list, `set` to \
-         update statuses by task number, and call `todo` with no arguments to \
-         read the current list. Your todo list is private to this sub-agent.\n\n",
+         For multi-step work, plan and track progress with the `todo_*` tools: \
+         `todo_write` sets the list, `todo_edit` updates statuses by task \
+         number, `todo_read` shows it. Your todo list is private to this \
+         sub-agent.\n\n",
     );
 
     prompt.push_str(&format!("## Permission Level: {permission}\n\n"));
@@ -2322,6 +2325,16 @@ fn build_subagent_system_prompt(
         prompt.push('\n');
     }
 
+    // The deferred half of the worker's registry, in the section the root reads in its world
+    // render and through the same function, so a worker's picture of the tools its parent's
+    // servers gave it never drifts from its parent's. The world render itself is skipped for a
+    // worker (`Agent::run_turn`, on the prompt override), so this is where the listing rides.
+    let discovery = crate::prompt::render_tool_discovery(catalog);
+    if !discovery.is_empty() {
+        prompt.push_str(&discovery);
+        prompt.push('\n');
+    }
+
     prompt
 }
 
@@ -2351,7 +2364,8 @@ mod tests {
 
     #[test]
     fn subagent_system_prompt_reflects_inherited_permission() {
-        let prompt = build_subagent_system_prompt(Permission::Unrestricted, &[], &[], None, "");
+        let prompt =
+            build_subagent_system_prompt(Permission::Unrestricted, &[], &[], &[], None, "");
         assert!(
             prompt.contains(&format!(
                 "## Permission Level: {}",
@@ -2360,7 +2374,7 @@ mod tests {
             "expected Write level in prompt, got: {prompt}"
         );
 
-        let read_prompt = build_subagent_system_prompt(Permission::Read, &[], &[], None, "");
+        let read_prompt = build_subagent_system_prompt(Permission::Read, &[], &[], &[], None, "");
         assert!(read_prompt.contains(&format!("## Permission Level: {}", Permission::Read)));
     }
 
@@ -2369,23 +2383,63 @@ mod tests {
     /// voice, under rules written for a conversation it is not part of.
     #[test]
     fn subagent_system_prompt_carries_no_user_instructions() {
-        let prompt = build_subagent_system_prompt(Permission::Unrestricted, &[], &[], None, "");
+        let prompt =
+            build_subagent_system_prompt(Permission::Unrestricted, &[], &[], &[], None, "");
         assert!(!prompt.contains("User Instructions"));
         assert!(!prompt.contains("installation-specific"));
     }
 
+    /// A worker holds every deferred tool its parent's servers gave it, so it is told about them
+    /// the way the root is: the same section, through the same function.
+    #[test]
+    fn subagent_system_prompt_lists_deferred_tools_for_discovery() {
+        let catalog: Vec<crate::prompt::ToolCatalogEntry> = vec![
+            (
+                "tool_search".to_string(),
+                "Search tools.".to_string(),
+                Permission::Read,
+                false,
+            ),
+            (
+                "mcp__notion__search".to_string(),
+                "Search Notion pages.".to_string(),
+                Permission::Read,
+                true,
+            ),
+        ];
+        let prompt = build_subagent_system_prompt(Permission::Read, &[], &catalog, &[], None, "");
+        assert!(prompt.contains("[Tool discovery]"), "{prompt}");
+        assert!(
+            prompt.contains("- **mcp__notion__search** (requires `read`): Search Notion pages."),
+            "{prompt}"
+        );
+        assert!(prompt.contains("`tool_search` finds a tool"), "{prompt}");
+    }
+
+    #[test]
+    fn subagent_system_prompt_has_no_discovery_section_without_deferred_tools() {
+        let catalog: Vec<crate::prompt::ToolCatalogEntry> = vec![(
+            "file_read".to_string(),
+            "Read a file.".to_string(),
+            Permission::Read,
+            false,
+        )];
+        let prompt = build_subagent_system_prompt(Permission::Read, &[], &catalog, &[], None, "");
+        assert!(!prompt.contains("[Tool discovery]"), "{prompt}");
+    }
+
     #[test]
     fn subagent_system_prompt_mentions_todo_tools() {
-        let prompt = build_subagent_system_prompt(Permission::Read, &[], &[], None, "");
+        let prompt = build_subagent_system_prompt(Permission::Read, &[], &[], &[], None, "");
         assert!(
-            prompt.contains("`todo` tool"),
+            prompt.contains("`todo_*` tools"),
             "expected todo tool mention in prompt, got: {prompt}"
         );
     }
 
     #[test]
     fn subagent_system_prompt_omits_inheritance_section_when_empty() {
-        let prompt = build_subagent_system_prompt(Permission::Read, &[], &[], None, "");
+        let prompt = build_subagent_system_prompt(Permission::Read, &[], &[], &[], None, "");
         assert!(
             !prompt.contains("Inherited Scratchpad"),
             "no inherited section expected for empty allowlist, got: {prompt}"
@@ -2395,7 +2449,7 @@ mod tests {
     #[test]
     fn subagent_system_prompt_lists_inherited_names() {
         let names = vec!["captured_output".to_string(), "research_notes".to_string()];
-        let prompt = build_subagent_system_prompt(Permission::Read, &[], &names, None, "");
+        let prompt = build_subagent_system_prompt(Permission::Read, &[], &[], &names, None, "");
         assert!(prompt.contains("## Inherited Scratchpad Entries"));
         assert!(prompt.contains("- captured_output"));
         assert!(prompt.contains("- research_notes"));
@@ -2405,7 +2459,7 @@ mod tests {
     #[test]
     fn subagent_system_prompt_warns_inherited_writes_will_error() {
         let names = vec!["build_log".to_string()];
-        let prompt = build_subagent_system_prompt(Permission::Read, &[], &names, None, "");
+        let prompt = build_subagent_system_prompt(Permission::Read, &[], &[], &names, None, "");
         assert!(
             prompt.contains("will return an error"),
             "expected write-rejection wording, got: {prompt}",
@@ -2647,7 +2701,7 @@ mod tests {
                 .is_empty()
         );
         // A non-array value is not a one-element list. A bare string is a refusal, not an empty
-        // list: read as empty, `deny_tools: "write_file"` would spawn an unrestricted worker.
+        // list: read as empty, `deny_tools: "file_write"` would spawn an unrestricted worker.
         assert!(string_array(&serde_json::json!({"x": "notion"}), "x", "agent_spawn").is_err());
         assert!(
             optional_u64(
@@ -2801,7 +2855,9 @@ mod tests {
         )
         .expect("subagent registry should build");
 
-        let todo = sub_registry.get("todo").expect("subagent should have todo");
+        let todo = sub_registry
+            .get("todo_write")
+            .expect("subagent should have todo_write");
         todo.execute(
             serde_json::json!({ "title": "Sub work", "items": ["sub task"] }),
             crate::tools::ToolContext::detached(CancellationToken::new()),
@@ -2816,12 +2872,71 @@ mod tests {
         );
     }
 
+    /// Both registry meta-tools reach a worker through the door the root uses, so a worker can
+    /// find and load the deferred tools its parent's servers gave it.
+    #[tokio::test]
+    async fn a_worker_registry_carries_tool_search() {
+        use crate::{
+            config::BuiltinToolFilter,
+            sandbox::{BackendProbe, SandboxCapability},
+        };
+
+        let sub_registry = ToolRegistry::build_for_subagent(
+            &crate::session::SessionMaterials {
+                providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
+                    Store::for_test().await.token_store(),
+                    &["test-profile"],
+                )),
+                core: crate::session::CoreMaterials {
+                    web_client: crate::config::WebClientConfig::default(),
+                    sandbox_enabled: true,
+                    sandbox_capability: SandboxCapability::Unavailable,
+                    sandbox_backend: crate::config::SandboxBackend::Landlock,
+                    backend_probe: BackendProbe::Missing {
+                        reason: "test fixture".to_string(),
+                    },
+                    builtin_filter: BuiltinToolFilter::default(),
+                    write_locks: crate::workspace::WriteLocks::default(),
+                },
+                skills: crate::skills::SkillCache::for_root(None),
+                memories: crate::store::memory::MemoryStore::detached(),
+                ..crate::session::SessionMaterials::for_test(store_for_test().await)
+            },
+            &crate::session::SessionCells::for_test(
+                SharedPermission::new(Permission::Read, crate::permission::EnabledPermissions::ALL),
+                crate::workspace::cwd_for_test(),
+                crate::workspace::roots_for_test(),
+                Arc::new(crate::frontend::SilentFrontend),
+            ),
+            crate::tools::registry::RegistryScope {
+                denials: ToolDenials::default(),
+                memory_access: MemoryAccess::Write,
+                parent_session_id: None,
+                inherited_scratchpad_names: Vec::new(),
+                context_ceiling_percent: 80,
+                auto_compact: false,
+            },
+        )
+        .expect("subagent registry should build");
+
+        let active: Vec<String> = sub_registry
+            .definitions_active_with_loaded(&[])
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert!(
+            active.iter().any(|name| name == "tool_search"),
+            "{active:?}"
+        );
+        assert!(active.iter().any(|name| name == "tool_load"), "{active:?}");
+    }
+
     fn spec_for_test(permission: Permission) -> SubagentSpec {
         SubagentSpec {
             permission,
             enabled_permissions: vec![Permission::None, permission],
             denied_servers: vec!["mekabridge".to_string()],
-            denied_tools: vec!["write_file".to_string()],
+            denied_tools: vec!["file_write".to_string()],
             memory: MemoryAccess::None,
             instructions: InstructionAccess::Inherit,
             inherited_scratchpad: vec!["build_log".to_string()],
@@ -3028,8 +3143,8 @@ mod tests {
         let denials = spec_for_test(Permission::Read).denials();
         assert!(denials.denies_server("mekabridge"));
         assert!(denials.denies_tool("mcp__mekabridge__send_message"));
-        assert!(denials.denies_tool("write_file"));
-        assert!(!denials.denies_tool("read_file"));
+        assert!(denials.denies_tool("file_write"));
+        assert!(!denials.denies_tool("file_read"));
     }
 
     /// A published profile wrapping one provider, for a test that does not care about the profile.
@@ -3434,7 +3549,7 @@ mod tests {
                 vec![
                     crate::provider::mock::MockEvent::ToolUseStart {
                         id: "call-1".into(),
-                        name: "write_file".into(),
+                        name: "file_write".into(),
                     },
                     crate::provider::mock::MockEvent::ToolUseEnd {
                         input: serde_json::json!({
@@ -3500,8 +3615,8 @@ mod tests {
         // *do*, and a spec-only assertion would still pass if the clamp never reached the registry.
         let transcript = format!("{:?}", store.load_events(child).await.expect("events"));
         assert!(
-            transcript.contains("'write_file' requires `workspace`; the session is at `read`"),
-            "the worker should have been refused write_file at Read, got: {transcript}"
+            transcript.contains("'file_write' requires `workspace`; the session is at `read`"),
+            "the worker should have been refused file_write at Read, got: {transcript}"
         );
         assert!(!target.exists(), "and nothing should have been written");
 
@@ -4240,11 +4355,12 @@ mod tests {
     /// The grant reaches the prompt, and its absence leaves no trace of the section.
     #[test]
     fn system_prompt_carries_instructions_only_when_granted() {
-        let ungranted = build_subagent_system_prompt(Permission::Read, &[], &[], None, "");
+        let ungranted = build_subagent_system_prompt(Permission::Read, &[], &[], &[], None, "");
         assert!(!ungranted.contains("User Instructions"));
 
         let granted = build_subagent_system_prompt(
             Permission::Read,
+            &[],
             &[],
             &[],
             Some("Never use pip. Always prefer uv."),
@@ -4258,7 +4374,7 @@ mod tests {
 
         // Whitespace-only instructions are treated as absent, matching the root agent.
         assert!(
-            !build_subagent_system_prompt(Permission::Read, &[], &[], Some("  \n "), "")
+            !build_subagent_system_prompt(Permission::Read, &[], &[], &[], Some("  \n "), "")
                 .contains("User Instructions")
         );
     }
@@ -4414,7 +4530,7 @@ mod tests {
         // An exhaustive `allowed_tools` that omits `agent_spawn` takes the family with it.
         assert!(!agent_tools_registered(
             &BuiltinToolFilter::from_config(
-                Some(vec!["read_file".to_string()]),
+                Some(vec!["file_read".to_string()]),
                 Vec::new(),
                 std::collections::HashMap::new(),
             ),
@@ -6308,7 +6424,7 @@ mod tests {
         );
     }
 
-    /// One round in which the worker writes `content` to `path` through `write_file`.
+    /// One round in which the worker writes `content` to `path` through `file_write`.
     fn write_file_round(
         id: &str,
         path: &std::path::Path,
@@ -6317,7 +6433,7 @@ mod tests {
         vec![
             crate::provider::mock::MockEvent::ToolUseStart {
                 id: id.to_string(),
-                name: "write_file".to_string(),
+                name: "file_write".to_string(),
             },
             crate::provider::mock::MockEvent::ToolUseEnd {
                 input: serde_json::json!({ "path": path.to_string_lossy(), "content": content }),

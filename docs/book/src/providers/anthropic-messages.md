@@ -100,7 +100,7 @@ thinking = "budgeted"   # only if the endpoint rejects the adaptive form
 
 ```json
 {
-  "name": "read_file",
+  "name": "file_read",
   "description": "Read the contents of a file at the given path.",
   "input_schema": { "type": "object", "properties": { ... } }
 }

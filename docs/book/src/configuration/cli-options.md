@@ -97,7 +97,7 @@ See [MCP](../usage/mcp.md#meka-mcp-cli) for the `add` flags and what each comman
 Inspect the built-in tool filters. `meka tool list` prints every built-in with its `Permission`,
 the `Source` of that requirement (`builtin`, or `override` from `[tools]`), its `Status`
 (`enabled`, `deferred`, or `disabled`), and the start of its description. The levels are the ones
-a session on this machine would enforce: `execute_command` is `read` where the shell sandbox is on
+a session on this machine would enforce: `shell_execute` is `read` where the shell sandbox is on
 and a backend is usable, and `unrestricted` otherwise, so the listing probes the sandbox the way a
 session start does and gives the same warning when none is usable.
 
@@ -390,7 +390,7 @@ meka mcp get notion --format json | jq .url
 
 ### `--eager-load-tool <SERVER:TOOL>`
 
-Eager-load a specific MCP tool for this session, bypassing the `load_tool` round-trip. The tool's schema ships in the cacheable tools-array prefix from turn 1 instead of being deferred. Mirrors the per-server [`eager_load_tools`](./config-file.md#mcpservers) config field: repeatable, raw tool names (the server-advertised form, not `mcp__<server>__<tool>`).
+Eager-load a specific MCP tool for this session, bypassing the `tool_load` round-trip. The tool's schema ships in the cacheable tools-array prefix from turn 1 instead of being deferred. Mirrors the per-server [`eager_load_tools`](./config-file.md#mcpservers) config field: repeatable, raw tool names (the server-advertised form, not `mcp__<server>__<tool>`).
 
 Particularly useful for scripted runs that know up front which tools they'll need. The flag *appends to* whatever `eager_load_tools` lists in `config.toml` for that server; it doesn't replace existing entries. Unknown server names log a warning and are skipped.
 

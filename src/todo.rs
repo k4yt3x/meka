@@ -1,6 +1,7 @@
 //! The task list the agent keeps for multi-step work: the items, their states, and the shared
-//! handle every collaborator reads. The `todo` tool that edits it is `tools::todo`; this module is
-//! the vocabulary, so the frontends and the system prompt can hold a list without holding a tool.
+//! handle every collaborator reads. The `todo_*` tools that edit it are `tools::todo`; this module
+//! is the vocabulary, so the frontends and the system prompt can hold a list without holding a
+//! tool.
 
 use std::sync::Arc;
 
@@ -40,7 +41,7 @@ pub(crate) struct TodoState {
     pub(crate) title: Option<String>,
     pub(crate) items: Vec<TodoItem>,
 }
-/// The task list of one session, shared by handle between the `todo` tool that edits it, the turn
+/// The task list of one session, shared by handle between the `todo_*` tools that edit it, the turn
 /// loop that renders it into the context block, and the frontend that draws it.
 ///
 /// A `std` lock rather than a `tokio` one: the tool edits the state in place inside
@@ -88,9 +89,9 @@ impl From<TodoItemInput> for TodoItem {
         }
     }
 }
-/// Render the task list as plain text (no ANSI), used both as the `todo` tool result echoed to the
-/// model and in the per-turn / post-compaction context blocks. Terminal coloring lives separately
-/// in `render::render_todo_list`.
+/// Render the task list as plain text (no ANSI), used both as the `todo_*` tool result echoed to
+/// the model and in the per-turn / post-compaction context blocks. Terminal coloring lives
+/// separately in `render::render_todo_list`.
 pub(crate) fn format_todo_state(state: &TodoState) -> String {
     if state.items.is_empty() {
         return "(no tasks)\n".to_string();

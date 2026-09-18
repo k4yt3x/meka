@@ -1,9 +1,9 @@
 //! The `memory_*` tools: the agent's read/write access to its own durable notes
 //! ([`crate::memory`]).
 //!
-//! All four gate at [`Permission::Read`], matching `scratchpad` and `todo`: these write to a store
-//! meka owns in its own database, not to the user's tree, and the motivating deployment runs at
-//! read permission permanently. Gating them at `workspace` would mean an agent that can never
+//! All four gate at [`Permission::Read`], matching `scratchpad_*` and `todo_*`: these write to a
+//! store meka owns in its own database, not to the user's tree, and the motivating deployment runs
+//! at read permission permanently. Gating them at `workspace` would mean an agent that can never
 //! remember anything, which defeats the feature.
 //!
 //! [`crate::memory::validate_memory_name`] is checked at every door that *writes* a name. The name
@@ -515,21 +515,6 @@ const DUPLICATE_TERM_OVERLAP: f64 = 0.6;
 /// are usually unrelated notes that both mention the same noun.
 const DUPLICATE_MIN_TERMS: usize = 3;
 
-/// Largest edit distance the last-resort tier accepts between a query term and a word in a
-/// memory's name or description.
-///
-/// Two for anything five characters or longer, because the most common typo is a transposition
-/// (`Tokoy` for `Tokyo`) and Levenshtein charges two for one; a threshold of one, which is what
-/// [`crate::tools::did_you_mean_hint`] uses for tool names, misses it. Short words stay at one,
-/// where two edits would match almost anything.
-fn fuzzy_threshold(term: &str) -> usize {
-    let length = term.chars().count();
-    if length < 5 {
-        return 1;
-    }
-    (length / 3).clamp(2, 4)
-}
-
 /// Which tier answered, so the result can say so.
 ///
 /// Stated in the output rather than kept internal: a prefix or edit-distance answer is a *guess*
@@ -586,7 +571,7 @@ impl MemorySearchTool {
             let haystack = format!("{} {}", entry.name, entry.description).to_lowercase();
             let mut best = usize::MAX;
             for term in terms {
-                let threshold = fuzzy_threshold(term);
+                let threshold = crate::tools::fuzzy_threshold(term);
                 // Hoisted: invariant across the word loop, and the pre-filter below exists to be
                 // O(1) per pair.
                 let term_chars = term.chars().count();

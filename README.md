@@ -78,13 +78,13 @@ See the [documentation](https://docs.meka.run) for the full usage guide.
 
 The agent has access to the following built-in tools:
 
-- `execute_command`: run commands and read their output
-- `read_file` / `write_file` / `edit_file`: read, create, and modify files
-- `find_files`: find files by name or glob pattern
-- `search_contents`: search file contents with regex, powered by ripgrep
-- `fetch_url`: fetch a web page as markdown
+- `shell_execute`: run commands and read their output
+- `file_read` / `file_write` / `file_edit`: read, create, and modify files
+- `file_find`: find files by name or glob pattern
+- `file_search`: search file contents with regex, powered by ripgrep
+- `web_fetch`: fetch a web page as markdown
 - `scratchpad_*`: session-scoped working memory for intermediate results
-- `todo`: structured task tracking, with live progress display
+- `todo_write`, `todo_edit`, `todo_read`: structured task tracking, with live progress display
 - `memory_*`: notes that survive the session, loaded into every later one
 - `conversation_read` / `conversation_search`: re-read this session's history
 - `context_check` / `context_compact`: read the remaining window, or compact on purpose
@@ -92,9 +92,9 @@ The agent has access to the following built-in tools:
 - `skill_*`: load, search, and optionally author skills
 - `schedule_*`: run a prompt later, once or repeatedly, optionally behind a gate
 - `task_list` / `task_cancel`: manage work the agent detached to the background
-- `render_image`: render an image into the conversation for vision models
+- `image_render`: render an image into the conversation for vision models
 - `mcp_resource_*` / `mcp_prompt_*`: read or render content from MCP servers
-- `load_tool`: fetch the full schema for a tool held back to keep the prompt small
+- `tool_load` / `tool_search`: fetch the full schema of a tool held back to keep the prompt small, or find one by keyword
 
 Run `meka tool list` for the current set with descriptions. Long-output tools take an optional `scratchpad` parameter to save their output there instead of returning it. See the [tool reference](https://docs.meka.run/tools/overview.html).
 

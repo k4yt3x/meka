@@ -440,7 +440,7 @@ impl TurnRecovery {
     ///
     /// [`Self::tiers_tried`] resets, because a vindicated tier was not spent, it was right:
     /// leaving it counted would make a second refusal in the same turn (over an image a later
-    /// `read_file` returned, which `Attachments` reaches) jump straight to `ToolExchanges` and
+    /// `file_read` returned, which `Attachments` reaches) jump straight to `ToolExchanges` and
     /// destroy the tool result whole. The bound the counter exists for is unaffected: a reset
     /// costs a 2xx.
     pub(super) async fn persist_vindicated_repair(&mut self, agent: &Agent, session_id: Uuid) {
@@ -648,7 +648,7 @@ pub(super) fn strip_non_text_content(messages: &[Message], reason: &str) -> Opti
                         ContentBlock::ToolResult {
                             tool_use_id: tool_use_id.clone(),
                             content: kept,
-                            // Whatever the call actually reported: `read_file` returned the image
+                            // Whatever the call actually reported: `file_read` returned the image
                             // it was asked for and the provider rejected the request carrying it,
                             // so flagging the call as failed would teach the model the wrong
                             // lesson; the note above carries the real instruction. Carried rather
@@ -1327,7 +1327,7 @@ mod tests {
         let degraded = degrade_rejected_content(
             &[
                 Message::user_with_images("look at this".to_string(), vec![image_source()]),
-                tool_call("call_1", "read_file", serde_json::json!({"path": "a.png"})),
+                tool_call("call_1", "file_read", serde_json::json!({"path": "a.png"})),
                 tool_result_text("call_1", "body"),
             ],
             "refused",
@@ -1370,7 +1370,7 @@ mod tests {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: "call_1".to_string(),
-                name: "read_file".to_string(),
+                name: "file_read".to_string(),
                 input: serde_json::json!({"path": "smoketest.png"}),
             }],
         };
@@ -1475,7 +1475,7 @@ mod tests {
         let messages = [
             tool_call(
                 "call_1",
-                "read_file",
+                "file_read",
                 serde_json::json!({"path": "notes.md"}),
             ),
             tool_result_text("call_1", "a body the provider would not encode"),
@@ -1501,7 +1501,7 @@ mod tests {
                 },
             ) => {
                 assert_eq!(id, tool_use_id, "the pairing must survive");
-                assert_eq!(name, "read_file", "the model can still see what it called");
+                assert_eq!(name, "file_read", "the model can still see what it called");
                 assert!(
                     !input.to_string().contains("notes.md"),
                     "the arguments must not stay on the call: {input}"
@@ -1517,7 +1517,7 @@ mod tests {
                 assert!(is_error, "the model reads this as a failed call");
 
                 let text = ContentBlock::tool_result_text_content(content);
-                assert!(text.contains("read_file"), "names the call: {text}");
+                assert!(text.contains("file_read"), "names the call: {text}");
                 assert!(text.contains("notes.md"), "quotes the arguments: {text}");
                 assert!(text.contains("refused"), "carries the reason: {text}");
                 assert!(
@@ -1540,7 +1540,7 @@ mod tests {
     /// that reasoning forward describing a turn that no longer exists.
     #[test]
     fn neutralizing_leaves_the_reasoning_that_describes_the_call() {
-        let mut call = tool_call("call_1", "read_file", serde_json::json!({}));
+        let mut call = tool_call("call_1", "file_read", serde_json::json!({}));
         call.content.insert(0, ContentBlock::Thinking {
             thinking: "I should read the file".to_string(),
             opaque: None,
@@ -1595,7 +1595,7 @@ mod tests {
         let prompt = Message::user("summarize the notes for me");
         let messages = [
             prompt,
-            tool_call("call_1", "read_file", serde_json::json!({})),
+            tool_call("call_1", "file_read", serde_json::json!({})),
             tool_result_text("call_1", "body"),
         ];
         let degraded = degrade_rejected_content(&messages, "refused", DegradeTier::ToolExchanges)
@@ -1609,11 +1609,11 @@ mod tests {
 
     /// A compaction's `loaded_tools_snapshot` has to be built from the log, not from the view.
     ///
-    /// Two compactions in a row are enough: the first replaces the `load_tool` exchange with a
+    /// Two compactions in a row are enough: the first replaces the `tool_load` exchange with a
     /// summary that names nothing, so a scan of the materialized conversation reports no loaded
     /// tools, the second boundary records that emptiness, and `prune_compacted_events` drops the
     /// events that would have corrected it. `DegradeTier::ToolExchanges` is the second way into
-    /// the same hole, since it empties a `load_tool` call in place. The live process would lose the
+    /// the same hole, since it empties a `tool_load` call in place. The live process would lose the
     /// tool while a resume, reading the full log off disk, got it back.
     #[tokio::test]
     async fn a_second_compaction_keeps_the_tools_the_first_one_carried() {
@@ -1645,7 +1645,7 @@ mod tests {
         messages.append(tool_call(
             "call_1",
             crate::tools::LOAD_TOOL_NAME,
-            serde_json::json!({"name": ["fetch_url"]}),
+            serde_json::json!({"name": ["web_fetch"]}),
         ));
         messages.append(tool_result_text("call_1", "loaded"));
         for index in 0..5 {
@@ -1667,13 +1667,13 @@ mod tests {
         assert!(
             crate::tools::load_tool::extract_loaded_tool_names_from_events(messages.events())
                 .iter()
-                .any(|name| name == "fetch_url"),
+                .any(|name| name == "web_fetch"),
             "a tool loaded before the first boundary must survive the second: {:?}",
             messages.events()
         );
     }
 
-    /// Emptying a `load_tool` exchange must not un-load the tool it loaded.
+    /// Emptying a `tool_load` exchange must not un-load the tool it loaded.
     ///
     /// Both scanners are pinned, because they disagree: the slice scan sees a call whose `input`
     /// names nothing and a result marked `is_error`, so it reports the tool was never loaded; the
@@ -1686,19 +1686,19 @@ mod tests {
             tool_call(
                 "call_1",
                 crate::tools::LOAD_TOOL_NAME,
-                serde_json::json!({"name": ["fetch_url"]}),
+                serde_json::json!({"name": ["web_fetch"]}),
             ),
             tool_result_text("call_1", "loaded"),
         ];
         assert!(
-            crate::tools::extract_loaded_tool_names(&messages).contains("fetch_url"),
+            crate::tools::extract_loaded_tool_names(&messages).contains("web_fetch"),
             "precondition: the undegraded exchange records the load"
         );
 
         let degraded = degrade_rejected_content(&messages, "refused", DegradeTier::ToolExchanges)
             .expect("there is an exchange to empty");
         assert!(
-            !crate::tools::extract_loaded_tool_names(&degraded).contains("fetch_url"),
+            !crate::tools::extract_loaded_tool_names(&degraded).contains("web_fetch"),
             "the slice scan cannot see through the emptied call, which is why nothing production \
              may use it"
         );
@@ -1714,7 +1714,7 @@ mod tests {
         assert!(
             crate::tools::load_tool::extract_loaded_tool_names_from_events(&events)
                 .iter()
-                .any(|name| name == "fetch_url"),
+                .any(|name| name == "web_fetch"),
             "the log still holds the rows that recorded the load, and a repair only ever adds"
         );
     }
@@ -1727,7 +1727,7 @@ mod tests {
         let huge = "x".repeat(QUOTED_ARGUMENTS_LIMIT * 4);
         let degraded = degrade_rejected_content(
             &[
-                tool_call("call_1", "write_file", serde_json::json!({"body": huge})),
+                tool_call("call_1", "file_write", serde_json::json!({"body": huge})),
                 tool_result_text("call_1", "body"),
             ],
             "refused",

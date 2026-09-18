@@ -43,7 +43,7 @@ pub(crate) const MAX_MCP_DESCRIPTION_CHARS: usize = 2048;
 
 /// Cap on base64 payload size for an MCP image tool-result block. A server returning a giant image
 /// would otherwise be cloned verbatim, forwarded to the provider, billed against the user's API
-/// quota, and risk OOM. Mirrors the 10 MiB body cap on `fetch_url`.
+/// quota, and risk OOM. Mirrors the 10 MiB body cap on `web_fetch`.
 pub(crate) const MAX_MCP_IMAGE_BYTES: usize = 10 * crate::text::MIB;
 
 /// Tools one MCP server may advertise before the list is cut.
@@ -1213,7 +1213,7 @@ pub(crate) fn tool_is_allowed(server_config: &McpServerConfig, tool_raw_name: &s
 /// Whether the given raw tool name is in this server's
 /// [`eager_load_tools`][McpServerConfig::eager_load_tools] list. Mirrors [`tool_is_allowed`]'s
 /// shape. When true, the registration sites skip `mark_deferred` so the tool ships in the cacheable
-/// tools-array prefix from the first turn instead of after a `load_tool` round-trip.
+/// tools-array prefix from the first turn instead of after a `tool_load` round-trip.
 pub(crate) fn tool_should_eager_load(server_config: &McpServerConfig, tool_raw_name: &str) -> bool {
     server_config
         .eager_load_tools
@@ -2560,14 +2560,14 @@ mod tests {
         registry.register_load_tool_for_test();
         crate::tools::mcp_adapter::install_on_worker_registry(&manager, &registry).await;
 
-        let load_tool = registry.get("load_tool").expect("load_tool registered");
-        let output = load_tool
+        let tool_load = registry.get("tool_load").expect("tool_load registered");
+        let output = tool_load
             .execute(
                 serde_json::json!({"name": "mcp__ida__decompile"}),
                 crate::tools::ToolContext::detached(tokio_util::sync::CancellationToken::new()),
             )
             .await
-            .expect("load_tool returns Ok with an error payload");
+            .expect("tool_load returns Ok with an error payload");
         let text = format!("{:?}", output.content);
         assert!(text.contains("ida"), "{text}");
         assert!(!text.contains("not registered"), "{text}");
@@ -2583,7 +2583,7 @@ mod tests {
         assert!(from_registry.is_some_and(|reason| reason.contains("ida")));
     }
 
-    /// `load_tool` is the path a model actually takes: the tool is absent from its catalog, so
+    /// `tool_load` is the path a model actually takes: the tool is absent from its catalog, so
     /// it reaches for the documented way to load a deferred tool first. Found by watching a real
     /// model do exactly that and get "not registered" back.
     #[tokio::test]
@@ -2603,14 +2603,14 @@ mod tests {
         registry.register_load_tool_for_test();
         crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
 
-        let load_tool = registry.get("load_tool").expect("load_tool registered");
-        let output = load_tool
+        let tool_load = registry.get("tool_load").expect("tool_load registered");
+        let output = tool_load
             .execute(
                 serde_json::json!({"name": "mcp__ida__decompile"}),
                 crate::tools::ToolContext::detached(tokio_util::sync::CancellationToken::new()),
             )
             .await
-            .expect("load_tool returns Ok with an error payload");
+            .expect("tool_load returns Ok with an error payload");
 
         assert!(output.is_error);
         let text = format!("{:?}", output.content);
@@ -2633,7 +2633,7 @@ mod tests {
         .expect("prepare");
 
         for name in [
-            "read_file",
+            "file_read",
             "memory_write",
             "mcp__nosuch__tool",
             "mcp__malformed",

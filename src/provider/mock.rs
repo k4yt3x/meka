@@ -774,7 +774,7 @@ mod tests {
                 },
                 MockEvent::ToolUseStart {
                     id: "call-1".into(),
-                    name: "read_file".into(),
+                    name: "file_read".into(),
                 },
                 MockEvent::ToolUseEnd {
                     input: serde_json::json!({"path": "a.txt"}),
@@ -806,7 +806,7 @@ mod tests {
         assert_eq!(message.content.len(), 3);
         assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "before "));
         assert!(
-            matches!(&message.content[1], ContentBlock::ToolUse { id, name, .. } if id == "call-1" && name == "read_file")
+            matches!(&message.content[1], ContentBlock::ToolUse { id, name, .. } if id == "call-1" && name == "file_read")
         );
         assert!(matches!(&message.content[2], ContentBlock::Text { text } if text == "after"));
         assert!(matches!(stop_reason, StopReason::ToolUse));

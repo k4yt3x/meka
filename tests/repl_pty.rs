@@ -413,12 +413,12 @@ fn approvals_switched_on_in_the_repl_are_recorded_on_the_row() {
 #[test]
 fn an_always_answer_at_the_approval_prompt_covers_the_next_call_to_the_tool() {
     const TWO_WRITES: &str = r#"[
- [{"type":"tool_use_start","id":"t1","name":"write_file"},
+ [{"type":"tool_use_start","id":"t1","name":"file_write"},
   {"type":"tool_use_end","input":{"path":"a.txt","content":"a"}},
   {"type":"message_end","stop_reason":"tool_use"}],
  [{"type":"text","text":"wrote a"},
   {"type":"message_end","stop_reason":"end_turn"}],
- [{"type":"tool_use_start","id":"t2","name":"write_file"},
+ [{"type":"tool_use_start","id":"t2","name":"file_write"},
   {"type":"tool_use_end","input":{"path":"b.txt","content":"b"}},
   {"type":"message_end","stop_reason":"tool_use"}],
  [{"type":"text","text":"wrote b"},
@@ -434,7 +434,7 @@ fn an_always_answer_at_the_approval_prompt_covers_the_next_call_to_the_tool() {
     ]);
     let prompts = rows
         .iter()
-        .filter(|row| row.contains("[approval] write_file"))
+        .filter(|row| row.contains("[approval] file_write"))
         .count();
     assert_eq!(
         prompts, 1,
@@ -460,12 +460,12 @@ fn an_always_answer_at_the_approval_prompt_covers_the_next_call_to_the_tool() {
 #[test]
 fn an_always_answer_does_not_survive_a_fork() {
     const TWO_WRITES: &str = r#"[
- [{"type":"tool_use_start","id":"t1","name":"write_file"},
+ [{"type":"tool_use_start","id":"t1","name":"file_write"},
   {"type":"tool_use_end","input":{"path":"a.txt","content":"a"}},
   {"type":"message_end","stop_reason":"tool_use"}],
  [{"type":"text","text":"wrote a"},
   {"type":"message_end","stop_reason":"end_turn"}],
- [{"type":"tool_use_start","id":"t2","name":"write_file"},
+ [{"type":"tool_use_start","id":"t2","name":"file_write"},
   {"type":"tool_use_end","input":{"path":"b.txt","content":"b"}},
   {"type":"message_end","stop_reason":"tool_use"}],
  [{"type":"text","text":"wrote b"},
@@ -487,7 +487,7 @@ fn an_always_answer_does_not_survive_a_fork() {
     );
     let prompts = rows
         .iter()
-        .filter(|row| row.contains("[approval] write_file"))
+        .filter(|row| row.contains("[approval] file_write"))
         .count();
     assert_eq!(
         prompts, 2,
@@ -798,7 +798,7 @@ fn the_shutdown_notice_reads_as_one_block_with_the_exit_banner() {
     let install = repl_install_with_extra(true, true, "", "\n[background]\nenabled = true\n");
     let script = r#"[
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
             { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -910,7 +910,7 @@ fn help_is_bracketed_by_the_repl_thread_too() {
 #[test]
 fn a_todo_list_is_not_double_spaced() {
     const TODO: &str = r#"[
- [{"type":"tool_use_start","id":"t1","name":"todo"},
+ [{"type":"tool_use_start","id":"t1","name":"todo_write"},
   {"type":"tool_use_end","input":{"title":"Work","items":["First","Second"]}},
   {"type":"message_end","stop_reason":"tool_use"}],
  [{"type":"text","text":"Done."},
@@ -1351,7 +1351,7 @@ fn a_canceled_task_rides_the_next_prompt_in_the_repl() {
     );
     let script = r#"[
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
             { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],

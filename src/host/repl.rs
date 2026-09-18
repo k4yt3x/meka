@@ -664,7 +664,7 @@ pub(crate) async fn run_interactive(
     hold_session_lock(&session_lock, None);
 
     // Stop this process's background tasks on the way out. `BackgroundTasks` has no `Drop`, and a
-    // detached `execute_command` is `setsid()`-ed, so nothing else reaches it: left alone it runs
+    // detached `shell_execute` is `setsid()`-ed, so nothing else reaches it: left alone it runs
     // on untracked, and the next session open sweeps its row to `interrupted` while it may still be
     // writing to the workspace.
     let stopped = crate::host::release_agent(&agent, &cancel, mcp_manager.as_ref()).await;

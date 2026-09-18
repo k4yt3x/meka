@@ -2776,12 +2776,12 @@ mod tests {
     fn an_allowed_tools_list_still_loads() {
         let from_list = parse(
             "listy",
-            "---\ndescription: d\nallowed-tools:\n  - read_file\n  - execute_command\n---\nbody\n",
+            "---\ndescription: d\nallowed-tools:\n  - file_read\n  - shell_execute\n---\nbody\n",
         )
         .expect("a list must not reject the skill");
         assert_eq!(
             from_list.allowed_tools.as_deref(),
-            Some("read_file execute_command")
+            Some("file_read shell_execute")
         );
 
         let from_string = parse(
@@ -3084,7 +3084,7 @@ mod tests {
             "---\n\
              description: A CC-shaped skill\n\
              when_to_use: a key Claude Code writes\n\
-             allowed-tools: [read_file]\n\
+             allowed-tools: [file_read]\n\
              user-invocable: false\n\
              ---\nBody\n",
         );

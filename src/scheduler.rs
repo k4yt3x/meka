@@ -979,7 +979,7 @@ pub(crate) async fn run_probe(
 }
 /// The shell probe: unsandboxed, in the session's directory, bounded by `timeout`.
 ///
-/// Authoring one requires `unrestricted`, which is the same level at which `execute_command` runs
+/// Authoring one requires `unrestricted`, which is the same level at which `shell_execute` runs
 /// arbitrary unsandboxed commands, so a sandbox here would block the ordinary cases (`gh`, `curl`)
 /// without raising the bar the agent must clear.
 pub(crate) async fn run_shell_probe(
@@ -989,7 +989,7 @@ pub(crate) async fn run_shell_probe(
 ) -> Result<ProbeOutcome, String> {
     let mut builder = gate_command_builder(command);
     // The creating session's directory, not the host process's. A gate is almost always written by
-    // the model right after verifying the same command through `execute_command`, which runs in the
+    // the model right after verifying the same command through `shell_execute`, which runs in the
     // session's cwd, so a gate that runs anywhere else silently stops matching the command the
     // model tested; under a `meka serve` systemd unit the process cwd is `/`.
     if let Some(directory) = cwd {
@@ -1264,7 +1264,7 @@ pub(crate) fn json_is_non_empty(value: &serde_json::Value) -> bool {
         serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
     }
 }
-/// Build the platform's shell invocation for a gate, mirroring what `execute_command` does on its
+/// Build the platform's shell invocation for a gate, mirroring what `shell_execute` does on its
 /// unsandboxed path (`crate::tools::shell`).
 pub(crate) fn gate_command_builder(command: &str) -> tokio::process::Command {
     #[cfg(windows)]

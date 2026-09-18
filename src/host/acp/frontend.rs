@@ -295,7 +295,7 @@ impl AcpFrontend {
     /// Open a live-output view for a starting tool call and return how it will be rendered, or
     /// `None` for calls that produce no streamed output.
     ///
-    /// Only `execute_command` qualifies: it is the one tool whose result can be minutes away, and
+    /// Only `shell_execute` qualifies: it is the one tool whose result can be minutes away, and
     /// the terminal frames below would be nonsense for anything that isn't a command. The mode is
     /// decided once, here, so the client can't be told about a terminal it never registered.
     pub(super) fn begin_live_output(&self, id: &str, tool_name: &str) -> Option<LiveOutputMode> {
@@ -309,7 +309,7 @@ impl AcpFrontend {
         };
         // The single most useful line when a user reports "I see the command but not its output":
         // it says whether the client asked for terminal rendering, which is the whole branch point.
-        tracing::debug!("execute_command {id} live output: {mode:?}");
+        tracing::debug!("shell_execute {id} live output: {mode:?}");
         self.live_output()
             .insert(id.to_string(), LiveOutput::new(mode));
         Some(mode)
@@ -387,7 +387,7 @@ impl Frontend for AcpFrontend {
                 // contents. Safe to hold across the send because `send_notification` is
                 // synchronous -- nothing is awaited under the lock.
                 let mut buffers = self.live_output();
-                // Absent means the call never opened a live view (not `execute_command`, or it
+                // Absent means the call never opened a live view (not `shell_execute`, or it
                 // already completed), so there is nothing to attach this to.
                 let Some(entry) = buffers.get_mut(&id) else {
                     return;
@@ -514,7 +514,7 @@ impl Frontend for AcpFrontend {
                 return;
             }
             FrontendEvent::TodoListUpdated { items, .. } => {
-                // The `todo` tool's list maps onto ACP's plan panel. The REPL-only `title` has no
+                // The `todo_*` tools' list maps onto ACP's plan panel. The REPL-only `title` has no
                 // `Plan` analog and is dropped. The agent loop (`agent/dispatch.rs`) never emits
                 // an emptied list, so a cleared plan is not pushed, as on the REPL.
                 SessionUpdate::Plan(Plan::new(todo_items_to_plan(&items)))
@@ -575,7 +575,7 @@ impl Frontend for AcpFrontend {
 
         // The sticky options name the *tool*, because that is their scope: the decision is keyed on
         // the tool name alone and applies to every later call to it, whatever its arguments. The
-        // prompt's title beside them is `<tool> <primary_param>` -- for `execute_command` that is
+        // prompt's title beside them is `<tool> <primary_param>` -- for `shell_execute` that is
         // the specific command line -- so a bare "Always allow" reads as approving the command the
         // user just read, when it actually approves every shell command for the rest of the
         // session. Spelling the tool out is what makes the affordance and the semantics agree, and
@@ -925,20 +925,22 @@ where
 /// MCP-loaded tools (named `mcp__server__tool`) and anything unknown fall through to `Other`.
 pub(super) fn tool_kind_for(name: &str) -> ToolKind {
     match name {
-        "read_file" | "todo" => ToolKind::Read,
-        "edit_file" | "write_file" => ToolKind::Edit,
-        "find_files" | "search_contents" => ToolKind::Search,
-        "execute_command" => ToolKind::Execute,
-        "fetch_url" => ToolKind::Fetch,
-        "agent_spawn" => ToolKind::Think,
-        // skill, memory_*, scratchpad_*, render_image, load_tool, mcp__*, and any
+        "file_read" | "todo_read" => ToolKind::Read,
+        "file_edit" | "file_write" => ToolKind::Edit,
+        "file_find" | "file_search" => ToolKind::Search,
+        "shell_execute" => ToolKind::Execute,
+        "web_fetch" => ToolKind::Fetch,
+        // The list tools plan rather than touch anything, so a client never opens its diff view
+        // for them.
+        "agent_spawn" | "todo_write" | "todo_edit" => ToolKind::Think,
+        // skill, memory_*, scratchpad_*, image_render, tool_load, mcp__*, and any
         // future built-ins.
         _ => ToolKind::Other,
     }
 }
 /// Build the human-readable `title` for a tool call: the tool's name, then the resolved primary
-/// argument (`display_summary`: the command for `execute_command`, the path for `read_file`, the
-/// URL for `fetch_url`, ...), so editors show what's running and not only which tool. The name is
+/// argument (`display_summary`: the command for `shell_execute`, the path for `file_read`, the
+/// URL for `web_fetch`, ...), so editors show what's running and not only which tool. The name is
 /// the one the REPL's indicator and approval prompt show, so the surfaces share one vocabulary.
 /// `raw_input` still carries the full argument object for clients that want it.
 pub(super) fn tool_call_title(name: &str, display_summary: Option<&str>) -> String {
@@ -960,7 +962,7 @@ pub(super) fn sanitize_title(text: &str) -> String {
         format!("{truncated}…")
     }
 }
-/// Convert meka's `todo` tool list into ACP [`PlanEntry`] rows for [`SessionUpdate::Plan`]. meka's
+/// Convert meka's `todo_*` list into ACP [`PlanEntry`] rows for [`SessionUpdate::Plan`]. meka's
 /// `Canceled` status has no ACP analog, so it maps to `Completed` ("no longer active") to keep
 /// the entry count stable against the model's own todo list. meka tracks no per-item priority, so
 /// every entry is reported as `Medium`.
@@ -986,16 +988,16 @@ pub(super) fn tool_locations(
     cwd: &SharedCwd,
 ) -> Vec<ToolCallLocation> {
     let raw = match name {
-        "read_file" | "edit_file" | "write_file" | "find_files" | "search_contents" => {
+        "file_read" | "file_edit" | "file_write" | "file_find" | "file_search" => {
             input.get("path").and_then(|v| v.as_str())
         }
         _ => None,
     };
     raw.map(|path| {
         let mut location = ToolCallLocation::new(resolve_against_cwd(cwd, path));
-        // For `read_file`, point the client at the first line being read. meka's `offset` is
+        // For `file_read`, point the client at the first line being read. meka's `offset` is
         // 0-based; ACP line numbers are 1-based.
-        if name == "read_file"
+        if name == "file_read"
             && let Some(offset) = input.get("offset").and_then(|value| value.as_u64())
         {
             location = location.line(u32::try_from(offset.saturating_add(1)).unwrap_or(u32::MAX));
@@ -1056,10 +1058,10 @@ pub(super) fn console_content_block(output: &str) -> ToolCallContent {
     text_content_block(format!("```console\n{}\n```", output.trim_end()))
 }
 /// Build the `content` array of a `tool_call_update` from meka's tool output. A populated `Diff`
-/// metadata wins (so clients like Zed get the structured diff for apply-UI). `execute_command`
+/// metadata wins (so clients like Zed get the structured diff for apply-UI). `shell_execute`
 /// output is wrapped in a `console` code block so editors render it monospaced (mirrors
 /// claude-agent-acp's no-terminal fallback). Other tools pass their text and image blocks through
-/// unchanged, so a tool that looked at an image (`read_file` on a PNG, `render_image`, `fetch_url`)
+/// unchanged, so a tool that looked at an image (`file_read` on a PNG, `image_render`, `web_fetch`)
 /// shows the human the same picture the model saw.
 pub(super) fn build_completion_content(
     tool_name: &str,
@@ -1079,8 +1081,8 @@ pub(super) fn build_completion_content(
         return vec![ToolCallContent::Diff(diff)];
     }
 
-    if tool_name == "execute_command" {
-        // Reuse the canonical text-flattening; `execute_command` output is text-only, so the
+    if tool_name == "shell_execute" {
+        // Reuse the canonical text-flattening; `shell_execute` output is text-only, so the
         // `[Image]` marker `tool_result_text_content` would emit for images never appears here.
         let combined = MekaContentBlock::tool_result_text_content(content);
         if combined.trim_end().is_empty() {

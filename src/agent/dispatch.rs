@@ -69,12 +69,12 @@ impl Agent {
         let outputs = futures::future::join_all(futures).await;
 
         // Serial pass to accumulate scratchpad hints, emit per-tool completion events in source
-        // order, build ToolResult blocks, and emit a single TodoListUpdated event if any `todo`
+        // order, build ToolResult blocks, and emit a single TodoListUpdated event if any `todo_*`
         // call landed and actually changed the rendered state.
         let mut results = Vec::with_capacity(planned.len());
         let mut todo_fired = false;
         for ((id, name, _), output) in planned.into_iter().zip(outputs) {
-            if name == "todo" {
+            if crate::tools::todo::changes_the_list(&name) {
                 todo_fired = true;
             }
             if output.spill_hint != crate::tools::SpillHint::default() {
@@ -172,14 +172,14 @@ impl Agent {
             .required_permission_for(name)
             .unwrap_or_else(|| tool.required_permission());
         let permission = self.cells.permission.get();
-        let admission = admit_tool_call(
+        let admission = crate::tools::admit_tool_call(
             name,
             required,
             permission,
             self.cells.permission.approvals(),
             tool.runs_outside_confinement(),
         );
-        if let Admission::Refuse(refusal) = admission {
+        if let crate::tools::Admission::Refuse(refusal) = admission {
             return *refusal;
         }
         // Scope the id across both dispatch paths, so a tool that has to correlate itself with the
@@ -207,7 +207,7 @@ impl Agent {
             return refusal;
         }
 
-        if matches!(admission, Admission::Ask) {
+        if matches!(admission, crate::tools::Admission::Ask) {
             // The same rule for the tool's own doors: an approved call runs at the level, so a
             // refusal the level already decides (the shell with nothing to confine it, a write
             // outside the roots) is returned here rather than asked about and then made anyway.
@@ -588,79 +588,10 @@ async fn record_background_outcome(
     }
 }
 
-/// What the door decided about one tool call.
-pub(super) enum Admission {
-    /// Within the level: run it.
-    Run,
-    /// Above the level, and the session submits such calls for approval.
-    Ask,
-    /// Above the level, with nobody to ask: the result the model gets instead.
-    ///
-    /// Boxed because a `ToolOutput` alone crosses clippy's `large_enum_variant` threshold on
-    /// Windows, where `PathBuf` is eight bytes wider.
-    Refuse(Box<crate::tools::ToolOutput>),
-}
-
-/// The one rule for whether a tool call runs, is submitted for approval, or is refused.
-///
-/// Dispatch and the checkpoint both ask this, so the two doors cannot disagree. The level bounds
-/// what runs unattended and the approvals switch decides what happens at the edge of it. An
-/// approved call still runs *at the level*: the write fence and the shell's confinement read the
-/// same cell, so approval never widens reach, it only turns a refusal into a question.
-///
-/// `unconfinable` is the door `Permission::allows` cannot provide for a tool meka cannot confine.
-/// `allows` treats `workspace` and `unrestricted` as equal on purpose, so a tool requiring
-/// `unrestricted` dispatches at `workspace` with no prompt; every built-in that matters has its
-/// own door downstream (the write fence, or `execute_command`'s refusal when it cannot be
-/// sandboxed), and an MCP adapter has neither. Such a call is a question when approvals are on and
-/// a refusal otherwise, the way the shell refuses when its sandbox is unavailable: half a boundary
-/// reported as a whole one is worse than an error saying so. Only `workspace` promises a boundary
-/// it might fail to apply, so only there does the flag matter.
-pub(super) fn admit_tool_call(
-    name: &str,
-    required: crate::permission::Permission,
-    permission: crate::permission::Permission,
-    approvals: bool,
-    unconfinable: bool,
-) -> Admission {
-    if !permission.allows(required) {
-        if approvals {
-            return Admission::Ask;
-        }
-        return Admission::Refuse(Box::new(crate::tools::ToolOutput::text(
-            format!(
-                "'{name}' requires `{required}`; the session is at `{permission}`. Ask the user to \
-                 raise it to `{required}`."
-            ),
-            true,
-        )));
-    }
-    if permission == crate::permission::Permission::Workspace
-        && !required.is_within(permission)
-        && unconfinable
-    {
-        if approvals {
-            return Admission::Ask;
-        }
-        return Admission::Refuse(Box::new(crate::tools::ToolOutput::text(
-            format!(
-                "'{name}' runs inside its MCP server's own process, which meka does not sandbox, so \
-                 `workspace` cannot confine what it writes. Ask the user for `unrestricted`, or \
-                 grant it explicitly with `[mcp.servers.*].tool_permissions` in the config."
-            ),
-            true,
-        )));
-    }
-    Admission::Run
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Admission, admit_tool_call, *};
-    use crate::{
-        agent::tests::{SendFileFixture, agent_with_registry_for_test, send_file_registry},
-        permission::Permission,
-    };
+    use super::*;
+    use crate::agent::tests::{SendFileFixture, agent_with_registry_for_test, send_file_registry};
 
     /// The prompt claims to show every argument the call was made with. `background` is taken out
     /// of the arguments before dispatch, so without this it would be the one argument a user could
@@ -681,89 +612,6 @@ mod tests {
     fn a_non_object_input_is_left_alone() {
         let input = serde_json::json!("bare");
         assert_eq!(super::approval_input(&input, true), input);
-    }
-
-    fn decide(required: Permission, level: Permission, approvals: bool) -> &'static str {
-        match admit_tool_call("t", required, level, approvals, false) {
-            Admission::Run => "run",
-            Admission::Ask => "ask",
-            Admission::Refuse(_) => "refuse",
-        }
-    }
-
-    /// The one rule, at every level: within the level runs, above it is refused, and the switch
-    /// turns that refusal into a question. Nothing sits above `unrestricted`, so it never asks.
-    #[test]
-    fn a_call_above_the_level_is_refused_or_asked_and_never_run() {
-        assert_eq!(
-            decide(Permission::Workspace, Permission::Read, false),
-            "refuse"
-        );
-        assert_eq!(decide(Permission::Workspace, Permission::Read, true), "ask");
-        assert_eq!(decide(Permission::Read, Permission::Read, true), "run");
-        assert_eq!(decide(Permission::Read, Permission::None, true), "ask");
-        assert_eq!(decide(Permission::Read, Permission::None, false), "refuse");
-        assert_eq!(
-            decide(Permission::Unrestricted, Permission::Unrestricted, true),
-            "run"
-        );
-        // `workspace` runs a tool that requires `unrestricted` when meka can confine it; the
-        // approval question is never asked for a call the level already covers.
-        assert_eq!(
-            decide(Permission::Unrestricted, Permission::Workspace, true),
-            "run"
-        );
-    }
-
-    /// A tool meka cannot confine is the one case where `workspace` covers the requirement and
-    /// still cannot deliver it: refused, or asked about when the switch is on.
-    #[test]
-    fn an_unconfinable_call_at_workspace_is_asked_about_when_approvals_are_on() {
-        let refused = admit_tool_call(
-            "mcp__x__t",
-            Permission::Unrestricted,
-            Permission::Workspace,
-            false,
-            true,
-        );
-        assert!(matches!(refused, Admission::Refuse(_)));
-        let asked = admit_tool_call(
-            "mcp__x__t",
-            Permission::Unrestricted,
-            Permission::Workspace,
-            true,
-            true,
-        );
-        assert!(matches!(asked, Admission::Ask));
-        // Not at `unrestricted`, which promises no boundary to fail to apply.
-        let run = admit_tool_call(
-            "mcp__x__t",
-            Permission::Unrestricted,
-            Permission::Unrestricted,
-            true,
-            true,
-        );
-        assert!(matches!(run, Admission::Run));
-    }
-
-    /// The refusal names the level it would take, which is what the model relays to the user.
-    #[test]
-    fn a_refusal_names_the_required_level() {
-        let Admission::Refuse(output) = admit_tool_call(
-            "write_file",
-            Permission::Workspace,
-            Permission::Read,
-            false,
-            false,
-        ) else {
-            panic!("a call above the level with approvals off is refused");
-        };
-        let text = output.text_content();
-        assert!(output.is_error);
-        assert!(text.contains("requires `workspace`"), "{text}");
-        assert!(text.contains("the session is at `read`"), "{text}");
-        // meka's own decision is a refusal; "denied" is the user's answer at the prompt.
-        assert!(!text.contains("denied"), "{text}");
     }
 
     /// A tool that runs outside any confinement meka can apply is refused at `workspace`, for
@@ -951,7 +799,7 @@ mod tests {
         );
     }
 
-    /// With `[shell].sandbox = false`, `execute_command` at `read` is refused however the user
+    /// With `[shell].sandbox = false`, `shell_execute` at `read` is refused however the user
     /// answers: an approved call runs at the level, and nothing can confine it there. Asking first
     /// put a question to the user whose yes could not matter, the way `admit_detach` already
     /// refuses a detached call ahead of the prompt. The refusal reaches the model unasked, in the
@@ -992,7 +840,7 @@ mod tests {
         let output = agent
             .resolve_and_execute_tool(
                 "call-1",
-                "execute_command",
+                "shell_execute",
                 &serde_json::json!({"command": "true"}),
                 &[],
                 None,
@@ -1105,7 +953,7 @@ mod tests {
         .await;
         agent
             .tool_registry
-            .register(Arc::new(crate::tools::todo::TodoTool {
+            .register(Arc::new(crate::tools::todo::TodoWriteTool {
                 todo_list: agent.cells.todo_list.clone(),
             }))
             .expect("registration");
@@ -1116,7 +964,7 @@ mod tests {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: "todo-1".to_string(),
-                name: "todo".to_string(),
+                name: "todo_write".to_string(),
                 input,
             }],
         };
@@ -1144,7 +992,7 @@ mod tests {
         assert_eq!(rendered(), 1, "rewriting the same list renders nothing");
         agent
             .execute_tool_calls(
-                &todo_call(serde_json::json!({"items": []})),
+                &todo_call(serde_json::json!({"title": "Plan", "items": []})),
                 &[],
                 None,
                 CancellationToken::new(),

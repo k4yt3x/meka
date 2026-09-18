@@ -326,12 +326,12 @@ pub(crate) enum LiveOutputMode {
     /// The reader replaces what it shows with what it is sent.
     Text,
 }
-/// Whether a tool's output is relayed while it runs. Only `execute_command` emits
+/// Whether a tool's output is relayed while it runs. Only `shell_execute` emits
 /// [`crate::frontend::FrontendEvent::ToolCallOutputDelta`], and it is the one tool whose result
 /// can be minutes away; a live view opened for anything else would show nothing. One answer for
 /// both hosts, so a second tool that starts streaming is wired up in one place.
 pub(crate) fn streams_output(tool_name: &str) -> bool {
-    tool_name == "execute_command"
+    tool_name == "shell_execute"
 }
 /// Per-tool-call state for relaying a running command's output.
 pub(crate) struct LiveOutput {

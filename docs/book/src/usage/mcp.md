@@ -58,7 +58,7 @@ A confidential OAuth client holds two at once: the long-lived client secret it a
 | `--permission <LEVEL>` | Per-server permission cap, applied to every tool on the server: `none`, `read`, `workspace` or `unrestricted` (default: `read`). |
 | `--allow-tool <TOOL>` | Raw tool name to allow (repeatable). When set, only listed tools register. |
 | `--disable-tool <TOOL>` | Raw tool name to block (repeatable). Applied after `--allow-tool`. |
-| `--eager-load-tool <TOOL>` | Raw tool name to eager-load (repeatable). Listed tools skip the `load_tool` round-trip and ship in the cacheable tools-array prefix from turn 1. |
+| `--eager-load-tool <TOOL>` | Raw tool name to eager-load (repeatable). Listed tools skip the `tool_load` round-trip and ship in the cacheable tools-array prefix from turn 1. |
 | `--tool-permission <TOOL=LEVEL>` | Per-tool permission override (repeatable). `LEVEL` is `none`, `read`, `workspace` or `unrestricted`. |
 | `--no-login` | Skip the auto-login an HTTP server's probe would otherwise start; run `meka mcp login <name>` later. |
 | `--required` | Persist `required = true`, so a turn is refused while this server is not connected. Omitted, the server inherits `[mcp].default_required` and is optional by default. |
@@ -130,7 +130,7 @@ Inside the REPL:
 
 ## Resources and prompts
 
-In addition to tools, meka exposes MCP resources and prompts through several builtin tools (deferred: the agent calls `load_tool` first to fetch the schema, then invokes them):
+In addition to tools, meka exposes MCP resources and prompts through several builtin tools (deferred: the agent finds them under `[Tool discovery]` or with `tool_search`, calls `tool_load` for the schema, then invokes them):
 
 | Builtin | Purpose |
 |---------|---------|

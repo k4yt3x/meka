@@ -108,7 +108,7 @@ pub(super) fn bwrap_on_path() -> Option<std::path::PathBuf> {
 /// The flag set mirrors the production-path argv in `src/tools/shell.rs` so a host that succeeds
 /// here also succeeds at runtime; without it, a kernel that quietly rejects (say)
 /// `--unshare-cgroup-try` or `--die-with-parent` would pass the probe and blow past the lazy
-/// hard-error gate the first time `execute_command` ran. `--unshare-net` is added on top so the
+/// hard-error gate the first time `shell_execute` ran. `--unshare-net` is added on top so the
 /// probe stays self-contained (no outbound DNS / network calls), even though production keeps the
 /// host network namespace.
 pub(super) fn smoke_test_bwrap(

@@ -40,7 +40,7 @@ pub(crate) fn capability_from_probe(probe: &BackendProbe) -> SandboxCapability {
     }
 }
 
-/// What a single `execute_command` call runs under.
+/// What a single `shell_execute` call runs under.
 ///
 /// Three states rather than a boolean, because `workspace` is neither of the two a boolean could
 /// express: it is not unconfined, and it is not read-only. Folding it into either
@@ -324,7 +324,7 @@ pub(crate) enum WarnContext {
     InitialReadLevel,
     /// User pressed Shift+Tab and cycled into `Read`. Only Warn 1 fires.
     ReadModeEntry,
-    /// `meka tool list` probed the sandbox to print `execute_command` at the level a session here
+    /// `meka tool list` probed the sandbox to print `shell_execute` at the level a session here
     /// would need. Only Warn 1 fires: it is the reason the row reads `unrestricted`.
     ToolListing,
 }
@@ -511,7 +511,7 @@ const POWERSHELL_UTF8_PRELUDE: &str = "if($ExecutionContext.SessionState.Languag
      $OutputEncoding=[System.Text.Encoding]::UTF8}catch{}};";
 
 /// Prepend the UTF-8 encoding prelude to a PowerShell command. Used by both the sandboxed and
-/// non-sandboxed Windows `execute_command` paths so pipe output is always decoded as UTF-8 on the
+/// non-sandboxed Windows `shell_execute` paths so pipe output is always decoded as UTF-8 on the
 /// Rust side regardless of the console's legacy code page.
 #[cfg_attr(
     not(target_os = "windows"),

@@ -4,7 +4,7 @@
 //! The advertised capability surface, the delegation rules and the wire shapes are documented in
 //! `docs/book/src/usage/acp.md`.
 //!
-//! **`execute_command` is never delegated to the client's `terminal/*`**, whatever it advertises
+//! **`shell_execute` is never delegated to the client's `terminal/*`**, whatever it advertises
 //! and whatever the permission level. meka owns the process so its Landlock / bwrap / sandbox-exec
 //! / Low-Integrity jail, env scrub, cwd resolution and process-group kill keep applying; the
 //! client's terminal offers no equivalent, so routing through it would run a command unsandboxed at
@@ -794,16 +794,16 @@ mod tests {
     #[test]
     fn a_sticky_permission_option_names_the_tool_it_covers() {
         assert_eq!(
-            sticky_option_label("allow", "execute_command"),
-            "Always allow any execute_command"
+            sticky_option_label("allow", "shell_execute"),
+            "Always allow any shell_execute"
         );
         assert_eq!(
-            sticky_option_label("deny", "write_file"),
-            "Always deny any write_file"
+            sticky_option_label("deny", "file_write"),
+            "Always deny any file_write"
         );
         for verb in ["allow", "deny"] {
             assert!(
-                sticky_option_label(verb, "execute_command").contains("execute_command"),
+                sticky_option_label(verb, "shell_execute").contains("shell_execute"),
                 "dropping the tool name makes the option read as approving the one call on screen"
             );
         }
@@ -811,13 +811,16 @@ mod tests {
 
     #[test]
     fn tool_kind_for_covers_builtins() {
-        assert_eq!(tool_kind_for("read_file"), ToolKind::Read);
-        assert_eq!(tool_kind_for("edit_file"), ToolKind::Edit);
-        assert_eq!(tool_kind_for("write_file"), ToolKind::Edit);
-        assert_eq!(tool_kind_for("find_files"), ToolKind::Search);
-        assert_eq!(tool_kind_for("search_contents"), ToolKind::Search);
-        assert_eq!(tool_kind_for("execute_command"), ToolKind::Execute);
-        assert_eq!(tool_kind_for("fetch_url"), ToolKind::Fetch);
+        assert_eq!(tool_kind_for("file_read"), ToolKind::Read);
+        assert_eq!(tool_kind_for("file_edit"), ToolKind::Edit);
+        assert_eq!(tool_kind_for("file_write"), ToolKind::Edit);
+        assert_eq!(tool_kind_for("file_find"), ToolKind::Search);
+        assert_eq!(tool_kind_for("file_search"), ToolKind::Search);
+        assert_eq!(tool_kind_for("shell_execute"), ToolKind::Execute);
+        assert_eq!(tool_kind_for("web_fetch"), ToolKind::Fetch);
+        assert_eq!(tool_kind_for("todo_read"), ToolKind::Read);
+        assert_eq!(tool_kind_for("todo_write"), ToolKind::Think);
+        assert_eq!(tool_kind_for("todo_edit"), ToolKind::Think);
         assert_eq!(tool_kind_for("agent_spawn"), ToolKind::Think);
         // MCP-loaded tools and anything else fall through.
         assert_eq!(tool_kind_for("mcp__github__create_issue"), ToolKind::Other);
@@ -879,7 +882,7 @@ mod tests {
         assert_eq!(source.media_type(), "image/png");
     }
 
-    /// A client's attachment is refused for the same reason a `read_file` result is: forwarding
+    /// A client's attachment is refused for the same reason a `file_read` result is: forwarding
     /// bytes that only look like a PNG lands the provider's rejection inside a committed message.
     #[tokio::test]
     async fn decode_acp_image_rejects_a_payload_that_does_not_decode() {
@@ -967,7 +970,7 @@ mod tests {
     fn tool_locations_resolves_relative_against_cwd() {
         let cwd = SharedCwd::new(PathBuf::from("/home/agent/proj"));
         let input = serde_json::json!({"path": "src/main.rs"});
-        let locations = tool_locations("read_file", &input, &cwd);
+        let locations = tool_locations("file_read", &input, &cwd);
         assert_eq!(locations.len(), 1);
         assert_eq!(
             locations[0].path,
@@ -979,7 +982,7 @@ mod tests {
     fn tool_locations_passes_absolute_paths_through() {
         let cwd = SharedCwd::new(PathBuf::from("/some/other/dir"));
         let input = serde_json::json!({"path": "/etc/hosts"});
-        let locations = tool_locations("edit_file", &input, &cwd);
+        let locations = tool_locations("file_edit", &input, &cwd);
         assert_eq!(locations[0].path, PathBuf::from("/etc/hosts"));
     }
 
@@ -987,24 +990,24 @@ mod tests {
     fn tool_locations_empty_for_non_path_tools() {
         let cwd = SharedCwd::new(PathBuf::from("/"));
         let input = serde_json::json!({"command": "ls"});
-        assert!(tool_locations("execute_command", &input, &cwd).is_empty());
-        assert!(tool_locations("todo", &input, &cwd).is_empty());
+        assert!(tool_locations("shell_execute", &input, &cwd).is_empty());
+        assert!(tool_locations("todo_read", &input, &cwd).is_empty());
     }
 
     #[test]
     fn tool_locations_read_file_line_from_offset() {
         let cwd = SharedCwd::new(PathBuf::from("/home/agent/proj"));
-        // `read_file` offset is 0-based; ACP `line` is 1-based.
+        // `file_read` offset is 0-based; ACP `line` is 1-based.
         let input = serde_json::json!({"path": "src/main.rs", "offset": 41});
-        let locations = tool_locations("read_file", &input, &cwd);
+        let locations = tool_locations("file_read", &input, &cwd);
         assert_eq!(locations.len(), 1);
         assert_eq!(locations[0].line, Some(42));
         // No offset -> no line.
         let no_offset = serde_json::json!({"path": "src/main.rs"});
-        assert_eq!(tool_locations("read_file", &no_offset, &cwd)[0].line, None);
+        assert_eq!(tool_locations("file_read", &no_offset, &cwd)[0].line, None);
         // Other path tools never set a line, even with an offset present.
         let edit = serde_json::json!({"path": "src/main.rs", "offset": 41});
-        assert_eq!(tool_locations("edit_file", &edit, &cwd)[0].line, None);
+        assert_eq!(tool_locations("file_edit", &edit, &cwd)[0].line, None);
     }
 
     #[test]
@@ -1017,7 +1020,7 @@ mod tests {
         let content = vec![ToolResultContent::Text {
             text: "ignored".to_string(),
         }];
-        let blocks = build_completion_content("edit_file", &content, metadata);
+        let blocks = build_completion_content("file_edit", &content, metadata);
         assert_eq!(blocks.len(), 1);
         assert!(matches!(blocks[0], ToolCallContent::Diff(_)));
     }
@@ -1027,32 +1030,32 @@ mod tests {
     #[test]
     fn tool_call_title_per_tool() {
         assert_eq!(
-            tool_call_title("execute_command", Some("git status && git diff")),
-            "execute_command git status && git diff"
+            tool_call_title("shell_execute", Some("git status && git diff")),
+            "shell_execute git status && git diff"
         );
         assert_eq!(
-            tool_call_title("read_file", Some("src/main.rs")),
-            "read_file src/main.rs"
+            tool_call_title("file_read", Some("src/main.rs")),
+            "file_read src/main.rs"
         );
         assert_eq!(
-            tool_call_title("edit_file", Some("src/lib.rs")),
-            "edit_file src/lib.rs"
+            tool_call_title("file_edit", Some("src/lib.rs")),
+            "file_edit src/lib.rs"
         );
         assert_eq!(
-            tool_call_title("write_file", Some("out.txt")),
-            "write_file out.txt"
+            tool_call_title("file_write", Some("out.txt")),
+            "file_write out.txt"
         );
         assert_eq!(
-            tool_call_title("find_files", Some("**/*.rs")),
-            "find_files **/*.rs"
+            tool_call_title("file_find", Some("**/*.rs")),
+            "file_find **/*.rs"
         );
         assert_eq!(
-            tool_call_title("search_contents", Some("TODO")),
-            "search_contents TODO"
+            tool_call_title("file_search", Some("TODO")),
+            "file_search TODO"
         );
         assert_eq!(
-            tool_call_title("fetch_url", Some("https://example.com")),
-            "fetch_url https://example.com"
+            tool_call_title("web_fetch", Some("https://example.com")),
+            "web_fetch https://example.com"
         );
         // An MCP tool's name is the server's, shown as the server spells it.
         assert_eq!(
@@ -1060,19 +1063,19 @@ mod tests {
             "mcp__exa__web_search_exa query"
         );
         // No primary argument resolved -> the name alone.
-        assert_eq!(tool_call_title("read_file", None), "read_file");
+        assert_eq!(tool_call_title("file_read", None), "file_read");
     }
 
     #[test]
     fn tool_call_title_sanitizes_whitespace_and_length() {
         // A multi-line command collapses to a single line.
         assert_eq!(
-            tool_call_title("execute_command", Some("git status\n  && git diff")),
-            "execute_command git status && git diff"
+            tool_call_title("shell_execute", Some("git status\n  && git diff")),
+            "shell_execute git status && git diff"
         );
         // Over-long titles are truncated with an ellipsis.
         let long = "x".repeat(400);
-        let title = tool_call_title("execute_command", Some(&long));
+        let title = tool_call_title("shell_execute", Some(&long));
         assert!(title.chars().count() <= 256);
         assert!(title.ends_with('…'));
     }
@@ -1082,7 +1085,7 @@ mod tests {
         let content = vec![ToolResultContent::Text {
             text: "hello\nworld\n".to_string(),
         }];
-        let blocks = build_completion_content("execute_command", &content, None);
+        let blocks = build_completion_content("shell_execute", &content, None);
         assert_eq!(blocks.len(), 1);
         let ToolCallContent::Content(chunk) = &blocks[0] else {
             panic!("expected ToolCallContent::Content; got {:?}", blocks[0]);
@@ -1098,7 +1101,7 @@ mod tests {
         let content = vec![ToolResultContent::Text {
             text: "   \n".to_string(),
         }];
-        assert!(build_completion_content("execute_command", &content, None).is_empty());
+        assert!(build_completion_content("shell_execute", &content, None).is_empty());
     }
 
     fn empty_live_output() -> LiveOutput {
@@ -1264,7 +1267,7 @@ mod tests {
                 RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                     OPTION_ALLOW_ONCE,
                 )),
-                "read_file",
+                "file_read",
                 record,
             ),
             PermissionOutcome::Allow,
@@ -1279,7 +1282,7 @@ mod tests {
                 RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                     OPTION_ALLOW_ALWAYS,
                 )),
-                "read_file",
+                "file_read",
                 record,
             ),
             PermissionOutcome::Allow,
@@ -1291,7 +1294,7 @@ mod tests {
                 RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                     OPTION_REJECT_ONCE,
                 )),
-                "write_file",
+                "file_write",
                 record,
             ),
             PermissionOutcome::Deny,
@@ -1307,7 +1310,7 @@ mod tests {
                 RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                     OPTION_REJECT_ALWAYS,
                 )),
-                "write_file",
+                "file_write",
                 record,
             ),
             PermissionOutcome::Deny,
@@ -1315,7 +1318,7 @@ mod tests {
         assert_eq!(sticky.borrow().last().copied(), Some("deny"));
 
         assert_eq!(
-            translate_permission_outcome(RequestPermissionOutcome::Cancelled, "read_file", record,),
+            translate_permission_outcome(RequestPermissionOutcome::Cancelled, "file_read", record,),
             PermissionOutcome::Canceled,
         );
     }
@@ -1325,7 +1328,7 @@ mod tests {
         use agent_client_protocol::schema::v1::SelectedPermissionOutcome;
         let result = translate_permission_outcome(
             RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("future_option")),
-            "read_file",
+            "file_read",
             &mut |_| {},
         );
         assert_eq!(result, PermissionOutcome::Deny);
@@ -1336,7 +1339,7 @@ mod tests {
         let content = vec![ToolResultContent::Text {
             text: "hello".to_string(),
         }];
-        let blocks = build_completion_content("read_file", &content, None);
+        let blocks = build_completion_content("file_read", &content, None);
         assert_eq!(blocks.len(), 1);
         assert!(matches!(blocks[0], ToolCallContent::Content(_)));
     }
@@ -1353,7 +1356,7 @@ mod tests {
                 data: "aGVsbG8=".to_string(),
             },
         }];
-        let blocks = build_completion_content("read_file", &content, None);
+        let blocks = build_completion_content("file_read", &content, None);
         assert_eq!(blocks.len(), 1);
         let ToolCallContent::Content(chunk) = &blocks[0] else {
             panic!("expected ToolCallContent::Content; got {:?}", blocks[0]);
@@ -1366,7 +1369,7 @@ mod tests {
     }
 
     /// A tool whose output interleaves text and an image keeps both blocks, in order: the text
-    /// marker `read_file` emits alongside an image (`[Image: path]`) is what names the file in the
+    /// marker `file_read` emits alongside an image (`[Image: path]`) is what names the file in the
     /// transcript, so dropping either half loses information.
     #[test]
     fn build_completion_content_preserves_mixed_text_and_image() {
@@ -1382,7 +1385,7 @@ mod tests {
                 },
             },
         ];
-        let blocks = build_completion_content("read_file", &content, None);
+        let blocks = build_completion_content("file_read", &content, None);
         assert_eq!(blocks.len(), 2);
         let ToolCallContent::Content(first) = &blocks[0] else {
             panic!("expected ToolCallContent::Content; got {:?}", blocks[0]);

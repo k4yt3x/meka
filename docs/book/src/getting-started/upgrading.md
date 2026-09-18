@@ -10,6 +10,46 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.59 to 0.60
+
+**Every built-in tool is named `<noun>_<verb>`.** The noun is the class a tool belongs to and the
+verb its one operation, so the tools that act on one thing sort as one block. Nine names change:
+
+| 0.59 | 0.60 |
+| --- | --- |
+| `read_file` | `file_read` |
+| `write_file` | `file_write` |
+| `edit_file` | `file_edit` |
+| `find_files` | `file_find` |
+| `search_contents` | `file_search` |
+| `execute_command` | `shell_execute` |
+| `fetch_url` | `web_fetch` |
+| `render_image` | `image_render` |
+| `load_tool` | `tool_load` |
+
+**`todo` is three tools.** `todo_write` takes `title` and `items` and replaces the list,
+`todo_edit` takes `set` and updates statuses by task number, `todo_read` takes nothing. The single
+tool's "items then set in one call" is two calls now.
+
+**`tool_search` is new**: keyword search over every registered tool, deferred ones included, that
+says for each whether the current permission level allows a call.
+
+What is converted for you, the first time the store is opened and behind the automatic backup: the
+calls in every stored session (so a resumed session keeps the tools it had loaded and its history
+shows one set of names), the `denied_tools` of every sub-agent, the tool a finished background
+task reports, and the tool a scheduled job's gate calls. A session archive written by 0.59
+(`format_version` 3) still imports; new archives carry `format_version` 4.
+
+One narrow case to know about: the conversion reads every stored message that can hold a call,
+and a prompt you typed that was, in its entirety, the JSON of a tool call under an old name is
+converted like a call. Prose around such JSON leaves it alone.
+
+What is not: a `[tools]` or `[subagents]` list, a `tool_permissions` key, a skill, standing
+instructions, or a client that matches on a tool name must be edited. The startup warning and the
+model's unknown-tool reply suggest the new name when the old one is a reordering of it
+(`read_file`, `write_file`, `edit_file`, `render_image`, `load_tool`) or a family's bare noun
+(`todo`); the other four are named only here.
+
 ## 0.58 to 0.59
 
 **meka is licensed under the GNU Affero General Public License, version 3 or later.** Releases up

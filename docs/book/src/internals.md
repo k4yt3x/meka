@@ -35,7 +35,7 @@ rank  module          holds
 12    skills          skill discovery and loading
 12    instructions    the standing instructions file
 12    oauth           expiry, refresh, the refresh lock, PKCE
-12    sandbox         read-only confinement for execute_command
+12    sandbox         read-only confinement for shell_execute
 13    workspace       cwd, roots, the write fence, private-directory refusals
 13    tokens          token estimates for the gauge between provider reports
 14    store           every SQL statement, behind one connection owner
@@ -108,6 +108,12 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
    that detaches it; `admit_tool_call` decides run, ask or refuse. Each call gets a `ToolContext`:
    the session id, the tool-use id, the prompt id, the frontend and the cancellation token. Every
    request carries the conversation whole; the context ceiling and compaction are its only bound.
+   The world state's `[Tool discovery]` index is bounded like the skills and memory indexes, in
+   `prompt::render_tool_discovery`: summaries while the section fits 8 KB, names past it, and
+   past 200 names a count that points at `tool_search`. One renderer serves the world render and
+   the sub-agent system prompt, which lists the worker's own registry the same way because the
+   world render is skipped under a prompt override. `admit_tool_call` lives in `tools`, where
+   `tool_search` and `tool_load` consult it to say what a call would do before the model makes it.
 4. **Recovery.** A failed request goes through `TurnRecovery`, which decides between a retry, a
    degraded resend and a reported failure. Compaction runs when the context gauge says so, when the
    model asks through `context_compact`, or when the user asks.
@@ -169,13 +175,13 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | What a resident session's log holds | `Store::load_conversation`: the rows from the last `compact_boundary` on (`load_view_events`), images inlined, orphaned `tool_use` dropped; the whole log is read only by `load_events` for the readers that want history | every host resume through `host::hydrate_conversation`, the sub-agent follow-up |
 | Forking | `Store::fork_session_locked` with `SourceLock::{Probe, HeldByCaller}` | `meka session fork` (`Probe`); REPL `/fork` through `host::fork_and_lock` (`HeldByCaller`); HTTP `POST /fork` and ACP `session/fork`, which hold a resident source still under `HeldByCaller` (refusing it mid-turn) and `Probe` a dormant one |
 | What an HTTP caller may do | `scope::Scoped<R>` as an extractor | every handler, by its signature |
-| Whether a path may be written | `workspace::WriteScope` | `write_file`, `edit_file`, `scratchpad_save_file`, `execute_command`'s confinement |
-| Whether meka's own directories may be read | `workspace::private_read_refusal` and `resolves_into_private` | `tools/util.rs` for the readers, `find_files`, `search_contents` |
+| Whether a path may be written | `workspace::WriteScope` | `file_write`, `file_edit`, `scratchpad_save_file`, `shell_execute`'s confinement |
+| Whether meka's own directories may be read | `workspace::private_read_refusal` and `resolves_into_private` | `tools/util.rs` for the readers, `file_find`, `file_search` |
 | Whether a backend reads a profile or account key | `Backend::reads_profile_key` and `reads_account_key` (in `config.rs`) | `profile add`, `profile set`, `account add`, the load-time warning |
 | Which account a profile bills | `config::account_for` | config validation, the provider registry |
 | Whether an MCP server's config may be sent at all | `ServerEntry::refused`, a field set at construction | every connect door in `mcp/connector.rs`, `ServerEntry::reconnect` |
 | Whether a fire's session is still resident | `HostHooks::still_resident` | scheduled fires and outcome deliveries, once the lock is won |
-| What a frontend answered for a file operation | `Delegation` | `read_file`, `edit_file`, `write_file` |
+| What a frontend answered for a file operation | `Delegation` | `file_read`, `file_edit`, `file_write` |
 | Whether thinking is on for a request | `ThinkingOverride` on `CompletionRequest` | the turn, the summarizer, the checkpoint turn |
 | Where an image's bytes rest | `store/blobs.rs`: `externalize_images` on write, `inline_blobs` on read | writes: `save_event`, `save_events_atomic`, `import_sessions`, the fork's row copy; reads: `Store::load_conversation` for every resume and the sub-agent follow-up; `GET /messages` serves the reference, `GET /blobs/{hash}` the bytes, and an export carries both |
 | The sentence for a name that matches nothing | `text::unknown_name` | every refusal by name: profiles, accounts, MCP servers, configuration options, scopes, gates |

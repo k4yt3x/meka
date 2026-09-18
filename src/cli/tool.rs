@@ -46,7 +46,7 @@ pub(crate) fn run_tool_subcommand(
             ));
             let shared_permission =
                 SharedPermission::new(config.permission, config.enabled_permissions);
-            // Probed, though nothing here runs a shell: `execute_command` declares `read` only
+            // Probed, though nothing here runs a shell: `shell_execute` declares `read` only
             // where the sandbox is on and usable, so a listing built with the sandbox off would
             // print `unrestricted` on every machine whose sessions run the tool at `read`. The
             // warning is the one a session start gives, and it explains an `unrestricted` row.

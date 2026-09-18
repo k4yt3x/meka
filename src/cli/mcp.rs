@@ -885,7 +885,7 @@ pub(crate) struct AddArgs {
     pub(crate) allow_tool: Vec<String>,
     /// Raw tool names to block-list (never register).
     pub(crate) disable_tool: Vec<String>,
-    /// Raw tool names to eager-load (skip `load_tool` round-trip).
+    /// Raw tool names to eager-load (skip `tool_load` round-trip).
     pub(crate) eager_load_tool: Vec<String>,
     /// Raw `NAME=LEVEL` pairs for per-tool permission overrides.
     pub(crate) tool_permission: Vec<String>,

@@ -327,7 +327,7 @@ unsafe fn set_workspace_ace(root: &std::path::Path, grant: bool) -> std::io::Res
     let _descriptor_guard = LocalFreeGuard(descriptor);
 
     // Placing the ACE re-propagates it over the whole tree, and `ensure` runs before *every*
-    // `execute_command`. Measured on the test box against a 5000-file workspace: 282ms per
+    // `shell_execute`. Measured on the test box against a 5000-file workspace: 282ms per
     // command, and every file's USN bumped each time.
     //
     // So skip the write when the ACE is already there. The read above has happened either way,
@@ -359,7 +359,7 @@ unsafe fn set_workspace_ace(root: &std::path::Path, grant: bool) -> std::io::Res
     // `GENERIC_WRITE` covers what a workspace write actually needs: on a file, write and append
     // data plus attributes; on a directory, the same two bits mean add-file and add-subdirectory.
     // `DELETE` is separate and is required for replacing a file, which is how every atomic write
-    // lands -- `write_file` renames a temp file over the target, and the rename needs delete rights
+    // lands -- `file_write` renames a temp file over the target, and the rename needs delete rights
     // on what it displaces.
     let access = EXPLICIT_ACCESS_W {
         grfAccessPermissions: GENERIC_WRITE | DELETE,

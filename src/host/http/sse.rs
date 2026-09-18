@@ -373,14 +373,14 @@ mod tests {
     fn translate_tool_call_composing() {
         let event = FrontendEvent::ToolCallComposing {
             id: "tu_1".into(),
-            name: "read_file".into(),
+            name: "file_read".into(),
         };
         let (event_type, data) =
             translate(event, SessionCapabilities::default()).expect("translates");
         assert_eq!(event_type, SseEventType::ToolCallComposing);
         assert_eq!(event_type.as_str(), "tool_call.composing");
         assert_eq!(data["id"], "tu_1");
-        assert_eq!(data["name"], "read_file");
+        assert_eq!(data["name"], "file_read");
     }
 
     /// Output streams under the call's own id, so a client appends it to that call; the shape is
@@ -406,7 +406,7 @@ mod tests {
     fn translate_sub_agent_activity() {
         let event = FrontendEvent::SubAgentActivity {
             tool_call_id: "tu_1".into(),
-            summary: "read_file: notes.txt\nsearch_contents: todo".into(),
+            summary: "file_read: notes.txt\nfile_search: todo".into(),
         };
         let (event_type, data) =
             translate(event, SessionCapabilities::default()).expect("translates");
@@ -414,17 +414,14 @@ mod tests {
         assert_eq!(event_type.as_str(), "subagent.activity");
         assert!(event_type.is_transient());
         assert_eq!(data["id"], "tu_1");
-        assert_eq!(
-            data["summary"],
-            "read_file: notes.txt\nsearch_contents: todo"
-        );
+        assert_eq!(data["summary"], "file_read: notes.txt\nfile_search: todo");
     }
 
     #[test]
     fn translate_tool_call_started() {
         let event = FrontendEvent::ToolCallStarted {
             id: "tu_1".into(),
-            name: "read_file".into(),
+            name: "file_read".into(),
             input: serde_json::json!({"path": "/etc/hosts"}),
             display_summary: Some("/etc/hosts".into()),
         };

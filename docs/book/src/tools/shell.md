@@ -1,6 +1,6 @@
 # Shell tool
 
-## `execute_command`
+## `shell_execute`
 
 Execute a shell command and return its output.
 
@@ -20,7 +20,7 @@ Execute a shell command and return its output.
 - Captures both stdout and stderr.
 - Returns the exit code along with the output if non-zero.
 - Oversized output is losslessly persisted to the scratchpad by the agent layer; the tool does not truncate what it returns to the agent, up to the residency ceiling below.
-- There is no cap on how much a command may print, but there is a cap on how much of it meka holds in memory. Past 8 MiB on one stream the bytes are written to a file instead, and the tool result carries the first and last 32 KiB plus that file's path, so the whole capture stays reachable with `read_file`. The file goes under `MEKA_DATA_DIR/command-output` when that variable is set, else the platform cache directory's `meka` subdirectory, else the temp directory; the temp directory is also the fallback when that directory cannot be created. Captures older than a day are swept on the way past. This exists because a command that writes faster than the turn ends (`cat /dev/zero`, a runaway build log) previously grew one buffer until the process died.
+- There is no cap on how much a command may print, but there is a cap on how much of it meka holds in memory. Past 8 MiB on one stream the bytes are written to a file instead, and the tool result carries the first and last 32 KiB plus that file's path, so the whole capture stays reachable with `file_read`. The file goes under `MEKA_DATA_DIR/command-output` when that variable is set, else the platform cache directory's `meka` subdirectory, else the temp directory; the temp directory is also the fallback when that directory cannot be created. Captures older than a day are swept on the way past. This exists because a command that writes faster than the turn ends (`cat /dev/zero`, a runaway build log) previously grew one buffer until the process died.
 - Default timeout is 30 seconds. If the command exceeds the timeout, it is killed (on Unix, via the process group so backgrounded grandchildren are caught too).
 - Supports cancellation: pressing Ctrl+C while a command is running kills the child process.
 
@@ -122,7 +122,7 @@ See [Permissions](../usage/permissions.md#per-platform-enforcement) for the full
 
 #### When the configured backend is unavailable
 
-If `sandbox_backend = "bubblewrap"` is set but `bwrap` isn't on `$PATH` (or user namespaces are denied), `execute_command` at `read` returns a hard error rather than silently falling back. The error names the configured backend and the specific failure reason. Either install `bubblewrap`, set `sandbox_backend = "landlock"`, or switch to `unrestricted` (Shift+Tab).
+If `sandbox_backend = "bubblewrap"` is set but `bwrap` isn't on `$PATH` (or user namespaces are denied), `shell_execute` at `read` returns a hard error rather than silently falling back. The error names the configured backend and the specific failure reason. Either install `bubblewrap`, set `sandbox_backend = "landlock"`, or switch to `unrestricted` (Shift+Tab).
 
 #### Disabling the sandbox entirely
 

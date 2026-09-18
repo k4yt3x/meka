@@ -7,19 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.60.0] - 2026-09-18
+
+### Added
+
+- `tool_search` finds a tool by keyword, deferred ones included, and whether your level allows it.
+
+### Changed
+
+- **Breaking:** every built-in is now `<noun>_<verb>`: nine names change; see the upgrade guide.
+- **Breaking:** `todo` is now `todo_write`, `todo_edit` and `todo_read`, one operation each.
+- Stored sessions, sub-agent restrictions, tasks, job gates and 0.59 archives convert on first open.
+- The per-turn deferred-tool listing is bounded, so a large MCP server costs less context.
+- `tool_load` suggests the right name for a near miss and lists keyword matches for a bare word.
+- `tool_load` says whether your permission level allows a call to the tool it loaded.
+
 ### Fixed
 
+- Sub-agents can now find and load the MCP tools they hold; they were never told about them.
 - `agent_delete` refuses a sub-agent that is still running instead of deleting it mid-run.
 - A turn whose session was deleted while its images decoded is refused instead of running.
 - `PATCH /v1/sessions/{id}` naming `cwd` or `profile` holds the session, so no turn starts under it.
 - A canceled turn no longer waits for a provider error reply whose body never arrives.
-- `fetch_url` stops when the turn is canceled instead of waiting for the server or its timeout.
+- `web_fetch` stops when the turn is canceled instead of waiting for the server or its timeout.
 - `[serve] max_concurrent_turns` now covers inbox, scheduled and background-outcome turns.
 - `[schedule] max_jobs` holds under concurrent creates.
-- `read_file` past its ceiling keeps a window's leading blank lines and reports the right range.
-- `read_file` no longer holds a line larger than its ceiling in memory before refusing it.
+- `file_read` past its ceiling keeps a window's leading blank lines and reports the right range.
+- `file_read` no longer holds a line larger than its ceiling in memory before refusing it.
 - Token usage from a turn's completed rounds is kept when a later round fails or it is canceled.
-- `fetch_url`'s `limit` counts characters as documented, not bytes.
+- `web_fetch`'s `limit` counts characters as documented, not bytes.
 - An MCP elicitation is declined, not guessed, when two sessions have calls in flight on one server.
 
 ## [0.59.0] - 2026-09-18
@@ -2311,7 +2327,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.59.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.60.0...HEAD
+[0.60.0]: https://github.com/k4yt3x/meka/compare/0.59.0...0.60.0
 [0.59.0]: https://github.com/k4yt3x/meka/compare/0.58.0...0.59.0
 [0.58.0]: https://github.com/k4yt3x/meka/compare/0.57.0...0.58.0
 [0.57.0]: https://github.com/k4yt3x/meka/compare/0.56.0...0.57.0

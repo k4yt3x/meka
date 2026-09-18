@@ -1,4 +1,4 @@
-//! The web tool: `fetch_url`, an HTTP GET with HTML-to-markdown conversion or a multimodal image
+//! The web tool: `web_fetch`, an HTTP GET with HTML-to-markdown conversion or a multimodal image
 //! return.
 
 use std::sync::LazyLock;
@@ -20,7 +20,7 @@ use crate::{
     tools::util::build_image_tool_output,
 };
 
-/// Build the `reqwest::Client` for `fetch_url` from the resolved
+/// Build the `reqwest::Client` for `web_fetch` from the resolved
 /// [`WebClientConfig`].
 ///
 /// Refused as [`MekaError::Installation`] rather than built from a fallback that ignores the
@@ -166,7 +166,7 @@ fn keep_boilerplate_container_content(html: &str) -> std::borrow::Cow<'_, str> {
     BOILERPLATE_CONTAINER_TAG.replace_all(html, "<${1}div${2}>")
 }
 
-/// Convert fetched HTML to Markdown exactly the way `fetch_url` does. Two steps: rewrite `<nav>` /
+/// Convert fetched HTML to Markdown exactly the way `web_fetch` does. Two steps: rewrite `<nav>` /
 /// `<footer>` containers so their links survive [`keep_boilerplate_container_content`], then run
 /// `fast_html2md` with the document's URL as the base so root-relative links (`/docs`) resolve to
 /// absolute URLs (`https://host/docs`) the model can follow directly. A `None` base leaves relative
@@ -206,7 +206,7 @@ pub(super) struct FetchUrlTool {
 impl Tool for FetchUrlTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "fetch_url".to_string(),
+            name: "web_fetch".to_string(),
             description: "Fetch a web page and return its content as markdown. Set 'raw' \
                           to true to return untreated HTML. If the URL resolves to a \
                           supported raster image (PNG, JPEG, GIF, WebP, BMP, TIFF, \
@@ -266,8 +266,8 @@ impl Tool for FetchUrlTool {
         input: serde_json::Value,
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let url = require_str(&input, "url", "fetch_url")?;
-        // Every wait below is raced against the turn's cancellation, as `execute_command` races
+        let url = require_str(&input, "url", "web_fetch")?;
+        // Every wait below is raced against the turn's cancellation, as `shell_execute` races
         // its child: the agent awaits every tool future, so a fetch that ignored the token held a
         // canceled turn until the peer answered or `[web] request_timeout` ran out. Dropping the
         // send or the body read aborts the request; a conversion already running off the runtime
@@ -278,7 +278,7 @@ impl Tool for FetchUrlTool {
         let response = unless_canceled(&cancellation, request.send())
             .await?
             .map_err(|error| MekaError::ToolExecution {
-                tool_name: "fetch_url".to_string(),
+                tool_name: "web_fetch".to_string(),
                 message: format!(
                     "failed to fetch '{}': {}",
                     url,
@@ -317,7 +317,7 @@ impl Tool for FetchUrlTool {
             let sniffed = crate::image::classify_bytes(&body_bytes);
             if !matches!(sniffed, ImageHandling::Unsupported) {
                 let marker = format!("Image fetched from {url}");
-                // Off the runtime, as `read_file` does it: decoding and re-encoding a
+                // Off the runtime, as `file_read` does it: decoding and re-encoding a
                 // multi-megapixel image is tens of milliseconds of pure CPU, and on the runtime it
                 // blocks every other task on that worker.
                 let marker = marker.clone();
@@ -329,7 +329,7 @@ impl Tool for FetchUrlTool {
                 )
                 .await?
                 .map_err(|error| MekaError::ToolExecution {
-                    tool_name: "fetch_url".to_string(),
+                    tool_name: "web_fetch".to_string(),
                     message: format!("image decode task failed: {error}"),
                 });
             }
@@ -350,7 +350,7 @@ impl Tool for FetchUrlTool {
             )
             .await?
             .map_err(|error| MekaError::ToolExecution {
-                tool_name: "fetch_url".to_string(),
+                tool_name: "web_fetch".to_string(),
                 message: format!("HTML conversion task failed: {error}"),
             })?
         };
@@ -371,7 +371,7 @@ impl Tool for FetchUrlTool {
         // the page. The cap then applies to the match list.
         let matched = match input.get("regex").and_then(|value| value.as_str()) {
             Some(pattern) => {
-                let re = compile_user_regex(pattern, "fetch_url")?;
+                let re = compile_user_regex(pattern, "web_fetch")?;
                 let matches: Vec<&str> = re.find_iter(&body).map(|found| found.as_str()).collect();
                 if matches.is_empty() {
                     return Ok(ToolOutput::text(
@@ -433,7 +433,7 @@ async fn read_body_capped(response: reqwest::Response) -> Result<Vec<u8>> {
         && len as usize > MAX_RESPONSE_BYTES
     {
         return Err(MekaError::ToolExecution {
-            tool_name: "fetch_url".to_string(),
+            tool_name: "web_fetch".to_string(),
             message: format!(
                 "response Content-Length {len} exceeds cap {MAX_RESPONSE_BYTES} bytes"
             ),
@@ -444,12 +444,12 @@ async fn read_body_capped(response: reqwest::Response) -> Result<Vec<u8>> {
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| MekaError::ToolExecution {
-            tool_name: "fetch_url".to_string(),
+            tool_name: "web_fetch".to_string(),
             message: format!("failed to read response body: {error}"),
         })?;
         if body_bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
             return Err(MekaError::ToolExecution {
-                tool_name: "fetch_url".to_string(),
+                tool_name: "web_fetch".to_string(),
                 message: format!(
                     "response body exceeded {MAX_RESPONSE_BYTES} bytes during streaming \
                      (possible decompression bomb)"
@@ -528,7 +528,7 @@ mod tests {
 
     #[test]
     fn html_to_markdown_synthetic_page_end_to_end() {
-        // Synthetic page (not a real site) exercising the full fetch_url conversion: a nav and a
+        // Synthetic page (not a real site) exercising the full web_fetch conversion: a nav and a
         // footer holding the only links, plus a script that must be stripped. Mirrors the layout of
         // modern SPA sites where primary navigation lives in <nav>/<footer>.
         let html = r#"
@@ -873,7 +873,7 @@ mod tests {
         assert_eq!(truncate_to_chars("abcd".to_string(), 0), "abcd");
     }
 
-    /// A canary on the response cap, which `fetch_url` reads through. It catches an accidental
+    /// A canary on the response cap, which `web_fetch` reads through. It catches an accidental
     /// bump in either direction; end-to-end coverage of the streaming check itself needs a real
     /// server and lives in the manual verification step.
     #[test]
@@ -883,7 +883,7 @@ mod tests {
 
     #[test]
     fn redirects_to_scratchpad_logic() {
-        // Mirrors the branch used in fetch_url::execute. When redirecting, we force `limit` to 0
+        // Mirrors the branch used in `web_fetch`'s execute. When redirecting, we force `limit` to 0
         // (unlimited).
         let with = serde_json::json!({ "scratchpad": "out", "limit": 100 });
         let without = serde_json::json!({ "limit": 100 });

@@ -12,7 +12,7 @@
 //! - **permission level** and the tools it blocks: `/permission` and Shift+Tab change it mid-turn.
 //! - **cwd and workspace roots**: `/cd`, `--writable-root`, and an ACP client re-sending
 //!   `additionalDirectories`.
-//! - **todo list**: rewritten by the `todo` tool.
+//! - **todo list**: rewritten by the `todo_*` tools.
 //! - **tools, skills, MCP server instructions** ([`WorldSnapshot`]): skills are re-read from disk
 //!   every turn, MCP servers connect late and can hot-swap their tool lists.
 //!
@@ -28,7 +28,7 @@ pub(crate) type ToolCatalogEntry = (String, String, Permission, bool);
 /// Per-entry cap for a deferred tool's summary. Keeps the rendered catalog bounded when MCP
 /// servers advertise 2 KB descriptions.
 ///
-/// Generous because this text is the *only* thing the model knows about a tool until `load_tool`
+/// Generous because this text is the *only* thing the model knows about a tool until `tool_load`
 /// fetches its schema, and the world-state block is re-rendered on change rather than every turn
 /// (see [`WorldSnapshot`]), so the extra characters are paid roughly once per session.
 const TOOL_SUMMARY_MAX_CHARS: usize = 250;
@@ -172,6 +172,7 @@ const MEMORY_INDEX_TOOL: &str = "memory_read";
 const MEMORY_WRITE_TOOL: &str = "memory_write";
 const MEMORY_SEARCH_TOOL: &str = "memory_search";
 const SKILL_SEARCH_TOOL: &str = "skill_search";
+const TOOL_SEARCH_TOOL: &str = "tool_search";
 const SCHEDULE_INDEX_TOOL: &str = "schedule_list";
 const TASK_INDEX_TOOL: &str = crate::background::TASK_INDEX_TOOL;
 
@@ -206,7 +207,7 @@ pub(crate) fn memory_index_is_live(catalog: &[ToolCatalogEntry]) -> bool {
 }
 
 /// Whether `name` is registered, deferred or not. A deferred tool still counts: its schema is
-/// withheld until `load_tool` fetches it, but the model can reach it.
+/// withheld until `tool_load` fetches it, but the model can reach it.
 fn catalog_has(catalog: &[ToolCatalogEntry], name: &str) -> bool {
     catalog.iter().any(|(entry, ..)| entry == name)
 }
@@ -424,6 +425,198 @@ fn clip_at_word_boundary(text: &str, limit: usize) -> String {
     format!("{}…", clipped.trim_end())
 }
 
+/// The `[Tool discovery]` index over the deferred half of `catalog`, or an empty string when
+/// nothing is deferred.
+///
+/// Every deferred tool is named with the level it requires. Summaries ride along while the whole
+/// section fits [`TOOL_INDEX_MAX_BYTES`]; past that every entry drops to its name, and past
+/// [`TOOL_INDEX_MAX_ENTRIES`] or the byte budget again the names stop and a count says what was
+/// left out. One tier for the whole section rather than per group, and groups in a fixed order,
+/// so the cut lands in the same place on every render and the cached prefix holds. Each group
+/// heading carries its count in every tier, and headings are kept past the last entry while they
+/// fit, so a server whose entries were all cut is still named with its size; headings are bounded
+/// too, and the count line says how many groups are not listed at all.
+///
+/// Shared by the world render and the sub-agent system prompt, which lists the worker's own
+/// registry through this same function so the two pictures never drift. Summarizing is idempotent,
+/// so a catalog that already carries summaries (the world snapshot's) renders unchanged.
+pub(crate) fn render_tool_discovery(catalog: &[ToolCatalogEntry]) -> String {
+    let deferred: Vec<ToolCatalogEntry> = catalog
+        .iter()
+        .filter(|(_, _, _, deferred)| *deferred)
+        .map(|(name, description, required, deferred)| {
+            (
+                name.clone(),
+                short_description(description),
+                *required,
+                *deferred,
+            )
+        })
+        .collect();
+    if deferred.is_empty() {
+        return String::new();
+    }
+    let searchable = catalog_has(catalog, TOOL_SEARCH_TOOL);
+
+    let mut out = String::from(
+        "[Tool discovery]\nRegistered, but their schemas are withheld. A summary, where one is \
+         shown, is all you have, and a trailing `…` means it was cut. Call `tool_load` with a \
+         tool's exact `name` (or a list) for the full schema. Calling one directly works but \
+         guesses at its optional parameters.",
+    );
+    if searchable {
+        out.push_str(
+            " `tool_search` finds a tool by keyword across names and descriptions, deferred ones \
+             included.",
+        );
+    }
+    out.push('\n');
+
+    let entries: Vec<&ToolCatalogEntry> = deferred.iter().collect();
+    let groups = group_deferred_entries(&entries);
+    let total = entries.len();
+    let heading = |name: &str, size: usize| {
+        format!(
+            "\n{name} ({size} tool{})\n",
+            if size == 1 { "" } else { "s" }
+        )
+    };
+    let described = |(name, summary, required, _): &ToolCatalogEntry| {
+        if summary.is_empty() {
+            format!("- **{name}** (requires `{required}`)\n")
+        } else {
+            format!("- **{name}** (requires `{required}`): {summary}\n")
+        }
+    };
+    let named = |(name, _, required, _): &ToolCatalogEntry| {
+        format!("- **{name}** (requires `{required}`)\n")
+    };
+
+    // Every entry described, when the whole section fits: header, headings and entries.
+    let whole: usize = out.len()
+        + groups
+            .iter()
+            .map(|(name, group)| {
+                heading(name, group.len()).len()
+                    + group
+                        .iter()
+                        .map(|entry| described(entry).len())
+                        .sum::<usize>()
+            })
+            .sum::<usize>();
+    if total <= TOOL_INDEX_MAX_ENTRIES && whole <= TOOL_INDEX_MAX_BYTES {
+        for (name, group) in &groups {
+            out.push_str(&heading(name, group.len()));
+            for entry in group {
+                out.push_str(&described(entry));
+            }
+        }
+        return out;
+    }
+
+    // Names, in group order, while the budget holds. The headings still to come are reserved
+    // while entries are listed, so a server whose entries are all cut is still named with its
+    // size; only a catalog whose headings alone overflow the budget starts dropping headings, and
+    // the count line then says how many groups are not listed at all. At least one entry is
+    // always shown, as the skills index guarantees, and the largest count line the section could
+    // end in is reserved ahead of everything, so the whole section fits the budget.
+    let budget = TOOL_INDEX_MAX_BYTES
+        .saturating_sub(hidden_tools_line(total, groups.len(), searchable).len());
+    let mut remaining_headings: usize = groups
+        .iter()
+        .map(|(name, group)| heading(name, group.len()).len())
+        .sum();
+    let mut shown = 0;
+    let mut listed_groups = 0;
+    let mut listing = true;
+    for (name, group) in &groups {
+        let head = heading(name, group.len());
+        remaining_headings -= head.len();
+        if listed_groups > 0 && out.len() + head.len() > budget {
+            break;
+        }
+        out.push_str(&head);
+        listed_groups += 1;
+        if !listing {
+            continue;
+        }
+        for entry in group {
+            let line = named(entry);
+            if shown > 0
+                && (shown == TOOL_INDEX_MAX_ENTRIES
+                    || out.len() + line.len() + remaining_headings > budget)
+            {
+                listing = false;
+                break;
+            }
+            out.push_str(&line);
+            shown += 1;
+        }
+    }
+    let hidden = total - shown;
+    if hidden > 0 {
+        out.push_str(&hidden_tools_line(
+            hidden,
+            groups.len() - listed_groups,
+            searchable,
+        ));
+    }
+    out
+}
+
+/// The lines an index shows for one list of entries, and how many entries it leaves out.
+///
+/// `described` and `named` are the same entries in the same order, each once with its summary and
+/// once by name alone. Every entry is described when that fits `budget` bytes and `max_entries`;
+/// otherwise names are taken in order while they fit. At least one entry is always shown, as the
+/// skills index guarantees, so one pathological summary cannot collapse a section to a bare count.
+fn lines_within_budget<'a>(
+    described: &'a [String],
+    named: &'a [String],
+    budget: usize,
+    max_entries: usize,
+) -> (Vec<&'a str>, usize) {
+    let described_bytes: usize = described.iter().map(String::len).sum();
+    if described.len() <= max_entries && described_bytes <= budget {
+        return (described.iter().map(String::as_str).collect(), 0);
+    }
+    let mut used = 0;
+    let mut shown: Vec<&str> = Vec::new();
+    for line in named.iter().take(max_entries) {
+        if !shown.is_empty() && used + line.len() > budget {
+            break;
+        }
+        used += line.len();
+        shown.push(line.as_str());
+    }
+    let hidden = named.len() - shown.len();
+    (shown, hidden)
+}
+
+/// The count of index entries left unshown, and of groups whose heading did not fit either, with
+/// the remedy only when the model has the tool, exactly as `[Skills]` names `skill_search`: saying
+/// the rest exists is worth it either way, but naming a tool that is not there is not a remedy.
+fn hidden_tools_line(hidden: usize, unlisted_groups: usize, searchable: bool) -> String {
+    format!(
+        "\n{} more tool{} not shown here{}{}\n",
+        hidden,
+        if hidden == 1 { "" } else { "s" },
+        match unlisted_groups {
+            0 => String::new(),
+            1 => ", in 1 group not listed above".to_string(),
+            groups => format!(", in {groups} groups not listed above"),
+        },
+        if searchable {
+            format!(
+                "; use `{TOOL_SEARCH_TOOL}` to find {} by name or description.",
+                if hidden == 1 { "it" } else { "them" }
+            )
+        } else {
+            ".".to_string()
+        }
+    )
+}
+
 /// Bucket deferred catalog entries by source for the `[Tool discovery]` section. Returns `(heading,
 /// entries)` pairs in a deterministic order: scratchpad operations, MCP resource tools, then
 /// per-MCP-server groups alphabetically, then a catch-all bucket for any deferred tool that matches
@@ -480,8 +673,8 @@ fn group_deferred_entries<'a>(
 /// sentence documenting a tool's most consequential optional parameter is rarely the opening one,
 /// so a first-sentence rule would hide a parameter like mekabridge's `as_photo` behind a summary
 /// that reads as complete. For the same reason the `…` is load-bearing: it is the only signal that
-/// `load_tool` has more to say.
-fn short_description(description: &str) -> String {
+/// `tool_load` has more to say.
+pub(crate) fn short_description(description: &str) -> String {
     let collapsed: String = {
         let mut out = String::with_capacity(description.len());
         let mut prev_space = false;
@@ -500,6 +693,14 @@ fn short_description(description: &str) -> String {
     };
 
     if collapsed.chars().count() <= TOOL_SUMMARY_MAX_CHARS {
+        return collapsed;
+    }
+    // A summary this function already produced: the marker puts it at most one character over
+    // the budget, and clipping it again can land a word earlier than the first pass did. The world
+    // snapshot holds summaries and `render_tool_discovery` summarizes what it is handed, so the
+    // second pass has to be a no-op or the full render and the diff would describe one tool two
+    // ways.
+    if collapsed.ends_with('…') && collapsed.chars().count() <= TOOL_SUMMARY_MAX_CHARS + 1 {
         return collapsed;
     }
 
@@ -618,12 +819,12 @@ pub(crate) fn build_system_prompt(
     prompt.push_str("- `none`: text-only, no tools may execute.\n");
     if sandboxed_shell {
         prompt.push_str(
-            "- `read`: read-only tools (file reads, search, web fetch). `execute_command` \
+            "- `read`: read-only tools (file reads, search, web fetch). `shell_execute` \
              runs with the filesystem mounted read-only. Commands that write to disk fail.\n",
         );
     } else {
         prompt.push_str(
-            "- `read`: read-only tools (file reads, search, web fetch). `execute_command` \
+            "- `read`: read-only tools (file reads, search, web fetch). `shell_execute` \
              is blocked at this level.\n",
         );
     }
@@ -631,13 +832,13 @@ pub(crate) fn build_system_prompt(
         prompt.push_str(
             "- `workspace`: full tool access, but writes are confined to the workspace \
              roots named in `[Environment context]`. Reads are not confined. \
-             `execute_command` runs under the same boundary.\n",
+             `shell_execute` runs under the same boundary.\n",
         );
     } else {
         prompt.push_str(
             "- `workspace`: full tool access, but writes are confined to the workspace \
              roots named in `[Environment context]`. Reads are not confined. \
-             `execute_command` is blocked at this level, because no sandbox is available \
+             `shell_execute` is blocked at this level, because no sandbox is available \
              to confine it.\n",
         );
     }
@@ -728,7 +929,6 @@ fn render_world_state_full(current: &WorldSnapshot) -> String {
         })
         .collect();
     let active: Vec<&ToolCatalogEntry> = catalog.iter().filter(|(_, _, _, d)| !d).collect();
-    let deferred: Vec<&ToolCatalogEntry> = catalog.iter().filter(|(_, _, _, d)| *d).collect();
 
     // `[Section]` headings rather than markdown ones, matching the rest of the `<context>` block
     // (`[Permission context]`, `[Todo list]`, `[Scratchpad entries]`).
@@ -752,26 +952,9 @@ fn render_world_state_full(current: &WorldSnapshot) -> String {
         sections.push(out);
     }
 
-    if !deferred.is_empty() {
-        let mut out = String::from(
-            "[Tool discovery]\nRegistered, but their schemas are withheld; the summaries below are all \
-             you have and a trailing `…` means one was cut. Call `load_tool` with a tool's exact \
-             `name` (or a list) for the full schema. Calling one directly works but guesses at its \
-             optional parameters.\n",
-        );
-        for (heading, group) in group_deferred_entries(&deferred) {
-            out.push_str(&format!("\n{heading}\n"));
-            for (name, summary, required, _) in &group {
-                if summary.is_empty() {
-                    out.push_str(&format!("- **{name}** (requires `{required}`)\n"));
-                } else {
-                    out.push_str(&format!(
-                        "- **{name}** (requires `{required}`): {summary}\n"
-                    ));
-                }
-            }
-        }
-        sections.push(out);
+    let discovery = render_tool_discovery(&catalog);
+    if !discovery.is_empty() {
+        sections.push(discovery);
     }
 
     // Skips alone are enough to render the section, for the reason `[Memory]` gives just below.
@@ -895,6 +1078,14 @@ fn render_schedule_section(jobs: &[ScheduledIndexEntry]) -> String {
 /// gets the same budget.
 const SKILL_INDEX_MAX_BYTES: usize = 8_192;
 const SKILL_INDEX_MAX_ENTRIES: usize = 200;
+
+/// Byte and entry ceilings on the rendered `[Tool discovery]` index: the skills and memory pair,
+/// for the same reason, an entry being a name and one line. Unlike those two this index has a
+/// middle tier: past the byte budget every entry keeps its name and loses its summary, since a
+/// name under its server's heading says most of what the summary says at a tenth of the cost, and
+/// only past both ceilings does the section start counting what it cannot name.
+const TOOL_INDEX_MAX_BYTES: usize = 8_192;
+const TOOL_INDEX_MAX_ENTRIES: usize = 200;
 
 /// Render the `[Skills]` index: the entries that fit, then a count of those that did not.
 ///
@@ -1299,26 +1490,25 @@ const SKIP_NAME_MAX_CHARS: usize = 80;
 fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldSnapshot) -> String {
     let mut lines: Vec<String> = Vec::new();
 
-    let newly_callable: Vec<&String> = current
+    type Facts = (Permission, bool, String);
+    let newly_callable: Vec<(&String, &Facts)> = current
         .tools
         .iter()
         .filter(|(name, (_, deferred, _))| {
             !deferred && !matches!(previous.tools.get(*name), Some((_, false, _)))
         })
-        .map(|(name, _)| name)
         .collect();
     // Described rather than merely named: a deferred tool's schema is withheld, so this one-line
-    // summary is all the model has to decide whether the tool is worth a `load_tool` round trip.
+    // summary is all the model has to decide whether the tool is worth a `tool_load` round trip.
     // A late-connecting MCP server can announce eighty tools at once, and eighty bare names are
     // not a catalog. Newly *callable* tools need no summary here because their full schema ships
     // in the API tools array; only the permission, which is meka's own concept, has to be stated.
-    let newly_deferred: Vec<String> = current
+    let newly_deferred: Vec<(&String, &Facts)> = current
         .tools
         .iter()
         .filter(|(name, (_, deferred, _))| {
             *deferred && !matches!(previous.tools.get(*name), Some((_, true, _)))
         })
-        .map(|(name, facts)| describe_tool(name, facts))
         .collect();
     let gone: Vec<&String> = previous
         .tools
@@ -1329,35 +1519,67 @@ fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldSnapshot) ->
     // server reconnecting with a reworded description for the same tool. Without this bucket the
     // snapshot would advance while nothing was said, leaving the model working from a stale
     // summary for the rest of the session.
-    let restated: Vec<String> = current
+    let restated: Vec<(&String, &Facts)> = current
         .tools
         .iter()
-        .filter_map(|(name, facts)| {
-            let before = previous.tools.get(name)?;
-            (before != facts && before.1 == facts.1).then(|| describe_tool(name, facts))
+        .filter(|(name, facts)| {
+            previous
+                .tools
+                .get(*name)
+                .is_some_and(|before| before != *facts && before.1 == facts.1)
         })
         .collect();
 
-    if !newly_callable.is_empty() {
-        lines.push(format!(
-            "- Now callable: {}",
-            join_names(newly_callable.into_iter())
-        ));
+    // Every list under the `[Tool discovery]` ceilings, and by the same rule: described while
+    // that fits, names past it, a count past the names. A reconnecting server can reword every
+    // tool it has at once, so the redescribed list is cut like the new one.
+    let searchable = current.tools.contains_key(TOOL_SEARCH_TOOL);
+    let bare = |entries: &[(&String, &Facts)]| -> Vec<String> {
+        entries
+            .iter()
+            .map(|(name, _)| format!("`{name}`"))
+            .collect()
+    };
+    let named = |entries: &[(&String, &Facts)]| -> Vec<String> {
+        entries
+            .iter()
+            .map(|(name, facts)| name_tool(name, facts))
+            .collect()
+    };
+    let described = |entries: &[(&String, &Facts)]| -> Vec<String> {
+        entries
+            .iter()
+            .map(|(name, facts)| describe_tool(name, facts))
+            .collect()
+    };
+    let callable = bare(&newly_callable);
+    if let Some(line) = tool_change_line("- Now callable: ", &callable, &callable, searchable) {
+        lines.push(line);
     }
-    if !newly_deferred.is_empty() {
-        lines.push(format!(
-            "- Now registered but not yet callable (use `load_tool`): {}",
-            newly_deferred.join("; "),
-        ));
+    if let Some(line) = tool_change_line(
+        "- Now registered but not yet callable (use `tool_load`): ",
+        &described(&newly_deferred),
+        &named(&newly_deferred),
+        searchable,
+    ) {
+        lines.push(line);
     }
-    if !gone.is_empty() {
-        lines.push(format!(
-            "- No longer available, do not call: {}",
-            join_names(gone.into_iter())
-        ));
+    let departed: Vec<String> = gone.iter().map(|name| format!("`{name}`")).collect();
+    if let Some(line) = tool_change_line(
+        "- No longer available, do not call: ",
+        &departed,
+        &departed,
+        searchable,
+    ) {
+        lines.push(line);
     }
-    if !restated.is_empty() {
-        lines.push(format!("- Redescribed: {}", restated.join("; ")));
+    if let Some(line) = tool_change_line(
+        "- Redescribed: ",
+        &described(&restated),
+        &named(&restated),
+        searchable,
+    ) {
+        lines.push(line);
     }
 
     // Looked up by name rather than by position: the list is priority-ordered, so re-prioritizing
@@ -1694,6 +1916,49 @@ fn describe_tool(name: &str, (required, _, summary): &(Permission, bool, String)
     }
 }
 
+/// The same line by name alone, for the tier past the byte budget.
+fn name_tool(name: &str, (required, ..): &(Permission, bool, String)) -> String {
+    format!("`{name}` (requires `{required}`)")
+}
+
+/// One `[Tool and skill changes]` line under the `[Tool discovery]` ceilings, or `None` for an
+/// empty list. `full` and `named` are the same entries, once with whatever the list shows in full
+/// and once by name alone; the label, the separators and the largest count line this list could
+/// end in are reserved ahead of the entries, so the whole line fits the budget, not only its
+/// entries. The count's remedy names `tool_search` only when the model has it.
+fn tool_change_line(
+    label: &str,
+    full: &[String],
+    named: &[String],
+    searchable: bool,
+) -> Option<String> {
+    if named.is_empty() {
+        return None;
+    }
+    let trailer = |hidden: usize| {
+        format!(
+            "; and {hidden} more{}",
+            if searchable {
+                format!(" (use `{TOOL_SEARCH_TOOL}` to find them)")
+            } else {
+                String::new()
+            }
+        )
+    };
+    let reserved = label.len() + trailer(named.len()).len() + 2 * named.len();
+    let (shown, hidden) = lines_within_budget(
+        full,
+        named,
+        TOOL_INDEX_MAX_BYTES.saturating_sub(reserved),
+        TOOL_INDEX_MAX_ENTRIES,
+    );
+    let mut line = format!("{label}{}", shown.join("; "));
+    if hidden > 0 {
+        line.push_str(&trailer(hidden));
+    }
+    Some(line)
+}
+
 fn join_names<'a>(names: impl Iterator<Item = &'a String>) -> String {
     names
         .map(|name| format!("`{name}`"))
@@ -1705,7 +1970,7 @@ fn join_names<'a>(names: impl Iterator<Item = &'a String>) -> String {
 ///
 /// Names are short, which is why the diff names cut entries at all rather than pointing at an index
 /// that predates the very writes being announced. Short is not the same as free. A restore loop
-/// through `PUT /v1/memory`, a `meka memory` sweep from a second terminal, or an `execute_command`
+/// through `PUT /v1/memory`, a `meka memory` sweep from a second terminal, or a `shell_execute`
 /// shelling out to one (all of which move rows behind a host's back) can put thousands of names on
 /// one line: 5,000 memories appearing between two turns is roughly 85k tokens of names, in the
 /// section whose own index render is held to 8 KB.
@@ -1819,7 +2084,7 @@ pub(crate) fn build_environment_context(
             // is refused outright rather than run unconfined. Stating the outcome covers both.
             context.push_str(
                 "Reads are not confined. Any write outside them is refused, including from \
-                 `execute_command`.\n",
+                 `shell_execute`.\n",
             );
         }
     }
@@ -2518,8 +2783,8 @@ mod tests {
         let skills = [sample_skill("setup-server")];
         let memories = [sample_memory("a-note", 5, "a durable fact", 0)];
 
-        // Only `read_file` registered: neither index has a way to be opened.
-        let catalog = catalog_with("read_file");
+        // Only `file_read` registered: neither index has a way to be opened.
+        let catalog = catalog_with("file_read");
         let rendered = render_world_state(
             &WorldSnapshot::new(&catalog, &skill_index(&skills), &memories, &[], &[]),
             None,
@@ -2557,7 +2822,7 @@ mod tests {
         assert!(!rendered.contains("[Skills]"), "{rendered}");
     }
 
-    /// A deferred tool still counts. Its schema is withheld until `load_tool` fetches it, but the
+    /// A deferred tool still counts. Its schema is withheld until `tool_load` fetches it, but the
     /// model can reach it, so the index it opens is still actionable.
     #[test]
     fn deferred_opening_tool_still_renders_the_index() {
@@ -2589,7 +2854,7 @@ mod tests {
             &[],
         );
         let after =
-            WorldSnapshot::new(&catalog_with("read_file"), &no_skills(), &memories, &[], &[
+            WorldSnapshot::new(&catalog_with("file_read"), &no_skills(), &memories, &[], &[
             ]);
 
         let diff = render_world_state(&after, Some(&before));
@@ -2774,7 +3039,7 @@ mod tests {
     fn skips_are_gated_with_the_tool_they_belong_to() {
         let rendered = render_world_state(
             &WorldSnapshot::new(
-                &catalog_with("read_file"),
+                &catalog_with("file_read"),
                 &skills_skipping(&[("deploy", "invalid frontmatter")]),
                 &[],
                 &[],
@@ -2922,19 +3187,19 @@ mod tests {
     fn sample_catalog() -> Vec<ToolCatalogEntry> {
         vec![
             (
-                "read_file".to_string(),
+                "file_read".to_string(),
                 "Read file contents".to_string(),
                 Permission::Read,
                 false,
             ),
             (
-                "write_file".to_string(),
+                "file_write".to_string(),
                 "Write text content to a file".to_string(),
                 Permission::Workspace,
                 false,
             ),
             (
-                "execute_command".to_string(),
+                "shell_execute".to_string(),
                 "Run a shell command".to_string(),
                 Permission::Read,
                 false,
@@ -3425,7 +3690,7 @@ mod tests {
     fn system_prompt_no_sandbox_note_without_flag() {
         let prompt = build_system_prompt(false, None);
         assert!(!prompt.contains("filesystem mounted read-only"));
-        assert!(prompt.contains("`execute_command` is blocked"));
+        assert!(prompt.contains("`shell_execute` is blocked"));
     }
 
     #[test]
@@ -3433,9 +3698,9 @@ mod tests {
         let catalog = sample_catalog();
         let prompt = world_state_for(&catalog, &[], &[]);
         assert!(prompt.contains("[Available tools]"));
-        assert!(prompt.contains("**read_file** (requires `read`)"));
-        assert!(prompt.contains("**write_file** (requires `workspace`)"));
-        assert!(prompt.contains("**execute_command** (requires `read`)"));
+        assert!(prompt.contains("**file_read** (requires `read`)"));
+        assert!(prompt.contains("**file_write** (requires `workspace`)"));
+        assert!(prompt.contains("**shell_execute** (requires `read`)"));
     }
 
     #[test]
@@ -3472,7 +3737,7 @@ mod tests {
     #[test]
     fn world_state_truncates_deferred_tool_descriptions() {
         // A 2 KB MCP description must collapse to a one-liner; the full description still flows
-        // through the tool schema once `load_tool` exposes it, so the only loss is the prose repeat
+        // through the tool schema once `tool_load` exposes it, so the only loss is the prose repeat
         // in the system prompt.
         let big_desc = "x".repeat(2048);
         let catalog: Vec<ToolCatalogEntry> = vec![(
@@ -3504,12 +3769,12 @@ mod tests {
 
     #[test]
     fn world_state_load_tool_itself_is_active_not_deferred() {
-        // load_tool is the bootstrap meta-tool. Listing it under `## Tool Discovery` would create
+        // tool_load is the bootstrap meta-tool. Listing it under `## Tool Discovery` would create
         // a chicken-and-egg problem, so it must always be in the active `## Available Tools`
         // section, never in the deferred catalog.
         let catalog: Vec<ToolCatalogEntry> = vec![
             (
-                "load_tool".to_string(),
+                "tool_load".to_string(),
                 "Load a deferred tool's schema.".to_string(),
                 Permission::Read,
                 false,
@@ -3526,8 +3791,8 @@ mod tests {
         let discovery_header = prompt.find("[Tool discovery]").unwrap();
         let active_section = &prompt[active_header..discovery_header];
         let discovery_section = &prompt[discovery_header..];
-        assert!(active_section.contains("**load_tool**"));
-        assert!(!discovery_section.contains("**load_tool**"));
+        assert!(active_section.contains("**tool_load**"));
+        assert!(!discovery_section.contains("**tool_load**"));
     }
 
     #[test]
@@ -3582,8 +3847,205 @@ mod tests {
         assert!(!notion_section.contains("mcp__github__"));
     }
 
+    /// `count` deferred tools on MCP server `server`, each described by `description`.
+    fn deferred_catalog(server: &str, count: usize, description: &str) -> Vec<ToolCatalogEntry> {
+        (0..count)
+            .map(|index| {
+                (
+                    format!("mcp__{server}__tool_{index:03}"),
+                    description.to_string(),
+                    Permission::Read,
+                    true,
+                )
+            })
+            .collect()
+    }
+
+    fn with_tool_search(mut catalog: Vec<ToolCatalogEntry>) -> Vec<ToolCatalogEntry> {
+        catalog.push((
+            TOOL_SEARCH_TOOL.to_string(),
+            "Search tools.".to_string(),
+            Permission::Read,
+            false,
+        ));
+        catalog
+    }
+
+    #[test]
+    fn the_tool_index_keeps_summaries_while_they_fit() {
+        let catalog = with_tool_search(deferred_catalog("notion", 3, "Search Notion pages."));
+        let section = render_tool_discovery(&catalog);
+        assert!(
+            section.contains("MCP server: notion (3 tools)"),
+            "{section}"
+        );
+        assert!(
+            section
+                .contains("- **mcp__notion__tool_000** (requires `read`): Search Notion pages.\n"),
+            "{section}"
+        );
+        assert!(!section.contains("not shown here"), "{section}");
+        assert!(section.contains("`tool_search` finds a tool"), "{section}");
+    }
+
+    /// Forty summaries of 240 characters run past the byte budget; forty names do not. Every
+    /// entry keeps its name and level and loses its summary, and nothing is counted as hidden.
+    #[test]
+    fn the_tool_index_falls_back_to_names_past_its_byte_budget() {
+        let description = "x".repeat(240);
+        let catalog = with_tool_search(deferred_catalog("notion", 40, &description));
+        let section = render_tool_discovery(&catalog);
+        assert!(section.len() <= TOOL_INDEX_MAX_BYTES, "{}", section.len());
+        for index in 0..40 {
+            let line = format!("- **mcp__notion__tool_{index:03}** (requires `read`)\n");
+            assert!(section.contains(&line), "{section}");
+        }
+        assert!(!section.contains("xxxx"), "{section}");
+        assert!(!section.contains("not shown here"), "{section}");
+    }
+
+    /// Three hundred names run past both ceilings. The names stop, the rest are counted with the
+    /// remedy, and a server whose entries were all cut is still named with its size.
+    #[test]
+    fn the_tool_index_counts_what_it_cannot_name() {
+        let mut catalog = deferred_catalog("aaa", 250, "One.");
+        catalog.extend(deferred_catalog("zzz", 50, "Two."));
+        let section = render_tool_discovery(&with_tool_search(catalog));
+        let shown = section
+            .lines()
+            .filter(|line| line.starts_with("- **"))
+            .count();
+        assert!(shown > 0 && shown <= TOOL_INDEX_MAX_ENTRIES, "{shown}");
+        let trailer = format!(
+            "\n{} more tools not shown here; use `tool_search` to find them by name or \
+             description.\n",
+            300 - shown
+        );
+        assert!(section.contains(&trailer), "{section}");
+        assert!(section.contains("MCP server: zzz (50 tools)"), "{section}");
+        assert!(!section.contains("mcp__zzz__"), "{section}");
+    }
+
+    #[test]
+    fn the_tool_index_names_tool_search_only_when_it_is_registered() {
+        let catalog = deferred_catalog("aaa", 300, "One.");
+        let without = render_tool_discovery(&catalog);
+        assert!(
+            without.contains("more tools not shown here.\n"),
+            "{without}"
+        );
+        assert!(!without.contains("tool_search"), "{without}");
+        let with = render_tool_discovery(&with_tool_search(catalog));
+        assert!(with.contains("use `tool_search` to find them"), "{with}");
+        assert!(
+            with.contains("`tool_search` finds a tool by keyword"),
+            "{with}"
+        );
+    }
+
+    /// The diff line for a late-connecting server is cut by the same ceilings as the index:
+    /// names once summaries would not fit, a count once names would not.
+    #[test]
+    fn a_late_server_s_tools_are_announced_within_the_same_budget() {
+        let snapshot =
+            |catalog: &[ToolCatalogEntry]| WorldSnapshot::new(catalog, &no_skills(), &[], &[], &[]);
+        let before = snapshot(&[]);
+        let description = "y".repeat(240);
+        let named = render_world_state_diff(
+            &snapshot(&deferred_catalog("late", 100, &description)),
+            &before,
+        );
+        assert!(
+            named.contains("`mcp__late__tool_099` (requires `read`)"),
+            "{named}"
+        );
+        assert!(!named.contains("yyyy"), "{named}");
+        assert!(!named.contains(" more"), "{named}");
+        let counted = render_world_state_diff(
+            &snapshot(&with_tool_search(deferred_catalog("late", 300, "One."))),
+            &before,
+        );
+        assert!(counted.contains("; and "), "{counted}");
+        assert!(
+            counted.contains(" more (use `tool_search` to find them)"),
+            "{counted}"
+        );
+    }
+
+    /// A server that rewords every tool it has at once is cut like a server that connects with
+    /// them: names past the byte budget, a count past the names, and the whole line within the
+    /// ceiling.
+    #[test]
+    fn a_redescribed_server_is_announced_within_the_same_budget() {
+        let snapshot =
+            |catalog: &[ToolCatalogEntry]| WorldSnapshot::new(catalog, &no_skills(), &[], &[], &[]);
+        let before = snapshot(&with_tool_search(deferred_catalog("late", 300, "One.")));
+        let reworded = "z".repeat(240);
+        let after = snapshot(&with_tool_search(deferred_catalog("late", 300, &reworded)));
+        let diff = render_world_state_diff(&after, &before);
+        let line = diff
+            .lines()
+            .find(|line| line.starts_with("- Redescribed: "))
+            .expect("the reworded tools are announced");
+        assert!(line.len() <= TOOL_INDEX_MAX_BYTES, "{}", line.len());
+        assert!(!line.contains("zzzz"), "{line}");
+        assert!(
+            line.contains("`mcp__late__tool_000` (requires `read`)"),
+            "{line}"
+        );
+        assert!(
+            line.contains(" more (use `tool_search` to find them)"),
+            "{line}"
+        );
+    }
+
+    /// Three hundred one-tool servers would spend the whole budget on headings alone. The
+    /// headings stop where the budget does, and the count line says how many groups were not
+    /// listed, so the section stays inside its ceiling whatever the shape of the catalog.
+    #[test]
+    fn the_tool_index_bounds_its_headings_too() {
+        let catalog: Vec<ToolCatalogEntry> = (0..300)
+            .map(|index| {
+                (
+                    format!("mcp__server{index:03}__only"),
+                    "One.".to_string(),
+                    Permission::Read,
+                    true,
+                )
+            })
+            .collect();
+        let section = render_tool_discovery(&with_tool_search(catalog));
+        assert!(section.len() <= TOOL_INDEX_MAX_BYTES, "{}", section.len());
+        assert!(section.contains("groups not listed above"), "{section}");
+        assert!(
+            section.contains("MCP server: server000 (1 tool)"),
+            "{section}"
+        );
+    }
+
+    /// A server withdrawing every tool it had is cut like one connecting with them: names up to
+    /// the ceiling, then a count, so a departure of three hundred tools is one bounded line.
+    #[test]
+    fn a_departing_server_s_tools_are_counted_within_the_same_budget() {
+        let snapshot =
+            |catalog: &[ToolCatalogEntry]| WorldSnapshot::new(catalog, &no_skills(), &[], &[], &[]);
+        let before = snapshot(&with_tool_search(deferred_catalog("gone", 300, "One.")));
+        let after = snapshot(&with_tool_search(Vec::new()));
+        let diff = render_world_state_diff(&after, &before);
+        let line = diff
+            .lines()
+            .find(|line| line.starts_with("- No longer available, do not call: "))
+            .expect("the departure is announced");
+        assert!(line.len() <= TOOL_INDEX_MAX_BYTES, "{}", line.len());
+        assert!(line.contains("`mcp__gone__tool_000`"), "{line}");
+        assert!(
+            line.contains(" more (use `tool_search` to find them)"),
+            "{line}"
+        );
+    }
+
     /// A parameter documented in the third sentence must survive into the summary, because until
-    /// `load_tool` runs this text is all the model has.
+    /// `tool_load` runs this text is all the model has.
     #[test]
     fn short_description_keeps_later_sentences() {
         let s = "Send a file from the local filesystem to a conversation. Use this to deliver \
@@ -3592,6 +4054,17 @@ mod tests {
         let out = short_description(s);
         assert!(out.contains("as_photo"), "{out}");
         assert!(!out.ends_with('…'), "nothing was dropped: {out}");
+    }
+
+    /// A clip that lands on a whitespace boundary keeps the whole budget and adds the marker, so
+    /// the summary is one character over; a second pass must hand it back rather than cut a word
+    /// earlier, because the discovery renderer summarizes the snapshot's summaries.
+    #[test]
+    fn a_summary_survives_a_second_pass() {
+        let text = format!("{}c tail of the description", "ab ".repeat(83));
+        let once = short_description(&text);
+        assert_eq!(once.chars().count(), TOOL_SUMMARY_MAX_CHARS + 1, "{once}");
+        assert_eq!(short_description(&once), once);
     }
 
     #[test]
@@ -3717,14 +4190,14 @@ mod tests {
             build_system_prompt(true, Some("Never use pip.")),
             "the system prompt must be byte-identical across a session",
         );
-        assert!(!baseline.contains("read_file"), "tools must not be in it");
+        assert!(!baseline.contains("file_read"), "tools must not be in it");
         assert!(!baseline.contains("deploy-app"), "skills must not be in it");
         assert!(
             !baseline.contains("Read before write."),
             "MCP instructions must not be in it",
         );
         // ...and all three are accounted for in the block that is appended instead.
-        assert!(world.contains("read_file"));
+        assert!(world.contains("file_read"));
         assert!(world.contains("deploy-app"));
         assert!(world.contains("Read before write."));
     }
@@ -3742,7 +4215,7 @@ mod tests {
         let turn1 = render_world_state(&current, last.as_ref());
         last = Some(current);
         assert!(turn1.contains("[Available tools]"), "got: {turn1}");
-        assert!(turn1.contains("**read_file**"));
+        assert!(turn1.contains("**file_read**"));
 
         // Turn 2: nothing changed. This is the steady state and must cost nothing.
         let current = WorldSnapshot::new(&catalog, &no_skills(), &[], &[], &[]);
@@ -3766,7 +4239,7 @@ mod tests {
         assert!(turn3.contains("Read before write."), "got: {turn3}");
         // A delta, not a re-listing: tools that did not move must not be repeated.
         assert!(
-            !turn3.contains("**read_file**"),
+            !turn3.contains("**file_read**"),
             "unchanged tools must not be re-sent every time something else moves; got: {turn3}",
         );
 
@@ -3779,7 +4252,7 @@ mod tests {
         // model can no longer see.
         let after_compact = render_world_state(&current, None);
         assert!(after_compact.contains("[Available tools]"));
-        assert!(after_compact.contains("**read_file**"));
+        assert!(after_compact.contains("**file_read**"));
         assert!(after_compact.contains("Read before write."));
     }
 
@@ -3913,7 +4386,7 @@ mod tests {
     /// full index render is held to 8 KB.
     ///
     /// Reachable without anything exotic: a restore loop through `PUT /v1/memory`, a
-    /// `meka memory` sweep from a second terminal, or `execute_command` (which gates at `read`)
+    /// `meka memory` sweep from a second terminal, or `shell_execute` (which gates at `read`)
     /// shelling out to one.
     #[test]
     fn a_bulk_memory_change_is_counted_rather_than_listed_entry_by_entry() {
@@ -3954,7 +4427,7 @@ mod tests {
         let full = render_world_state(&snapshot, None);
 
         assert!(full.contains("[Available tools]"));
-        assert!(full.contains("**read_file**"));
+        assert!(full.contains("**file_read**"));
         assert!(
             !full.contains("supersedes"),
             "a full render is not a delta; got: {full}",
@@ -4336,7 +4809,7 @@ mod tests {
         crate::store::background::BackgroundTask {
             id: format!("{short}-0000-0000-0000-000000000000"),
             session_id: uuid::Uuid::nil(),
-            tool: "execute_command".to_string(),
+            tool: "shell_execute".to_string(),
             label: label.to_string(),
             status: crate::store::background::TaskStatus::Running,
             outcome: None,
@@ -4459,7 +4932,7 @@ mod tests {
         assert!(context.contains("Only read-only tools are executable."));
         // The per-turn block must not enumerate individual tools: that duplicates the static
         // system-prompt catalog and balloons with MCP-tool count.
-        assert!(!context.contains("write_file"));
+        assert!(!context.contains("file_write"));
         assert!(!context.contains("requires `"));
     }
 
@@ -4501,7 +4974,7 @@ mod tests {
         let context = build_permission_context(Permission::None, false);
         assert!(context.contains("Current permission level: none"));
         assert!(context.contains("No tools are executable."));
-        assert!(!context.contains("read_file"));
+        assert!(!context.contains("file_read"));
     }
 
     #[test]

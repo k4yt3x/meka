@@ -483,7 +483,7 @@ fn per_turn_context_states_the_catalog_once_not_every_turn() {
     );
 
     assert!(
-        user_texts[0].contains("[Available tools]") && user_texts[0].contains("**read_file**"),
+        user_texts[0].contains("[Available tools]") && user_texts[0].contains("**file_read**"),
         "the first turn must state the catalog; got: {}",
         user_texts[0],
     );
@@ -2384,7 +2384,7 @@ fn graceful_shutdown_waits_for_a_detached_turn_to_unwind() {
 /// the turn cleanly.
 #[test]
 fn mid_turn_permission_round_trips() {
-    // Round 1: model asks to run write_file; round 2: after deny, model gives up.
+    // Round 1: model asks to run file_write; round 2: after deny, model gives up.
     let workspace = tempfile::tempdir().expect("tempdir");
     let write_path_text = workspace
         .path()
@@ -2393,7 +2393,7 @@ fn mid_turn_permission_round_trips() {
         .to_string();
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "file_write" },
             { "type": "tool_use_end", "input": {"path": &write_path_text, "content": "x"} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -2471,7 +2471,7 @@ fn mid_turn_permission_round_trips() {
                     serde_json::from_str(data.trim()).expect("parse data");
                 // The prompt has to show what is being written, not only where: a client
                 // rendering `tool_name` alone would ask for a write without showing the write.
-                assert_eq!(payload["tool_name"], "write_file", "{payload}");
+                assert_eq!(payload["tool_name"], "file_write", "{payload}");
                 assert_eq!(
                     payload["input"],
                     serde_json::json!({"path": write_path_text, "content": "x"}),
@@ -3173,12 +3173,12 @@ fn a_workspace_session_writes_inside_its_cwd_and_is_refused_outside() {
 
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "file_write" },
             { "type": "tool_use_end", "input": {"path": inside, "content": "in"} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "type": "tool_use_start", "id": "tu_2", "name": "write_file" },
+            { "type": "tool_use_start", "id": "tu_2", "name": "file_write" },
             { "type": "tool_use_end", "input": {"path": outside, "content": "out"} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -3230,7 +3230,7 @@ fn a_workspace_session_writes_inside_its_cwd_and_is_refused_outside() {
 fn streaming_session_without_prompt_support_does_not_park_on_permission() {
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "file_write" },
             { "type": "tool_use_end", "input": {"path": "/tmp/meka-test-noprompt.txt", "content": "x"} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -3931,7 +3931,7 @@ fn permission_allow_outcome_resumes_turn() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "file_write" },
             { "type": "tool_use_end", "input": {
                 "path": workspace.path().join("meka-permission-allow-test.txt").to_string_lossy(),
                 "content": "hello"
@@ -5212,7 +5212,7 @@ fn streaming_turn_event_ids_are_dense_and_monotonic() {
 /// turn must auto-allow without emitting another `permission_required` event.
 #[test]
 fn sticky_allow_always_short_circuits_second_tool_call() {
-    // Two tool_use rounds of the same write-tier tool + a terminal text round. `write_file`
+    // Two tool_use rounds of the same write-tier tool + a terminal text round. `file_write`
     // is above `read`, so approvals gate it; `list_directory` would short-circuit as read-tier
     // without prompting and miss the point of the test.
     let workspace = tempfile::tempdir().expect("tempdir");
@@ -5220,12 +5220,12 @@ fn sticky_allow_always_short_circuits_second_tool_call() {
     let _ = std::fs::remove_file(&write_path);
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "file_write" },
             { "type": "tool_use_end", "input": {"path": write_path.to_string_lossy(), "content": "first"} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "type": "tool_use_start", "id": "tu_2", "name": "write_file" },
+            { "type": "tool_use_start", "id": "tu_2", "name": "file_write" },
             { "type": "tool_use_end", "input": {"path": write_path.to_string_lossy(), "content": "second"} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -5443,7 +5443,7 @@ fn blocking_turn_with_approvals_auto_denies_with_notice() {
         "",
         serde_json::json!([
             [
-                { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+                { "type": "tool_use_start", "id": "tu_1", "name": "file_write" },
                 { "type": "tool_use_end", "input": {"path": "denied.txt", "content": "x"} },
                 { "type": "message_end", "stop_reason": "tool_use" }
             ],
@@ -5574,7 +5574,7 @@ fn terminal_sse_events_carry_turn_id_and_session_id() {
 fn responses_body_unknown_field_returns_422() {
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "file_write" },
             { "type": "tool_use_end", "input": {
                 "path": std::env::temp_dir().join("meka-l10-test").to_string_lossy(),
                 "content": "x"
@@ -5628,7 +5628,7 @@ fn cancel_mid_tool_call_leaves_no_orphaned_tool_use_in_the_store() {
     let target = std::env::temp_dir().join(format!("meka-orphan-{}.txt", uuid::Uuid::new_v4()));
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "file_write" },
             { "type": "tool_use_end", "input": {
                 "path": target.to_string_lossy(),
                 "content": "x"
@@ -6896,7 +6896,7 @@ fn a_gate_refusal_is_a_422_when_no_permission_would_help() {
     assert_eq!(status, 422, "no level fixes a name that does not exist");
     assert!(kind.ends_with("invalid-body"), "{kind}");
 
-    let (status, kind) = refuse(&high, serde_json::json!({"tool": "write_file"}));
+    let (status, kind) = refuse(&high, serde_json::json!({"tool": "file_write"}));
     assert_eq!(status, 422, "no level fixes a tool that is not read-only");
     assert!(kind.ends_with("invalid-body"), "{kind}");
 }
@@ -6944,7 +6944,7 @@ fn a_read_only_built_in_tool_gate_is_accepted_at_read() {
             "prompt": "tell me when it changes",
             "every": "1h",
             "gate": {
-                "check": {"tool": "read_file", "arguments": {"path": "/etc/hostname"}},
+                "check": {"tool": "file_read", "arguments": {"path": "/etc/hostname"}},
                 "when": "changed",
             },
         }))
@@ -6971,7 +6971,7 @@ fn a_read_only_built_in_tool_gate_is_accepted_at_read() {
 
 /// A `schedule:r` token sees that a job is gated, but not what the gate runs.
 ///
-/// A gate command is an `execute_command` line that runs unattended as the server's user. The
+/// A gate command is a `shell_execute` line that runs unattended as the server's user. The
 /// webhook path already withholds the same field, on the stated grounds that a command line is the
 /// highest-entropy field in the system and the one most likely to carry a credential someone pasted
 /// into a `curl`. `GET /v1/schedule` is server-wide, so leaving the command at `schedule:r` handed
@@ -7914,23 +7914,23 @@ fn session_tools_endpoint_lists_the_catalog_with_permissions() {
     let body: serde_json::Value = response.json().expect("parse");
     let tools = body["tools"].as_array().expect("tools");
     assert!(!tools.is_empty(), "a session always has built-in tools");
-    let read_file = tools
+    let file_read = tools
         .iter()
-        .find(|t| t["name"] == "read_file")
-        .expect("read_file must be registered");
-    assert_eq!(read_file["required_permission"], "read");
-    assert_eq!(read_file["deferred"], false);
-    let write_file = tools
+        .find(|t| t["name"] == "file_read")
+        .expect("file_read must be registered");
+    assert_eq!(file_read["required_permission"], "read");
+    assert_eq!(file_read["deferred"], false);
+    let file_write = tools
         .iter()
-        .find(|t| t["name"] == "write_file")
-        .expect("write_file must be registered");
+        .find(|t| t["name"] == "file_write")
+        .expect("file_write must be registered");
     assert_eq!(
-        write_file["required_permission"], "workspace",
+        file_write["required_permission"], "workspace",
         "the catalog must report the tier a client needs to render an approval prompt"
     );
 }
 
-/// `meka tool list` exists to show what a session would have, and `execute_command` is the one
+/// `meka tool list` exists to show what a session would have, and `shell_execute` is the one
 /// built-in whose level depends on the machine: `read` where the shell sandbox is on and usable,
 /// `unrestricted` otherwise. A listing that skipped the probe printed `unrestricted` everywhere.
 /// The oracle is a live session's own catalog on the same host and config, so the test holds
@@ -7949,8 +7949,8 @@ fn the_tool_listing_shows_execute_command_at_the_level_a_session_here_needs() {
         .as_array()
         .expect("tools")
         .iter()
-        .find(|tool| tool["name"] == "execute_command")
-        .expect("execute_command is registered")["required_permission"]
+        .find(|tool| tool["name"] == "shell_execute")
+        .expect("shell_execute is registered")["required_permission"]
         .clone();
 
     let output = harness
@@ -7970,8 +7970,8 @@ fn the_tool_listing_shows_execute_command_at_the_level_a_session_here_needs() {
         .as_array()
         .expect("tools")
         .iter()
-        .find(|tool| tool["name"] == "execute_command")
-        .expect("execute_command is listed")["required_permission"]
+        .find(|tool| tool["name"] == "shell_execute")
+        .expect("shell_execute is listed")["required_permission"]
         .clone();
     assert_eq!(
         listed_level, session_level,
@@ -8039,7 +8039,7 @@ fn a_session_denied_agent_spawn_registers_none_of_the_family() {
         );
     }
     assert!(
-        names.contains(&"read_file".to_string()),
+        names.contains(&"file_read".to_string()),
         "only the family is denied, got: {names:?}"
     );
 }
@@ -8061,7 +8061,7 @@ fn a_session_at_depth_zero_registers_none_of_the_family() {
         );
     }
     assert!(
-        names.contains(&"read_file".to_string()),
+        names.contains(&"file_read".to_string()),
         "only the family is denied, got: {names:?}"
     );
 }
@@ -8362,7 +8362,7 @@ fn an_attending_feed_reader_is_asked_to_approve_a_gated_call_the_inbox_started()
     let path = workspace.path().join("attended.txt");
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "file_write" },
             { "type": "tool_use_end", "input": {"path": path, "content": "hi"} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -8403,7 +8403,7 @@ fn an_attending_feed_reader_is_asked_to_approve_a_gated_call_the_inbox_started()
     });
     let prompt = sse_event_data(&until_prompt, "permission_required")
         .unwrap_or_else(|| panic!("the attendee is asked: {until_prompt}"));
-    assert_eq!(prompt["tool_name"], "write_file", "{prompt}");
+    assert_eq!(prompt["tool_name"], "file_write", "{prompt}");
     assert_eq!(
         prompt["input"]["content"], "hi",
         "the prompt shows the write: {prompt}"
@@ -8443,7 +8443,7 @@ fn a_feed_reader_that_does_not_attend_gets_the_refusal_notice() {
     let path = workspace.path().join("unattended.txt");
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "file_write" },
             { "type": "tool_use_end", "input": {"path": path, "content": "hi"} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -8523,7 +8523,7 @@ fn attending_the_feed_needs_the_write_scope() {
 fn a_commands_output_streams_live_and_the_result_still_arrives_whole() {
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
             { "type": "tool_use_end", "input": {"command": "printf 'one\\ntwo\\nthree\\n'"} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -8615,7 +8615,7 @@ fn a_commands_output_streams_live_and_the_result_still_arrives_whole() {
 fn a_detached_commands_output_is_not_streamed_after_its_turn() {
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
             { "type": "tool_use_end", "input": {
                 "command": "sleep 0.5; echo late; sleep 0.5; echo later",
                 "background": true
@@ -8673,7 +8673,7 @@ fn a_sub_agents_tool_calls_show_as_activity_on_the_parents_feed() {
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "type": "tool_use_start", "id": "tu_w", "name": "read_file" },
+            { "type": "tool_use_start", "id": "tu_w", "name": "file_read" },
             { "type": "tool_use_end", "input": {"path": notes} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -8714,7 +8714,7 @@ fn a_sub_agents_tool_calls_show_as_activity_on_the_parents_feed() {
     assert!(
         activity["summary"]
             .as_str()
-            .is_some_and(|summary| summary.contains("read_file")),
+            .is_some_and(|summary| summary.contains("file_read")),
         "{activity}"
     );
     let block = body
@@ -10089,7 +10089,7 @@ fn webhook_payloads_carry_no_message_content() {
 fn canceling_a_running_background_task_stops_it() {
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
             { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -10170,7 +10170,7 @@ fn canceling_a_running_background_task_stops_it() {
 fn a_canceled_task_rides_on_the_next_turn_instead_of_causing_one() {
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
             { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -10311,7 +10311,7 @@ fn a_canceled_task_rides_on_the_next_turn_instead_of_causing_one() {
 fn a_session_with_a_running_background_task_is_not_evicted() {
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
             { "type": "tool_use_end", "input": {"command": "sleep 30", "background": true} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -10391,7 +10391,7 @@ fn a_session_with_a_running_background_task_is_not_evicted() {
 fn a_fire_that_fails_keeps_the_outcome_riding_on_it() {
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
             { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -10508,7 +10508,7 @@ fn a_scheduled_fire_announces_what_it_claims() {
     );
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
             { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -10593,7 +10593,7 @@ fn a_scheduled_fire_announces_what_it_claims() {
 fn a_scheduled_fire_carries_a_cancellation_that_was_waiting() {
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
             { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -10708,7 +10708,7 @@ fn a_canceled_task_is_announced_without_being_delivered() {
     );
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
             { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -10792,7 +10792,7 @@ fn a_canceled_task_is_announced_without_being_delivered() {
     );
 }
 
-/// A `task.finished` delivery must not carry the task's label. For `execute_command` that is the
+/// A `task.finished` delivery must not carry the task's label. For `shell_execute` that is the
 /// shell command line, which is exactly where a pasted credential ends up.
 #[test]
 fn task_webhook_payload_omits_the_command_line() {
@@ -10804,7 +10804,7 @@ fn task_webhook_payload_omits_the_command_line() {
     // The mock provider drives the tool call; the payload shape is what is under test.
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
             { "type": "tool_use_end",
               "input": {"command": "echo SECRET-TOKEN-IN-COMMAND", "background": true} },
             { "type": "message_end", "stop_reason": "tool_use" }
@@ -10837,7 +10837,7 @@ fn task_webhook_payload_omits_the_command_line() {
                 "no `label` field at all: {}",
                 delivery.body
             );
-            assert_eq!(payload["tool"], "execute_command");
+            assert_eq!(payload["tool"], "shell_execute");
         }
         Err(_) => panic!("a task.finished delivery must arrive"),
     }
@@ -12162,7 +12162,7 @@ fn an_interrupt_stops_a_requested_compaction_before_it_replaces_the_window() {
         [
             { "type": "tool_use_start", "id": "tu_1", "name": "context_compact" },
             { "type": "tool_use_end", "input": {} },
-            { "type": "tool_use_start", "id": "tu_2", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "tu_2", "name": "shell_execute" },
             { "type": "tool_use_end", "input": {"command": "sleep 5"} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],

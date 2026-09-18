@@ -15,10 +15,10 @@ use crate::{
     image::{ImageHandling, prepare_image_source},
 };
 
-/// Default cap for regex-search-mode hits; shared by `read_file` and `scratchpad_read`.
+/// Default cap for regex-search-mode hits; shared by `file_read` and `scratchpad_read`.
 pub(super) const MAX_SEARCH_MATCHES: usize = 100;
 
-/// Wall-clock ceiling on one filesystem walk (`find_files`, `search_contents`). The result caps
+/// Wall-clock ceiling on one filesystem walk (`file_find`, `file_search`). The result caps
 /// bound only what is returned, not what is examined, and a walk rooted high in the tree (`/proc`
 /// and `/sys` alone are effectively unbounded) would otherwise run until the filesystem is
 /// exhausted. Sized well above any plausible repository-scoped search and well below the point
@@ -94,7 +94,7 @@ pub(super) fn require_str(
     tool_name: &str,
 ) -> Result<String> {
     // Blank is missing. Every caller names a thing (a path, a pattern, a command, a name), and an
-    // empty one is never that thing: `edit_file` with an empty `old_string` and `replace_all`
+    // empty one is never that thing: `file_edit` with an empty `old_string` and `replace_all`
     // spliced the replacement between every character of the file and reported success.
     input[field]
         .as_str()
@@ -160,7 +160,7 @@ pub(super) fn refuse_private_read(
 /// the returned path for every later filesystem operation, never the raw string.
 ///
 /// Errors when the path cannot be resolved rather than falling back to the raw path, which would
-/// leave `..` and symlink components unresolved. A `write_file` target may not exist yet, so its
+/// leave `..` and symlink components unresolved. A `file_write` target may not exist yet, so its
 /// callers canonicalize the parent directory and re-join the file name.
 pub(super) async fn canonicalize_for_tool(tool_name: &str, path: &Path) -> Result<PathBuf> {
     tokio::fs::canonicalize(path)
@@ -237,7 +237,7 @@ pub(super) fn redirects_to_scratchpad(input: &serde_json::Value) -> bool {
 
 /// Build a two-block `ToolOutput` (text marker + multimodal Image) from raw image bytes plus a
 /// pre-computed classification. Wraps `prepare_image_payload` so error paths become a text
-/// `ToolOutput` with `is_error: true`. Shared by `fetch_url`, `read_file`, and `render_image`.
+/// `ToolOutput` with `is_error: true`. Shared by `web_fetch`, `file_read`, and `image_render`.
 pub(crate) fn build_image_tool_output(
     marker: &str,
     handling: ImageHandling,
@@ -370,7 +370,7 @@ mod tests {
     }
 
     /// A blank string names nothing, so it is refused the way a missing field is. Two copies of
-    /// this function disagreed on it, and the lenient one let `edit_file` accept an empty
+    /// this function disagreed on it, and the lenient one let `file_edit` accept an empty
     /// `old_string`.
     #[test]
     fn a_blank_string_is_a_missing_parameter() {

@@ -186,7 +186,7 @@ impl WebhookDispatcher {
         {
             self.send(
                 WebhookEvent::TaskFinished,
-                // No `label`. It is the tool's primary argument, which for `execute_command` is
+                // No `label`. It is the tool's primary argument, which for `shell_execute` is
                 // the shell command line -- the highest-entropy field in the system and the one
                 // most likely to carry a credential someone pasted into a `curl`. A subscriber
                 // that wants it reads `GET /v1/sessions/{id}/tasks` with its own token, which is
@@ -463,7 +463,7 @@ mod tests {
         let task = crate::store::background::BackgroundTask {
             id: uuid::Uuid::new_v4().to_string(),
             session_id,
-            tool: "execute_command".to_string(),
+            tool: "shell_execute".to_string(),
             label: "sleep 900".to_string(),
             status: crate::store::background::TaskStatus::Canceled,
             outcome: None,

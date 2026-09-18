@@ -46,7 +46,7 @@ pub(super) fn format_embedded_resource(embedded: &EmbeddedResource) -> String {
 /// Decode an ACP image content block into meka's internal [`crate::image::ImageSource`] via the
 /// shared client-image pipeline, so ACP and the HTTP API enforce the same limits.
 ///
-/// Off the runtime, for the reason `read_file` and `fetch_url` document at their own call sites:
+/// Off the runtime, for the reason `file_read` and `web_fetch` document at their own call sites:
 /// the pipeline base64-decodes and then decodes the image to verify it, which is tens of
 /// milliseconds of pure CPU on a multi-megapixel screenshot, and on the runtime it blocks every
 /// other task on that worker. The editor pasting one attachment must not stall an unrelated
@@ -446,7 +446,7 @@ pub(super) async fn run_prompt_turn(
         // `agent_message_chunk` is rendered as Markdown, where a bare newline is a soft break (it
         // collapses to a space) and small indents are stripped. Wrap the preformatted table in a
         // fenced code block so the column alignment and line breaks survive, matching how
-        // `execute_command` output is rendered.
+        // `shell_execute` output is rendered.
         let body = format!("```\n{output}\n```");
         send_session_update(
             &frontend.connection,

@@ -461,7 +461,7 @@ impl reedline::EditMode for CyclePermissionMode {
             }
             // Re-emit the "backend unavailable" warn at the moment the user enters the read level,
             // so a misconfigured sandbox surfaces immediately instead of waiting for
-            // the first `execute_command` failure. The "stronger sandbox available"
+            // the first `shell_execute` failure. The "stronger sandbox available"
             // nudge (Warn 2) intentionally does not fire here: startup-only, to avoid
             // nagging.
             //
@@ -1231,7 +1231,7 @@ pub(super) fn format_progress_update(update: &crate::frontend::ProgressUpdate) -
     // Flattened, not merely sanitized. `sanitize_text` deliberately keeps `\n`, and both of these
     // are server-controlled: `tool_name` is the raw name the server advertised (only the namespaced
     // form goes through `normalize_server_name`). A tool called "x\n[approval]
-    // execute_command\n..." would otherwise open new rows inside meka's own chrome.
+    // shell_execute\n..." would otherwise open new rows inside meka's own chrome.
     let server = crate::text::sanitize_to_line(&update.server_name, usize::MAX);
     let tool = crate::text::sanitize_to_line(&update.tool_name, usize::MAX);
     let counter = match update.total {
@@ -1954,7 +1954,7 @@ mod tests {
             tool_name: "tool".to_string(),
             tool_use_id: None,
             message: Some(
-                "working\n[approval] execute_command\n  command: ls -la\nAllow? (Y/n) ".to_string(),
+                "working\n[approval] shell_execute\n  command: ls -la\nAllow? (Y/n) ".to_string(),
             ),
             progress: 1.0,
             total: None,

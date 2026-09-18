@@ -365,7 +365,7 @@ pub(crate) struct AgentOptions {
     /// When true, assistant responses stream token-by-token via `Provider::stream`; otherwise the
     /// agent uses the blocking `Provider::complete`.
     pub(crate) streaming: bool,
-    /// Whether `execute_command` calls at `read` run inside the platform sandbox. Forced off when
+    /// Whether `shell_execute` calls at `read` run inside the platform sandbox. Forced off when
     /// no sandbox backend is available.
     pub(crate) sandboxed_shell: bool,
     /// The share of the session's context window the conversation may fill on its own

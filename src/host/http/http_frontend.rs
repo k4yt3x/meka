@@ -1125,7 +1125,7 @@ mod tests {
             16,
         );
         let request = || PermissionRequest {
-            tool_name: "write_file".into(),
+            tool_name: "file_write".into(),
             primary_param: None,
             input: serde_json::Value::Null,
             cancellation: tokio_util::sync::CancellationToken::new(),
@@ -1184,7 +1184,7 @@ mod tests {
             async move {
                 frontend
                     .request_permission(PermissionRequest {
-                        tool_name: "write_file".into(),
+                        tool_name: "file_write".into(),
                         primary_param: None,
                         input: serde_json::Value::Null,
                         cancellation: tokio_util::sync::CancellationToken::new(),
@@ -1238,13 +1238,13 @@ mod tests {
             content: Vec::new(),
             metadata: None,
         };
-        frontend.push_event(started("tu_1", "execute_command"));
+        frontend.push_event(started("tu_1", "shell_execute"));
         frontend.push_event(output("tu_1", "live\n"));
-        frontend.push_event(completed("tu_1", "execute_command"));
+        frontend.push_event(completed("tu_1", "shell_execute"));
         // The detached command keeps writing after its call returned its task id.
         frontend.push_event(output("tu_1", "late\n"));
         // A tool that does not stream never opens a view, so nothing of its id is relayed.
-        frontend.push_event(started("tu_2", "read_file"));
+        frontend.push_event(started("tu_2", "file_read"));
         frontend.push_event(output("tu_2", "never\n"));
         frontend.push_event(output("tu_9", "unknown\n"));
 
@@ -1282,7 +1282,7 @@ mod tests {
             async move {
                 frontend
                     .request_permission(PermissionRequest {
-                        tool_name: "write_file".into(),
+                        tool_name: "file_write".into(),
                         primary_param: None,
                         input: serde_json::Value::Null,
                         cancellation: tokio_util::sync::CancellationToken::new(),
@@ -1318,7 +1318,7 @@ mod tests {
             async move {
                 frontend
                     .request_permission(PermissionRequest {
-                        tool_name: "write_file".into(),
+                        tool_name: "file_write".into(),
                         primary_param: None,
                         input: serde_json::Value::Null,
                         cancellation: tokio_util::sync::CancellationToken::new(),
@@ -1383,7 +1383,7 @@ mod tests {
         };
         frontend.push_event(FrontendEvent::ToolCallStarted {
             id: "tu_1".into(),
-            name: "execute_command".into(),
+            name: "shell_execute".into(),
             input: serde_json::Value::Null,
             display_summary: None,
         });
@@ -1392,7 +1392,7 @@ mod tests {
         frontend.push_event(output("two\n"));
         frontend.push_event(FrontendEvent::ToolCallCompleted {
             id: "tu_1".into(),
-            name: "execute_command".into(),
+            name: "shell_execute".into(),
             is_error: false,
             content: Vec::new(),
             metadata: None,
@@ -1456,7 +1456,7 @@ mod tests {
         let frontend = HttpFrontend::new();
         let outcome = frontend
             .request_permission(PermissionRequest {
-                tool_name: "execute_command".into(),
+                tool_name: "shell_execute".into(),
                 primary_param: Some("rm /tmp/x".into()),
                 input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
@@ -1470,7 +1470,7 @@ mod tests {
                 matches!(
                     event,
                     FrontendEvent::Notice(notice)
-                        if notice.text.contains("execute_command")
+                        if notice.text.contains("shell_execute")
                             && notice.text.contains("refused without asking")
                             && notice.text.contains("`stream: true`")
                 )
@@ -1498,7 +1498,7 @@ mod tests {
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
             frontend.request_permission(PermissionRequest {
-                tool_name: "execute_command".into(),
+                tool_name: "shell_execute".into(),
                 primary_param: Some("rm /tmp/x".into()),
                 input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
@@ -1542,10 +1542,10 @@ mod tests {
     #[tokio::test]
     async fn sticky_allow_short_circuits_subsequent_requests() {
         let frontend = HttpFrontend::new();
-        frontend.sticky.remember_allow("read_file");
+        frontend.sticky.remember_allow("file_read");
         let outcome = frontend
             .request_permission(PermissionRequest {
-                tool_name: "read_file".into(),
+                tool_name: "file_read".into(),
                 primary_param: None,
                 input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
@@ -1570,10 +1570,10 @@ mod tests {
     #[tokio::test]
     async fn sticky_deny_short_circuits_subsequent_requests() {
         let frontend = HttpFrontend::new();
-        frontend.sticky.remember_deny("execute_command");
+        frontend.sticky.remember_deny("shell_execute");
         let outcome = frontend
             .request_permission(PermissionRequest {
-                tool_name: "execute_command".into(),
+                tool_name: "shell_execute".into(),
                 primary_param: None,
                 input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
@@ -1593,7 +1593,7 @@ mod tests {
             let frontend_clone = Arc::new(frontend);
             let frontend_inner = Arc::clone(&frontend_clone);
             let request = PermissionRequest {
-                tool_name: "write_file".into(),
+                tool_name: "file_write".into(),
                 primary_param: Some("/tmp/x".into()),
                 input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
@@ -1617,7 +1617,7 @@ mod tests {
             let outcome = join.await.expect("join");
             assert_eq!(outcome, PermissionOutcome::Allow);
             assert!(
-                frontend_clone.is_always_allowed("write_file"),
+                frontend_clone.is_always_allowed("file_write"),
                 "AllowAlways must record the tool as always allowed, and only that"
             );
             frontend_clone
@@ -1703,7 +1703,7 @@ mod tests {
         let join = tokio::spawn(async move {
             frontend_inner
                 .request_permission(PermissionRequest {
-                    tool_name: "execute_command".into(),
+                    tool_name: "shell_execute".into(),
                     primary_param: Some("rm -rf /".into()),
                     input: serde_json::Value::Null,
                     cancellation: waiter,
@@ -1742,7 +1742,7 @@ mod tests {
             "the caller has to be told the reply landed nowhere"
         );
         assert!(
-            !frontend.is_always_allowed("execute_command"),
+            !frontend.is_always_allowed("shell_execute"),
             "and a reply nobody received must not grant the tool for the rest of the session"
         );
     }
@@ -1762,7 +1762,7 @@ mod tests {
             async move {
                 frontend
                     .request_permission(PermissionRequest {
-                        tool_name: "write_file".into(),
+                        tool_name: "file_write".into(),
                         primary_param: Some("/tmp/x".into()),
                         input: serde_json::json!({"path": "/tmp/x", "content": "the payload"}),
                         cancellation,
@@ -1778,7 +1778,7 @@ mod tests {
             .try_recv()
             .expect("the pause event is on the stream");
         assert_eq!(event.event_type, SseEventType::PermissionRequired);
-        assert_eq!(event.data["tool_name"], "write_file");
+        assert_eq!(event.data["tool_name"], "file_write");
         assert_eq!(
             event.data["input"],
             serde_json::json!({"path": "/tmp/x", "content": "the payload"}),
@@ -1811,7 +1811,7 @@ mod tests {
         let join = tokio::spawn(async move {
             frontend_inner
                 .request_permission(PermissionRequest {
-                    tool_name: "execute_command".into(),
+                    tool_name: "shell_execute".into(),
                     primary_param: Some("echo hi".into()),
                     input: serde_json::Value::Null,
                     cancellation: tokio_util::sync::CancellationToken::new(),
@@ -2007,7 +2007,7 @@ mod tests {
         let join = tokio::spawn(async move {
             asking
                 .request_permission(PermissionRequest {
-                    tool_name: "execute_command".into(),
+                    tool_name: "shell_execute".into(),
                     primary_param: Some("echo hi".into()),
                     input: serde_json::Value::Null,
                     cancellation: tokio_util::sync::CancellationToken::new(),

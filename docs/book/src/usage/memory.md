@@ -138,7 +138,7 @@ This never blocks the write. The failure worth preventing is the silent one, whe
 
 ## What not to save
 
-Memory is for what is *not* derivable from the material at hand. Code structure, git history, and file contents are all reachable with `search_contents`, `read_file`, and `execute_command`, so recording them produces stale duplicates of things the agent could just look up.
+Memory is for what is *not* derivable from the material at hand. Code structure, git history, and file contents are all reachable with `file_search`, `file_read`, and `shell_execute`, so recording them produces stale duplicates of things the agent could just look up.
 
 What belongs in memory: who someone is and how they prefer to work, guidance you have given that should not need repeating, decisions and their reasons, and pointers to where information lives in external systems.
 

@@ -29,7 +29,7 @@ fn is_safe_char(ch: char) -> bool {
     // Only the two whitespace controls that cannot move the cursor back pass. `\r` is deliberately
     // not among them: it returns the cursor to column zero without advancing a line, which is
     // enough to overwrite a line meka has already printed using no escape sequence at all. A
-    // server progress message of `"\r[approval] execute_command\n  command: ls\nAllow? (Y/n) "`
+    // server progress message of `"\r[approval] shell_execute\n  command: ls\nAllow? (Y/n) "`
     // would otherwise repaint a convincing approval block at column zero, and everything that
     // renders server text (the elicitation banner, the form labels, the progress line) trusts this
     // function to have made it terminal-safe.
@@ -312,7 +312,7 @@ pub(crate) fn tail_columns(text: &str, max_columns: usize) -> String {
 /// **When it does not fit, the last two rows are a count and the END of the text**, not wherever
 /// the budget ran out. This is [`elide_to_width`]'s reasoning one dimension up. Wrapping is chosen
 /// over cutting so the tail of a command cannot be hidden from the line being approved, and a wrap
-/// that shows the first `max_rows` rows and stops hides exactly that: a 90 KB `execute_command`
+/// that shows the first `max_rows` rows and stops hides exactly that: a 90 KB `shell_execute`
 /// fills every row it is given and leaves `; rm -rf /important` off the end of the last one, so
 /// the notification surface, which elides from the middle, would show that tail and the decision
 /// surface would not.

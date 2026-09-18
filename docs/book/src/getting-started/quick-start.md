@@ -45,7 +45,7 @@ The `[r]` indicates the **read** permission level (the default). The agent can r
 meka ~/project [r] > what files are in the current directory?
 ```
 
-The agent will use the `find_files` tool to list files and describe them.
+The agent will use the `file_find` tool to list files and describe them.
 
 ## 4. Enable the workspace level
 

@@ -144,10 +144,10 @@ impl Permission {
     /// it must be the one that promises no boundary.
     ///
     /// `Workspace` does not pass, tempting as it is on the reasoning that it is *safer* than the
-    /// top rung. That is true of `execute_command`, which `workspace` confines, and false of a
+    /// top rung. That is true of `shell_execute`, which `workspace` confines, and false of a
     /// gate, which bypasses every backend. Passing it is a one-call escape: at `workspace`, a
     /// single `schedule_create` with a `gate` runs arbitrary commands outside the boundary within
-    /// one poll interval, no race and no user interaction, while `execute_command` at the same
+    /// one poll interval, no race and no user interaction, while `shell_execute` at the same
     /// level is confined and is refused outright when it cannot be. The interactive shell must not
     /// have a higher bar than the unattended one.
     ///

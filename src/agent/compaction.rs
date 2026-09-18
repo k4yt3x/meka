@@ -243,7 +243,7 @@ fn summarize_all_but_a_trailing_prompt(view: &[Message]) -> (Vec<Message>, Vec<M
 /// checkpoint loop is not a turn. Without a bound here the checkpoint would be the one place in
 /// meka where a tool result enters the conversation at unlimited size, and it would do so at the
 /// worst possible moment: the window is near full, which is why compaction is running at all. A
-/// single `read_file` could then overflow the request, and the only visible consequence would be a
+/// single `file_read` could then overflow the request, and the only visible consequence would be a
 /// warn line and a silent fall back to the summarizer.
 ///
 /// Truncated rather than spilled, because spilling would create scratchpad entries nobody asked
@@ -445,7 +445,7 @@ impl Agent {
         // out of the active set on the next turn.
         //
         // Read from the events, like the per-turn active set, and not from the materialized slice:
-        // a slice scan sees only `load_tool` exchanges still standing in the current view, and
+        // a slice scan sees only `tool_load` exchanges still standing in the current view, and
         // `DegradeTier::ToolExchanges` empties a refused call in place while a previous compaction
         // replaces everything before it with a summary that names nothing. A short snapshot would
         // be made permanent by `prune_compacted_events`.
@@ -536,11 +536,11 @@ impl Agent {
             .store(LAST_ACCEPTED_UNKNOWN, std::sync::atomic::Ordering::Relaxed);
 
         // The model's view of which files it has read is reset by the summary; drop the
-        // read-tracker so `edit_file` re-reads rather than trusting a pre-compaction read (also
+        // read-tracker so `file_edit` re-reads rather than trusting a pre-compaction read (also
         // bounds its growth).
         //
         // Since `context_compact` began draining mid-turn this also forgets reads the *current*
-        // turn made, so an `edit_file` after a compaction it asked for is refused until the file is
+        // turn made, so a `file_edit` after a compaction it asked for is refused until the file is
         // read again. Kept deliberately: whether the read survived depends on where the kept tail
         // was cut, and re-reading costs a call where trusting a read that fell out of the window
         // costs a blind edit.
@@ -793,9 +793,9 @@ impl Agent {
                             .unwrap_or_else(|| tool.required_permission());
                         let permission = self.cells.permission.get();
                         let admission = if name == "context_replace" {
-                            super::dispatch::Admission::Run
+                            crate::tools::Admission::Run
                         } else {
-                            super::dispatch::admit_tool_call(
+                            crate::tools::admit_tool_call(
                                 &name,
                                 required,
                                 permission,
@@ -808,9 +808,9 @@ impl Agent {
                             admission,
                         ) {
                             (Err(refusal), _) => refusal,
-                            (Ok(_), super::dispatch::Admission::Refuse(refusal)) => *refusal,
+                            (Ok(_), crate::tools::Admission::Refuse(refusal)) => *refusal,
                             (Ok((input, _detach)), admission) => {
-                                let asked = matches!(admission, super::dispatch::Admission::Ask);
+                                let asked = matches!(admission, crate::tools::Admission::Ask);
                                 // As dispatch does: a refusal the level already decides is
                                 // returned instead of asked about, since approval could not
                                 // lift it.

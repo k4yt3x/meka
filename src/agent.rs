@@ -53,7 +53,7 @@ pub(crate) struct Agent {
     tool_registry: ToolRegistry,
     store: Store,
     options: AgentOptions,
-    /// Last todo state pushed to the frontend, so a no-op `todo` call (e.g. a read with no
+    /// Last todo state pushed to the frontend, so a no-op `todo_*` call (e.g. a rewrite with no
     /// arguments, or a rewrite that changes nothing) doesn't re-render the list. Private to this
     /// `Agent`; sub-agents route through `Agent::new` and so get their own.
     last_rendered_todo: tokio::sync::RwLock<Option<crate::todo::TodoState>>,
@@ -331,7 +331,7 @@ impl Agent {
     ///
     /// Doesn't call `set_mcp_manager`. MCP tool dispatch from the sub-agent's registry works
     /// without an attached manager because the adapters delegate through `Arc<ServerEntry>`
-    /// directly, and the paths that do need the manager (`load_tool`, the unknown-tool
+    /// directly, and the paths that do need the manager (`tool_load`, the unknown-tool
     /// explanation) reach it through the registry, which
     /// [`crate::tools::mcp_adapter::install_on_worker_registry`] wires up.
     pub(crate) fn new_subagent(
@@ -777,7 +777,7 @@ mod tests {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: "call_1".to_string(),
-                name: "read_file".to_string(),
+                name: "file_read".to_string(),
                 input: serde_json::json!({"path": "/tmp/test"}),
             }],
         }

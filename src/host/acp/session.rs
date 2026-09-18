@@ -965,7 +965,7 @@ pub(super) async fn handle_close_session(
     // Waits on the conversation mutex, which an in-flight prompt holds for the whole turn. That is
     // safe only because the handler is `cx.spawn`ed: on the dispatch loop it would starve the very
     // response the turn is waiting for. The cancel above does not make the wait short either --
-    // `read_file` and the `fs/*` delegates do not observe the token -- so this genuinely blocks
+    // `file_read` and the `fs/*` delegates do not observe the token -- so this genuinely blocks
     // until the turn ends, off the loop, which is the correct place to do it.
     drop(entry.conversation.lock().await);
     let stopped = entry.release(state.shared.mcp_manager.as_ref()).await;

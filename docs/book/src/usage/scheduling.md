@@ -126,14 +126,14 @@ field you mean and ignores the `checked_at` beside it. For a shell gate, pairing
 monotonic marker (`git rev-list --count HEAD` alongside the commit sha) does the same job.
 
 > **A shell gate needs `unrestricted` permission.** It runs unattended, on a timer, until someone
-> cancels it: a longer-lived grant than `execute_command`, which at least ends with the turn that
+> cancels it: a longer-lived grant than `shell_execute`, which at least ends with the turn that
 > called it. It also runs with **no sandbox**, so `workspace` cannot authorize one: a level whose
 > whole meaning is a write boundary must not hand out a command that has none. A *tool* gate is not
 > held to this: `read` carries it, provided the tool resolves to `read` as well. Ungated reminders
 > work at `read`.
 
-> **`execute_command` is a tool, and that is a door.** Where a sandbox backend is usable it resolves
-> to `read`, so `check: { tool: "execute_command", arguments: { command: "..." } }` is a legitimate
+> **`shell_execute` is a tool, and that is a door.** Where a sandbox backend is usable it resolves
+> to `read`, so `check: { tool: "shell_execute", arguments: { command: "..." } }` is a legitimate
 > tool gate at `read`: an arbitrary command, on a timer, from a session that could not have
 > authorized the shell form. What makes that acceptable is that the two are not the same thing: a
 > gate dispatches at `read`, which is the level `Confinement::resolve` sandboxes, so the command

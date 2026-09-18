@@ -25,7 +25,7 @@ Every other capability block (`[schedule]`, `[skills]`, `[memory]`) defaults on.
 Once enabled, every tool gains an optional `background` parameter, including tools from MCP servers, since a slow MCP call is exactly the kind worth detaching:
 
 ```text
-execute_command({"command": "cargo test --all", "background": true})
+shell_execute({"command": "cargo test --all", "background": true})
 ```
 
 That returns something like:
@@ -137,7 +137,7 @@ Sub-agents (`agent_spawn`) deliberately cannot start background tasks. A sub-age
 
 Background tasks make it ordinary for two agents to work in one directory at once. meka does not lock anything: coordination is the orchestrating agent's job, exactly as it is between two people on one machine.
 
-What it does do is make a lost race **visible**. `edit_file` records what a file looked like when it was read, and refuses an edit against a file that changed since:
+What it does do is make a lost race **visible**. `file_edit` records what a file looked like when it was read, and refuses an edit against a file that changed since:
 
 ```text
 Error: file 'src/main.rs' changed on disk after you read it. Something else
@@ -150,4 +150,4 @@ This applies whether or not background tasks are enabled: a shell `sed -i`, or y
 
 A file served by the editor under [ACP](./acp.md) is checked against the editor rather than the disk,
 since the bytes the agent saw were the editor's. The check is the same; only the thing it compares
-against changes. See [read-before-edit](../tools/file-operations.md#edit_file).
+against changes. See [read-before-edit](../tools/file-operations.md#file_edit).

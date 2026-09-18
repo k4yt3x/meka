@@ -23,12 +23,17 @@ impl ToolRegistry {
 /// Name of the meta-tool that loads a deferred tool's schema. Calls to this tool are scanned out of
 /// the conversation to compute the per-turn active tool set; see
 /// [`crate::tools::load_tool::extract_loaded_tool_names_from_events`].
-pub(crate) const LOAD_TOOL_NAME: &str = "load_tool";
-/// Most tools one `load_tool` call will render. A batch past this is more likely a model loading a
+pub(crate) const LOAD_TOOL_NAME: &str = "tool_load";
+/// Most tools one `tool_load` call will render. A batch past this is more likely a model loading a
 /// whole server speculatively than a task that genuinely needs them all, and each schema is
 /// unbounded in size.
 pub(crate) const MAX_LOAD_TOOL_BATCH: usize = 10;
-/// The tool names one `load_tool` call refers to, in order, deduplicated, and capped at
+/// Name of the meta-tool that searches the registry by keyword: `tool_load`'s sibling.
+pub(crate) const SEARCH_TOOL_NAME: &str = "tool_search";
+/// Most matches one `tool_search` call renders: one `tool_load` batch, so everything a search
+/// turns up can be loaded in the next call.
+pub(crate) const TOOL_SEARCH_MAX_RESULTS: usize = MAX_LOAD_TOOL_BATCH;
+/// The tool names one `tool_load` call refers to, in order, deduplicated, and capped at
 /// [`MAX_LOAD_TOOL_BATCH`].
 ///
 /// Accepts a bare string or an array of strings: a task needing three tools off one server should
@@ -40,7 +45,7 @@ pub(crate) fn load_tool_names(input: &serde_json::Value) -> Vec<String> {
     names.truncate(MAX_LOAD_TOOL_BATCH);
     names
 }
-/// Every distinct name the call asked for, before [`MAX_LOAD_TOOL_BATCH`] is applied. `load_tool`
+/// Every distinct name the call asked for, before [`MAX_LOAD_TOOL_BATCH`] is applied. `tool_load`
 /// compares this against [`load_tool_names`] so an over-long batch is reported rather than quietly
 /// half-honored, which is the same class of silent shortfall this whole advisory machinery exists
 /// to eliminate.
@@ -58,7 +63,7 @@ pub(crate) fn requested_tool_names(input: &serde_json::Value) -> Vec<String> {
     names
 }
 /// Walk the conversation and collect the names of tools that have been loaded via successful
-/// `load_tool` calls. A `load_tool` `tool_use` block counts only when paired with a non-error
+/// `tool_load` calls. A `tool_load` `tool_use` block counts only when paired with a non-error
 /// `tool_result` whose `tool_use_id` matches; this excludes errored loads (unknown name, malformed
 /// args) and orphan `tool_use` blocks awaiting their result.
 ///
@@ -67,7 +72,7 @@ pub(crate) fn requested_tool_names(input: &serde_json::Value) -> Vec<String> {
 /// active set is assembled (see [`ToolRegistry::definitions_active_with_loaded`]).
 ///
 /// Test-only, because the answer it gives is not the one production wants: a materialized slice
-/// shows only the `load_tool` exchanges still standing in the current view, and a compaction or a
+/// shows only the `tool_load` exchanges still standing in the current view, and a compaction or a
 /// `DegradeTier::ToolExchanges` repair takes them out of it.
 /// [`crate::tools::load_tool::extract_loaded_tool_names_from_events`] reads the log instead. The
 /// `#[cfg(test)]` is what stops this drifting back into a live path.
@@ -204,11 +209,12 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "context_compact",
     "conversation_read",
     "conversation_search",
-    "edit_file",
-    "execute_command",
-    "fetch_url",
-    "find_files",
-    "load_tool",
+    "file_edit",
+    "file_find",
+    "file_read",
+    "file_search",
+    "file_write",
+    "image_render",
     "mcp_prompt_get",
     "mcp_prompt_list",
     "mcp_resource_list",
@@ -220,8 +226,6 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "memory_read",
     "memory_search",
     "memory_write",
-    "read_file",
-    "render_image",
     "schedule_cancel",
     "schedule_create",
     "schedule_list",
@@ -234,21 +238,25 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "scratchpad_rename",
     "scratchpad_save_file",
     "scratchpad_write",
-    "search_contents",
+    "shell_execute",
     "skill_delete",
     "skill_read",
     "skill_search",
     "skill_write",
     "task_cancel",
     "task_list",
-    "todo",
-    "write_file",
+    "todo_edit",
+    "todo_read",
+    "todo_write",
+    "tool_load",
+    "tool_search",
+    "web_fetch",
 ];
 /// Tools a checkpoint turn may reach, on top of the `context_replace` it is given.
 ///
 /// An allow-list, because the guiding rule is that **a checkpoint can save, but not act**: the turn
 /// exists to preserve what already happened, not to do more work while the window is about to be
-/// rewritten. So no `execute_command`, no `write_file` / `edit_file`, no `agent_spawn`, no
+/// rewritten. So no `shell_execute`, no `file_write` / `file_edit`, no `agent_spawn`, no
 /// `schedule_*`, and no MCP tools.
 ///
 /// The read tools *are* here, because deciding what is worth keeping sometimes means checking
@@ -260,17 +268,19 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
 pub(crate) const CHECKPOINT_TOOL_NAMES: &[&str] = &[
     "conversation_read",
     "conversation_search",
-    "find_files",
+    "file_find",
+    "file_read",
+    "file_search",
     "memory_read",
     "memory_search",
     "memory_write",
-    "read_file",
     "scratchpad_edit",
     "scratchpad_list",
     "scratchpad_read",
     "scratchpad_write",
-    "search_contents",
-    "todo",
+    "todo_edit",
+    "todo_read",
+    "todo_write",
 ];
 /// Warn (never fail) on `[tools]` entries that don't match any known built-in. Mirrors MCP's
 /// `warn_on_stale_tool_config()`.
@@ -376,13 +386,13 @@ pub(crate) struct ToolRegistry {
     /// [`crate::tools::mcp_adapter::install_on_worker_registry`] and
     /// [`mcp_resources::register_all`] so the registry stays the single place the answer lives.
     pub(super) denials: Arc<ToolDenials>,
-    /// Files read this session, shared with the file tools so `edit_file` can require a prior
+    /// Files read this session, shared with the file tools so `file_edit` can require a prior
     /// read. Cleared on conversation compaction.
     pub(super) read_tracker: ReadTracker,
     /// Back-reference to the MCP manager, filled in by
     /// [`crate::tools::mcp_adapter::attach_session_registry`] for session registries and
     /// [`crate::tools::mcp_adapter::install_on_worker_registry`] for sub-agent ones. Both
-    /// `load_tool` and `Agent::resolve_and_execute_tool` read it to distinguish "no such tool"
+    /// `tool_load` and `Agent::resolve_and_execute_tool` read it to distinguish "no such tool"
     /// from "that tool's server isn't connected". `Weak` because the manager owns the registry
     /// list, not the other way round.
     pub(super) mcp_manager: Arc<std::sync::OnceLock<std::sync::Weak<crate::mcp::McpClientManager>>>,
@@ -487,7 +497,7 @@ impl ToolRegistry {
     }
 
     /// Clear the read-tracker. Called on conversation compaction: the model's context is reset, so
-    /// a follow-up `edit_file` should re-read the file rather than trust a pre-compaction read.
+    /// a follow-up `file_edit` should re-read the file rather than trust a pre-compaction read.
     pub(crate) async fn clear_read_tracker(&self) {
         self.read_tracker.write().await.clear();
     }
@@ -547,7 +557,7 @@ impl ToolRegistry {
         }
     }
 
-    /// Register just `load_tool`, for tests that exercise its unfindable-name path against a real
+    /// Register just `tool_load`, for tests that exercise its unfindable-name path against a real
     /// registry + manager pair without building the whole builtin set.
     #[cfg(test)]
     pub(crate) fn register_load_tool_for_test(&self) {
@@ -555,6 +565,8 @@ impl ToolRegistry {
             tools: Arc::downgrade(&self.tools),
             deferred: Arc::downgrade(&self.deferred),
             mcp_manager: Arc::downgrade(&self.mcp_manager),
+            permission_overrides: Arc::clone(&self.permission_overrides),
+            permission: crate::tools::tests::shared_permission_for_test(),
         }));
     }
 
@@ -576,7 +588,7 @@ impl ToolRegistry {
     }
 
     /// Mark a tool as deferred. Deferred tools live in the registry but are hidden from the
-    /// per-turn tools array until the model explicitly loads them via the `load_tool` meta-tool.
+    /// per-turn tools array until the model explicitly loads them via the `tool_load` meta-tool.
     /// Discoverability is preserved by the `[Tool discovery]` section of the per-turn `<context>`
     /// block (built from `tool_catalog()`), and the active set is recomputed per turn from the
     /// conversation, not from registry state.
@@ -675,7 +687,7 @@ impl ToolRegistry {
 
     /// Returns every active tool definition regardless of the caller's current permission. The
     /// active set is the union of non-deferred tools and deferred tools whose schema has been
-    /// loaded via the `load_tool` meta-tool. `loaded` is computed by the caller (via
+    /// loaded via the `tool_load` meta-tool. `loaded` is computed by the caller (via
     /// [`crate::tools::load_tool::extract_loaded_tool_names_from_events`], which is the only door
     /// for that question outside tests).
     ///
@@ -686,7 +698,7 @@ impl ToolRegistry {
     ///
     /// Emits always-active tools first in registration order, then loaded-deferred tools in the
     /// order they were loaded. Both halves grow only at the tail as a session proceeds, which is
-    /// what keeps this array a stable cache prefix: `load_tool` only ever appends to the
+    /// what keeps this array a stable cache prefix: `tool_load` only ever appends to the
     /// conversation, so the second half only ever gains entries.
     ///
     /// Filtering the registration-ordered list in place would *not* be append-only. With tools
@@ -772,7 +784,7 @@ impl ToolRegistry {
         let sandbox_backend = core.sandbox_backend;
         let backend_probe = core.backend_probe.clone();
         let read_tracker = self.read_tracker.clone();
-        // One scope for every tool that writes a path the user named, so `write_file`, `edit_file`
+        // One scope for every tool that writes a path the user named, so `file_write`, `file_edit`
         // and `scratchpad_save_file` cannot end up judging the boundary differently.
         let write_scope = crate::workspace::WriteScope::new(
             site.permission.clone(),
@@ -827,7 +839,7 @@ impl ToolRegistry {
         self.register(tool).expect("builtin tool name collision");
     }
 
-    /// Register the session-scoped tools (load_tool, skill_*, render_image, todo, scratchpad_*) on
+    /// Register the session-scoped tools (tool_load, skill_*, image_render, todo, scratchpad_*) on
     /// the registry. Shared between [`Self::build_default`] and [`Self::build_for_subagent`] so
     /// adding a new such tool to the parent automatically gives it to sub-agents too.
     ///
@@ -858,10 +870,20 @@ impl ToolRegistry {
         let memories = materials.memories.clone();
         let background = background.then(|| cells.background_tasks.clone());
         *crate::sync::write(&self.inherited_scratchpad_names) = inherited_scratchpad_names.clone();
+        // The two registry meta-tools, root and sub-agent alike: the same door for both is what
+        // keeps a worker's picture of its tools identical to its parent's.
         self.register_builtin(Arc::new(load_tool::LoadToolTool {
             tools: Arc::downgrade(&self.tools),
             deferred: Arc::downgrade(&self.deferred),
             mcp_manager: Arc::downgrade(&self.mcp_manager),
+            permission_overrides: Arc::clone(&self.permission_overrides),
+            permission: cells.permission.clone(),
+        }));
+        self.register_builtin(Arc::new(load_tool::ToolSearchTool {
+            tools: Arc::downgrade(&self.tools),
+            deferred: Arc::downgrade(&self.deferred),
+            permission_overrides: Arc::clone(&self.permission_overrides),
+            permission: cells.permission.clone(),
         }));
         // Both stores register their tools only when the subsystem is switched on. Skipping is
         // the whole point of the config switch: a disabled subsystem must keep its schemas out of
@@ -923,7 +945,13 @@ impl ToolRegistry {
                 self.register_builtin(tool);
             }
         }
-        self.register_builtin(Arc::new(todo::TodoTool { todo_list }));
+        self.register_builtin(Arc::new(todo::TodoWriteTool {
+            todo_list: todo_list.clone(),
+        }));
+        self.register_builtin(Arc::new(todo::TodoEditTool {
+            todo_list: todo_list.clone(),
+        }));
+        self.register_builtin(Arc::new(todo::TodoReadTool { todo_list }));
         self.register_builtin(Arc::new(scratchpad::ScratchpadWriteTool {
             store: store.clone(),
             inherited_names: inherited_scratchpad_names.clone(),
@@ -1131,8 +1159,8 @@ impl ToolRegistry {
     /// Build a registry holding only the core tools, for a scheduled gate's tool probe.
     ///
     /// Nothing session-scoped is registered: a gate is a predicate, and `memory_*` / `skill_*` /
-    /// `todo` are not questions about the world. What it does get is the read-only built-ins a
-    /// watcher wants (`read_file`, `fetch_url`), built against the job's cwd rather
+    /// `todo_*` are not questions about the world. What it does get is the read-only built-ins a
+    /// watcher wants (`file_read`, `web_fetch`), built against the job's cwd rather
     /// than the host process's, for the same reason a shell gate runs there.
     ///
     /// Construction is allocation only, no I/O, so a caller may build one per evaluation.
@@ -1142,7 +1170,7 @@ impl ToolRegistry {
     /// job's own directory. A gate may only call a tool that resolves to `read`, and nothing meka
     /// ships writes at that level, but `tool_permissions` can lower one that does, and it then
     /// writes under the session's cwd, unattended, for as long as the job exists: the operator's
-    /// own instruction, which is why this does not claim writes are impossible. `execute_command`
+    /// own instruction, which is why this does not claim writes are impossible. `shell_execute`
     /// cannot be opened this way, since it re-derives its own confinement rather than trusting
     /// the level.
     pub(crate) fn for_gate(core: &CoreMaterials, site: crate::session::ToolSite) -> Result<Self> {
@@ -1152,7 +1180,7 @@ impl ToolRegistry {
     }
 
     /// Build a tool registry for a sub-agent. Sub-agents get the same session-scoped tools as the
-    /// parent (load_tool, skill_*, memory_*, render_image, todo, scratchpad_*) scoped to their own
+    /// parent (tool_load, skill_*, memory_*, image_render, todo, scratchpad_*) scoped to their own
     /// ephemeral child session, through `cells` that are the sub-agent's own.
     ///
     /// `agent_spawn` is deliberately not registered here, but sub-agents *can* nest: the caller
@@ -1240,7 +1268,7 @@ mod tests {
     ///
     /// Asserted behaviorally rather than by identity because `ToolRegistry` hands back
     /// `Arc<dyn Tool>` with no downcast: run a real confined command through the registry's own
-    /// `execute_command`, then ask the process ledger whether it heard about the root.
+    /// `shell_execute`, then ask the process ledger whether it heard about the root.
     #[cfg(windows)]
     #[tokio::test]
     async fn the_shell_the_registry_builds_grants_through_the_process_ledger() {
@@ -1290,10 +1318,10 @@ mod tests {
         )
         .expect("registry builds");
 
-        let execute_command = registry
-            .get("execute_command")
-            .expect("execute_command is registered");
-        let result = execute_command
+        let shell_execute = registry
+            .get("shell_execute")
+            .expect("shell_execute is registered");
+        let result = shell_execute
             .execute(
                 serde_json::json!({"command": "cmd /c echo ok"}),
                 crate::tools::ToolContext::detached(CancellationToken::new()),
@@ -1312,8 +1340,8 @@ mod tests {
 
     /// The registry's write boundary is bound to the session's own permission cell, so moving that
     /// cell moves the boundary. Building the shared `WriteScope` from a permanently-`Unrestricted`
-    /// handle instead would sever the session's level from `write_file`, `edit_file`,
-    /// `scratchpad_save_file` and `execute_command` at once, failing open in one line.
+    /// handle instead would sever the session's level from `file_write`, `file_edit`,
+    /// `scratchpad_save_file` and `shell_execute` at once, failing open in one line.
     ///
     /// Driven through the production builder and the real tool rather than through the helpers,
     /// because the helpers are what that edit leaves working.
@@ -1367,11 +1395,11 @@ mod tests {
         )
         .expect("registry builds");
 
-        let write_file = registry
-            .get("write_file")
-            .expect("write_file is registered");
+        let file_write = registry
+            .get("file_write")
+            .expect("file_write is registered");
         let write_outside = || {
-            write_file.execute(
+            file_write.execute(
                 serde_json::json!({
                     "path": outside.to_str().expect("path"),
                     "content": "payload",
@@ -1382,8 +1410,8 @@ mod tests {
 
         // At `workspace` the cell confines it.
         //
-        // Either refusal shape counts. `write_file` returns `Err(MekaError::ToolExecution)` from
-        // `resolve_write_target` while `edit_file` returns `Ok(ToolOutput { is_error: true })`;
+        // Either refusal shape counts. `file_write` returns `Err(MekaError::ToolExecution)` from
+        // `resolve_write_target` while `file_edit` returns `Ok(ToolOutput { is_error: true })`;
         // both reach the model as a failed tool call, and pinning one here would make this test
         // fail for a reason that has nothing to do with the boundary.
         let refused = write_outside().await;
@@ -1450,6 +1478,25 @@ mod tests {
     #[test]
     fn extract_loaded_tool_names_empty() {
         assert!(extract_loaded_tool_names(&[]).is_empty());
+    }
+
+    /// The scanner has one name. A call under any other name, however close, loads nothing: a
+    /// store's history carries the meta-tool under the one name the ledger gives it, so nothing
+    /// here tolerates a second spelling.
+    #[test]
+    fn a_call_under_any_other_name_loads_nothing() {
+        let loaded = vec![
+            load_tool_use("u1", "scratchpad_read"),
+            tool_result("u1", "loaded", false),
+        ];
+        assert!(extract_loaded_tool_names(&loaded).contains("scratchpad_read"));
+
+        let mut other = loaded.clone();
+        let ContentBlock::ToolUse { name, .. } = &mut other[0].content[0] else {
+            panic!("the first block is the call");
+        };
+        *name = "not_the_loader".to_string();
+        assert!(extract_loaded_tool_names(&other).is_empty());
     }
 
     #[test]
@@ -1539,7 +1586,7 @@ mod tests {
 
     #[test]
     fn extract_loaded_tool_names_orphan_use() {
-        // load_tool was issued but the tool_result hasn't arrived yet.
+        // tool_load was issued but the tool_result hasn't arrived yet.
         let messages = vec![load_tool_use("u1", "scratchpad_read")];
         assert!(extract_loaded_tool_names(&messages).is_empty());
     }
@@ -1551,7 +1598,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
                     id: "u1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({ "name": "anything" }),
                 }],
             },
@@ -1562,7 +1609,7 @@ mod tests {
 
     #[test]
     fn extract_loaded_tool_names_malformed_input() {
-        // load_tool called with no `name` field: must not panic, must not pollute the active set.
+        // tool_load called with no `name` field: must not panic, must not pollute the active set.
         let messages = vec![
             Message {
                 role: Role::Assistant,
@@ -1639,7 +1686,7 @@ mod tests {
 
     #[test]
     fn extract_loaded_tool_names_mismatched_id() {
-        // tool_result references an id that no `load_tool` use claimed. The result is dropped; the
+        // tool_result references an id that no `tool_load` use claimed. The result is dropped; the
         // orphan use stays unmatched and is not added to the active set.
         let messages = vec![
             load_tool_use("u1", "scratchpad_read"),
@@ -1650,7 +1697,7 @@ mod tests {
 
     #[test]
     fn extract_loaded_tool_names_interleaved_with_other_tool_calls() {
-        // load_tool calls share the message stream with regular tool calls; the scanner must pair
+        // tool_load calls share the message stream with regular tool calls; the scanner must pair
         // on tool_use_id, not on positional adjacency.
         let messages = vec![
             Message {
@@ -1658,7 +1705,7 @@ mod tests {
                 content: vec![
                     ContentBlock::ToolUse {
                         id: "u1".to_string(),
-                        name: "read_file".to_string(),
+                        name: "file_read".to_string(),
                         input: serde_json::json!({"path": "/tmp/x"}),
                     },
                     ContentBlock::ToolUse {
@@ -1774,7 +1821,7 @@ mod tests {
             assert!(registry.get(name).is_none(), "{name} must not register");
         }
         // Unrelated built-ins are untouched.
-        assert!(registry.get("read_file").is_some());
+        assert!(registry.get("file_read").is_some());
     }
 
     #[tokio::test]
@@ -1785,26 +1832,26 @@ mod tests {
         assert!(none_tools.is_empty());
 
         let read_tools = registry.definitions_for_permission(Permission::Read, false);
-        assert!(read_tools.iter().any(|t| t.name == "read_file"));
-        assert!(read_tools.iter().any(|t| t.name == "find_files"));
-        assert!(read_tools.iter().any(|t| t.name == "execute_command"));
-        assert!(!read_tools.iter().any(|t| t.name == "write_file"));
+        assert!(read_tools.iter().any(|t| t.name == "file_read"));
+        assert!(read_tools.iter().any(|t| t.name == "file_find"));
+        assert!(read_tools.iter().any(|t| t.name == "shell_execute"));
+        assert!(!read_tools.iter().any(|t| t.name == "file_write"));
 
         let write_tools = registry.definitions_for_permission(Permission::Unrestricted, false);
-        assert!(write_tools.iter().any(|t| t.name == "read_file"));
-        assert!(write_tools.iter().any(|t| t.name == "write_file"));
-        assert!(write_tools.iter().any(|t| t.name == "execute_command"));
+        assert!(write_tools.iter().any(|t| t.name == "file_read"));
+        assert!(write_tools.iter().any(|t| t.name == "file_write"));
+        assert!(write_tools.iter().any(|t| t.name == "shell_execute"));
     }
 
     #[tokio::test]
     async fn definitions_active_includes_write_tools() {
         let registry = tool_registry_for_test().await;
         let active = registry.definitions_active(&[]);
-        assert!(active.iter().any(|t| t.name == "read_file"));
-        assert!(active.iter().any(|t| t.name == "write_file"));
-        assert!(active.iter().any(|t| t.name == "edit_file"));
-        assert!(active.iter().any(|t| t.name == "execute_command"));
-        // All five scratchpad tools ship default: no `load_tool` round-trip.
+        assert!(active.iter().any(|t| t.name == "file_read"));
+        assert!(active.iter().any(|t| t.name == "file_write"));
+        assert!(active.iter().any(|t| t.name == "file_edit"));
+        assert!(active.iter().any(|t| t.name == "shell_execute"));
+        // All five scratchpad tools ship default: no `tool_load` round-trip.
         assert!(active.iter().any(|t| t.name == "scratchpad_write"));
         assert!(active.iter().any(|t| t.name == "scratchpad_read"));
         assert!(active.iter().any(|t| t.name == "scratchpad_edit"));
@@ -1938,7 +1985,7 @@ mod tests {
 
     #[tokio::test]
     async fn definitions_active_exposes_loaded_deferred_tool() {
-        // End-to-end: a successful load_tool call in the conversation promotes the named tool into
+        // End-to-end: a successful tool_load call in the conversation promotes the named tool into
         // the active set on the next call.
         let registry = tool_registry_for_test().await;
         registry.register_deferred_fixture("fixture_alpha");
@@ -1962,7 +2009,7 @@ mod tests {
 
     #[tokio::test]
     async fn definitions_active_errored_load_stays_hidden() {
-        // A load_tool call that ended in an error tool_result must NOT expose the deferred tool:
+        // A tool_load call that ended in an error tool_result must NOT expose the deferred tool:
         // the model's parameter shape was wrong, so the schema was not delivered.
         let registry = tool_registry_for_test().await;
         registry.register_deferred_fixture("fixture_alpha");
@@ -1977,16 +2024,16 @@ mod tests {
 
     #[tokio::test]
     async fn definitions_active_load_tool_itself_always_visible() {
-        // load_tool is the bootstrap meta-tool. It must appear in the active set for an empty
+        // tool_load is the bootstrap meta-tool. It must appear in the active set for an empty
         // conversation; otherwise the model has no way to discover deferred tools.
         let registry = tool_registry_for_test().await;
         let active = registry.definitions_active(&[]);
-        assert!(active.iter().any(|t| t.name == "load_tool"));
+        assert!(active.iter().any(|t| t.name == "tool_load"));
     }
 
     #[tokio::test]
     async fn definitions_active_unknown_load_silently_dropped() {
-        // load_tool was called for a tool that isn't registered. The scanner records the (errored)
+        // tool_load was called for a tool that isn't registered. The scanner records the (errored)
         // result as not loaded, and even if it were loaded, the registry just doesn't contain a
         // tool by that name: no crash, no spurious entry.
         let registry = tool_registry_for_test().await;
@@ -2005,7 +2052,7 @@ mod tests {
 
         let entries = registry.tool_catalog();
         let names: std::collections::HashSet<_> = entries.iter().map(|(n, ..)| n.clone()).collect();
-        assert!(names.contains("write_file"));
+        assert!(names.contains("file_write"));
         assert!(names.contains("scratchpad_read"));
         assert!(names.contains("fixture_alpha"));
 
@@ -2019,18 +2066,18 @@ mod tests {
             !by_name["scratchpad_read"],
             "scratchpad_read ships active and must not be flagged deferred"
         );
-        assert!(!by_name["write_file"], "write_file is an active builtin");
+        assert!(!by_name["file_write"], "file_write is an active builtin");
 
         let required: std::collections::HashMap<_, _> =
             entries.iter().map(|(n, _, p, _)| (n.clone(), *p)).collect();
-        assert_eq!(required["read_file"], Permission::Read);
-        assert_eq!(required["write_file"], Permission::Workspace);
+        assert_eq!(required["file_read"], Permission::Read);
+        assert_eq!(required["file_write"], Permission::Workspace);
     }
 
     #[tokio::test]
     async fn scratchpad_tools_default_to_active() {
         // Every scratchpad tool ships active: an asymmetry where `scratchpad_write` is active but
-        // its siblings are deferred behind `load_tool` trips agents up.
+        // its siblings are deferred behind `tool_load` trips agents up.
         let registry = tool_registry_for_test().await;
         let entries = registry.tool_catalog();
         for name in [
@@ -2050,7 +2097,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} missing from catalog"));
             assert!(
                 !entry.3,
-                "{name} must not be deferred (would force a load_tool round-trip)",
+                "{name} must not be deferred (would force a tool_load round-trip)",
             );
         }
     }
@@ -2085,12 +2132,12 @@ mod tests {
     #[test]
     fn checkpoint_tool_names_exclude_acting_and_deleting() {
         for name in [
-            "execute_command",
-            "write_file",
-            "edit_file",
+            "shell_execute",
+            "file_write",
+            "file_edit",
             "agent_spawn",
             "schedule_create",
-            "fetch_url",
+            "web_fetch",
             "memory_delete",
             "scratchpad_delete",
         ] {
@@ -2115,9 +2162,9 @@ mod tests {
 
         assert!(names.contains("context_replace"));
         assert!(names.contains("memory_write"));
-        assert!(names.contains("read_file"));
-        assert!(!names.contains("execute_command"));
-        assert!(!names.contains("write_file"));
+        assert!(names.contains("file_read"));
+        assert!(!names.contains("shell_execute"));
+        assert!(!names.contains("file_write"));
         assert!(!names.contains("agent_spawn"));
     }
 
@@ -2155,14 +2202,14 @@ mod tests {
     #[test]
     fn builtin_filter_default_admits_everything() {
         let filter = BuiltinToolFilter::default();
-        assert!(filter.admits("read_file"));
-        assert!(filter.admits("write_file"));
+        assert!(filter.admits("file_read"));
+        assert!(filter.admits("file_write"));
         assert!(filter.admits("anything_else"));
     }
 
     #[test]
     fn builtin_filter_allow_list_restricts() {
-        let allowed: HashSet<String> = ["read_file", "find_files"]
+        let allowed: HashSet<String> = ["file_read", "file_find"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -2170,26 +2217,26 @@ mod tests {
             allowed: Some(allowed),
             ..Default::default()
         };
-        assert!(filter.admits("read_file"));
-        assert!(filter.admits("find_files"));
-        assert!(!filter.admits("write_file"));
-        assert!(!filter.admits("execute_command"));
+        assert!(filter.admits("file_read"));
+        assert!(filter.admits("file_find"));
+        assert!(!filter.admits("file_write"));
+        assert!(!filter.admits("shell_execute"));
     }
 
     #[test]
     fn builtin_filter_block_list_wins_over_allow_list() {
-        let allowed: HashSet<String> = ["read_file", "write_file"]
+        let allowed: HashSet<String> = ["file_read", "file_write"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let disabled: HashSet<String> = ["write_file"].iter().map(|s| s.to_string()).collect();
+        let disabled: HashSet<String> = ["file_write"].iter().map(|s| s.to_string()).collect();
         let filter = BuiltinToolFilter {
             allowed: Some(allowed),
             disabled,
             ..Default::default()
         };
-        assert!(filter.admits("read_file"));
-        assert!(!filter.admits("write_file"));
+        assert!(filter.admits("file_read"));
+        assert!(!filter.admits("file_write"));
     }
 
     #[test]
@@ -2199,31 +2246,31 @@ mod tests {
             filter.allowed.is_none(),
             "empty allow-list should drop to None"
         );
-        assert!(filter.admits("read_file"));
+        assert!(filter.admits("file_read"));
     }
 
     #[tokio::test]
     async fn registry_permission_override_applied() {
         let mut overrides = HashMap::new();
-        overrides.insert("read_file".to_string(), Permission::Unrestricted);
+        overrides.insert("file_read".to_string(), Permission::Unrestricted);
         let filter = BuiltinToolFilter::from_config(None, Vec::new(), overrides);
         let registry = tool_registry_for_test_with_filter(filter).await;
 
         // Override wins over the Tool impl's hardcoded `Read`.
         assert_eq!(
-            registry.required_permission_for("read_file"),
+            registry.required_permission_for("file_read"),
             Some(Permission::Unrestricted)
         );
         // Non-overridden tool returns its hardcoded level.
         assert_eq!(
-            registry.required_permission_for("write_file"),
+            registry.required_permission_for("file_write"),
             Some(Permission::Workspace)
         );
         // Catalog must reflect the override too (the world-state block reads from it).
         let catalog = registry.tool_catalog();
         let read_file_required = catalog
             .iter()
-            .find(|(name, ..)| name == "read_file")
+            .find(|(name, ..)| name == "file_read")
             .map(|(_, _, permission, _)| *permission);
         assert_eq!(read_file_required, Some(Permission::Unrestricted));
     }
@@ -2231,23 +2278,23 @@ mod tests {
     #[tokio::test]
     async fn registry_permission_override_excludes_tool_from_lower_level() {
         let mut overrides = HashMap::new();
-        overrides.insert("read_file".to_string(), Permission::Unrestricted);
+        overrides.insert("file_read".to_string(), Permission::Unrestricted);
         let filter = BuiltinToolFilter::from_config(None, Vec::new(), overrides);
         let registry = tool_registry_for_test_with_filter(filter).await;
 
-        // At Read permission, read_file should now be excluded from the permission-filtered
+        // At Read permission, file_read should now be excluded from the permission-filtered
         // definitions because the override raised it to `unrestricted`.
         let read_defs = registry.definitions_for_permission(Permission::Read, false);
-        assert!(!read_defs.iter().any(|t| t.name == "read_file"));
+        assert!(!read_defs.iter().any(|t| t.name == "file_read"));
 
         let write_defs = registry.definitions_for_permission(Permission::Unrestricted, false);
-        assert!(write_defs.iter().any(|t| t.name == "read_file"));
+        assert!(write_defs.iter().any(|t| t.name == "file_read"));
     }
 
     #[tokio::test]
     async fn subagent_registry_honors_filter() {
         let filter =
-            BuiltinToolFilter::from_config(None, vec!["fetch_url".to_string()], HashMap::new());
+            BuiltinToolFilter::from_config(None, vec!["web_fetch".to_string()], HashMap::new());
         let sandbox_capability = crate::sandbox::detect();
         let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
         let store = Store::for_test().await;
@@ -2294,9 +2341,9 @@ mod tests {
             },
         )
         .expect("default web client config should build cleanly");
-        assert!(registry.get("read_file").is_some());
-        assert!(registry.get("fetch_url").is_none());
-        assert!(registry.get("todo").is_some());
+        assert!(registry.get("file_read").is_some());
+        assert!(registry.get("web_fetch").is_none());
+        assert!(registry.get("todo_write").is_some());
         assert!(registry.get("agent_spawn").is_none());
     }
 
@@ -2395,7 +2442,7 @@ mod tests {
             );
         }
         // The gate is memory-specific, not a blanket refusal.
-        assert!(registry.get("read_file").is_some());
+        assert!(registry.get("file_read").is_some());
     }
 
     #[tokio::test]
@@ -2423,13 +2470,13 @@ mod tests {
     #[tokio::test]
     async fn subagent_denied_builtin_is_absent() {
         let registry = subagent_registry(
-            ToolDenials::new(Vec::new(), vec!["write_file".to_string()]),
+            ToolDenials::new(Vec::new(), vec!["file_write".to_string()]),
             crate::config::MemoryAccess::Write,
         )
         .await;
-        assert!(registry.get("write_file").is_none());
+        assert!(registry.get("file_write").is_none());
         assert!(
-            registry.get("edit_file").is_some(),
+            registry.get("file_edit").is_some(),
             "denying one tool must not take its neighbors"
         );
     }
@@ -2473,7 +2520,7 @@ mod tests {
         let denials = ToolDenials::new(vec!["notion".to_string()], Vec::new());
         assert!(denials.denies_tool("mcp__notion__create_page"));
         assert!(!denials.denies_tool("mcp__linear__create_issue"));
-        assert!(!denials.denies_tool("write_file"));
+        assert!(!denials.denies_tool("file_write"));
     }
 
     /// `[subagents]` restricts sub-agents, not the agent doing the delegating. The root registry's
@@ -2528,7 +2575,7 @@ mod tests {
         .expect("prepare");
 
         let allow_listed = ToolRegistry::new_with_filter(BuiltinToolFilter::from_config(
-            Some(vec!["read_file".to_string()]),
+            Some(vec!["file_read".to_string()]),
             Vec::new(),
             HashMap::new(),
         ));
@@ -2538,7 +2585,7 @@ mod tests {
             "an exhaustive allowed_tools must not silently take the MCP meta-tools"
         );
         assert!(
-            !allow_listed.admits("write_file"),
+            !allow_listed.admits("file_write"),
             "while still biting the tools it always did"
         );
 
@@ -2611,7 +2658,7 @@ mod tests {
         assert_eq!(server_of_tool("mcp__notion__create_page"), Some("notion"));
         // Tool names may themselves contain `__`; server names may not.
         assert_eq!(server_of_tool("mcp__notion__a__b"), Some("notion"));
-        assert_eq!(server_of_tool("write_file"), None);
+        assert_eq!(server_of_tool("file_write"), None);
         assert_eq!(server_of_tool("mcp__malformed"), None);
     }
 
@@ -2622,14 +2669,14 @@ mod tests {
         // register_core_tools.
         let names: HashSet<&str> = BUILTIN_TOOL_NAMES.iter().copied().collect();
         for expected in &[
-            "read_file",
-            "write_file",
-            "edit_file",
-            "find_files",
-            "search_contents",
-            "execute_command",
-            "fetch_url",
-            "todo",
+            "file_read",
+            "file_write",
+            "file_edit",
+            "file_find",
+            "file_search",
+            "shell_execute",
+            "web_fetch",
+            "todo_write",
             "scratchpad_read",
             "scratchpad_write",
             "scratchpad_edit",
@@ -2639,9 +2686,9 @@ mod tests {
             "skill_search",
             "skill_write",
             "skill_delete",
-            "render_image",
+            "image_render",
             "agent_spawn",
-            "load_tool",
+            "tool_load",
         ] {
             assert!(
                 names.contains(expected),

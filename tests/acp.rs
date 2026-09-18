@@ -169,7 +169,7 @@ impl AcpTestHarnessBuilder {
 }
 
 /// A fixture path in the harness's work directory, which sits beside `config_dir`. A file *under*
-/// the config dir is inside meka's own directory, which `read_file` refuses below `unrestricted`.
+/// the config dir is inside meka's own directory, which `file_read` refuses below `unrestricted`.
 /// The directory sessions from [`AcpTestHarness::new_session`] work in, from inside a `pre_spawn`
 /// closure that is handed the config directory beside it. An approved write at `read` lands only
 /// under the workspace roots, so a script that expects its write to succeed targets this.
@@ -548,15 +548,15 @@ model = "claude-sonnet-4-5"
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
         .pre_spawn(|config_dir| {
-            // Target file for the scripted `read_file` call. Real tool runs against this path, so
-            // it must exist. In the work directory beside the config dir: `read_file` refuses
+            // Target file for the scripted `file_read` call. Real tool runs against this path, so
+            // it must exist. In the work directory beside the config dir: `file_read` refuses
             // meka's own directory below `unrestricted`.
             let target = fixture_beside(config_dir, "target.txt");
             std::fs::write(&target, "hello from mock test\n").expect("write target");
             serde_json::json!([
                 [
                     { "type": "text", "text": "reading the file...\n" },
-                    { "type": "tool_use_start", "id": "call_1", "name": "read_file" },
+                    { "type": "tool_use_start", "id": "call_1", "name": "file_read" },
                     { "type": "tool_use_end", "input": { "path": target.to_str().unwrap() } },
                     { "type": "message_end", "stop_reason": "tool_use" }
                 ],
@@ -588,8 +588,8 @@ model = "claude-sonnet-4-5"
         // the bare name alone, and not a second vocabulary.
         let title = update["title"].as_str().unwrap_or("");
         assert!(
-            title.starts_with("read_file ") && title.contains("target.txt"),
-            "tool_call title should be 'read_file <path>': {update}",
+            title.starts_with("file_read ") && title.contains("target.txt"),
+            "tool_call title should be 'file_read <path>': {update}",
         );
         true
     });
@@ -610,7 +610,7 @@ model = "claude-sonnet-4-5"
     );
 }
 
-/// The `todo` tool surfaces as a `plan` session/update with one entry per item.
+/// A `todo_write` call surfaces as a `plan` session/update with one entry per item.
 #[test]
 fn acp_todo_tool_emits_plan_update() {
     let config_toml = r#"
@@ -627,7 +627,7 @@ model = "claude-sonnet-4-5"
             serde_json::json!([
                 [
                     { "type": "text", "text": "planning...\n" },
-                    { "type": "tool_use_start", "id": "call_todo", "name": "todo" },
+                    { "type": "tool_use_start", "id": "call_todo", "name": "todo_write" },
                     {
                         "type": "tool_use_end",
                         "input": { "title": "Work", "items": ["First", "Second"] }
@@ -840,7 +840,7 @@ enabled = ["read", "workspace", "unrestricted"]
                 .join("inside.txt");
             serde_json::json!([
                 [
-                    { "type": "tool_use_start", "id": "call_in", "name": "write_file" },
+                    { "type": "tool_use_start", "id": "call_in", "name": "file_write" },
                     {
                         "type": "tool_use_end",
                         "input": { "path": inside.to_str().unwrap(), "content": "in" }
@@ -848,7 +848,7 @@ enabled = ["read", "workspace", "unrestricted"]
                     { "type": "message_end", "stop_reason": "tool_use" }
                 ],
                 [
-                    { "type": "tool_use_start", "id": "call_out", "name": "write_file" },
+                    { "type": "tool_use_start", "id": "call_out", "name": "file_write" },
                     {
                         "type": "tool_use_end",
                         "input": {
@@ -883,7 +883,7 @@ enabled = ["read", "workspace", "unrestricted"]
 }
 
 /// Drive a full `meka acp` permission round-trip with the mock provider. The scripted turn calls
-/// `write_file` (which, above `read` with approvals on, triggers a `session/request_permission`);
+/// `file_write` (which, above `read` with approvals on, triggers a `session/request_permission`);
 /// the test auto-responds with the configured outcome and asserts the resulting tool-call status.
 fn run_permission_scenario(answer: PermissionAnswer) {
     // `read` with approvals on: a write is above the level, so it triggers the round-trip we want
@@ -908,7 +908,7 @@ enabled = ["read", "unrestricted"]
             serde_json::json!([
                 [
                     { "type": "text", "text": "writing the file...\n" },
-                    { "type": "tool_use_start", "id": "call_write", "name": "write_file" },
+                    { "type": "tool_use_start", "id": "call_write", "name": "file_write" },
                     {
                         "type": "tool_use_end",
                         "input": { "path": target.to_str().unwrap(), "content": "hello" }
@@ -941,7 +941,7 @@ enabled = ["read", "unrestricted"]
                 assert!(
                     tool_call["title"]
                         .as_str()
-                        .is_some_and(|title| title.starts_with("write_file ")),
+                        .is_some_and(|title| title.starts_with("file_write ")),
                     "the permission title opens with the tool's name: {value}"
                 );
                 assert_eq!(
@@ -963,8 +963,8 @@ enabled = ["read", "unrestricted"]
                     .filter_map(|option| option["name"].as_str())
                     .collect();
                 assert!(
-                    option_names.contains(&"Always allow any write_file")
-                        && option_names.contains(&"Always deny any write_file"),
+                    option_names.contains(&"Always allow any file_write")
+                        && option_names.contains(&"Always deny any file_write"),
                     "the sticky options name the tool the way the title does: {option_names:?}"
                 );
                 Some(serde_json::json!({
@@ -1000,7 +1000,7 @@ enabled = ["read", "unrestricted"]
     match answer {
         PermissionAnswer::AllowOnce => assert_eq!(
             status, "completed",
-            "allow_once should let write_file complete; updates: {updates:?}",
+            "allow_once should let file_write complete; updates: {updates:?}",
         ),
         PermissionAnswer::RejectOnce => assert_eq!(
             status, "failed",
@@ -1043,7 +1043,7 @@ model = "claude-sonnet-4-5"
 "#;
     install.write_config(config_toml);
 
-    // Beside the config dir, not in it: `read_file` refuses meka's own directory below
+    // Beside the config dir, not in it: `file_read` refuses meka's own directory below
     // `unrestricted`.
     let target = install.root().join("target.txt");
     std::fs::write(&target, "hello from reload test\n").expect("write target");
@@ -1051,7 +1051,7 @@ model = "claude-sonnet-4-5"
     let script = serde_json::json!([
         [
             { "type": "text", "text": "reading the file...\n" },
-            { "type": "tool_use_start", "id": "call_1", "name": "read_file" },
+            { "type": "tool_use_start", "id": "call_1", "name": "file_read" },
             { "type": "tool_use_end", "input": { "path": target.to_str().unwrap() } },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -2099,7 +2099,7 @@ enabled = ["read", "workspace"]
     );
 }
 
-/// when the client advertises `fs.read_text_file`, a `read_file` tool call delegates to
+/// when the client advertises `fs.read_text_file`, a `file_read` tool call delegates to
 /// `fs/read_text_file` rather than touching the disk. The mock provider scripts the tool use; the
 /// test harness intercepts the outgoing fs request and answers with canned content.
 #[test]
@@ -2126,7 +2126,7 @@ model = "claude-sonnet-4-5"
             serde_json::json!([
                 [
                     { "type": "text", "text": "reading..." },
-                    { "type": "tool_use_start", "id": "call_read", "name": "read_file" },
+                    { "type": "tool_use_start", "id": "call_read", "name": "file_read" },
                     { "type": "tool_use_end", "input": { "path": target.to_str().unwrap() } },
                     { "type": "message_end", "stop_reason": "tool_use" }
                 ],
@@ -2166,13 +2166,13 @@ model = "claude-sonnet-4-5"
     assert_eq!(std::fs::read_to_string(&target).expect("read"), "ON DISK\n");
 }
 
-/// when the client advertises `fs.write_text_file`, a `write_file` tool call delegates to
+/// when the client advertises `fs.write_text_file`, a `file_write` tool call delegates to
 /// `fs/write_text_file` and does NOT touch the local disk. The test harness intercepts the request,
 /// replies ok, and asserts no local file was created.
 #[test]
 fn acp_fs_write_text_file_is_delegated_when_capability_offered() {
     let content_to_write = "hello from delegated write";
-    // `unrestricted` so the agent's permission gate doesn't refuse `write_file` before we even
+    // `unrestricted` so the agent's permission gate doesn't refuse `file_write` before we even
     // reach the delegation seam.
     let config_toml = r#"
 [accounts.mock]
@@ -2197,7 +2197,7 @@ enabled = ["read", "unrestricted"]
             serde_json::json!([
                 [
                     { "type": "text", "text": "writing..." },
-                    { "type": "tool_use_start", "id": "call_write", "name": "write_file" },
+                    { "type": "tool_use_start", "id": "call_write", "name": "file_write" },
                     {
                         "type": "tool_use_end",
                         "input": { "path": target.to_str().unwrap(), "content": content_to_write }
@@ -2211,7 +2211,7 @@ enabled = ["read", "unrestricted"]
             ])
         })
         .build();
-    // `write_file` canonicalizes the parent directory before handing the path to the delegate, so
+    // `file_write` canonicalizes the parent directory before handing the path to the delegate, so
     // the expected path matches `/private/var/...` on macOS rather than the `/var/...` tempdir
     // returns from `config_dir()`. Stripped of the `\\?\` prefix the way meka strips it, because
     // this is compared against a path meka reports rather than one the test constructs.
@@ -2234,7 +2234,7 @@ enabled = ["read", "unrestricted"]
     let mut delegated_content: Option<String> = None;
     let _ = harness.await_response_with_dispatch(id, |value| match value["method"].as_str() {
         Some("fs/read_text_file") => {
-            // Pre-read for diff metadata: return file-not-found shaped error so write_file falls
+            // Pre-read for diff metadata: return file-not-found shaped error so file_write falls
             // back to None old_text.
             Some(serde_json::json!({
                 "jsonrpc": "2.0",
@@ -2274,7 +2274,7 @@ enabled = ["read", "unrestricted"]
     );
 }
 
-/// when the client does NOT advertise `fs.write_text_file`, `write_file` falls back to a local disk
+/// when the client does NOT advertise `fs.write_text_file`, `file_write` falls back to a local disk
 /// write. No `fs/write_text_file` request should appear.
 #[test]
 fn acp_write_file_falls_back_to_local_when_no_capability() {
@@ -2299,7 +2299,7 @@ enabled = ["read", "unrestricted"]
             serde_json::json!([
                 [
                     { "type": "text", "text": "writing..." },
-                    { "type": "tool_use_start", "id": "call_write", "name": "write_file" },
+                    { "type": "tool_use_start", "id": "call_write", "name": "file_write" },
                     {
                         "type": "tool_use_end",
                         "input": { "path": target.to_str().unwrap(), "content": content_to_write }
@@ -2343,7 +2343,7 @@ fn zed_shaped_capabilities() -> serde_json::Value {
     })
 }
 
-/// `execute_command` always runs in meka's own (sandboxed) child process, never in the client's
+/// `shell_execute` always runs in meka's own (sandboxed) child process, never in the client's
 /// terminal, whatever the permission level and whatever the client advertises. `unrestricted` is
 /// the level where delegating would be tempting, and `read` is the level where it would be a
 /// sandbox bypass. Guards both by asserting no `terminal/*` traffic and that the output is the
@@ -2368,7 +2368,7 @@ enabled = ["read", "unrestricted"]
         let script = serde_json::json!([
             [
                 { "type": "text", "text": "running..." },
-                { "type": "tool_use_start", "id": "call_exec", "name": "execute_command" },
+                { "type": "tool_use_start", "id": "call_exec", "name": "shell_execute" },
                 { "type": "tool_use_end", "input": { "command": "echo ran-inside-meka" } },
                 { "type": "message_end", "stop_reason": "tool_use" }
             ],
@@ -2406,7 +2406,7 @@ enabled = ["read", "unrestricted"]
 
         assert!(
             terminal_methods.is_empty(),
-            "{level} level must run execute_command inside meka; saw {terminal_methods:?}",
+            "{level} level must run shell_execute inside meka; saw {terminal_methods:?}",
         );
         // Either terminal status will do. Whether the command *succeeds* is a property of the
         // host's sandbox, not of this test: on a runner where the platform sandbox rejects the
@@ -2444,7 +2444,7 @@ enabled = ["read", "unrestricted"]
     }
 }
 
-/// `unrestricted`, so `execute_command` is not subject to the sandbox's availability on the test
+/// `unrestricted`, so `shell_execute` is not subject to the sandbox's availability on the test
 /// host.
 const ACP_UNRESTRICTED_CONFIG: &str = r#"
 [accounts.mock]
@@ -2469,7 +2469,7 @@ fn acp_execute_command_streams_output_while_running() {
     let script = serde_json::json!([
         [
             { "type": "text", "text": "running..." },
-            { "type": "tool_use_start", "id": "call_exec", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "call_exec", "name": "shell_execute" },
             {
                 "type": "tool_use_end",
                 "input": { "command": "echo first; sleep 0.5; echo second" }
@@ -2529,7 +2529,7 @@ fn acp_terminal_capable_client_gets_an_agent_owned_terminal() {
     let script = serde_json::json!([
         [
             { "type": "text", "text": "running..." },
-            { "type": "tool_use_start", "id": "call_exec", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "call_exec", "name": "shell_execute" },
             {
                 "type": "tool_use_end",
                 "input": { "command": "echo alpha; sleep 0.4; echo beta; exit 7" }
@@ -2617,7 +2617,7 @@ fn acp_terminal_capable_client_gets_an_agent_owned_terminal() {
 fn acp_terminal_capability_alone_does_not_enable_terminal_rendering() {
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "call_exec", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "call_exec", "name": "shell_execute" },
             { "type": "tool_use_end", "input": { "command": "echo capability-check" } },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -2664,7 +2664,7 @@ fn acp_terminal_capability_alone_does_not_enable_terminal_rendering() {
 fn acp_client_without_terminal_capability_gets_console_text() {
     let script = serde_json::json!([
         [
-            { "type": "tool_use_start", "id": "call_exec", "name": "execute_command" },
+            { "type": "tool_use_start", "id": "call_exec", "name": "shell_execute" },
             { "type": "tool_use_end", "input": { "command": "echo plain-text-path" } },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
@@ -3041,7 +3041,7 @@ model = "claude-sonnet-4-5"
     );
 }
 
-/// when the client advertises both `fs.readTextFile` and `fs.writeTextFile`, `edit_file` delegates
+/// when the client advertises both `fs.readTextFile` and `fs.writeTextFile`, `file_edit` delegates
 /// both halves and does not touch the local disk: the delegated read+write composition.
 #[test]
 fn acp_edit_file_delegates_when_both_fs_capabilities_offered() {
@@ -3057,7 +3057,7 @@ model = "claude-sonnet-4-5"
 default = "unrestricted"
 enabled = ["read", "unrestricted"]
 "#;
-    // edit_file canonicalizes the target before reaching the delegation seam, so the path must
+    // file_edit canonicalizes the target before reaching the delegation seam, so the path must
     // exist on disk. Seed it with a *different* content from what the delegate will serve; this
     // proves the editor's in-buffer view (via fs/read_text_file) wins over the on-disk bytes.
     // `force=true` skips the read-before-edit gate (we're not testing that path).
@@ -3076,7 +3076,7 @@ enabled = ["read", "unrestricted"]
             serde_json::json!([
                 [
                     { "type": "text", "text": "editing..." },
-                    { "type": "tool_use_start", "id": "call_edit", "name": "edit_file" },
+                    { "type": "tool_use_start", "id": "call_edit", "name": "file_edit" },
                     {
                         "type": "tool_use_end",
                         "input": {
@@ -3123,8 +3123,8 @@ enabled = ["read", "unrestricted"]
         _ => None,
     });
 
-    assert!(saw_fs_read, "edit_file must delegate the read half");
-    assert!(saw_fs_write, "edit_file must delegate the write half");
+    assert!(saw_fs_read, "file_edit must delegate the read half");
+    assert!(saw_fs_write, "file_edit must delegate the write half");
     assert_eq!(
         delegated_content.as_deref(),
         Some(expected_new_content),
@@ -3135,13 +3135,13 @@ enabled = ["read", "unrestricted"]
     let on_disk = std::fs::read_to_string(&target).expect("read seeded file");
     assert_eq!(
         on_disk, disk_content,
-        "edit_file modified the local file despite delegating to fs/write_text_file"
+        "file_edit modified the local file despite delegating to fs/write_text_file"
     );
 }
 
 /// a sub-agent's permission prompt must forward through `PermissionForwardingFrontend` to the
 /// parent's ACP connection. The parent triggers `agent_spawn`; the sub-agent runs in `ask` mode
-/// (inherited) and attempts `write_file`, which fires a `session/request_permission` on the
+/// (inherited) and attempts `file_write`, which fires a `session/request_permission` on the
 /// *parent's* connection. Test answers `allow_once` and asserts the request was observed.
 #[test]
 fn acp_subagent_permission_forwards_to_parent_client() {
@@ -3176,10 +3176,10 @@ enabled = ["read", "unrestricted"]
                     },
                     { "type": "message_end", "stop_reason": "tool_use" }
                 ],
-                // Sub-agent round 1: write_file → triggers permission.
+                // Sub-agent round 1: file_write → triggers permission.
                 [
                     { "type": "text", "text": "writing..." },
-                    { "type": "tool_use_start", "id": "call_write", "name": "write_file" },
+                    { "type": "tool_use_start", "id": "call_write", "name": "file_write" },
                     {
                         "type": "tool_use_end",
                         "input": { "path": target.to_str().unwrap(), "content": "subagent wrote me" }
@@ -3222,7 +3222,7 @@ enabled = ["read", "unrestricted"]
 
     assert!(
         saw_permission_request,
-        "sub-agent's write_file must forward a session/request_permission \
+        "sub-agent's file_write must forward a session/request_permission \
          through the parent connection",
     );
 }
@@ -3448,13 +3448,13 @@ enabled = ["read", "unrestricted"]
         .pre_spawn(|config_dir| {
             let target_a = work_dir_beside(config_dir).join("a.txt");
             let target_b = work_dir_beside(config_dir).join("b.txt");
-            // Two complete turns; both invoke write_file. Only the first should provoke a
+            // Two complete turns; both invoke file_write. Only the first should provoke a
             // permission round-trip.
             serde_json::json!([
                 // Turn 1 round 1.
                 [
                     { "type": "text", "text": "writing a..." },
-                    { "type": "tool_use_start", "id": "call_a", "name": "write_file" },
+                    { "type": "tool_use_start", "id": "call_a", "name": "file_write" },
                     {
                         "type": "tool_use_end",
                         "input": { "path": target_a.to_str().unwrap(), "content": "a" }
@@ -3469,7 +3469,7 @@ enabled = ["read", "unrestricted"]
                 // Turn 2 round 1.
                 [
                     { "type": "text", "text": "writing b..." },
-                    { "type": "tool_use_start", "id": "call_b", "name": "write_file" },
+                    { "type": "tool_use_start", "id": "call_b", "name": "file_write" },
                     {
                         "type": "tool_use_end",
                         "input": { "path": target_b.to_str().unwrap(), "content": "b" }
@@ -3487,7 +3487,7 @@ enabled = ["read", "unrestricted"]
         .build();
     let session_id = harness.new_session();
 
-    // Turn 1: write_file → request_permission (allow_always).
+    // Turn 1: file_write → request_permission (allow_always).
     let id_1 = harness.prompt(&session_id, "write a");
     let mut prompts_for_turn_1 = 0_usize;
     let _ = harness.await_response_with_dispatch(id_1, |value| {
@@ -4751,7 +4751,7 @@ enabled = ["read", "unrestricted"]
             serde_json::json!([
                 [
                     { "type": "text", "text": "writing..." },
-                    { "type": "tool_use_start", "id": "call_write", "name": "write_file" },
+                    { "type": "tool_use_start", "id": "call_write", "name": "file_write" },
                     {
                         "type": "tool_use_end",
                         "input": { "path": target.to_str().unwrap(), "content": "hi" }
@@ -4789,11 +4789,11 @@ enabled = ["read", "unrestricted"]
 
 // === fs/read_text_file line + limit =================================
 
-/// `read_file` asks the editor for the whole document even when the model passed `offset`/`limit`,
+/// `file_read` asks the editor for the whole document even when the model passed `offset`/`limit`,
 /// and windows what comes back locally.
 ///
 /// Pushing the window down to `fs/read_text_file` looked tidier and cost two things. The freshness
-/// stamp recorded the slice rather than the document, so the next `edit_file` compared a slice
+/// stamp recorded the slice rather than the document, so the next `file_edit` compared a slice
 /// against the whole buffer and refused with a false "changed in the editor". And a response of
 /// exactly `limit` lines was indistinguishable from a file that ended there, so a truncated read
 /// was handed to the model with no notice.
@@ -4812,7 +4812,7 @@ fn acp_fs_read_text_file_fetches_the_whole_document_and_windows_locally() {
             serde_json::json!([
                 [
                     { "type": "text", "text": "reading partial..." },
-                    { "type": "tool_use_start", "id": "call_read", "name": "read_file" },
+                    { "type": "tool_use_start", "id": "call_read", "name": "file_read" },
                     {
                         "type": "tool_use_end",
                         "input": { "path": target.to_string_lossy(), "offset": 9, "limit": 50 }
@@ -5287,7 +5287,7 @@ enabled = ["read", "unrestricted"]
             let target = work_dir_beside(config_dir).join("doomed.txt");
             serde_json::json!([[
                 { "type": "text", "text": "writing..." },
-                { "type": "tool_use_start", "id": "call_w", "name": "write_file" },
+                { "type": "tool_use_start", "id": "call_w", "name": "file_write" },
                 {
                     "type": "tool_use_end",
                     "input": { "path": target.to_str().unwrap(), "content": "x" }
@@ -5462,7 +5462,7 @@ fn acp_empty_refusal_surfaces_standin_message() {
 /// Regression: tool calls must run off the *presence* of `tool_use` blocks, not the reported stop
 /// reason. Providers mislabel it - OpenAI Codex reports `completed` for a tool turn, and Claude
 /// occasionally reports `end_turn` with `tool_use` present. Here the mock emits a complete
-/// `read_file` call but ends the turn with `stop_reason: "end_turn"`; meka must still execute the
+/// `file_read` call but ends the turn with `stop_reason: "end_turn"`; meka must still execute the
 /// tool (and the turn completes normally) instead of orphaning the call and breaking the next
 /// request.
 #[test]
@@ -5478,14 +5478,14 @@ model = "claude-sonnet-4-5"
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
         .pre_spawn(|config_dir| {
-            // In the work directory beside the config dir: `read_file` refuses meka's own
+            // In the work directory beside the config dir: `file_read` refuses meka's own
             // directory below `unrestricted`.
             let target = fixture_beside(config_dir, "target.txt");
             std::fs::write(&target, "hello from mock test\n").expect("write target");
             serde_json::json!([
                 [
                     { "type": "text", "text": "reading the file...\n" },
-                    { "type": "tool_use_start", "id": "call_1", "name": "read_file" },
+                    { "type": "tool_use_start", "id": "call_1", "name": "file_read" },
                     { "type": "tool_use_end", "input": { "path": target.to_str().unwrap() } },
                     // A complete tool call whose stop reason is not "tool_use".
                     { "type": "message_end", "stop_reason": "end_turn" }
@@ -6922,7 +6922,7 @@ poll_interval = "200ms"
             .execute(
                 "INSERT INTO background_tasks \
                  (id, session_id, tool, label, status, outcome, started_at, finished_at) \
-                 VALUES (?1, ?2, 'execute_command', 'sleep 900', 'canceled', NULL, ?3, ?3)",
+                 VALUES (?1, ?2, 'shell_execute', 'sleep 900', 'canceled', NULL, ?3, ?3)",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
                     &session_id,
@@ -7089,7 +7089,7 @@ poll_interval = "200ms"
             .execute(
                 "INSERT INTO background_tasks \
                  (id, session_id, tool, label, status, outcome, started_at, finished_at) \
-                 VALUES (?1, ?2, 'execute_command', 'cargo build', 'completed', '42 passed', \
+                 VALUES (?1, ?2, 'shell_execute', 'cargo build', 'completed', '42 passed', \
                          ?3, ?3)",
                 rusqlite::params![uuid::Uuid::new_v4().to_string(), &session_id, now],
             )
@@ -7176,7 +7176,7 @@ poll_interval = "200ms"
             .execute(
                 "INSERT INTO background_tasks \
                  (id, session_id, tool, label, status, outcome, started_at, finished_at) \
-                 VALUES (?1, ?2, 'execute_command', 'sleep 900', 'canceled', NULL, ?3, ?3)",
+                 VALUES (?1, ?2, 'shell_execute', 'sleep 900', 'canceled', NULL, ?3, ?3)",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
                     &session_id,
@@ -7257,7 +7257,7 @@ enabled = true
             .execute(
                 "INSERT INTO background_tasks \
                  (id, session_id, tool, label, status, outcome, started_at, finished_at) \
-                 VALUES (?1, ?2, 'execute_command', 'sleep 900', 'canceled', NULL, ?3, ?3)",
+                 VALUES (?1, ?2, 'shell_execute', 'sleep 900', 'canceled', NULL, ?3, ?3)",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
                     &session_id,

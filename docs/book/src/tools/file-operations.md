@@ -1,6 +1,6 @@
 # File operations
 
-## `read_file`
+## `file_read`
 
 Read the contents of a file at a given path. Supports text files and images.
 
@@ -20,8 +20,8 @@ Read the contents of a file at a given path. Supports text files and images.
 
 - `limit` defaults to 2000 lines. Whenever the read stops short of the end of the file, whether because of the default or an explicit `limit`, a notice naming the range shown and the total line count is appended. A definitive answer drawn from a silent truncation is worse than an error.
 - Use `offset`/`limit` to page through large files.
-- A single read holds at most 16 MiB in memory. Asking for the whole of a file larger than that is refused, because there is no bounded way to return it; asking for a *window* of one is not, and streams past everything outside the window. So a command-output capture larger than the ceiling stays readable a page at a time, which is what [`execute_command`](shell.md) promises when it spills one to a file.
-- A read that shows the whole file returns it byte for byte, so a CRLF file stays CRLF and an `old_string` copied out of it applies as written. A windowed read normalizes line endings to `\n`; if a later `edit_file` misses for that reason it says so.
+- A single read holds at most 16 MiB in memory. Asking for the whole of a file larger than that is refused, because there is no bounded way to return it; asking for a *window* of one is not, and streams past everything outside the window. So a command-output capture larger than the ceiling stays readable a page at a time, which is what [`shell_execute`](shell.md) promises when it spills one to a file.
+- A read that shows the whole file returns it byte for byte, so a CRLF file stays CRLF and an `old_string` copied out of it applies as written. A windowed read normalizes line endings to `\n`; if a later `file_edit` misses for that reason it says so.
 - Under [ACP](../usage/acp.md) the editor is asked for the whole document and the window is applied here, so both the truncation notice and the freshness fingerprint describe the document rather than the slice.
 - `regex` runs the pattern against each line and returns `line:content` rows (like `grep -n`). It bypasses `offset`/`limit` and is meaningless on image content. Under [ACP](../usage/acp.md) it searches the editor's copy of the file, like any other text read, so a search and the edit that follows it see the same document.
 
@@ -35,7 +35,7 @@ Recognized image extensions are returned as base64-encoded multimodal content:
 
 Images are refused if the final payload exceeds 3.75 MB (~5 MB base64). Conversion can enlarge an image, so a small TIFF may produce a too-large PNG.
 
-Every image `read_file` returns is decoded before it is sent, including the pass-through formats, and one that does not decode is a tool error naming the failure. The same door covers `fetch_url`, `render_image`, and an image a client attaches over ACP or the HTTP API. The decode is not about the extension: a truncated or corrupt PNG keeps a valid signature, so nothing short of decoding it tells the two apart. It matters because a broken image is not refused where it is read but inside the provider, by which time it sits in a tool result the session has already saved and every later turn re-sends.
+Every image `file_read` returns is decoded before it is sent, including the pass-through formats, and one that does not decode is a tool error naming the failure. The same door covers `web_fetch`, `image_render`, and an image a client attaches over ACP or the HTTP API. The decode is not about the extension: a truncated or corrupt PNG keeps a valid signature, so nothing short of decoding it tells the two apart. It matters because a broken image is not refused where it is read but inside the provider, by which time it sits in a tool result the session has already saved and every later turn re-sends.
 
 The check is strict, including PNG chunk checksums, so a damaged file that some viewers still render is refused here. That is deliberate: meka cannot know which decoder is on the other end, and being wrong the other way puts an image the provider rejects into the session permanently. The error names what failed, so a file reported as corrupt is worth re-exporting.
 
@@ -65,9 +65,9 @@ meka ~/project [r] > show me lines 10 through 20 of src/main.rs
 
 ---
 
-## `edit_file`
+## `file_edit`
 
-Modify a file. Supports two modes: **replace** (swap `old_string` for `new_string`) and **insert** (place content before or after `old_string` while preserving the anchor). The file must have been read with `read_file` first (unless `force` is set).
+Modify a file. Supports two modes: **replace** (swap `old_string` for `new_string`) and **insert** (place content before or after `old_string` while preserving the anchor). The file must have been read with `file_read` first (unless `force` is set).
 
 **Permission:** Workspace
 
@@ -91,7 +91,7 @@ Exactly one of `new_string`, `insert_before`, or `insert_after` must be provided
 - A path outside the [workspace roots](../usage/permissions.md#the-workspace-boundary) is refused unless the level is `unrestricted`; the refusal names the roots a write may land under.
 - If `old_string` matches more than once and `replace_all` is not set, the edit is **refused**. Add surrounding context to make the anchor unique, or set `replace_all` to change every occurrence.
 - To delete text, use replace mode with an empty `new_string`.
-- The file must have been previously read with `read_file` on the same path. This prevents blind edits. Set `force` to bypass this requirement.
+- The file must have been previously read with `file_read` on the same path. This prevents blind edits. Set `force` to bypass this requirement.
 - The read must still be **valid**. meka records the file's modification time and size when it is read, and refuses an edit if either has changed since:
 
   ```text
@@ -100,7 +100,7 @@ Exactly one of `new_string`, `insert_before`, or `insert_after` must be provided
   before editing so you are not overwriting that change, or set force=true.
   ```
 
-  This is a deliberately different message from the never-read case, because the next move differs: re-read to see what changed, then decide whether the edit still applies. Anything can be the other writer, an `execute_command` running `sed -i`, a [background task](../usage/background.md), or you in another window. `write_file` and a successful `edit_file` both re-record the file, so consecutive edits never trip it.
+  This is a deliberately different message from the never-read case, because the next move differs: re-read to see what changed, then decide whether the edit still applies. Anything can be the other writer, a `shell_execute` running `sed -i`, a [background task](../usage/background.md), or you in another window. `file_write` and a successful `file_edit` both re-record the file, so consecutive edits never trip it.
 
   A read served by the editor under [ACP](../usage/acp.md) is checked against the editor, not the disk. Those are two different documents that share a path: the editor serves its own copy of every file it owns, saved or not, so comparing one to the other would fire every time you save a file nobody edited and stay silent when you rewrite the buffer the agent is about to edit. meka fingerprints what the editor served and compares it against what the editor serves when the edit arrives, which it fetches anyway. Editing the buffer, or the editor reloading a file something else rewrote, is reported:
 
@@ -116,7 +116,7 @@ Exactly one of `new_string`, `insert_before`, or `insert_after` must be provided
 
 ---
 
-## `write_file`
+## `file_write`
 
 Create or overwrite a file with the given content.
 
@@ -136,4 +136,4 @@ Create or overwrite a file with the given content.
 - Creates parent directories if they do not exist.
 - A path outside the [workspace roots](../usage/permissions.md#the-workspace-boundary) is refused unless the level is `unrestricted`; the refusal names the roots a write may land under.
 - Overwrites the file if it already exists.
-- Overwriting an **existing** file is subject to the same staleness check as `edit_file`: if the file was read and has changed since, the write is refused with the message shown above and `force` is the way past it. A whole-file rewrite is the more destructive of the two, so it is not the more permissive one. Creating a new file needs no prior read.
+- Overwriting an **existing** file is subject to the same staleness check as `file_edit`: if the file was read and has changed since, the write is refused with the message shown above and `force` is the way past it. A whole-file rewrite is the more destructive of the two, so it is not the more permissive one. Creating a new file needs no prior read.

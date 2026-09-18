@@ -960,7 +960,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
                     id: "call_abc".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/x"}),
                 }],
             },
@@ -1003,7 +1003,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
                     id: "call_abc".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/x"}),
                 }],
             },
@@ -1024,7 +1024,7 @@ mod tests {
 
         // [0] user message, [1] function_call, [2] function_call_output
         assert_eq!(input[1]["type"], "function_call");
-        assert_eq!(input[1]["name"], "read_file");
+        assert_eq!(input[1]["name"], "file_read");
         assert_eq!(input[1]["call_id"], "call_abc");
         // arguments must be a JSON string, not a parsed object
         assert!(input[1]["arguments"].is_string());
@@ -1275,7 +1275,7 @@ mod tests {
                     "item": {
                         "type": "function_call",
                         "call_id": "c1",
-                        "name": "read_file"
+                        "name": "file_read"
                     }
                 }),
             ),
@@ -1293,7 +1293,7 @@ mod tests {
                     "item": {
                         "type": "function_call",
                         "call_id": "c1",
-                        "name": "read_file",
+                        "name": "file_read",
                         "arguments": "{\"path\":\"/tmp/x\"}"
                     }
                 }),
@@ -1308,7 +1308,7 @@ mod tests {
         outcome.expect("clean stream");
         assert!(matches!(
             events[0],
-            StreamEvent::ToolUseStart { ref id, ref name } if id == "c1" && name == "read_file"
+            StreamEvent::ToolUseStart { ref id, ref name } if id == "c1" && name == "file_read"
         ));
         match &events[1] {
             StreamEvent::ToolUseEnd { input } => assert_eq!(input["path"], "/tmp/x"),
@@ -1422,7 +1422,7 @@ mod tests {
             (
                 "response.output_item.added",
                 serde_json::json!({
-                    "item": {"type": "function_call", "call_id": "c1", "name": "write_file"}
+                    "item": {"type": "function_call", "call_id": "c1", "name": "file_write"}
                 }),
             ),
             (
@@ -1435,7 +1435,7 @@ mod tests {
                     "item": {
                         "type": "function_call",
                         "call_id": "c1",
-                        "name": "write_file",
+                        "name": "file_write",
                         "arguments": "{\"path\": "
                     }
                 }),
@@ -1446,7 +1446,7 @@ mod tests {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                StreamEvent::ToolCallRejected { name, .. } if name == "write_file"
+                StreamEvent::ToolCallRejected { name, .. } if name == "file_write"
             )),
             "the call must be rejected: {events:?}",
         );
@@ -1957,7 +1957,7 @@ mod tests {
     fn tool_call(id: &str) -> ContentBlock {
         ContentBlock::ToolUse {
             id: id.to_string(),
-            name: "read_file".to_string(),
+            name: "file_read".to_string(),
             input: serde_json::json!({}),
         }
     }

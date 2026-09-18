@@ -50,7 +50,7 @@ impl GateToolset {
     /// The level a gate's built-ins are constructed and dispatched at.
     ///
     /// `Read` is the only level a probe can have been admitted at, and it is also the only one that
-    /// leaves `execute_command` confined: `Confinement::resolve` spawns a bare shell only at
+    /// leaves `shell_execute` confined: `Confinement::resolve` spawns a bare shell only at
     /// `unrestricted`, so handing this registry that level would turn the one read-level tool that
     /// runs arbitrary code into an unsandboxed command on a timer.
     ///
@@ -233,24 +233,24 @@ mod tests {
         use crate::schedule::GateTools;
 
         assert_eq!(
-            toolset(HashMap::new()).resolve("fetch_url"),
+            toolset(HashMap::new()).resolve("web_fetch"),
             Some(Permission::Read),
-            "unconfigured, `fetch_url` is a read-only probe and a legitimate gate"
+            "unconfigured, `web_fetch` is a read-only probe and a legitimate gate"
         );
 
         let raised = toolset(HashMap::from([(
-            "fetch_url".to_string(),
+            "web_fetch".to_string(),
             Permission::Unrestricted,
         )]));
         assert_eq!(
-            raised.resolve("fetch_url"),
+            raised.resolve("web_fetch"),
             Some(Permission::Unrestricted),
             "an operator who raised it must be obeyed here as well as at dispatch"
         );
         assert!(
             crate::schedule::gate_probe_is_authorized(
                 &crate::schedule::GateProbe::Tool {
-                    name: "fetch_url".to_string(),
+                    name: "web_fetch".to_string(),
                     arguments: serde_json::json!({}),
                 },
                 Permission::Unrestricted,
@@ -261,9 +261,9 @@ mod tests {
         );
     }
 
-    /// A gate that reaches `execute_command` runs it confined, or not at all.
+    /// A gate that reaches `shell_execute` runs it confined, or not at all.
     ///
-    /// `execute_command` resolves to `read` wherever a sandbox is usable, so a session at `read`
+    /// `shell_execute` resolves to `read` wherever a sandbox is usable, so a session at `read`
     /// can name it as a gate probe and get an arbitrary command on a timer. That is allowed, and it
     /// rests entirely on the pairing asserted here: the level that admits it as a probe is the same
     /// level that forces `Confinement::ReadOnly`, and where the sandbox is unavailable the tool
@@ -297,7 +297,7 @@ mod tests {
 
         let outcome = toolset
             .call(
-                "read_file",
+                "file_read",
                 &serde_json::json!({ "path": path.to_string_lossy() }),
                 std::time::Duration::from_secs(10),
                 Some(directory.path()),
@@ -317,7 +317,7 @@ mod tests {
 
         let missing = toolset
             .call(
-                "read_file",
+                "file_read",
                 &serde_json::json!({ "path": directory.path().join("absent").to_string_lossy() }),
                 std::time::Duration::from_secs(10),
                 Some(directory.path()),
@@ -369,7 +369,7 @@ mod tests {
             };
         use crate::schedule::GateTools;
         let probe = crate::schedule::GateProbe::Tool {
-            name: "execute_command".to_string(),
+            name: "shell_execute".to_string(),
             arguments: serde_json::json!({ "command": "true" }),
         };
 
@@ -384,7 +384,7 @@ mod tests {
 
         let sandboxed = toolset(true, usable);
         assert_eq!(
-            sandboxed.resolve("execute_command"),
+            sandboxed.resolve("shell_execute"),
             Some(Permission::Read),
             "with a usable sandbox the shell is a read-level tool"
         );
@@ -402,7 +402,7 @@ mod tests {
 
         let unconfined = toolset(false, crate::sandbox::SandboxCapability::Unavailable);
         assert_eq!(
-            unconfined.resolve("execute_command"),
+            unconfined.resolve("shell_execute"),
             Some(Permission::Unrestricted),
             "with no sandbox it is not a read-level tool"
         );

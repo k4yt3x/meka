@@ -83,7 +83,7 @@ model   = "llama3"
 {
   "type": "function",
   "function": {
-    "name": "read_file",
+    "name": "file_read",
     "description": "Read the contents of a file at the given path.",
     "parameters": { "type": "object", "properties": { ... } }
   }

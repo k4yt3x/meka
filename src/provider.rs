@@ -1370,7 +1370,7 @@ mod tests {
                 },
                 ContentBlock::ToolUse {
                     id: "call_1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({}),
                 },
             ],
@@ -1481,7 +1481,7 @@ mod tests {
         let mut accumulators = std::collections::HashMap::new();
         accumulators.insert(0, ToolCallAccumulator {
             id: "call-1".to_string(),
-            name: "read_file".to_string(),
+            name: "file_read".to_string(),
             arguments: "{not json".to_string(),
         });
 
@@ -1499,7 +1499,7 @@ mod tests {
         match second {
             StreamEvent::ToolCallRejected { id, name, reason } => {
                 assert_eq!(id, "call-1");
-                assert_eq!(name, "read_file");
+                assert_eq!(name, "file_read");
                 assert!(reason.starts_with("invalid JSON arguments"));
             }
             other => panic!("expected ToolCallRejected, got {other:?}"),
@@ -1516,7 +1516,7 @@ mod tests {
         let mut accumulators = std::collections::HashMap::new();
         accumulators.insert(0, ToolCallAccumulator {
             id: "call-2".to_string(),
-            name: "read_file".to_string(),
+            name: "file_read".to_string(),
             arguments: r#"{"path": "/tmp/x"}"#.to_string(),
         });
 
@@ -1558,7 +1558,7 @@ mod tests {
                 },
                 ContentBlock::ToolUse {
                     id: "call_1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/test.txt"}),
                 },
             ],
@@ -1591,7 +1591,7 @@ mod tests {
                 },
                 ContentBlock::ToolUse {
                     id: "call_1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/test"}),
                 },
             ],

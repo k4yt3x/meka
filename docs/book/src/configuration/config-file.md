@@ -581,7 +581,7 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `permission` | No | Server-wide permission override: `none`, `read`, `workspace` or `unrestricted`. Applies to every tool on this server, beating the `readOnlyHint` the server advertises and the `[mcp].default_permission` global fallback. Any other value is refused at startup, naming the line, the way an unknown key is. See *Permission resolution* below. |
 | `allowed_tools` | No | Optional allow-list of raw tool names (the form the server advertises, not the `server__tool` namespaced form). When set and non-empty, only these tools are registered; all others from this server are ignored. |
 | `disabled_tools` | No | Optional block-list of raw tool names. Applied **after** `allowed_tools`; tools listed here are never registered. Both lists can coexist; the net set is `allowed_tools \ disabled_tools`. |
-| `eager_load_tools` | No | Raw tool names that should ship **eager-loaded** instead of deferred. Listed tools skip the `load_tool` round-trip and sit in the cacheable tools-array prefix from turn 1. Use this for tools the agent invokes constantly (search, fetch, …); leave others deferred so the tools array stays lean. |
+| `eager_load_tools` | No | Raw tool names that should ship **eager-loaded** instead of deferred. Listed tools skip the `tool_load` round-trip and sit in the cacheable tools-array prefix from turn 1. Use this for tools the agent invokes constantly (search, fetch, …); leave others deferred so the tools array stays lean. |
 | `tool_permissions` | No | Per-tool permission overrides keyed by raw tool name, same values as `permission`. Beats the server-level `permission` and the server's `readOnlyHint` when resolving a tool's required permission. A level meka does not have is refused at startup, naming the line. |
 | `trust_read_only_hint` | No | Whether this server's `readOnlyHint: true` may classify a tool as `read`. Defaults to `true`. Set `false` for a server you have not audited: its hints become advisory for display only, so its tools fall through to the strict `unrestricted` fallback, skipping `[mcp].default_permission` (a global convenience must not re-grant what a per-server audit decision refused). A `readOnlyHint: false` is still honored either way, since it only raises the requirement. See *Permission resolution* below. |
 | `disabled` | No | When `true`, the server is skipped entirely at startup: no process is spawned, no HTTP connect is attempted. Flip it back with `meka mcp enable <name>` or by editing the config. Unset means `false`. |
@@ -928,7 +928,7 @@ Linux-only choice between `"landlock"` and `"bubblewrap"`:
 
 When omitted, meka probes Bubblewrap once at startup. If Bubblewrap is available it auto-picks it; otherwise it auto-picks Landlock and emits a one-shot warning nudging you to install `bubblewrap` for stronger protection. Set the field explicitly to either value (including `"landlock"`) to suppress that warning. No command writes this field; leave it unset to keep auto-detection.
 
-If the configured backend can't be used at runtime (bwrap not installed, user namespaces denied, etc.), `execute_command` at `read` hard-errors with a message naming the configured backend and the specific failure reason. `read` is not blocked for other tools; only `execute_command` requires a usable sandbox.
+If the configured backend can't be used at runtime (bwrap not installed, user namespaces denied, etc.), `shell_execute` at `read` hard-errors with a message naming the configured backend and the specific failure reason. `read` is not blocked for other tools; only `shell_execute` requires a usable sandbox.
 
 Overridable for one run with `meka --sandbox-backend landlock|bubblewrap`, and for a whole
 environment with `MEKA_SANDBOX_BACKEND`. Precedence is flag, then environment, then this field.
@@ -943,7 +943,7 @@ sandbox_backend = "bubblewrap"  # or "landlock"
 
 ## `[tools]`: built-in tool filters
 
-The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to meka's built-in tools (`read_file`, `write_file`, `execute_command`, etc.) via a top-level `[tools]` table. MCP per-server filtering is separate from this and keeps its own namespaces; this block only affects the built-ins.
+The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to meka's built-in tools (`file_read`, `file_write`, `shell_execute`, etc.) via a top-level `[tools]` table. MCP per-server filtering is separate from this and keeps its own namespaces; this block only affects the built-ins.
 
 | Key | Purpose |
 |---|---|
@@ -956,19 +956,19 @@ Stale entries (a name that matches no built-in) emit a `warn!` at startup. meka 
 Restrict a session to read-only inspection:
 ```toml
 [tools]
-allowed_tools = ["read_file", "find_files", "search_contents", "fetch_url"]
+allowed_tools = ["file_read", "file_find", "file_search", "web_fetch"]
 ```
 
-Force `execute_command` to need `unrestricted`, so a session below that with approvals on prompts for every shell call:
+Force `shell_execute` to need `unrestricted`, so a session below that with approvals on prompts for every shell call:
 ```toml
 [tools.tool_permissions]
-execute_command = "unrestricted"
+shell_execute = "unrestricted"
 ```
 
 Disable web access entirely in a locked-down environment:
 ```toml
 [tools]
-disabled_tools = ["fetch_url"]
+disabled_tools = ["web_fetch"]
 ```
 
 Sub-agents spawned via `agent_spawn` inherit the same filter; a disabled built-in is disabled everywhere. To take something away from sub-agents *only*, use [`[subagents]`](#subagents). Run `meka tool list` to see every built-in's effective required permission, whether a `[tools.tool_permissions]` override is in effect, and whether the current config enables it.
@@ -991,7 +991,7 @@ disabled_tools = ["mcp__notion__create_page"]
 
 **`disabled_servers` is the one that matters.** Naming a server removes everything it offers from every sub-agent: its tools, its resources, and its prompts. Reach for it when a server exists to talk to *you* or to act on your behalf. The motivating case is a server that can message the user: without this, a sub-agent three levels down can send a message the user has no way to distinguish from the one they are actually talking to.
 
-`disabled_tools` takes names as they appear in the tool list, so built-ins (`write_file`) and namespaced MCP tools (`mcp__notion__create_page`) share one namespace. For a whole server, prefer `disabled_servers`: it covers the resource and prompt surfaces that a tool-name list cannot reach.
+`disabled_tools` takes names as they appear in the tool list, so built-ins (`file_write`) and namespaced MCP tools (`mcp__notion__create_page`) share one namespace. For a whole server, prefer `disabled_servers`: it covers the resource and prompt surfaces that a tool-name list cannot reach.
 
 An entry matching nothing emits a `warn!` at startup, the same way `[tools]` does. A typo here denies nothing while reading as a restriction, which is worse than writing no config at all.
 
@@ -1230,7 +1230,7 @@ show_content = true
 
 ## `[web]`
 
-Settings for the HTTP client `fetch_url` uses. All keys are optional; unset fields use the defaults shown below.
+Settings for the HTTP client `web_fetch` uses. All keys are optional; unset fields use the defaults shown below.
 
 | Key | Type | Default | Purpose |
 |---|---|---|---|
@@ -1340,19 +1340,19 @@ and setting `off` for a quiet scrollback must not leave you approving calls you 
 
 | Value | Description |
 |-------|-------------|
-| `off` | Name only: `[tool execute_command]`. No argument reaches your terminal |
-| `summary` | Name plus the one argument that identifies the call: ``[tool execute_command(`cargo test`)]`` (default) |
+| `off` | Name only: `[tool shell_execute]`. No argument reaches your terminal |
+| `summary` | Name plus the one argument that identifies the call: ``[tool shell_execute(`cargo test`)]`` (default) |
 | `full` | Every argument, as an indented block under the name |
 
 Default: `summary`
 
 `full` writes each parameter on its own line. A value that fits on a line follows its key; one that
-does not gets an indented block under a bare `key:`, so a multi-line `edit_file` argument stays
+does not gets an indented block under a bare `key:`, so a multi-line `file_edit` argument stays
 readable instead of collapsing into escaped newlines. Nesting is carried by indentation, with `-`
 for array elements:
 
 ```
-[tool edit_file]
+[tool file_edit]
   path: src/render.rs
   old_string:
     let first_line = thinking.lines().next().unwrap_or("");
@@ -1361,8 +1361,8 @@ for array elements:
 [tool agent_spawn]
   prompt: Audit the scheduler for missed-occurrence bugs
   tools:
-    - read_file
-    - search_contents
+    - file_read
+    - file_search
 ```
 
 Consecutive calls are separated by a blank line under `full`, since each one is a block and running
@@ -1401,7 +1401,7 @@ When you need the exact JSON a tool was called with, `meka session export` has i
 unflattened.
 
 **`full` puts every argument on screen, secrets included.** `summary` shows only the one argument
-that identifies a call (`write_file`'s path, `fetch_url`'s URL), so a request header carrying a token
+that identifies a call (`file_write`'s path, `web_fetch`'s URL), so a request header carrying a token
 or a file body carrying a key stayed off screen. `full` shows all of them, and replayed history
 reprints them on every `/history` and every resume. meka never puts its own credentials into tool
 arguments, so what appears is what the model itself passed, but that is worth knowing before turning

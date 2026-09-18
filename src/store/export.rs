@@ -4,9 +4,10 @@
 use super::*;
 
 /// On-wire format version for `meka session export --format json`. Bumped when the envelope shape
-/// or the underlying [`crate::conversation::Event`] serialization changes incompatibly; `meka
-/// session import` rejects versions it doesn't recognize.
-pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 3;
+/// or the underlying [`crate::conversation::Event`] serialization changes incompatibly. An older
+/// archive the migration module knows is brought forward before it is read; `meka session import`
+/// refuses any other version.
+pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 4;
 /// Decode an archive, refusing one written for another `format_version` before its shape is read.
 ///
 /// The version is read on its own first, because a release that changed the shape also changed
@@ -22,19 +23,34 @@ pub(crate) fn parse_session_export(raw: &[u8]) -> crate::error::Result<SessionEx
         MekaError::Usage(format!("invalid session export JSON: {error}"))
     };
     let envelope: Envelope = serde_json::from_slice(raw).map_err(invalid)?;
-    check_format_version(envelope.format_version)?;
-    serde_json::from_slice(raw).map_err(invalid)
+    if envelope.format_version == SESSION_EXPORT_FORMAT_VERSION {
+        return serde_json::from_slice(raw).map_err(invalid);
+    }
+    // Only the migration module knows what an older meka wrote, so this door hands the document
+    // over and reads the answer: brought forward, or not a version it knows.
+    let mut document: serde_json::Value = serde_json::from_slice(raw).map_err(invalid)?;
+    if !super::migrations::bring_archive_forward(
+        &mut document,
+        u64::from(SESSION_EXPORT_FORMAT_VERSION),
+    ) {
+        return Err(unsupported_format_version(envelope.format_version));
+    }
+    serde_json::from_value(document).map_err(invalid)
 }
 
-/// Whether this build reads archives of `version`.
+/// Whether this build reads archives of `version` as they are.
 fn check_format_version(version: u32) -> crate::error::Result<()> {
     if version != SESSION_EXPORT_FORMAT_VERSION {
-        return Err(MekaError::Usage(format!(
-            "unsupported session export format_version {version} (this build supports \
-             {SESSION_EXPORT_FORMAT_VERSION})"
-        )));
+        return Err(unsupported_format_version(version));
     }
     Ok(())
+}
+
+fn unsupported_format_version(version: u32) -> MekaError {
+    MekaError::Usage(format!(
+        "unsupported session export format_version {version} (this build supports \
+         {SESSION_EXPORT_FORMAT_VERSION})"
+    ))
 }
 
 /// Sessions one `POST /v1/sessions/import` will accept.

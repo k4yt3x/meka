@@ -77,7 +77,7 @@ impl SharedRoots {
 /// path: `cwd` first, then each additional root, with anything already covered by another root
 /// dropped.
 ///
-/// Only correct for a walker that descends, which today means `search_contents`. A tool that
+/// Only correct for a walker that descends, which today means `file_search`. A tool that
 /// anchors a pattern at each root instead wants [`glob_roots`]; dropping a contained root would
 /// drop the files under it.
 ///
@@ -128,8 +128,8 @@ fn retain_broadest(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
 /// the same thing (this folder is part of my workspace) and get the same treatment, searchable and
 /// writable, so there is no second list to keep in step with this one.
 ///
-/// **This is the one definition of the boundary.** The in-process fence on `write_file` /
-/// `edit_file` / `scratchpad_save_file` and every sandbox dialect (Landlock, Bubblewrap, Seatbelt,
+/// **This is the one definition of the boundary.** The in-process fence on `file_write` /
+/// `file_edit` / `scratchpad_save_file` and every sandbox dialect (Landlock, Bubblewrap, Seatbelt,
 /// the Windows restricted token) derive their allow-list from here and nowhere else, so the file
 /// tools and the shell cannot disagree about where a write may land.
 ///
@@ -265,9 +265,9 @@ fn private_directories_among(candidates: impl IntoIterator<Item = PathBuf>) -> V
 /// The refusal for reading `target` at `permission`, when it lies inside meka's own directories.
 ///
 /// The sandbox hides these from a confined shell and the write fence refuses them at every level
-/// below `unrestricted`; the in-process read tools had no such door, so `read_file` and
-/// `search_contents` at `read` returned `config.toml` and byte runs out of `meka.db`, and
-/// `fetch_url` at the same level could carry them out. Same rule and the same exception:
+/// below `unrestricted`; the in-process read tools had no such door, so `file_read` and
+/// `file_search` at `read` returned `config.toml` and byte runs out of `meka.db`, and
+/// `web_fetch` at the same level could carry them out. Same rule and the same exception:
 /// `unrestricted` reads them as it writes them. `target` must be canonical, or a symlink into the
 /// store walks past it.
 pub(crate) fn private_read_refusal(
@@ -628,7 +628,7 @@ pub(crate) fn is_within_roots(path: &std::path::Path, roots: &[PathBuf]) -> bool
 
 /// Normalize `.` and `..` textually, without consulting the filesystem.
 ///
-/// The filesystem cannot help for the case this exists for: a `write_file` naming a path that does
+/// The filesystem cannot help for the case this exists for: a `file_write` naming a path that does
 /// not exist yet, which is most of them. `canonicalize` fails on a missing path, so the only way to
 /// judge `<root>/../../etc/passwd` *before* creating anything is to resolve the components as
 /// text. It is not a substitute for canonicalization, which still runs afterwards to catch the
@@ -742,7 +742,7 @@ impl WriteScope {
             // Only the level that disclaims a boundary is exempt. Written as an allow-list rather
             // than `Workspace => Some(..), _ => None`, because that catch-all fails open: `none`
             // and `read` normally never reach a write door, but `[tools.tool_permissions]`
-            // overrides a tool's required level with no floor, so `write_file = "read"` dispatches
+            // overrides a tool's required level with no floor, so `file_write = "read"` dispatches
             // the tool at `read` and the fence must still confine it.
             //
             // At `none` and `read` this yields the workspace roots rather than nothing, which is a
@@ -752,13 +752,13 @@ impl WriteScope {
             // - `Confinement::resolve` answers "what may a command meka did not write do", and the
             //   honest answer at `read` is nothing.
             // - This answers "where may a tool the operator deliberately lowered write", and a
-            //   `write_file = "read"` override is a statement that the tool should be usable at
+            //   `file_write = "read"` override is a statement that the tool should be usable at
             //   that level. Refusing it outright would make the override a no-op with no
             //   diagnostic; confining it to the workspace roots is the narrowest reading that still
             //   honors what was configured.
             //
             // So the override can only ever narrow *reach*: it never escapes the roots, and it
-            // cannot touch `execute_command`, which stays closed at `read` regardless.
+            // cannot touch `shell_execute`, which stays closed at `read` regardless.
             crate::permission::Permission::Unrestricted => None,
             _ => Some(writable_roots(cwd, &self.roots)),
         }
@@ -889,7 +889,7 @@ impl WriteScope {
 /// first, then each additional root, with only *exact* repeats dropped.
 ///
 /// The counterpart to [`search_roots`] for a tool that builds one rooted pattern per root rather
-/// than descending from it. Containment must not drop anything here: `find_files` turns each root
+/// than descending from it. Containment must not drop anything here: `file_find` turns each root
 /// into `<root>/<pattern>`, and a glob's `*` does not cross `/`, so a workspace of `/work` plus
 /// `cwd = /work/main` would answer `*.md` from `/work/*.md` alone and miss `/work/main/README.md`
 /// entirely. That is the exact "the agent says a file you can see doesn't exist" failure multi-root
@@ -1626,7 +1626,7 @@ mod tests {
 
     /// A `..` that climbs out of the workspace is refused even though the path is never created.
     ///
-    /// `admit` is reached with a path that does not exist yet on every `write_file` to a new file,
+    /// `admit` is reached with a path that does not exist yet on every `file_write` to a new file,
     /// so `canonicalize` cannot answer and the only defense is resolving the components as text
     /// first. Without that, `starts_with` is component-wise and answers yes for
     /// `<root>/../../etc/passwd`, because the literal path really does begin with `<root>`, so

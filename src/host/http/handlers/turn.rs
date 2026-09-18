@@ -580,7 +580,7 @@ async fn commit_idempotency(
 ///
 /// Every failure is a 422: these are all malformed input, not server faults.
 ///
-/// Off the runtime, for the reason `read_file` and `fetch_url` document at their own call sites:
+/// Off the runtime, for the reason `file_read` and `web_fetch` document at their own call sites:
 /// the pipeline base64-decodes and then decodes each image to verify it, which is tens of
 /// milliseconds of pure CPU on a multi-megapixel attachment, and on the runtime it blocks every
 /// other task on that worker. One client posting a screenshot must not stall an unrelated
@@ -1701,13 +1701,13 @@ mod tests {
         let recorder: Recorder = vec![
             FrontendEvent::ToolCallStarted {
                 id: "tu_1".into(),
-                name: "read_file".into(),
+                name: "file_read".into(),
                 input: input.clone(),
                 display_summary: Some("src/main.rs".into()),
             },
             FrontendEvent::ToolCallCompleted {
                 id: "tu_1".into(),
-                name: "read_file".into(),
+                name: "file_read".into(),
                 is_error: false,
                 content: vec![ToolResultContent::Text {
                     text: "fn main() {}".into(),
@@ -1725,7 +1725,7 @@ mod tests {
         assert_eq!(response.tool_calls.len(), 1);
         let call = &response.tool_calls[0];
         assert_eq!(call.id, "tu_1");
-        assert_eq!(call.name, "read_file");
+        assert_eq!(call.name, "file_read");
         assert_eq!(call.input, input);
         assert!(!call.is_error);
         match &call.content[0] {

@@ -237,7 +237,7 @@ mod tests {
         let task = BackgroundTask {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: uuid::Uuid::new_v4(),
-            tool: "execute_command".to_string(),
+            tool: "shell_execute".to_string(),
             label: "cargo test --all".to_string(),
             status: TaskStatus::Completed,
             outcome: Some("test result: ok".to_string()),
@@ -329,7 +329,7 @@ mod tests {
         let task = BackgroundTask {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: session,
-            tool: "execute_command".to_string(),
+            tool: "shell_execute".to_string(),
             label: label.to_string(),
             status: TaskStatus::Running,
             outcome: None,

@@ -767,7 +767,7 @@ pub(crate) enum McpAction {
         #[arg(long = "disable-tool", value_name = "TOOL")]
         disable_tool: Vec<String>,
 
-        /// Raw tool name to eager-load (repeatable; skips `load_tool`)
+        /// Raw tool name to eager-load (repeatable; skips `tool_load`)
         #[arg(long = "eager-load-tool", value_name = "TOOL")]
         eager_load_tool: Vec<String>,
 

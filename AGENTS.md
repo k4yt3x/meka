@@ -392,29 +392,32 @@ baseline object its new name in `BASELINE_OBJECTS` beside the old one.
 Names are read by the model every turn and `tool_catalog` is sorted, so a name is both label and
 sort key.
 
-- **A family shares a noun prefix**: `<subsystem>_<verb>`, which is what makes the family arrive as
-  one sorted block. It names what the tools act on, which is not always the module they live in.
-  Where a subsystem manages more than one kind of object, qualify before the verb and keep the object
-  first. A verb that merely mentions a noun does not make it a managed object.
-- **A standalone tool reads as a verb phrase**: `<verb>_<object>`. A subsystem with one operation may
-  use the bare noun.
-
-Two exceptions. **An industry-standard name beats internal consistency**: models reach for
-`read_file`, `write_file`, `edit_file` and `execute_command` zero-shot, and renaming them trades
-accuracy for tidiness. And **`load_tool` stays verb-first** despite acting on meka's own registry,
-because the name appears verbatim in the `[Tool discovery]` preamble the model reads every turn.
-`scratchpad_load_file` and `scratchpad_save_file` carry a trailing object because `load` and `save`
-alone would read as acting on the scratchpad itself; accepted as names, not as a pattern.
+- **Every built-in is `<noun>_<verb>`.** The noun is the class: the config section or docs page that
+  governs the tool when one exists (`shell`, `web`, `file`), else the object the tool acts on
+  (`task`, `image`, `agent`), singular, qualified when a subsystem manages more than one kind of
+  object (`mcp_resource`, `mcp_prompt`). It is not always the module the tool lives in. The verb is
+  the operation, one per tool: arguments shape an operation and never select one, so a tool whose
+  operation depends on which arguments are present is a family that wants splitting, which is how
+  `todo` became `todo_write`, `todo_edit` and `todo_read`.
+- **A trailing object only where the verb alone would read as acting on the noun itself**:
+  `scratchpad_load_file` and `scratchpad_save_file`, because `load` and `save` alone would read as
+  acting on the scratchpad. Accepted as names, not as a pattern.
 
 Renaming a tool is breaking: names appear in config lists, user-authored skills, and the history of
 every existing session. Prefer getting it right at introduction. When renaming anyway, add a
 `**Breaking:**` changelog line and update `BUILTIN_TOOL_NAMES` (sorted), `MCP_META_TOOL_NAMES`, and
 `builtin_primary_param` in `src/tools.rs`. A tool is shown by its real name on every surface, the
-way MCP tools are; there is no display alias to update. Two silent traps: a blanket
-find-and-replace rewrites MCP tool names containing a built-in as a substring, so anchor every
-substitution to a name boundary; and reversing word order defeats the edit-distance hint
-(`did_you_mean_hint`, behind `builtin_name_hint` and `near_miss_hint`), so nothing points a resumed
-model at the new name.
+way MCP tools are; there is no display alias to update. A rename also reaches stored data: the
+calls in every session's history, the `denied_tools` of every sub-agent spec, the tool on every
+background task row, and every archive an older build wrote. Each takes a ledger step and an entry
+in the migration module's archive conversion (`bring_archive_forward`), the one place that may know
+an older name; the active tool set is recovered by scanning history for `tool_load` calls by name,
+so that step is what keeps a resumed session's loaded tools. One
+silent trap: a blanket find-and-replace rewrites MCP tool names containing a built-in as a
+substring, so anchor every substitution to a name boundary. The edit-distance hint
+(`did_you_mean_hint`, behind `builtin_name_hint` and `near_miss_hint`) catches a typo, a dropped
+`mcp__server__` prefix, a bare family noun and reordered words; a rename that changes the words
+themselves leaves a resumed model with only the preamble to point it at the new name.
 
 Designing a tool: separate tight tools beat one polymorphic tool with an `action` enum. A family is
 fine when each member's parameters are distinct and self-describing; a single tool whose parameters

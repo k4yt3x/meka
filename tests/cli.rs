@@ -658,7 +658,7 @@ fn mcp_add_tool_filter_and_permission_flags_round_trip() {
         "disabled_tools missing:\n{contents}"
     );
     // The one flag of the four that reached the parser and not the file: accepted, reported as a
-    // success, and dropped, so every session paid the `load_tool` round trip it was meant to skip.
+    // success, and dropped, so every session paid the `tool_load` round trip it was meant to skip.
     assert!(
         contents.contains("eager_load_tools"),
         "eager_load_tools missing:\n{contents}"
@@ -1283,9 +1283,9 @@ fn run_scripted_from(
 
 /// A scripted turn that writes `marker.txt` with a *relative* path, so where the file lands is
 /// where the session's working directory actually was. More direct than reading the rendering:
-/// `write_file` resolves against the same `SharedCwd` every other tool does.
+/// `file_write` resolves against the same `SharedCwd` every other tool does.
 const WRITE_A_MARKER: &str = r#"[
-  [{"type":"tool_use_start","id":"call-1","name":"write_file"},
+  [{"type":"tool_use_start","id":"call-1","name":"file_write"},
    {"type":"tool_use_end","input":{"path":"marker.txt","content":"here"}},
    {"type":"message_end","stop_reason":"tool_use"}],
   [{"type":"text","text":"done"},{"type":"message_end","stop_reason":"end_turn"}]
@@ -1295,7 +1295,7 @@ const WRITE_A_MARKER: &str = r#"[
 /// said before calling the tool and after must read as two paragraphs, not one run-on sentence.
 const NARRATED_MARKER: &str = r#"[
   [{"type":"text","text":"Writing the marker."},
-   {"type":"tool_use_start","id":"call-1","name":"write_file"},
+   {"type":"tool_use_start","id":"call-1","name":"file_write"},
    {"type":"tool_use_end","input":{"path":"marker.txt","content":"here"}},
    {"type":"message_end","stop_reason":"tool_use"}],
   [{"type":"text","text":"done"},{"type":"message_end","stop_reason":"end_turn"}]
@@ -1333,7 +1333,7 @@ fn a_json_one_shot_prints_one_object_and_nothing_else() {
     assert_eq!(
         report["tool_calls"],
         serde_json::json!([{
-            "name": "write_file",
+            "name": "file_write",
             "input": {"path": "marker.txt", "content": "here"},
             "is_error": false,
         }])
@@ -1388,7 +1388,7 @@ fn a_one_shot_with_approvals_on_refuses_each_gated_tool_and_says_so() {
                 notices.iter().any(|notice| {
                     notice["level"] == "warn"
                         && notice["text"].as_str().is_some_and(|text| {
-                            text.contains("'write_file'") && text.contains("refused without asking")
+                            text.contains("'file_write'") && text.contains("refused without asking")
                         })
                 }),
                 "the refusal names the tool in the report: {report}"
@@ -1396,7 +1396,7 @@ fn a_one_shot_with_approvals_on_refuses_each_gated_tool_and_says_so() {
             assert_eq!(report["tool_calls"][0]["is_error"], true, "{report}");
         } else {
             assert!(
-                stderr.contains("'write_file'") && stderr.contains("refused without asking"),
+                stderr.contains("'file_write'") && stderr.contains("refused without asking"),
                 "the refusal names the tool on stderr: {stderr}"
             );
         }
@@ -1436,7 +1436,7 @@ fn a_json_one_shot_reports_the_turn_s_notices() {
     );
 }
 
-/// A config that lets `write_file` run, since the marker above is the whole measurement.
+/// A config that lets `file_write` run, since the marker above is the whole measurement.
 fn write_capable_config(install: &Install) {
     install.write_config(
         "default_profile = \"mock\"\n\n[accounts.mock]\nbackend = \"anthropic-messages\"\n\n\
@@ -2056,7 +2056,7 @@ fn a_failed_oneshot_turn_still_waits_for_its_detached_work() {
         &install,
         install.root(),
         r#"[
-          [{"type":"tool_use_start","id":"call-1","name":"execute_command"},
+          [{"type":"tool_use_start","id":"call-1","name":"shell_execute"},
            {"type":"tool_use_end","input":{"command":"sleep 1; echo finished-late","background":true}},
            {"type":"message_end","stop_reason":"tool_use"}],
           [{"type":"fail","message":"the provider fell over"}]
@@ -2105,10 +2105,10 @@ fn a_sub_agent_bounded_by_writable_roots_writes_only_there() {
           [{"type":"tool_use_start","id":"call-1","name":"agent_spawn"},
            {"type":"tool_use_end","input":{"prompt":"write both","writable_roots":["sub"]}},
            {"type":"message_end","stop_reason":"tool_use"}],
-          [{"type":"tool_use_start","id":"call-2","name":"write_file"},
+          [{"type":"tool_use_start","id":"call-2","name":"file_write"},
            {"type":"tool_use_end","input":{"path":"inside.txt","content":"in"}},
            {"type":"message_end","stop_reason":"tool_use"}],
-          [{"type":"tool_use_start","id":"call-3","name":"write_file"},
+          [{"type":"tool_use_start","id":"call-3","name":"file_write"},
            {"type":"tool_use_end","input":{"path":"../outside.txt","content":"out"}},
            {"type":"message_end","stop_reason":"tool_use"}],
           [{"type":"text","text":"worker done"},{"type":"message_end","stop_reason":"end_turn"}],
@@ -2342,7 +2342,7 @@ fn a_oneshot_run_carries_an_outcome_that_was_waiting() {
         .execute(
             "INSERT INTO background_tasks \
              (id, session_id, tool, label, status, outcome, started_at, finished_at) \
-             VALUES (?1, ?2, 'execute_command', 'sleep 900', 'canceled', NULL, ?3, ?3)",
+             VALUES (?1, ?2, 'shell_execute', 'sleep 900', 'canceled', NULL, ?3, ?3)",
             rusqlite::params![uuid::Uuid::new_v4().to_string(), &id, now],
         )
         .expect("seed the canceled task");
@@ -3219,7 +3219,7 @@ fn tool_list_prints_json_with_the_source_and_status_of_each_tool() {
     std::fs::create_dir_all(&config_dir).expect("config dir");
     std::fs::write(
         config_dir.join("config.toml"),
-        "[tools]\ndisabled_tools = [\"agent_spawn\"]\n\n[tools.tool_permissions]\nread_file = \
+        "[tools]\ndisabled_tools = [\"agent_spawn\"]\n\n[tools.tool_permissions]\nfile_read = \
          \"none\"\n\n[shell]\nsandbox = false\n",
     )
     .expect("write config.toml");
@@ -3234,11 +3234,11 @@ fn tool_list_prints_json_with_the_source_and_status_of_each_tool() {
             .find(|tool| tool["name"] == name)
             .unwrap_or_else(|| panic!("{name} must be listed: {listed}"))
     };
-    let read_file = find("read_file");
-    assert_eq!(read_file["required_permission"], "none");
-    assert_eq!(read_file["permission_source"], "override");
-    assert_eq!(read_file["enabled"], true);
-    let execute = find("execute_command");
+    let file_read = find("file_read");
+    assert_eq!(file_read["required_permission"], "none");
+    assert_eq!(file_read["permission_source"], "override");
+    assert_eq!(file_read["enabled"], true);
+    let execute = find("shell_execute");
     assert_eq!(execute["permission_source"], "builtin");
     assert_eq!(
         execute["required_permission"], "unrestricted",

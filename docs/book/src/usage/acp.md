@@ -45,17 +45,17 @@ These are returned in `InitializeResponse.agentCapabilities`:
 
 The client advertises these in `InitializeRequest.clientCapabilities`; meka stashes them and lets the built-in tools route accordingly:
 
-- **`fs.readTextFile: true`**: `read_file` issues `fs/read_text_file { sessionId, path, line?, limit? }` so the client serves the *in-buffer* view of the file. Image and regex `read_file` modes have no `fs/*` analog and stay local.
-- **`fs.writeTextFile: true`**: `write_file` and `edit_file`'s apply step issue `fs/write_text_file { sessionId, path, content }`. meka still attaches diff metadata to the `tool_call_update` so clients with an apply-diff UI can render it.
+- **`fs.readTextFile: true`**: `file_read` issues `fs/read_text_file { sessionId, path, line?, limit? }` so the client serves the *in-buffer* view of the file. Image and regex `file_read` modes have no `fs/*` analog and stay local.
+- **`fs.writeTextFile: true`**: `file_write` and `file_edit`'s apply step issue `fs/write_text_file { sessionId, path, content }`. meka still attaches diff metadata to the `tool_call_update` so clients with an apply-diff UI can render it.
 - **`terminal`**: not consumed. It means "I implement `terminal/*`", i.e. the agent may run commands *in the client*, which meka never does. See [Shell commands stay inside meka](#shell-commands-stay-inside-meka).
-- **`_meta.terminal_output: true`**: the client renders agent-owned terminals, so `execute_command` output is streamed into a real terminal instead of a code block. A *rendering* choice only: meka still spawns and sandboxes the process either way. Advertised by Zed; independent of the `terminal` capability above.
+- **`_meta.terminal_output: true`**: the client renders agent-owned terminals, so `shell_execute` output is streamed into a real terminal instead of a code block. A *rendering* choice only: meka still spawns and sandboxes the process either way. Advertised by Zed; independent of the `terminal` capability above.
 - **`elicitation.form` / `elicitation.url`**: when an MCP server asks the user for input mid-tool-call, meka issues `elicitation/create` so the prompt renders in the editor. The two are advertised independently and checked separately: a server asking for a form when only `url` is advertised is declined rather than sent. Without the capability meka declines every elicitation, which is what it did unconditionally before. Elicitations raised inside a sub-agent forward to the parent session, like permission prompts.
 
 If the client omits a capability, the matching tool falls back to local syscalls; the user-visible behavior is the same as `meka` in the REPL.
 
 ## Shell commands stay inside meka
 
-`execute_command` never runs in the client's terminal, whatever the client advertises and whatever the permission level. meka spawns the process itself so everything it wraps a command in keeps applying: the sandbox that `read` and `workspace` depend on (Landlock / bwrap / sandbox-exec / restricted token), the environment scrub that keeps API keys out of the child, the per-session cwd from `/cd`, the timeout, and the process-group kill that reaches backgrounded grandchildren. The client's `terminal/*` offers none of that.
+`shell_execute` never runs in the client's terminal, whatever the client advertises and whatever the permission level. meka spawns the process itself so everything it wraps a command in keeps applying: the sandbox that `read` and `workspace` depend on (Landlock / bwrap / sandbox-exec / restricted token), the environment scrub that keeps API keys out of the child, the per-session cwd from `/cd`, the timeout, and the process-group kill that reaches backgrounded grandchildren. The client's `terminal/*` offers none of that.
 
 meka used to delegate in any level other than `read`, which made every sandboxed level a bypass: meka would refuse to run at all when no sandbox backend was available, then hand the same command to an unsandboxed editor terminal. Delegation is gone rather than narrowed, so `workspace` keeps its boundary here exactly as it does in the REPL.
 
@@ -80,7 +80,7 @@ Editors differ in which paths they will serve: Zed answers only for the project 
 - **`ResourceNotFound` (`-32002`)** means the client will not serve this path, so it holds no buffer for it. meka reads or writes the file locally, and a *write* says so in the tool result: the change still appears in that tool call's diff, but not in the editor's buffer or undo history. This is what keeps ACP as capable as the terminal: the agent can read and edit its own skills, prompts, and configuration even though they live outside the project.
 - **Any other error** means the client may own the file and hold unsaved changes for it, so the tool call fails instead of routing around the client. Reading on-disk bytes would hand the model a stale view of a file the user is editing, and writing them back would overwrite unsaved work.
 
-The route is chosen once per tool call by the read, not per request: `edit_file` and `write_file` write back through whichever filesystem they read from, so a diff taken from the editor's buffer isn't applied to disk while the buffer keeps the old content. The read is also the more reliable signal: Zed reports an out-of-project path as `ResourceNotFound` on `fs/read_text_file` but as a generic error on `fs/write_text_file`, so a route chosen from the write's own error would never recognize it.
+The route is chosen once per tool call by the read, not per request: `file_edit` and `file_write` write back through whichever filesystem they read from, so a diff taken from the editor's buffer isn't applied to disk while the buffer keeps the old content. The read is also the more reliable signal: Zed reports an out-of-project path as `ResourceNotFound` on `fs/read_text_file` but as a generic error on `fs/write_text_file`, so a route chosen from the write's own error would never recognize it.
 
 One case can't honor that: a client advertising `fs.readTextFile` but not `fs.writeTextFile` reads for meka and expects meka to do the write, so the edit lands on disk while the client still holds a buffer for the file. The tool result discloses that too, with its own note.
 
@@ -101,7 +101,7 @@ What an `InternalError`'s `data` carries follows the same policy the HTTP API ap
 - **`session/list { cwd?, cursor? }`**: paginated index. Filtered to the requested cwd when present, compared in the canonical spelling every session records; sub-agent sessions are always hidden. `nextCursor` is opaque; round-trip it back to keep paging.
 - **`session/resume { sessionId, cwd, mcpServers }`**: adopts the session id without replaying. Use this when the client already has the history rendered. Same cwd-update behavior as `session/load`, including that a refused resume writes nothing. A sub-agent's id is refused on the same terms as `session/load`.
 - **`session/fork { sessionId, cwd, additionalDirectories, mcpServers }`**: copies the session's conversation into a new persisted session, adopts the copy as active, and returns its id. The source is left open and untouched. See [Forking](#forking).
-- **`session/close { sessionId }`**: cancels any in-flight prompt, waits for that turn to finish (the cancel does not cut short a `read_file` or an `fs/*` request already in progress), releases the on-disk session lock, and removes the entry from the map.
+- **`session/close { sessionId }`**: cancels any in-flight prompt, waits for that turn to finish (the cancel does not cut short a `file_read` or an `fs/*` request already in progress), releases the on-disk session lock, and removes the entry from the map.
 - **`session/cancel { sessionId }`**: interrupts the active `session/prompt`. The response carries `stopReason: "cancelled"`. A cancel sent straight after a prompt still stops that prompt, even if it arrives before the turn has started: meka latches the signal and applies it as the turn begins. The latch is scoped to a prompt that is already on its way, so a cancel with nothing to stop is discarded rather than saved. Interrupting a turn, canceling twice, or canceling while idle all leave the next prompt you send to run normally.
 - **`session/set_mode { sessionId, modeId }`**: flips the agent's `Permission` cell. A level outside `[permissions].enabled` is refused with `InvalidParams`. On success, meka emits `session/update: current_mode_update`. The flip is atomic and applies to the *next* tool call within an in-flight turn; no need to wait for the turn to finish.
 - **`session/set_config_option { sessionId, configId, value }`**: sets one of the three entries in `configOptions`. Returns the full list with its new values. See [Session config options](#session-config-options).
@@ -133,17 +133,17 @@ A `session/prompt` carries a `prompt` array of `ContentBlock`s. meka accepts:
 
 `audio` blocks (and `image` when `vision = false`) produce `InvalidParams`.
 
-Images travel in the other direction too: when a tool looks at one (`read_file` on an image file,
-`render_image`, `fetch_url` on an image URL), the picture is forwarded on that tool call as an
+Images travel in the other direction too: when a tool looks at one (`file_read` on an image file,
+`image_render`, `web_fetch` on an image URL), the picture is forwarded on that tool call as an
 `image` content block rather than a placeholder, so the client renders what the model was shown.
 
 While the turn runs, meka streams `session/update` notifications:
 
 - `agent_message_chunk` for each piece of assistant text.
 - `agent_thought_chunk` for thinking blocks (Claude OAuth / extended-thinking models).
-- `tool_call` when a tool starts, with `kind`, `status: "in_progress"`, an absolute `locations` array (relative paths resolved against the session cwd, with the start line for `read_file`), the raw input, and a human-readable `title`. The title is the tool's name followed by its primary argument, the same words the REPL's `[tool ...]` indicator uses, so editors show what's running rather than the bare tool name: `execute_command <command>`, `read_file <path>` / `edit_file <path>` / `write_file <path>`, `fetch_url <url>`, and the same under an MCP tool's own name.
-- `tool_call_update` when a tool finishes, with the final `status` (`completed` / `failed`), a `content` array, and `raw_output` (the structured tool result). `execute_command` output is wrapped in a fenced `console` code block so editors render it monospaced; `edit_file` and `write_file` populate diff content blocks so clients can render the apply-diff UI. (Large outputs offloaded to the scratchpad show the scratchpad reference rather than the full payload.)
-- `plan` whenever the agent's `todo` tool updates the task list, so clients with a plan panel (e.g. Zed) render the live to-do list. meka's `canceled` todo status maps to `completed`.
+- `tool_call` when a tool starts, with `kind`, `status: "in_progress"`, an absolute `locations` array (relative paths resolved against the session cwd, with the start line for `file_read`), the raw input, and a human-readable `title`. The title is the tool's name followed by its primary argument, the same words the REPL's `[tool ...]` indicator uses, so editors show what's running rather than the bare tool name: `shell_execute <command>`, `file_read <path>` / `file_edit <path>` / `file_write <path>`, `web_fetch <url>`, and the same under an MCP tool's own name.
+- `tool_call_update` when a tool finishes, with the final `status` (`completed` / `failed`), a `content` array, and `raw_output` (the structured tool result). `shell_execute` output is wrapped in a fenced `console` code block so editors render it monospaced; `file_edit` and `file_write` populate diff content blocks so clients can render the apply-diff UI. (Large outputs offloaded to the scratchpad show the scratchpad reference rather than the full payload.)
+- `plan` whenever a `todo_write` or `todo_edit` call updates the task list, so clients with a plan panel (e.g. Zed) render the live to-do list. meka's `canceled` todo status maps to `completed`.
 - `session_info_update` once per session, carrying the title (the first user message's words, cut to 80 characters) so a freshly created or loaded tab gets a label without a `session/list` call.
 - A `[meka]`-prefixed `agent_message_chunk` for an advisory meka itself raised during the turn (a lost write, a compaction, an MCP elicitation it declined on your behalf), since ACP has no primitive for one. A warning carries `[meka warn]` instead, so a client can style the two apart. A scheduled job's turn that failed or was interrupted is reported the same way, since it has no `session/prompt` response to carry its outcome.
 - A `user_message_chunk` carrying a scheduled job's prompt, pushed by meka itself before the turn it fires runs, so the transcript shows what triggered it.
@@ -257,13 +257,13 @@ An editor whose workspace holds several folders (Zed's Add Folder to Project) se
 
 What the extra roots do and don't change:
 
-- **Search sweeps all of them.** `find_files` and `search_contents` walk every root when you don't pass an explicit `path`. The 60-second walk budget is shared across the whole call, not granted per root, so a four-folder workspace doesn't get a four-minute ceiling. Passing `path` searches exactly that tree, as before.
-- **A truncated `search_contents` says which roots it skipped.** Roots are walked in order starting from `cwd`, so a busy `cwd` can fill the 100-match cap before later roots are reached. When that happens the output names how many roots went unsearched, rather than leaving their absence to read as "nothing there". Pass `path` to search one directly, or `scratchpad` to lift the cap. `find_files` is unaffected: its cap bounds only what it prints, so it still counts matches across every root.
+- **Search sweeps all of them.** `file_find` and `file_search` walk every root when you don't pass an explicit `path`. The 60-second walk budget is shared across the whole call, not granted per root, so a four-folder workspace doesn't get a four-minute ceiling. Passing `path` searches exactly that tree, as before.
+- **A truncated `file_search` says which roots it skipped.** Roots are walked in order starting from `cwd`, so a busy `cwd` can fill the 100-match cap before later roots are reached. When that happens the output names how many roots went unsearched, rather than leaving their absence to read as "nothing there". Pass `path` to search one directly, or `scratchpad` to lift the cap. `file_find` is unaffected: its cap bounds only what it prints, so it still counts matches across every root.
 - **Overlapping roots are collapsed.** A root nested inside another (or a repeat of `cwd`) is dropped, so its tree isn't walked twice and its files aren't reported twice. Symlinked duplicates aren't detected.
 - **The model is told they exist.** Each root is named in the per-turn environment context, alongside the working directory.
 - **Relative paths still resolve against `cwd` only.** This is what the spec requires: `cwd` "remains the base for relative paths". Use an absolute path to reach a file in another root.
-- **The shell still runs in `cwd`.** `execute_command` is unaffected.
-- **A stale root is skipped, not fatal.** A root that no longer exists is passed over so the other roots can still answer; `search_contents` reports "does not exist" only when *no* root existed. Root paths are escaped before they reach the glob engine, so a folder named `2024*` or `notes[1]` matches literally instead of widening the search.
+- **The shell still runs in `cwd`.** `shell_execute` is unaffected.
+- **A stale root is skipped, not fatal.** A root that no longer exists is passed over so the other roots can still answer; `file_search` reports "does not exist" only when *no* root existed. Root paths are escaped before they reach the glob engine, so a folder named `2024*` or `notes[1]` matches literally instead of widening the search.
 
 Every entry must be an absolute path; a relative one is refused with `InvalidParams`.
 
@@ -291,6 +291,6 @@ This method is marked **unstable** in the protocol: it is not part of the spec y
 
 - **Tool-call diff metadata isn't persisted.** A session reopened with `session/load` replays `tool_call_update`s as plain text rather than diffs. The on-disk content is unaffected.
 - **`terminal/*` is never used**: meka owns every process it spawns, so no command runs in the client's terminal. Output streams into the tool call instead, as an agent-owned terminal where the client advertises `_meta.terminal_output` and a `console` block otherwise. See [Shell commands stay inside meka](#shell-commands-stay-inside-meka).
-- **Image and regex `read_file`**: stay local. The `fs/read_text_file` request carries only text, so there's no protocol surface to delegate either case.
+- **Image and regex `file_read`**: stay local. The `fs/read_text_file` request carries only text, so there's no protocol surface to delegate either case.
 - **`audio` prompts**: not supported; `audio` content blocks produce `InvalidParams`.
 - **No client-side model gate for images**: when `vision` is on, meka forwards images to whatever model the profile names; a non-vision model returns a provider error rather than meka refusing up front. Set `vision = false` for text-only endpoints.

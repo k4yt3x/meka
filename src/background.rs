@@ -319,7 +319,7 @@ fn render_outcomes_with_trailer(tasks: &[BackgroundTask], trailer: &str) -> Stri
             "\n---\n\n**{}** ({}) {} after {}.\n",
             task.short_id(),
             // Sanitized like the outcome below. The label is derived from the tool's primary
-            // argument, which for `execute_command` is a shell command line the *model* wrote, so
+            // argument, which for `shell_execute` is a shell command line the *model* wrote, so
             // it is no more trusted than the output it names.
             elide(&crate::text::sanitize_text(&task.label), LABEL_MAX_CHARS),
             task.status.headline(),
@@ -410,7 +410,7 @@ mod tests {
         BackgroundTask {
             id: "7f3a1c22-0000-0000-0000-000000000000".to_string(),
             session_id: Uuid::nil(),
-            tool: "execute_command".to_string(),
+            tool: "shell_execute".to_string(),
             label: "cargo test --all".to_string(),
             status,
             outcome: outcome.map(str::to_string),
@@ -643,10 +643,10 @@ mod tests {
     #[test]
     fn spill_entry_name_is_unique_per_task() {
         assert_ne!(
-            spill_entry_name("7f3a1c22-aaaa", "execute_command"),
-            spill_entry_name("91bd0e44-bbbb", "execute_command"),
+            spill_entry_name("7f3a1c22-aaaa", "shell_execute"),
+            spill_entry_name("91bd0e44-bbbb", "shell_execute"),
         );
-        assert!(spill_entry_name("7f3a1c22-aaaa", "execute_command").contains("7f3a1c22"));
+        assert!(spill_entry_name("7f3a1c22-aaaa", "shell_execute").contains("7f3a1c22"));
     }
 
     #[test]
@@ -758,7 +758,7 @@ mod tests {
         let task = BackgroundTask {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: uuid::Uuid::new_v4(),
-            tool: "execute_command".to_string(),
+            tool: "shell_execute".to_string(),
             label: "sleep 900".to_string(),
             status: TaskStatus::Canceled,
             outcome: None,

@@ -719,7 +719,7 @@ pub(crate) async fn cancel(
 pub(crate) struct BackgroundTaskView {
     pub(crate) id: String,
     pub(crate) session_id: Uuid,
-    /// The tool that was backgrounded, e.g. `execute_command`.
+    /// The tool that was backgrounded, e.g. `shell_execute`.
     pub(crate) tool: String,
     /// Human-readable summary of what was started.
     pub(crate) label: String,

@@ -78,7 +78,7 @@ it again. See [permissions](./permissions.md) for why recording it would be wron
 
 A resume restores the conversation, not the world it ran in. The messages come back verbatim, which means the agent reads its own earlier tool calls and can reasonably assume their effects still hold. Two kinds of state do not survive the process that made them:
 
-- **Which files have been read.** meka tracks reads in memory so `edit_file` can refuse to write over a file the agent has not seen. A new process starts with that record empty, so the first edit to any file asks for a `read_file` first.
+- **Which files have been read.** meka tracks reads in memory so `file_edit` can refuse to write over a file the agent has not seen. A new process starts with that record empty, so the first edit to any file asks for a `file_read` first.
 - **Anything an MCP server was holding.** A loaded database, an authenticated session, a subscription: these belong to the server's process, not to the conversation, and a reconnect drops them. meka has no way to model what a given server keeps open.
 
 Everything else is restated in the per-turn context on every turn regardless (permission level, working directory, todo list, tool catalog), and background tasks that were running deliver an `interrupted` outcome, so none of those can go stale unnoticed.
@@ -245,7 +245,7 @@ Session compacted. Wrote 2 memories: deploy-pipeline-quirks, api-rate-limits.
 
 Note that an *automatic* compaction runs a checkpoint too, unattended, and can write memory without anyone watching.
 
-Compaction preserves scratchpad entries and the todo list, and re-injects environment context so the agent isn't disoriented afterwards. The tool catalog, skill list, and MCP server instructions are restated in full on the next turn, since the messages that carried them may have been summarized away. Tools loaded via `load_tool` stay loaded; the deferred-tool active set is snapshotted into the compaction boundary. If a detail was dropped, the model can `conversation_search` / `conversation_read` the full pre-compaction history, which stays on disk.
+Compaction preserves scratchpad entries and the todo list, and re-injects environment context so the agent isn't disoriented afterwards. The tool catalog, skill list, and MCP server instructions are restated in full on the next turn, since the messages that carried them may have been summarized away. Tools loaded via `tool_load` stay loaded; the deferred-tool active set is snapshotted into the compaction boundary. If a detail was dropped, the model can `conversation_search` / `conversation_read` the full pre-compaction history, which stays on disk.
 
 Internally, compaction does not delete pre-compaction rows from the store. It appends a `compact_boundary` row to the `messages` table; the materialized view is reconstructed from the event log, so the persisted log itself stays append-only. A resume reads that log from its last `compact_boundary` row: nothing before it can reach the view, so opening a session costs the same however long its history is. `conversation_search`, `conversation_read`, `GET /messages`, a rewind and an export still read the whole log.
 
@@ -407,7 +407,7 @@ Pass `--format json` for a structured export instead of rendered Markdown:
 meka session export 550e8400-e29b-41d4-a716-446655440000 --format json
 ```
 
-This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, and scratchpad entries. The archive carries `format_version: 3`, and an import refuses any other version rather than guessing at its shape. Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
+This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, and scratchpad entries. The archive carries `format_version: 4`, and an import refuses any other version rather than guessing at its shape, except a 0.59 archive (`format_version: 3`), which differs only in the tool names 0.60 changed and is converted as it is read. Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
 
 ## Importing a session
 

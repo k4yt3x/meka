@@ -9,9 +9,9 @@ control over the agent's capabilities and prevent accidental modifications.
 | Level | Indicator | What it allows |
 |-------|-----------|----------------|
 | **None** | `[n]` (green) | No tools. The agent can only respond with text. |
-| **Read** | `[r]` (yellow) | Read-only tools: `read_file`, `find_files`, `search_contents`, `fetch_url`, `execute_command` (sandboxed read-only), `todo`, `agent_spawn`, scratchpad tools |
-| **Workspace** | `[w]` (orange) | Every tool, but **writes are confined to the workspace roots**. Reads stay unrestricted. `execute_command` runs in a sandbox that permits writes only under those roots |
-| **Unrestricted** | `[u]` (red) | Every tool, no boundary. `execute_command` runs with no sandbox at all |
+| **Read** | `[r]` (yellow) | Read-only tools: `file_read`, `file_find`, `file_search`, `web_fetch`, `shell_execute` (sandboxed read-only), `todo_*`, `agent_spawn`, scratchpad tools |
+| **Workspace** | `[w]` (orange) | Every tool, but **writes are confined to the workspace roots**. Reads stay unrestricted. `shell_execute` runs in a sandbox that permits writes only under those roots |
+| **Unrestricted** | `[u]` (red) | Every tool, no boundary. `shell_execute` runs with no sandbox at all |
 
 The ladder is ordered by **reach**: each level contains the ones below it, and a tool call that
 needs more than the session's level is refused. With [approvals](#approvals) on, it is put to you
@@ -59,15 +59,15 @@ permission level, which *are* recorded and *do* come back. Writing it to the row
 `meka serve` sharing the data directory could later grant those roots to a job it fires, on the
 authority of a flag that process was never given.
 
-The same set governs both halves, derived once so they cannot disagree: the file tools check it
-before writing, and the shell sandbox is built from it. A refusal from `write_file` names the roots
+The same set governs both halves, derived once so they cannot disagree: the `file_*` tools check it
+before writing, and the shell sandbox is built from it. A refusal from `file_write` names the roots
 so the agent can retry somewhere valid.
 
 A sub-agent can be handed a narrower boundary than its parent's: [`agent_spawn`'s
 `writable_roots`](../tools/overview.md#agent_spawn) names the directories it may write under, each
 of which must lie inside the parent's own.
 
-If `[shell].sandbox = false`, `execute_command` is refused at `workspace` rather than run
+If `[shell].sandbox = false`, `shell_execute` is refused at `workspace` rather than run
 unconfined. Nothing else would be holding the boundary, and half a boundary reported as a whole one
 is worse than an error that says so. Use `unrestricted` for those turns.
 
@@ -87,7 +87,7 @@ Four limits, stated plainly because none of them is visible from the inside:
   config keys, not by this one.
 - **Reads are never confined**, at any level. The boundary is "this cannot change things outside
   the workspace", not "this cannot see them".
-- **The in-process fence resolves paths, it does not pin them.** `write_file` and `edit_file`
+- **The in-process fence resolves paths, it does not pin them.** `file_write` and `file_edit`
   resolve every existing component of a target before judging it, so a symlink already planted on
   the path is caught. What is left open is the race: a directory checked and then swapped for a
   symlink before the write lands. Closing it means holding a directory descriptor through the write
@@ -112,8 +112,8 @@ meka's own directories are hidden too: the config directory, the data directory 
 `meka.db` and every account credential, and the command-output captures. Bubblewrap masks them
 after every workspace bind and `sandbox-exec` denies them last, so a confined command cannot read
 the credential store even from a workspace root at `$HOME` that contains it, and the in-process
-`write_file` and `edit_file` refuse a target under them whatever roots the session holds. The
-in-process read tools (`read_file`, `search_contents`, `find_files`, `scratchpad_load_file`) refuse
+`file_write` and `file_edit` refuse a target under them whatever roots the session holds. The
+in-process read tools (`file_read`, `file_search`, `file_find`, `scratchpad_load_file`) refuse
 them below `unrestricted` too, and a search from a root above them steps around them. Landlock
 and the Windows token cannot express that denial: their rules only add access, so under either a
 command at `read` can still read the store, and a workspace root containing it can write it.
@@ -254,7 +254,7 @@ refused, and the agent is told which level it would need. On, the call is paused
 instead:
 
 ```text
-[approval] execute_command
+[approval] shell_execute
   command: ls -la
 Allow? (Y/n/always/never)
 ```
@@ -265,11 +265,11 @@ ACP client; set `approvals = true` under `[permissions]` to start every new sess
 the level, it is recorded on the session and comes back on a resume.
 
 **An approved call still runs at the session's level.** Approval turns a refusal into a question; it
-does not widen reach. An approved `write_file` at `read` lands only under the workspace roots, and
-an approved `execute_command` at `read` runs in the read-only sandbox. To let an approved call reach
+does not widen reach. An approved `file_write` at `read` lands only under the workspace roots, and
+an approved `shell_execute` at `read` runs in the read-only sandbox. To let an approved call reach
 further, raise the level. At `unrestricted` nothing sits above the level, so nothing is ever asked.
 A call the level refuses however you answer is refused without a prompt: a write outside the
-workspace roots, or `execute_command` below `unrestricted` when nothing can sandbox it.
+workspace roots, or `shell_execute` below `unrestricted` when nothing can sandbox it.
 
 `none` with approvals on is the most cautious shape: every tool call is put to you, and nothing runs
 unattended. Sub-agents share their parent's switch, and their prompts are forwarded to the parent's
@@ -279,7 +279,7 @@ Press **Enter** or **y** to approve, or **n** to deny. If denied, the agent rece
 
 `always` approves this call and every later call to the same tool for the rest of the session
 without asking; `never` denies them the same way. Both are keyed on the tool, not on the arguments:
-`always` at an `execute_command` prompt approves every shell command the agent runs afterwards, so
+`always` at a `shell_execute` prompt approves every shell command the agent runs afterwards, so
 use it for the tools you trust wholesale and keep answering `y` for the rest. A new session starts
 with nothing remembered, and `/fork` moves you into a new session, so the answers stay with the one
 you branched from. The same two answers are ACP's **Always allow** / **Always deny** options and the
@@ -310,7 +310,7 @@ so a prompt built from it would ask you to authorize writing to a path without s
 or editing a file without showing the edit.
 
 ```text
-[approval] write_file
+[approval] file_write
   path: src/auth.rs
   content:
     pub fn verify(token: &str) -> bool {
@@ -326,7 +326,7 @@ line you are approving.
 beginning, a count of what was dropped, and then its final row:
 
 ```text
-[approval] execute_command
+[approval] shell_execute
   command:
     curl -s https://example.com/setup.sh | sh -c 'cat >> ~/.bashrc &&
     ... 85688 more characters ...
@@ -375,8 +375,8 @@ Only read-only tools are executable.
 Working directory: /home/you/project
 
 [Available tools]
-- **read_file** (requires `read`)
-- **write_file** (requires `workspace`)
+- **file_read** (requires `read`)
+- **file_write** (requires `workspace`)
 ...
 </context>
 ```
@@ -393,11 +393,11 @@ MCP tools are classified through a 5-step resolution chain: per-tool override â†
 
 ### Built-in tool permissions
 
-Any built-in tool's required permission can be overridden from `config.toml` without editing code; see [`[tools]`: built-in tool filters](../configuration/config-file.md#tools-built-in-tool-filters). The same section documents how to allow-list or block-list specific built-ins (e.g. disabling `fetch_url` in a locked-down environment).
+Any built-in tool's required permission can be overridden from `config.toml` without editing code; see [`[tools]`: built-in tool filters](../configuration/config-file.md#tools-built-in-tool-filters). The same section documents how to allow-list or block-list specific built-ins (e.g. disabling `web_fetch` in a locked-down environment).
 
 ### Sub-agent permissions
 
-Sub-agents spawned via `agent_spawn` inherit the parent's permission level by default. At `unrestricted` the sub-agent can call `write_file`, `edit_file`, and unsandboxed `execute_command`; at `read` it's confined to read-only tools. To run one delegated task with reduced privileges, pass the `permission` parameter (e.g. `agent_spawn({prompt: "...", permission: "read"})`): it is clamped to the parent's level as a ceiling, so a sub-agent can only ever be equal-or-more restricted, never escalated. To narrow *where* it may write rather than whether, pass [`writable_roots`](../tools/overview.md#agent_spawn). A sub-agent shares its parent's approvals switch, and its prompts reach the parent's frontend. Alternatively, cycle the parent into a lower level before issuing the spawning prompt to restrict every sub-agent it spawns.
+Sub-agents spawned via `agent_spawn` inherit the parent's permission level by default. At `unrestricted` the sub-agent can call `file_write`, `file_edit`, and unsandboxed `shell_execute`; at `read` it's confined to read-only tools. To run one delegated task with reduced privileges, pass the `permission` parameter (e.g. `agent_spawn({prompt: "...", permission: "read"})`): it is clamped to the parent's level as a ceiling, so a sub-agent can only ever be equal-or-more restricted, never escalated. To narrow *where* it may write rather than whether, pass [`writable_roots`](../tools/overview.md#agent_spawn). A sub-agent shares its parent's approvals switch, and its prompts reach the parent's frontend. Alternatively, cycle the parent into a lower level before issuing the spawning prompt to restrict every sub-agent it spawns.
 
 ## Examples
 
@@ -407,7 +407,7 @@ Sub-agents spawned via `agent_spawn` inherit the parent's permission level by de
 meka ~/project [r] > read the contents of main.rs
 ```
 
-The agent uses `read_file` and shows the contents. Shell commands also work at `read`, but run in a **read-only sandbox**; the filesystem is write-protected for the child process:
+The agent uses `file_read` and shows the contents. Shell commands also work at `read`, but run in a **read-only sandbox**; the filesystem is write-protected for the child process:
 
 ```text
 meka ~/project [r] > list the files in this directory
@@ -443,7 +443,7 @@ The agent will explain that it cannot write files at `read` and suggest switchin
 | Skills | `~/.config/meka/skills/` | `skill_write`, `skill_delete` (only with [`[skills] agent_managed`](../configuration/config-file.md#skills)) |
 | Scratchpad, todos, scheduled jobs, background tasks | the store | various |
 
-Of those, only the skill tools reach the filesystem at all; memory is a table in the store. Note what that makes `skill_write` at `read`: a persistence primitive. A skill it writes is read back into every later session's prompt, so a prompt-injected instruction can outlive the turn that carried it. That is the reason `[skills] agent_managed` is off by default and the tool is never given to a sub-agent. That boundary is enforced in two places: a skill name must be one path component matching the Agent Skills spec's own rule (lowercase letters, digits and hyphens), so it cannot contain `..` or a path separator, and a symlink sitting at that name is refused rather than followed, so an existing link cannot redirect a write out of the skills directory. Memory names are governed by a different and wider rule (`[A-Za-z0-9_-]`), which is safe for a different reason: a memory name is a primary key in a table, never a path. `write_file`, `edit_file` and `scratchpad_save_file` are the only built-ins that touch your tree, and all three require `workspace` or above, and are fenced to the workspace roots at that level.
+Of those, only the skill tools reach the filesystem at all; memory is a table in the store. Note what that makes `skill_write` at `read`: a persistence primitive. A skill it writes is read back into every later session's prompt, so a prompt-injected instruction can outlive the turn that carried it. That is the reason `[skills] agent_managed` is off by default and the tool is never given to a sub-agent. That boundary is enforced in two places: a skill name must be one path component matching the Agent Skills spec's own rule (lowercase letters, digits and hyphens), so it cannot contain `..` or a path separator, and a symlink sitting at that name is refused rather than followed, so an existing link cannot redirect a write out of the skills directory. Memory names are governed by a different and wider rule (`[A-Za-z0-9_-]`), which is safe for a different reason: a memory name is a primary key in a table, never a path. `file_write`, `file_edit` and `scratchpad_save_file` are the only built-ins that touch your tree, and all three require `workspace` or above, and are fenced to the workspace roots at that level.
 
 A root you asked for is not always a root you get. `--writable-root` drops a path three ways, each with a warning: one that is not a directory, one naming a system directory the sandbox masks (`/`, `/proc`, `/dev`, `/sys`, `/run`, `/tmp`, `/var/tmp`, `$XDG_RUNTIME_DIR`), and one that does not resolve at startup; the last is kept rather than refused, so a build directory becomes a root the moment it exists. See [CLI options](../configuration/cli-options.md#--writable-root-path).
 
@@ -457,7 +457,7 @@ For a server you have not audited, either pin its tools explicitly with [`tool_p
 
 So the honest statement of `read`'s filesystem guarantee is: your tree is safe from meka's built-in tools, plus whichever MCP servers you have chosen to trust.
 
-> **Note:** The read-only sandbox uses Bubblewrap or Landlock (ABI v3+, kernel 6.2+) on Linux, `sandbox-exec` on macOS, and a Low-integrity token on Windows. See [Shell](../tools/shell.md#read-only-sandbox) for what each backend covers. Where no backend is usable, shell commands are not available at `read` or `workspace`. You can disable sandboxed shell execution by setting `sandbox = false` under `[shell]` in the config file (see [Config file](../configuration/config-file.md)), which makes `execute_command` require `unrestricted` instead.
+> **Note:** The read-only sandbox uses Bubblewrap or Landlock (ABI v3+, kernel 6.2+) on Linux, `sandbox-exec` on macOS, and a Low-integrity token on Windows. See [Shell](../tools/shell.md#read-only-sandbox) for what each backend covers. Where no backend is usable, shell commands are not available at `read` or `workspace`. You can disable sandboxed shell execution by setting `sandbox = false` under `[shell]` in the config file (see [Config file](../configuration/config-file.md)), which makes `shell_execute` require `unrestricted` instead.
 
 ### Workspace
 
@@ -465,4 +465,4 @@ So the honest statement of `read`'s filesystem guarantee is: your tree is safe f
 meka ~/project [w] > run cargo test and show me the output
 ```
 
-The agent uses `execute_command` to run the tests and shows the results.
+The agent uses `shell_execute` to run the tests and shows the results.

@@ -71,14 +71,14 @@ meka --oneshot -p "how many files are here?" --format json
   "stop_reason": "end_turn",
   "text": "There are 14 files in this directory.",
   "tool_calls": [
-    { "name": "find_files", "input": { "glob": "*" }, "is_error": false }
+    { "name": "file_find", "input": { "glob": "*" }, "is_error": false }
   ],
   "usage": {
     "input_tokens": 1180, "output_tokens": 42,
     "cache_creation_input_tokens": 0, "cache_read_input_tokens": 1024
   },
   "notices": [
-    { "level": "warn", "text": "approvals are on but nobody can answer here, so 'execute_command' was refused without asking" }
+    { "level": "warn", "text": "approvals are on but nobody can answer here, so 'shell_execute' was refused without asking" }
   ]
 }
 ```

@@ -84,7 +84,7 @@ fn build_large_output_preview(name: &str, text: &str) -> String {
 ///
 /// `inherited_names` are the entries a parent lent this session read-only. The seven
 /// `scratchpad_*` tools refuse to write those, and this door has to as well: it is the universal
-/// parameter every tool takes, so `execute_command({.., scratchpad: "<inherited>"})` wrote a local
+/// parameter every tool takes, so `shell_execute({.., scratchpad: "<inherited>"})` wrote a local
 /// row under the parent's name and every later `scratchpad_read` found the shadow first. The
 /// result stays inline, with the same refusal the tools give, so the model learns why.
 pub(crate) async fn save_explicit_scratchpad_results(
@@ -489,7 +489,7 @@ impl Tool for ScratchpadEditTool {
             name: "scratchpad_edit".to_string(),
             description: "Edit a scratchpad entry in place. Provide 'content' to fully \
                 overwrite, or 'old_string'/'new_string' for targeted string replacement \
-                (like edit_file). When you are a sub-agent, names inherited read-only \
+                (like file_edit). When you are a sub-agent, names inherited read-only \
                 from the parent are refused. Copy the content into your own entry first \
                 if you need to mutate it."
                 .to_string(),
@@ -1209,8 +1209,8 @@ impl Tool for ScratchpadLoadFileTool {
 }
 
 pub(super) struct ScratchpadSaveFileTool {
-    /// The write boundary, shared with `write_file`. This tool reads as the scratchpad's
-    /// `write_file` and lands bytes at a path the user named, so it is fenced the same way.
+    /// The write boundary, shared with `file_write`. This tool reads as the scratchpad's
+    /// `file_write` and lands bytes at a path the user named, so it is fenced the same way.
     pub(crate) scope: crate::workspace::WriteScope,
     pub(crate) store: Store,
     pub(crate) site: crate::session::ToolSite,
@@ -1218,11 +1218,11 @@ pub(super) struct ScratchpadSaveFileTool {
     pub(crate) parent_session_id: Option<Uuid>,
     /// See [`ScratchpadReadTool::inherited_names`].
     pub(crate) inherited_names: Vec<String>,
-    /// The same tracker `write_file` and `edit_file` stamp.
+    /// The same tracker `file_write` and `file_edit` stamp.
     ///
-    /// This tool is described to the model as the scratchpad's `write_file`, and it lands bytes at
+    /// This tool is described to the model as the scratchpad's `file_write`, and it lands bytes at
     /// a path the user named, so it has to leave the same record: otherwise the tracker keeps the
-    /// pre-save stamp and the next `write_file` or `edit_file` on that path is refused as if
+    /// pre-save stamp and the next `file_write` or `file_edit` on that path is refused as if
     /// something else had written it.
     pub(crate) read_tracker: crate::tools::ReadTracker,
 }
@@ -1234,7 +1234,7 @@ impl Tool for ScratchpadSaveFileTool {
             name: "scratchpad_save_file".to_string(),
             description: "Write the contents of a scratchpad entry to a file on disk without \
                 routing the bytes through the conversation. Useful for persisting a sub-agent's \
-                report or a large extracted result. Mirrors `write_file`: creates parent \
+                report or a large extracted result. Mirrors `file_write`: creates parent \
                 directories, refuses to replace an existing file unless `force` is set, UTF-8 \
                 only. A path outside the workspace roots is refused unless the level is \
                 `unrestricted`. Sub-agents can save inherited entries (read from parent, write \
@@ -1318,7 +1318,7 @@ impl Tool for ScratchpadSaveFileTool {
             message: format!("scratchpad entry '{name}' not found"),
         })?;
 
-        // Shared with `write_file` rather than mirrored, because the two must agree on the file
+        // Shared with `file_write` rather than mirrored, because the two must agree on the file
         // they name and on the lock they take, and a copy of the resolution here agreed on neither.
         // Both are dispatched concurrently from one assistant message and both write through a temp
         // file derived from the target, so two calls naming one path could interleave.
@@ -1331,14 +1331,14 @@ impl Tool for ScratchpadSaveFileTool {
         .await?;
 
         // Asked under the write lock, so the answer is still true when the write happens. This
-        // tool reads as the scratchpad's `write_file`, so it refuses to replace an existing file
+        // tool reads as the scratchpad's `file_write`, so it refuses to replace an existing file
         // the same way, and `force` is the same escape hatch, spelled the same way.
         let force = input
             .get("force")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         // "Cannot tell" is not "does not exist": a target that is there but cannot be stat'ed (a
-        // symlink loop, an I/O error) must not be written over without `force`. `write_file`
+        // symlink loop, an I/O error) must not be written over without `force`. `file_write`
         // refuses the same case with the same escape hatch.
         let replaced = match tokio::fs::metadata(&target).await {
             Ok(meta) => Some(meta.len()),
@@ -1381,7 +1381,7 @@ impl Tool for ScratchpadSaveFileTool {
                 message: format!("failed to write '{path}': {error}"),
             })?;
 
-        // Stamped like any other write meka performs, so the next `write_file` or `edit_file` on
+        // Stamped like any other write meka performs, so the next `file_write` or `file_edit` on
         // this path does not mistake meka's own bytes for someone else's. `FileRoute::Local`
         // because this wrote to disk directly rather than through an editor delegate.
         super::file::record_write(
@@ -1439,9 +1439,9 @@ mod tests {
     ///
     /// Every other test here builds the tool with `WriteScope::unconfined()`, so replacing
     /// `&self.scope` with a fresh unconfined scope would leave them green, and this tool is
-    /// described to the model as the scratchpad's `write_file`, so that would be a full write door
+    /// described to the model as the scratchpad's `file_write`, so that would be a full write door
     /// outside the boundary at `workspace`. A save that is not recorded makes the next
-    /// `write_file`/`edit_file` on the same path refuse meka's own bytes as someone else's.
+    /// `file_write`/`file_edit` on the same path refuse meka's own bytes as someone else's.
     #[tokio::test]
     async fn saving_a_file_is_fenced_by_its_scope_and_records_the_write() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1514,7 +1514,7 @@ mod tests {
         );
         assert!(
             read_tracker.read().await.contains_key(&inside),
-            "the write must be stamped, or the next write_file blames someone else for it"
+            "the write must be stamped, or the next file_write blames someone else for it"
         );
     }
 
@@ -1528,7 +1528,7 @@ mod tests {
 
         let large_text = "x".repeat(MAX_INLINE_RESULT_BYTES + 1000);
         let assistant_msg =
-            make_assistant_message(vec![("call-1", "execute_command", serde_json::json!({}))]);
+            make_assistant_message(vec![("call-1", "shell_execute", serde_json::json!({}))]);
         let mut results = vec![ContentBlock::ToolResult {
             tool_use_id: "call-1".to_string(),
             content: vec![ToolResultContent::Text {
@@ -1552,14 +1552,14 @@ mod tests {
             assert!(text.contains("<large-output"));
             // The tool name still leads, so the handle stays recognizable; the call-id tail after
             // it is what makes it unique (see the collision test below).
-            assert!(text.contains("name=\"execute_command_"), "{}", text);
+            assert!(text.contains("name=\"shell_execute_"), "{}", text);
             assert!(text.contains("scratchpad_read"));
             assert!(!text.contains(&large_text));
         } else {
             panic!("expected ToolResult");
         }
 
-        let name = format!("execute_command_{}_1", short_call_id("call-1"));
+        let name = format!("shell_execute_{}_1", short_call_id("call-1"));
         let loaded = manager
             .load_scratchpad_entry(session_id, &name)
             .await
@@ -1819,7 +1819,7 @@ mod tests {
         for (call_id, body) in [("call-turn1", 'a'), ("call-turn3", 'b')] {
             let text = body.to_string().repeat(MAX_INLINE_RESULT_BYTES + 100);
             let assistant_msg =
-                make_assistant_message(vec![(call_id, "execute_command", serde_json::json!({}))]);
+                make_assistant_message(vec![(call_id, "shell_execute", serde_json::json!({}))]);
             let mut results = vec![ContentBlock::ToolResult {
                 tool_use_id: call_id.to_string(),
                 content: vec![ToolResultContent::Text { text: text.clone() }],
@@ -1834,10 +1834,7 @@ mod tests {
             )
             .await
             .expect("persist");
-            names.push((
-                format!("execute_command_{}_1", short_call_id(call_id)),
-                text,
-            ));
+            names.push((format!("shell_execute_{}_1", short_call_id(call_id)), text));
         }
 
         assert_ne!(names[0].0, names[1].0, "two calls must not share a name");
@@ -1863,7 +1860,7 @@ mod tests {
 
         let small_text = "hello world".to_string();
         let assistant_msg =
-            make_assistant_message(vec![("call-1", "execute_command", serde_json::json!({}))]);
+            make_assistant_message(vec![("call-1", "shell_execute", serde_json::json!({}))]);
         let mut results = vec![ContentBlock::ToolResult {
             tool_use_id: "call-1".to_string(),
             content: vec![ToolResultContent::Text {
@@ -1899,7 +1896,7 @@ mod tests {
 
         let assistant_msg = make_assistant_message(vec![(
             "call-1",
-            "execute_command",
+            "shell_execute",
             serde_json::json!({"command": "echo hi", "scratchpad": "cmd_output"}),
         )]);
 
@@ -1942,7 +1939,7 @@ mod tests {
             .expect("create");
         let assistant_msg = make_assistant_message(vec![(
             "call-1",
-            "execute_command",
+            "shell_execute",
             serde_json::json!({"command": "make", "scratchpad": "build_log"}),
         )]);
         let mut results = vec![ContentBlock::ToolResult {
@@ -1989,7 +1986,7 @@ mod tests {
 
         let assistant_msg = make_assistant_message(vec![(
             "call-1",
-            "execute_command",
+            "shell_execute",
             serde_json::json!({"command": "echo hi"}),
         )]);
 
@@ -2029,7 +2026,7 @@ mod tests {
 
         let assistant_msg = make_assistant_message(vec![(
             "call-1",
-            "render_image",
+            "image_render",
             serde_json::json!({"from_scratchpad": "img"}),
         )]);
 
@@ -3298,7 +3295,7 @@ mod tests {
 
     #[tokio::test]
     async fn scratchpad_load_file_resolves_relative_path_against_cwd() {
-        // A relative path resolves against the session cwd (like `read_file`), not the process
+        // A relative path resolves against the session cwd (like `file_read`), not the process
         // cwd, so `scratchpad_load_file` tracks `/cd`.
         let manager = Store::for_test().await;
         let session_id = manager
@@ -3425,7 +3422,7 @@ mod tests {
         assert_eq!(written, "final analysis");
     }
 
-    /// `scratchpad_save_file` has to take the same per-path write lock `write_file` does.
+    /// `scratchpad_save_file` has to take the same per-path write lock `file_write` does.
     ///
     /// Both are dispatched concurrently from one assistant message and both write through a temp
     /// file derived from the target, so two calls naming one path with no lock in common could
@@ -3461,9 +3458,9 @@ mod tests {
                 .with_session_id(session_id_for_test(session_id)),
         };
 
-        // Whoever holds it, holds it against both tools: this is the lock `write_file` takes.
+        // Whoever holds it, holds it against both tools: this is the lock `file_write` takes.
         let (_, held) = super::super::file::resolve_write_target(
-            "write_file",
+            "file_write",
             &tool.site.cwd,
             &tool.scope,
             target.to_str().expect("path"),
@@ -3481,7 +3478,7 @@ mod tests {
         .await;
         assert!(
             blocked.is_err(),
-            "the save must wait behind a write_file holding the same path",
+            "the save must wait behind a file_write holding the same path",
         );
 
         drop(held);
@@ -3505,7 +3502,7 @@ mod tests {
     /// Saving over a file that already exists is refused, and the confirmation says what it
     /// replaced when `force` allows it.
     ///
-    /// This tool reads as the scratchpad's `write_file`, so a path the model named by mistake must
+    /// This tool reads as the scratchpad's `file_write`, so a path the model named by mistake must
     /// not be gone with a success message on top of it.
     #[tokio::test]
     async fn scratchpad_save_file_refuses_to_replace_an_existing_file() {

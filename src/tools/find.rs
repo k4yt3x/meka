@@ -1,4 +1,4 @@
-//! `find_files` tool: glob-pattern file discovery.
+//! `file_find` tool: glob-pattern file discovery.
 
 use async_trait::async_trait;
 
@@ -34,7 +34,7 @@ pub(super) struct FindFilesTool {
 impl Tool for FindFilesTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "find_files".to_string(),
+            name: "file_find".to_string(),
             description: format!(
                 "Find files matching a glob pattern (e.g., '**/*.rs', 'src/*.txt'). \
                  Avoid overly broad searches: scanning a large tree can take \
@@ -46,7 +46,7 @@ impl Tool for FindFilesTool {
                  fall back to a tree-wide scan if targeted attempts have all \
                  failed. Inline results default to {DEFAULT_INLINE_RESULTS} entries; pass `limit` to \
                  raise the cap or `scratchpad` to collect them all. \
-                 Multiple independent find_files calls in one assistant message \
+                 Multiple independent file_find calls in one assistant message \
                  run in parallel.",
             ),
             parameters: serde_json::json!({
@@ -92,7 +92,7 @@ impl Tool for FindFilesTool {
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let cancellation = context.cancellation.clone();
-        let pattern = require_str(&input, "glob", "find_files")?;
+        let pattern = require_str(&input, "glob", "file_find")?;
         // An explicit `path` searches exactly that tree, resolved against the per-session cwd so
         // the search runs in the right place regardless of where the process was launched. With no
         // `path`, sweep every workspace root: in a multi-root ACP workspace, searching only `cwd`
@@ -105,11 +105,11 @@ impl Tool for FindFilesTool {
         let mut full_patterns: Vec<String> = Vec::with_capacity(base_paths.len());
         for base in &base_paths {
             // A root the caller named inside meka's own directories is refused, as
-            // `search_contents` refuses it; a walk that reaches them from above skips what it finds
+            // `file_search` refuses it; a walk that reaches them from above skips what it finds
             // there in `run_walk`.
             if crate::workspace::resolves_into_private(base, &private) {
                 return Err(MekaError::ToolExecution {
-                    tool_name: "find_files".to_string(),
+                    tool_name: "file_find".to_string(),
                     message: format!(
                         "'{}' is inside meka's own directories, which only `unrestricted` reads.",
                         base.display()
@@ -128,7 +128,7 @@ impl Tool for FindFilesTool {
             // path that does not exist and report "No files found" as a definitive answer.
             let Some(base) = base.to_str() else {
                 return Err(MekaError::ToolExecution {
-                    tool_name: "find_files".to_string(),
+                    tool_name: "file_find".to_string(),
                     message: format!(
                         "workspace root '{}' is not valid UTF-8, and the glob matcher cannot accept it. Pass an explicit `path` inside a root that is, or rename the directory.",
                         base.display()
@@ -170,7 +170,7 @@ impl Tool for FindFilesTool {
         // stops it shortly after.
         let outcome = tokio::select! {
             joined = walk => joined.map_err(|error| MekaError::ToolExecution {
-                tool_name: "find_files".to_string(),
+                tool_name: "file_find".to_string(),
                 message: format!("task join error: {error}"),
             })??,
             _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
@@ -180,7 +180,7 @@ impl Tool for FindFilesTool {
     }
 }
 
-/// The blocking half of `find_files`. Consults `budget` once per entry the glob iterator yields,
+/// The blocking half of `file_find`. Consults `budget` once per entry the glob iterator yields,
 /// which is what makes an over-broad walk stoppable at all: nothing outside this loop can end it,
 /// because a `spawn_blocking` task that has started cannot be aborted.
 ///
@@ -230,7 +230,7 @@ fn run_walk(
         // That is a caller mistake worth reporting loudly: degrading it to "no files found" would
         // hand the model a definitive-looking answer to a question that was never asked.
         let paths = glob::glob(full_pattern).map_err(|error| MekaError::ToolExecution {
-            tool_name: "find_files".to_string(),
+            tool_name: "file_find".to_string(),
             message: format!("invalid glob pattern '{full_pattern}': {error}"),
         })?;
 
@@ -625,7 +625,7 @@ mod tests {
     }
 
     /// A file under `cwd` must still be found when the workspace also names an ancestor of `cwd`.
-    /// `find_files` anchors the caller's pattern at each root and a glob's `*` does not cross `/`,
+    /// `file_find` anchors the caller's pattern at each root and a glob's `*` does not cross `/`,
     /// so pruning the nested root (which is right for a descending walk, and what `search_roots`
     /// does) would answer `*.md` from the ancestor alone and report the file as missing.
     #[test]

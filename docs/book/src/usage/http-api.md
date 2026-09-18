@@ -80,11 +80,11 @@ data: {"text":"a Rust workspace that..."}
 
 event: tool_call.composing
 id: 3
-data: {"id":"tu_1","name":"read_file"}
+data: {"id":"tu_1","name":"file_read"}
 
 event: tool_call.executing
 id: 4
-data: {"id":"tu_1","name":"read_file","input":{"path":"src/main.rs"},"display_summary":"src/main.rs"}
+data: {"id":"tu_1","name":"file_read","input":{"path":"src/main.rs"},"display_summary":"src/main.rs"}
 
 event: tool_call.completed
 id: 5
@@ -472,7 +472,7 @@ With `stream: false` (the default), the server holds the connection until the tu
   "tool_calls": [
     {
       "id": "tu_1",
-      "name": "read_file",
+      "name": "file_read",
       "input": {"path": "src/main.rs"},
       "display_summary": "src/main.rs",
       "is_error": false,
@@ -542,10 +542,10 @@ Reasoning streams in chunks, one event per chunk, the way `assistant_text.delta`
 | `tool_call.executing` | `id`, `name`, `input`, `display_summary` | Tool call starts |
 | `tool_call.completed` | `id`, `is_error`, `content` | Tool call finishes |
 | `progress` | `server_name`, `tool_name`, `tool_use_id`, `progress`, `total`, `message` | An MCP tool reported progress while running |
-| `tool_call.output_delta` | `id`, `chunk` | A running `execute_command` produced output; append `chunk` to what you show for the call |
+| `tool_call.output_delta` | `id`, `chunk` | A running `shell_execute` produced output; append `chunk` to what you show for the call |
 | `subagent.activity` | `id`, `summary` | A sub-agent under the `agent_spawn` call `id` started a tool call; `summary` is its rolling activity block and replaces the previous one |
 
-`progress` relays an MCP server's `notifications/progress` for a call that is still running: `progress` is the server's counter, `total` its target when it gave one, `message` its text, and `tool_use_id` the `tool_call.executing` the update belongs to. The three optional fields are omitted when the server did not send them. Only MCP tools report progress; a built-in's next sign of life is its `tool_call.completed`, except `execute_command`, whose output streams as `tool_call.output_delta`.
+`progress` relays an MCP server's `notifications/progress` for a call that is still running: `progress` is the server's counter, `total` its target when it gave one, `message` its text, and `tool_use_id` the `tool_call.executing` the update belongs to. The three optional fields are omitted when the server did not send them. Only MCP tools report progress; a built-in's next sign of life is its `tool_call.completed`, except `shell_execute`, whose output streams as `tool_call.output_delta`.
 
 `tool_call.output_delta` and `subagent.activity` are progress rather than history, and the feed treats them so: they carry no `id`, are never replayed after a reconnect, and never displace the events a `Last-Event-ID` resumption depends on. Command output is coalesced to about one event per 150 ms per call, whatever is left is flushed just ahead of the call's `tool_call.completed`, and that event still carries the whole output. The activity block holds the sub-agent's last 20 tool calls. A command run with `background: true` is not streamed: its call returns at once with a task id, and its output arrives with the task's outcome.
 
@@ -1222,7 +1222,7 @@ A **shell** gate (`"check": {"command": "…"}`) runs through `sh -c` as the use
 
 A **tool** gate (`"check": {"tool": "…", "arguments": {…}}`) is not held to that bar. It may only name a tool meka resolves to `read`, and the session need only be at `read`. Both facts are re-checked on every fire, so a tool that resolves higher after a config change stops being a gate.
 
-`execute_command` is one such tool wherever a sandbox backend is usable, so a `read` session can plant an arbitrary command on a timer through the tool form. That is deliberate and it is not the same grant as the shell form: a gate dispatches at `read`, the level meka sandboxes, so the command runs read-only-confined rather than as a bare `sh -c`, and where no sandbox is available the tool resolves above `read` and the gate is refused instead. The confinement blocks writes, not the network. See [Scheduled jobs](./scheduling.md) for the longer version.
+`shell_execute` is one such tool wherever a sandbox backend is usable, so a `read` session can plant an arbitrary command on a timer through the tool form. That is deliberate and it is not the same grant as the shell form: a gate dispatches at `read`, the level meka sandboxes, so the command runs read-only-confined rather than as a bare `sh -c`, and where no sandbox is available the tool resolves above `read` and the gate is refused instead. The confinement blocks writes, not the network. See [Scheduled jobs](./scheduling.md) for the longer version.
 
 No job of any kind can be created on a session at `none`, gated or not: no tool runs there, so the turn could neither act on the job nor cancel it, and `POST /v1/sessions/{id}/schedule` answers 403 `session-permission` rather than creating a row that can never run. A job whose session drops to `none` afterwards keeps its row and reports itself: every job view carries a `withheld` field, present only when something is holding the job back. With `sessions:r` it is the same sentence the agent is given; a `schedule:r`-only token gets a fixed sentence saying the reason needs `sessions:r`, because the reason can name the session's level, a gate's tool, or the first line of a check's output. It is computed per request from the session's current level, so it tracks a `PATCH /v1/sessions/{id}` without the job being rewritten.
 

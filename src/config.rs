@@ -2324,7 +2324,7 @@ impl From<RenderMode> for String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ToolParams {
-    /// Name only: `[tool execute_command]`. The only setting under which a model-supplied string
+    /// Name only: `[tool shell_execute]`. The only setting under which a model-supplied string
     /// never reaches the terminal at all.
     Off,
     /// Name plus the one argument [`crate::tools::resolve_primary_param`] picks out, on one line
@@ -2600,7 +2600,7 @@ pub(crate) struct McpServerConfig {
     /// here are never registered.
     pub(crate) disabled_tools: Option<Vec<String>>,
     /// Raw tool names (server-advertised, not the `mcp__<server>__<tool>` namespaced form) that
-    /// should ship eager-loaded instead of deferred. Saves a `load_tool` round-trip and keeps the
+    /// should ship eager-loaded instead of deferred. Saves a `tool_load` round-trip and keeps the
     /// schema in the cacheable tools-array prefix. Names that don't match an advertised tool
     /// surface as a `warn!` via [`crate::mcp::warn_on_stale_tool_config`].
     pub(crate) eager_load_tools: Option<Vec<String>>,
@@ -3815,7 +3815,7 @@ max_tasks = 3
         let config: ConfigFile = toml::from_str(
             r#"[subagents]
 disabled_servers = ["mekabridge"]
-disabled_tools = ["mcp__notion__create_page", "write_file"]
+disabled_tools = ["mcp__notion__create_page", "file_write"]
 agent_chosen_profile = true
 "#,
         )
@@ -3824,7 +3824,7 @@ agent_chosen_profile = true
         assert_eq!(subagents.disabled_servers, vec!["mekabridge".to_string()]);
         assert_eq!(subagents.disabled_tools, vec![
             "mcp__notion__create_page".to_string(),
-            "write_file".to_string()
+            "file_write".to_string()
         ]);
         assert!(subagents.agent_chosen_profile);
     }
@@ -4650,30 +4650,30 @@ client_secret = "my-secret"
     fn tools_config_deserialization() {
         let toml_str = r#"
 [tools]
-allowed_tools = ["read_file", "find_files"]
-disabled_tools = ["fetch_url"]
+allowed_tools = ["file_read", "file_find"]
+disabled_tools = ["web_fetch"]
 
 [tools.tool_permissions]
-execute_command = "workspace"
-read_file = "unrestricted"
+shell_execute = "workspace"
+file_read = "unrestricted"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let tools = config.tools.expect("tools should be present");
         assert_eq!(
             tools.allowed_tools.as_deref(),
-            Some(["read_file".to_string(), "find_files".to_string()].as_slice())
+            Some(["file_read".to_string(), "file_find".to_string()].as_slice())
         );
         assert_eq!(
             tools.disabled_tools.as_deref(),
-            Some(["fetch_url".to_string()].as_slice())
+            Some(["web_fetch".to_string()].as_slice())
         );
         let permissions = tools.tool_permissions.expect("tool_permissions set");
         assert_eq!(
-            permissions.get("execute_command").copied(),
+            permissions.get("shell_execute").copied(),
             Some(Permission::Workspace)
         );
         assert_eq!(
-            permissions.get("read_file").copied(),
+            permissions.get("file_read").copied(),
             Some(Permission::Unrestricted)
         );
     }
@@ -4690,7 +4690,7 @@ read_file = "unrestricted"
     #[test]
     fn a_tool_permission_level_meka_does_not_have_is_refused_at_parse() {
         let error =
-            toml::from_str::<ConfigFile>("[tools.tool_permissions]\nwrite_file = \"superuser\"\n")
+            toml::from_str::<ConfigFile>("[tools.tool_permissions]\nfile_write = \"superuser\"\n")
                 .expect_err("superuser is not a level")
                 .to_string();
         assert!(

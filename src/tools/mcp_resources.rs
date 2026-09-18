@@ -538,7 +538,7 @@ pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClien
     // install that has one.
     //
     // All seven are discovery-style helpers, so each is marked deferred. Marking rides along in the
-    // same macro: a deferred marker for a tool that was never registered is a name `load_tool`
+    // same macro: a deferred marker for a tool that was never registered is a name `tool_load`
     // would offer and then fail to find.
     macro_rules! register_meta {
         ($name:expr, $tool:expr) => {

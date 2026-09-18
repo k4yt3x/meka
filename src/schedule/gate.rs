@@ -56,7 +56,7 @@ impl GateProbe {
     /// HTTP view are read by parties who did not author the job.
     ///
     /// The kind is named because the two are otherwise indistinguishable where a tool's name would
-    /// also be a valid command: `fetch_url` as a shell gate and `fetch_url` as a tool gate rendered
+    /// also be a valid command: `web_fetch` as a shell gate and `web_fetch` as a tool gate rendered
     /// identically, and they are an unsandboxed `sh -c` and a structured call. The model needs the
     /// difference to recreate the job it is reading back.
     pub(crate) fn detail(&self) -> String {
@@ -639,7 +639,7 @@ mod tests {
             ),
             (
                 GateProbe::Tool {
-                    name: "fetch_url".to_string(),
+                    name: "web_fetch".to_string(),
                     arguments: serde_json::json!({"url": "https://example.test/health"}),
                 },
                 GatePredicate::Matches {
@@ -877,7 +877,7 @@ mod tests {
     }
 
     /// The model almost always authors a gate right after verifying the same command through
-    /// `execute_command`, which runs in the session cwd. Under a `meka serve` unit the host process
+    /// `shell_execute`, which runs in the session cwd. Under a `meka serve` unit the host process
     /// sits somewhere else entirely (`/`, or wherever systemd put it), so a gate that ignores the
     /// session cwd silently stops matching the command the user watched succeed.
     #[cfg(unix)]

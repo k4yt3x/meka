@@ -1,6 +1,6 @@
 # Web
 
-## `fetch_url`
+## `web_fetch`
 
 Fetch a web page and return its content as markdown text.
 
@@ -26,11 +26,11 @@ Fetch a web page and return its content as markdown text.
 - HTTP timeout: 30 seconds by default; [`[web].request_timeout`](../configuration/config-file.md#web) changes it, and `connect_timeout` / `read_timeout` add tighter caps on the handshake and on a stalled body.
 - Reads at most 10 MiB of decompressed body, checked while streaming so a small compressed payload cannot expand past it.
 - Returns the HTTP status code as an error if the request fails (e.g., 404, 500).
-- `fetch_url` is not a network boundary. It reaches whatever the process can reach, including private and loopback addresses, and so does a sandboxed `execute_command`, whose network is open. Confine the network at the host, not per tool.
+- `web_fetch` is not a network boundary. It reaches whatever the process can reach, including private and loopback addresses, and so does a sandboxed `shell_execute`, whose network is open. Confine the network at the host, not per tool.
 
 ### Image URLs
 
-If the response `Content-Type` is a supported raster image format, `fetch_url` returns a multimodal `Image` content block instead of markdown. No disk is touched; bytes are base64-encoded in memory.
+If the response `Content-Type` is a supported raster image format, `web_fetch` returns a multimodal `Image` content block instead of markdown. No disk is touched; bytes are base64-encoded in memory.
 
 **Provider-native formats** (passed through unchanged):
 - `image/png`, `image/jpeg` (and `image/jpg`), `image/gif`, `image/webp`, `image/bmp` (and `image/x-ms-bmp`)

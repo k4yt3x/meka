@@ -1,4 +1,4 @@
-//! `execute_command` tool. Spawns a shell process, optionally constrained by the platform sandbox
+//! `shell_execute` tool. Spawns a shell process, optionally constrained by the platform sandbox
 //! when permissions are read-only, and streams stdout/stderr back to the agent as it arrives.
 //!
 //! The sandbox is Landlock or Bubblewrap on Linux (see [`crate::sandbox`] for which is preferred),
@@ -79,7 +79,7 @@ fn bwrap_args(
     // Without it a session whose cwd is under a masked directory loses the directory entirely, and
     // bwrap's fallback is silent: `Command::current_dir` chdirs before `execve`, bwrap cannot
     // re-enter that path inside the new root, and it lands the child in `$HOME` instead, while
-    // `read_file` and `search_contents` run in-process and see the real files.
+    // `file_read` and `file_search` run in-process and see the real files.
     //
     // Read-only because a writable root that happens to be the cwd is bound read-write by the loop
     // below, and a later mount wins.
@@ -102,7 +102,7 @@ fn bwrap_args(
 
     for root in writable {
         // `--bind-try`, not `--bind`. A root is canonicalized when the confinement is resolved and
-        // mounted a moment later; a concurrent `execute_command` running `rm -rf` on it in between
+        // mounted a moment later; a concurrent `shell_execute` running `rm -rf` on it in between
         // makes plain `--bind` abort the whole spawn with a bwrap error the model cannot act on.
         // Landlock already degrades the same way (it skips a root it cannot open rather than
         // failing the command), and this is the same rule spelled in bwrap's own vocabulary.
@@ -139,7 +139,7 @@ pub(crate) struct ExecuteCommandTool {
     /// that does and does not cover.
     #[cfg(windows)]
     pub(crate) windows_grants: std::sync::Arc<crate::sandbox::windows::WindowsGrants>,
-    /// The write boundary, shared with `write_file`. The shell derives its sandbox allow-list from
+    /// The write boundary, shared with `file_write`. The shell derives its sandbox allow-list from
     /// the same [`crate::workspace::WriteScope`] the file tools fence against, so the two cannot
     /// disagree about where a write may land.
     pub(crate) scope: crate::workspace::WriteScope,
@@ -178,13 +178,13 @@ impl ExecuteCommandTool {
     /// `unrestricted` is the only level whose intent is `Unconfined`; every other level reaching an
     /// unconfined spawn is a configuration that cannot deliver what the level says. Keyed on
     /// `workspace` alone, the sibling case stays open: `[tools.tool_permissions]` overrides a
-    /// tool's required level with no floor, so `execute_command = "read"` plus `[shell].sandbox =
+    /// tool's required level with no floor, so `shell_execute = "read"` plus `[shell].sandbox =
     /// false` would run a plain `sh -c` at `read`, with the full parent environment, since the
     /// scrub is gated on `sandboxed` too.
     fn admit_confinement(&self, permission: Permission, sandboxed: bool) -> Result<()> {
         if permission != Permission::Unrestricted && !sandboxed {
             return Err(MekaError::ToolExecution {
-                tool_name: "execute_command".to_string(),
+                tool_name: "shell_execute".to_string(),
                 message: "`[shell].sandbox = false` leaves nothing to confine this command \
                           below `unrestricted`; set `[shell].sandbox = true`"
                     .to_string(),
@@ -214,7 +214,7 @@ impl ExecuteCommandTool {
              sandbox."
         );
         Err(MekaError::ToolExecution {
-            tool_name: "execute_command".to_string(),
+            tool_name: "shell_execute".to_string(),
             message,
         })
     }
@@ -224,7 +224,7 @@ impl ExecuteCommandTool {
 impl Tool for ExecuteCommandTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "execute_command".to_string(),
+            name: "shell_execute".to_string(),
             description: "Execute a shell command and return its output. On Unix the \
                 command runs via `sh -c <command>`. POSIX `$VAR` expansion applies; \
                 quote with single quotes or `\\$` to pass a literal `$`. On Windows \
@@ -233,7 +233,7 @@ impl Tool for ExecuteCommandTool {
                 wrap with another `powershell -Command` or the outer PowerShell will \
                 expand your inner `$var` references to empty strings. At the read \
                 permission level the command runs in a read-only sandbox where filesystem writes are \
-                blocked. Multiple independent execute_command calls in one assistant \
+                blocked. Multiple independent shell_execute calls in one assistant \
                 message run in parallel; use this for read-only commands and \
                 serialize anything that mutates shared state (files, git, packages)."
                 .to_string(),
@@ -301,7 +301,7 @@ impl Tool for ExecuteCommandTool {
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let cancellation = context.cancellation.clone();
-        let command = require_str(&input, "command", "execute_command")?;
+        let command = require_str(&input, "command", "shell_execute")?;
         let timeout = input["timeout_ms"]
             .as_u64()
             .map(std::time::Duration::from_millis)
@@ -353,13 +353,13 @@ impl Tool for ExecuteCommandTool {
                     })
                     .await
                     .map_err(|error| MekaError::ToolExecution {
-                        tool_name: "execute_command".to_string(),
+                        tool_name: "shell_execute".to_string(),
                         message: format!("granting workspace write access panicked: {error}"),
                     })?;
 
                     if let Err((root, error)) = &granted {
                         return Err(MekaError::ToolExecution {
-                            tool_name: "execute_command".to_string(),
+                            tool_name: "shell_execute".to_string(),
                             message: format!(
                                 "failed to make '{}' writable for the sandboxed shell: {}; a \
                                  workspace root on Windows must be a directory meka owns",
@@ -519,7 +519,7 @@ impl Tool for ExecuteCommandTool {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|error| MekaError::ToolExecution {
-                tool_name: "execute_command".to_string(),
+                tool_name: "shell_execute".to_string(),
                 message: format!("failed to spawn command: {error}"),
             })?;
 
@@ -563,7 +563,7 @@ impl Tool for ExecuteCommandTool {
             }
             status = child.wait() => {
                 let status = status.map_err(|error| MekaError::ToolExecution {
-                    tool_name: "execute_command".to_string(),
+                    tool_name: "shell_execute".to_string(),
                     message: format!("failed to wait for command: {error}"),
                 })?;
 
@@ -664,7 +664,7 @@ impl OutputRelay {
 
 /// How much of one stream meka will hold in the turn's memory before moving it to a file.
 ///
-/// There is no cap on how much a command may print, and there should not be: `execute_command` was
+/// There is no cap on how much a command may print, and there should not be: `shell_execute` was
 /// deliberately changed to stop truncating at 30 KB. But a drain accumulating one unbounded
 /// `Vec<u8>` takes the process down with any command that writes faster than the turn ends, `cat
 /// /dev/zero` being the extreme. Past this point the bytes go to disk and the result names the
@@ -1117,7 +1117,7 @@ async fn run_windows_sandboxed(
     let mut sandboxed =
         crate::sandbox::windows::spawn_sandboxed_command(command, confinement, &cwd).map_err(
             |error| MekaError::ToolExecution {
-                tool_name: "execute_command".to_string(),
+                tool_name: "shell_execute".to_string(),
                 message: format!("failed to spawn sandboxed command: {error}"),
             },
         )?;
@@ -1166,11 +1166,11 @@ async fn run_windows_sandboxed(
         join = &mut wait_handle => {
             let status = join
                 .map_err(|error| MekaError::ToolExecution {
-                    tool_name: "execute_command".to_string(),
+                    tool_name: "shell_execute".to_string(),
                     message: format!("wait task panicked: {error}"),
                 })?
                 .map_err(|error| MekaError::ToolExecution {
-                    tool_name: "execute_command".to_string(),
+                    tool_name: "shell_execute".to_string(),
                     message: format!("failed to wait for command: {error}"),
                 })?;
 
@@ -1349,7 +1349,7 @@ mod tests {
         );
     }
 
-    /// `execute_command` reports its exit status structurally, not only inside the prose the model
+    /// `shell_execute` reports its exit status structurally, not only inside the prose the model
     /// reads, so a frontend rendering a terminal can show the real code instead of guessing from
     /// the error flag.
     #[tokio::test]
@@ -1755,7 +1755,7 @@ mod tests {
     #[tokio::test]
     async fn workspace_refuses_the_shell_when_the_sandbox_is_disabled() {
         // Every level that promises confinement, not just `workspace`: narrowed to `workspace`
-        // alone, `[tools.tool_permissions] execute_command = "read"` plus `[shell].sandbox = false`
+        // alone, `[tools.tool_permissions] shell_execute = "read"` plus `[shell].sandbox = false`
         // would run a plain `sh -c` at `read`, with the full parent environment since the scrub is
         // gated on the same flag.
         for level in [Permission::None, Permission::Read, Permission::Workspace] {
@@ -1790,7 +1790,7 @@ mod tests {
             .await;
         match result {
             Err(MekaError::ToolExecution { tool_name, message }) => {
-                assert_eq!(tool_name, "execute_command");
+                assert_eq!(tool_name, "shell_execute");
                 assert!(
                     message.contains("[shell].sandbox = false"),
                     "the refusal must name the key responsible: {message}"
@@ -1802,7 +1802,7 @@ mod tests {
         }
     }
 
-    /// When the configured sandbox backend isn't usable, `execute_command` at `read` must return
+    /// When the configured sandbox backend isn't usable, `shell_execute` at `read` must return
     /// `Err(MekaError::ToolExecution)`, *not* `Ok(ToolOutput { is_error: true })`. The hard error
     /// path is how the model is forced to surface the failure to the user rather than just retrying
     /// or describing it as a tool result.
@@ -1834,7 +1834,7 @@ mod tests {
             .await;
         match result {
             Err(MekaError::ToolExecution { tool_name, message }) => {
-                assert_eq!(tool_name, "execute_command");
+                assert_eq!(tool_name, "shell_execute");
                 // The Linux error path splices in the configured backend's display name
                 // (`Bubblewrap`); the non-Linux variant drops the Linux-specific config reference
                 // and reads "sandbox is unavailable: ...". Both must include the probe reason
@@ -1899,7 +1899,7 @@ mod tests {
                 // 50 000 "x" characters, in each host shell's own vocabulary. The Unix spelling
                 // is POSIX-portable (`head` and `tr` rather than bash brace expansion, so it
                 // works under `dash`) and the Windows one is PowerShell, which is the shell
-                // `execute_command` actually invokes there.
+                // `shell_execute` actually invokes there.
                 serde_json::json!({
                     "command": if cfg!(windows) {
                         "Write-Output ('x' * 50000)"
@@ -2431,7 +2431,7 @@ mod tests {
     mod bubblewrap_boundary {
         use std::path::PathBuf;
 
-        /// The level `execute_command` needs depends on whether a sandbox can actually confine it.
+        /// The level `shell_execute` needs depends on whether a sandbox can actually confine it.
         ///
         /// `read` only when the sandbox is both enabled *and* backed by a working backend;
         /// otherwise `unrestricted`, because a command meka cannot confine is a command only the
@@ -2781,7 +2781,7 @@ mod tests {
         }
     }
 
-    /// `execute_command` at `workspace`, end to end, on a real Unix sandbox.
+    /// `shell_execute` at `workspace`, end to end, on a real Unix sandbox.
     ///
     /// The Linux dialects are each tested through their helpers (`bwrap_args`, `apply_landlock`)
     /// with a hand-built root list, so nothing else exercises the wire between `Confinement` and

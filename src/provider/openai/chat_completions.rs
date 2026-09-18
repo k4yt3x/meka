@@ -901,7 +901,7 @@ mod tests {
                         "tool_calls": [{
                             "id": "call_abc",
                             "index": 0,
-                            "function": {"name": "execute_command", "arguments": "{\"command\":"}
+                            "function": {"name": "shell_execute", "arguments": "{\"command\":"}
                         }]
                     },
                     "finish_reason": null
@@ -929,7 +929,7 @@ mod tests {
         assert_eq!(final_stop, Some(StopReason::ToolUse));
         let accumulator = accumulators.get(&0).expect("accumulated tool call");
         assert_eq!(accumulator.id, "call_abc");
-        assert_eq!(accumulator.name, "execute_command");
+        assert_eq!(accumulator.name, "shell_execute");
         assert_eq!(accumulator.arguments, "{\"command\": \"pwd\"}");
     }
 
@@ -1264,7 +1264,7 @@ mod tests {
         .expect("build test provider");
 
         let tools = vec![ToolDefinition::new(
-            "read_file".to_string(),
+            "file_read".to_string(),
             "Read a file".to_string(),
             serde_json::json!({
                 "type": "object",
@@ -1279,7 +1279,7 @@ mod tests {
         let openai_tools = body["tools"].as_array().expect("tools should be array");
         assert_eq!(openai_tools.len(), 1);
         assert_eq!(openai_tools[0]["type"], "function");
-        assert_eq!(openai_tools[0]["function"]["name"], "read_file");
+        assert_eq!(openai_tools[0]["function"]["name"], "file_read");
     }
 
     #[test]
@@ -1306,7 +1306,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
                     id: "call_1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/test.txt"}),
                 }],
             },
@@ -1360,7 +1360,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
                     id: "call_1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/test.txt"}),
                 }],
             },
@@ -1463,7 +1463,7 @@ mod tests {
                         "id": "call_abc",
                         "type": "function",
                         "function": {
-                            "name": "read_file",
+                            "name": "file_read",
                             "arguments": "{\"path\":\"/tmp/test.txt\"}"
                         }
                     }]
@@ -1482,7 +1482,7 @@ mod tests {
 
         if let ContentBlock::ToolUse { id, name, input } = &tool_uses[0] {
             assert_eq!(id, "call_abc");
-            assert_eq!(name, "read_file");
+            assert_eq!(name, "file_read");
             assert_eq!(input["path"], "/tmp/test.txt");
         } else {
             panic!("expected ToolUse block");
@@ -1516,7 +1516,7 @@ mod tests {
                         "id": "call_bad",
                         "type": "function",
                         "function": {
-                            "name": "read_file",
+                            "name": "file_read",
                             "arguments": "{not valid json"
                         }
                     }]
@@ -1598,7 +1598,7 @@ mod tests {
                     "tool_calls": [{
                         "type": "function",
                         "function": {
-                            "name": "read_file",
+                            "name": "file_read",
                             "arguments": "{}"
                         }
                     }]
@@ -1676,7 +1676,7 @@ mod tests {
                     "tool_calls": [{
                         "id": "call_abc",
                         "type": "function",
-                        "name": "read_file",
+                        "name": "file_read",
                         "arguments": "{\"path\":\"/tmp/test.txt\"}"
                     }]
                 },
@@ -1694,7 +1694,7 @@ mod tests {
 
         if let ContentBlock::ToolUse { id, name, input } = &tool_uses[0] {
             assert_eq!(id, "call_abc");
-            assert_eq!(name, "read_file");
+            assert_eq!(name, "file_read");
             assert_eq!(input["path"], "/tmp/test.txt");
         } else {
             panic!("expected ToolUse block");
@@ -1757,7 +1757,7 @@ mod tests {
         .expect("build test provider");
 
         let tools = vec![ToolDefinition::new(
-            "write_file".to_string(),
+            "file_write".to_string(),
             "Create or overwrite a file".to_string(),
             serde_json::json!({
                 "type": "object",
@@ -1773,7 +1773,7 @@ mod tests {
         let openai_tools = body["tools"].as_array().expect("tools should be array");
 
         assert_eq!(openai_tools[0]["type"], "function");
-        assert_eq!(openai_tools[0]["function"]["name"], "write_file");
+        assert_eq!(openai_tools[0]["function"]["name"], "file_write");
         assert_eq!(
             openai_tools[0]["function"]["description"],
             "Create or overwrite a file"
@@ -1816,7 +1816,7 @@ mod tests {
     async fn a_tool_call_is_accumulated_before_its_id_arrives() {
         let (_events, accumulators, _) = drive_chunks(&[
             serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
-                "index": 0, "function": {"name": "read_file", "arguments": "{\"path\":"}
+                "index": 0, "function": {"name": "file_read", "arguments": "{\"path\":"}
             }]}}]}),
             serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
                 "index": 0, "id": "call_1", "function": {"arguments": " \"a.txt\"}"}
@@ -1825,7 +1825,7 @@ mod tests {
         .await;
         let accumulator = accumulators.get(&0).expect("one call accumulated");
         assert_eq!(accumulator.id, "call_1");
-        assert_eq!(accumulator.name, "read_file");
+        assert_eq!(accumulator.name, "file_read");
         assert_eq!(accumulator.arguments, "{\"path\": \"a.txt\"}");
     }
 
@@ -1853,7 +1853,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
                     id: "call_1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({"path": "x"}),
                 }],
             },

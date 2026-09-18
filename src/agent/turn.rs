@@ -896,7 +896,7 @@ impl Agent {
                 // alone, whose spawned task needs an owned slice.
                 let api_messages: &[Message] = messages.as_slice();
 
-                // Recompute the active tool set every iteration so a `load_tool` call earlier in
+                // Recompute the active tool set every iteration so a `tool_load` call earlier in
                 // this turn becomes visible to the model on the very next request, without
                 // mutating any registry state. Append-only growth keeps the tools array's cache
                 // prefix stable.
@@ -912,7 +912,7 @@ impl Agent {
                     Arc::from(self.tool_registry.definitions_active_with_loaded(&loaded));
 
                 // The part of the window that is not conversation, for `context_check` to report.
-                // Re-stamped per round because the active tool set grows as `load_tool` pulls in
+                // Re-stamped per round because the active tool set grows as `tool_load` pulls in
                 // deferred schemas. Written, never read by the agent: an estimate is fine for
                 // informing the model's decision, while the agent's own thresholds run off the
                 // provider's exact numbers.
@@ -5254,7 +5254,7 @@ mod tests {
                 MockEvent::Usage { input_tokens: 1234 },
                 MockEvent::ToolUseStart {
                     id: "call-1".to_string(),
-                    name: "todo".to_string(),
+                    name: "todo_read".to_string(),
                 },
                 MockEvent::ToolUseEnd {
                     input: serde_json::json!({}),
@@ -6555,7 +6555,7 @@ mod tests {
         ]
     }
 
-    /// The whole incident, end to end: a deferred tool is callable without `load_tool`, so a model
+    /// The whole incident, end to end: a deferred tool is callable without `tool_load`, so a model
     /// working from the truncated `[Tool discovery]` summary takes a silently wrong default. The
     /// result has to say so, because the call itself succeeds and there is no error to read.
     #[tokio::test]
@@ -6599,7 +6599,7 @@ mod tests {
 
         assert!(results.contains("Sent (message id 1)"), "{results}");
         assert!(results.contains("as_photo"), "the omitted flag: {results}");
-        assert!(results.contains("load_tool"), "{results}");
+        assert!(results.contains("tool_load"), "{results}");
     }
 
     /// A thinking block that carries no text still has to announce that it ended.
@@ -6819,7 +6819,7 @@ mod tests {
             vec![
                 MockEvent::ToolUseStart {
                     id: "tu_1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                 },
                 MockEvent::ToolUseEnd {
                     input: serde_json::json!({"path": "/tmp/a.txt"}),
@@ -6855,7 +6855,7 @@ mod tests {
             .iter()
             .position(|event| {
                 matches!(event, FrontendEvent::ToolCallComposing { id, name }
-                    if id == "tu_1" && name == "read_file")
+                    if id == "tu_1" && name == "file_read")
             })
             .expect("the call names itself while its arguments are still streaming");
         let dispatched = events
@@ -6877,7 +6877,7 @@ mod tests {
     impl crate::tools::Tool for SlowFixture {
         fn definition(&self) -> ToolDefinition {
             ToolDefinition {
-                name: "execute_command".to_string(),
+                name: "shell_execute".to_string(),
                 description: "Run a shell command.".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -7060,7 +7060,7 @@ mod tests {
         vec![
             MockEvent::ToolUseStart {
                 id: "call-1".to_string(),
-                name: "execute_command".to_string(),
+                name: "shell_execute".to_string(),
             },
             MockEvent::ToolUseEnd {
                 input: serde_json::json!({"command": command, "background": true}),
@@ -7446,7 +7446,7 @@ mod tests {
         let stringified = vec![
             MockEvent::ToolUseStart {
                 id: "call-1".to_string(),
-                name: "execute_command".to_string(),
+                name: "shell_execute".to_string(),
             },
             MockEvent::ToolUseEnd {
                 input: serde_json::json!({"command": "make", "background": "true"}),
@@ -7670,7 +7670,7 @@ mod tests {
         }]));
         assert!(!has_visible_text(&[ContentBlock::ToolUse {
             id: "call_1".to_string(),
-            name: "read_file".to_string(),
+            name: "file_read".to_string(),
             input: serde_json::json!({}),
         }]));
         assert!(has_visible_text(&[ContentBlock::Text {

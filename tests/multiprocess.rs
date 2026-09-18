@@ -389,7 +389,7 @@ fn one_slow_reply(text: &str, thinking_for: Duration) -> serde_json::Value {
 
 /// A gate command that records one run and then declines, spelled for the host's own shell.
 ///
-/// `execute_command` runs `powershell.exe -Command` on Windows and a POSIX shell elsewhere, and a
+/// `shell_execute` runs `powershell.exe -Command` on Windows and a POSIX shell elsewhere, and a
 /// gate is an ordinary command. The POSIX spelling alone (`printf 'ran\n' >> …`) has no `printf` in
 /// PowerShell, so on Windows the log stayed empty, [`gate_runs`] read zero forever, and the test
 /// timed out waiting rather than failing on the claim semantics it exists to measure. `sleep` needs
@@ -536,7 +536,7 @@ fn a_second_process_cannot_sweep_a_running_background_task() {
     let proof = cluster.path("finished");
     cluster.script(serde_json::json!([
         [
-            {"type": "tool_use_start", "id": "tu_1", "name": "execute_command"},
+            {"type": "tool_use_start", "id": "tu_1", "name": "shell_execute"},
             {"type": "tool_use_end", "input": {
                 "command": sleep_then_leave_proof(4, &proof),
                 "background": true,

@@ -4166,7 +4166,7 @@ mod tests {
                 },
                 ContentBlock::ToolUse {
                     id: "u1".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/x"}),
                 },
             ],
@@ -4464,7 +4464,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
                     id: "u9".to_string(),
-                    name: "read_file".to_string(),
+                    name: "file_read".to_string(),
                     input: serde_json::json!({"path": "/tmp/x"}),
                 }],
             }),

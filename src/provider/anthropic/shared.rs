@@ -1609,14 +1609,14 @@ mod tests {
     }
 
     /// Unparseable tool arguments are the model's intent, mangled. Running the tool with `{}`
-    /// instead executes something the model never asked for -- `write_file` with no path, a shell
+    /// instead executes something the model never asked for -- `file_write` with no path, a shell
     /// command with no command -- and reports success for it. Rejecting hands the model back a
     /// result it can act on.
     #[tokio::test]
     async fn a_tool_call_with_unparseable_arguments_is_rejected_not_run_empty() {
         let (events, outcome) = decode_sse(concat!(
             "event: content_block_start\n",
-            "data: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"write_file\"}}\n\n",
+            "data: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"file_write\"}}\n\n",
             "event: content_block_delta\n",
             "data: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\": \"}}\n\n",
             "event: content_block_stop\n",
@@ -1630,7 +1630,7 @@ mod tests {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                StreamEvent::ToolCallRejected { name, .. } if name == "write_file"
+                StreamEvent::ToolCallRejected { name, .. } if name == "file_write"
             )),
             "the call must be rejected: {events:?}",
         );

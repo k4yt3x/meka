@@ -493,7 +493,7 @@ impl std::str::FromStr for TaskStatus {
 pub(crate) struct BackgroundTask {
     pub(crate) id: String,
     pub(crate) session_id: Uuid,
-    /// The tool that was backgrounded, e.g. `execute_command`.
+    /// The tool that was backgrounded, e.g. `shell_execute`.
     pub(crate) tool: String,
     /// Human-readable summary of what was started, from
     /// [`crate::tools::resolve_primary_param`]. Carried so `task_list` and the delivered turn can
@@ -538,7 +538,7 @@ mod tests {
         let task = crate::store::background::BackgroundTask {
             id: Uuid::new_v4().to_string(),
             session_id,
-            tool: "execute_command".to_string(),
+            tool: "shell_execute".to_string(),
             label: label.to_string(),
             status: crate::store::background::TaskStatus::Running,
             outcome: None,

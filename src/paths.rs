@@ -67,7 +67,7 @@ pub(crate) fn meka_config_dir() -> Option<PathBuf> {
 pub(crate) fn meka_data_dir() -> Option<PathBuf> {
     data_dir_override().or_else(|| dirs::data_dir().map(|base| base.join("meka")))
 }
-/// Where `execute_command` spools a command's output when it overflows the inline result.
+/// Where `shell_execute` spools a command's output when it overflows the inline result.
 ///
 /// `MEKA_DATA_DIR` first, so a run isolated to a scratch directory keeps its captures there too
 /// rather than dropping them in the real user's cache; otherwise the platform cache directory,

@@ -303,7 +303,7 @@ mod tests {
         let task = BackgroundTask {
             id: Uuid::new_v4().to_string(),
             session_id,
-            tool: "execute_command".to_string(),
+            tool: "shell_execute".to_string(),
             label: label.to_string(),
             status: TaskStatus::Running,
             outcome: None,

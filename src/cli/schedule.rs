@@ -939,13 +939,13 @@ mod tests {
         let shell = &rows_for(
             &crate::schedule::SchedulerMemory::default(),
             &[(
-                job_with(Some(shell_gate("fetch_url", GatePredicate::Changed))),
+                job_with(Some(shell_gate("web_fetch", GatePredicate::Changed))),
                 None,
             )],
             Layout::Unscoped,
             None,
             &Resolvable::of(&[(
-                job_with(Some(shell_gate("fetch_url", GatePredicate::Changed))),
+                job_with(Some(shell_gate("web_fetch", GatePredicate::Changed))),
                 None,
             )]),
         )[0][4];
@@ -954,7 +954,7 @@ mod tests {
             &[(
                 job_with(Some(Gate {
                     probe: GateProbe::Tool {
-                        name: "fetch_url".to_string(),
+                        name: "web_fetch".to_string(),
                         arguments: serde_json::json!({}),
                     },
                     predicate: GatePredicate::Changed,
@@ -968,7 +968,7 @@ mod tests {
             &Resolvable::of(&[(
                 job_with(Some(Gate {
                     probe: GateProbe::Tool {
-                        name: "fetch_url".to_string(),
+                        name: "web_fetch".to_string(),
                         arguments: serde_json::json!({}),
                     },
                     predicate: GatePredicate::Changed,

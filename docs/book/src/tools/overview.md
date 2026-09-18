@@ -6,14 +6,16 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 
 | Tool | Permission | Description |
 |------|-----------|-------------|
-| [`read_file`](./file-operations.md#read_file) | Read | Read file contents |
-| [`edit_file`](./file-operations.md#edit_file) | Workspace | Make string replacements in a file |
-| [`write_file`](./file-operations.md#write_file) | Workspace | Create or overwrite a file |
-| [`find_files`](./search.md#find_files) | Read | Find files by glob pattern |
-| [`search_contents`](./search.md#search_contents) | Read | Search file contents with regex |
-| [`fetch_url`](./web.md#fetch_url) | Read | Fetch a web page as markdown |
-| [`execute_command`](./shell.md#execute_command) | Read | Run a shell command (see the note below) |
-| [`todo`](./overview.md#todo) | Read | Manage and read a structured task list |
+| [`file_read`](./file-operations.md#file_read) | Read | Read file contents |
+| [`file_edit`](./file-operations.md#file_edit) | Workspace | Make string replacements in a file |
+| [`file_write`](./file-operations.md#file_write) | Workspace | Create or overwrite a file |
+| [`file_find`](./search.md#file_find) | Read | Find files by glob pattern |
+| [`file_search`](./search.md#file_search) | Read | Search file contents with regex |
+| [`web_fetch`](./web.md#web_fetch) | Read | Fetch a web page as markdown |
+| [`shell_execute`](./shell.md#shell_execute) | Read | Run a shell command (see the note below) |
+| [`todo_write`](./overview.md#todo_write-todo_edit-todo_read) | Read | Create or replace the task list |
+| [`todo_edit`](./overview.md#todo_write-todo_edit-todo_read) | Read | Update task statuses by number |
+| [`todo_read`](./overview.md#todo_write-todo_edit-todo_read) | Read | Read the task list |
 | [`agent_spawn`](./overview.md#agent_spawn) | Read | Delegate tasks to a sub-agent |
 | [`agent_list`](./overview.md#agent_list--agent_followup--agent_steer--agent_delete) | Read | List the sub-agents this session spawned |
 | [`agent_followup`](./overview.md#agent_list--agent_followup--agent_steer--agent_delete) | Read | Ask a sub-agent another question |
@@ -36,7 +38,7 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`memory_read`](../usage/memory.md) | Read | Load one saved memory in full |
 | [`memory_search`](../usage/memory.md) | Read | Ranked full-text search over every memory |
 | [`memory_delete`](../usage/memory.md) | Read | Delete a saved memory |
-| [`render_image`](./overview.md#render_image) | Read | View an image from in-memory base64 or scratchpad |
+| [`image_render`](./overview.md#image_render) | Read | View an image from in-memory base64 or scratchpad |
 | [`context_check`](./overview.md#context_check--context_compact) | Read | Measure the context window live: occupancy, headroom, compaction count |
 | [`context_compact`](./overview.md#context_check--context_compact) | Read | Ask for a compaction before the next step of this turn |
 | [`conversation_search`](./overview.md#conversation_search--conversation_read) | Read | Search the full conversation history, including compacted turns |
@@ -46,7 +48,8 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`schedule_cancel`](../usage/scheduling.md) | Read | Cancel a scheduled job |
 | [`task_list`](../usage/background.md) | Read | List this session's background tasks |
 | [`task_cancel`](../usage/background.md) | Read | Stop a running background task |
-| [`load_tool`](./overview.md#deferred-tools) | Read | Fetch the full schema of a deferred tool, one name or up to ten |
+| [`tool_load`](./overview.md#deferred-tools) | Read | Fetch the full schema of a deferred tool, one name or up to ten |
+| [`tool_search`](./overview.md#deferred-tools) | Read | Find a tool by keyword across names and descriptions, deferred ones included |
 
 The `schedule_*` tools require [`[schedule] enabled`](../configuration/config-file.md#schedule) (on by default), the `memory_*` tools require [`[memory] enabled`](../configuration/config-file.md#memory) (on by default), and the `task_*` tools require [`[background] enabled`](../configuration/config-file.md#background) (off by default). `skill_write` and `skill_delete` require [`[skills] agent_managed`](../configuration/config-file.md#skills) (off by default) and are never given to a sub-agent. A disabled subsystem registers no tools at all, rather than shipping schemas that could only fail.
 
@@ -55,22 +58,22 @@ The `schedule_*` tools require [`[schedule] enabled`](../configuration/config-fi
 Tools are grouped by the minimum permission level required:
 
 **Read permission** (available at `read` and above):
-- `read_file`, `find_files`, `search_contents`, `fetch_url`
-- `execute_command` (sandboxed, filesystem write-protected)
-- `todo`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_steer`, `agent_delete`, `render_image`
+- `file_read`, `file_find`, `file_search`, `web_fetch`
+- `shell_execute` (sandboxed, filesystem write-protected)
+- `todo_read`, `todo_write`, `todo_edit`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_steer`, `agent_delete`, `image_render`
 - All skill tools, including `skill_write` and `skill_delete` when they are enabled: like memory,
   skills live in meka's own config directory, not your working tree
 - `conversation_search`, `conversation_read`, `context_check`, `context_compact`
-- Every scratchpad tool except `scratchpad_save_file`, which writes to a path you name and so sits at `workspace` with `write_file`
+- Every scratchpad tool except `scratchpad_save_file`, which writes to a path you name and so sits at `workspace` with `file_write`
 - All memory tools. Writing a memory needs only read permission: memories live in the store,
   which is meka's own, not your working tree.
 
 **Workspace permission** (available at `workspace` and above; writes are confined to the workspace roots at `workspace`):
-- `edit_file`, `write_file`, `scratchpad_save_file`
+- `file_edit`, `file_write`, `scratchpad_save_file`
 
-`execute_command` is not in that list: it asks for `read` when a sandbox backend is available and `unrestricted` when none is, so it is reachable at `read` and confined by the *level*, not by its own requirement.
+`shell_execute` is not in that list: it asks for `read` when a sandbox backend is available and `unrestricted` when none is, so it is reachable at `read` and confined by the *level*, not by its own requirement.
 
-With [approvals](../usage/permissions.md#approvals) on, a call above the level is put to you instead of refused. An approved call still runs at the session's level: an approved `execute_command` at `read` runs in the read-only sandbox, and an approved `write_file` lands only under the workspace roots. Raise the level when an approved call needs more reach.
+With [approvals](../usage/permissions.md#approvals) on, a call above the level is put to you instead of refused. An approved call still runs at the session's level: an approved `shell_execute` at `read` runs in the read-only sandbox, and an approved `file_write` lands only under the workspace roots. Raise the level when an approved call needs more reach.
 
 At **none**, no tools are available. The agent can only respond with text.
 
@@ -82,7 +85,7 @@ Any built-in can be allow-listed, blocked, or have its required permission overr
 
 When [MCP servers](../configuration/config-file.md#mcpservers) are configured, their tools are registered under a namespaced name of the form `mcp__<server>__<tool>` (e.g. `mcp__notion__notion-search`). The `mcp__` prefix matches [Claude Code](https://github.com/anthropics/claude-code)'s convention and keeps MCP tools from colliding with built-in names. They appear in the per-turn context catalog alongside the built-ins, with their resolved permission level annotated inline, and are called the same way.
 
-meka also exposes seven built-in **MCP meta-tools** for browsing server-side resources and prompts. All are deferred by default; call `load_tool` with the exact name to make the schema available on the next turn:
+meka also exposes seven built-in **MCP meta-tools** for browsing server-side resources and prompts. All are deferred by default; `tool_search` finds them, and `tool_load` with the exact name makes the schema available on the next turn:
 
 | Tool | Permission | Description |
 |------|-----------|-------------|
@@ -96,20 +99,26 @@ meka also exposes seven built-in **MCP meta-tools** for browsing server-side res
 
 ## Deferred tools
 
-Most MCP tools are **deferred**: they are registered and listed under `[Tool discovery]` in the per-turn context, but their JSON schemas are withheld from the request until the agent calls `load_tool`. A large server can advertise fifty tools with multi-kilobyte schemas, and shipping all of them on every turn costs more than it returns.
+Most MCP tools are **deferred**: they are registered and listed under `[Tool discovery]` in the per-turn context, but their JSON schemas are withheld from the request until the agent calls `tool_load`. A large server can advertise fifty tools with multi-kilobyte schemas, and shipping all of them on every turn costs more than it returns.
 
-The trade-off is that until a tool is loaded, the agent sees only its name and a summary clipped to 250 characters. **Anything past that clip is invisible**, including optional parameters, and a summary that was clipped ends in `…`.
+The listing is bounded, like the skills and memory indexes. Every deferred tool appears under its server with the permission level it requires. A one-line summary rides along while the whole section fits 8 KB; past that every entry keeps its name and loses its summary, and past 200 names the section stops and counts what it left out. Each server heading carries its tool count in every tier and headings are kept while they fit, so a server whose entries were cut is still named with its size; past that, the count line says how many groups are not listed at all.
+
+The trade-off is that until a tool is loaded, the agent sees at most its name and a summary clipped to 250 characters. **Anything past that clip is invisible**, including optional parameters, and a summary that was clipped ends in `…`.
 
 Two behaviors exist so this never turns into a silent wrong answer:
 
 - Calling a deferred tool without loading it **works**. The agent may be confident about the required arguments, and forcing a round trip it doesn't need is worse than allowing it.
 - But when it does that and the tool has documented parameters it didn't pass, meka appends a note to the tool result naming them, with their types, defaults, and descriptions. A wrong default stops being invisible. The note is emitted once per tool per run.
 
-`load_tool` takes one name or an array of up to ten, so a task needing several tools off one server costs one round trip:
+`tool_search` finds a tool by keyword across every registered tool's name and full description, deferred ones included. Matching is forgiving: a word in the name outranks one in the description, a whole word outranks a substring, and a near miss (`xerfs` for `xrefs`) still counts. Each result carries the tool's summary, whether it is deferred, and whether the session's current permission level and approvals switch allow a call, by the same rule dispatch applies, so the agent never loads a tool only to find the call refused at that door. A tool's own refusals once called (a shell with no sandbox at `workspace`, a path outside the roots) depend on the arguments and are not predicted. Up to ten results are shown, which is one `tool_load` batch.
+
+`tool_load` takes one name or an array of up to ten, so a task needing several tools off one server costs one round trip. Each loaded schema is headed by the same line on whether the level allows a call, and a name that matches nothing is answered with the nearest registered names or, failing that, the keyword matches for the word:
 
 ```text
-load_tool({"name": ["mcp__notion__search", "mcp__notion__fetch"]})
+tool_load({"name": ["mcp__notion__search", "mcp__notion__fetch"]})
 ```
+
+Sub-agents see the same picture: a worker's system prompt carries the identical `[Tool discovery]` section over its own registry (its parent's servers minus whatever [`[subagents]`](../configuration/config-file.md#subagents) and `agent_spawn` deny), and it has `tool_search` and `tool_load` like the root.
 
 Tools listed in a server's [`eager_load_tools`](../configuration/config-file.md#mcpservers) skip all of this: their schemas ship from turn 1. Use it for tools whose optional parameters matter and that the agent reaches for constantly.
 
@@ -120,7 +129,7 @@ Tools listed in a server's [`eager_load_tools`](../configuration/config-file.md#
 With [`[background] enabled`](../configuration/config-file.md#background), every tool except `context_compact` gains an optional `background` parameter, MCP tools included. `context_compact` does no work of its own: it parks a request the loop drains once the batch's results are in, and detaching it would race that drain. A call that sets it returns a task id immediately and delivers its result later as its own turn, which is what makes a twenty-minute build affordable. See [Background tasks](../usage/background.md).
 
 ```text
-execute_command({"command": "cargo test --all", "background": true})
+shell_execute({"command": "cargo test --all", "background": true})
 ```
 
 Like `scratchpad`, `background` is meka's own: it is consumed by the agent loop and removed from the arguments before the tool, or a remote MCP server, ever sees it.
@@ -134,18 +143,18 @@ These two are also the only parameters meka type-checks. A `background` that is 
 A `scratchpad` string parameter saves a tool's output to the scratchpad under that name instead of returning it inline, so a large result stays out of the conversation.
 
 ```text
-execute_command({"command": "pdftotext doc.pdf -", "scratchpad": "pdf_text"})
+shell_execute({"command": "pdftotext doc.pdf -", "scratchpad": "pdf_text"})
 ```
 
 It is honored on **every** tool, MCP servers included: the redirect happens where the result is
 recorded, not inside the tool. Eleven built-ins also *advertise* it in their schema, which is how the
-model discovers it: `read_file`, `edit_file`, `write_file`, `find_files`, `search_contents`,
-`fetch_url`, `execute_command`, `conversation_read`, `agent_spawn`, `agent_followup`
-and `todo`, the last for uniformity alone, since its list is kept as state and nothing is redirected.
+model discovers it: `file_read`, `file_edit`, `file_write`, `file_find`, `file_search`,
+`web_fetch`, `shell_execute`, `conversation_read`, `agent_spawn`, `agent_followup`
+and the `todo_*` tools, the last for uniformity alone, since its list is kept as state and nothing is redirected.
 
-Three of those lift a cap when it is set, producing their full untruncated output: `find_files` (500
-results), `search_contents` (100 matches) and `fetch_url` (`limit`). An explicit `limit` on
-`find_files` or `search_contents` still applies.
+Three of those lift a cap when it is set, producing their full untruncated output: `file_find` (500
+results), `file_search` (100 matches) and `web_fetch` (`limit`). An explicit `limit` on
+`file_find` or `file_search` still applies.
 
 ## How tool calls work
 
@@ -158,21 +167,19 @@ results), `search_contents` (100 matches) and `fetch_url` (`limit`). An explicit
 
 Tool calls and their results are displayed in the terminal so you can see what the agent is doing.
 
-## `todo`
+## `todo_write`, `todo_edit`, `todo_read`
 
-A built-in tool for managing a structured task list during a session. The agent uses it to track multi-step work and communicate progress; the list is displayed in the terminal (for the root agent) and injected into the conversation context each turn. Every call returns the full current list (with task numbers), so the agent never needs a separate read.
+A structured task list for a session. The agent uses it to track multi-step work and communicate progress; the list is displayed in the terminal (for the root agent) and injected into the conversation context each turn. Every call returns the full current list with task numbers, so the agent always has the numbers its next edit needs.
 
-Inputs (all optional):
+- `todo_write` creates or replaces the whole list: `title`, a short heading for the overall goal, and `items`, each a task string (status defaults to `pending`) or an object `{text, status}`. Tasks are numbered `1..N` in order. Both parameters are required.
+- `todo_edit` updates statuses by task number: `set`, e.g. `{"1": "completed", "2": "in_progress"}`. This is the common path while working. Every number is checked before any status changes, so one bad number changes nothing.
+- `todo_read` returns the list and takes no arguments.
 
-- `title`: a short heading summarizing the overall goal; rendered as the list's heading (`TODO: <title>`). **Required whenever you pass `items`**, and persists across later `set` updates.
-- `items`: replace the whole list. Each entry is a task string (status defaults to `pending`) or an object `{text, status}`. Tasks are numbered `1..N` in order.
-- `set`: a sparse status update keyed by task number, e.g. `{"1": "completed", "2": "in_progress"}`. This is the common path while working.
-
-Task statuses are `pending`, `in_progress`, `completed`, and `canceled`. Calling `todo` with no arguments simply reads the current list.
+Task statuses are `pending`, `in_progress`, `completed`, and `canceled`.
 
 ## `agent_spawn`
 
-Spawns a sub-agent to perform research, analysis, or any other delegated task. The sub-agent gets its own private todo list (`todo` operates on the sub-agent's own state), runs silently (its tool calls are not surfaced to the terminal), and returns a single text report. Use this to keep exploratory or speculative work out of the main conversation context.
+Spawns a sub-agent to perform research, analysis, or any other delegated task. The sub-agent gets its own private todo list (the `todo_*` tools operate on the sub-agent's own state), runs silently (its tool calls are not surfaced to the terminal), and returns a single text report. Use this to keep exploratory or speculative work out of the main conversation context.
 
 Multiple `agent_spawn` calls in one assistant turn run in parallel; useful when independent investigations can proceed concurrently.
 
@@ -225,15 +232,15 @@ Skills are knowledge packages stored in `~/.config/meka/skills/<name>/SKILL.md`.
 
 The last two are registered only when [`[skills] agent_managed`](../configuration/config-file.md#skills) is on, and never for a sub-agent. See [Skills](../usage/skills.md) for how to author skills and [Letting the agent manage skills](../usage/skills.md#letting-the-agent-manage-skills) for when to hand authoring to the agent.
 
-## `render_image`
+## `image_render`
 
-Displays an image the agent has in memory, as base64 bytes or in a scratchpad entry, as a multimodal content block. Complements `fetch_url` (network) and `read_file` (local file) by covering the third case: image data produced on the fly by a command pipeline.
+Displays an image the agent has in memory, as base64 bytes or in a scratchpad entry, as a multimodal content block. Complements `web_fetch` (network) and `file_read` (local file) by covering the third case: image data produced on the fly by a command pipeline.
 
 Typical workflow:
 
 ```text
-execute_command({"command": "ffmpeg -i input.mp4 -vframes 1 -f image2pipe pipe: | base64 -w0", "scratchpad": "frame"})
-render_image({"from_scratchpad": "frame"})
+shell_execute({"command": "ffmpeg -i input.mp4 -vframes 1 -f image2pipe pipe: | base64 -w0", "scratchpad": "frame"})
+image_render({"from_scratchpad": "frame"})
 ```
 
 Parameters:
@@ -247,7 +254,7 @@ Exactly one of `from_scratchpad` or `base64` must be provided. Prefer `from_scra
 
 The bytes must decode to a supported raster image. PNG, JPEG, GIF, WebP, and BMP pass through unchanged; TIFF, ICO, HDR, EXR, TGA, PNM, QOI, DDS, and Farbfeld are auto-converted to PNG. Size cap is ~3.75 MB on the final payload.
 
-Only call `render_image` when the current model supports vision input.
+Only call `image_render` when the current model supports vision input.
 
 ## `conversation_search` / `conversation_read`
 

@@ -6,11 +6,11 @@ The scratchpad is a session-scoped working memory that the agent can use to stor
 
 - **Proactively**: The agent stores intermediate results (extracted text, API responses, research notes) for later use.
 - **Via `scratchpad` parameter**: any tool call carrying one has its output saved there instead of returned inline. See [Scratchpad parameter](./overview.md#scratchpad-parameter) for which tools advertise it.
-- **Automatically**: when a tool's output exceeds 30,000 bytes, it is saved under a generated name (e.g. `execute_command_a1b2c3_1`) and replaced with a preview. Reading the entry back is never treated that way: a `scratchpad_read` reply stays inline however large, sized to what fits in the context window (see `limit` below).
+- **Automatically**: when a tool's output exceeds 30,000 bytes, it is saved under a generated name (e.g. `shell_execute_a1b2c3_1`) and replaced with a preview. Reading the entry back is never treated that way: a `scratchpad_read` reply stays inline however large, sized to what fits in the context window (see `limit` below).
 
 ## Tools
 
-The whole family ships default-active; no `load_tool` round-trip is required to use any of them.
+The whole family ships default-active; no `tool_load` round-trip is required to use any of them.
 
 ### `scratchpad_write`
 
@@ -120,9 +120,9 @@ through the model.
 **Permission:** Workspace
 
 This is the one scratchpad tool that leaves meka's own storage, so it is the one that requires a
-level that can write. It reads as the scratchpad's `write_file` and is fenced identically: at
+level that can write. It reads as the scratchpad's `file_write` and is fenced identically: at
 `workspace` the path must resolve inside a workspace root, and the refusal is the same one
-`write_file` gives. Every other scratchpad tool stays at `read` because the scratchpad lives in
+`file_write` gives. Every other scratchpad tool stays at `read` because the scratchpad lives in
 the store, not your tree.
 
 | Name | Type | Required | Description |
@@ -146,7 +146,7 @@ The sub-agent's `scratchpad_read` falls back to the parent for an inherited name
 
 This is how a large captured output reaches a sub-agent without being re-inlined into the prompt.
 When you expect to delegate a result later, name it at the source with the `scratchpad` parameter
-(`execute_command({command: "...", scratchpad: "build_log"})`) so there is a semantic name to pass
+(`shell_execute({command: "...", scratchpad: "build_log"})`) so there is a semantic name to pass
 through.
 
 ## Lifecycle

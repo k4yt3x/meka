@@ -204,10 +204,10 @@ The most recent message's last content block and the user system prompt carry `c
 Caching is prefix-based: the tools array precedes the system prompt, which precedes the messages, so a byte changing early invalidates everything after it. meka is built so that nothing which changes mid-session sits in that prefix.
 
 - **The system prompt is fixed for a session.** It carries only the role description, permission model, standing instructions, guidelines, and OS/shell info, all resolved once at startup. The tool catalog, skill list, and MCP server instructions live in the per-turn `<context>` block instead, because all three can change while a session runs.
-- **The tools array only grows at the tail.** `load_tool` appends a schema rather than reordering. The array heads the prefix, so the request after a load still rewrites the whole cache once; what the append buys is that nothing else moves, and the request after that reads it all back.
+- **The tools array only grows at the tail.** `tool_load` appends a schema rather than reordering. The array heads the prefix, so the request after a load still rewrites the whole cache once; what the append buys is that nothing else moves, and the request after that reads it all back.
 - **Permission toggles cost nothing.** See [Permissions](../usage/permissions.md).
 
-Three things do legitimately invalidate it, all by necessity rather than oversight: compaction, which rewrites the head of the conversation; a `load_tool` call, which grows the tools array; and an MCP server withdrawing a tool via `tools/list_changed`, which removes it from the array. A change to the array re-caches everything behind it once, the system prompt included, and the following request reads it all back.
+Three things do legitimately invalidate it, all by necessity rather than oversight: compaction, which rewrites the head of the conversation; a `tool_load` call, which grows the tools array; and an MCP server withdrawing a tool via `tools/list_changed`, which removes it from the array. A change to the array re-caches everything behind it once, the system prompt included, and the following request reads it all back.
 
 You can see the effect directly: `/status` reports the cache hit ratio, and reads should dominate from the second turn onward.
 

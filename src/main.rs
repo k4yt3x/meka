@@ -977,7 +977,7 @@ mod tests {
     fn validate_valid_chain() {
         let mut log = build_log(vec![
             user_msg("hello"),
-            assistant_tool_use("c1", "read_file"),
+            assistant_tool_use("c1", "file_read"),
             tool_result("c1"),
             assistant_text("done"),
         ]);
@@ -990,7 +990,7 @@ mod tests {
     fn validate_orphaned_tool_use_dropped() {
         let mut log = build_log(vec![
             user_msg("hello"),
-            assistant_tool_use("c1", "read_file"),
+            assistant_tool_use("c1", "file_read"),
             // Missing tool_result for c1
             assistant_text("done"),
         ]);
@@ -1007,7 +1007,7 @@ mod tests {
     fn validate_orphaned_at_end() {
         let mut log = build_log(vec![
             user_msg("hello"),
-            assistant_tool_use("c1", "read_file"),
+            assistant_tool_use("c1", "file_read"),
         ]);
         log.sanitize_orphans();
         assert_eq!(log.len(), 1);
@@ -1018,7 +1018,7 @@ mod tests {
     fn validate_mismatched_ids() {
         let mut log = build_log(vec![
             user_msg("hello"),
-            assistant_tool_use("c1", "read_file"),
+            assistant_tool_use("c1", "file_read"),
             tool_result("c2"), // Wrong ID
         ]);
         log.sanitize_orphans();
@@ -1041,9 +1041,9 @@ mod tests {
     fn validate_multiple_chains() {
         let mut log = build_log(vec![
             user_msg("start"),
-            assistant_tool_use("c1", "read_file"),
+            assistant_tool_use("c1", "file_read"),
             tool_result("c1"),
-            assistant_tool_use("c2", "write_file"),
+            assistant_tool_use("c2", "file_write"),
             // Missing tool_result for c2
             assistant_text("done"),
         ]);

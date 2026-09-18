@@ -273,6 +273,25 @@ const MIGRATIONS: &[Migration] = &[
         name: "messages_are_indexed_by_kind",
         step: Step::Sql(MESSAGES_KIND_INDEX),
     },
+    // 0.60 names the meta-tool that loads a deferred schema `tool_load`. The active tool set is
+    // recovered each turn by scanning the conversation for that tool's calls by name, so a call
+    // stored under the old name would silently drop every tool a session had loaded.
+    Migration {
+        name: "tool_use_blocks_call_tool_load",
+        step: Step::Rust(tool_use_blocks_call_tool_load),
+    },
+    // 0.60 names every built-in `<noun>_<verb>` and splits `todo` into three; the calls, the
+    // sub-agent specs and the finished tasks a store holds take the new names here.
+    Migration {
+        name: "tool_calls_take_their_class_first_names",
+        step: Step::Rust(tool_calls_take_their_class_first_names),
+    },
+    // 0.60's names reach a scheduled job's gate too: a gate that calls a built-in by its old name
+    // would otherwise be withheld as naming no tool.
+    Migration {
+        name: "gate_tools_take_their_class_first_names",
+        step: Step::Rust(gate_tools_take_their_class_first_names),
+    },
 ];
 
 /// The inbox table. `appended_at` is written by the transaction that writes the conversation row
@@ -2174,6 +2193,351 @@ fn retag_thinking_block(block: &mut serde_json::Value) -> bool {
     true
 }
 
+/// Every stored call of the meta-tool that loads a deferred schema takes its 0.60 name.
+///
+/// A call lives in an assistant row's block list or inside a `repair` envelope's messages; the walk
+/// is generic over both. A `compact_boundary` row's snapshot names the tools a session loaded,
+/// never the meta-tool itself, so it is never selected.
+fn tool_use_blocks_call_tool_load(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, String)> = {
+        let mut statement = transaction
+            .prepare("SELECT id, content FROM messages WHERE content LIKE '%\"load_tool\"%'")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, content) in rows {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        if !rename_tool_use_names(&mut value, "load_tool", "tool_load") {
+            continue;
+        }
+        let encoded = match serde_json::to_string(&value) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+            }
+        };
+        transaction.execute(
+            "UPDATE messages SET content = ?1 WHERE id = ?2",
+            rusqlite::params![encoded, id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Rename every `tool_use` block under `value` whose `name` is `from` to `to`, at any depth, and
+/// report whether anything changed. A block's `input` is not descended into: arguments that happen
+/// to spell a block are the model's data, not a call.
+///
+/// Generic over the envelope on purpose. An assistant row is a list of blocks, a `repair` row nests
+/// messages in an envelope, and a session archive nests events in sessions; one walk serves the
+/// ledger step above and the archive decoder in `export.rs`, which is the one door outside this
+/// module that converts an older shape.
+pub(crate) fn rename_tool_use_names(value: &mut serde_json::Value, from: &str, to: &str) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            let is_call = object.get("type").and_then(|kind| kind.as_str()) == Some("tool_use");
+            let mut changed = false;
+            if is_call && object.get("name").and_then(|name| name.as_str()) == Some(from) {
+                object.insert(
+                    "name".to_string(),
+                    serde_json::Value::String(to.to_string()),
+                );
+                changed = true;
+            }
+            for (key, child) in object.iter_mut() {
+                if is_call && key == "input" {
+                    continue;
+                }
+                changed |= rename_tool_use_names(child, from, to);
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= rename_tool_use_names(item, from, to);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// Every 0.60 rename, old name to new, for the tools whose calls a store or an archive may hold.
+/// `todo` is not here: its split is by argument shape, see [`todo_name_0_60`].
+const RENAMES_0_60: &[(&str, &str)] = &[
+    ("edit_file", "file_edit"),
+    ("execute_command", "shell_execute"),
+    ("fetch_url", "web_fetch"),
+    ("find_files", "file_find"),
+    ("load_tool", "tool_load"),
+    ("read_file", "file_read"),
+    ("render_image", "image_render"),
+    ("search_contents", "file_search"),
+    ("write_file", "file_write"),
+];
+
+/// The three tools `todo` became, sorted.
+const TODO_NAMES_0_60: [&str; 3] = ["todo_edit", "todo_read", "todo_write"];
+
+/// The 0.60 name of `name`, when 0.60 renamed it.
+fn renamed_0_60(name: &str) -> Option<&'static str> {
+    RENAMES_0_60
+        .iter()
+        .find(|(from, _)| *from == name)
+        .map(|(_, to)| *to)
+}
+
+/// The 0.60 name of a `todo` call, by what it carried: a list to write, statuses to edit, or
+/// nothing to read. A call carrying both keeps `todo_write`, with its `set` left in the input:
+/// history is a record and is not replayed.
+fn todo_name_0_60(input: Option<&serde_json::Value>) -> &'static str {
+    let carries = |key: &str| {
+        input
+            .and_then(|input| input.get(key))
+            .is_some_and(|value| !value.is_null())
+    };
+    if carries("items") {
+        "todo_write"
+    } else if carries("set") {
+        "todo_edit"
+    } else {
+        "todo_read"
+    }
+}
+
+/// Apply every 0.60 rename under `value`, at any depth, and report whether anything changed: a
+/// `tool_use` block by its name (a `todo` call by its argument shape, its `input` otherwise left
+/// alone), and every `denied_tools` list, in which `todo` becomes its three members.
+///
+/// One walk serves the ledger step and the archive door in `export.rs`, the two places an older
+/// shape is converted.
+fn rename_tools_0_60(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            let is_call = object.get("type").and_then(|kind| kind.as_str()) == Some("tool_use");
+            let mut changed = false;
+            if is_call {
+                let renamed = match object.get("name").and_then(|name| name.as_str()) {
+                    Some("todo") => Some(todo_name_0_60(object.get("input"))),
+                    Some(name) => renamed_0_60(name),
+                    None => None,
+                };
+                if let Some(to) = renamed {
+                    object.insert(
+                        "name".to_string(),
+                        serde_json::Value::String(to.to_string()),
+                    );
+                    changed = true;
+                }
+            }
+            if let Some(list) = object
+                .get_mut("denied_tools")
+                .and_then(|list| list.as_array_mut())
+            {
+                let mut renamed_list = Vec::with_capacity(list.len());
+                let mut touched = false;
+                for entry in list.iter() {
+                    match entry.as_str() {
+                        Some("todo") => {
+                            renamed_list.extend(
+                                TODO_NAMES_0_60
+                                    .iter()
+                                    .map(|name| serde_json::Value::String((*name).to_string())),
+                            );
+                            touched = true;
+                        }
+                        Some(name) => match renamed_0_60(name) {
+                            Some(to) => {
+                                renamed_list.push(serde_json::Value::String(to.to_string()));
+                                touched = true;
+                            }
+                            None => renamed_list.push(entry.clone()),
+                        },
+                        None => renamed_list.push(entry.clone()),
+                    }
+                }
+                if touched {
+                    *list = renamed_list;
+                    changed = true;
+                }
+            }
+            for (key, child) in object.iter_mut() {
+                if is_call && key == "input" {
+                    continue;
+                }
+                changed |= rename_tools_0_60(child);
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= rename_tools_0_60(item);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// [`rename_tools_0_60`] over a sub-agent spec held as a JSON string, as the session row and the
+/// archive both hold it. `None` when nothing changed or the string is not JSON.
+fn rename_tools_0_60_in_spec(spec: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(spec).ok()?;
+    if !rename_tools_0_60(&mut value) {
+        return None;
+    }
+    serde_json::to_string(&value).ok()
+}
+
+/// The archive `format_version` 0.59 wrote: the one older version an import still reads.
+const ARCHIVE_FORMAT_0_59: u64 = 3;
+
+/// Bring a session archive written by an older meka to the current shape, reporting whether it
+/// was one. `current` is the version this build writes, handed in as data the way a [`Context`]
+/// is. An archive is not the store, so the ledger never reaches it; this is the archive's one
+/// conversion, and the number of the version it converts lives here and nowhere else.
+///
+/// 0.59's archive differs from the current shape only in the tool names 0.60 changed: the events
+/// are walked by [`rename_tools_0_60`], and each session's spec on its own, since it rides the
+/// archive as a string.
+pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u64) -> bool {
+    if document
+        .get("format_version")
+        .and_then(|version| version.as_u64())
+        != Some(ARCHIVE_FORMAT_0_59)
+    {
+        return false;
+    }
+    rename_tools_0_60(document);
+    if let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    {
+        for session in sessions {
+            let renamed = session
+                .get("subagent_spec_json")
+                .and_then(|spec| spec.as_str())
+                .and_then(rename_tools_0_60_in_spec);
+            if let Some(renamed) = renamed {
+                session["subagent_spec_json"] = renamed.into();
+            }
+        }
+    }
+    document["format_version"] = current.into();
+    true
+}
+
+/// Every stored call, sub-agent spec and finished task takes its 0.60 name.
+///
+/// A stale name in a stored call is display; in a `denied_tools` list it is a denial that has
+/// silently stopped applying, which is why specs are converted rather than tolerated. Rows are
+/// selected broadly and written only when the walk changed something, so a replay writes nothing.
+fn tool_calls_take_their_class_first_names(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT id, content FROM messages WHERE content LIKE '%\"type\":\"tool_use\"%'",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, content) in rows {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        if !rename_tools_0_60(&mut value) {
+            continue;
+        }
+        let encoded = match serde_json::to_string(&value) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+            }
+        };
+        transaction.execute(
+            "UPDATE messages SET content = ?1 WHERE id = ?2",
+            rusqlite::params![encoded, id],
+        )?;
+    }
+    let specs: Vec<(String, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT id, subagent_spec_json FROM sessions WHERE subagent_spec_json IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, spec) in specs {
+        if let Some(renamed) = rename_tools_0_60_in_spec(&spec) {
+            transaction.execute(
+                "UPDATE sessions SET subagent_spec_json = ?1 WHERE id = ?2",
+                rusqlite::params![renamed, id],
+            )?;
+        }
+    }
+    for (from, to) in RENAMES_0_60 {
+        transaction.execute(
+            "UPDATE background_tasks SET tool = ?2 WHERE tool = ?1",
+            rusqlite::params![from, to],
+        )?;
+    }
+    Ok(())
+}
+
+/// Every scheduled job whose gate calls a tool by name takes the tool's 0.60 name.
+///
+/// A gate names a read-only tool a watcher wants, `file_read` or `web_fetch` among the built-ins,
+/// and the scheduler withholds a job whose gate names no tool; left alone, every such job would
+/// stop firing on the first launch after the rename. The spec is one JSON value with the probe
+/// under `tool`, as `GateProbe` serializes it; only the name is touched.
+fn gate_tools_take_their_class_first_names(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    // A store an earlier build left without the gate columns has no gates to convert.
+    if !table_has_column(transaction, "scheduled_jobs", "gate_kind")?
+        || !table_has_column(transaction, "scheduled_jobs", "gate_spec_json")?
+    {
+        return Ok(());
+    }
+    let rows: Vec<(String, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT id, gate_spec_json FROM scheduled_jobs \
+             WHERE gate_kind = 'tool' AND gate_spec_json IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, spec) in rows {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&spec) else {
+            continue;
+        };
+        let Some(to) = value
+            .get("tool")
+            .and_then(|tool| tool.get("name"))
+            .and_then(|name| name.as_str())
+            .and_then(renamed_0_60)
+        else {
+            continue;
+        };
+        value["tool"]["name"] = serde_json::Value::String(to.to_string());
+        let encoded = match serde_json::to_string(&value) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+            }
+        };
+        transaction.execute(
+            "UPDATE scheduled_jobs SET gate_spec_json = ?1 WHERE id = ?2",
+            rusqlite::params![encoded, id],
+        )?;
+    }
+    Ok(())
+}
+
 /// A root row that recorded no level takes `[permissions].default` once `config.toml` reads.
 ///
 /// [`sessions_carry_approvals`] stamps such a row only when the caller could read the file, and
@@ -2700,6 +3064,15 @@ mod tests {
             ("names_follow_the_vocabulary", 13015232274362220399_u64),
             ("sessions_have_an_inbox", 5664388226393763354_u64),
             ("messages_are_indexed_by_kind", 3120448634739482323_u64),
+            ("tool_use_blocks_call_tool_load", 12114945205812471246_u64),
+            (
+                "tool_calls_take_their_class_first_names",
+                15307148509222958465_u64,
+            ),
+            (
+                "gate_tools_take_their_class_first_names",
+                1618890790364633461_u64,
+            ),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
         /// every column-zero function it calls, recursively. What a Rust step does is its body and
@@ -3148,12 +3521,294 @@ mod tests {
         );
     }
 
+    /// 0.60 renames `load_tool` to `tool_load`, and the active tool set is recovered by scanning
+    /// for that name, so a stored call under the old name is renamed where it is stored: in an
+    /// assistant row's block list and inside a `repair` envelope alike. Prose that merely mentions
+    /// the old name and a call whose arguments spell it are not calls and stay byte for byte; a
+    /// second run finds nothing to do.
+    #[tokio::test]
+    async fn stored_load_tool_calls_are_renamed_once() {
+        let directory = tempfile::tempdir().expect("a directory for the store");
+        let path = directory.path().join("meka.db");
+        let session = uuid::Uuid::new_v4().to_string();
+        let call = r#"[{"type":"tool_use","id":"t1","name":"load_tool","input":{"name":"mcp__notion__search"}}]"#;
+        let repair = r#"{"Repair":{"replaced_count":1,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"load_tool","input":{"name":"mcp__notion__fetch"}}]}]}}"#;
+        let prose = r#"[{"type":"text","text":"call \"load_tool\" first"}]"#;
+        let arguments = r#"[{"type":"tool_use","id":"t3","name":"memory_write","input":{"type":"tool_use","name":"load_tool"}}]"#;
+        {
+            let mut connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(BASELINE_0_42)
+                .expect("the baseline builds");
+            stopped_before(&mut connection, "tool_use_blocks_call_tool_load");
+            plant_session(&connection, &session);
+            plant_message_of_kind(&connection, &session, "assistant", call);
+            plant_message_of_kind(&connection, &session, "repair", repair);
+            plant_message_of_kind(&connection, &session, "assistant", prose);
+            plant_message_of_kind(&connection, &session, "assistant", arguments);
+        }
+
+        crate::store::Store::open(Some(&path), &Context::default())
+            .await
+            .expect("the store migrates on open");
+
+        let mut connection = rusqlite::Connection::open(&path).expect("reopen");
+        let after = stored_messages(&connection);
+        assert_eq!(after[0].1, call.replace("load_tool", "tool_load"));
+        assert_eq!(after[1].1, repair.replace("load_tool", "tool_load"));
+        assert_eq!(after[2].1, prose, "prose naming the old tool is not a call");
+        assert_eq!(after[3].1, arguments, "a call's arguments are not a call");
+
+        let transaction = connection.transaction().expect("transaction");
+        tool_use_blocks_call_tool_load(&transaction).expect("a replay");
+        transaction.commit().expect("commit");
+        assert_eq!(
+            stored_messages(&connection),
+            after,
+            "a second run changes nothing"
+        );
+    }
+
     fn plant_message(connection: &rusqlite::Connection, session: &str, role: &str, content: &str) {
         connection
             .execute(
                 "INSERT INTO messages (session_id, role, content, created_at) \
                  VALUES (?1, ?2, ?3, 'now')",
                 rusqlite::params![session, role, content],
+            )
+            .expect("a message to carry forward");
+    }
+
+    /// [`plant_message`] for a store past `columns_follow_one_naming_rule`, where the column is
+    /// `kind`.
+    /// 0.60 gives every built-in a `<noun>_<verb>` name and splits `todo` three ways. Every place
+    /// the store holds a tool name is converted: calls in assistant rows and `repair` envelopes,
+    /// `todo` calls by the shape of their arguments, the `denied_tools` of a sub-agent spec, and
+    /// a finished task's tool. A call's arguments are not calls and stay; a second run changes
+    /// nothing.
+    #[tokio::test]
+    async fn stored_calls_take_their_class_first_names() {
+        let directory = tempfile::tempdir().expect("a directory for the store");
+        let path = directory.path().join("meka.db");
+        let session = uuid::Uuid::new_v4().to_string();
+        let read = r#"[{"type":"tool_use","id":"a","name":"read_file","input":{"path":"x"}}]"#;
+        let write =
+            r#"[{"type":"tool_use","id":"b","name":"todo","input":{"title":"T","items":["x"]}}]"#;
+        let edit =
+            r#"[{"type":"tool_use","id":"c","name":"todo","input":{"set":{"1":"completed"}}}]"#;
+        let look = r#"[{"type":"tool_use","id":"d","name":"todo","input":{}}]"#;
+        let repair = r#"{"Repair":{"replaced_count":1,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"e","name":"execute_command","input":{"command":"ls"}}]}]}}"#;
+        let arguments =
+            r#"[{"type":"tool_use","id":"f","name":"tool_load","input":{"name":"read_file"}}]"#;
+        let spec = r#"{"permission":"read","denied_tools":["write_file","todo","memory_read"]}"#;
+        {
+            let mut connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(BASELINE_0_42)
+                .expect("the baseline builds");
+            stopped_before(&mut connection, "tool_calls_take_their_class_first_names");
+            plant_session(&connection, &session);
+            for content in [read, write, edit, look, arguments] {
+                plant_message_of_kind(&connection, &session, "assistant", content);
+            }
+            plant_message_of_kind(&connection, &session, "repair", repair);
+            connection
+                .execute(
+                    "UPDATE sessions SET subagent_spec_json = ?1 WHERE id = ?2",
+                    rusqlite::params![spec, session],
+                )
+                .expect("a spec");
+            connection
+                .execute(
+                    "INSERT INTO background_tasks \
+                         (id, session_id, tool, label, status, started_at) \
+                     VALUES ('task', ?1, 'execute_command', 'l', 'completed', 'now')",
+                    [&session],
+                )
+                .expect("a task");
+        }
+
+        crate::store::Store::open(Some(&path), &Context::default())
+            .await
+            .expect("the store migrates on open");
+
+        let mut connection = rusqlite::Connection::open(&path).expect("reopen");
+        let after = stored_messages(&connection);
+        assert_eq!(after[0].1, read.replace("read_file", "file_read"));
+        assert_eq!(after[1].1, write.replace("\"todo\"", "\"todo_write\""));
+        assert_eq!(after[2].1, edit.replace("\"todo\"", "\"todo_edit\""));
+        assert_eq!(after[3].1, look.replace("\"todo\"", "\"todo_read\""));
+        assert_eq!(after[4].1, arguments, "a call's arguments are not a call");
+        assert_eq!(
+            after[5].1,
+            repair.replace("execute_command", "shell_execute")
+        );
+        let spec_after: String = connection
+            .query_row(
+                "SELECT subagent_spec_json FROM sessions WHERE id = ?1",
+                [&session],
+                |row| row.get(0),
+            )
+            .expect("the spec");
+        assert_eq!(
+            spec_after,
+            r#"{"permission":"read","denied_tools":["file_write","todo_edit","todo_read","todo_write","memory_read"]}"#
+        );
+        let task_tool: String = connection
+            .query_row(
+                "SELECT tool FROM background_tasks WHERE id = 'task'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the task");
+        assert_eq!(task_tool, "shell_execute");
+
+        let transaction = connection.transaction().expect("transaction");
+        tool_calls_take_their_class_first_names(&transaction).expect("a replay");
+        transaction.commit().expect("commit");
+        assert_eq!(
+            stored_messages(&connection),
+            after,
+            "a second run changes nothing"
+        );
+    }
+
+    /// A gate that calls a built-in by name is the one place outside the conversation a stored
+    /// tool name decides behavior: the scheduler withholds a job whose gate names no tool. The
+    /// tool gate takes the 0.60 name, a shell gate is left byte for byte, and a second run
+    /// changes nothing.
+    #[tokio::test]
+    async fn stored_gates_name_their_tools_class_first() {
+        let directory = tempfile::tempdir().expect("a directory for the store");
+        let path = directory.path().join("meka.db");
+        let session = uuid::Uuid::new_v4().to_string();
+        let watcher = r#"{"tool":{"name":"read_file","arguments":{"path":"x"}},"when":"changed"}"#;
+        let shell = r#"{"shell":{"command":"gh pr checks"},"when":"changed"}"#;
+        {
+            let mut connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(BASELINE_0_42)
+                .expect("the baseline builds");
+            stopped_before(&mut connection, "gate_tools_take_their_class_first_names");
+            plant_session(&connection, &session);
+            for (id, kind, spec) in [("watch", "tool", watcher), ("checks", "shell", shell)] {
+                connection
+                    .execute(
+                        "INSERT INTO scheduled_jobs (id, session_id, kind, spec, prompt, \
+                             gate_kind, gate_spec_json, created_at, next_fire_at) \
+                         VALUES (?1, ?2, 'every', '6h', 'p', ?3, ?4, 'now', 'later')",
+                        rusqlite::params![id, session, kind, spec],
+                    )
+                    .expect("a gated job");
+            }
+        }
+
+        crate::store::Store::open(Some(&path), &Context::default())
+            .await
+            .expect("the store migrates on open");
+
+        let mut connection = rusqlite::Connection::open(&path).expect("reopen");
+        let gates = |connection: &rusqlite::Connection| -> Vec<(String, String)> {
+            let mut statement = connection
+                .prepare("SELECT id, gate_spec_json FROM scheduled_jobs ORDER BY id")
+                .expect("prepare");
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        };
+        let after = gates(&connection);
+        assert_eq!(after[0], ("checks".to_string(), shell.to_string()));
+        assert_eq!(
+            after[1],
+            (
+                "watch".to_string(),
+                watcher.replace("read_file", "file_read")
+            )
+        );
+
+        let transaction = connection.transaction().expect("transaction");
+        gate_tools_take_their_class_first_names(&transaction).expect("a replay");
+        transaction.commit().expect("commit");
+        assert_eq!(gates(&connection), after, "a second run changes nothing");
+    }
+
+    /// The archive door hands an older archive here and reads the answer: a 0.59 archive, whose
+    /// tool names are 0.60's concern, comes back in the current shape with every call, and the
+    /// `denied_tools` of its sub-agent spec, under the current names, and nothing past the door
+    /// sees an old one. Driven through the door itself, since that is the path an import takes.
+    #[test]
+    fn a_previous_archive_is_brought_forward_at_the_door() {
+        use crate::{
+            conversation::{ContentBlock, Event},
+            store::export::{SESSION_EXPORT_FORMAT_VERSION, parse_session_export},
+        };
+
+        let archive = serde_json::json!({
+            "format_version": 3,
+            "meka_version": "0.59.0",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "cwd": null,
+                "permission": "read",
+                "capabilities_json": null,
+                "profile": "work",
+                "subagent_spec_json": "{\"permission\":\"read\",\"denied_tools\":[\"write_file\",\"todo\"]}",
+                "stats": crate::stats::SessionStatsSnapshot::default(),
+                "events": [{
+                    "at": "2020-01-01T00:00:00Z",
+                    "event": {"Append": {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "t1", "name": "load_tool",
+                         "input": {"name": "mcp__notion__search"}},
+                        {"type": "tool_use", "id": "t2", "name": "read_file",
+                         "input": {"path": "x"}},
+                        {"type": "tool_use", "id": "t3", "name": "todo",
+                         "input": {"set": {"1": "completed"}}},
+                    ]}},
+                }],
+                "scratchpad_entries": {},
+            }],
+        });
+        let export = parse_session_export(archive.to_string().as_bytes())
+            .expect("an older archive is brought forward rather than refused");
+        assert_eq!(export.format_version, SESSION_EXPORT_FORMAT_VERSION);
+        let Event::Append(message) = &export.sessions[0].events[0].event else {
+            panic!("the event survives conversion");
+        };
+        let names: Vec<&str> = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["tool_load", "file_read", "todo_edit"]);
+        assert_eq!(
+            export.sessions[0].subagent_spec_json.as_deref(),
+            Some(
+                r#"{"permission":"read","denied_tools":["file_write","todo_edit","todo_read","todo_write"]}"#
+            )
+        );
+    }
+
+    fn plant_message_of_kind(
+        connection: &rusqlite::Connection,
+        session: &str,
+        kind: &str,
+        content: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO messages (session_id, kind, content, created_at) \
+                 VALUES (?1, ?2, ?3, 'now')",
+                rusqlite::params![session, kind, content],
             )
             .expect("a message to carry forward");
     }
@@ -4754,7 +5409,7 @@ mod tests {
                      VALUES ('s', 'out', 'c', 'now');
                  INSERT INTO background_tasks \
                      (id, session_id, tool_name, label, status, scratchpad_name, started_at) \
-                     VALUES ('t', 's', 'execute_command', 'l', 'completed', 'out', 'now');
+                     VALUES ('t', 's', 'shell_execute', 'l', 'completed', 'out', 'now');
                  INSERT INTO mcp_oauth_credentials (server_name, credentials_json, updated_at) \
                      VALUES ('docs', '{}', 'now');
                  INSERT INTO memories (name, description, recorded_at, updated_at, last_read_at) \
@@ -4809,7 +5464,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("the task row");
-        assert_eq!((tool.as_str(), entry.as_str()), ("execute_command", "out"));
+        assert_eq!((tool.as_str(), entry.as_str()), ("shell_execute", "out"));
         let server: String = connection
             .query_row("SELECT server FROM mcp_credentials", [], |row| row.get(0))
             .expect("the credential row");

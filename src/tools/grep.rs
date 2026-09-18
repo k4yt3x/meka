@@ -1,4 +1,4 @@
-//! `search_contents` tool: ripgrep-style content search powered by the `grep-*` crates, with glob
+//! `file_search` tool: ripgrep-style content search powered by the `grep-*` crates, with glob
 //! filtering.
 //!
 //! It does **not** honor `.gitignore`, despite the name suggesting ripgrep's behavior: the walk
@@ -30,7 +30,7 @@ pub(super) struct SearchContentsTool {
 impl Tool for SearchContentsTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "search_contents".to_string(),
+            name: "file_search".to_string(),
             description: format!(
                 "Search file contents using a regex pattern (powered by ripgrep). \
                  Avoid overly broad searches: scanning a large tree is slow \
@@ -42,7 +42,7 @@ impl Tool for SearchContentsTool {
                  scan if targeted attempts have all failed. Inline results are \
                  capped at {MAX_INLINE_MATCHES} matches; pass `limit` for fewer, or the \
                  `scratchpad` parameter to collect an unbounded result set. Multiple independent \
-                 search_contents calls in one assistant message run in parallel.",
+                 file_search calls in one assistant message run in parallel.",
             ),
             parameters: serde_json::json!({
                 "type": "object",
@@ -91,7 +91,7 @@ impl Tool for SearchContentsTool {
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let cancellation = context.cancellation.clone();
-        let pattern = require_str(&input, "pattern", "search_contents")?;
+        let pattern = require_str(&input, "pattern", "file_search")?;
         // An explicit `path` searches exactly that tree, resolved against the per-session cwd. With
         // no `path`, sweep every workspace root: in a multi-root ACP workspace, searching only
         // `cwd` silently misses whole folders the user can see in their editor. Carried as
@@ -102,7 +102,7 @@ impl Tool for SearchContentsTool {
             None => crate::workspace::search_roots(&self.site.cwd, &self.site.roots),
         };
         let file_glob = input["glob"].as_str().map(|s| s.to_string());
-        // Cap precedence, as `find_files` has it: an explicit `limit` wins, clamped to the inline
+        // Cap precedence, as `file_find` has it: an explicit `limit` wins, clamped to the inline
         // cap the way `memory_search` clamps its own; with none, `scratchpad` lifts the cap so the
         // agent can collect an unbounded result set.
         let max_results = match input.get("limit").and_then(serde_json::Value::as_u64) {
@@ -133,7 +133,7 @@ impl Tool for SearchContentsTool {
         // The search checks the same token per directory entry and stops on its own.
         let result = tokio::select! {
             joined = search => joined.map_err(|error| MekaError::ToolExecution {
-                tool_name: "search_contents".to_string(),
+                tool_name: "file_search".to_string(),
                 message: format!("task join error: {error}"),
             })??,
             _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
@@ -169,7 +169,7 @@ fn search_with_grep(
         .dfa_size_limit(DFA_SIZE_BYTES)
         .build(pattern)
         .map_err(|error| MekaError::ToolExecution {
-            tool_name: "search_contents".to_string(),
+            tool_name: "file_search".to_string(),
             message: format!("invalid or oversized regex '{pattern}': {error}"),
         })?;
 
@@ -219,7 +219,7 @@ fn search_with_grep(
         // at the store is the question, and a silent empty answer would read as "nothing there".
         if crate::workspace::resolves_into_private(path, private) {
             return Err(MekaError::ToolExecution {
-                tool_name: "search_contents".to_string(),
+                tool_name: "file_search".to_string(),
                 message: format!(
                     "'{}' is inside meka's own directories, which only `unrestricted` reads.",
                     path.display()
@@ -238,7 +238,7 @@ fn search_with_grep(
                 glob_pattern =
                     Some(
                         glob::Pattern::new(g).map_err(|error| MekaError::ToolExecution {
-                            tool_name: "search_contents".to_string(),
+                            tool_name: "file_search".to_string(),
                             message: format!("invalid glob pattern '{g}': {error}"),
                         })?,
                     );
@@ -264,7 +264,7 @@ fn search_with_grep(
     // path exists, and "does not exist" is a definitive answer the model will act on.
     if !searched_any && !timed_out {
         return Err(MekaError::ToolExecution {
-            tool_name: "search_contents".to_string(),
+            tool_name: "file_search".to_string(),
             message: format!(
                 "path '{}' does not exist",
                 search_paths
@@ -477,7 +477,7 @@ mod tests {
 
     use super::*;
 
-    /// `search_contents` below `unrestricted` refuses a `path` inside meka's own directories, and a
+    /// `file_search` below `unrestricted` refuses a `path` inside meka's own directories, and a
     /// walk from a root above them neither enters them nor follows a symlink into them. The
     /// database is searched as bytes, so a pattern for a key prefix pulled runs out of `meka.db`.
     #[tokio::test]
@@ -612,8 +612,8 @@ mod tests {
         assert!(result.text_content().contains("hello again"));
     }
 
-    /// The counterpart to `find_files`' nested-root test, pinning why the two tools use different
-    /// root sets. `search_contents` descends, so `search_roots` pruning `cwd` in favor of an
+    /// The counterpart to `file_find`' nested-root test, pinning why the two tools use different
+    /// root sets. `file_search` descends, so `search_roots` pruning `cwd` in favor of an
     /// ancestor genuinely loses nothing here. If that ever stops holding, this fails rather than
     /// the tool quietly reporting a file in `cwd` as absent.
     #[tokio::test]
@@ -749,7 +749,7 @@ mod tests {
     }
 
     /// An explicit `limit` beats the unbounded default `scratchpad` would otherwise apply, the
-    /// precedence `find_files` documents for its own `limit`.
+    /// precedence `file_find` documents for its own `limit`.
     #[tokio::test]
     async fn an_explicit_limit_beats_the_scratchpad_lift() {
         let temp_dir = tempfile::tempdir().expect("tempdir");

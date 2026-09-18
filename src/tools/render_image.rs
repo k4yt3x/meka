@@ -1,4 +1,4 @@
-//! `render_image` tool: turns base64 image data (provided inline or read from a scratchpad entry)
+//! `image_render` tool: turns base64 image data (provided inline or read from a scratchpad entry)
 //! into a multimodal Image content block so the provider can view it.
 
 use async_trait::async_trait;
@@ -23,7 +23,7 @@ pub(super) struct RenderImageTool {
 impl Tool for RenderImageTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "render_image".to_string(),
+            name: "image_render".to_string(),
             description: "View an image from in-memory base64 bytes or a scratchpad entry. \
                           Use this after producing image data via a command pipeline (e.g. \
                           `ffmpeg ... | base64 -w0`) to see the image directly, without \
@@ -71,7 +71,7 @@ impl Tool for RenderImageTool {
             }
             (None, None) => {
                 return Err(MekaError::ToolExecution {
-                    tool_name: "render_image".to_string(),
+                    tool_name: "image_render".to_string(),
                     message: "missing `from_scratchpad` or `base64` parameter".to_string(),
                 });
             }
@@ -81,14 +81,14 @@ impl Tool for RenderImageTool {
                         .session_id
                         .get()
                         .ok_or_else(|| MekaError::ToolExecution {
-                            tool_name: "render_image".to_string(),
+                            tool_name: "image_render".to_string(),
                             message: "no active session".to_string(),
                         })?;
                 self.store
                     .load_scratchpad_entry(session_id, name)
                     .await?
                     .ok_or_else(|| MekaError::ToolExecution {
-                        tool_name: "render_image".to_string(),
+                        tool_name: "image_render".to_string(),
                         message: format!("scratchpad entry '{name}' not found"),
                     })?
             }
@@ -114,11 +114,11 @@ impl Tool for RenderImageTool {
             None => "Image rendered from base64 input".to_string(),
         };
 
-        // Off the runtime; same reason as `read_file` and `fetch_url`.
+        // Off the runtime; same reason as `file_read` and `web_fetch`.
         tokio::task::spawn_blocking(move || build_image_tool_output(&marker, handling, &bytes))
             .await
             .map_err(|error| MekaError::ToolExecution {
-                tool_name: "render_image".to_string(),
+                tool_name: "image_render".to_string(),
                 message: format!("image decode task failed: {error}"),
             })
     }
