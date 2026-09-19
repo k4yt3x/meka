@@ -76,25 +76,23 @@ See the [documentation](https://docs.meka.run) for the full usage guide.
 
 ## Tools
 
-The agent has access to the following built-in tools:
+The agent has access to the following built-in tools, grouped by class:
 
-- `shell_execute`: run commands and read their output
-- `file_read` / `file_write` / `file_edit`: read, create, and modify files
-- `file_find`: find files by name or glob pattern
-- `file_search`: search file contents with regex, powered by ripgrep
-- `web_fetch`: fetch a web page as markdown
-- `scratchpad_*`: session-scoped working memory for intermediate results
-- `todo_write`, `todo_edit`, `todo_read`: structured task tracking, with live progress display
-- `memory_*`: notes that survive the session, loaded into every later one
-- `conversation_read` / `conversation_search`: re-read this session's history
-- `context_check` / `context_compact`: read the remaining window, or compact on purpose
-- `agent_*`: delegate to a sub-agent, which never exceeds your permission level
-- `skill_*`: load, search, and optionally author skills
+- `shell_execute`: run a shell command and read its output
+- `file_*`: read, write, edit, find, and search files
+- `web_fetch`: fetch a URL as markdown, raw HTML, or an image
+- `scratchpad_*`: session-scoped working memory, kept out of the context window
+- `todo_*`: track multi-step work in a task list shown in the terminal
+- `memory_*`: keep durable notes that outlive the session
+- `conversation_*`: search and re-read this session's full conversation
+- `context_*`: measure the live context window, or compact it
+- `agent_*`: delegate work to sub-agents and manage them
+- `skill_*`: read and search skills, or write and delete them when `agent_managed` is set
 - `schedule_*`: run a prompt later, once or repeatedly, optionally behind a gate
-- `task_list` / `task_cancel`: manage work the agent detached to the background
-- `image_render`: render an image into the conversation for vision models
-- `mcp_resource_*` / `mcp_prompt_*`: read or render content from MCP servers
-- `tool_load` / `tool_search`: fetch the full schema of a tool held back to keep the prompt small, or find one by keyword
+- `task_*`: list and cancel background tasks
+- `image_render`: view an image from base64 or a scratchpad entry
+- `mcp_*`: list, read, and subscribe to MCP resources, and render MCP prompts
+- `tool_*`: find a tool by keyword, or load a deferred tool's schema
 
 Run `meka tool list` for the current set with descriptions. Long-output tools take an optional `scratchpad` parameter to save their output there instead of returning it. See the [tool reference](https://docs.meka.run/tools/overview.html).
 
