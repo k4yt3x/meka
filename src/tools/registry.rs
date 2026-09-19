@@ -642,35 +642,6 @@ impl ToolRegistry {
         self.get(name).map(|tool| tool.required_permission())
     }
 
-    /// Returns tool definitions for the API call, excluding deferred tools. Permission-filtered
-    /// view, used by sub-agents which run at a fixed permission. The main agent uses
-    /// [`Self::definitions_active_with_loaded`] so the tools array remains byte-identical across
-    /// mid-session `/permission` toggles, keeping the Claude prompt cache warm on subsequent turns.
-    ///
-    /// With approvals on, a tool above the level is listed too: dispatch puts it to the user rather
-    /// than refusing it, so leaving it out would tell the sub-agent a tool it can use does not
-    /// exist.
-    pub(crate) fn definitions_for_permission(
-        &self,
-        permission: Permission,
-        approvals: bool,
-    ) -> Vec<ToolDefinition> {
-        let deferred = crate::sync::read(&self.deferred);
-        crate::sync::read(&self.tools)
-            .iter()
-            .filter(|tool| {
-                let definition = tool.definition();
-                let required = self
-                    .permission_overrides
-                    .get(&definition.name)
-                    .copied()
-                    .unwrap_or_else(|| tool.required_permission());
-                (approvals || permission.allows(required)) && !deferred.contains(&definition.name)
-            })
-            .map(|tool| tool.definition())
-            .collect()
-    }
-
     /// Slice-based convenience wrapper for tests: composes [`extract_loaded_tool_names`] with
     /// [`Self::definitions_active_with_loaded`]. Production code goes through the events-aware path
     /// (see [`crate::tools::load_tool::extract_loaded_tool_names_from_events`]) so
@@ -1825,25 +1796,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn definitions_for_permission_filters_by_level() {
-        let registry = tool_registry_for_test().await;
-
-        let none_tools = registry.definitions_for_permission(Permission::None, false);
-        assert!(none_tools.is_empty());
-
-        let read_tools = registry.definitions_for_permission(Permission::Read, false);
-        assert!(read_tools.iter().any(|t| t.name == "file_read"));
-        assert!(read_tools.iter().any(|t| t.name == "file_find"));
-        assert!(read_tools.iter().any(|t| t.name == "shell_execute"));
-        assert!(!read_tools.iter().any(|t| t.name == "file_write"));
-
-        let write_tools = registry.definitions_for_permission(Permission::Unrestricted, false);
-        assert!(write_tools.iter().any(|t| t.name == "file_read"));
-        assert!(write_tools.iter().any(|t| t.name == "file_write"));
-        assert!(write_tools.iter().any(|t| t.name == "shell_execute"));
-    }
-
-    #[tokio::test]
     async fn definitions_active_includes_write_tools() {
         let registry = tool_registry_for_test().await;
         let active = registry.definitions_active(&[]);
@@ -2282,13 +2234,25 @@ mod tests {
         let filter = BuiltinToolFilter::from_config(None, Vec::new(), overrides);
         let registry = tool_registry_for_test_with_filter(filter).await;
 
-        // At Read permission, file_read should now be excluded from the permission-filtered
-        // definitions because the override raised it to `unrestricted`.
-        let read_defs = registry.definitions_for_permission(Permission::Read, false);
-        assert!(!read_defs.iter().any(|t| t.name == "file_read"));
+        // At Read permission, file_read should now be excluded from the checkpoint
+        // tools because the override raised it to `unrestricted`.
+        let read_defs = registry.checkpoint_tools(
+            Permission::Read,
+            false,
+            Arc::new(std::sync::Mutex::new(None)),
+        );
+        assert!(!read_defs.iter().any(|t| t.definition().name == "file_read"));
 
-        let write_defs = registry.definitions_for_permission(Permission::Unrestricted, false);
-        assert!(write_defs.iter().any(|t| t.name == "file_read"));
+        let write_defs = registry.checkpoint_tools(
+            Permission::Unrestricted,
+            false,
+            Arc::new(std::sync::Mutex::new(None)),
+        );
+        assert!(
+            write_defs
+                .iter()
+                .any(|t| t.definition().name == "file_read")
+        );
     }
 
     #[tokio::test]

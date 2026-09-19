@@ -253,15 +253,7 @@ impl Tool for ScratchpadWriteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "scratchpad_write".to_string(),
-            description: "Store content in the scratchpad under the given name: a \
-                session-scoped working memory that persists across turns without consuming \
-                conversation context. If the name already exists, the content is overwritten. \
-                Use this to save intermediate results, extracted text, accumulated data, or \
-                research notes. You can also save tool output directly by adding a 'scratchpad' \
-                parameter to any tool call. When you are a sub-agent, names inherited \
-                read-only from the parent are refused here. Use a different name (e.g. \
-                'name_local') for your own state."
-                .to_string(),
+            description: "Create or overwrite a session-scoped scratchpad entry. Stored content survives compaction and is loaded on demand. Use it for working notes or intermediate results; a tool call's `scratchpad` parameter saves its output directly. Inherited parent entries are read-only.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -345,16 +337,11 @@ impl Tool for ScratchpadReadTool {
         ToolDefinition {
             name: "scratchpad_read".to_string(),
             description: format!(
-                "Read or search a scratchpad entry by name. Default returns {DEFAULT_READ_LIMIT} \
-                 bytes from offset; pass a larger `limit` to load the full entry in one call, \
-                 or page with `offset`/`limit` for partial reads. A read is never spilled back \
-                 to the scratchpad: it is cut to what fits in the context window now, and the \
-                 reply says where to continue. Provide `regex` to return matching lines (max \
-                 {MAX_SEARCH_MATCHES}) instead of a byte range. Also used to access content \
-                 referenced by <large-output> tags. Pass the `size` value from the tag as \
-                 `limit` when you intend to read everything. When this is a sub-agent and the \
-                 name is not found locally, looks up names from the parent's inherited \
-                 allowlist (see the system-prompt section if any).",
+                "Read a scratchpad entry, including `<large-output>` references and granted parent \
+                 entries. Returns up to {DEFAULT_READ_LIMIT} bytes, further limited by context \
+                 headroom; the result gives a continuation offset. Set `limit` to the entry's size \
+                 for a full read if it fits. `regex` returns up to {MAX_SEARCH_MATCHES} matching lines \
+                 instead of a byte range. Reads are not spilled back to the scratchpad."
             ),
             parameters: serde_json::json!({
                 "type": "object",
@@ -487,12 +474,7 @@ impl Tool for ScratchpadEditTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "scratchpad_edit".to_string(),
-            description: "Edit a scratchpad entry in place. Provide 'content' to fully \
-                overwrite, or 'old_string'/'new_string' for targeted string replacement \
-                (like file_edit). When you are a sub-agent, names inherited read-only \
-                from the parent are refused. Copy the content into your own entry first \
-                if you need to mutate it."
-                .to_string(),
+            description: "Edit a scratchpad entry. Supply either `content` to overwrite it, or `old_string` and `new_string` for replacement. Replacement changes the first match unless `replace_all` is true; duplicate matches are not refused. Inherited parent entries are read-only.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -729,18 +711,7 @@ impl Tool for ScratchpadMergeTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "scratchpad_merge".to_string(),
-            description: "Combine scratchpad entries into one entry without routing the bytes \
-                through the conversation, for collecting parallel sub-agent reports or any \
-                accumulated data. The entries go in the order given: `sources` first, in the \
-                order listed, then every own entry whose name starts with `prefix`, in name \
-                order. `format` controls the join: `concat_with_headers` (default) puts a \
-                `--- name ---` line before each entry's content, `concat` joins the contents \
-                with a newline, `json_array` parses each content as JSON (quoting one that is \
-                not) into one compact JSON array. The sources are kept as they are; nothing is \
-                deleted, and `target` is overwritten if it exists. A sub-agent cannot merge into \
-                a name inherited read-only from the parent, but may list inherited entries in \
-                `sources`; `prefix` selects only its own entries."
-                .to_string(),
+            description: "Combine entries without returning their contents inline. Joins `sources` in the given order, then own entries matching `prefix` in name order, excluding `target`. Keeps the sources and overwrites the target. Inherited entries may be sources but not the target.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -764,7 +735,7 @@ impl Tool for ScratchpadMergeTool {
                         "type": "string",
                         "enum": ["concat_with_headers", "concat", "json_array"],
                         "default": "concat_with_headers",
-                        "description": "How to join the source entries. Default: `concat_with_headers`."
+                        "description": "`concat_with_headers` adds entry-name headings; `concat` joins with newlines; `json_array` parses each entry as JSON, or quotes it as a string."
                     }
                 },
                 "required": ["target"]
@@ -1232,14 +1203,7 @@ impl Tool for ScratchpadSaveFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "scratchpad_save_file".to_string(),
-            description: "Write the contents of a scratchpad entry to a file on disk without \
-                routing the bytes through the conversation. Useful for persisting a sub-agent's \
-                report or a large extracted result. Mirrors `file_write`: creates parent \
-                directories, refuses to replace an existing file unless `force` is set, UTF-8 \
-                only. A path outside the workspace roots is refused unless the level is \
-                `unrestricted`. Sub-agents can save inherited entries (read from parent, write \
-                to disk) without copying through the model."
-                .to_string(),
+            description: "Save a scratchpad entry to a UTF-8 file without returning its contents inline. Creates parent directories and refuses to replace an existing file unless `force` is true. Workspace write boundaries apply. Inherited entries may be saved.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

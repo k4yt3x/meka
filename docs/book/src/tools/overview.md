@@ -35,7 +35,7 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`skill_write`](./overview.md#the-skill_-tools) | Read | Create or update a skill |
 | [`skill_delete`](./overview.md#the-skill_-tools) | Read | Delete a skill and its directory |
 | [`memory_write`](../usage/memory.md) | Read | Save a durable note that outlives the session |
-| [`memory_read`](../usage/memory.md) | Read | Load one saved memory in full |
+| [`memory_read`](../usage/memory.md) | Read | Read a saved memory, paging long bodies |
 | [`memory_search`](../usage/memory.md) | Read | Ranked full-text search over every memory |
 | [`memory_delete`](../usage/memory.md) | Read | Delete a saved memory |
 | [`image_render`](./overview.md#image_render) | Read | View an image from in-memory base64 or scratchpad |
@@ -85,7 +85,7 @@ Any built-in can be allow-listed, blocked, or have its required permission overr
 
 When [MCP servers](../configuration/config-file.md#mcpservers) are configured, their tools are registered under a namespaced name of the form `mcp__<server>__<tool>` (e.g. `mcp__notion__notion-search`). The `mcp__` prefix matches [Claude Code](https://github.com/anthropics/claude-code)'s convention and keeps MCP tools from colliding with built-in names. They appear in the per-turn context catalog alongside the built-ins, with their resolved permission level annotated inline, and are called the same way.
 
-meka also exposes seven built-in **MCP meta-tools** for browsing server-side resources and prompts. All are deferred by default; `tool_search` finds them, and `tool_load` with the exact name makes the schema available on the next turn:
+meka also exposes seven built-in **MCP meta-tools** for browsing server-side resources and prompts. All are deferred by default; `tool_search` finds them, and `tool_load` with the exact name makes the schema available on the next model request within the same turn:
 
 | Tool | Permission | Description |
 |------|-----------|-------------|
@@ -95,7 +95,7 @@ meka also exposes seven built-in **MCP meta-tools** for browsing server-side res
 | `mcp_prompt_get` | Read | Render a server prompt with arguments |
 | `mcp_resource_subscribe` | Read | Receive change notifications for a resource |
 | `mcp_resource_unsubscribe` | Read | Stop receiving change notifications |
-| `mcp_resource_updates_list` | Read | Inspect pending resource-change notifications |
+| `mcp_resource_updates_list` | Read | Inspect the latest recorded resource updates |
 
 ## Deferred tools
 
@@ -200,6 +200,8 @@ Multiple `agent_spawn` calls in one assistant turn run in parallel; useful when 
 
 Neither can be granted beyond what you hold yourself, so authority only narrows going down a chain of sub-agents. A sub-agent you gave no memory cannot give its own sub-agents any.
 
+**What it sees.** A sub-agent gets the same per-turn context the root does, over its own registry: the tool discovery index, the skill index, the memories it was granted, and the instructions of the MCP servers it is allowed to use. Its conversation, todo list and scratchpad entries are private; filesystem changes are shared within the workspace it was given.
+
 **Follow-up.** `agent_spawn` returns the sub-agent's id on the first line of its result, above the report. Keep it if you might have a second question: with it you can call `agent_followup` instead of re-spawning one that would have to rediscover everything.
 
 ## `agent_list` / `agent_followup` / `agent_steer` / `agent_delete`
@@ -292,8 +294,8 @@ Where `conversation_*` reads the **archive** (the full log on disk, including tu
 Using 84000 of 200000 tokens (42%).
 Headroom: 96000 tokens before the context ceiling at 90%. Auto-compaction fires there,
 between turns or between two of your tool rounds.
-Kept verbatim on compaction: about 16000 tokens of the most recent turns; everything
-older is replaced by a summary.
+Compaction may keep about 16000 tokens of recent rounds verbatim; the rest
+becomes a summary.
 Fixed overhead: about 12000 tokens of system prompt and tool schemas (estimated).
 Compaction does not reclaim this.
 Conversation: about 72000 tokens, which is the part compaction acts on.
@@ -304,7 +306,7 @@ This exists because the pushed `[Context budget]` block is rendered once, at the
 
 `context_compact` requests a compaction before the agent's next step. It runs once the current batch of tool calls finishes, and the turn then continues against the summary; one request is honored per turn.
 
-- `instructions`: what to preserve or drop. Takes precedence over the default summary sections.
-- `keep_recent`: whether to keep the most recent turns verbatim. Default `true`; `false` starts clean.
+- `instructions`: what to preserve or drop. Active restrictions, authorizations, and commitments must still be preserved.
+- `keep_recent`: allow recent rounds to be kept verbatim. Default `true`; a tail is kept only when enough older history can be summarized. `false` requests no retained tail.
 
 There is a third tool, `context_replace`, that exists only inside a checkpoint turn and is how the agent submits its summary. It is deliberately absent from the ordinary catalog and from `[tools]` configuration. See [Compacting a session](../usage/sessions.md#compacting-a-session).

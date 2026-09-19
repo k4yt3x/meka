@@ -207,16 +207,7 @@ impl Tool for FetchUrlTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "web_fetch".to_string(),
-            description: "Fetch a web page and return its content as markdown. Set 'raw' \
-                          to true to return untreated HTML. If the URL resolves to a \
-                          supported raster image (PNG, JPEG, GIF, WebP, BMP, TIFF, \
-                          ICO, HDR, EXR, TGA, PNM, QOI, DDS, or Farbfeld), the image \
-                          is returned as a multimodal content block directly. \
-                          Non-native formats are transparently converted to PNG. \
-                          `limit`, `regex`, and `raw` do not apply to image \
-                          responses. Only fetch image URLs if the current model \
-                          supports vision input."
-                .to_string(),
+            description: "Fetch a URL as Markdown, or raw HTML with `raw`. Supported raster images are returned as image content, with non-native formats converted to PNG; `limit`, `regex`, and `raw` do not apply to them. Request images only when image input is enabled.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

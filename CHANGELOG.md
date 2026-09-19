@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.61.0] - 2026-09-19
+
+### Added
+
+- `memory_read` accepts a character offset to continue reading long notes.
+
+### Changed
+
+- Agent guidance is shorter and states search limits, image support, and one-shot delivery rules.
+- Context summaries prioritize active work, constraints, and commitments over completed history.
+
+### Fixed
+
+- Agents retain live memory, tool, and execution guidance across compaction.
+- Sub-agents receive current tool, skill, memory, and permitted MCP server guidance.
+- Checkpoints and background notices name only tools that are registered.
+- Loading a tool no longer suggests calling one the level refuses.
+- Bulk skill updates stay within the same context budget as the initial index.
+
 ## [0.60.0] - 2026-09-18
 
 ### Added
@@ -2327,7 +2346,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.60.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.61.0...HEAD
+[0.61.0]: https://github.com/k4yt3x/meka/compare/0.60.0...0.61.0
 [0.60.0]: https://github.com/k4yt3x/meka/compare/0.59.0...0.60.0
 [0.59.0]: https://github.com/k4yt3x/meka/compare/0.58.0...0.59.0
 [0.58.0]: https://github.com/k4yt3x/meka/compare/0.57.0...0.58.0

@@ -32,17 +32,7 @@ impl Tool for SearchContentsTool {
         ToolDefinition {
             name: "file_search".to_string(),
             description: format!(
-                "Search file contents using a regex pattern (powered by ripgrep). \
-                 Avoid overly broad searches: scanning a large tree is slow \
-                 and will hit many directories the user has no read permission \
-                 for, producing noisy errors. Start with the smallest `path` \
-                 and a tight `glob` filter that plausibly contains the match; \
-                 if that returns nothing, widen the `path` by one level or \
-                 loosen the `glob`, and repeat. Only fall back to a tree-wide \
-                 scan if targeted attempts have all failed. Inline results are \
-                 capped at {MAX_INLINE_MATCHES} matches; pass `limit` for fewer, or the \
-                 `scratchpad` parameter to collect an unbounded result set. Multiple independent \
-                 file_search calls in one assistant message run in parallel.",
+                "Search file contents with a case-sensitive Rust regex. Directory walks skip dot-prefixed entries, `target`, `node_modules`, and symlinked directories; name an excluded path explicitly to search it. The `glob` filter matches filenames, not relative paths. Searches do not apply gitignore rules. Inline results are capped at {MAX_INLINE_MATCHES}; `scratchpad` without `limit` removes the match cap, not the search time budget."
             ),
             parameters: serde_json::json!({
                 "type": "object",
@@ -53,11 +43,11 @@ impl Tool for SearchContentsTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "File or directory to search in. Omit to search every workspace root (the working directory plus any additional roots listed in the environment context). Set it to narrow to the smallest subtree that can answer the question."
+                        "description": "File or directory to search in. Omit to search every workspace root (the working directory plus any additional roots listed in the environment context). Set it to search a specific file or subtree."
                     },
                     "glob": {
                         "type": "string",
-                        "description": "Glob pattern to filter files (e.g., '*.rs'). Strongly recommended when searching directories to avoid scanning unrelated files."
+                        "description": "Glob matched against each filename, not its relative path."
                     },
                     "limit": {
                         "type": "integer",

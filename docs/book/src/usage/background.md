@@ -2,7 +2,9 @@
 
 An ordinary tool call holds the turn open until it returns. That is right for reading a file and wrong for a twenty-minute build: the agent cannot answer anything else while it waits, and the alternative it reaches for on its own, `nohup … &` plus polling, gets no notification when the work is done.
 
-A **background tool call** returns immediately with a task id and delivers its result later, as its own turn.
+A **background tool call** returns immediately with a task id and delivers its result later while
+a resident host is running. A one-shot run waits at exit and prints the outcome without another
+model turn, so work needed for its answer should stay in the foreground.
 
 **Off by default.** Turn it on with:
 
@@ -25,14 +27,17 @@ Every other capability block (`[schedule]`, `[skills]`, `[memory]`) defaults on.
 Once enabled, every tool gains an optional `background` parameter, including tools from MCP servers, since a slow MCP call is exactly the kind worth detaching:
 
 ```text
-shell_execute({"command": "cargo test --all", "background": true})
+shell_execute({"command": "cargo test --all", "timeout_ms": 900000, "background": true})
 ```
+
+Background execution does not extend a tool's timeout. The example gives the command fifteen
+minutes; without `timeout_ms`, the shell's usual thirty-second timeout still applies.
 
 That returns something like:
 
 ```text
-Started in the background as task 7f3a1c22 (cargo test --all). It is still
-running; its result will be delivered to you when it finishes.
+Started in the background as task 7f3a1c22 (cargo test --all).
+See [Execution context] for result delivery.
 ```
 
 The agent then carries on. When the task ends, its outcome arrives as a new turn:
@@ -49,9 +54,8 @@ Running tasks also appear in the per-turn context under `[Background]`, so the a
 
 ```text
 [Background]
-Tasks you started and did not wait for, still running. Each will report to you
-on its own when it finishes; do not poll for them and do not start a second
-copy of work already listed here.
+Running tasks; do not duplicate their work.
+See [Execution context] for result delivery.
 
 - **7f3a1c22**: cargo test --all
 ```

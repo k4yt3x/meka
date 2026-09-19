@@ -110,13 +110,22 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
    request carries the conversation whole; the context ceiling and compaction are its only bound.
    The world state's `[Tool discovery]` index is bounded like the skills and memory indexes, in
    `prompt::render_tool_discovery`: summaries while the section fits 8 KB, names past it, and
-   past 200 names a count that points at `tool_search`. One renderer serves the world render and
-   the sub-agent system prompt, which lists the worker's own registry the same way because the
-   world render is skipped under a prompt override. `admit_tool_call` lives in `tools`, where
+   past 200 names a count that points at `tool_search`. Root agents and sub-agents share this
+   per-turn renderer over their own registries. Workers receive permitted server instructions and
+   granted memories here; their system prompts carry the role and granted standing instructions,
+   without repeating active tool descriptions. Skill updates use the same bounded renderer as the
+   initial skill index. The execution context states the active profile's image-input capability
+   and whether the host can deliver later turns. `admit_tool_call` lives in `tools`, where
    `tool_search` and `tool_load` consult it to say what a call would do before the model makes it.
 4. **Recovery.** A failed request goes through `TurnRecovery`, which decides between a retry, a
    degraded resend and a reported failure. Compaction runs when the context gauge says so, when the
-   model asks through `context_compact`, or when the user asks.
+   model asks through `context_compact`, or when the user asks. Checkpoint guidance is built from
+   that request's actual tool set. Summaries prioritize active constraints, authorizations, verified
+   progress, commitments, and the next action; compaction-specific focus does not override those
+   preservation requirements. Every compaction restores full live context before the agent's next
+   request, including memory, discovery, permission, and execution guidance. The world snapshot
+   advances only after the replacement is saved. Finished background outcomes are not delivered
+   again during this rebuild.
 5. **Output.** Text, thinking, tool indicators, approval prompts and elicitations all reach the
    user through the session's `Frontend`. The REPL, ACP and HTTP each implement it once; a
    sub-agent's `PermissionForwardingFrontend` forwards its approval prompts and notices to its

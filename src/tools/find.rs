@@ -36,29 +36,18 @@ impl Tool for FindFilesTool {
         ToolDefinition {
             name: "file_find".to_string(),
             description: format!(
-                "Find files matching a glob pattern (e.g., '**/*.rs', 'src/*.txt'). \
-                 Avoid overly broad searches: scanning a large tree can take \
-                 a long time and will hit many directories the user has no \
-                 read permission for, producing noisy errors. Start with the \
-                 smallest `path` and most specific `glob` that plausibly \
-                 contains the answer; if that returns nothing, widen the \
-                 `path` by one level or loosen the `glob`, and repeat. Only \
-                 fall back to a tree-wide scan if targeted attempts have all \
-                 failed. Inline results default to {DEFAULT_INLINE_RESULTS} entries; pass `limit` to \
-                 raise the cap or `scratchpad` to collect them all. \
-                 Multiple independent file_find calls in one assistant message \
-                 run in parallel.",
+                "Find paths matching a glob. Search the relevant workspace or subtree; avoid filesystem-wide scans unless needed. Inline results default to {DEFAULT_INLINE_RESULTS}; set `limit` to change the cap or `scratchpad` to collect all results within the search time budget."
             ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "glob": {
                         "type": "string",
-                        "description": "Glob pattern to match files against. Prefer narrow patterns over broad ones like `**/*`."
+                        "description": "Glob pattern to match files against."
                     },
                     "path": {
                         "type": "string",
-                        "description": "Directory to search in. Omit to search every workspace root (the working directory plus any additional roots listed in the environment context). Set it to narrow to the smallest subtree that can answer the question."
+                        "description": "Directory to search in. Omit to search every workspace root (the working directory plus any additional roots listed in the environment context). Set it to search a specific subtree."
                     },
                     "limit": {
                         "type": "integer",

@@ -79,13 +79,7 @@ impl Tool for ScheduleCreateTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "schedule_create".to_string(),
-            description: "Arrange for a prompt to be delivered to you at a future time, so you can \
-                act without the user asking again. Use for reminders (\"remind me in 20 minutes\"), \
-                recurring work (\"summarize my calendar every weekday morning\"), and watching \
-                something change. Give exactly one of `at`, `every`, or `cron`. The prompt is \
-                delivered as a turn with no human present, so write it as an instruction to \
-                yourself, including any context you will need and no longer have."
-                .to_string(),
+            description: "Schedule a self-contained prompt for this session. Give exactly one of `at`, `every`, or `cron`. A running scheduler must serve the session for the job to fire; a saved job alone does not keep meka running. Write the prompt as an unattended instruction, including the context it needs.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

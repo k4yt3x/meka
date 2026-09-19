@@ -708,9 +708,7 @@ impl Tool for ListMcpResourceUpdatesTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "mcp_resource_updates_list".to_string(),
-            description: "List all resources that have been reported as updated since \
-                          this meka session started. Rows are `<server>\\t<uri>\\t<unix_ts>`."
-                .to_string(),
+            description: "List the latest recorded update per resource in the shared MCP context, not just this session. The bounded in-memory log resets when the host restarts. Rows are `<server>\\t<uri>\\t<unix_ts>`.".to_string(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
             ..Default::default()
         }

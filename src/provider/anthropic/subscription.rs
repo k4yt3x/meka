@@ -3114,6 +3114,10 @@ mod tests {
 
         let u1_text = {
             let block = build_turn_context(TurnContext {
+                tools: &crate::prompt::AvailableTools::default(),
+                vision: true,
+                one_shot: false,
+                background_enabled: false,
                 permission: Permission::Read,
                 approvals: false,
                 todos: &crate::todo::TodoState::default(),
@@ -3146,6 +3150,10 @@ mod tests {
 
         let u2_text = {
             let block = build_turn_context(TurnContext {
+                tools: &crate::prompt::AvailableTools::default(),
+                vision: true,
+                one_shot: false,
+                background_enabled: false,
                 permission: Permission::Unrestricted,
                 approvals: false,
                 todos: &crate::todo::TodoState::default(),
@@ -3271,6 +3279,10 @@ mod tests {
         // Turn 1: empty history, fixture_deferred not yet exposed.
         let u1_text = {
             let block = build_turn_context(crate::prompt::TurnContext {
+                tools: &crate::prompt::AvailableTools::default(),
+                vision: true,
+                one_shot: false,
+                background_enabled: false,
                 permission: Permission::Unrestricted,
                 approvals: false,
                 todos: &crate::todo::TodoState::default(),

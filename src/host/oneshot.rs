@@ -232,8 +232,10 @@ pub(crate) async fn run_oneshot(
     sweep_expired_sessions(&config, &store).await?;
 
     // The same deps the long-lived hosts build, so all four hosts assemble a session identically.
-    let shared =
-        Arc::new(build_shared_deps(Arc::clone(&config), store.clone(), mcp_manager.clone()).await?);
+    let mut shared =
+        build_shared_deps(Arc::clone(&config), store.clone(), mcp_manager.clone()).await?;
+    shared.agent_options.one_shot = true;
+    let shared = Arc::new(shared);
     let providers = Arc::clone(&shared.providers);
     // A resumed session reopens where it was, not where this shell is. See
     // `resume_working_directory`.

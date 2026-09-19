@@ -1,6 +1,6 @@
 # Instructions
 
-Standing instructions are your own guidance to the agent, applied to every session on this machine. They land in the system prompt under a `## User Instructions` heading, and the model is told to treat them as hard constraints unless they conflict with safety requirements.
+Standing instructions are your own guidance to the agent, applied to every session on this machine. They land in the system prompt under a `## Standing instructions` heading, and the model is told to follow them within safety requirements.
 
 Use them for things that are true of your setup rather than of any one task:
 

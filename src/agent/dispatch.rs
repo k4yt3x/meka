@@ -490,17 +490,18 @@ impl Agent {
         });
         self.cells.background_tasks.attach(&task.id, join).await;
 
-        crate::tools::ToolOutput::text(
-            format!(
-                "Started in the background as task {} ({}). It is still running; its result will \
-                 be delivered to you when it finishes. Do not wait for it here. Use `task_list` to \
-                 check on it and `task_cancel` with \"{}\" to stop it.",
-                task.short_id(),
-                task.label,
-                task.short_id(),
-            ),
-            false,
-        )
+        let mut notice = format!(
+            "Started in the background as task {} ({}). See [Execution context] for result delivery.",
+            task.short_id(),
+            task.label,
+        );
+        if self.tool_registry.get("task_list").is_some() {
+            notice.push_str(" Use `task_list` for status.");
+        }
+        if self.tool_registry.get("task_cancel").is_some() {
+            notice.push_str(" Use `task_cancel` to stop it.");
+        }
+        crate::tools::ToolOutput::text(notice, false)
     }
 
     /// Invoke a tool and turn its failure into the output the model reads.

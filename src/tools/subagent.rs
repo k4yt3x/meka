@@ -249,36 +249,18 @@ pub(crate) fn profile_choices(materials: &crate::session::SessionMaterials) -> V
 /// `agent_spawn`'s schema, as a free function so a caller holding no tool can still name it.
 /// `profile_choices` is what the `profile` parameter offers; empty, the parameter is absent.
 pub(crate) fn agent_spawn_definition(profile_choices: &[String]) -> ToolDefinition {
-    let mut description = "Spawn a sub-agent to perform a research, analysis, or delegated task. \
-                      The sub-agent inherits the parent's permission level, has its own \
-                      private todo list and scratchpad, and returns a single text report. \
-                      Multiple agent_spawn calls in one turn run in parallel. Pass `skill` \
-                      to run an installed skill in the sub-agent. The skill's instructions \
-                      become the sub-agent's task; supply at least one of `prompt` or \
-                      `skill`. Use `inherit_scratchpad` to grant read-only access to \
-                      specific parent scratchpad entries by name so the sub-agent can \
-                      consume large captured output via `scratchpad_read` without you \
-                      re-inlining it in the prompt. Tip: when you expect to hand output to a \
-                      sub-agent later, set the `scratchpad` parameter on the originating \
-                      tool call (e.g. `shell_execute({command: \"...\", scratchpad: \
-                      \"build_log\"})`) so the entry has a semantic name you can pass \
-                      through `inherit_scratchpad`. Sub-agents may themselves spawn further \
-                      sub-agents up to a configured depth; tune a subtree's depth with \
-                      `max_depth`. Pass `permission` to run the sub-agent at a more \
-                      restricted level than your own (you can restrict but never escalate), \
-                      `writable_roots` to confine its writes to directories within your own \
-                      reach, and `deny_servers` / `deny_tools` to withhold MCP servers or \
-                      individual tools it would otherwise inherit. Restrictions only ever \
-                      accumulate: these add to whatever the installation already denies \
-                      sub-agents, and there is no way to grant back."
+    let mut description = "Assign a self-contained task to a sub-agent and receive its report. \
+        It has a private conversation, todo list, and scratchpad; filesystem changes are shared. \
+        Supply `prompt`, `skill`, or both. Grant needed context explicitly with `inherit_scratchpad`, \
+        `memory`, or `instructions`. Independent calls run concurrently; assign separate work to \
+        avoid conflicting edits. Permission and denial restrictions cannot exceed your own grants."
         .to_string();
     let mut parameters = serde_json::json!({
         "type": "object",
         "properties": {
             "prompt": {
                 "type": "string",
-                "description": "The task description for the sub-agent. Optional when \
-                                `skill` is given; otherwise required."
+                "description": "Self-contained task, scope, and expected result. The parent conversation is not copied. Optional when `skill` is given."
             },
             "skill": {
                 "type": "string",
@@ -295,21 +277,14 @@ pub(crate) fn agent_spawn_definition(profile_choices: &[String]) -> ToolDefiniti
             "inherit_scratchpad": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Names of the parent's scratchpad entries the sub-agent \
-                                is allowed to read. The sub-agent's `scratchpad_read` \
-                                falls back to the parent for these names; \
-                                `scratchpad_list` shows them with origin `inherited`. \
-                                Read-only: `scratchpad_write` / `_edit` / `_delete` \
-                                targeting an inherited name return an error so the \
-                                sub-agent can't silently shadow your copy. Names that \
-                                don't exist in the parent are silently skipped."
+                "description": "Parent scratchpad entry names to grant read-only. Missing names are skipped; inherited names cannot be overwritten."
             },
             "permission": {
                 "type": "string",
                 "enum": ["none", "read", "workspace", "unrestricted"],
                 "description": "Permission level for the sub-agent, never above your \
                                 own. Defaults to your current level; use a lower one \
-                                (e.g. \"read\") to sandbox risky work."
+                                to narrow its access."
             },
             "writable_roots": {
                 "type": "array",
@@ -331,24 +306,13 @@ pub(crate) fn agent_spawn_definition(profile_choices: &[String]) -> ToolDefiniti
                 "type": "string",
                 "enum": ["none", "read"],
                 "default": "none",
-                "description": "Grant the sub-agent read access to your memory store. \
-                                Defaults to \"none\": a sub-agent starts with a clean slate, \
-                                since memories from unrelated work are context it pays for \
-                                and reasons from. Grant \"read\" when the task genuinely \
-                                depends on what you have recorded. Sub-agents can never \
-                                write to the store; record anything worth keeping \
-                                yourself, from the sub-agent's report."
+                "description": "Grant read access to saved memories when the task needs them. Default: none. Sub-agents cannot write memories; preserve useful findings from their reports yourself."
             },
             "instructions": {
                 "type": "string",
                 "enum": ["none", "inherit"],
                 "default": "none",
-                "description": "Give the sub-agent the installation's instructions file. \
-                                Defaults to \"none\", because those instructions describe \
-                                you (your persona, how to address the user), and a \
-                                sub-agent is not you. Pass \"inherit\" when the task needs \
-                                the project's standing rules verbatim and quoting the \
-                                relevant ones into `prompt` would be lossy or expensive."
+                "description": "Pass `inherit` when the task needs the installation's standing rules. Default: none; task-specific constraints still belong in `prompt`."
             },
             "deny_servers": {
                 "type": "array",
@@ -1836,7 +1800,6 @@ async fn build_subagent(
     // worker talk to a 32k profile while auto-compacting against the 1M one the session had left.
     let parent_options = params.parent_options.clone();
     let sub_shared_perm = spec.shared_permission_bounded(parent_permission);
-    let effective_permission = spec.effective_permission(parent_permission.get());
     let denials = spec.denials();
     // Resolved once: it feeds both this worker's system prompt and what its own children can be
     // given. `None` here is what makes nesting self-enforcing: a worker that was not granted the
@@ -1974,35 +1937,12 @@ async fn build_subagent(
         })?;
     }
 
-    // Build the system prompt against the fully-loaded registry (which now includes MCP adapters).
-    // The override on `AgentOptions` is static, so this single build captures the whole catalog
-    // the sub-agent can see.
-    let tools = sub_registry
-        .definitions_for_permission(effective_permission, parent_permission.approvals());
-    // Gated on the registry rather than on the spec alone: `[memory] enabled = false` or a
-    // `[tools]` filter can leave a granted worker without `memory_read`, and an index describing
-    // memories it has no tool to open is pure cost. This mirrors how the root agent's index is
-    // gated on the same tool being in its catalog.
-    let memory_index = if sub_registry.get("memory_read").is_some() {
-        render_subagent_memory_index(&params.materials.memories.index().await.unwrap_or_else(
-            |error| {
-                // Search still works, and the worker is told what it has. A store that cannot be
-                // read is not a reason to refuse to spawn.
-                tracing::warn!("failed to read the memory index for a sub-agent: {error}");
-                Vec::new()
-            },
-        ))
-    } else {
-        String::new()
-    };
-    let catalog = sub_registry.tool_catalog();
+    let available = crate::prompt::AvailableTools::new(sub_registry.registered_tool_names());
     let sub_system_prompt = build_subagent_system_prompt(
-        effective_permission,
-        &tools,
-        &catalog,
+        parent_options.sandboxed_shell,
+        &available,
         &spec.inherited_scratchpad,
         granted_instructions.as_deref(),
-        &memory_index,
     );
 
     Ok(Agent::new_subagent(
@@ -2194,147 +2134,36 @@ fn compose_subagent_task(prompt: Option<&str>, skill_body: Option<&str>) -> Opti
     }
 }
 
-/// Ceiling on the memory index handed to a granted worker. Smaller than the root agent's 8 KiB
-/// budget on purpose: a worker was spawned for one task, and the store is background for it rather
-/// than the running context it is for the agent that owns the session.
-const SUBAGENT_MEMORY_INDEX_MAX_BYTES: usize = 4_096;
-
-/// Render the memory index for a worker granted `memory: "read"`.
-///
-/// Separate from the root agent's `[Memory]` section rather than shared with it, for two
-/// reasons. A sub-agent's system prompt is a static override, so it never receives the per-turn
-/// world state the parent's index rides in. And the parent's header tells the reader to call
-/// `memory_write` when it learns something durable, which a worker cannot do: pointing it at a
-/// tool it does not have is how a model burns a turn discovering the tool is missing.
-fn render_subagent_memory_index(memories: &[crate::memory::Memory]) -> String {
-    if memories.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from(
-        "## Memory\n\nDurable notes the agent that spawned you has saved, most important first. \
-         Call `memory_read` with a name to load one in full, or `memory_search` to search across \
-         all of them. You cannot add to or change this store: if you learn something worth \
-         keeping, say so in your report and let the agent that spawned you decide.\n\n",
-    );
-    let mut shown = 0;
-    for memory in memories {
-        // Sanitized at the boundary, like the root agent's index: the store hands back stored
-        // bytes, and this is a worker's context. Elided too, as the parent's index and both search
-        // renderers do: descriptions are unbounded at the write door, so a single 4,000-character
-        // one at the top of the store would exceed the whole budget on its own.
-        let line = format!(
-            "- **{}**: {}\n",
-            memory.name,
-            crate::entry::elide_description_for_index(
-                &crate::memory::render_description_for_model(&memory.description)
-            )
-        );
-        // Always emit the first, for the same reason `render_hits` does. The elide above is what
-        // actually makes a collapse to zero entries unreachable (`MAX_DESCRIPTION_CHARS` bounds
-        // one line far below this budget), so this branch is the belt to that brace, and holds if
-        // that bound ever moves. It is deliberately not something the tests can distinguish.
-        if shown > 0 && out.len() + line.len() > SUBAGENT_MEMORY_INDEX_MAX_BYTES {
-            break;
-        }
-        out.push_str(&line);
-        shown += 1;
-    }
-    // Same reason the parent states its remainder: a silently truncated index reads as "this is
-    // everything", which is what turns a full store into a confidently incomplete answer.
-    let remaining = memories.len() - shown;
-    if remaining > 0 {
-        out.push_str(&format!(
-            "\n{remaining} more not listed here. Use `memory_search` to reach them.\n"
-        ));
-    }
-    out.push('\n');
-    out
-}
-
-/// The sub-agent's system prompt.
-///
-/// `user_instructions` is `None` unless the `agent_spawn` call asked for them. Instructions are
-/// installation-wide and describe the root agent: its persona, how it should address the user,
-/// what it should volunteer. A worker handed a task by another agent is not that agent, and
-/// inheriting the persona unasked is how a sub-agent ends up talking to the user as though it were
-/// the one they are speaking to.
-///
-/// They remain *grantable* because they are also where project conventions live, and a parent that
-/// judges a task needs the standing rules can hand them over verbatim rather than paraphrasing them
-/// into the prompt.
+/// A worker's role and granted standing instructions. Live state uses the same per-turn renderer as
+/// the root.
 fn build_subagent_system_prompt(
-    permission: Permission,
-    tools: &[ToolDefinition],
-    catalog: &[crate::prompt::ToolCatalogEntry],
+    sandboxed_shell: bool,
+    available: &crate::prompt::AvailableTools,
     inherited_scratchpad: &[String],
     user_instructions: Option<&str>,
-    memory_index: &str,
 ) -> String {
-    let mut prompt = String::new();
+    let mut prompt = crate::prompt::build_system_prompt(sandboxed_shell, user_instructions);
     prompt.push_str(
-        "You are a research sub-agent. Complete the assigned task using the \
-         available tools, then produce a concise final report summarizing your \
-         findings. Do not ask follow-up questions. Work with what you have. \
-         For multi-step work, plan and track progress with the `todo_*` tools: \
-         `todo_write` sets the list, `todo_edit` updates statuses by task \
-         number, `todo_read` shows it. Your todo list is private to this \
-         sub-agent.\n\n",
+        "\n## Assignment\n\n\
+         You are a sub-agent reporting to your parent agent. Complete the assigned task without \
+         follow-up questions. Your conversation, todo list, and scratchpad entries are private; \
+         filesystem changes are shared within your granted workspace. Report the outcome, relevant \
+         evidence or verification, and unresolved limitations. User-facing persona instructions \
+         concern your parent; your response is a report to it.\n",
     );
-
-    prompt.push_str(&format!("## Permission Level: {permission}\n\n"));
-
-    if let Some(instructions) = user_instructions
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-    {
-        prompt.push_str("## User Instructions\n\n");
-        prompt.push_str(
-            "These are installation-specific rules, handed to you by the agent that spawned you. \
-             Treat them as hard constraints unless they conflict with safety requirements. They \
-             describe that agent's own conduct, so where they concern how to address the user or \
-             what to volunteer, they are context rather than instructions to you: your output goes \
-             back to that agent as a report, not to the user.\n\n",
-        );
-        prompt.push_str(instructions);
-        prompt.push_str("\n\n");
-    }
-
-    prompt.push_str(memory_index);
-
     if !inherited_scratchpad.is_empty() {
-        prompt.push_str("## Inherited Scratchpad Entries\n\n");
+        prompt.push_str("\n## Inherited scratchpad entries\n\n");
         prompt.push_str(
-            "Your parent agent has granted you read-only access to the following \
-             scratchpad entries from its own session. Use `scratchpad_read` with \
-             the exact names below to load them on demand. Do not assume their \
-             contents without reading. `scratchpad_write`, `_edit`, and `_delete` \
-             against these names will return an error; if you need to derive new \
-             state, save it under a different name (e.g. `<name>_local`).\n\n",
+            "These parent entries are read-only; use different names for your own entries.\n",
         );
+        if available.is_available("scratchpad_read") {
+            prompt
+                .push_str("Use `scratchpad_read` to read their contents before relying on them.\n");
+        }
         for name in inherited_scratchpad {
             prompt.push_str(&format!("- {name}\n"));
         }
-        prompt.push('\n');
     }
-
-    if !tools.is_empty() {
-        prompt.push_str("## Available Tools\n\n");
-        for tool in tools {
-            prompt.push_str(&format!("- **{}**: {}\n", tool.name, tool.description));
-        }
-        prompt.push('\n');
-    }
-
-    // The deferred half of the worker's registry, in the section the root reads in its world
-    // render and through the same function, so a worker's picture of the tools its parent's
-    // servers gave it never drifts from its parent's. The world render itself is skipped for a
-    // worker (`Agent::run_turn`, on the prompt override), so this is where the listing rides.
-    let discovery = crate::prompt::render_tool_discovery(catalog);
-    if !discovery.is_empty() {
-        prompt.push_str(&discovery);
-        prompt.push('\n');
-    }
-
     prompt
 }
 
@@ -2361,114 +2190,6 @@ mod tests {
         provider::{Provider, mock::text_round},
         store::Store,
     };
-
-    #[test]
-    fn subagent_system_prompt_reflects_inherited_permission() {
-        let prompt =
-            build_subagent_system_prompt(Permission::Unrestricted, &[], &[], &[], None, "");
-        assert!(
-            prompt.contains(&format!(
-                "## Permission Level: {}",
-                Permission::Unrestricted
-            )),
-            "expected Write level in prompt, got: {prompt}"
-        );
-
-        let read_prompt = build_subagent_system_prompt(Permission::Read, &[], &[], &[], None, "");
-        assert!(read_prompt.contains(&format!("## Permission Level: {}", Permission::Read)));
-    }
-
-    /// The installation's instructions describe the root agent, not a worker one of its turns
-    /// handed a task to. A sub-agent that inherited them would answer the user in the leader's
-    /// voice, under rules written for a conversation it is not part of.
-    #[test]
-    fn subagent_system_prompt_carries_no_user_instructions() {
-        let prompt =
-            build_subagent_system_prompt(Permission::Unrestricted, &[], &[], &[], None, "");
-        assert!(!prompt.contains("User Instructions"));
-        assert!(!prompt.contains("installation-specific"));
-    }
-
-    /// A worker holds every deferred tool its parent's servers gave it, so it is told about them
-    /// the way the root is: the same section, through the same function.
-    #[test]
-    fn subagent_system_prompt_lists_deferred_tools_for_discovery() {
-        let catalog: Vec<crate::prompt::ToolCatalogEntry> = vec![
-            (
-                "tool_search".to_string(),
-                "Search tools.".to_string(),
-                Permission::Read,
-                false,
-            ),
-            (
-                "mcp__notion__search".to_string(),
-                "Search Notion pages.".to_string(),
-                Permission::Read,
-                true,
-            ),
-        ];
-        let prompt = build_subagent_system_prompt(Permission::Read, &[], &catalog, &[], None, "");
-        assert!(prompt.contains("[Tool discovery]"), "{prompt}");
-        assert!(
-            prompt.contains("- **mcp__notion__search** (requires `read`): Search Notion pages."),
-            "{prompt}"
-        );
-        assert!(prompt.contains("`tool_search` finds a tool"), "{prompt}");
-    }
-
-    #[test]
-    fn subagent_system_prompt_has_no_discovery_section_without_deferred_tools() {
-        let catalog: Vec<crate::prompt::ToolCatalogEntry> = vec![(
-            "file_read".to_string(),
-            "Read a file.".to_string(),
-            Permission::Read,
-            false,
-        )];
-        let prompt = build_subagent_system_prompt(Permission::Read, &[], &catalog, &[], None, "");
-        assert!(!prompt.contains("[Tool discovery]"), "{prompt}");
-    }
-
-    #[test]
-    fn subagent_system_prompt_mentions_todo_tools() {
-        let prompt = build_subagent_system_prompt(Permission::Read, &[], &[], &[], None, "");
-        assert!(
-            prompt.contains("`todo_*` tools"),
-            "expected todo tool mention in prompt, got: {prompt}"
-        );
-    }
-
-    #[test]
-    fn subagent_system_prompt_omits_inheritance_section_when_empty() {
-        let prompt = build_subagent_system_prompt(Permission::Read, &[], &[], &[], None, "");
-        assert!(
-            !prompt.contains("Inherited Scratchpad"),
-            "no inherited section expected for empty allowlist, got: {prompt}"
-        );
-    }
-
-    #[test]
-    fn subagent_system_prompt_lists_inherited_names() {
-        let names = vec!["captured_output".to_string(), "research_notes".to_string()];
-        let prompt = build_subagent_system_prompt(Permission::Read, &[], &[], &names, None, "");
-        assert!(prompt.contains("## Inherited Scratchpad Entries"));
-        assert!(prompt.contains("- captured_output"));
-        assert!(prompt.contains("- research_notes"));
-        assert!(prompt.contains("scratchpad_read"));
-    }
-
-    #[test]
-    fn subagent_system_prompt_warns_inherited_writes_will_error() {
-        let names = vec!["build_log".to_string()];
-        let prompt = build_subagent_system_prompt(Permission::Read, &[], &[], &names, None, "");
-        assert!(
-            prompt.contains("will return an error"),
-            "expected write-rejection wording, got: {prompt}",
-        );
-        assert!(
-            prompt.contains("_local"),
-            "expected naming suggestion, got: {prompt}",
-        );
-    }
 
     #[test]
     fn compose_subagent_task_combinations() {
@@ -3203,6 +2924,7 @@ mod tests {
             memory_access: MemoryAccess::Write,
             config_denials: ToolDenials::default(),
             parent_options: AgentOptions {
+                one_shot: false,
                 streaming: false,
                 sandboxed_shell: false,
                 gate_tools: None,
@@ -4255,118 +3977,24 @@ mod tests {
         );
     }
 
-    /// A `memory: "read"` grant has to arrive with an index, or it is only half a grant:
-    fn memory_for_test(name: &str, priority: u8, description: &str) -> crate::memory::Memory {
-        crate::memory::Memory {
-            name: name.to_string(),
-            description: description.to_string(),
-            priority,
-            tags: Vec::new(),
-            created_at: std::time::SystemTime::UNIX_EPOCH,
-            updated_at: std::time::SystemTime::UNIX_EPOCH,
-            read_count: 0,
-            body: None,
-        }
-    }
-
-    /// `memory_read` takes an exact name, and a sub-agent never receives the per-turn world state
-    /// the root agent's `[Memory]` section rides in. Without this the worker holds two tools and
-    /// no idea what to call them with.
-    #[test]
-    fn a_granted_worker_gets_a_usable_memory_index() {
-        let index = [
-            memory_for_test("build-incantation", 1, "How this project is built"),
-            memory_for_test("review-style", 2, "What the user wants from a review"),
-        ];
-
-        let rendered = render_subagent_memory_index(&index);
-        assert!(rendered.contains("build-incantation"));
-        assert!(rendered.contains("How this project is built"));
-        assert!(rendered.contains("review-style"));
-        assert!(rendered.contains("memory_read"), "and how to open one");
-        // A worker cannot write, so it must not be told to. The root agent's header says to call
-        // `memory_write`, which is exactly why this renders separately.
-        assert!(
-            !rendered.contains("memory_write"),
-            "must not point a read-only worker at a tool it lacks: {rendered}"
-        );
-        assert!(rendered.contains("report"), "it reports instead");
-
-        // An empty store contributes nothing at all rather than an empty heading.
-        assert!(render_subagent_memory_index(&[]).is_empty());
-    }
-
-    /// A truncated index must say so. Reading as "this is everything" is what turns a full store
-    /// into a confidently incomplete answer.
-    #[test]
-    fn a_truncated_memory_index_states_its_remainder() {
-        let memories: Vec<crate::memory::Memory> = (0..400)
-            .map(|n| {
-                memory_for_test(
-                    &format!("memory-{n:03}"),
-                    1,
-                    &"a description long enough to make the budget bite".repeat(3),
-                )
-            })
-            .collect();
-        let rendered = render_subagent_memory_index(&memories);
-        assert!(
-            rendered.len() <= SUBAGENT_MEMORY_INDEX_MAX_BYTES + 200,
-            "budget respected"
-        );
-        assert!(rendered.contains("more not listed here"), "{rendered}");
-        assert!(rendered.contains("memory_search"), "and how to reach them");
-    }
-
-    /// One enormous description must not empty a granted worker's whole index.
-    ///
-    /// Descriptions are unbounded at the write door. With the budget checked before every push and
-    /// nothing elided, a single 4,000-character description at the top of the store would produce
-    /// a header promising memories followed by "N more not listed here", in a worker that had been
-    /// deliberately granted access to them.
-    #[test]
-    fn one_enormous_description_does_not_empty_the_subagent_index() {
-        let mut memories = vec![memory_for_test("enormous", 1, &"x".repeat(4_000))];
-        memories.extend(
-            (0..3).map(|n| memory_for_test(&format!("ordinary-{n}"), 3, "a short description")),
-        );
-
-        let rendered = render_subagent_memory_index(&memories);
-
-        assert!(
-            rendered.contains("**enormous**"),
-            "the first entry is always emitted: {rendered}"
-        );
-        assert!(
-            !rendered.contains(&"x".repeat(4_000)),
-            "and its description is elided rather than carried whole"
-        );
-        assert!(
-            rendered.contains("**ordinary-0**"),
-            "which leaves room for the rest of the store: {rendered}"
-        );
-        assert!(
-            rendered.len() <= SUBAGENT_MEMORY_INDEX_MAX_BYTES + 200,
-            "budget still respected: {} bytes",
-            rendered.len()
-        );
-    }
-
     /// The grant reaches the prompt, and its absence leaves no trace of the section.
     #[test]
     fn system_prompt_carries_instructions_only_when_granted() {
-        let ungranted = build_subagent_system_prompt(Permission::Read, &[], &[], &[], None, "");
-        assert!(!ungranted.contains("User Instructions"));
+        let ungranted = build_subagent_system_prompt(
+            false,
+            &crate::prompt::AvailableTools::default(),
+            &[],
+            None,
+        );
+        assert!(!ungranted.contains("Standing instructions"));
 
         let granted = build_subagent_system_prompt(
-            Permission::Read,
-            &[],
-            &[],
+            false,
+            &crate::prompt::AvailableTools::default(),
             &[],
             Some("Never use pip. Always prefer uv."),
-            "",
         );
-        assert!(granted.contains("## User Instructions"));
+        assert!(granted.contains("## Standing instructions"));
         assert!(granted.contains("Never use pip. Always prefer uv."));
         // The worker is told whose rules these are, so persona clauses read as context rather than
         // as an instruction to address the user directly.
@@ -4374,8 +4002,13 @@ mod tests {
 
         // Whitespace-only instructions are treated as absent, matching the root agent.
         assert!(
-            !build_subagent_system_prompt(Permission::Read, &[], &[], &[], Some("  \n "), "")
-                .contains("User Instructions")
+            !build_subagent_system_prompt(
+                false,
+                &crate::prompt::AvailableTools::default(),
+                &[],
+                Some("  \n ")
+            )
+            .contains("Standing instructions")
         );
     }
 
@@ -7194,5 +6827,143 @@ mod tests {
         // Released on drop, so a turn that errors or is canceled doesn't strand the worker.
         drop(first);
         assert!(FollowupGuard::claim(&in_flight, agent).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_worker_retains_its_live_world_after_mid_turn_compaction() {
+        let store = store_for_test().await;
+        let parent = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let mut params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent)),
+        );
+        params.parent_options.streaming = true;
+        params.parent_options.auto_compact = true;
+        params.parent_options.compact_checkpoint = true;
+        params.materials.memories = store.memory_store(true);
+        params
+            .materials
+            .memories
+            .write(crate::store::memory::WriteRequest {
+                name: "worker-note".into(),
+                description: Some("Review constraints".into()),
+                priority: Some(0),
+                tags: None,
+                body: Some("Keep the fixture unchanged.".into()),
+            })
+            .await
+            .expect("memory");
+        let manager = crate::mcp::McpClientManager::prepare(
+            &[
+                crate::config::McpServerConfig::for_test("visible"),
+                crate::config::McpServerConfig::for_test("hidden"),
+            ],
+            None,
+            None,
+            crate::mcp::McpClientContext::new(),
+        )
+        .await
+        .expect("manager");
+        manager
+            .server_entry("visible")
+            .expect("visible")
+            .record_instructions(Some("VISIBLE SERVER GUIDANCE".into()));
+        manager
+            .server_entry("hidden")
+            .expect("hidden")
+            .record_instructions(Some("HIDDEN SERVER GUIDANCE".into()));
+        params.materials.mcp_manager = Some(Arc::downgrade(&manager));
+        use crate::provider::mock::{MockEvent, MockStopReason};
+        let mock = Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::Usage {
+                    input_tokens: 190_000,
+                },
+                MockEvent::ToolUseStart {
+                    id: "load".into(),
+                    name: "tool_load".into(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({"name":"file_read"}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "summary".into(),
+                    name: "context_replace".into(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({"summary":"Continue reviewing the fixture."}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            text_round("report"),
+        ]));
+        let spawn = AgentSpawnTool {
+            parent_permission: params.cells.permission.clone(),
+            tool_builder_params: params.on_provider(mock.clone()),
+            inherited_denials: ToolDenials::default(),
+            remaining_depth: 1,
+            absolute_depth: 0,
+        };
+        let output = spawn.execute(serde_json::json!({"prompt":"Review the fixture", "memory":"read",
+            "deny_servers":["hidden"], "deny_tools":["todo_write","todo_edit","todo_read","memory_search"]}),
+            crate::tools::ToolContext::detached(CancellationToken::new())).await.expect("spawn");
+        assert!(!output.is_error, "{}", output.text_content());
+        let requests = mock.streams();
+        assert_eq!(
+            requests.len(),
+            2,
+            "the worker continues after the checkpoint"
+        );
+        assert_eq!(mock.completions().len(), 1, "one checkpoint");
+        assert!(
+            requests[1].messages[0]
+                .wire_text()
+                .contains("[Conversation summary from session compaction]")
+        );
+        for request in &requests {
+            let context = request
+                .messages
+                .iter()
+                .map(crate::conversation::Message::wire_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(context.contains("[Execution context]"), "{context}");
+            assert!(context.contains("Image input: enabled"), "{context}");
+            assert!(context.contains("[Tool discovery]"), "{context}");
+            assert!(context.contains("mcp_resource_list"), "{context}");
+            assert!(context.contains("worker-note"), "{context}");
+            assert!(context.contains("Keep the fixture unchanged."), "{context}");
+            assert_eq!(
+                context.matches("VISIBLE SERVER GUIDANCE").count(),
+                1,
+                "{context}"
+            );
+            assert!(!context.contains("HIDDEN SERVER GUIDANCE"), "{context}");
+            for name in ["todo_write", "todo_edit", "todo_read", "memory_search"] {
+                assert!(
+                    !request.system_prompt.contains(name),
+                    "{}",
+                    request.system_prompt
+                );
+                assert!(!context.contains(name), "{context}");
+                assert!(!request.tools.iter().any(|tool| tool.name == name));
+            }
+            let read = request
+                .tools
+                .iter()
+                .find(|tool| tool.name == "file_read")
+                .expect("read tool");
+            assert!(!request.system_prompt.contains(&read.description));
+        }
     }
 }

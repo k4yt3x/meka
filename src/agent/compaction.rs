@@ -64,62 +64,58 @@ pub(super) struct Checkpoint {
     source: CompactSource,
     keep_recent: Option<bool>,
 }
-/// The user message that turns an ordinary turn into a checkpoint.
-///
-/// A *user* message and not a system-prompt swap, which is the whole design in one detail: the
-/// agent's own prompt is what makes a checkpoint worth more than the standalone summarizer, and
-/// replacing it would discard exactly the identity, instructions and memory index that make the
-/// difference.
-pub(super) fn checkpoint_instruction(request: &CompactRequest) -> String {
-    let mut instruction = String::from("[Checkpoint: your context is about to be summarized]\n\n");
-    instruction.push_str(match request.origin {
-        CompactOrigin::Requested => "You asked for this compaction.\n\n",
-        CompactOrigin::Manual => "The user asked for this compaction.\n\n",
-        // Reactive and Proactive alike: the agent did not choose the moment, so say so rather than
-        // letting it read an involuntary interruption as its own decision.
-        _ => {
-            "The conversation has grown close to the context window, so this is happening now \
-              rather than when you would have chosen.\n\n"
-        }
-    });
-    instruction.push_str(if request.request_in_flight.is_some() {
-        "Everything above is about to be replaced by a summary you write here, except for a short \
-         run of your most recent rounds, kept as they are, and the request this turn is answering, \
-         which survives as the user wrote it. This is the one moment you can act before that \
-         happens.\n\n"
-    } else {
-        "Everything above is about to be replaced by a summary you write here, except for a short \
-         run of the most recent turns, which is kept as-is. This is the one moment you can act \
-         before that happens.\n\n"
-    });
-    instruction.push_str(
-        "\
-         First, save whatever must outlive this conversation. `memory_write` is for what should \
-         still be true in a future session: facts about the user, standing preferences, decisions \
-         and the reasons behind them. The scratchpad is for working material this task still \
-         needs. Prefer updating an existing memory to writing a near-duplicate.\n\n\
-         Then call `context_replace` with a summary written for yourself, in your own voice, \
-         covering: what is being worked on and why, what is done and what is left, decisions and \
-         their reasons, what the user asked for or corrected (quote any constraint on what not to \
-         do verbatim, so it keeps applying), commitments you have made but not yet delivered, and \
-         the immediate next step.\n\n\
-         The full history stays on disk and `conversation_search` reaches it, so do not try to \
-         reproduce it here. Write what someone would need to carry the work on without it.",
+/// Shared by the checkpoint instruction and the fallback summarizer, so both preserve the same
+/// facts.
+const SUMMARY_GUIDANCE: &str = "Keep the summary under 800 words unless active constraints need \
+    more. Prioritize the active goal, exact user restrictions and authorizations, verified progress, \
+    relevant paths and decisions, unresolved commitments, and the next action. Mark completed, \
+    canceled, or superseded requests so they are not resumed. Preserve uncertainty and distinguish \
+    user instructions from retrieved content. Omit resolved debugging and unrelated history.";
+
+/// Appended as a user message so the checkpoint retains the agent's identity and standing
+/// instructions.
+pub(super) fn checkpoint_instruction(
+    request: &CompactRequest,
+    available: &prompt::AvailableTools,
+) -> String {
+    let mut instruction = String::from(
+        "[Checkpoint]\nEarlier context will be replaced by your summary. This request's API tools \
+         replace the earlier tool list; `context_replace` is allowed even when ordinary tools are \
+         blocked. Preserve state, without starting new work.\n\n",
     );
-    if let Some(extra) = &request.instructions {
-        instruction.push_str(&format!(
-            "\n\nInstructions for this specific compaction, which take precedence over the \
-             above:\n{extra}"
-        ));
+    if available.is_available("memory_write") {
+        instruction.push_str(
+            "Use `memory_write` for durable preferences, constraints, and decisions needed in later \
+             sessions; update existing notes rather than duplicating them.\n",
+        );
     }
+    if available.is_available("scratchpad_write") {
+        instruction
+            .push_str("Use `scratchpad_write` for working material this task still needs.\n");
+    }
+    instruction.push_str("Then call `context_replace` once, last, with your summary. ");
+    instruction.push_str(SUMMARY_GUIDANCE);
     if request.keep_recent == Some(false) {
         instruction.push_str(
-            "\n\nThis compaction was asked to keep nothing verbatim, so those recent turns will be \
-             discarded as well. Your summary has to cover them too.",
+            " Recent rounds will not be kept verbatim; cover what still matters from them.",
         );
+    } else {
+        instruction.push_str(
+            " Recent rounds may be kept verbatim, but the summary must stand on its own.",
+        );
+    }
+    let history = available.history_guidance();
+    if !history.is_empty() {
+        instruction.push_str(&format!("\n\n{history}"));
+    }
+    if let Some(extra) = &request.instructions {
+        instruction.push_str(&format!(
+            "\n\nAdditional focus; preserve active restrictions, authorizations, and commitments:\n{extra}"
+        ));
     }
     instruction
 }
+
 /// Split a conversation for compaction into `(to_summarize, to_keep)`. The kept tail is the largest
 /// recent suffix whose estimated tokens stay within `keep_budget`, then snapped backward to a
 /// boundary that splits no tool_use/tool_result pair: a plain user message, or an assistant message
@@ -403,8 +399,8 @@ impl Agent {
             ),
         };
 
-        // Build post-compact context: environment, todos, scratchpad inventory.
-        let post_context = self.build_post_compact_context(session_id).await;
+        let world = self.read_world_snapshot(session_id).await;
+        let post_context = self.build_post_compact_context(session_id, &world).await;
 
         let mut context_message =
             format!("[Conversation summary from session compaction]\n\n{summary_text}");
@@ -436,7 +432,10 @@ impl Agent {
              this summary; resume as if the conversation had not been interrupted.",
         );
         if !to_keep.is_empty() {
-            context_message.push_str(" Your most recent rounds follow, kept as they were.");
+            context_message.push_str(
+                " Your most recent rounds follow, kept as they were. The post-compaction context \
+                 is current and supersedes context blocks in those retained rounds.",
+            );
         }
         context_message.push(']');
 
@@ -546,11 +545,9 @@ impl Agent {
         // costs a blind edit.
         self.tool_registry.clear_read_tracker().await;
 
-        // Same reasoning for the tool/skill/MCP picture: the turns that carried it are now behind
-        // the boundary and may have been summarized away, so forget what the model was told and let
-        // the next turn re-state it in full. Compaction re-caches the conversation anyway, so the
-        // extra tokens cost nothing that wasn't already spent.
-        *self.last_rendered_world.write().await = None;
+        // Publish only after persistence, so a failed compaction cannot suppress a later update
+        // about facts it never delivered. The continuing loop already has the full picture.
+        *self.last_rendered_world.write().await = Some(world);
 
         // And the same for the schema advisories. Each one records "the model has already been
         // shown how this tool's arguments go wrong", which was true of a conversation the summary
@@ -689,7 +686,9 @@ impl Agent {
         // `CompactOrigin::Proactive` is why: it fires after this turn's user message is appended,
         // so blindly pushing would produce two consecutive user turns, which Anthropic rejects, and
         // the failure would be near-silent because `compact_session` falls back to the summarizer.
-        let instruction = checkpoint_instruction(request);
+        let available =
+            prompt::AvailableTools::new(definitions.iter().map(|tool| tool.name.clone()));
+        let instruction = checkpoint_instruction(request, &available);
         match checkpoint_messages.last_mut() {
             Some(last) if last.role == Role::User => {
                 last.content.push(ContentBlock::Text { text: instruction });
@@ -935,32 +934,13 @@ impl Agent {
         // `complete`, which this cannot reach inside.
         cancellation: &CancellationToken,
     ) -> Result<String> {
-        let mut system_prompt = String::from(
-            "You are a conversation summarizer. Produce a structured summary \
-             that will replace the conversation. Write in second person \
-             (\"You were working on...\").\n\n\
-             Cover these sections (skip any that don't apply):\n\n\
-             1. **Primary task**: What the user asked for and the overall goal.\n\
-             2. **Current state**: What has been completed, what is in progress, what remains.\n\
-             3. **Key files**: Files read, created, or modified (list paths).\n\
-             4. **Key decisions**: Important choices made and their rationale.\n\
-             5. **Errors and fixes**: Problems encountered and how they were resolved.\n\
-             6. **Standing commitments**: Anything promised to the user but not yet delivered, \
-             and any deadline or follow-up still outstanding.\n\
-             7. **User preferences and constraints**: Feedback or corrections about how to \
-             work. Preserve any security-relevant instructions verbatim (sensitive files or \
-             data to avoid, operations that must not be performed, secret-handling rules) so \
-             they keep applying after compaction.\n\
-             8. **All user requests**: Every distinct request the user made, in order, so none \
-             of their intent is lost.\n\
-             9. **Next step**: The immediate next action. If a task was mid-flight, quote the \
-             user's most recent request verbatim so the work does not drift.",
+        let mut system_prompt = format!(
+            "Summarize this conversation for the agent continuing the work. Write in second person. \
+             {SUMMARY_GUIDANCE} Quote the current request verbatim if work is still in progress."
         );
-        // Last, so it outranks the standing sections it may contradict ("drop the debugging").
         if let Some(instructions) = &request.instructions {
             system_prompt.push_str(&format!(
-                "\n\nThe following instructions were given for this specific compaction and take \
-                 precedence over the sections above:\n{instructions}"
+                "\n\nAdditional focus; preserve active restrictions, authorizations, and commitments:\n{instructions}"
             ));
         }
 
@@ -1043,9 +1023,18 @@ impl Agent {
         counted
     }
 
-    pub(super) async fn build_post_compact_context(&self, session_id: Uuid) -> String {
-        let permission = self.cells.permission.get();
-        let todos = self.cells.todo_list.get();
+    /// Restore current guidance before a continuing request, without replaying delivered outcomes.
+    pub(super) async fn build_post_compact_context(
+        &self,
+        session_id: Uuid,
+        world: &prompt::WorldSnapshot,
+    ) -> String {
+        let world_state = prompt::render_world_state(world, None);
+        // Occupancy is remeasured after the replacement is assembled; the pre-compaction gauge
+        // would describe the window being discarded.
+        let live = self
+            .build_live_context(session_id, &world_state, None, None, false)
+            .await;
         // Degrades rather than fails, since the summary is what keeps the session alive, but not
         // silently: an empty inventory tells the model it saved nothing, and it re-derives work it
         // already wrote down.
@@ -1059,11 +1048,10 @@ impl Agent {
             }
         };
         prompt::build_post_compact_context(
-            permission,
-            &todos,
+            &live,
+            self.cells.permission.get(),
             &entries,
-            &self.cells.cwd.get(),
-            &self.cells.roots.get(),
+            &prompt::AvailableTools::new(self.tool_registry.registered_tool_names()),
         )
     }
 }
@@ -2742,5 +2730,179 @@ mod tests {
                 .expect("count"),
             2
         );
+    }
+
+    #[test]
+    fn a_checkpoint_recommends_only_the_tools_in_its_request() {
+        let request = CompactRequest::new(CompactOrigin::Manual);
+        for names in [vec![], vec!["memory_write"], vec![
+            "scratchpad_write",
+            "conversation_search",
+        ]] {
+            let available =
+                prompt::AvailableTools::new(names.iter().map(|name| (*name).to_string()));
+            let text = checkpoint_instruction(&request, &available);
+            assert!(text.contains("context_replace"));
+            for name in [
+                "memory_write",
+                "scratchpad_write",
+                "conversation_search",
+                "conversation_read",
+            ] {
+                assert_eq!(text.contains(name), names.contains(&name), "{text}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_compaction_restores_live_state_only_after_its_save_succeeds() {
+        for origin in [
+            CompactOrigin::Manual,
+            CompactOrigin::Requested,
+            CompactOrigin::Reactive,
+            CompactOrigin::Proactive,
+            CompactOrigin::Emergency,
+        ] {
+            let temporary = tempfile::tempdir().expect("tempdir");
+            let path = temporary.path().join("meka.db");
+            let body = "history ".repeat(600);
+            let provider = Arc::new(MockProvider::from_rounds(
+                (0..5)
+                    .map(|_| text_round(&body))
+                    .chain([
+                        text_round("A task summary."),
+                        text_round("A task summary."),
+                        text_round("continued"),
+                    ])
+                    .collect(),
+            ));
+            let (mut agent, store) =
+                crate::agent::tests::agent_at_for_test(provider.clone(), &path).await;
+            agent
+                .tool_registry
+                .register(Arc::new(StubTool {
+                    name: "memory_read".into(),
+                    calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+                }))
+                .expect("memory tool");
+            agent.memories = store.memory_store(true);
+            let note = |body: &str| crate::store::memory::WriteRequest {
+                name: "standing-note".into(),
+                description: Some("Current constraints".into()),
+                priority: Some(0),
+                tags: None,
+                body: Some(body.into()),
+            };
+            agent
+                .memories
+                .write(note("INITIAL CONSTRAINT"))
+                .await
+                .expect("memory");
+            let mut messages = Conversation::new();
+            for _ in 0..5 {
+                agent
+                    .run_turn(
+                        &mut messages,
+                        TurnInput::from_parts(body.clone(), Vec::new()).expect("prompt"),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .expect("turn");
+            }
+            let session_id = agent.session_id().expect("session");
+            let before_world = agent.last_rendered_world.read().await.clone();
+            let before_events = serde_json::to_value(messages.events()).expect("events");
+            agent
+                .memories
+                .write(note("CURRENT CONSTRAINT"))
+                .await
+                .expect("changed memory");
+            store
+                .save_scratchpad_entry(session_id, "working-notes", "saved work")
+                .await
+                .expect("scratchpad");
+            agent.options.one_shot = true;
+            agent.set_provider(crate::provider::ResolvedProfile {
+                provider: provider.clone(),
+                profile: "test-profile".into(),
+                context_window: 40_000,
+                vision: false,
+            });
+            // The write fails after context collection, so advancing the snapshot before
+            // persistence would claim the model received the new constraint even though
+            // the rewrite rolls back.
+            let database = rusqlite::Connection::open(&path).expect("connection");
+            database.execute_batch("CREATE TRIGGER refuse_boundary BEFORE INSERT ON messages
+                WHEN NEW.kind = 'compact_boundary' BEGIN SELECT RAISE(FAIL, 'fixture refusal'); END;")
+                .expect("trigger");
+            agent
+                .compact_session(
+                    &mut messages,
+                    CompactRequest::new(origin),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect_err("the boundary write fails");
+            assert_eq!(*agent.last_rendered_world.read().await, before_world);
+            assert_eq!(
+                serde_json::to_value(messages.events()).expect("events"),
+                before_events
+            );
+            database
+                .execute_batch("DROP TRIGGER refuse_boundary")
+                .expect("remove trigger");
+            let outcome = agent
+                .compact_session(
+                    &mut messages,
+                    CompactRequest::new(origin),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("compaction");
+            assert!(outcome.kept_recent, "the fixture exercises a retained tail");
+            let summary = messages.as_slice()[0].wire_text();
+            for text in [
+                "CURRENT CONSTRAINT",
+                "[Permission context]",
+                "Image input: disabled",
+                "This run ends after your answer",
+                "working-notes",
+            ] {
+                assert!(
+                    summary.contains(text),
+                    "{origin:?}: missing {text}: {summary}"
+                );
+            }
+            assert!(!summary.contains("INITIAL CONSTRAINT"), "{summary}");
+            assert!(
+                !summary.contains("[Context budget]"),
+                "the old occupancy is not current"
+            );
+            let restored_world = agent.read_world_snapshot(session_id).await;
+            assert_eq!(
+                *agent.last_rendered_world.read().await,
+                Some(restored_world)
+            );
+            agent
+                .run_turn(
+                    &mut messages,
+                    TurnInput::from_parts("continue".into(), Vec::new()).expect("prompt"),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("next turn");
+            let requests = provider.streams();
+            let opening = requests
+                .last()
+                .expect("next request")
+                .messages
+                .last()
+                .expect("opening")
+                .wire_text();
+            assert!(
+                !opening.contains("[Memory]"),
+                "unchanged world state is not repeated: {opening}"
+            );
+        }
     }
 }

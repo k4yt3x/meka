@@ -58,8 +58,8 @@ pub(crate) struct Agent {
     /// `Agent`; sub-agents route through `Agent::new` and so get their own.
     last_rendered_todo: tokio::sync::RwLock<Option<crate::todo::TodoState>>,
     /// The tool/skill/MCP picture the model was last shown. `None` means "tell it everything": a
-    /// fresh agent, or a compaction that may have summarized the earlier rendering away. Same
-    /// shape and reasoning as [`Self::last_rendered_todo`].
+    /// fresh or rewound conversation. Compaction publishes the snapshot restored into its saved
+    /// summary, so the continuing loop has that picture already.
     last_rendered_world: tokio::sync::RwLock<Option<crate::prompt::WorldSnapshot>>,
     /// Shared skill cache. Re-checks the on-disk snapshot at the top of each turn and re-discovers
     /// when something changed, so adds / removes / frontmatter edits land without restart.
@@ -349,6 +349,7 @@ impl Agent {
     ) -> Self {
         let options = AgentOptions {
             sandboxed_shell: parent_options.sandboxed_shell,
+            one_shot: parent_options.one_shot,
             // A sub-agent has no `[Scheduled]` section: the jobs belong to the parent's
             // session, and `new_subagent` gives it a session of its own.
             gate_tools: None,
@@ -463,7 +464,7 @@ impl Agent {
     /// world-state index makes `run_turn` believe it already told the model about a tool or MCP
     /// server whose announcement the rewind just deleted, so it never mentions it again.
     ///
-    /// `compact_session` clears the same two inline, since it rewrites the conversation itself.
+    /// Compaction replaces the world snapshot with the live context it restores into the summary.
     pub(crate) async fn reset_conversation_markers(&self) {
         self.last_accepted_len
             .store(LAST_ACCEPTED_UNKNOWN, std::sync::atomic::Ordering::Relaxed);
@@ -639,6 +640,7 @@ mod tests {
     ) -> Agent {
         let options = AgentOptions {
             streaming: true,
+            one_shot: false,
             sandboxed_shell: false,
             gate_tools: None,
             // 80 rather than the shipped default so the tests that switch compaction on keep

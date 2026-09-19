@@ -27,7 +27,7 @@ The directory holds two more things that are not config keys. Standing instructi
 └── skills/
 ```
 
-Write `instructions.md`, or split a large set across `instructions/*.md`, and meka reads it at startup into the `## User Instructions` section of the system prompt; see [Instructions](../usage/instructions.md). To pass the text as a string instead (containers, CI), use `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE`, or `--instructions`.
+Write `instructions.md`, or split a large set across `instructions/*.md`, and meka reads it at startup into the `## Standing instructions` section of the system prompt; see [Instructions](../usage/instructions.md). To pass the text as a string instead (containers, CI), use `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE`, or `--instructions`.
 
 Everything in that directory is content you put there, so it is safe to keep under version control. Commands that edit the config take a cross-process lock on the directory itself, as does claiming a skill store, so neither leaves a lock file behind; a write is published by renaming a short-lived `config.toml.<pid>.<seq>.tmp` over the target, so that name can appear for the duration of one write. If you are upgrading from a version that wrote `.config.toml.lock`, or `.meka-store.lock` inside a skill store, delete them: nothing reads or writes them any more.
 

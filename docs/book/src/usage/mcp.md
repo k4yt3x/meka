@@ -140,7 +140,7 @@ In addition to tools, meka exposes MCP resources and prompts through several bui
 | `mcp_prompt_get` | Render a prompt by `server` + `name` with optional `arguments`; returns `<role>: <text>` lines. |
 | `mcp_resource_subscribe` | Subscribe to `resources/updated` notifications for a specific URI. |
 | `mcp_resource_unsubscribe` | Cancel a prior subscription. |
-| `mcp_resource_updates_list` | Print every resource that has been reported as updated since the session started. |
+| `mcp_resource_updates_list` | List the latest recorded update per resource in the shared, bounded MCP context log; it resets when the host restarts. |
 
 ## Startup concurrency
 

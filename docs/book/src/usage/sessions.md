@@ -223,7 +223,7 @@ With `auto_compact = false` the conversation grows until the provider rejects a 
 
 ### Compacting a session
 
-When a session becomes too long, `/compact` replaces the older turns with a summary and keeps a token-budgeted tail of the most recent messages verbatim (snapped to a clean user-turn boundary so tool calls aren't split).
+When a session becomes too long, `/compact` replaces the older turns with a summary. A token-budgeted tail of recent messages may be kept verbatim, without splitting tool calls from their results. If too little older history remains to summarize, the whole conversation is summarized instead; an unanswered trailing prompt is still kept.
 
 By default the summary is written by **the agent itself**, in a *checkpoint turn* that runs before anything is discarded. The agent gets its real system prompt, its memory index, the full conversation, and a small set of tools, and is told its context is about to be replaced. It saves whatever must outlive the window (`memory_write` for facts and decisions that should still be true in a future session, the scratchpad for working material), then calls `context_replace` with the summary.
 
@@ -268,7 +268,7 @@ Turning it off leaves the standalone summarizer to write every summary, which sa
 
 ### Auto-compact
 
-When `auto_compact` is enabled (default: `true`), meka automatically compacts the conversation once it is past `context_ceiling_percent` of the context window (default: 90%). The check runs at three points. At the start of a turn it reads the last reported usage, which a resumed session takes from its row, so the first turn after a resume is checked against the real number. Before the first request it projects the request from an estimate, so a turn whose own input jumps over the ceiling is compacted before it is sent. And after every round of tool results inside a turn it reads that round's reported usage, so a long tool loop overshoots the line by one round rather than by the whole loop; the turn's most recent rounds are kept verbatim within the budget, its earlier ones are summarized with the history, the request the turn is answering is quoted after the summary as the user wrote it, and one crossing is answered once, until a later measurement reads under the line again. As a last resort, if the provider still rejects a request for exceeding the context window, meka compacts once and retries the turn instead of failing.
+When `auto_compact` is enabled (default: `true`), meka automatically compacts the conversation once it is past `context_ceiling_percent` of the context window (default: 90%). The check runs at three points. At the start of a turn it reads the last reported usage, which a resumed session takes from its row, so the first turn after a resume is checked against the real number. Before the first request it projects the request from an estimate, so a turn whose own input jumps over the ceiling is compacted before it is sent. And after every round of tool results inside a turn it reads that round's reported usage, so a long tool loop overshoots the line by one round rather than by the whole loop; the turn's most recent rounds may be kept verbatim within the budget, its earlier ones are summarized with the history, the request the turn is answering is quoted after the summary as the user wrote it, and one crossing is answered once, until a later measurement reads under the line again. As a last resort, if the provider still rejects a request for exceeding the context window, meka compacts once and retries the turn instead of failing.
 
 ```toml
 [session]
@@ -279,13 +279,13 @@ context_window = 200000  # optional override
 
 ### Agent-initiated compaction
 
-The agent doesn't have to wait for the ceiling. `context_compact` asks for a compaction before the agent's next step: it runs once the current batch of tool calls finishes, and the turn then carries on against the summary. With the default `keep_recent`, the tail keeps the most recent rounds within the verbatim budget, cut at a call so no call is parted from its result, and everything before that, the history and the current turn's earlier rounds alike, goes into the summary; the request the turn is answering is quoted after the summary as the user wrote it, so the turn continues against the user's words rather than a paraphrase. One compaction per turn: a further request once the first has run is ignored, and the agent can ask again on a later turn.
+The agent doesn't have to wait for the ceiling. `context_compact` asks for a compaction before the agent's next step: it runs once the current batch of tool calls finishes, and the turn then carries on against the summary. With the default `keep_recent`, a retained tail may keep the most recent rounds within the verbatim budget, cut at a call so no call is parted from its result, and everything before that, the history and the current turn's earlier rounds alike, goes into the summary; the request the turn is answering is quoted after the summary as the user wrote it, so the turn continues against the user's words rather than a paraphrase. One compaction per turn: a further request once the first has run is ignored, and the agent can ask again on a later turn.
 
 ```text
 context_compact(instructions: "the day's work is in memory now", keep_recent: false)
 ```
 
-`keep_recent: false` skips the verbatim tail entirely, so the summary is all that remains. That is the difference between compacting and turning the page, and it's what makes a "start of a new day" routine work: a scheduled job at midnight can write the day's diary to memory, then compact clean, instead of carrying yesterday's context forward indefinitely.
+`keep_recent: false` requests no verbatim tail. The checkpoint's own `context_replace` has the last word, and without a checkpoint the tail is kept, since nothing was saved. When the tail goes, the summary and the restored live context carry the work forward; an unanswered trailing prompt is still preserved. That is the difference between compacting and turning the page, and it's what makes a "start of a new day" routine work: a scheduled job at midnight can write the day's diary to memory, then compact clean, instead of carrying yesterday's context forward indefinitely.
 
 The request is parked rather than applied where it is made: a tool cannot rewrite the conversation the agent loop is holding. It is drained at the next boundary between rounds, once the batch's tool results are in, which is what lets the rest of the turn run against the summary.
 

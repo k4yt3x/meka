@@ -362,6 +362,9 @@ impl SessionCells {
 /// [`crate::permission::SharedPermission`] and `ToolRegistry`) rather than by mutating fields here.
 #[derive(Clone)]
 pub(crate) struct AgentOptions {
+    /// Whether the host exits after this turn rather than delivering later scheduled or background
+    /// turns.
+    pub(crate) one_shot: bool,
     /// When true, assistant responses stream token-by-token via `Provider::stream`; otherwise the
     /// agent uses the blocking `Provider::complete`.
     pub(crate) streaming: bool,
@@ -393,9 +396,8 @@ pub(crate) struct AgentOptions {
     pub(crate) mcp_grace: std::time::Duration,
     /// When `Some`, `run_turn` uses this string verbatim instead of invoking
     /// [`crate::prompt::build_system_prompt`]. Sub-agents set this to their stripped-down prompt
-    /// from `build_subagent_system_prompt`. The override is static; it does not see per-turn todo
-    /// updates or permission changes, which is fine for one-shot sub-agents whose tool list and
-    /// permission level are fixed at spawn time.
+    /// from `build_subagent_system_prompt`. Live tools, permissions and other session state still
+    /// arrive through the shared per-turn context.
     pub(crate) system_prompt_override: Option<String>,
     /// How to resolve a scheduled gate's tool when telling the model which of its jobs are held.
     ///
@@ -504,6 +506,7 @@ impl AgentOptions {
     ) -> Self {
         Self {
             streaming: config.streaming,
+            one_shot: false,
             sandboxed_shell,
             gate_tools,
             context_ceiling_percent: config.context_ceiling_percent,
@@ -520,6 +523,7 @@ impl AgentOptions {
     pub(crate) fn for_test() -> Self {
         Self {
             streaming: false,
+            one_shot: false,
             sandboxed_shell: false,
             gate_tools: None,
             context_ceiling_percent: crate::config::DEFAULT_CONTEXT_CEILING_PERCENT,

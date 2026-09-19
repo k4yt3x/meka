@@ -624,10 +624,8 @@ pub(crate) struct ResolvedProfile {
     pub(crate) profile: String,
     /// What the context gauge and the auto-compaction ceiling read.
     pub(crate) context_window: u64,
-    /// Whether this profile's model accepts image input. The agent does not read it: admitting an
-    /// attachment is the host's decision, made before a turn exists, and every host asks
-    /// `ResidentSession::accepts_images`, which reads this cell once the session's recorded
-    /// profile has reached the agent.
+    /// Whether this profile accepts image input. Hosts check it before accepting attachments; the
+    /// agent reports it in each turn's context so image-producing tools have the same guidance.
     pub(crate) vision: bool,
 }
 /// The profile a session runs on.

@@ -101,14 +101,9 @@ impl Tool for LoadToolTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: LOAD_TOOL_NAME.to_string(),
-            description: "Load the full schema for one or more deferred tools listed \
-                          under `[Tool discovery]` in the conversation context or found \
-                          with `tool_search`. After a successful call, each tool's full \
-                          schema becomes available on your next turn, and the result says \
-                          whether your current permission level allows a call. \
-                          Invoke the tools by name as usual. Pass exact tool names (e.g. \
-                          `mcp__notion__fetch`), either one as a string or several as an \
-                          array."
+            description: "Load schemas by exact tool name or a list of names. Resolved schemas \
+                are available on your next model request within this turn. The result reports \
+                permission eligibility; loading does not grant permission to execute."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -187,7 +182,7 @@ impl Tool for LoadToolTool {
             );
             if !is_deferred {
                 sections.push(format!(
-                    "Tool '{name}' is already available and {status}. Call it directly."
+                    "Tool '{name}' is already in the API catalog and {status}."
                 ));
                 continue;
             }
@@ -200,11 +195,6 @@ impl Tool for LoadToolTool {
             ));
         }
 
-        let plural = if names.len() == 1 {
-            "schema is"
-        } else {
-            "schemas are"
-        };
         // Say so when the cap bit. Loading 10 of 15 while reporting success would leave the model
         // believing it holds five schemas it has never seen, which is the exact failure this tool's
         // advisories exist to prevent.
@@ -221,16 +211,14 @@ impl Tool for LoadToolTool {
         } else {
             String::new()
         };
-        // Only claimed when something loaded: appended unconditionally, the trailer would follow an
-        // error with "The full schema is now available on your next turn".
+        // A completely failed load must not promise schemas on the next request.
         let body = if resolved == 0 {
             sections.join("\n\n---\n\n")
         } else {
             format!(
-                "{}\n\nThe full {} now available on your next turn. Call the tools directly with \
-                 the parameters above.{}",
+                "{}\n\nResolved schemas are available on your next model request within this turn. \
+                 Loading does not grant permission to execute.{}",
                 sections.join("\n\n---\n\n"),
-                plural,
                 capped,
             )
         };
@@ -261,8 +249,7 @@ impl Tool for ToolSearchTool {
                  `query` are matched against tool names and descriptions, near misses tolerated, \
                  best matches first, up to {TOOL_SEARCH_MAX_RESULTS} per call. Each result says \
                  whether your current permission level allows a call and whether the tool is \
-                 deferred, in which case `tool_load` fetches its schema or you can call it \
-                 directly."
+                 deferred. Use `tool_load` when its schema is absent from the API catalog."
             ),
             parameters: serde_json::json!({
                 "type": "object",
@@ -502,13 +489,15 @@ fn render_search(
             found.tool.runs_outside_confinement(),
             permission,
         );
-        out.push_str(&format!("- **{name}** (requires `{required}`)"));
+        out.push_str(&format!("- **{name}** (level `{required}`)"));
         if !summary.is_empty() {
             out.push_str(&format!(": {summary}"));
         }
         out.push_str(&format!("\n  {status}"));
         if deferred.contains(name) {
-            out.push_str("; deferred: call `tool_load` for the schema, or call it directly");
+            out.push_str(
+                "; deferred: use `tool_load` if its schema is absent from the API catalog",
+            );
         }
         out.push('\n');
     }
@@ -906,7 +895,7 @@ mod tests {
         let fixture = build_test_tool(ida_tools(), &["mcp__ida__xrefs_to"]);
         let text = search(&fixture, "xrefs").await.text_content();
         assert!(
-            status_of(&text, "mcp__ida__xrefs_to").contains("deferred: call `tool_load`"),
+            status_of(&text, "mcp__ida__xrefs_to").contains("deferred: use `tool_load`"),
             "{text}"
         );
         assert!(
@@ -1002,16 +991,23 @@ mod tests {
             .expect("a load answers");
         let text = output.text_content();
         assert!(
-            text.contains("Tool 'thing_read' is already available and is allowed at your level."),
+            text.contains(
+                "Tool 'thing_read' is already in the API catalog and is allowed at your level."
+            ),
             "{text}"
         );
         assert!(
             text.contains(
-                "Tool 'thing_write' is already available and is above your level (requires \
+                "Tool 'thing_write' is already in the API catalog and is above your level (requires \
                  `unrestricted`, you are at `read`); a call is refused."
             ),
             "{text}"
         );
+        let refused = text
+            .split("Tool 'thing_write'")
+            .nth(1)
+            .expect("refused tool section");
+        assert!(!refused.contains("Call it directly"), "{refused}");
     }
 
     /// A bare word is not a near miss of any namespaced name, so the edit-distance hint has
@@ -1051,7 +1047,7 @@ mod tests {
         assert!(text.contains("[Tool discovery]"));
         // And it must not also claim the schema arrived.
         assert!(
-            !text.contains("next turn"),
+            !text.contains("next model request within this turn"),
             "a load that resolved nothing must not promise a schema: {text}"
         );
     }
@@ -1101,7 +1097,7 @@ mod tests {
         // The schema body must be the actual tool's schema, not a placeholder.
         assert!(text.contains("\"url\""));
         assert!(text.contains("\"required\""));
-        assert!(text.contains("next turn"));
+        assert!(text.contains("next model request within this turn"));
     }
 
     #[tokio::test]
@@ -1126,7 +1122,7 @@ mod tests {
 
         assert!(!result.is_error);
         let text = result.text_content();
-        assert!(text.contains("already available"));
+        assert!(text.contains("already in the API catalog"));
         assert!(text.contains("file_read"));
         // Must NOT render the schema block; the model already has it.
         assert!(!text.contains("## Schema"));

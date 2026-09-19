@@ -404,6 +404,112 @@ pub(super) struct StreamProgress {
 }
 
 impl Agent {
+    /// Collect current facts for both turn openings and compaction, without claiming they were
+    /// delivered.
+    pub(super) async fn read_world_snapshot(&self, session_id: Uuid) -> prompt::WorldSnapshot {
+        let catalog = self.tool_registry.tool_catalog();
+        let skills = self.skills.current().await;
+        let (memories, memories_readable) = match prompt::memory_index_is_live(&catalog) {
+            false => (Vec::new(), true),
+            true => match self.memories.index().await {
+                Ok(memories) => (memories, true),
+                Err(error) => {
+                    tracing::warn!("failed to read the memory index: {error}");
+                    (Vec::new(), false)
+                }
+            },
+        };
+        let mcp_instructions = self
+            .tool_registry
+            .mcp_manager()
+            .map(|manager| {
+                manager
+                    .server_instructions()
+                    .into_iter()
+                    .filter(|(server, _)| !self.tool_registry.denials().denies_server(server))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        // Jobs can be changed by another client, so a cached list would miss cancellations and
+        // holds. Skipped when no tool opens the index, so `[schedule] enabled = false` pays no
+        // round trip per turn for a section nothing would render.
+        let scheduled = if prompt::schedule_index_is_live(&catalog) {
+            self.store
+                .schedule_store()
+                .list_scheduled_jobs(session_id)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!("failed to load scheduled jobs for context: {error}");
+                    Vec::new()
+                })
+        } else {
+            Vec::new()
+        };
+        let mut current =
+            prompt::WorldSnapshot::new(&catalog, &skills, &memories, &mcp_instructions, &scheduled)
+                .with_gate_authority(
+                    self.store.scheduler_memory(),
+                    &scheduled,
+                    self.cells.permission.get(),
+                    self.options.gate_tools.as_deref(),
+                );
+        // A failed read is not evidence of deletion. Preserve what was known, including across a
+        // compaction that removes the messages carrying it.
+        if !memories_readable && let Some(previous) = self.last_rendered_world.read().await.as_ref()
+        {
+            current.carry_memories_from(previous);
+        }
+        current
+    }
+
+    /// Use the same live capability and session-state rendering after compaction as at a turn
+    /// opening.
+    pub(super) async fn build_live_context(
+        &self,
+        session_id: Uuid,
+        world_state: &str,
+        budget: Option<prompt::ContextBudget>,
+        outcomes: Option<&str>,
+        resumed: bool,
+    ) -> String {
+        let catalog = self.tool_registry.tool_catalog();
+        // Running tasks are state; completed outcomes belong to the turn that delivers them and
+        // must not be delivered again by a context rebuild. Skipped when no `task_*` tool is
+        // registered, the default, so the usual installation pays no round trip for it.
+        let background_tasks = if prompt::background_index_is_live(&catalog) {
+            self.store
+                .background_store()
+                .list_running_background_tasks(session_id)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!("failed to load background tasks for context: {error}");
+                    Vec::new()
+                })
+        } else {
+            Vec::new()
+        };
+        let tools = prompt::AvailableTools::new(catalog.into_iter().map(|(name, ..)| name));
+        let todos = self.cells.todo_list.get();
+        let cwd = self.cells.cwd.get();
+        let roots = self.cells.roots.get();
+        prompt::build_turn_context(prompt::TurnContext {
+            tools: &tools,
+            vision: self.cells.profile.current().vision,
+            one_shot: self.options.one_shot,
+            background_enabled: self.tool_registry.background_enabled(),
+            permission: self.cells.permission.get(),
+            approvals: self.cells.permission.approvals(),
+            todos: &todos,
+            cwd: &cwd,
+            roots: &roots,
+            world_state,
+            budget,
+            background: &background_tasks,
+            outcomes,
+            resumed,
+        })
+    }
+
     /// Whether a turn could start right now, asked before anything irreversible is done for it.
     ///
     /// [`Self::run_turn`] gates on this itself, deliberately before it touches the conversation, so
@@ -581,102 +687,11 @@ impl Agent {
             }
         }
 
-        let permission = self.cells.permission.get();
-        let approvals = self.cells.permission.approvals();
-
-        let catalog = self.tool_registry.tool_catalog();
-        let skills = self.skills.current().await;
-        // A store that cannot be read degrades rather than failing the turn: this runs on every
-        // prompt, and a transient `SQLITE_BUSY` should not cost the turn itself.
-        //
-        // `memories_readable` is what stops that degradation becoming a lie: an empty `Vec` here is
-        // indistinguishable from an empty store, so the world-state diff would read it as every
-        // memory having been deleted and announce them all as written again on the next successful
-        // read. Skipped outright when no tool can open the index, exactly as the schedule and
-        // background reads are: `index()` materializes every row, and `WorldSnapshot::new` would
-        // then decline to render any of it. "Readable" for a store nobody asked about is `true`:
-        // nothing failed, so there is nothing for the diff to carry forward.
-        let (memories, memories_readable) = match prompt::memory_index_is_live(&catalog) {
-            false => (Vec::new(), true),
-            true => match self.memories.index().await {
-                Ok(memories) => (memories, true),
-                Err(error) => {
-                    tracing::warn!("failed to read the memory index: {error}");
-                    (Vec::new(), false)
-                }
-            },
-        };
-        let mcp_instructions = self
-            .mcp_manager()
-            .map(|manager| manager.server_instructions())
-            .unwrap_or_default();
-
-        // Tools, skills, and MCP instructions move mid-session, so they ride in the user message
-        // and only what changed since the model was last told is rendered. `world_state_rollback`
-        // is the snapshot before this turn claimed to have announced the change: a turn that fails
-        // early pops its user message, which is the only place the announcement lives, so the claim
-        // is withdrawn with it. Skipped for sub-agents, whose `system_prompt_override` already
-        // lists a tool set fixed at spawn. Read fresh each turn and rendered outside the
-        // world-state diff: running tasks are live state, like the todo list, not a record of what
-        // the model has been told. Skipped entirely when the `task_*` tools are unregistered, which
-        // is the default.
-        let background_tasks =
-            match prompt::background_index_is_live(&catalog).then_some(session_id) {
-                Some(id) => self
-                    .store
-                    .background_store()
-                    .list_running_background_tasks(id)
-                    .await
-                    .unwrap_or_else(|error| {
-                        tracing::warn!("failed to load background tasks for context: {error}");
-                        Vec::new()
-                    }),
-                None => Vec::new(),
-            };
-
-        let (world_state, world_state_rollback) = if self.options.system_prompt_override.is_some() {
-            (String::new(), None)
-        } else {
-            // Read fresh rather than cached: a job can be added or canceled by `meka schedule`, by
-            // another attached client, or by the scheduler retiring a fired one-shot, none of which
-            // pass through this agent. Skipped outright when the tool that opens the index is not
-            // registered: without this an installation with `[schedule] enabled = false` pays a
-            // database round trip on every single turn for a section that will be discarded.
-            let scheduled = match prompt::schedule_index_is_live(&catalog).then_some(session_id) {
-                Some(id) => self
-                    .store
-                    .schedule_store()
-                    .list_scheduled_jobs(id)
-                    .await
-                    .unwrap_or_else(|error| {
-                        tracing::warn!("failed to load scheduled jobs for context: {error}");
-                        Vec::new()
-                    }),
-                None => Vec::new(),
-            };
-            let mut current = prompt::WorldSnapshot::new(
-                &catalog,
-                &skills,
-                &memories,
-                &mcp_instructions,
-                &scheduled,
-            )
-            // The live level, not the one recorded on the row: this answers "can it fire *now*",
-            // which is the same question `prepare` asks a moment later on the scheduler's thread.
-            .with_gate_authority(
-                self.store.scheduler_memory(),
-                &scheduled,
-                self.cells.permission.get(),
-                self.options.gate_tools.as_deref(),
-            );
+        // The snapshot rolls back with a withdrawn opening; compaction publishes its own snapshot
+        // only after saving the replacement context.
+        let current = self.read_world_snapshot(session_id).await;
+        let (world_state, world_state_rollback) = {
             let mut last = self.last_rendered_world.write().await;
-            // An unreadable store carries the previous snapshot's memories forward, so the diff
-            // compares that half against itself and says nothing about it; advancing to an empty
-            // list would announce the whole store as deleted. Nothing to carry (the first turn of a
-            // session) leaves the list empty, which renders no `[Memory]` section at all.
-            if !memories_readable && let Some(previous) = last.as_ref() {
-                current.carry_memories_from(previous);
-            }
             let rendered = prompt::render_world_state(&current, last.as_ref());
             let previous = last.replace(current);
             drop(last);
@@ -690,23 +705,15 @@ impl Agent {
         // `crate::tools::subagent::AgentFollowupTool`.
         let resumed = messages.take_resumed_notice();
 
-        let context_block = {
-            let todos = self.cells.todo_list.get();
-            let cwd = self.cells.cwd.get();
-            let roots = self.cells.roots.get();
-            prompt::build_turn_context(prompt::TurnContext {
-                permission,
-                approvals,
-                todos: &todos,
-                cwd: &cwd,
-                roots: &roots,
-                world_state: &world_state,
-                budget: Some(self.context_budget(session_id).await),
-                background: &background_tasks,
-                outcomes: outcomes.as_deref(),
+        let context_block = self
+            .build_live_context(
+                session_id,
+                &world_state,
+                Some(self.context_budget(session_id).await),
+                outcomes.as_deref(),
                 resumed,
-            })
-        };
+            )
+            .await;
         // What arrived for the session since its last turn rides this one's opening, whoever
         // started it: read here, where every turn passes, rather than at each host's door, and
         // read as late as possible, right ahead of the save that stamps it, so a withdrawal has
@@ -4854,9 +4861,6 @@ mod tests {
             agent_with_registry_for_test(provider as Arc<dyn Provider>, registry).await;
         agent.store = store.clone();
         agent.memories = memories.clone();
-        // The harness builds sub-agent-shaped agents, and a `system_prompt_override` skips the
-        // per-turn world state entirely, which is the block under test.
-        agent.options.system_prompt_override = None;
 
         let mut messages = Conversation::new();
         agent
@@ -7105,7 +7109,10 @@ mod tests {
             })
             .collect();
         assert!(results.contains("Started in the background"), "{results}");
-        assert!(results.contains("task_cancel"), "{results}");
+        assert!(
+            !results.contains("task_cancel"),
+            "the fixture has no cancellation tool: {results}"
+        );
 
         let running = store
             .background_store()
@@ -7860,6 +7867,58 @@ mod tests {
                 "question 0",
                 "the request opens on the conversation's first message"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_context_tracks_the_profile_and_host_without_unavailable_task_tools() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            text_round("first"),
+            text_round("second"),
+        ]));
+        let registry = crate::tools::ToolRegistry::new();
+        registry.enable_background();
+        let (mut agent, _store) = agent_with_registry_for_test(provider.clone(), registry).await;
+        agent.options.one_shot = true;
+        agent.cells.permission.set_approvals(true);
+        let mut conversation = Conversation::new();
+        for vision in [false, true] {
+            agent.set_provider(crate::provider::ResolvedProfile {
+                provider: provider.clone(),
+                profile: "test-profile".into(),
+                context_window: 200_000,
+                vision,
+            });
+            agent
+                .run_turn(
+                    &mut conversation,
+                    TurnInput::from_parts("continue".into(), Vec::new()).expect("prompt"),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("turn");
+        }
+        let requests = provider.streams();
+        for (request, vision) in requests.iter().zip([false, true]) {
+            let context = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == Role::User)
+                .expect("user")
+                .wire_text();
+            assert!(
+                context.contains(if vision {
+                    "Image input: enabled"
+                } else {
+                    "Image input: disabled"
+                }),
+                "{context}"
+            );
+            assert!(context.contains("without another model turn"), "{context}");
+            assert!(context.contains("Approvals: off"), "{context}");
+            assert!(!context.contains("task_list"), "{context}");
+            assert!(!context.contains("task_cancel"), "{context}");
         }
     }
 }

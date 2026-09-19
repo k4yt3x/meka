@@ -997,18 +997,7 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "file_read".to_string(),
-            description: format!(
-                "Read the contents of a file at the given path. Supported raster \
-                 image files (PNG, JPEG, GIF, WebP, BMP, TIFF, ICO, HDR, EXR, \
-                 TGA, PNM, QOI, DDS, Farbfeld) are returned as a multimodal \
-                 content block; non-native formats are transparently converted \
-                 to PNG. Only read image files if the current model supports \
-                 vision input. Provide `regex` to return matching lines (max {MAX_SEARCH_MATCHES}) \
-                 instead of a line range; `regex` ignores `offset`/`limit` and \
-                 cannot be combined with image reads. Multiple independent \
-                 file_read calls in one assistant message run in parallel: \
-                 batch them instead of reading files sequentially.",
-            ),
+            description: "Read text or a supported raster image. Text reads return a line range; `regex` returns matching lines instead and ignores `offset`/`limit`. Image reads ignore those text options and require image input to be enabled. Non-native image formats are converted to PNG.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1341,23 +1330,7 @@ impl Tool for EditFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "file_edit".to_string(),
-            description: "Modify a file. Two modes: (1) Replace: provide \
-                          'new_string' to swap 'old_string' for it (an empty \
-                          'new_string' deletes 'old_string'). (2) Insert: provide \
-                          'insert_before' or 'insert_after' to place content adjacent to \
-                          'old_string' while preserving the anchor itself; useful when you \
-                          only need to add lines without rewriting surrounding context. \
-                          Exactly one of 'new_string', 'insert_before', 'insert_after' \
-                          must be set. 'replace_all' applies the operation to every \
-                          occurrence; if it is omitted and 'old_string' matches more than \
-                          once, the edit is refused so you can add context to disambiguate \
-                          or set 'replace_all' deliberately. The file must have been \
-                          read with file_read first unless 'force' is set to true. A path \
-                          outside the workspace roots is refused unless the level is \
-                          `unrestricted`. On success the response includes a small ±3-line \
-                          snippet around the first edited site so you can confirm the change \
-                          landed."
-                .to_string(),
+            description: "Edit a file using an exact text anchor. Set exactly one of `new_string`, `insert_before`, or `insert_after`. Ambiguous matches are refused unless `replace_all` is true. Read the file first; changes since that read are refused unless `force` is true. Workspace write boundaries apply. Returns a short snippet around the first edit.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1738,7 +1711,7 @@ impl Tool for WriteFileTool {
 
     /// `Workspace` is the *lowest* level at which this tool is usable, which is what
     /// `required_permission` means: it drives the `[Available tools]` catalog, the denial message
-    /// and `definitions_for_permission`. Where a write may actually land is settled at the write
+    /// and admission. Where a write may actually land is settled at the write
     /// door against the workspace roots, not by the level, so naming the top rung here would tell
     /// the model it needs an authority it does not.
     ///

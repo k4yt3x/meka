@@ -2,14 +2,15 @@
 
 Memory is the agent's own set of durable notes. It writes them itself, they survive compaction, and they outlive any single session.
 
-Without it, an agent's only state is its context window. When a long session compacts, detail is summarized away; `conversation_search` can still search the message log, but only for something you remember to look for. Memory is the deliberate half: a fact the agent decided was worth keeping, in a place it will always see.
+Without it, an agent's only state is its context window. When a long session compacts, detail is summarized away; `conversation_search` can still search the message log, but only for something you remember to look for. Memory is the deliberate half: a fact the agent decided was worth keeping, in a store later sessions can search.
 
 ## How memory works
 
 - Memories are rows in the `memories` table of the store (`~/.local/share/meka/meka.db`, or under `MEKA_DATA_DIR`), one row per memory.
 - The store is scoped to the **meka instance**, not to a session or a directory. Everything sharing a `MEKA_DATA_DIR` shares one memory; pointing a deployment at its own data dir gives it its own.
-- On every prompt, meka lists each memory's `description` in the per-turn context. Bodies are **not** loaded automatically; the agent calls `memory_read` when a description suggests it needs the detail.
+- The per-turn context includes a bounded memory index, updated when it changes. Priority-0 bodies are inlined within a separate budget; other bodies are read on demand with `memory_read`.
 - The index is re-stated in full at the start of a session, after every compaction, and whenever it scrolls out of the context window. This is what makes memory survive compaction.
+- The agent is told to save durable preferences, constraints, decisions, and facts, to keep temporary task state in the scratchpad, and that current instructions and corrections take precedence over stored preferences.
 - Memories are available at every permission level except **none**; all four memory tools ask only for **read**. Writing a memory therefore needs no write authority over your files, and `workspace`'s boundary does not apply to it: the store belongs to meka, not to your working tree.
 
 > **Memories live in `MEKA_DATA_DIR`**, alongside sessions, rather than in the config directory. A backup of your config directory does not capture them; `meka memory export` is what does.
@@ -19,7 +20,7 @@ Without it, an agent's only state is its context window. When a long session com
 | Field | Meaning |
 |---|---|
 | `name` | Unique identifier, `[A-Za-z0-9_-]`. Case-insensitive: `NOTE` and `note` are one memory. |
-| `description` | One line, shown in every session's index. Make it stand on its own. |
+| `description` | One line used in the bounded index. Make it stand on its own. |
 | `priority` | `0`–`9`, default `5`. See [Priority](#priority). |
 | `tags` | Lowercase labels (`[a-z0-9-]`, at most 10) for grouping and filtering. |
 | `body` | Detail, loaded on demand by `memory_read`. |
@@ -56,7 +57,7 @@ Within one priority band, the most recently *recorded* memory sorts first, so a 
 
 Because the agent picks a priority at write time and everything feels important then, priorities tend to drift downward over a long-lived instance. The Priority column of `meka memory list` shows that happening so you can rebalance. Search ranking compensates for the same drift from the other side: see [Search](#search).
 
-**Priority 0 is the always-in-context tier.** A priority-0 memory has its *body* rendered into the per-turn context in full, not just its description, because for a standing directive the body is the directive and leaving it behind a tool call means the agent has to look the rule up before it can follow it. The band is budgeted separately from the index (4 KiB in total, 1,024 characters per memory) so a long directive cannot crowd out the index and the index cannot crowd out the directives. Priority 1 is still "standing" for ranking purposes, but is listed by description like everything else.
+**Priority 0 is the inline tier.** A priority-0 memory has its *body* rendered into the per-turn context within the limits below, not just its description, because for a standing directive the body is the directive and leaving it behind a tool call means the agent has to look the rule up before it can follow it. The band is budgeted separately from the index (4 KiB in total, 1,024 characters per memory) so a long directive cannot crowd out the index and the index cannot crowd out the directives. Priority 1 is still "standing" for ranking purposes, but is listed by description like everything else.
 
 Priority 0 is not a promise of unlimited space. A memory the 4 KiB band cannot fit falls through to the index below, and on a large store the index has its own ceiling to ration, so past a few dozen standing memories some of them fit nowhere. The section says so explicitly when it happens, naming how many are listed by description and how many were left out entirely, because a standing rule the agent never sees is one it is being held to and cannot read. If you see that line, either raise those notes' importance relative to the rest of the store or trim the tier: a hundred always-apply rules is not an always-apply tier.
 
@@ -72,6 +73,13 @@ decisions (405); use `memory_search` to find them.
 A bare count is not a usable signal once it runs to thousands: it says something is missing without saying what. The tag distribution is something the agent can turn into a query, which is most of what tags are for.
 
 Nothing is lost. `memory_search` covers the whole store, including the entries the index omitted.
+
+## Reading long notes
+
+`memory_read` returns up to 16,000 body characters per call. When more remain, the result gives a
+continuation offset. Pass it as `offset` with the same memory name to read the next part. Offsets
+are zero-based character positions in the displayed body, not byte positions. The description and
+age are repeated on each page.
 
 ## Search
 
@@ -117,7 +125,7 @@ meka memory verify --rebuild    # regenerate it from the table
 | Tool | Purpose |
 |---|---|
 | `memory_write` | Save a memory, or update one by writing to the same name |
-| `memory_read` | Load one memory's body in full |
+| `memory_read` | Read a memory body, continuing with `offset` when needed |
 | `memory_search` | Ranked full-text search over every memory |
 | `memory_delete` | Remove a memory permanently |
 
@@ -165,7 +173,7 @@ meka memory export --dir ~/backup/memory            # one Markdown file per memo
 | `--description <DESCRIPTION>` | Required. The one line shown in every session's memory index. |
 | `--priority <PRIORITY>` | `0` is most important, `9` least; defaults to `5`. |
 | `--tag <TAG>` | Label for grouping and filtering; repeatable. |
-| `--body <BODY>` | Detail loaded only on `memory_read`. |
+| `--body <BODY>` | Detail read on demand, or inlined within budget at priority 0. |
 | `--from-file <PATH>` | Read the body from this file instead of `--body`. |
 | `--force` | Update an existing memory instead of refusing; whatever is not mentioned is kept. |
 

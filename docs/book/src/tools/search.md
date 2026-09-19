@@ -52,19 +52,21 @@ Search file contents using a regex pattern. Powered by the ripgrep library.
 |------|------|----------|-------------|
 | `pattern` | string | yes | Regex pattern to search for |
 | `path` | string | no | File or directory to search in. Omitted, every workspace root is walked |
-| `glob` | string | no | Glob pattern to filter which files are searched (e.g., `*.rs`) |
+| `glob` | string | no | Glob matched against the filename, not its relative path (e.g., `*.rs`) |
 | `limit` | integer | no | Maximum matches to return, 1 to 100 (default: 100; unbounded with `scratchpad` unless set) |
 | `scratchpad` | string | no | Save output to the scratchpad under this name |
 
 ### Behavior
 
-- Searches recursively through directories.
+- Searches recursively through directories, without following symlinked directories.
 - Skips hidden files (starting with `.`), the `target` and `node_modules` directories, and, below
   `unrestricted`, meka's own private directories: the config directory, the data directory holding
   `meka.db`, and the command-output captures. `file_find` steps around the same three.
 - **`.gitignore` is not honored.** Only the matcher comes from ripgrep; the walk is meka's own, and
-  those four exclusions are all of it. A build directory that is ignored but not named above is
+  those exclusions govern the walk. A build directory that is ignored but not named above is
   searched, so pass `glob` or `path` to stay out of one.
+- Name a hidden file, skipped build directory, or symlinked directory explicitly with `path` to
+  search it. Private meka directories still require `unrestricted`.
 - Results are limited to 100 matches; `limit` lowers the cap, and `scratchpad` lifts it unless
   `limit` is also set. The search stops once the cap is exceeded instead of reading the rest of
   the tree to fill a result set it will truncate anyway.

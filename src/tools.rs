@@ -231,11 +231,7 @@ pub(crate) fn admit_arguments(
     let (input, detach) = take_background_flag(input, schema);
     if detach && !detachable(name) {
         return Err(ToolOutput::text(
-            format!(
-                "Error: `{name}` cannot run in the background. It parks a request the turn drains \
-                 as soon as this batch's results are in, so a detached one would fire against a \
-                 later turn. Call it without `background`."
-            ),
+            format!("`{name}` cannot run in the background; call it without `background`."),
             true,
         ));
     }
@@ -283,10 +279,7 @@ fn offer_background(parameters: &mut serde_json::Value) {
             "type": "boolean",
             "default": false,
             "description":
-                "Run this call in the background. It returns a task id immediately and its result \
-                 is delivered to you when it finishes, so use it for work that takes minutes (long \
-                 builds, test suites, large downloads) and not for anything you need in order to \
-                 continue this turn. Track it with `task_list` and stop it with `task_cancel`.",
+                "Return a task id and continue without waiting. Keeps this tool's timeout; see [Execution context] for result delivery.",
         }),
     );
 }
@@ -341,7 +334,7 @@ pub(crate) fn schema_disagreement(
         .unwrap_or(false);
     if !undeclared.is_empty() && !open {
         lines.push(format!(
-            "Sent but not declared in this tool's schema, so it was most likely ignored: {}.",
+            "Sent but not declared in this tool's schema; check the result before relying on these arguments: {}.",
             undeclared.join(", "),
         ));
     }
@@ -374,8 +367,7 @@ pub(crate) fn schema_disagreement(
                 String::new()
             };
             lines.push(format!(
-                "Called without loading its schema, so these documented parameters took their \
-                 defaults:\n  {}{}",
+                "Called without loading its schema. These documented parameters were omitted:\n  {}{}",
                 unused.join("\n  "),
                 tail,
             ));
@@ -1983,15 +1975,32 @@ mod tests {
         );
     }
 
-    /// With approvals on, a worker's catalog lists the tools above its level: dispatch puts them
-    /// to the user rather than refusing them, so the prompt must not say they do not exist.
+    /// Checkpoints must offer calls that dispatch can submit for approval.
     #[tokio::test]
-    async fn approvals_list_the_tools_above_the_level() {
-        let registry = tool_registry_for_test().await;
-        let listed = registry.definitions_for_permission(Permission::Read, true);
-        assert!(listed.iter().any(|t| t.name == "file_write"));
-        let hidden = registry.definitions_for_permission(Permission::Read, false);
-        assert!(!hidden.iter().any(|t| t.name == "file_write"));
+    async fn checkpoints_offer_tools_that_can_be_approved() {
+        let registry = tool_registry_for_test_with(
+            BuiltinToolFilter::from_config(
+                None,
+                Vec::new(),
+                [("file_read".to_string(), Permission::Unrestricted)]
+                    .into_iter()
+                    .collect(),
+            ),
+            false,
+        )
+        .await;
+        let listed = registry.checkpoint_tools(
+            Permission::Read,
+            true,
+            Arc::new(std::sync::Mutex::new(None)),
+        );
+        assert!(listed.iter().any(|t| t.definition().name == "file_read"));
+        let hidden = registry.checkpoint_tools(
+            Permission::Read,
+            false,
+            Arc::new(std::sync::Mutex::new(None)),
+        );
+        assert!(!hidden.iter().any(|t| t.definition().name == "file_read"));
     }
 
     #[tokio::test]

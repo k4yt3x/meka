@@ -225,18 +225,16 @@ impl Tool for ExecuteCommandTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "shell_execute".to_string(),
-            description: "Execute a shell command and return its output. On Unix the \
-                command runs via `sh -c <command>`. POSIX `$VAR` expansion applies; \
-                quote with single quotes or `\\$` to pass a literal `$`. On Windows \
-                the command runs via `powershell.exe -Command <command>`. Use \
-                PowerShell syntax directly (e.g. `$var = ...`, `$env:PATH`); do NOT \
-                wrap with another `powershell -Command` or the outer PowerShell will \
-                expand your inner `$var` references to empty strings. At the read \
-                permission level the command runs in a read-only sandbox where filesystem writes are \
-                blocked. Multiple independent shell_execute calls in one assistant \
-                message run in parallel; use this for read-only commands and \
-                serialize anything that mutates shared state (files, git, packages)."
-                .to_string(),
+            description: format!(
+                "{} Each call starts in the session's working directory; shell state does not \
+                 persist between calls. At restricted levels a suitable sandbox is required. \
+                 Background execution keeps `timeout_ms` unchanged.",
+                if cfg!(windows) {
+                    "Run PowerShell syntax via `powershell.exe -Command`. Do not nest another `powershell -Command`."
+                } else {
+                    "Run a POSIX shell command via `sh -c`. Use POSIX quoting."
+                },
+            ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

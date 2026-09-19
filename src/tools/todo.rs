@@ -77,7 +77,7 @@ impl Tool for TodoWriteTool {
                           order. Each item is a task string (status defaults to pending) or an \
                           object {\"text\":..., \"status\":...}. Tasks are numbered 1..N in order \
                           and the full list is returned. Flip statuses as you work with \
-                          `todo_edit`; keep exactly one task in_progress."
+                          `todo_edit`; keep at most one task in_progress."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -164,7 +164,7 @@ impl Tool for TodoEditTool {
             name: "todo_edit".to_string(),
             description: "Update task statuses by number as you work: pass `set`, e.g. \
                           {\"1\":\"completed\",\"2\":\"in_progress\"}, as you start and finish \
-                          each step. Keep exactly one task in_progress; mark a task completed only \
+                          each step. Keep at most one task in_progress; mark a task completed only \
                           when truly done, or canceled if you drop it. Every number is checked \
                           before any status changes, and the full list is returned."
                 .to_string(),

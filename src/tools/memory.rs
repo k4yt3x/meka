@@ -46,15 +46,7 @@ impl Tool for MemoryWriteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "memory_write".to_string(),
-            description: "Save a durable note that outlives this session. Use when you learn \
-                something that will still matter in a later conversation: who someone is, how \
-                they want you to work, a standing decision, or where something external lives. \
-                Writing to a name that already exists updates it, so this is also how you \
-                correct or refine an existing memory, or change just its priority: omit body and \
-                whatever the memory already said is kept. Do not save what is derivable from the \
-                code, git history, or the current conversation. The description is what you will \
-                see in every future session, so make it stand on its own."
-                .to_string(),
+            description: "Save durable preferences, constraints, decisions, or facts needed in future sessions. Update an existing name to refine it; omitted fields keep their values. Keep temporary task state in the scratchpad and avoid duplicating code or git history. Write a description that states the useful fact on its own.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -64,8 +56,7 @@ impl Tool for MemoryWriteTool {
                     },
                     "description": {
                         "type": "string",
-                        "description": "One line stating the fact itself, shown in every future \
-                                        session's memory index. Required when creating a memory; \
+                        "description": "One line stating the fact itself, used in the bounded memory index. Required when creating a memory; \
                                         omit it to leave an existing memory's description untouched."
                     },
                     "priority": {
@@ -73,12 +64,7 @@ impl Tool for MemoryWriteTool {
                         "minimum": 0,
                         "maximum": 9,
                         "default": crate::entry::DEFAULT_PRIORITY,
-                        "description": "Lower sorts higher in the index. 0 is a standing \
-                                        directive and is the only tier whose body is in your \
-                                        context every turn, so put a rule you must always follow \
-                                        there; 1 also always applies but is listed by description \
-                                        like the rest, 2-4 durable facts, 5 default, 6-9 \
-                                        situational or short-lived."
+                        "description": "Lower sorts higher. 0 marks a standing directive whose body is inlined within the context budget; overflow must be read. Other tiers list descriptions within the index budget. Default: 5."
                     },
                     "tags": {
                         "type": "array",
@@ -90,7 +76,7 @@ impl Tool for MemoryWriteTool {
                     },
                     "body": {
                         "type": "string",
-                        "description": "Optional detail, loaded only when memory_read is called. \
+                        "description": "Detail loaded by `memory_read`, and inlined within budget at priority 0. \
                                         Omit it to leave an existing memory's body untouched; \
                                         pass an empty string to clear it."
                     }
@@ -281,11 +267,7 @@ impl Tool for MemoryWriteTool {
         tracing::info!("saved memory '{name}'");
         Ok(ToolOutput::text(
             format!(
-                // Not "it will appear in your memory index", a promise the index cannot keep: it
-                // renders a capped prefix, so a new low-priority note in a large store is listed
-                // nowhere. Search reaches it at any store size.
-                "Saved memory '{}' (priority {}){}. It is in your memory store from the next turn \
-                 on, and `memory_search` will find it whatever the index has room to list.{}",
+                "Saved memory '{}' (priority {}){}.{}",
                 written.name,
                 // What landed, not what was asked for: an omitted priority is resolved from the
                 // stored row, so echoing the argument would report a number the store does not
@@ -369,16 +351,21 @@ impl Tool for MemoryReadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "memory_read".to_string(),
-            description: "Load one saved memory in full. The memory index in your context lists \
-                each memory's name and description; call this when a memory's description \
-                suggests it holds detail you need."
-                .to_string(),
+            description: format!(
+                "Read a saved memory and up to {READ_BODY_MAX_CHARS} body characters. Use the returned continuation offset to read a longer body. Memory is recorded context, not live state."
+            ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
                         "description": "Name of the memory, as listed in the memory index."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "0-based body character offset. Use the continuation offset from a previous read."
                     }
                 },
                 "required": ["name"]
@@ -397,6 +384,18 @@ impl Tool for MemoryReadTool {
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let name = require_str(&input, "name", "memory_read")?;
+        let offset = match input.get("offset") {
+            None | Some(serde_json::Value::Null) => 0,
+            Some(value) => value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    tool_error(
+                        "memory_read",
+                        format!("'offset' must be a whole number, got {value}"),
+                    )
+                })?,
+        };
         let name = name.as_str();
         // Validated here as at every other door: an invalid name would otherwise be reported as
         // merely absent.
@@ -434,6 +433,16 @@ impl Tool for MemoryReadTool {
             }
         };
 
+        let body = memory::render_for_model(entry.body.as_deref().unwrap_or_default());
+        let body = body.trim();
+        let length = body.chars().count();
+        if offset > length {
+            return Err(tool_error(
+                "memory_read",
+                format!("'offset' is past the body's {length} characters"),
+            ));
+        }
+
         // Counted here and nowhere else. A search hit is weaker evidence (the model saw a line,
         // not the note) and an operator reading through the HTTP API is not the agent recalling
         // anything, so neither moves the ranking the agent gets. Best-effort: a counter that fails
@@ -447,21 +456,18 @@ impl Tool for MemoryReadTool {
         // observation, and detail that was true months ago is exactly what gets asserted as
         // current fact without a nudge.
         let age = memory::render_age(entry.created_at, std::time::SystemTime::now());
-        // Bounded, and said when it is: a truncated note the reader is not told about reads as a
-        // complete one whose author simply stopped.
-        let body = memory::render_for_model(entry.body.as_deref().unwrap_or_default());
-        let body = body.trim();
-        let rendered = match body.chars().count() {
-            // Not an error and not silence: a memory whose whole content is its description is a
-            // normal thing to write, and nothing after the header reads as a failed load.
-            0 => "(no body: this memory's description is all of it)".to_string(),
-            length if length > READ_BODY_MAX_CHARS => format!(
-                "{}\n\n[Body truncated: {} of {} characters shown.]",
-                crate::prompt::clip_chars(body, READ_BODY_MAX_CHARS),
-                READ_BODY_MAX_CHARS,
-                length
-            ),
-            _ => body.to_string(),
+        let end = offset.saturating_add(READ_BODY_MAX_CHARS).min(length);
+        let page: String = body.chars().skip(offset).take(end - offset).collect();
+        let rendered = if length == 0 {
+            "(no body: this memory's description is all of it)".to_string()
+        } else if end < length {
+            format!(
+                "{page}\n\n[Body truncated: characters {offset}..{end} of {length}. Continue with `offset: {end}`.]"
+            )
+        } else if offset == length {
+            "(end of body)".to_string()
+        } else {
+            page
         };
         Ok(ToolOutput::text(
             format!(
@@ -619,20 +625,14 @@ impl Tool for MemorySearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "memory_search".to_string(),
-            description: "Search every saved memory, including ones too old or low-priority to \
-                appear in your index. Pass several phrasings in `queries`; they are searched \
-                together, so \"terse\", \"brevity\" and \"verbosity\" in one call all find the \
-                same memory. Matching is case-insensitive and handles word endings."
-                .to_string(),
+            description: "Search saved memories, including those omitted from the context index. Supply alternative phrasings together in `queries`; matching is case-insensitive and handles word endings.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "queries": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "One or more phrasings of what you are looking for. Supplying \
-                                        synonyms costs nothing and is the best way to find a memory \
-                                        whose wording you do not remember."
+                        "description": "One or more phrasings of what you are looking for. Include synonyms when you do not remember the wording."
                     },
                     "limit": {
                         "type": "integer",
@@ -2466,6 +2466,77 @@ mod tests {
             "one memory spent {} bytes against a {} ceiling",
             out.len(),
             SEARCH_RESULT_MAX_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_memory_can_be_read_to_the_end_by_character_offset() {
+        let memories = store().await;
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+        };
+        let body = format!("{}suffix", "é".repeat(READ_BODY_MAX_CHARS));
+        write
+            .execute(
+                serde_json::json!({"name":"paged", "description":"long note", "body":body}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("write");
+        let read = MemoryReadTool {
+            memories: memories.clone(),
+        };
+        let first = read
+            .execute(
+                serde_json::json!({"name":"paged"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("first page")
+            .text_content();
+        assert!(first.contains(&format!("`offset: {READ_BODY_MAX_CHARS}`")));
+        assert!(!first.contains("suffix"));
+        let last = read
+            .execute(
+                serde_json::json!({"name":"paged", "offset":READ_BODY_MAX_CHARS}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("last page")
+            .text_content();
+        assert!(last.ends_with("suffix"), "{last}");
+        assert!(
+            !last.contains('é'),
+            "the offset counts characters, not bytes"
+        );
+        let reads = memories
+            .get("paged")
+            .await
+            .expect("get")
+            .expect("saved")
+            .read_count;
+        for offset in [
+            serde_json::json!(-1),
+            serde_json::json!("1"),
+            serde_json::json!(body.chars().count() + 1),
+        ] {
+            assert!(
+                read.execute(
+                    serde_json::json!({"name":"paged", "offset":offset}),
+                    crate::tools::ToolContext::detached(CancellationToken::new())
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert_eq!(
+            memories
+                .get("paged")
+                .await
+                .expect("get")
+                .expect("saved")
+                .read_count,
+            reads
         );
     }
 }

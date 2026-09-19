@@ -272,8 +272,7 @@ impl Tool for SkillWriteTool {
                     },
                     "description": {
                         "type": "string",
-                        "description": "One line stating what the skill is for, shown in every \
-                                        future session's skill index. Required when creating a \
+                        "description": "One line stating what the skill is for, used in the bounded skill index. Required when creating a \
                                         skill; omit it to leave an existing skill's description \
                                         untouched."
                     },

@@ -24,14 +24,7 @@ impl Tool for RenderImageTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "image_render".to_string(),
-            description: "View an image from in-memory base64 bytes or a scratchpad entry. \
-                          Use this after producing image data via a command pipeline (e.g. \
-                          `ffmpeg ... | base64 -w0`) to see the image directly, without \
-                          needing a public URL or disk write. The bytes must decode to a \
-                          supported raster image: PNG/JPEG/GIF/WebP/BMP pass through, and \
-                          TIFF/ICO/HDR/EXR/TGA/PNM/QOI/DDS/Farbfeld are auto-converted to \
-                          PNG. Only call this when the current model supports vision."
-                .to_string(),
+            description: "View a supported raster image from base64 bytes. Supply exactly one of `from_scratchpad` or `base64`; prefer a scratchpad entry for large payloads. Non-native formats are converted to PNG. Requires image input to be enabled.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

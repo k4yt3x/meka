@@ -8,9 +8,9 @@ control over the agent's capabilities and prevent accidental modifications.
 
 | Level | Indicator | What it allows |
 |-------|-----------|----------------|
-| **None** | `[n]` (green) | No tools. The agent can only respond with text. |
+| **None** | `[n]` (green) | No tools without approval. |
 | **Read** | `[r]` (yellow) | Read-only tools: `file_read`, `file_find`, `file_search`, `web_fetch`, `shell_execute` (sandboxed read-only), `todo_*`, `agent_spawn`, scratchpad tools |
-| **Workspace** | `[w]` (orange) | Every tool, but **writes are confined to the workspace roots**. Reads stay unrestricted. `shell_execute` runs in a sandbox that permits writes only under those roots |
+| **Workspace** | `[w]` (orange) | File and shell writes stay inside workspace roots. Unconfined MCP calls may need approval or be refused; the shell needs an available sandbox |
 | **Unrestricted** | `[u]` (red) | Every tool, no boundary. `shell_execute` runs with no sandbox at all |
 
 The ladder is ordered by **reach**: each level contains the ones below it, and a tool call that
@@ -369,19 +369,23 @@ meka lists **every registered tool** in the per-turn `<context>` block with its 
 <context>
 [Permission context]
 Current permission level: read
-Only read-only tools are executable.
+Read-classified tools are allowed.
+Approvals: off. Calls above the level are refused.
+
+[Execution context]
+Image input: enabled.
 
 [Environment context]
 Working directory: /home/you/project
 
 [Available tools]
-- **file_read** (requires `read`)
-- **file_write** (requires `workspace`)
+- **file_read** (level `read`)
+- **file_write** (level `workspace`)
 ...
 </context>
 ```
 
-That two-line permission section is almost the only permission-dependent content in the request; `[Environment context]` is the other, since it is empty at `none` and gains a writable-roots block at `workspace`. The system prompt and the tools-array schemas stay byte-identical across `/permission` toggles, so mid-session level changes don't invalidate the Claude prompt cache; the entire conversation stays warm.
+That short permission section is almost the only permission-dependent content in the request; `[Environment context]` is the other, since it is empty at `none` and gains a writable-roots block at `workspace`. The system prompt and the tools-array schemas stay byte-identical across `/permission` toggles, so mid-session level changes don't invalidate the Claude prompt cache; the entire conversation stays warm.
 
 The same reasoning is why the tool catalog itself lives here rather than in the system prompt. Prompt caching is prefix-based, and the system prompt heads that prefix, so anything cached there that later changes (an MCP server connecting late or hot-swapping its tools, a skill being installed) would re-cache the entire conversation behind it. The `<context>` block rides inside your own message instead, so changes are appended rather than rewritten.
 

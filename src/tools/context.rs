@@ -226,8 +226,8 @@ impl Tool for ContextCheckTool {
                      past the window fails the turn.\n"
                 });
                 report.push_str(&format!(
-                    "Kept verbatim on compaction: about {} tokens of the most recent turns; \
-                     everything older is replaced by a summary.\n",
+                    "Compaction may keep about {} tokens of recent rounds verbatim; the rest \
+                     becomes a summary.\n",
                     compaction_tail_budget(window)
                 ));
             }
@@ -254,12 +254,11 @@ impl Tool for ContextCheckTool {
             report.push_str(&match generation {
                 0 => "Compactions so far: none, so nothing has been summarized away yet.\n".into(),
                 1 => "Compactions so far: 1. Detail from before it survives only as a summary; \
-                      `conversation_search` reaches the original turns.\n"
+                      The original turns remain stored.\n"
                     .to_string(),
                 count => format!(
                     "Compactions so far: {count}. Each one summarizes the previous summary, so early \
-                     detail is now several removes from the original; write anything that must \
-                     last to memory rather than trusting it to survive another pass.\n"
+                     detail is now several removes from the original; save essential state with the available tools before another pass.\n"
                 ),
             });
         }
@@ -285,37 +284,27 @@ impl Tool for ContextCompactTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "context_compact".to_string(),
-            // Branched for the same reason the result below is: this is the only text the model
-            // reads *before* it decides. Told it will get a checkpoint on an installation that
-            // has none, it defers the one action that had to happen first, and the deferral is
-            // unrecoverable because the summary is written without it.
             description: if self.checkpoint_enabled {
-                "Compact this conversation before your next step. Earlier turns become a summary \
-                 you write, after a checkpoint for saving anything that must outlive them, and \
-                 this turn then carries on against it. Use it when a stretch of work is done \
-                 rather than waiting for auto-compaction mid-task. `conversation_search` still \
-                 reaches the full history."
-                    .to_string()
+                "Summarize earlier context after this tool batch, then continue the turn. A checkpoint \
+                 first lets you save state with the tools available there. Recent rounds may be kept \
+                 when `keep_recent` is true. Full history and scratchpad entries remain stored."
             } else {
-                "Compact this conversation before your next step. Earlier turns become a summary \
-                 written without you, and this turn then carries on against it. There is no \
-                 checkpoint on this installation, so save anything that must outlive this \
-                 conversation to memory in the same batch as this call: afterwards is too late. \
-                 Use it when a stretch of work is done rather than waiting for auto-compaction \
-                 mid-task. `conversation_search` still reaches the full history."
-                    .to_string()
-            },
+                "Summarize earlier context after this tool batch, then continue the turn. There is \
+                 no checkpoint; save essential state with available tools before this batch ends. \
+                 Recent rounds may be kept when `keep_recent` is true. Full history and scratchpad \
+                 entries remain stored."
+            }.to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "instructions": {
                         "type": "string",
-                        "description": "What to preserve or drop, e.g. \"keep the design decisions, drop the debugging\". Takes precedence over the default summary sections."
+                        "description": "What to emphasize or omit. Active restrictions, authorizations, and commitments must be preserved."
                     },
                     "keep_recent": {
                         "type": "boolean",
                         "default": true,
-                        "description": "Whether to keep the most recent turns verbatim after the summary. Default: true. Set false to start clean, only when the summary and what you have saved cover everything, such as when closing out a day's work."
+                        "description": "Allow recent rounds to be kept verbatim. Set false only when the summary and saved state cover everything still needed."
                     }
                 },
             }),
@@ -359,8 +348,7 @@ impl Tool for ContextCompactTool {
             } else {
                 "Compaction runs once this batch of tool calls finishes, and then this turn \
                  continues against the summary. There is no checkpoint on this installation, so \
-                 the summary is written without you and anything not already in memory is gone \
-                 from your context. One compaction per turn; to compact again, ask on a \
+                 the summary is written without you. Omitted details remain in the stored history; scratchpad entries survive. One compaction per turn; to compact again, ask on a \
                  later turn."
                     .to_string()
             },
@@ -396,7 +384,7 @@ impl Tool for ContextReplaceTool {
                     "keep_recent": {
                         "type": "boolean",
                         "default": true,
-                        "description": "Whether to keep the most recent turns verbatim after the summary. Default: true. Set false only when your summary and what you have saved fully cover them."
+                        "description": "Allow recent rounds to be kept verbatim after the summary. Default: true. Set false only when your summary and what you have saved fully cover them."
                     }
                 },
                 "required": ["summary"]
