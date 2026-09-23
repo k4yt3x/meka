@@ -150,7 +150,6 @@ pub(crate) async fn compact(
         origin: CompactOrigin::Manual,
         instructions: body.instructions,
         keep_recent: body.keep_recent,
-        prompt_id: None,
         request_in_flight: None,
     };
     // A *fresh* token, published the way `submit_turn` publishes one, rather than a clone of

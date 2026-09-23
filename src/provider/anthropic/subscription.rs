@@ -19,7 +19,8 @@ use uuid::Uuid;
 use super::shared::{
     self, DEFAULT_EFFORT, convert_messages_to_claude_content, convert_tools_to_claude_tools,
     model_is_haiku, model_supports_effort, model_supports_mid_conversation_system,
-    model_supports_modern_features, model_supports_temperature,
+    model_supports_mid_conversation_tool_changes, model_supports_modern_features,
+    model_supports_per_turn_effort, model_supports_temperature,
 };
 use crate::{
     config::ThinkingMode,
@@ -195,9 +196,17 @@ impl ClaudeSubscriptionProvider {
         self.resolved_effort.is_some()
     }
 
-    /// Mirrors Claude Code 2.1.263's beta assembly for a first-party OAuth turn, validated against
-    /// a live capture of its interactive CLI: opus-5 with tools, thinking on and display updates,
-    /// fourteen betas in this order.
+    /// Mirrors Claude Code 2.1.280's beta assembly for a first-party OAuth turn, validated against
+    /// live captures of its interactive CLI: Opus 5.5 and Opus 5 with tools, thinking on and
+    /// display updates, sixteen betas in this order on Opus 5.5.
+    ///
+    /// `per-turn-control-2026-07-01` and `mid-conversation-tool-changes-2026-07-01` are gated on
+    /// the model, each the way Claude Code's catalog gates it; see the two predicates.
+    /// `thinking-binding-controls-2026-08-01` goes with thinking on, and nothing in the body with
+    /// it, because Claude Code's default binding behavior is the server's.
+    ///
+    /// A compaction's requests leave out `extended-cache-ttl-2025-04-11`, since they carry the
+    /// API's own TTL; see `build_request_body`.
     ///
     /// `context-1m-2025-08-07` is sent when the profile's `context_window` is a million tokens or
     /// more. Claude Code sends it for the `[1m]` model variant its user selected, and the profile's
@@ -219,9 +228,14 @@ impl ClaudeSubscriptionProvider {
     ///
     /// `cache-diagnosis-2026-04-07` is sent unconditionally too, paired with the body's
     /// `diagnostics.previous_message_id`.
-    fn compute_betas(&self, has_tools: bool, thinking_on: bool) -> Option<String> {
+    fn compute_betas(
+        &self,
+        has_tools: bool,
+        thinking_on: bool,
+        compaction: bool,
+    ) -> Option<String> {
         let model = self.model.as_str();
-        let mut parts: Vec<&'static str> = Vec::with_capacity(14);
+        let mut parts: Vec<&'static str> = Vec::with_capacity(17);
 
         if !model_is_haiku(model) {
             parts.push("claude-code-20250219");
@@ -245,6 +259,12 @@ impl ClaudeSubscriptionProvider {
         if model_supports_mid_conversation_system(model) {
             parts.push("mid-conversation-system-2026-04-07");
         }
+        if model_supports_per_turn_effort(model) {
+            parts.push("per-turn-control-2026-07-01");
+        }
+        if model_supports_mid_conversation_tool_changes(model) {
+            parts.push("mid-conversation-tool-changes-2026-07-01");
+        }
 
         if has_tools {
             parts.push("advanced-tool-use-2025-11-20");
@@ -258,10 +278,15 @@ impl ClaudeSubscriptionProvider {
         }
 
         parts.push("fallback-credit-2026-06-01");
+        if thinking_on && model_supports_modern_features(model) {
+            parts.push("thinking-binding-controls-2026-08-01");
+        }
         if self.wire_thinking_display(thinking_on) == Some(WireThinkingDisplay::Updates) {
             parts.push("thinking-display-updates-2026-08-18");
         }
-        parts.push("extended-cache-ttl-2025-04-11");
+        if !compaction {
+            parts.push("extended-cache-ttl-2025-04-11");
+        }
         parts.push("cache-diagnosis-2026-04-07");
 
         Some(parts.join(","))
@@ -525,6 +550,7 @@ impl ClaudeSubscriptionProvider {
                     &auth_value,
                     &self.session_id,
                     Some("oauth-2025-04-20"),
+                    None,
                 ))
             },
             &tokio_util::sync::CancellationToken::new(),
@@ -633,8 +659,14 @@ impl ClaudeSubscriptionProvider {
         thinking: ThinkingOverride,
         attribution: &crate::provider::Attribution,
     ) -> serde_json::Value {
-        let claude_messages =
-            convert_messages_to_claude_content(messages, super::shared::CacheBreakpoint::OneHour);
+        // A compaction's requests take the API's own TTL, as Claude Code's do: the summary is read
+        // once, so an hour of cache would be paid for and never read back.
+        let breakpoint = if attribution.compaction.is_some() {
+            super::shared::CacheBreakpoint::Ephemeral
+        } else {
+            super::shared::CacheBreakpoint::OneHour
+        };
+        let claude_messages = convert_messages_to_claude_content(messages, breakpoint);
 
         let metadata_user_id = serde_json::json!({
             "device_id": self.device_id,
@@ -678,7 +710,7 @@ impl ClaudeSubscriptionProvider {
                     {
                         "type": "text",
                         "text": system_prompt,
-                        "cache_control": { "type": "ephemeral", "ttl": "1h", "scope": "global" }
+                        "cache_control": breakpoint.global_scope_value()
                     }
                 ]),
             );
@@ -808,6 +840,7 @@ impl shared::ClaudeBackend for ClaudeSubscriptionProvider {
         has_tools: bool,
         _stream: bool,
         thinking: ThinkingOverride,
+        attribution: &crate::provider::Attribution,
     ) -> Result<reqwest::RequestBuilder> {
         let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
         Ok(attestation::apply_headers(
@@ -815,8 +848,13 @@ impl shared::ClaudeBackend for ClaudeSubscriptionProvider {
             auth_header_name,
             &auth_header_value,
             &self.session_id,
-            self.compute_betas(has_tools, self.effective_thinking(thinking).is_on())
-                .as_deref(),
+            self.compute_betas(
+                has_tools,
+                self.effective_thinking(thinking).is_on(),
+                attribution.compaction.is_some(),
+            )
+            .as_deref(),
+            Some(attribution),
         ))
     }
 
@@ -883,6 +921,7 @@ impl Provider for ClaudeSubscriptionProvider {
                 &auth_value,
                 &self.session_id,
                 Some("oauth-2025-04-20"),
+                None,
             );
             match request.send().await {
                 Ok(response) if response.status().is_success() => response
@@ -2093,7 +2132,7 @@ mod tests {
             ("claude-opus-4-6-20250514", false),
         ] {
             let betas = provider_with(model, thinking)
-                .compute_betas(true, true)
+                .compute_betas(true, true, false)
                 .unwrap();
             assert!(
                 !betas.contains("adaptive-thinking"),
@@ -2104,16 +2143,17 @@ mod tests {
 
     #[test]
     fn betas_modern_thinking_model_full_set() {
-        // Tools + thinking + the default display: matches the live Claude Code 2.1.263 interactive
-        // CLI wire capture exactly, minus `context-1m-2025-08-07`, which this profile's window does
-        // not ask for. Display updates replace the redaction beta on a turn with thinking on.
+        // Tools + thinking + the default display: matches the live Claude Code 2.1.280 interactive
+        // CLI wire capture on Opus 5.5 exactly, minus `context-1m-2025-08-07`, which this profile's
+        // window does not ask for. Display updates replace the redaction beta on a turn with
+        // thinking on.
         let betas = provider_full(
-            "claude-opus-4-8",
+            "claude-opus-5-5",
             true,
             "high",
             crate::config::ThinkingDisplay::Updates,
         )
-        .compute_betas(true, true)
+        .compute_betas(true, true, false)
         .unwrap();
         let parts: Vec<&str> = betas.split(',').collect();
         assert_eq!(
@@ -2126,14 +2166,103 @@ mod tests {
                 "context-management-2025-06-27",
                 "prompt-caching-scope-2026-01-05",
                 "mid-conversation-system-2026-04-07",
+                "per-turn-control-2026-07-01",
+                "mid-conversation-tool-changes-2026-07-01",
                 "advanced-tool-use-2025-11-20",
                 "effort-2025-11-24",
                 "fallback-credit-2026-06-01",
+                "thinking-binding-controls-2026-08-01",
                 "thinking-display-updates-2026-08-18",
                 "extended-cache-ttl-2025-04-11",
                 "cache-diagnosis-2026-04-07",
             ],
-            "Claude Code 2.1.263 CLI beta set"
+            "Claude Code 2.1.280 CLI beta set"
+        );
+    }
+
+    #[test]
+    fn the_two_model_gated_2026_07_betas_follow_the_catalog() {
+        // The Opus 5 capture of the same build carries tool changes but not per-turn control, and
+        // Sonnet 5 is the one catalog entry with mid-conversation system and not tool changes.
+        let betas = provider_with("claude-opus-5", true)
+            .compute_betas(true, true, false)
+            .unwrap();
+        assert!(!betas.contains("per-turn-control-2026-07-01"), "{betas}");
+        assert!(
+            betas.contains("mid-conversation-tool-changes-2026-07-01"),
+            "{betas}"
+        );
+        let betas = provider_with("claude-sonnet-5", true)
+            .compute_betas(true, true, false)
+            .unwrap();
+        assert!(
+            betas.contains("mid-conversation-system-2026-04-07"),
+            "{betas}"
+        );
+        assert!(
+            !betas.contains("mid-conversation-tool-changes-2026-07-01"),
+            "{betas}"
+        );
+    }
+
+    #[test]
+    fn thinking_binding_controls_go_with_thinking_on() {
+        let with = provider_with("claude-opus-5-5", true)
+            .compute_betas(true, true, false)
+            .unwrap();
+        let without = provider_with("claude-opus-5-5", true)
+            .compute_betas(true, false, false)
+            .unwrap();
+        assert!(
+            with.contains("thinking-binding-controls-2026-08-01"),
+            "{with}"
+        );
+        assert!(
+            !without.contains("thinking-binding-controls-2026-08-01"),
+            "{without}"
+        );
+    }
+
+    /// The compaction capture of the same build carries every other beta and the API's own cache
+    /// TTL on every breakpoint, the summary being read once.
+    #[test]
+    fn a_compactions_request_takes_the_default_cache_ttl_and_no_ttl_beta() {
+        let provider = provider_with("claude-opus-5-5", true);
+        let betas = provider.compute_betas(true, true, true).unwrap();
+        assert!(!betas.contains("extended-cache-ttl-2025-04-11"), "{betas}");
+        assert!(betas.contains("cache-diagnosis-2026-04-07"), "{betas}");
+
+        let compaction = crate::provider::Attribution {
+            compaction: Some(crate::provider::CompactionKind::Manual),
+            ..Default::default()
+        };
+        let body = provider.build_request_body(
+            "system prompt",
+            &[Message::user("summarize")],
+            &[],
+            true,
+            ThinkingOverride::Inherit,
+            &compaction,
+        );
+        assert_eq!(
+            body["system"][2]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "scope": "global"})
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+        let turn = provider.build_request_body(
+            "system prompt",
+            &[Message::user("hello")],
+            &[],
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
+        assert_eq!(
+            turn["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"})
         );
     }
 
@@ -2143,7 +2272,7 @@ mod tests {
         // the thinking toggle, so they appear whether thinking is on or off.
         for thinking in [true, false] {
             let betas = provider_with("claude-opus-4-6-20250514", thinking)
-                .compute_betas(true, true)
+                .compute_betas(true, true, false)
                 .unwrap();
             assert!(betas.contains("interleaved-thinking-2025-05-14"), "{betas}");
             assert!(betas.contains("thinking-token-count-2026-05-13"), "{betas}");
@@ -2165,7 +2294,7 @@ mod tests {
         ] {
             assert!(
                 !provider_with(model, false)
-                    .compute_betas(true, true)
+                    .compute_betas(true, true, false)
                     .unwrap()
                     .contains("context-1m-2025-08-07"),
                 "{model} must not send context-1m"
@@ -2183,7 +2312,7 @@ mod tests {
         ] {
             assert!(
                 provider_with(model, false)
-                    .compute_betas(true, true)
+                    .compute_betas(true, true, false)
                     .unwrap()
                     .contains("extended-cache-ttl-2025-04-11"),
                 "{model} must send extended-cache-ttl"
@@ -2197,7 +2326,7 @@ mod tests {
         // absolute and would send it; see
         // output_config_omitted_when_unset_and_model_lacks_effort.)
         let betas = provider_effort("claude-haiku-4-5-20251001", None)
-            .compute_betas(true, true)
+            .compute_betas(true, true, false)
             .unwrap();
         assert!(!betas.contains("claude-code-20250219"), "{betas}");
         assert!(!betas.contains("effort-2025-11-24"), "{betas}");
@@ -2216,7 +2345,7 @@ mod tests {
             "claude-haiku-4-5-20251001",
         ] {
             let provider = provider_with(model, false);
-            let betas = provider.compute_betas(true, true).unwrap();
+            let betas = provider.compute_betas(true, true, false).unwrap();
             assert!(betas.contains("oauth-2025-04-20"), "{model} → {betas}");
             assert!(
                 betas.contains("prompt-caching-scope-2026-01-05"),
@@ -2280,6 +2409,7 @@ mod tests {
             "claude-opus-4-8",
             "claude-opus-4-6-20250514",
             "claude-opus-5",
+            "claude-opus-5-5",
             "claude-sonnet-5",
             // Claude Code's bundled table happens to give this one `xhigh`. meka does not carry
             // per-model figures: the server cannot tell meka's default from a configured value, so
@@ -2295,10 +2425,10 @@ mod tests {
                 ThinkingOverride::Inherit,
                 &crate::provider::Attribution::default(),
             );
-            assert_eq!(body["output_config"]["effort"], "high", "{model}");
+            assert_eq!(body["output_config"]["effort"], "medium", "{model}");
             assert!(
                 provider
-                    .compute_betas(true, true)
+                    .compute_betas(true, true, false)
                     .unwrap_or_default()
                     .contains("effort-2025-11-24"),
                 "{model} takes an effort, so the beta rides with it"
@@ -2324,7 +2454,7 @@ mod tests {
                 );
                 assert!(
                     !provider
-                        .compute_betas(true, true)
+                        .compute_betas(true, true, false)
                         .unwrap_or_default()
                         .contains("effort-2025-11-24"),
                     "{model} {configured:?}"
@@ -2346,7 +2476,7 @@ mod tests {
         assert_eq!(body["output_config"]["effort"], "max");
         assert!(
             forced
-                .compute_betas(true, true)
+                .compute_betas(true, true, false)
                 .unwrap()
                 .contains("effort-2025-11-24"),
             "effort beta must accompany an explicit override in the body"
@@ -2391,14 +2521,14 @@ mod tests {
         let provider = provider_with("claude-opus-4-8", true);
         assert!(
             provider
-                .compute_betas(true, true)
+                .compute_betas(true, true, false)
                 .unwrap()
                 .contains("advanced-tool-use-2025-11-20"),
             "advanced-tool-use must be sent when the request carries tools"
         );
         assert!(
             !provider
-                .compute_betas(false, true)
+                .compute_betas(false, true, false)
                 .unwrap()
                 .contains("advanced-tool-use-2025-11-20"),
             "advanced-tool-use must be omitted when there are no tools"
@@ -2409,10 +2539,15 @@ mod tests {
     fn betas_mid_conversation_system_gated_on_model() {
         // The gate is a denylist, so the newer models get it and the named older ones do not
         // (mirrors Claude Code 2.1.263's own list).
-        for model in ["claude-opus-4-8", "claude-opus-5", "claude-sonnet-5"] {
+        for model in [
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+        ] {
             assert!(
                 provider_with(model, true)
-                    .compute_betas(true, true)
+                    .compute_betas(true, true, false)
                     .unwrap()
                     .contains("mid-conversation-system-2026-04-07"),
                 "{model} must send mid-conversation-system"
@@ -2421,7 +2556,7 @@ mod tests {
         for model in ["claude-opus-4-6-20250514", "claude-haiku-4-5-20251001"] {
             assert!(
                 !provider_with(model, true)
-                    .compute_betas(true, true)
+                    .compute_betas(true, true, false)
                     .unwrap()
                     .contains("mid-conversation-system-2026-04-07"),
                 "{model} must not send mid-conversation-system"
@@ -2443,7 +2578,7 @@ mod tests {
         ] {
             assert!(
                 provider_with(model, true)
-                    .compute_betas(true, true)
+                    .compute_betas(true, true, false)
                     .unwrap()
                     .contains("mid-conversation-system-2026-04-07"),
                 "{model} is newer than the denylist and must still send mid-conversation-system"
@@ -2640,7 +2775,7 @@ mod tests {
             "high",
             crate::config::ThinkingDisplay::Updates,
         );
-        let betas = on.compute_betas(true, true).unwrap();
+        let betas = on.compute_betas(true, true, false).unwrap();
         assert!(
             betas.contains("thinking-display-updates-2026-08-18"),
             "{betas}"
@@ -2657,7 +2792,7 @@ mod tests {
             "high",
             crate::config::ThinkingDisplay::Updates,
         );
-        let betas = off.compute_betas(true, false).unwrap();
+        let betas = off.compute_betas(true, false, false).unwrap();
         assert!(betas.contains("redact-thinking-2026-02-12"), "{betas}");
         assert!(
             !betas.contains("thinking-display-updates-2026-08-18"),
@@ -2674,7 +2809,7 @@ mod tests {
             "high",
             crate::config::ThinkingDisplay::Summarized,
         );
-        let betas = on.compute_betas(true, true).unwrap();
+        let betas = on.compute_betas(true, true, false).unwrap();
         assert!(!betas.contains("redact-thinking-2026-02-12"), "{betas}");
         assert!(
             !betas.contains("thinking-display-updates-2026-08-18"),
@@ -2691,9 +2826,43 @@ mod tests {
             crate::config::ThinkingDisplay::Summarized,
         );
         assert!(
-            !off.compute_betas(true, false)
+            !off.compute_betas(true, false, false)
                 .unwrap()
                 .contains("redact-thinking")
+        );
+    }
+
+    /// Claude Code 2.1.280 with `showThinkingSummaries` on, captured on Opus 5.5: the same set
+    /// as the default display minus the display-updates beta, and `display: "summarized"`.
+    #[test]
+    fn betas_under_summaries_match_the_2_1_280_capture() {
+        let provider = provider_full(
+            "claude-opus-5-5",
+            true,
+            "high",
+            crate::config::ThinkingDisplay::Summarized,
+        );
+        let betas = provider.compute_betas(true, true, false).unwrap();
+        assert_eq!(betas.split(',').collect::<Vec<_>>(), vec![
+            "claude-code-20250219",
+            "oauth-2025-04-20",
+            "interleaved-thinking-2025-05-14",
+            "thinking-token-count-2026-05-13",
+            "context-management-2025-06-27",
+            "prompt-caching-scope-2026-01-05",
+            "mid-conversation-system-2026-04-07",
+            "per-turn-control-2026-07-01",
+            "mid-conversation-tool-changes-2026-07-01",
+            "advanced-tool-use-2025-11-20",
+            "effort-2025-11-24",
+            "fallback-credit-2026-06-01",
+            "thinking-binding-controls-2026-08-01",
+            "extended-cache-ttl-2025-04-11",
+            "cache-diagnosis-2026-04-07",
+        ]);
+        assert_eq!(
+            body_for(&provider)["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "summarized"})
         );
     }
 
@@ -2705,7 +2874,7 @@ mod tests {
             "high",
             crate::config::ThinkingDisplay::Redacted,
         );
-        let betas = provider.compute_betas(true, true).unwrap();
+        let betas = provider.compute_betas(true, true, false).unwrap();
         assert!(betas.contains("redact-thinking-2026-02-12"), "{betas}");
         assert!(
             !betas.contains("thinking-display-updates-2026-08-18"),
@@ -2726,7 +2895,7 @@ mod tests {
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::ClaudeSubscription,
                     AuthCredential::ApiKey("test-key".to_string()),
-                    "claude-opus-5".to_string(),
+                    "claude-opus-5-5".to_string(),
                 )
                 .credential_key(Some("test".to_string()))
                 .thinking(ThinkingMode::Adaptive, 10000)
@@ -2736,7 +2905,7 @@ mod tests {
             .expect("provider")
         };
         let betas = with_window(Some(1_000_000))
-            .compute_betas(true, true)
+            .compute_betas(true, true, false)
             .unwrap();
         assert_eq!(
             betas.split(',').nth(2),
@@ -2744,7 +2913,9 @@ mod tests {
             "third, after oauth, as Claude Code orders it: {betas}"
         );
         for window in [None, Some(200_000), Some(999_999)] {
-            let betas = with_window(window).compute_betas(true, true).unwrap();
+            let betas = with_window(window)
+                .compute_betas(true, true, false)
+                .unwrap();
             assert!(
                 !betas.contains("context-1m-2025-08-07"),
                 "{window:?}: {betas}"

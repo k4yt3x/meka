@@ -291,6 +291,7 @@ impl Agent {
         if messages.is_empty() {
             return Err(MekaError::Config("no messages to compact".to_string()));
         }
+        let compaction_kind = request.origin.kind();
 
         // Owned here rather than returned by the checkpoint, because a `memory_write` is durable
         // the moment it runs and the turn can still fail or be canceled afterwards; returned by
@@ -595,6 +596,20 @@ impl Agent {
                 generation: reported_generation,
             })
             .await;
+        if self.role.is_root() {
+            *crate::sync::lock(&self.context_compacted) = Some(compaction_kind);
+        }
+        // `diagnostics.previous_message_id` names the response the conversation still ends on,
+        // which Claude Code reads off the last assistant message it sends. A compaction that
+        // summarized that response leaves nothing to name, the `null` a first request sends; a
+        // kept tail still carries it.
+        if !messages
+            .as_slice()
+            .iter()
+            .any(|message| message.role == Role::Assistant)
+        {
+            *crate::sync::lock(&self.previous_message) = None;
+        }
 
         Ok(CompactOutcome {
             source,
@@ -607,18 +622,20 @@ impl Agent {
         })
     }
 
-    /// Who a compaction's requests are for: the turn that asked, or an id minted for a host-driven
-    /// `/compact`, which answers no prompt of its own.
+    /// Who a compaction's requests are for. Claude Code's compaction names the response it
+    /// follows and the kind of compaction it is, and nothing about the prompt: its summary request
+    /// is the last user message the header reads, and that one carries no prompt id or origin.
     fn compaction_attribution(&self, request: &CompactRequest) -> crate::provider::Attribution {
         crate::provider::Attribution {
             subagent: self.role.is_worker(),
-            prompt_id: Some(request.prompt_id.unwrap_or_else(Uuid::new_v4)),
             previous_request: Some(Arc::clone(&self.previous_request)),
             // A compaction is a side query, not a message of the conversation: its response must
             // not become the conversation's previous message, and Claude Code's side queries
             // carry no `diagnostics` at all.
             previous_message: None,
             session_id: self.cells.session_id.get(),
+            compaction: Some(request.origin.kind()),
+            ..Default::default()
         }
     }
 
@@ -840,6 +857,7 @@ impl Agent {
                                             session_id,
                                             tool_call_id: Some(tool_use_id.clone()),
                                             prompt_id: attribution.prompt_id,
+                                            turn_origin: attribution.turn_origin,
                                             frontend: Arc::clone(&self.cells.frontend),
                                             cancellation: cancellation.clone(),
                                         },
@@ -1996,6 +2014,62 @@ mod tests {
         assert_eq!(messages.len(), 1, "only the summary should remain");
     }
 
+    /// The first request after a compaction says what set it going, and only that one: Claude
+    /// Code clears its flag as it reads it.
+    #[tokio::test]
+    async fn the_request_after_a_compaction_reports_it_once() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![replace_round(
+            "summary", None,
+        )]));
+        let (agent, store) = agent_with_checkpoint(provider, true).await;
+        let mut messages = conversation();
+        assert_eq!(agent.take_context_compacted(), None);
+
+        compact(&agent, &store, &mut messages, CompactRequest {
+            origin: CompactOrigin::Proactive,
+            instructions: None,
+            keep_recent: None,
+            request_in_flight: None,
+        })
+        .await;
+
+        assert_eq!(
+            agent.take_context_compacted(),
+            Some(crate::provider::CompactionKind::Auto)
+        );
+        assert_eq!(agent.take_context_compacted(), None);
+    }
+
+    /// The previous message id names a response the request still carries. Summarizing it away
+    /// clears the id, the way a first request has none; a kept tail keeps it.
+    #[tokio::test]
+    async fn a_compaction_that_summarizes_the_last_reply_forgets_its_message_id() {
+        for (keep_recent, expected) in [(false, None), (true, Some("msg_01last".to_string()))] {
+            let provider = Arc::new(MockProvider::from_rounds(vec![replace_round(
+                "summary",
+                Some(keep_recent),
+            )]));
+            let (agent, store) = agent_with_checkpoint(provider, true).await;
+            *crate::sync::lock(&agent.previous_message) = Some("msg_01last".to_string());
+            let mut messages = conversation();
+
+            let outcome = compact(&agent, &store, &mut messages, CompactRequest {
+                origin: CompactOrigin::Manual,
+                instructions: None,
+                keep_recent: None,
+                request_in_flight: None,
+            })
+            .await;
+
+            assert_eq!(outcome.kept_recent, keep_recent);
+            assert_eq!(
+                *crate::sync::lock(&agent.previous_message),
+                expected,
+                "keep_recent {keep_recent}"
+            );
+        }
+    }
+
     /// `context_replace` knows more than the caller did, because it ran after reading the
     /// conversation, so its answer wins over the request's.
     #[tokio::test]
@@ -2011,7 +2085,6 @@ mod tests {
             origin: CompactOrigin::Requested,
             instructions: None,
             keep_recent: Some(false),
-            prompt_id: None,
             request_in_flight: None,
         })
         .await;
@@ -2082,7 +2155,6 @@ mod tests {
             origin: CompactOrigin::Requested,
             instructions: None,
             keep_recent: Some(false),
-            prompt_id: None,
             request_in_flight: None,
         })
         .await;
@@ -2197,7 +2269,6 @@ mod tests {
             origin: CompactOrigin::Requested,
             instructions: None,
             keep_recent: Some(false),
-            prompt_id: None,
             request_in_flight: None,
         })
         .await;

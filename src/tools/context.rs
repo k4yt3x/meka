@@ -319,7 +319,7 @@ impl Tool for ContextCompactTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        context: crate::tools::ToolContext,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let request = CompactRequest {
             origin: CompactOrigin::Requested,
@@ -329,7 +329,6 @@ impl Tool for ContextCompactTool {
                 .filter(|instructions| !instructions.is_empty())
                 .map(str::to_string),
             keep_recent: input["keep_recent"].as_bool(),
-            prompt_id: context.prompt_id,
             request_in_flight: None,
         };
         let mut pending = crate::sync::lock(&self.pending);

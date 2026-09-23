@@ -20,7 +20,7 @@ Named for the subscription rather than the protocol because that is what you are
 
 ```bash
 meka account add anthropic --backend claude-subscription
-meka profile add work --account anthropic --model claude-opus-5
+meka profile add work --account anthropic --model claude-opus-5-5
 ```
 
 `meka account add` prints an authorization URL for you to open, walks you through authorization,
@@ -40,10 +40,10 @@ backend = "claude-subscription"
 
 [profiles.work]
 account = "anthropic"
-model = "claude-opus-5"
-effort = "xhigh"         # optional; unset sends "high", as Claude Code does
+model = "claude-opus-5-5"
+effort = "xhigh"         # optional; unset sends "medium", Claude Code's default for Opus 5.5
 thinking = "adaptive"    # optional; "adaptive"|"budgeted"|"off", default "adaptive"
-thinking_display = "updates"  # optional; updates|summarized|redacted, default updates
+thinking_display = "summarized"  # optional; summarized|updates|redacted, default summarized
 ```
 
 See [Configuration → Config file](../configuration/config-file.md) for the full list of fields.
@@ -52,7 +52,7 @@ See [Configuration → Config file](../configuration/config-file.md) for the ful
 
 ### `effort`
 
-Sent as `output_config.effort` under the `effort-2025-11-24` beta. When unset, meka sends `high`, which is what Claude Code does; only a model that takes no effort at all gets neither the field nor the beta. An explicit value is absolute: sent verbatim, with no validation or clamping, whatever model it is aimed at. Typical values: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. See [Reasoning effort](#reasoning-effort).
+Sent as `output_config.effort` under the `effort-2025-11-24` beta. When unset, meka sends `medium`, Claude Code's default for Opus 5.5; only a model that takes no effort at all gets neither the field nor the beta. An explicit value is absolute: sent verbatim, with no validation or clamping, whatever model it is aimed at. Typical values: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. See [Reasoning effort](#reasoning-effort).
 
 ### `thinking`
 
@@ -60,11 +60,12 @@ Sent as `output_config.effort` under the `effort-2025-11-24` beta. When unset, m
 
 ### `thinking_display`
 
-How the model's thinking is presented, one of Claude Code's three display modes. `updates`, the
-default and Claude Code's own since 2.1.263, sends `thinking.display = "updates"` under the
+How the model's thinking is presented, one of Claude Code's three display modes. `summarized`,
+the default, sends `thinking.display = "summarized"` and streams a short readable summary, which
+is what Claude Code sends with its `showThinkingSummaries` setting on. `updates`, Claude Code's
+own default since 2.1.263, sends `thinking.display = "updates"` under the
 `thinking-display-updates-2026-08-18` beta: the server streams a running token count instead of
-the text, which the REPL draws as `Thinking... (150 tokens)`. `summarized` sends
-`thinking.display = "summarized"` and streams a short readable summary. `redacted` sends the
+the text, which the REPL draws as `Thinking... (150 tokens)`. `redacted` sends the
 `redact-thinking-2026-02-12` beta and no display field, and the server may answer with opaque
 `redacted_thinking` blocks. In every mode the `thinking` blocks come back signed, and meka stores
 and replays them verbatim, so multi-turn reasoning continuity is maintained. With thinking off
@@ -108,7 +109,7 @@ The OAuth client id defaults to Claude Code's client id but can be overridden pe
 
 ## Supported models
 
-Any model your Claude Code subscription exposes. For the current line-up and their retirement dates, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview); `meka profile add` suggests `claude-opus-5` for a profile on a Claude account.
+Any model your Claude Code subscription exposes. For the current line-up and their retirement dates, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview); `meka profile add` suggests `claude-opus-5-5` for a profile on a Claude account.
 
 meka forwards the model string verbatim and doesn't gate which strings are valid. What is model-derived is a small set of gates, each pointed the way Claude Code points it. `temperature` is an allowlist, so an unrecognized model omits the field rather than earning a 400: it goes only to the models that still accept sampling params (Opus 4.6, Sonnet 4.6, Haiku 4.5, and older). `mid-conversation-system-2026-04-07` and `output_config.effort` are denylists, so an unrecognized model gets both: withholding the first would silently drop mid-conversation system messages, and effort is what a newer model is for. The `claude-code-20250219` beta is skipped for the Haiku tier. See [Beta header](#beta-header) and [Reasoning effort](#reasoning-effort).
 
@@ -125,10 +126,16 @@ meka forwards the model string verbatim and doesn't gate which strings are valid
 - `User-Agent: claude-cli/<version> (external, cli)`
 - `X-Claude-Code-Session-Id: <uuid>` (per-process)
 - Stainless SDK identification headers (`x-stainless-*`)
+- `x-claude-code-request-class`: `main` for a turn of the conversation, `subagent` for a sub-agent's turn (with `x-claude-code-agent-type: custom`), `compaction` for a compaction's requests
+- `x-claude-code-prev-tool-durations`: on the request after a tool round, `name=milliseconds` per call the round ran, `;`-separated, in dispatch order
+- `x-cc-compaction-request` and `x-claude-code-compaction`: on a compaction's requests, what set it going: `manual` for `/compact`, `POST /compact` and `context_compact`, `auto` for a ceiling crossed, `reactive` for a request the provider refused as too large
+- `x-cc-context-compacted` and `x-claude-code-context-compacted`: the same word on the conversation's first request after a compaction
+
+These four are what Claude Code 2.1.280 says about each request; for the two compaction facts it keeps a first-party name and a gateway-hint name and sends both.
 
 ### Beta header
 
-Composed dynamically from the model, window and thinking settings, mirroring Claude Code's own assembly. Order is significant; the list below matches the Claude Code 2.1.263 interactive-CLI wire capture (tools present, thinking on, display updates) exactly:
+Composed dynamically from the model, window and thinking settings, mirroring Claude Code's own assembly. Order is significant; the list below matches the Claude Code 2.1.280 interactive-CLI wire capture on Opus 5.5 (tools present, thinking on, display updates) exactly:
 
 | Beta | When |
 |------|------|
@@ -141,20 +148,23 @@ Composed dynamically from the model, window and thinking settings, mirroring Cla
 | `context-management-2025-06-27` | Any modern Claude (4.x+) |
 | `prompt-caching-scope-2026-01-05` | Always |
 | `mid-conversation-system-2026-04-07` | Everything except Claude 3.x, Opus 4.7 and older, Sonnet 4.6 and older, and Haiku 4.5 |
+| `per-turn-control-2026-07-01` | Opus 5.5 and Fable 5.1, the two models Claude Code's bundled catalog grants per-turn effort; nothing newer, since Claude Code sends nothing for a model its catalog does not list |
+| `mid-conversation-tool-changes-2026-07-01` | Wherever the mid-conversation system beta goes, except Sonnet 5 |
 | `advanced-tool-use-2025-11-20` | When the request carries tools (meka always does) |
 | `effort-2025-11-24` | Every model that takes an effort at all, whether or not the profile set one |
 | `fallback-credit-2026-06-01` | Always. Claude Code latches it on every interactive turn; it only advertises that the server may answer with a fallback credit, and meka sends no `fallbacks` of its own |
+| `thinking-binding-controls-2026-08-01` | Any modern Claude with thinking on. Nothing in the body goes with it: Claude Code leaves the binding behavior to the server |
 | `thinking-display-updates-2026-08-18` | Any modern Claude with thinking on under `thinking_display = "updates"`, paired with `thinking.display = "updates"` |
-| `extended-cache-ttl-2025-04-11` | Always (meka sends a 1h cache TTL) |
+| `extended-cache-ttl-2025-04-11` | Every request but a compaction's, which takes the API's own TTL; see [Cache control](#cache-control) |
 | `cache-diagnosis-2026-04-07` | Always, paired with the body's `diagnostics.previous_message_id`: the id of the previous response's message, or `null` on a conversation's first request and after a resume |
 
 ### System prompt
 
 Sent as an array of three `text` blocks:
 
-1. `x-anthropic-billing-header: cc_version=<version>.<fingerprint>; cc_entrypoint=cli; cch=<xxHash64-attestation>;` plus, when they apply, ` cc_is_subagent=true;`, ` cc_prev_req=<request id>;` and ` cc_prompt_id=<uuid>;`, in that order. The fingerprint suffix is a 3-character hex hash derived from the first user message (`SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3]`); the `cch` token is xxHash64 of a filtered copy of the serialized request body, computed and patched in just before send.
+1. `x-anthropic-billing-header: cc_version=<version>.<fingerprint>; cc_entrypoint=cli; cch=<xxHash64-attestation>;` plus, when they apply, ` cc_is_subagent=true;`, ` cc_prev_req=<request id>;`, ` cc_prompt_id=<uuid>;` and ` cc_turn_origin=<origin>;`, in that order. The fingerprint suffix is a 3-character hex hash derived from the first user message (`SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3]`); the `cch` token is xxHash64 of a filtered copy of the serialized request body, computed and patched in just before send.
 
-   `cc_prompt_id` identifies one human prompt and stays the same across every request that prompt produces, including the whole tool loop; a sub-agent inherits its spawner's. `cc_prev_req` names the `request-id` of the previous response in the same conversation, so it is absent on a conversation's first request. Both are absent from meka's own side queries, which is where Claude Code omits them too.
+   `cc_prompt_id` identifies one prompt and stays the same across every request that prompt produces, including the whole tool loop; a sub-agent inherits its spawner's. `cc_turn_origin` says where that prompt came from: `human` for words a person typed through any host, `scheduled` for a fired job, `peer` for inbox items, `task_notification` for finished background work delivering itself; a sub-agent inherits this too. `cc_prev_req` names the `request-id` of the previous response in the same conversation, so it is absent on a conversation's first request. A compaction's requests carry `cc_prev_req` and neither of the other two, which is what Claude Code's own compaction sends.
 2. `You are Claude Code, Anthropic's official CLI for Claude.` (fixed identity prefix).
 3. Your own system prompt, which carries `cache_control: {type: "ephemeral", ttl: "1h", scope: "global"}`.
 
@@ -177,9 +187,9 @@ Nothing in meka depends on that order. `patch_request_body` finds the `cch=00000
 - `context_management.edits = [{type: "clear_thinking_20251015", keep: "all"}]`: present when thinking is enabled on a context-management-capable model. Mirrors Claude Code's `apiMicrocompact`.
 - `output_config.effort`: see [Reasoning effort](#reasoning-effort).
 - `thinking.display`: see [`thinking_display`](#thinking_display); absent with thinking off and under `redacted`.
-- `diagnostics.previous_message_id`: the id of the previous response's message in this conversation, `null` on the first request and after a resume; absent on a compaction request, which is a side query. Pairs with the `cache-diagnosis-2026-04-07` beta.
+- `diagnostics.previous_message_id`: the id of the previous response's message in this conversation, `null` on the first request, after a resume, and after a compaction that summarized that response away; absent on a compaction request, which is a side query. Pairs with the `cache-diagnosis-2026-04-07` beta.
 - `temperature: 1` (only when `thinking = "off"`, and only for models that still accept sampling params).
-- `max_tokens`: `64_000` under `thinking = "adaptive"`, `max(thinking_budget * 2, 32_000)` under `budgeted`, `32_000` under `off`.
+- `max_tokens`: `128_000` under `thinking = "adaptive"`, `max(thinking_budget * 2, 32_000)` under `budgeted`, `32_000` under `off`. Claude Code reads the figure off a per-model catalog, which says `128_000` for Opus 5.5 and `64_000` for the rest of the current line-up; [`max_output_tokens`](../configuration/config-file.md#max_output_tokens) on the profile states another.
 
 ### Reasoning effort
 
@@ -188,10 +198,10 @@ Claude Code never leaves `output_config.effort` to the server on a model that ta
 | | sent |
 |---|---|
 | profile sets `effort` | that value, verbatim |
-| profile sets nothing | `high` |
+| profile sets nothing | `medium` |
 | model takes no effort | nothing, and no beta; a configured value is dropped with a warning |
 
-One value for every model, not a copy of that table. `high` is what Claude Code's own resolution produces for almost every effort-capable model in the 2.1.263 table once the clamps have run, and it is what Claude Code falls back to for any model the table does not list. Carrying the per-model figures instead would add facts about Anthropic's data that go stale on their release schedule and buy nothing, because the server cannot tell a default meka chose from a value you configured. Models that take no effort at all are the Claude 3.x line, Opus 4.0/4.1, Sonnet 4.0/4.5 and Haiku 4.5.
+One value for every model, not a copy of that table. `medium` is what the 2.1.280 table says for Opus 5.5, the model `meka profile add` suggests; most other entries say `high`, Opus 4.7's says `xhigh`, and `high` is what Claude Code falls back to for any model the table does not list. Carrying the per-model figures instead would add facts about Anthropic's data that go stale on their release schedule and buy nothing, because the server cannot tell a default meka chose from a value you configured. Models that take no effort at all are the Claude 3.x line, Opus 4.0/4.1, Sonnet 4.0/4.5 and Haiku 4.5.
 
 A value you configure is absolute. Claude Code silently lowers `xhigh` or `max` to `high` on a model whose bundled entry lacks the capability; meka does not, because that table is a snapshot of someone else's system and quietly overriding what you asked for on the strength of it is worse than letting the API answer.
 
@@ -199,7 +209,7 @@ Only `claude-subscription` does this. `anthropic-messages` still omits `effort` 
 
 ### Cache control
 
-The most recent message's last content block and the user system prompt carry `cache_control: {type: "ephemeral", ttl: "1h"}`. The 1h TTL is what an OAuth subscriber's Claude Code turn carries on the wire.
+The most recent message's last content block and the user system prompt carry `cache_control: {type: "ephemeral", ttl: "1h"}`. The 1h TTL is what an OAuth subscriber's Claude Code turn carries on the wire. A compaction's requests carry the breakpoints without the TTL and without the `extended-cache-ttl-2025-04-11` beta, as Claude Code's do: the summary is read once, and an hour of cache would be paid for and never read back.
 
 Caching is prefix-based: the tools array precedes the system prompt, which precedes the messages, so a byte changing early invalidates everything after it. meka is built so that nothing which changes mid-session sits in that prefix.
 

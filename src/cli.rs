@@ -1252,7 +1252,7 @@ mod tests {
             "--account",
             "work",
             "--model",
-            "claude-opus-5",
+            "claude-opus-5-5",
         ]);
         match cli.command {
             Some(Command::Profile {
@@ -1266,7 +1266,7 @@ mod tests {
             }) => {
                 assert_eq!(name, "daily");
                 assert_eq!(account.as_deref(), Some("work"));
-                assert_eq!(model.as_deref(), Some("claude-opus-5"));
+                assert_eq!(model.as_deref(), Some("claude-opus-5-5"));
             }
             other => panic!("expected profile add, got {other:?}"),
         }

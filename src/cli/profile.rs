@@ -187,7 +187,9 @@ fn prompt_account(config_file: &config::ConfigFile) -> anyhow::Result<String> {
 /// by typing a different name; an empty entry accepts the default.
 fn default_model_for(backend: config::Backend) -> &'static str {
     match backend {
-        config::Backend::AnthropicMessages | config::Backend::ClaudeSubscription => "claude-opus-5",
+        config::Backend::AnthropicMessages | config::Backend::ClaudeSubscription => {
+            "claude-opus-5-5"
+        }
         config::Backend::OpenAiChatCompletions
         | config::Backend::OpenAiResponses
         | config::Backend::ChatGptSubscription => "gpt-5.6-sol",
@@ -1443,11 +1445,11 @@ mod tests {
     fn default_model_for_known_backends() {
         assert_eq!(
             default_model_for(config::Backend::AnthropicMessages),
-            "claude-opus-5"
+            "claude-opus-5-5"
         );
         assert_eq!(
             default_model_for(config::Backend::ClaudeSubscription),
-            "claude-opus-5"
+            "claude-opus-5-5"
         );
         assert_eq!(
             default_model_for(config::Backend::OpenAiChatCompletions),
@@ -1944,7 +1946,7 @@ model = "gpt-5.6"
 
 [profiles.work]
 account = "work"
-model = "claude-opus-5"
+model = "claude-opus-5-5"
 
 [profiles.typo]
 account = "typo"
@@ -2042,7 +2044,7 @@ account = "work"
     /// Every settable key parses its own value type, and refuses what it cannot mean.
     #[test]
     fn each_profile_key_parses_the_way_its_add_flag_does() {
-        assert!(parse_profile_value("work", "model", "claude-opus-5").is_ok());
+        assert!(parse_profile_value("work", "model", "claude-opus-5-5").is_ok());
         assert!(parse_profile_value("work", "context_window", "200000").is_ok());
         assert!(parse_profile_value("work", "context_window", "lots").is_err());
         assert!(parse_profile_value("work", "vision", "false").is_ok());

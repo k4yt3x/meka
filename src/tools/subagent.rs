@@ -1952,6 +1952,7 @@ async fn build_subagent(
         &parent_options,
         sub_system_prompt,
         call.prompt_id,
+        call.turn_origin,
     ))
 }
 
@@ -6674,6 +6675,7 @@ mod tests {
             session_id: None,
             tool_call_id: None,
             prompt_id: Some(prompt_id),
+            turn_origin: Some(crate::provider::TurnOrigin::Scheduled),
             frontend: Arc::new(crate::frontend::SilentFrontend),
             cancellation: CancellationToken::new(),
         };
@@ -6692,6 +6694,11 @@ mod tests {
             provider.completion_prompt_ids(),
             vec![Some(spawning_prompt)],
             "the spawned worker's request must bill to the prompt that spawned it"
+        );
+        assert_eq!(
+            provider.completion_turn_origins(),
+            vec![Some(crate::provider::TurnOrigin::Scheduled)],
+            "and report where that prompt came from"
         );
 
         let followup_prompt = Uuid::new_v4();

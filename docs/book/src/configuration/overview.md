@@ -8,7 +8,7 @@ to get started is to let the two command suites write both for you:
 
 ```console
 $ meka account add anthropic --backend claude-subscription
-$ meka profile add work --account anthropic --model claude-opus-5
+$ meka profile add work --account anthropic --model claude-opus-5-5
 ```
 
 The first command writes an `[accounts.anthropic]` table to the config file, runs the OAuth login
@@ -24,7 +24,7 @@ backend = "claude-subscription"
 
 [profiles.work]
 account = "anthropic"
-model   = "claude-opus-5"
+model   = "claude-opus-5-5"
 ```
 
 See [Config file](./config-file.md) for the full reference and the
@@ -61,7 +61,7 @@ gauging its context against the 1M window its profile still stated, and never au
 To change a setting, edit the profile:
 
 ```bash
-meka profile set work model claude-opus-5
+meka profile set work model claude-opus-5-5
 ```
 
 To run something different, make a second profile on the same account and select it:

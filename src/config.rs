@@ -637,10 +637,11 @@ pub(crate) const DEFAULT_MCP_HTTP_CONCURRENCY: usize = 20;
 /// Default extended-thinking token budget.
 pub(crate) const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 16_000;
 /// `[session].context_ceiling_percent` when unset: the share of the window the conversation may
-/// fill before auto-compaction fires and past which a whole read is cut. A tenth of the window is
-/// left for the reply and for one round's growth past the line; on the default window that is
-/// 100k tokens against a reply budget of 64k.
-pub(crate) const DEFAULT_CONTEXT_CEILING_PERCENT: u64 = 90;
+/// fill before auto-compaction fires and past which a whole read is cut. What is left has to hold
+/// the reply and one round's growth past the line, because the API refuses a request whose input
+/// and `max_tokens` together exceed the window; on the default window this leaves 150k tokens
+/// against the Claude reply budget of 128k.
+pub(crate) const DEFAULT_CONTEXT_CEILING_PERCENT: u64 = 85;
 /// Default maximum sub-agent recursion depth (root spawns down to grandchild).
 const DEFAULT_SUBAGENT_MAX_DEPTH: usize = 3;
 
@@ -2456,11 +2457,12 @@ impl From<ThinkingMode> for String {
 #[serde(try_from = "String", into = "String")]
 pub(crate) enum ThinkingDisplay {
     /// `thinking.display = "updates"` under the `thinking-display-updates-2026-08-18` beta, and no
-    /// redaction beta: Claude Code's default from 2.1.263.
-    #[default]
+    /// redaction beta: Claude Code's own default since 2.1.263.
     Updates,
     /// `thinking.display = "summarized"` and no redaction beta: Claude Code's
-    /// `showThinkingSummaries` setting.
+    /// `showThinkingSummaries` setting, and meka's default, because a summary says what the model
+    /// is doing where a token count does not, at the same price.
+    #[default]
     Summarized,
     /// No display field and the `redact-thinking-2026-02-12` beta: Claude Code with display
     /// updates switched off.
@@ -4099,7 +4101,7 @@ model = "m"
 "#;
         let resolved = resolve_with_config(usable);
         assert_eq!(
-            DEFAULT_CONTEXT_CEILING_PERCENT, 90,
+            DEFAULT_CONTEXT_CEILING_PERCENT, 85,
             "the documented default"
         );
         assert_eq!(

@@ -39,6 +39,9 @@ pub(crate) struct TurnInput {
     /// what is waiting for itself once it knows its session, so no door can forget; a driver
     /// that opens a turn on items it already read hands them over here instead.
     inbox: Vec<crate::store::inbox::InboxItem>,
+    /// Where the prompt came from, as the billing header reports it. Each door sets its own; the
+    /// scheduler restates a fired job's, since its words are typed by nobody.
+    origin: crate::provider::TurnOrigin,
 }
 
 enum Prompt {
@@ -63,6 +66,7 @@ impl TurnInput {
             retention: PromptRetention::Keep,
             riding: Vec::new(),
             inbox: Vec::new(),
+            origin: crate::provider::TurnOrigin::Human,
         })
     }
 
@@ -78,6 +82,7 @@ impl TurnInput {
             retention: PromptRetention::Keep,
             riding: Vec::new(),
             inbox: items,
+            origin: crate::provider::TurnOrigin::Peer,
         })
     }
 
@@ -100,7 +105,14 @@ impl TurnInput {
             retention: PromptRetention::Keep,
             riding: Vec::new(),
             inbox: Vec::new(),
+            origin: crate::provider::TurnOrigin::TaskNotification,
         }
+    }
+
+    /// Where the prompt came from, when the door that admitted it is not the one that knows.
+    pub(crate) fn originating(mut self, origin: crate::provider::TurnOrigin) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// What becomes of the prompt if the turn ends unanswered: the scheduler's answer per job, the
@@ -575,16 +587,22 @@ impl Agent {
     }
 
     /// Who this turn's requests are for. A worker answers its parent's prompt, so it carries the
-    /// id its parent's turn handed the spawning call rather than minting one; the root agent
-    /// mints one per turn. The previous-request slot is the agent's own, so a conversation names
-    /// its own last response and never a sibling's.
-    fn turn_attribution(&self) -> crate::provider::Attribution {
+    /// id and the origin its parent's turn handed the spawning call rather than minting its own;
+    /// the root agent mints an id per turn and reports where the turn's prompt came from. The
+    /// previous-request slot is the agent's own, so a conversation names its own last response
+    /// and never a sibling's.
+    fn turn_attribution(
+        &self,
+        origin: crate::provider::TurnOrigin,
+    ) -> crate::provider::Attribution {
         crate::provider::Attribution {
             subagent: self.role.is_worker(),
             prompt_id: Some(self.role.inherited_prompt_id().unwrap_or_else(Uuid::new_v4)),
             previous_request: Some(Arc::clone(&self.previous_request)),
             previous_message: Some(Arc::clone(&self.previous_message)),
             session_id: self.cells.session_id.get(),
+            turn_origin: Some(self.role.inherited_turn_origin().unwrap_or(origin)),
+            ..Default::default()
         }
     }
 
@@ -612,7 +630,12 @@ impl Agent {
         let words = input.words();
         let request_in_flight = words.clone();
         let outcomes = input.delivered_outcomes();
-        let TurnInput { images, inbox, .. } = input;
+        let TurnInput {
+            images,
+            inbox,
+            origin,
+            ..
+        } = input;
         // Gate on MCP readiness BEFORE touching session state / message history so a rejected turn
         // leaves no trace in the conversation.
         self.await_mcp_ready().await?;
@@ -650,7 +673,7 @@ impl Agent {
             id
         };
         // After the session exists, so the first turn's requests name it as the others do.
-        let attribution = self.turn_attribution();
+        let attribution = self.turn_attribution(origin);
 
         self.cells.frontend.emit(FrontendEvent::TurnStarted).await;
 
@@ -676,8 +699,7 @@ impl Agent {
                 if let Err(error) = self
                     .compact_session(
                         messages,
-                        CompactRequest::new(CompactOrigin::Reactive)
-                            .attributed_to(attribution.prompt_id),
+                        CompactRequest::new(CompactOrigin::Reactive),
                         cancellation.clone(),
                     )
                     .await
@@ -810,8 +832,7 @@ impl Agent {
                 match self
                     .compact_session(
                         messages,
-                        CompactRequest::new(CompactOrigin::Proactive)
-                            .attributed_to(attribution.prompt_id),
+                        CompactRequest::new(CompactOrigin::Proactive),
                         cancellation.clone(),
                     )
                     .await
@@ -866,6 +887,10 @@ impl Agent {
         // display reflects the whole turn (including tool-execution loops), not just the final
         // round-trip.
         let mut turn_usage = crate::stats::TokenUsage::default();
+        // What the previous round ran, for every request until the next round replaces it: a
+        // repair or a mid-turn compaction re-sends the same continuation, which Claude Code
+        // reports the same way.
+        let mut last_round_durations: Vec<crate::provider::ToolDuration> = Vec::new();
 
         let result: Result<TurnOutcome> = 'turn: {
             loop {
@@ -955,6 +980,8 @@ impl Agent {
                     recovery.inbox_ids.clone(),
                     round.clone(),
                 );
+                let request_attribution = attribution
+                    .for_request(last_round_durations.clone(), self.take_context_compacted());
                 let call_result: Result<(Message, StopReason, crate::stats::TokenUsage)> = if self
                     .options
                     .streaming
@@ -963,7 +990,7 @@ impl Agent {
                         Arc::clone(&system_prompt),
                         Arc::from(api_messages),
                         tools,
-                        attribution.clone(),
+                        request_attribution.clone(),
                         round.clone(),
                         &mut progress,
                     )
@@ -979,7 +1006,7 @@ impl Agent {
                             .provider()
                             .complete(
                                 CompletionRequest::new(&system_prompt, api_messages, &tools)
-                                    .attributed(attribution.clone()),
+                                    .attributed(request_attribution.clone()),
                                 round.clone(),
                             )
                             .await
@@ -1366,14 +1393,15 @@ impl Agent {
                         );
                     }
 
-                    let mut tool_results = self
+                    let (mut tool_results, tool_durations) = self
                         .execute_tool_calls(
                             &assistant_message,
                             &loaded,
-                            attribution.prompt_id,
+                            &attribution,
                             cancellation.clone(),
                         )
                         .await;
+                    last_round_durations = tool_durations;
 
                     if let Err(error) = crate::tools::scratchpad::save_explicit_scratchpad_results(
                         &self.store,
@@ -1556,7 +1584,6 @@ impl Agent {
                                     .compact_session(
                                         messages,
                                         CompactRequest::new(CompactOrigin::Reactive)
-                                            .attributed_to(attribution.prompt_id)
                                             .answering(recovery.request_in_flight.clone()),
                                         cancellation.clone(),
                                     )
@@ -2642,6 +2669,46 @@ mod tests {
             .expect("create session");
         agent.cells().session_id.set(session_id);
         (agent, provider, store, session_id, frontend)
+    }
+
+    /// What the door says about the prompt is what the request reports: the scheduler restates
+    /// a fired job's origin on words nobody typed, and a typed prompt is a person's.
+    #[tokio::test]
+    async fn a_turns_requests_report_the_origin_its_door_stated() {
+        let (agent, provider, _store, _session, _frontend) =
+            agent_with_session(vec![text_round("ok"), text_round("ok")]).await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts(
+                    "[Scheduled job fired] news".into(),
+                    Vec::new(),
+                )
+                .expect("a prompt")
+                .originating(crate::provider::TurnOrigin::Scheduled),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("and now?".into(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+        let origins: Vec<_> = provider
+            .streams()
+            .iter()
+            .map(|request| request.turn_origin)
+            .collect();
+        assert_eq!(origins, vec![
+            Some(crate::provider::TurnOrigin::Scheduled),
+            Some(crate::provider::TurnOrigin::Human),
+        ]);
     }
 
     fn a_stalled_answer(first: &str, rest: &str) -> Vec<MockEvent> {

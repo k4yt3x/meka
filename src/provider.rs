@@ -53,7 +53,7 @@ use crate::{
 /// Claude Code's OAuth client id, which the `claude-subscription` backend authenticates as.
 pub(crate) const DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID: &str =
     "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-/// The token endpoint Claude Code 2.1.263 exchanges the login code at and refreshes against
+/// The token endpoint Claude Code 2.1.280 exchanges the login code at and refreshes against
 /// (`TOKEN_URL` in the binary); `[accounts.<name>].oauth_token_url` overrides it.
 pub(crate) const DEFAULT_CLAUDE_SUBSCRIPTION_TOKEN_URL: &str =
     "https://platform.claude.com/v1/oauth/token";
@@ -170,6 +170,64 @@ pub(crate) type PreviousRequestSlot = Arc<std::sync::Mutex<Option<String>>>;
 /// for the request id: Claude Code names it as `diagnostics.previous_message_id`.
 pub(crate) type PreviousMessageSlot = Arc<std::sync::Mutex<Option<String>>>;
 
+/// Where the prompt a request answers came from, as `cc_turn_origin` names it. Claude Code
+/// stamps its own vocabulary on every user message and reports the one behind the request; a
+/// sub-agent inherits its spawner's, and a compaction reports none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnOrigin {
+    /// Words a person typed, whichever host they arrived through.
+    Human,
+    /// A scheduled job firing.
+    Scheduled,
+    /// Inbox items from another session, agent or client.
+    Peer,
+    /// Finished background work delivering itself.
+    TaskNotification,
+}
+
+impl TurnOrigin {
+    /// The wire spelling.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Scheduled => "scheduled",
+            Self::Peer => "peer",
+            Self::TaskNotification => "task_notification",
+        }
+    }
+}
+
+/// What set a compaction going, in the words Claude Code's compaction headers use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionKind {
+    /// Asked for: `/compact`, `POST /compact`, or the agent's own `context_compact`.
+    Manual,
+    /// A measured or projected occupancy crossed the ceiling.
+    Auto,
+    /// The provider refused the request as too large.
+    Reactive,
+}
+
+impl CompactionKind {
+    /// The wire spelling.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Auto => "auto",
+            Self::Reactive => "reactive",
+        }
+    }
+}
+
+/// How long one tool call of the previous round took, for `x-claude-code-prev-tool-durations`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolDuration {
+    /// The tool's registered name, as the model called it.
+    pub(crate) name: String,
+    /// From dispatch to its result, or to its detachment for a background call.
+    pub(crate) elapsed: std::time::Duration,
+}
+
 /// Who a request is for, as the billing header has to describe it.
 ///
 /// None of this can live on the provider: one `Arc<dyn Provider>` serves the main agent and every
@@ -197,9 +255,49 @@ pub(crate) struct Attribution {
     /// without it the endpoint spreads one conversation's requests across machines, and the prompt
     /// cache answers a fraction of them.
     pub(crate) session_id: Option<Uuid>,
+    /// Where the prompt this request answers came from (`cc_turn_origin`). A compaction has none.
+    pub(crate) turn_origin: Option<TurnOrigin>,
+    /// Set on a compaction's own requests: what set it going, for the compaction headers.
+    pub(crate) compaction: Option<CompactionKind>,
+    /// Set on the first request of the conversation after a compaction: what set that compaction
+    /// going, for the context-compacted headers.
+    pub(crate) context_compacted: Option<CompactionKind>,
+    /// The tool calls the previous round ran, in dispatch order, for
+    /// `x-claude-code-prev-tool-durations`. Empty on a request that follows no tool round.
+    pub(crate) previous_tool_durations: Vec<ToolDuration>,
 }
 
 impl Attribution {
+    /// The `x-claude-code-request-class` a request reports: a compaction before anything else,
+    /// since a worker's compaction is one too; then a worker's turn; then a turn of the
+    /// conversation. `None` for a request that is none of those, which Claude Code leaves
+    /// unclassified as well.
+    pub(crate) fn request_class(&self) -> Option<&'static str> {
+        if self.compaction.is_some() {
+            Some("compaction")
+        } else if self.subagent {
+            Some("subagent")
+        } else if self.is_conversation_turn() {
+            Some("main")
+        } else {
+            None
+        }
+    }
+
+    /// This attribution for one request: carrying what the previous round ran and, on the first
+    /// request after a compaction, what set that compaction going.
+    pub(crate) fn for_request(
+        &self,
+        previous_tool_durations: Vec<ToolDuration>,
+        context_compacted: Option<CompactionKind>,
+    ) -> Self {
+        Self {
+            previous_tool_durations,
+            context_compacted,
+            ..self.clone()
+        }
+    }
+
     /// The id of the response before this request in its conversation, if one was recorded.
     pub(crate) fn previous_request_id(&self) -> Option<String> {
         self.previous_request
@@ -240,6 +338,32 @@ impl Attribution {
     /// `diagnostics.previous_message_id`.
     pub(crate) fn is_conversation_turn(&self) -> bool {
         self.previous_message.is_some()
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+
+    #[test]
+    fn a_request_is_classed_as_a_compaction_before_a_worker_before_a_turn() {
+        let slot = PreviousMessageSlot::default();
+        let turn = Attribution {
+            previous_message: Some(Arc::clone(&slot)),
+            ..Default::default()
+        };
+        assert_eq!(turn.request_class(), Some("main"));
+        let worker = Attribution {
+            subagent: true,
+            ..turn.clone()
+        };
+        assert_eq!(worker.request_class(), Some("subagent"));
+        let compaction = Attribution {
+            compaction: Some(CompactionKind::Reactive),
+            ..worker.clone()
+        };
+        assert_eq!(compaction.request_class(), Some("compaction"));
+        assert_eq!(Attribution::default().request_class(), None);
     }
 }
 
@@ -979,7 +1103,7 @@ mod tests {
     #[tokio::test]
     async fn rotating_a_credential_retires_the_provider_built_from_it() {
         let mut profiles = profiles(&["work"]);
-        profiles.profile("work").model = Some("claude-opus-5".to_string());
+        profiles.profile("work").model = Some("claude-opus-5-5".to_string());
         let registry = provider_registry_for_test(profiles).await;
         registry
             .token_store
@@ -1018,7 +1142,7 @@ mod tests {
         let mut configured = profiles(&["work", "fast"]);
         configured.accounts.remove("fast");
         configured.profile("fast").account = "work".to_string();
-        configured.profile("work").model = Some("claude-opus-5".to_string());
+        configured.profile("work").model = Some("claude-opus-5-5".to_string());
         configured.profile("fast").model = Some("claude-haiku-4-5".to_string());
         let registry = provider_registry_for_test(configured).await;
         registry

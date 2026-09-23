@@ -180,6 +180,7 @@ impl crate::schedule::GateTools for GateToolset {
             session_id,
             tool_call_id: None,
             prompt_id: None,
+            turn_origin: None,
             frontend: std::sync::Arc::new(crate::frontend::SilentFrontend),
             cancellation: cancellation.clone(),
         };

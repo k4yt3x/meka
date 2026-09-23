@@ -9,11 +9,11 @@ credential flow (OAuth login or API-key prompt) and writes the account to
 ```bash
 # Claude Code subscription (OAuth)
 meka account add anthropic --backend claude-subscription
-meka profile add work --account anthropic --model claude-opus-5
+meka profile add work --account anthropic --model claude-opus-5-5
 
 # or a Claude API key
 meka account add anthropic --backend anthropic-messages
-meka profile add work --account anthropic --model claude-opus-5
+meka profile add work --account anthropic --model claude-opus-5-5
 
 # or OpenAI
 meka account add openai --backend openai-chat-completions

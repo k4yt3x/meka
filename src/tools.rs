@@ -763,6 +763,8 @@ pub(crate) struct ToolContext {
     /// The prompt the turn making this call answers, so a worker spawned by the call bills its
     /// work to the same prompt.
     pub(crate) prompt_id: Option<uuid::Uuid>,
+    /// Where that prompt came from, for the same reason.
+    pub(crate) turn_origin: Option<crate::provider::TurnOrigin>,
     /// Where this call's prompts, progress and live output go.
     pub(crate) frontend: Arc<dyn crate::frontend::Frontend>,
     /// Canceled when this call, or the turn carrying it, is stopped.
@@ -778,6 +780,7 @@ impl ToolContext {
             session_id: None,
             tool_call_id: None,
             prompt_id: None,
+            turn_origin: None,
             frontend: Arc::new(crate::frontend::SilentFrontend),
             cancellation,
         }

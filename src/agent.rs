@@ -108,6 +108,10 @@ pub(crate) struct Agent {
     /// The message id twin of [`Self::previous_request`], read for
     /// `diagnostics.previous_message_id`.
     previous_message: crate::provider::PreviousMessageSlot,
+    /// What set the last compaction going, waiting for the conversation's next request to report
+    /// it in the context-compacted headers, which is when Claude Code clears its own flag. Set by
+    /// the root agent alone, since Claude Code stamps it on the main thread and nowhere else.
+    context_compacted: std::sync::Mutex<Option<crate::provider::CompactionKind>>,
     /// Conversation length at the time of the most recent request the provider *accepted*, or
     /// [`LAST_ACCEPTED_UNKNOWN`] before the first one. Everything appended past it is what a
     /// `MekaError::InvalidRequest` is allowed to blame: the failing request differs from the last
@@ -132,10 +136,11 @@ pub(crate) struct Agent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentRole {
     Root,
-    /// A worker answers its parent's prompt, so it carries the id its parent's turn handed the
-    /// spawning call rather than minting one.
+    /// A worker answers its parent's prompt, so it carries the id and the origin its parent's
+    /// turn handed the spawning call rather than minting its own.
     Worker {
         inherited_prompt_id: Option<uuid::Uuid>,
+        inherited_turn_origin: Option<crate::provider::TurnOrigin>,
     },
 }
 
@@ -153,7 +158,18 @@ impl AgentRole {
             Self::Root => None,
             Self::Worker {
                 inherited_prompt_id,
+                ..
             } => inherited_prompt_id,
+        }
+    }
+
+    fn inherited_turn_origin(self) -> Option<crate::provider::TurnOrigin> {
+        match self {
+            Self::Root => None,
+            Self::Worker {
+                inherited_turn_origin,
+                ..
+            } => inherited_turn_origin,
         }
     }
 }
@@ -196,6 +212,7 @@ impl Agent {
             // spawner's.
             previous_request: crate::provider::PreviousRequestSlot::default(),
             previous_message: crate::provider::PreviousMessageSlot::default(),
+            context_compacted: std::sync::Mutex::new(None),
             last_accepted_len: std::sync::atomic::AtomicUsize::new(LAST_ACCEPTED_UNKNOWN),
         }
     }
@@ -344,8 +361,10 @@ impl Agent {
         tool_registry: ToolRegistry,
         parent_options: &AgentOptions,
         sub_system_prompt: String,
-        // The prompt the spawning call answered, so the worker's requests bill to it.
+        // The prompt the spawning call answered and where it came from, so the worker's requests
+        // bill to it.
         inherited_prompt_id: Option<uuid::Uuid>,
+        inherited_turn_origin: Option<crate::provider::TurnOrigin>,
     ) -> Self {
         let options = AgentOptions {
             sandboxed_shell: parent_options.sandboxed_shell,
@@ -385,6 +404,7 @@ impl Agent {
             options,
             AgentRole::Worker {
                 inherited_prompt_id,
+                inherited_turn_origin,
             },
         )
     }
@@ -469,6 +489,13 @@ impl Agent {
         self.last_accepted_len
             .store(LAST_ACCEPTED_UNKNOWN, std::sync::atomic::Ordering::Relaxed);
         *self.last_rendered_world.write().await = None;
+        *crate::sync::lock(&self.context_compacted) = None;
+    }
+
+    /// The compaction the next request is the first to follow, if any; see
+    /// [`Self::context_compacted`].
+    pub(super) fn take_context_compacted(&self) -> Option<crate::provider::CompactionKind> {
+        crate::sync::lock(&self.context_compacted).take()
     }
 
     /// The registry this agent dispatches through. Exposed so a host that attached it to the MCP

@@ -99,7 +99,6 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                     .filter(|value| !value.is_empty())
                     .map(str::to_string),
                 keep_recent: None,
-                prompt_id: None,
                 request_in_flight: None,
             };
             match crate::host::terminal::compact_interruptible(

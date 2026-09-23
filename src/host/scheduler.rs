@@ -234,7 +234,9 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
     // Admitted before any outcome is claimed. A claim is one-way, so a prompt refused after it
     // would leave the batch stamped delivered and never handed out again.
     let input = match crate::agent::TurnInput::from_parts(wakeup.render_prompt(), Vec::new()) {
-        Ok(input) => input.retaining(job.prompt_retention()),
+        Ok(input) => input
+            .retaining(job.prompt_retention())
+            .originating(crate::provider::TurnOrigin::Scheduled),
         Err(empty) => {
             tracing::warn!("scheduled job {job_id} rendered no prompt: {empty}");
             return FireOutcome::Unrunnable;
@@ -741,6 +743,10 @@ mod tests {
             admitted < claimed,
             "a scheduled fire must admit its prompt before claiming outcomes; found \
              admit@{admitted} claim@{claimed}"
+        );
+        assert!(
+            wakeup.contains(".originating(crate::provider::TurnOrigin::Scheduled)"),
+            "a fired job's words are typed by nobody, so the fire must restate their origin"
         );
 
         let typed = include_str!("repl.rs")

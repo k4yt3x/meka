@@ -55,14 +55,14 @@ Add an account with `meka account add`, then a profile on it with `meka profile 
 
 ```bash
 meka account add anthropic --backend claude-subscription
-meka profile add work --account anthropic --model claude-opus-5
+meka profile add work --account anthropic --model claude-opus-5-5
 ```
 
 An account is a backend, an endpoint and a login. The backend is either a wire protocol (`anthropic-messages`, `openai-chat-completions`, `openai-responses`) or a subscription (`claude-subscription`, `chatgpt-subscription`). A profile is an account plus a model, so one login can serve several models. Add several and switch with `meka profile use <name>` or `--profile <name>`. For an OpenAI-compatible endpoint like OpenRouter, set `--base-url` on the account:
 
 ```bash
 meka account add openrouter --backend openai-chat-completions --base-url https://openrouter.ai/api/v1
-meka profile add opus --account openrouter --model anthropic/claude-opus-5
+meka profile add opus --account openrouter --model anthropic/claude-opus-5.5
 ```
 
 Run `meka` and start typing. Press Shift+Tab to cycle permissions (none, read, workspace, unrestricted):

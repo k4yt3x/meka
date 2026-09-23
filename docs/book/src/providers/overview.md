@@ -35,7 +35,7 @@ token) in the store, and `meka profile add` names the model:
 
 ```console
 $ meka account add anthropic --backend claude-subscription
-$ meka profile add work --account anthropic --model claude-opus-5
+$ meka profile add work --account anthropic --model claude-opus-5-5
 ```
 
 This produces an `[accounts.anthropic]` and a `[profiles.work]` entry in
@@ -47,7 +47,7 @@ backend = "claude-subscription"
 
 [profiles.work]
 account = "anthropic"
-model   = "claude-opus-5"
+model   = "claude-opus-5-5"
 ```
 
 Two profiles on one account share one login, which is how one subscription runs two models. With

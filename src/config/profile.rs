@@ -601,8 +601,8 @@ mod tests {
     #[test]
     fn a_profile_needs_a_model_that_is_not_empty() {
         assert_eq!(
-            require_model("work", Some("claude-opus-5")).expect("a model"),
-            "claude-opus-5"
+            require_model("work", Some("claude-opus-5-5")).expect("a model"),
+            "claude-opus-5-5"
         );
         for missing in [None, Some(""), Some("   ")] {
             let message = require_model("work", missing)
@@ -657,8 +657,8 @@ mod tests {
         assert!(settings.vision, "vision defaults on");
         assert_eq!(
             settings.thinking_display,
-            crate::config::ThinkingDisplay::Updates,
-            "thinking display defaults to updates"
+            crate::config::ThinkingDisplay::Summarized,
+            "thinking display defaults to summaries"
         );
         assert_eq!(
             settings.context_window,
@@ -906,7 +906,7 @@ mod tests {
             "\n",
             "[profiles.work]\n",
             "account = \"work\"\n",
-            "model = \"claude-opus-5\"\n",
+            "model = \"claude-opus-5-5\"\n",
             "context_window = 200000\n",
             "max_output_tokens = 64000\n",
             "effort = \"high\"\n",
@@ -958,7 +958,7 @@ mod tests {
             "\n",
             "# the window this model really has\n",
             "context_window = 200000\n",
-            "model = \"claude-opus-5\" # pinned deliberately\n",
+            "model = \"claude-opus-5-5\" # pinned deliberately\n",
             "account = \"work\"\n",
         )
         .parse()
@@ -986,7 +986,7 @@ mod tests {
             "the comment should still sit above the key it explains: {rendered}"
         );
         assert!(
-            rendered.contains("model = \"claude-opus-5\" # pinned deliberately"),
+            rendered.contains("model = \"claude-opus-5-5\" # pinned deliberately"),
             "a trailing comment should still sit beside its value: {rendered}"
         );
     }

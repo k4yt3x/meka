@@ -1555,7 +1555,7 @@ mod tests {
     /// user as a fact about the profile, and meka does not know what an unstated model resolves to.
     #[test]
     fn a_provider_option_describes_only_a_stated_model() {
-        let profiles = profiles_for_test(&[("work", Some("claude-opus-5")), ("personal", None)]);
+        let profiles = profiles_for_test(&[("work", Some("claude-opus-5-5")), ("personal", None)]);
 
         let option = profile_config_option(&profiles, "personal");
 
@@ -1563,7 +1563,7 @@ mod tests {
         assert_eq!(current_value(&option), "personal");
         assert_eq!(select_options(&option), vec![
             ("personal".to_string(), None),
-            ("work".to_string(), Some("claude-opus-5".to_string())),
+            ("work".to_string(), Some("claude-opus-5-5".to_string())),
         ],);
     }
 

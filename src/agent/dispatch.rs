@@ -24,9 +24,9 @@ impl Agent {
         &self,
         assistant_message: &Message,
         loaded: &[String],
-        prompt_id: Option<Uuid>,
+        attribution: &crate::provider::Attribution,
         cancellation: CancellationToken,
-    ) -> Vec<ContentBlock> {
+    ) -> (Vec<ContentBlock>, Vec<crate::provider::ToolDuration>) {
         // Emit tool-call indicators in source order. The streaming path already emitted these as
         // `ToolUseEnd` events; this loop only fires for the blocking provider path. Serial so
         // concurrent execution below can't interleave indicators.
@@ -57,14 +57,21 @@ impl Agent {
         // Dispatch concurrently. `join_all` preserves input ordering so the i-th output corresponds
         // to the i-th planned call.
         let futures = planned.iter().map(|(id, name, input)| {
-            self.resolve_and_execute_tool(
-                id.as_str(),
-                name.as_str(),
-                input,
-                loaded,
-                prompt_id,
-                cancellation.clone(),
-            )
+            let cancellation = cancellation.clone();
+            async move {
+                let started = std::time::Instant::now();
+                let output = self
+                    .resolve_and_execute_tool(
+                        id.as_str(),
+                        name.as_str(),
+                        input,
+                        loaded,
+                        attribution,
+                        cancellation,
+                    )
+                    .await;
+                (output, started.elapsed())
+            }
         });
         let outputs = futures::future::join_all(futures).await;
 
@@ -72,8 +79,13 @@ impl Agent {
         // order, build ToolResult blocks, and emit a single TodoListUpdated event if any `todo_*`
         // call landed and actually changed the rendered state.
         let mut results = Vec::with_capacity(planned.len());
+        let mut durations = Vec::with_capacity(planned.len());
         let mut todo_fired = false;
-        for ((id, name, _), output) in planned.into_iter().zip(outputs) {
+        for ((id, name, _), (output, elapsed)) in planned.into_iter().zip(outputs) {
+            durations.push(crate::provider::ToolDuration {
+                name: name.clone(),
+                elapsed,
+            });
             if crate::tools::todo::changes_the_list(&name) {
                 todo_fired = true;
             }
@@ -128,7 +140,7 @@ impl Agent {
             }
         }
 
-        results
+        (results, durations)
     }
 
     pub(super) async fn resolve_and_execute_tool(
@@ -137,7 +149,7 @@ impl Agent {
         name: &str,
         input: &serde_json::Value,
         loaded: &[String],
-        prompt_id: Option<Uuid>,
+        attribution: &crate::provider::Attribution,
         cancellation: CancellationToken,
     ) -> crate::tools::ToolOutput {
         let Some(tool) = self.tool_registry.get(name) else {
@@ -226,13 +238,14 @@ impl Agent {
         }
 
         let mut output = if detach {
-            self.start_background_call(&tool, tool_call_id, name, input, session_id, prompt_id)
+            self.start_background_call(&tool, tool_call_id, name, input, session_id, attribution)
                 .await
         } else {
             Self::run_tool(&*tool, input, crate::tools::ToolContext {
                 session_id,
                 tool_call_id: Some(tool_call_id.to_string()),
-                prompt_id,
+                prompt_id: attribution.prompt_id,
+                turn_origin: attribution.turn_origin,
                 frontend: Arc::clone(&self.cells.frontend),
                 cancellation,
             })
@@ -363,8 +376,10 @@ impl Agent {
         name: &str,
         input: &serde_json::Value,
         session_id: Option<Uuid>,
-        prompt_id: Option<Uuid>,
+        attribution: &crate::provider::Attribution,
     ) -> crate::tools::ToolOutput {
+        let prompt_id = attribution.prompt_id;
+        let turn_origin = attribution.turn_origin;
         let session_id = match self.admit_detach(session_id).await {
             Ok(session_id) => session_id,
             Err(refusal) => return refusal,
@@ -440,6 +455,7 @@ impl Agent {
                     session_id: Some(session_id),
                     tool_call_id: Some(tool_call_id),
                     prompt_id,
+                    turn_origin,
                     frontend,
                     cancellation: scoped.clone(),
                 };
@@ -712,7 +728,7 @@ mod tests {
                     name,
                     &serde_json::json!({}),
                     &[],
-                    None,
+                    &crate::provider::Attribution::default(),
                     CancellationToken::new(),
                 )
                 .await;
@@ -786,7 +802,7 @@ mod tests {
                 "write_thing",
                 &serde_json::json!({"background": true}),
                 &[],
-                None,
+                &crate::provider::Attribution::default(),
                 CancellationToken::new(),
             )
             .await;
@@ -844,7 +860,7 @@ mod tests {
                 "shell_execute",
                 &serde_json::json!({"command": "true"}),
                 &[],
-                None,
+                &crate::provider::Attribution::default(),
                 CancellationToken::new(),
             )
             .await;
@@ -898,7 +914,7 @@ mod tests {
                     "mcp__bridge__send_file",
                     &serde_json::json!({"path": path}),
                     &[],
-                    None,
+                    &crate::provider::Attribution::default(),
                     CancellationToken::new(),
                 )
                 .await
@@ -938,6 +954,54 @@ mod tests {
             "and it spends the slot: {}",
             again.text_content()
         );
+    }
+
+    /// The request after a round reports how long each of the round's calls took, in dispatch
+    /// order, which is only knowable here.
+    #[tokio::test]
+    async fn a_round_reports_the_duration_of_each_call_in_dispatch_order() {
+        use crate::provider::mock::MockProvider;
+
+        let (agent, _store) = agent_with_registry_for_test(
+            Arc::new(MockProvider::from_rounds(vec![])),
+            crate::tools::ToolRegistry::new(),
+        )
+        .await;
+        agent
+            .tool_registry
+            .register(Arc::new(crate::tools::todo::TodoWriteTool {
+                todo_list: agent.cells.todo_list.clone(),
+            }))
+            .expect("register");
+        let message = Message {
+            role: crate::conversation::Role::Assistant,
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "call-1".to_string(),
+                    name: "todo_write".to_string(),
+                    input: serde_json::json!({"title": "Plan", "items": ["first"]}),
+                },
+                ContentBlock::ToolUse {
+                    id: "call-2".to_string(),
+                    name: "no_such_tool".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ],
+        };
+        let (results, durations) = agent
+            .execute_tool_calls(
+                &message,
+                &[],
+                &crate::provider::Attribution::default(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(results.len(), 2);
+        let names: Vec<&str> = durations
+            .iter()
+            .map(|duration| duration.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["todo_write", "no_such_tool"]);
     }
 
     /// One `TodoListUpdated` per change with something to show. A rewrite that changes nothing
@@ -982,20 +1046,25 @@ mod tests {
             .execute_tool_calls(
                 &todo_call(list.clone()),
                 &[],
-                None,
+                &crate::provider::Attribution::default(),
                 CancellationToken::new(),
             )
             .await;
         assert_eq!(rendered(), 1, "a new list is rendered once");
         agent
-            .execute_tool_calls(&todo_call(list), &[], None, CancellationToken::new())
+            .execute_tool_calls(
+                &todo_call(list),
+                &[],
+                &crate::provider::Attribution::default(),
+                CancellationToken::new(),
+            )
             .await;
         assert_eq!(rendered(), 1, "rewriting the same list renders nothing");
         agent
             .execute_tool_calls(
                 &todo_call(serde_json::json!({"title": "Plan", "items": []})),
                 &[],
-                None,
+                &crate::provider::Attribution::default(),
                 CancellationToken::new(),
             )
             .await;

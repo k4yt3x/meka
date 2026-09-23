@@ -61,7 +61,7 @@ base_url = "http://localhost:11434/v1"
 
 [profiles.work]
 account = "anthropic"
-model   = "claude-opus-5"
+model   = "claude-opus-5-5"
 
 [profiles.fast]
 account        = "anthropic"
@@ -215,7 +215,7 @@ says so.
 
 The model identifier to send to the provider, forwarded verbatim. Optional in the file, but a session cannot run without one: a profile that names no model is refused by name when a session tries to run on it. meka does not gate which strings are valid, so an OpenAI-compatible endpoint accepts whatever that server exposes.
 
-`meka profile add` suggests `claude-opus-5` for a profile on a Claude account and `gpt-5.6-sol` for one on an OpenAI account. For the current line-ups, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview) and [OpenAI's models overview](https://platform.openai.com/docs/models); naming them here would go stale on someone else's schedule.
+`meka profile add` suggests `claude-opus-5-5` for a profile on a Claude account and `gpt-5.6-sol` for one on an OpenAI account. For the current line-ups, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview) and [OpenAI's models overview](https://platform.openai.com/docs/models); naming them here would go stale on someone else's schedule.
 
 Change it with `meka profile set <name> model <value>`.
 
@@ -240,12 +240,12 @@ Override the per-request output (completion) token cap. When unset, each backend
 
 | Backend | Default when unset |
 |---|---|
-| Claude, [`thinking`](#thinking) `adaptive` | 64000 |
+| Claude, [`thinking`](#thinking) `adaptive` | 128000 |
 | Claude, `budgeted` | twice the resolved budget, or 32000, whichever is larger |
 | Claude, `off` | 32000 |
 | Every other backend | the endpoint's own |
 
-The Claude figures are meka's own defaults for the two Anthropic backends, taken from what Claude Code 2.1.263 sends on the wire; stating one here replaces them. The OpenAI backends send no cap unless the profile states one, because each reaches whatever `base_url` names and the endpoint's default is that endpoint's fact.
+The Claude figures are meka's own defaults for the two Anthropic backends. The adaptive one is what Claude Code 2.1.280 sends for Opus 5.5, the model `meka profile add` suggests, and the most any model that takes adaptive thinking accepts; Claude Code's per-model catalog says 64000 for the rest of the line-up, and stating a figure here replaces the default. The OpenAI backends send no cap unless the profile states one, because each reaches whatever `base_url` names and the endpoint's default is that endpoint's fact.
 
 Under `thinking = "budgeted"` the value must exceed the profile's resolved thinking budget ([`thinking_budget`](#thinking_budget), else [`[thinking].budget`](#thinkingbudget), else 16000). `meka profile add` and `meka profile set` both refuse a profile that fails this, and it is validated again at startup.
 
@@ -259,7 +259,7 @@ max_output_tokens = 16000
 
 One knob for reasoning effort across every backend: Claude sends it as `output_config.effort` (`claude-subscription` under the `effort-2025-11-24` beta, `anthropic-messages` directly), `openai-chat-completions` as `reasoning_effort` (with `max_completion_tokens` for the output cap), and the two Responses backends as `reasoning.effort` (with `max_output_tokens`).
 
-**When unset the field is omitted, and the provider applies its own default. `claude-subscription` is the exception: it sends `high`, matching Claude Code.** That is the point of leaving it unset: effort is a request parameter the provider owns, and omitting it is how you ask for whatever that provider considers right. meka picks no tier of its own, because it cannot know which tiers a given endpoint implements: `anthropic-messages` and `openai-chat-completions` reach any compatible server, including local ones serving weights that never had a reasoning knob, and a tier the backend doesn't implement is a rejected request rather than a graceful ignore.
+**When unset the field is omitted, and the provider applies its own default. `claude-subscription` is the exception: it sends `medium`, Claude Code's default for Opus 5.5.** That is the point of leaving it unset: effort is a request parameter the provider owns, and omitting it is how you ask for whatever that provider considers right. meka picks no tier of its own, because it cannot know which tiers a given endpoint implements: `anthropic-messages` and `openai-chat-completions` reach any compatible server, including local ones serving weights that never had a reasoning knob, and a tier the backend doesn't implement is a rejected request rather than a graceful ignore.
 
 An explicit value is absolute: sent verbatim (trimmed and lowercased), with no validation or clamping, whatever model it is aimed at. You own correctness for your model and endpoint; an invalid value is rejected by the API. A blank value reads as unset.
 
@@ -338,12 +338,14 @@ max_request_bytes = 8388608
 `claude-subscription` only. How the model's thinking is presented, one of Claude Code's three
 display modes:
 
-- `updates` (the default, Claude Code's own): the server streams a running token count in place
-  of the text, and the REPL draws `Thinking... (150 tokens)` from it, redrawn as the count climbs
-  and left on screen when the phase ends. Sent as `thinking.display = "updates"` under the
+- `summarized` (the default): the server streams a short summary of the reasoning, shown as
+  thinking text (one dimmed preview line, or the whole summary under
+  [`thinking.show_content`](#thinkingshow_content)). Sent as `thinking.display = "summarized"`,
+  which is what Claude Code sends with its `showThinkingSummaries` setting on.
+- `updates` (Claude Code's own default): the server streams a running token count in place of the
+  text, and the REPL draws `Thinking... (150 tokens)` from it, redrawn as the count climbs and left
+  on screen when the phase ends. Sent as `thinking.display = "updates"` under the
   `thinking-display-updates-2026-08-18` beta.
-- `summarized`: the server streams a short summary of the reasoning, shown as thinking text. Sent
-  as `thinking.display = "summarized"`.
 - `redacted`: the server withholds the text and may return opaque `redacted_thinking` blocks. Sent
   as the `redact-thinking-2026-02-12` beta with no display field.
 
@@ -354,7 +356,7 @@ redaction beta as Claude Code does.
 ```toml
 [profiles.work]
 account          = "anthropic"
-thinking_display = "summarized"
+thinking_display = "updates"
 ```
 
 ## `meka account` CLI
@@ -389,7 +391,7 @@ login.
 
 | Command | Action |
 |---|---|
-| `meka profile add <name> [--account A] [--model M] [...]` | Add a profile. Prompts for the account and model when not flagged (a sole account is offered as the default; the model prompt offers `claude-opus-5` on a Claude account and `gpt-5.6-sol` on an OpenAI one), then offers an optional advanced step covering thinking, context window and effort, plus the thinking budget if you answer `budgeted`. Every other [profile field](#profile-fields) has a flag writing the key of the same name: `--context-window`, `--max-output-tokens`, `--effort`, `--vision`, `--thinking`, `--thinking-budget`, `--max-request-bytes` and `--thinking-display <DISPLAY>`, so one non-interactive command can create a profile of any shape. An unflagged setting is left out of the profile so its documented default applies. Does not touch `default_profile`. |
+| `meka profile add <name> [--account A] [--model M] [...]` | Add a profile. Prompts for the account and model when not flagged (a sole account is offered as the default; the model prompt offers `claude-opus-5-5` on a Claude account and `gpt-5.6-sol` on an OpenAI one), then offers an optional advanced step covering thinking, context window and effort, plus the thinking budget if you answer `budgeted`. Every other [profile field](#profile-fields) has a flag writing the key of the same name: `--context-window`, `--max-output-tokens`, `--effort`, `--vision`, `--thinking`, `--thinking-budget`, `--max-request-bytes` and `--thinking-display <DISPLAY>`, so one non-interactive command can create a profile of any shape. An unflagged setting is left out of the profile so its documented default applies. Does not touch `default_profile`. |
 | `meka profile list` | List configured profiles with account, backend, model and the default marker; `--format json` prints the same as one document. Names any profile whose account is not configured. |
 | `meka profile set <name> <key> <value>` | Change one setting on an existing profile, in place. `--unset` in place of the value removes the key instead. See [Changing one setting](#changing-one-setting). |
 | `meka profile use <name>` | Set `default_profile` to this profile. |
@@ -409,7 +411,7 @@ and there is one shape to read rather than one per history. Comments move with t
 annotated profile stays annotated.
 
 ```console
-$ meka profile set work model claude-opus-5
+$ meka profile set work model claude-opus-5-5
 $ meka profile set work context_window 200000
 $ meka profile set work effort --unset
 ```
@@ -503,7 +505,7 @@ names the model.
 ```console
 $ meka account add anthropic --backend claude-subscription
 # Prints the OAuth login URL for you to open, then stores the token in the store.
-$ meka profile add work --account anthropic --model claude-opus-5
+$ meka profile add work --account anthropic --model claude-opus-5-5
 ```
 
 ### `anthropic-messages`
@@ -511,7 +513,7 @@ $ meka profile add work --account anthropic --model claude-opus-5
 ```console
 $ meka account add anthropic --backend anthropic-messages
 # Prompts for your Anthropic API key (sk-ant-api03-...).
-$ meka profile add work --account anthropic --model claude-opus-5
+$ meka profile add work --account anthropic --model claude-opus-5-5
 ```
 
 ### `openai-chat-completions`
@@ -1146,9 +1148,9 @@ auto_compact = false
 
 The share of the context window meka lets the conversation fill on its own. Two things happen at the line: with `auto_compact` on, the conversation is compacted once past it; and a whole `scratchpad_read` that would carry the context past it is cut there and says where to continue, whether or not compaction is on. Refused outside 1 through 100.
 
-What is left above the line has to hold the reply and one round's growth past it, so keep at least your output budget plus a round free: the default leaves 100k tokens on a 1M window against a Claude reply budget of 64000, and on a small window it needs lowering, or `max_output_tokens` does.
+What is left above the line has to hold the reply and one round's growth past it, so keep at least your output budget plus a round free: the API refuses a request whose input and output cap together exceed the window. The default leaves 150k tokens on a 1M window against a Claude reply budget of 128000; on a small window it needs lowering, or `max_output_tokens` does.
 
-Default: `90`
+Default: `85`
 
 ```toml
 [session]

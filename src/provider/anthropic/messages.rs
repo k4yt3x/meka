@@ -205,6 +205,7 @@ impl shared::ClaudeBackend for AnthropicMessagesProvider {
         _has_tools: bool,
         stream: bool,
         thinking: ThinkingOverride,
+        _attribution: &crate::provider::Attribution,
     ) -> Result<reqwest::RequestBuilder> {
         let request = if stream {
             request.header("accept-encoding", "identity")
@@ -462,6 +463,7 @@ mod tests {
         for model in [
             "claude-opus-4-8",
             "claude-opus-5",
+            "claude-opus-5-5",
             "claude-sonnet-4-20250514",
             "hf.co/bartowski/Qwen3.8-27B-GGUF:Q8_0",
         ] {

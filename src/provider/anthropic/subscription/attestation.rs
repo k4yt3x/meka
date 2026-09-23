@@ -72,10 +72,10 @@ fn compute_fingerprint_from_messages(messages: &[Message]) -> String {
 /// derived from the first user message per Claude Code's behavior. The `cch` is replaced with the
 /// real attestation by [`patch_request_body`] after serialization.
 ///
-/// The optional segments follow in the order Claude Code's builder emits them (2.1.241 and 2.1.263,
-/// verified against wire captures): `cch`, then `cc_workload`, `cc_is_subagent`, `cc_prev_req`,
-/// `cc_prompt_id`. meka never has a workload, so that one is always absent; the rest appear
-/// exactly when their source does.
+/// The optional segments follow in the order Claude Code's builder emits them (2.1.241 through
+/// 2.1.280, verified against wire captures): `cch`, then `cc_workload`, `cc_is_subagent`,
+/// `cc_prev_req`, `cc_prompt_id`, `cc_turn_origin`. meka never has a workload, so that one is
+/// always absent; the rest appear exactly when their source does.
 pub(super) fn generate_billing_header(
     messages: &[Message],
     attribution: &crate::provider::Attribution,
@@ -93,14 +93,59 @@ pub(super) fn generate_billing_header(
         .prompt_id
         .map(|id| format!(" cc_prompt_id={id};"))
         .unwrap_or_default();
+    let origin = attribution
+        .turn_origin
+        .map(|origin| format!(" cc_turn_origin={};", origin.name()))
+        .unwrap_or_default();
     format!(
-        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch=00000;{}{}{}",
+        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch=00000;{}{}{}{}",
         CC_VERSION,
         compute_fingerprint_from_messages(messages),
         subagent,
         previous_request,
         prompt,
+        origin,
     )
+}
+
+/// Claude Code caps `x-claude-code-prev-tool-durations` at this many calls and this many
+/// characters, keeping whole entries in dispatch order until either runs out.
+const TOOL_DURATIONS_MAX_ENTRIES: usize = 32;
+const TOOL_DURATIONS_MAX_CHARS: usize = 4096;
+
+/// `name=milliseconds` per call of the previous round, `;`-separated, the name percent-encoded
+/// where it would break the format (`%`, `;`, `=`, `,`, space) or the header (anything outside
+/// printable ASCII). `None` when the round ran nothing, which leaves the header out.
+fn render_tool_durations(durations: &[crate::provider::ToolDuration]) -> Option<String> {
+    let mut rendered = String::new();
+    for duration in durations.iter().take(TOOL_DURATIONS_MAX_ENTRIES) {
+        let entry = format!(
+            "{}={}",
+            percent_encode_tool_name(&duration.name),
+            duration.elapsed.as_millis()
+        );
+        let separator = usize::from(!rendered.is_empty());
+        if rendered.len() + separator + entry.len() > TOOL_DURATIONS_MAX_CHARS {
+            break;
+        }
+        if separator == 1 {
+            rendered.push(';');
+        }
+        rendered.push_str(&entry);
+    }
+    (!rendered.is_empty()).then_some(rendered)
+}
+
+fn percent_encode_tool_name(name: &str) -> String {
+    let mut encoded = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        match byte {
+            b'%' | b';' | b'=' | b',' | b' ' => encoded.push_str(&format!("%{byte:02X}")),
+            0x20..=0x7e => encoded.push(byte as char),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 // xxHash64 and the `cch` attestation token. The seed and the preimage filter below are the whole
@@ -461,10 +506,13 @@ fn stainless_os() -> &'static str {
 /// Applies all HTTP headers Claude Code sends, in the order it sends them.
 ///
 /// The order is not cosmetic: HTTP/2 preserves it, so it is as much a client signature as the
-/// values are. What the 2.1.241 and 2.1.263 wire captures show is the Stainless SDK's `Headers`
-/// object serialized in a case-sensitive sort (uppercase before lowercase), then the transport's
-/// own `Connection` / `Host` / `Accept-Encoding` / `Content-Length` after it. `reqwest`'s
-/// `HeaderMap` iterates in insertion order, so inserting in that order reproduces it.
+/// values are. What the 2.1.241 through 2.1.280 wire captures show is the Stainless SDK's
+/// `Headers` object serialized in a case-sensitive sort (uppercase before lowercase), then the
+/// transport's own `Connection` / `Host` / `Accept-Encoding` / `Content-Length` after it.
+/// `reqwest`'s `HeaderMap` iterates in insertion order, so inserting in that order reproduces it.
+///
+/// `attribution` adds what Claude Code says about the request itself; the OAuth account
+/// endpoints pass `None`, since a GET there has no request to classify.
 ///
 /// Two parts of it are outside meka's reach and stay different. Header *names* go out lowercased
 /// (`http::HeaderName` normalizes, and HTTP/2 requires it anyway, so this is invisible on the real
@@ -485,6 +533,7 @@ pub(super) fn apply_headers(
     auth_header_value: &str,
     session_id: &str,
     betas: Option<&str>,
+    attribution: Option<&crate::provider::Attribution>,
 ) -> reqwest::RequestBuilder {
     let mut request = request
         .header("Accept", "application/json")
@@ -508,13 +557,53 @@ pub(super) fn apply_headers(
         request = request.header("anthropic-beta", betas);
     }
 
-    request
+    let mut request = request
         .header("anthropic-dangerous-direct-browser-access", "true")
         .header("anthropic-version", "2023-06-01")
-        .header("x-app", "cli")
+        .header("x-app", "cli");
+    if let Some(attribution) = attribution {
+        request = apply_request_hints(request, attribution);
+    }
+    request
         // Per-request, not from an SDK helper.
         .header("x-client-request-id", Uuid::new_v4().to_string())
         .header("Accept-Encoding", "gzip, deflate, br, zstd")
+}
+
+/// The headers Claude Code 2.1.280 adds about the request itself, in the sorted position the
+/// captures show them: `x-cc-*` ahead of `x-claude-code-*`, each group alphabetical. Two facts
+/// go out twice because Claude Code keeps a first-party name and a gateway-hint name for each
+/// and sends both to Anthropic.
+///
+/// A worker's turn names its agent type as `custom`: a meka sub-agent is defined by the call that
+/// spawned it, which is Claude Code's `agent:custom` query source. Its compaction names none, the
+/// way Claude Code's `compact` query source has none.
+fn apply_request_hints(
+    mut request: reqwest::RequestBuilder,
+    attribution: &crate::provider::Attribution,
+) -> reqwest::RequestBuilder {
+    if let Some(kind) = attribution.compaction {
+        request = request.header("x-cc-compaction-request", kind.name());
+    }
+    if let Some(kind) = attribution.context_compacted {
+        request = request.header("x-cc-context-compacted", kind.name());
+    }
+    if attribution.subagent && attribution.compaction.is_none() {
+        request = request.header("x-claude-code-agent-type", "custom");
+    }
+    if let Some(kind) = attribution.compaction {
+        request = request.header("x-claude-code-compaction", kind.name());
+    }
+    if let Some(kind) = attribution.context_compacted {
+        request = request.header("x-claude-code-context-compacted", kind.name());
+    }
+    if let Some(durations) = render_tool_durations(&attribution.previous_tool_durations) {
+        request = request.header("x-claude-code-prev-tool-durations", durations);
+    }
+    if let Some(class) = attribution.request_class() {
+        request = request.header("x-claude-code-request-class", class);
+    }
+    request
 }
 
 #[cfg(test)]
@@ -758,6 +847,130 @@ mod tests {
         assert_ne!(h0, h1);
         assert_ne!(h0, h_claude);
         assert_ne!(h1, h_claude);
+    }
+
+    #[test]
+    fn the_billing_header_names_the_turn_origin_after_the_prompt_id() {
+        let previous = crate::provider::PreviousRequestSlot::default();
+        *crate::sync::lock(&previous) = Some("req_011abc".to_string());
+        let prompt_id = Uuid::new_v4();
+        let attribution = crate::provider::Attribution {
+            subagent: true,
+            prompt_id: Some(prompt_id),
+            previous_request: Some(previous),
+            turn_origin: Some(crate::provider::TurnOrigin::Scheduled),
+            ..Default::default()
+        };
+        let header = generate_billing_header(&[Message::user("hello")], &attribution);
+        let expected_tail = format!(
+            " cc_is_subagent=true; cc_prev_req=req_011abc; cc_prompt_id={prompt_id}; \
+             cc_turn_origin=scheduled;"
+        );
+        assert!(header.ends_with(&expected_tail), "{header}");
+        // A compaction reports neither a prompt nor an origin.
+        let compaction = crate::provider::Attribution {
+            compaction: Some(crate::provider::CompactionKind::Auto),
+            ..Default::default()
+        };
+        let header = generate_billing_header(&[Message::user("hello")], &compaction);
+        assert!(header.ends_with("cch=00000;"), "{header}");
+    }
+
+    #[test]
+    fn tool_durations_render_in_dispatch_order_with_encoded_names_and_caps() {
+        use std::time::Duration;
+
+        let duration = |name: &str, millis: u64| crate::provider::ToolDuration {
+            name: name.to_string(),
+            elapsed: Duration::from_millis(millis),
+        };
+        assert_eq!(render_tool_durations(&[]), None);
+        assert_eq!(
+            render_tool_durations(&[
+                duration("file_read", 13),
+                duration("mcp__x__a b;c=d,e%é", 1500),
+            ])
+            .as_deref(),
+            Some("file_read=13;mcp__x__a%20b%3Bc%3Dd%2Ce%25%C3%A9=1500")
+        );
+        // Whole entries, in order, until the entry cap or the character cap is reached.
+        let many: Vec<_> = (0..40).map(|i| duration(&format!("t{i}"), i)).collect();
+        let rendered = render_tool_durations(&many).unwrap();
+        assert_eq!(rendered.split(';').count(), TOOL_DURATIONS_MAX_ENTRIES);
+        assert!(rendered.starts_with("t0=0;t1=1;"), "{rendered}");
+        let long: Vec<_> = (0..4).map(|i| duration(&"n".repeat(2000), i)).collect();
+        let rendered = render_tool_durations(&long).unwrap();
+        assert_eq!(rendered.split(';').count(), 2, "{}", rendered.len());
+        assert!(rendered.len() <= TOOL_DURATIONS_MAX_CHARS);
+    }
+
+    /// The request hints sit where Claude Code's sorted headers put them: after `x-app`, ahead of
+    /// `x-client-request-id`, `x-cc-*` before `x-claude-code-*`, each group alphabetical.
+    #[test]
+    fn request_hints_sit_between_x_app_and_the_client_request_id() {
+        let names_after_x_app = |attribution: crate::provider::Attribution| -> Vec<String> {
+            let request = apply_headers(
+                reqwest::Client::new().post("http://127.0.0.1:9/v1/messages"),
+                "Authorization",
+                "Bearer x",
+                "session",
+                Some("oauth-2025-04-20"),
+                Some(&attribution),
+            )
+            .build()
+            .unwrap();
+            request
+                .headers()
+                .keys()
+                .map(|name| name.as_str().to_string())
+                .skip_while(|name| name != "x-app")
+                .skip(1)
+                .take_while(|name| name != "accept-encoding")
+                .collect()
+        };
+        let slot = crate::provider::PreviousMessageSlot::default();
+        let turn = crate::provider::Attribution {
+            previous_message: Some(slot),
+            context_compacted: Some(crate::provider::CompactionKind::Auto),
+            previous_tool_durations: vec![crate::provider::ToolDuration {
+                name: "file_read".to_string(),
+                elapsed: std::time::Duration::from_millis(3),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(names_after_x_app(turn), vec![
+            "x-cc-context-compacted",
+            "x-claude-code-context-compacted",
+            "x-claude-code-prev-tool-durations",
+            "x-claude-code-request-class",
+            "x-client-request-id",
+        ]);
+        let compaction = crate::provider::Attribution {
+            subagent: true,
+            compaction: Some(crate::provider::CompactionKind::Manual),
+            ..Default::default()
+        };
+        assert_eq!(names_after_x_app(compaction), vec![
+            "x-cc-compaction-request",
+            "x-claude-code-compaction",
+            "x-claude-code-request-class",
+            "x-client-request-id",
+        ]);
+        let worker = crate::provider::Attribution {
+            subagent: true,
+            previous_message: Some(crate::provider::PreviousMessageSlot::default()),
+            ..Default::default()
+        };
+        assert_eq!(names_after_x_app(worker), vec![
+            "x-claude-code-agent-type",
+            "x-claude-code-request-class",
+            "x-client-request-id",
+        ]);
+        // A request that is none of those, the way a side query of no kind is, is unclassified.
+        assert_eq!(
+            names_after_x_app(crate::provider::Attribution::default()),
+            vec!["x-client-request-id"]
+        );
     }
 
     #[test]

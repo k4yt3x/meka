@@ -18,7 +18,7 @@ The protocol is not Anthropic's alone. Databricks, OpenRouter, Vercel AI Gateway
 
 ```bash
 meka account add anthropic --backend anthropic-messages
-meka profile add work --account anthropic --model claude-opus-5
+meka profile add work --account anthropic --model claude-opus-5-5
 ```
 
 `meka account add` prompts for your Claude API key, saves it to the store, and writes the
@@ -37,7 +37,7 @@ backend = "anthropic-messages"
 
 [profiles.work]
 account = "anthropic"
-model   = "claude-opus-5"
+model   = "claude-opus-5-5"
 ```
 
 ### `effort`
@@ -50,7 +50,7 @@ meka sends the reasoning-effort control as `output_config.effort` in the request
 
 ## Supported models
 
-Any model available through the Claude Messages API; meka forwards the model string verbatim and doesn't gate which strings are valid. For the current line-up and their retirement dates, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview); `meka profile add` suggests `claude-opus-5` for a profile on a Claude account.
+Any model available through the Claude Messages API; meka forwards the model string verbatim and doesn't gate which strings are valid. For the current line-up and their retirement dates, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview); `meka profile add` suggests `claude-opus-5-5` for a profile on a Claude account.
 
 ## Custom base URL
 
@@ -59,7 +59,7 @@ To use a Claude-API-compatible proxy or gateway, set the account's `base_url` wh
 ```bash
 meka account add gateway --backend anthropic-messages \
     --base-url https://gateway.example.com/anthropic
-meka profile add gateway --account gateway --model claude-opus-5
+meka profile add gateway --account gateway --model claude-opus-5-5
 ```
 
 A trailing `/v1` is dropped, since meka appends it per request: publish `https://gateway.example.com/anthropic` or `https://gateway.example.com/anthropic/v1`, either works.

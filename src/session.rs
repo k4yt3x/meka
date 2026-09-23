@@ -450,6 +450,16 @@ pub(crate) enum CompactOrigin {
     /// The provider refused the request as too large.
     Emergency,
 }
+impl CompactOrigin {
+    /// The kind Claude Code's compaction headers report for this origin.
+    pub(crate) fn kind(self) -> crate::provider::CompactionKind {
+        match self {
+            Self::Manual | Self::Requested => crate::provider::CompactionKind::Manual,
+            Self::Reactive | Self::Proactive => crate::provider::CompactionKind::Auto,
+            Self::Emergency => crate::provider::CompactionKind::Reactive,
+        }
+    }
+}
 /// One compaction, and the instructions shaping it.
 #[derive(Debug, Clone)]
 pub(crate) struct CompactRequest {
@@ -462,9 +472,6 @@ pub(crate) struct CompactRequest {
     /// which resolves to `true`; `context_replace` may override it with a better-informed answer,
     /// since only the checkpoint turn knows whether the summary already covers them.
     pub(crate) keep_recent: Option<bool>,
-    /// The prompt the compaction serves, when a turn asked for it; a host-driven `/compact` has
-    /// none and its requests mint one.
-    pub(crate) prompt_id: Option<Uuid>,
     /// The words of the request a turn still in progress is answering, when the compaction runs
     /// inside that turn. Quoted after the summary if the split takes the request into the head,
     /// so the turn continues against what the user wrote rather than a paraphrase of it. `None`
@@ -477,7 +484,6 @@ impl CompactRequest {
             origin,
             instructions: None,
             keep_recent: None,
-            prompt_id: None,
             request_in_flight: None,
         }
     }
@@ -486,12 +492,6 @@ impl CompactRequest {
     #[must_use]
     pub(crate) fn answering(mut self, words: Option<String>) -> Self {
         self.request_in_flight = words;
-        self
-    }
-
-    /// Bill the compaction's requests to the turn that asked for it.
-    pub(crate) fn attributed_to(mut self, prompt_id: Option<Uuid>) -> Self {
-        self.prompt_id = prompt_id;
         self
     }
 }

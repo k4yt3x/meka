@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `claude-subscription` matches Claude Code 2.1.280, its login scopes included.
+- `meka profile add` suggests `claude-opus-5-5` for a profile on a Claude account.
+- Claude requests default to 128000 output tokens under adaptive thinking, up from 64000.
+- `claude-subscription` sends `medium` effort when the profile sets none, in place of `high`.
+- The context ceiling defaults to 85% of the window, leaving room for the larger reply.
+- Claude subscription turns ask for thinking summaries by default, in place of token counts.
+
 ## [0.61.0] - 2026-09-19
 
 ### Added

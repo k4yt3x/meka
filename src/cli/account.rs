@@ -19,14 +19,15 @@ use crate::{
     store::{AuthCredential, TokenStore},
 };
 
-/// Claude Code 2.1.263's `REDIRECT_URI`: the hosted page that shows the code the user pastes back.
+/// Claude Code 2.1.280's `MANUAL_REDIRECT_URL`: the hosted page that shows the code the user
+/// pastes back.
 const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
-/// Claude Code 2.1.263's `CLAUDE_AI_AUTHORIZE_URL`: the consumer login for a claude.ai account, as
+/// Claude Code 2.1.280's `CLAUDE_AI_AUTHORIZE_URL`: the consumer login for a claude.ai account, as
 /// opposed to its console login at `platform.claude.com/oauth/authorize`.
 const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
-/// The scope set Claude Code 2.1.263 requests for a claude.ai login, in its order.
+/// The scope set Claude Code 2.1.280 requests for a claude.ai login, in its order.
 const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code \
-                      user:mcp_servers user:file_upload";
+                      user:mcp_servers user:file_upload user:plugins";
 
 /// `chatgpt-subscription` OAuth flow constants. Mirror Codex's first-party CLI: the authorization
 /// server lives at `auth.openai.com`, the redirect listener binds on `localhost:1455`.
@@ -2583,12 +2584,12 @@ mod tests {
     fn build_authorize_url_contains_params() {
         let url = build_authorize_url("cid", "challenge", "state").unwrap();
         assert!(url.starts_with(AUTHORIZE_URL));
-        // The scope set as Claude Code 2.1.263 sends it, captured from its own authorization URL:
+        // The scope set as Claude Code 2.1.280 sends it, captured from its own authorization URL:
         // the same names in the same order, so a login is indistinguishable from the first-party
         // client's.
         assert!(
             url.contains(
-                "scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload&"
+                "scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload+user%3Aplugins&"
             ),
             "{url}"
         );

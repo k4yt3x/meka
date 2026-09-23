@@ -188,6 +188,8 @@ pub(crate) struct MockProvider {
     /// `--no-stream` runs this way, and whether it carried its parent's prompt id is visible
     /// nowhere else.
     completion_prompt_ids: Mutex<Vec<Option<uuid::Uuid>>>,
+    /// Where each `complete` call said its prompt came from, in call order, for the same reason.
+    completion_turn_origins: Mutex<Vec<Option<crate::provider::TurnOrigin>>>,
     /// What each [`Provider::stream`] call was handed, in order.
     ///
     /// The streaming counterpart to [`Self::completions`], and added for the same reason plus one
@@ -220,6 +222,8 @@ pub(crate) struct StreamRequest {
     /// nothing in the response reveals whether the attribution made it. Without this the wrapper
     /// that carries it over can be deleted and every test still passes.
     pub(crate) prompt_id: Option<uuid::Uuid>,
+    /// Where that prompt came from, recorded for the same reason.
+    pub(crate) turn_origin: Option<crate::provider::TurnOrigin>,
     /// The session the request named, for the same reason: a ChatGPT request sends it as its
     /// cache affinity, and a turn that reads it before the session exists sends none.
     pub(crate) session_id: Option<uuid::Uuid>,
@@ -247,6 +251,12 @@ impl MockProvider {
     #[cfg(test)]
     pub(crate) fn completion_prompt_ids(&self) -> Vec<Option<uuid::Uuid>> {
         crate::sync::lock(&self.completion_prompt_ids).clone()
+    }
+
+    /// The turn origin behind each `complete` call so far, in order.
+    #[cfg(test)]
+    pub(crate) fn completion_turn_origins(&self) -> Vec<Option<crate::provider::TurnOrigin>> {
+        crate::sync::lock(&self.completion_turn_origins).clone()
     }
 
     /// A provider that replays `rounds`, one per call, and answers nothing once they are spent.
@@ -279,6 +289,7 @@ impl Provider for MockProvider {
         crate::sync::lock(&self.completion_thinking).push(thinking);
         crate::sync::lock(&self.completions).push(messages.to_vec());
         crate::sync::lock(&self.completion_prompt_ids).push(attribution.prompt_id);
+        crate::sync::lock(&self.completion_turn_origins).push(attribution.turn_origin);
 
         let events = {
             let mut rounds = crate::sync::lock(&self.rounds);
@@ -426,6 +437,7 @@ impl Provider for MockProvider {
             messages: messages.to_vec(),
             tools: tools.to_vec(),
             prompt_id: attribution.prompt_id,
+            turn_origin: attribution.turn_origin,
             session_id: attribution.session_id,
         });
 

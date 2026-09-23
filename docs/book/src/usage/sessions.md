@@ -215,7 +215,7 @@ See [Config file](../configuration/config-file.md#session) for details.
 
 ## Context management
 
-Every request carries the whole conversation as it stands, tool calls and their results included. Nothing is dropped by count: the context ceiling and compaction are the only bound. Once the occupancy the provider last reported passes `context_ceiling_percent` of the profile's `context_window` (90% by default), auto-compaction summarizes the older turns and keeps the recent ones verbatim, between turns and between the tool rounds of one turn. See [`[session]`](../configuration/config-file.md#session) for the switch and the percent.
+Every request carries the whole conversation as it stands, tool calls and their results included. Nothing is dropped by count: the context ceiling and compaction are the only bound. Once the occupancy the provider last reported passes `context_ceiling_percent` of the profile's `context_window` (85% by default), auto-compaction summarizes the older turns and keeps the recent ones verbatim, between turns and between the tool rounds of one turn. See [`[session]`](../configuration/config-file.md#session) for the switch and the percent.
 
 The full history stays in the store either way. After a compaction a request carries the summary and the kept tail, and the tool catalog, skill list and MCP server instructions are restated in full on the next turn.
 
@@ -268,12 +268,12 @@ Turning it off leaves the standalone summarizer to write every summary, which sa
 
 ### Auto-compact
 
-When `auto_compact` is enabled (default: `true`), meka automatically compacts the conversation once it is past `context_ceiling_percent` of the context window (default: 90%). The check runs at three points. At the start of a turn it reads the last reported usage, which a resumed session takes from its row, so the first turn after a resume is checked against the real number. Before the first request it projects the request from an estimate, so a turn whose own input jumps over the ceiling is compacted before it is sent. And after every round of tool results inside a turn it reads that round's reported usage, so a long tool loop overshoots the line by one round rather than by the whole loop; the turn's most recent rounds may be kept verbatim within the budget, its earlier ones are summarized with the history, the request the turn is answering is quoted after the summary as the user wrote it, and one crossing is answered once, until a later measurement reads under the line again. As a last resort, if the provider still rejects a request for exceeding the context window, meka compacts once and retries the turn instead of failing.
+When `auto_compact` is enabled (default: `true`), meka automatically compacts the conversation once it is past `context_ceiling_percent` of the context window (default: 85%). The check runs at three points. At the start of a turn it reads the last reported usage, which a resumed session takes from its row, so the first turn after a resume is checked against the real number. Before the first request it projects the request from an estimate, so a turn whose own input jumps over the ceiling is compacted before it is sent. And after every round of tool results inside a turn it reads that round's reported usage, so a long tool loop overshoots the line by one round rather than by the whole loop; the turn's most recent rounds may be kept verbatim within the budget, its earlier ones are summarized with the history, the request the turn is answering is quoted after the summary as the user wrote it, and one crossing is answered once, until a later measurement reads under the line again. As a last resort, if the provider still rejects a request for exceeding the context window, meka compacts once and retries the turn instead of failing.
 
 ```toml
 [session]
 auto_compact = true
-context_ceiling_percent = 90  # default
+context_ceiling_percent = 85  # default
 context_window = 200000  # optional override
 ```
 
@@ -296,7 +296,7 @@ Once a turn has been measured, the per-turn context block carries a `[Context bu
 ```text
 [Context budget]
 Using ~84k of 200k tokens (42%). The conversation is summarized automatically past
-90%, between turns or between two of your tool rounds, which loses detail; your most
+85%, between turns or between two of your tool rounds, which loses detail; your most
 recent rounds are kept verbatim. Prefer to finish or checkpoint work before then.
 ```
 

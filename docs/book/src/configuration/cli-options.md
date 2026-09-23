@@ -31,9 +31,9 @@ Manage profiles: an account plus a model and every model-tied setting. `meka pro
 `[profiles.<name>]` table; nothing here touches a credential.
 
 ```bash
-meka profile add work --account anthropic --model claude-opus-5
+meka profile add work --account anthropic --model claude-opus-5-5
 meka profile list [--format <FORMAT>]
-meka profile set work model claude-opus-5
+meka profile set work model claude-opus-5-5
 meka profile set work effort --unset   # back to the default
 meka profile use work
 meka profile remove work
