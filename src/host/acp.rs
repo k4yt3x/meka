@@ -1030,10 +1030,6 @@ mod tests {
     #[test]
     fn tool_call_title_per_tool() {
         assert_eq!(
-            tool_call_title("shell_execute", Some("git status && git diff")),
-            "shell_execute git status && git diff"
-        );
-        assert_eq!(
             tool_call_title("file_read", Some("src/main.rs")),
             "file_read src/main.rs"
         );
@@ -1066,16 +1062,36 @@ mod tests {
         assert_eq!(tool_call_title("file_read", None), "file_read");
     }
 
+    /// An execute call's title is the command and nothing else. A client renders that title as
+    /// the command (Zed puts it in the terminal card and copies it from there, and shows no
+    /// `raw_input` for the kind), so a name in front of it would be copied along, and the title
+    /// is the only copy of the command the user sees.
+    #[test]
+    fn an_execute_call_s_title_is_the_command_and_nothing_else() {
+        assert_eq!(
+            tool_call_title("shell_execute", Some("git status && git diff")),
+            "git status && git diff"
+        );
+        // Neither collapsed to one line nor cut.
+        let script = format!(
+            "for f in *.rs; do\n  wc -l \"$f\"\ndone # {}",
+            "x".repeat(400)
+        );
+        assert_eq!(tool_call_title("shell_execute", Some(&script)), script);
+        // Without a command there is nothing to show but the name.
+        assert_eq!(tool_call_title("shell_execute", None), "shell_execute");
+    }
+
     #[test]
     fn tool_call_title_sanitizes_whitespace_and_length() {
-        // A multi-line command collapses to a single line.
+        // A multi-line argument collapses to a single line.
         assert_eq!(
-            tool_call_title("shell_execute", Some("git status\n  && git diff")),
-            "shell_execute git status && git diff"
+            tool_call_title("agent_spawn", Some("audit the\n  parser")),
+            "agent_spawn audit the parser"
         );
         // Over-long titles are truncated with an ellipsis.
         let long = "x".repeat(400);
-        let title = tool_call_title("shell_execute", Some(&long));
+        let title = tool_call_title("agent_spawn", Some(&long));
         assert!(title.chars().count() <= 256);
         assert!(title.ends_with('…'));
     }

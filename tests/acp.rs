@@ -2526,14 +2526,13 @@ fn acp_execute_command_streams_output_while_running() {
 /// block renders with no expansion affordance at all, so the output is sent but never shown.
 #[test]
 fn acp_terminal_capable_client_gets_an_agent_owned_terminal() {
+    // Two lines, so the title assertion below can tell a verbatim command from a collapsed one.
+    let command = "echo alpha; sleep 0.4\necho beta; exit 7";
     let script = serde_json::json!([
         [
             { "type": "text", "text": "running..." },
             { "type": "tool_use_start", "id": "call_exec", "name": "shell_execute" },
-            {
-                "type": "tool_use_end",
-                "input": { "command": "echo alpha; sleep 0.4; echo beta; exit 7" }
-            },
+            { "type": "tool_use_end", "input": { "command": command } },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
@@ -2572,6 +2571,13 @@ fn acp_terminal_capable_client_gets_an_agent_owned_terminal() {
     assert_eq!(announced[0]["sessionUpdate"], "tool_call");
     assert_eq!(announced[0]["content"][0]["type"], "terminal");
     assert_eq!(announced[0]["content"][0]["terminalId"], "call_exec");
+    // Zed renders an execute call's title as the command: it is what the terminal card shows and
+    // what its copy button copies, and `rawInput` is not shown for the kind. So the title is the
+    // command verbatim, with no tool name in front of it and its line break kept.
+    assert_eq!(
+        announced[0]["title"], command,
+        "the title of an execute call is the command itself",
+    );
 
     // Output is appended, so no chunk may repeat what an earlier one already delivered.
     let output_frames = for_call("terminal_output");

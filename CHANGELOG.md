@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The context ceiling defaults to 85% of the window, leaving room for the larger reply.
 - Claude subscription turns ask for thinking summaries by default, in place of token counts.
 
+### Fixed
+
+- An ACP tool call for a shell command titles itself with the whole command, not a cut one-liner.
+
 ## [0.61.0] - 2026-09-19
 
 ### Added

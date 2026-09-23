@@ -575,11 +575,11 @@ impl Frontend for AcpFrontend {
 
         // The sticky options name the *tool*, because that is their scope: the decision is keyed on
         // the tool name alone and applies to every later call to it, whatever its arguments. The
-        // prompt's title beside them is `<tool> <primary_param>` -- for `shell_execute` that is
-        // the specific command line -- so a bare "Always allow" reads as approving the command the
-        // user just read, when it actually approves every shell command for the rest of the
-        // session. Spelling the tool out is what makes the affordance and the semantics agree, and
-        // it is spelled the way the title spells it.
+        // prompt's title beside them is `<tool> <primary_param>`, and for `shell_execute` the
+        // command line alone, so a bare "Always allow" reads as approving the command the user just
+        // read, when it actually approves every shell command for the rest of the session. Spelling
+        // the tool out is what makes the affordance and the semantics agree, and it is spelled the
+        // way the REPL spells it.
         let options = vec![
             PermissionOption::new(OPTION_ALLOW_ONCE, "Allow", PermissionOptionKind::AllowOnce),
             PermissionOption::new(
@@ -939,19 +939,34 @@ pub(super) fn tool_kind_for(name: &str) -> ToolKind {
     }
 }
 /// Build the human-readable `title` for a tool call: the tool's name, then the resolved primary
-/// argument (`display_summary`: the command for `shell_execute`, the path for `file_read`, the
-/// URL for `web_fetch`, ...), so editors show what's running and not only which tool. The name is
-/// the one the REPL's indicator and approval prompt show, so the surfaces share one vocabulary.
-/// `raw_input` still carries the full argument object for clients that want it.
+/// argument (`display_summary`: the path for `file_read`, the URL for `web_fetch`, ...), so editors
+/// show what's running and not only which tool. The name is the one the REPL's indicator and
+/// approval prompt show, so the surfaces share one vocabulary. `raw_input` still carries the full
+/// argument object for clients that want it.
+///
+/// A call of kind `execute` is the exception: its title is the command itself, whole, which is what
+/// claude-agent-acp sends. A client treats an execute call's title as the command rather than as a
+/// label: Zed shows it in the terminal card, its copy button copies it, and it shows no `raw_input`
+/// for the kind, so a name in front corrupts the command and a collapsed or cut title is the only
+/// copy of it the user ever sees.
 pub(super) fn tool_call_title(name: &str, display_summary: Option<&str>) -> String {
-    let raw = match display_summary.map(str::trim).filter(|s| !s.is_empty()) {
+    let argument = display_summary.map(str::trim).filter(|s| !s.is_empty());
+    if tool_kind_for(name) == ToolKind::Execute
+        && let Some(command) = argument
+    {
+        return command.to_string();
+    }
+    let raw = match argument {
         Some(argument) => format!("{name} {argument}"),
         None => name.to_string(),
     };
     sanitize_title(&raw)
 }
-/// Collapse internal whitespace (so a multi-line command becomes a one-line title) and cap the
-/// length so an editor never gets an unwieldy title. Mirrors claude-agent-acp's `sanitizeTitle`.
+/// Collapse internal whitespace and cap the length, so an editor never gets an unwieldy label.
+///
+/// The cap is the one claude-agent-acp puts on a session title; it puts none on a tool call's, but
+/// its tool titles are a verb and a path, where meka's primary argument can be a sub-agent's whole
+/// prompt.
 pub(super) fn sanitize_title(text: &str) -> String {
     const MAX_TITLE_CHARS: usize = 256;
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
