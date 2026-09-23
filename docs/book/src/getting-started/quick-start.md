@@ -17,7 +17,7 @@ meka profile add work --account anthropic --model claude-opus-5-5
 
 # or OpenAI
 meka account add openai --backend openai-chat-completions
-meka profile add work --account openai --model gpt-5.6-sol
+meka profile add work --account openai --model gpt-6-astra
 ```
 
 `account add` prompts for the backend you omit and acquires the secret (browser OAuth for

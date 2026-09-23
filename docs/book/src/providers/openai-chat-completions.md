@@ -19,7 +19,7 @@ For the same key against OpenAI's newer protocol, see [`openai-responses`](./ope
 
 ```bash
 meka account add openai --backend openai-chat-completions
-meka profile add work --account openai --model gpt-5.6-sol
+meka profile add work --account openai --model gpt-6-astra
 ```
 
 `meka account add` prompts for your OpenAI API key, saves it to the store, and writes the
@@ -38,12 +38,12 @@ backend = "openai-chat-completions"
 
 [profiles.work]
 account = "openai"
-model   = "gpt-5.6-sol"
+model   = "gpt-6-astra"
 ```
 
 ## Supported models
 
-Any model reachable over the Chat Completions API that supports tool calling. For OpenAI's current line-up, see [OpenAI's models overview](https://platform.openai.com/docs/models); `meka profile add` suggests `gpt-5.6-sol` for a profile on an OpenAI account. Against a compatible endpoint the valid names are that server's: whatever Ollama, vLLM, LM Studio or OpenRouter serves. meka forwards the model string verbatim and doesn't gate which strings are valid.
+Any model reachable over the Chat Completions API that supports tool calling. For OpenAI's current line-up, see [OpenAI's models overview](https://platform.openai.com/docs/models); `meka profile add` suggests `gpt-6-astra` for a profile on an OpenAI account. Against a compatible endpoint the valid names are that server's: whatever Ollama, vLLM, LM Studio or OpenRouter serves. meka forwards the model string verbatim and doesn't gate which strings are valid.
 
 ## Custom base URL
 

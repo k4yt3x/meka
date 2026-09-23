@@ -8,7 +8,7 @@ speaks, so the two differ only in how they authenticate and where they post.
 
 ```console
 $ meka account add openai --backend openai-responses
-$ meka profile add work --account openai --model gpt-5.6-sol
+$ meka profile add work --account openai --model gpt-6-astra
 ```
 
 ```toml
@@ -19,7 +19,7 @@ backend = "openai-responses"
 
 [profiles.work]
 account = "openai"
-model   = "gpt-5.6-sol"
+model   = "gpt-6-astra"
 ```
 
 ## Configuration

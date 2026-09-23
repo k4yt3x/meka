@@ -188,7 +188,7 @@ mod tests {
                 crate::provider::ProviderBuilder::new(
                     crate::config::Backend::OpenAiResponses,
                     crate::store::AuthCredential::ApiKey(api_key),
-                    "gpt-5.6-sol".to_string(),
+                    "gpt-6-astra".to_string(),
                 )
                 .base_url(base_url.map(str::to_string))
                 .effort(effort.map(str::to_string))

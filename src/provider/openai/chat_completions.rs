@@ -1206,7 +1206,7 @@ mod tests {
     fn an_unconfigured_profile_sends_no_reasoning_effort_whatever_the_model() {
         // Recognized reasoning model or local weights, the answer is the same: OpenAI owns the
         // default and meka asks for it by omitting the field.
-        for model in ["gpt-5.6-sol", "o3", "llama3.1"] {
+        for model in ["gpt-6-astra", "o3", "llama3.1"] {
             let provider = {
                 let api_key: String = "test-key".to_string();
                 OpenAiChatCompletionsProvider::new(

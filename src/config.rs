@@ -3642,7 +3642,7 @@ backend = "chatgpt-subscription"
 
 [profiles.work]
 account = "work"
-model = "gpt-5.6-sol"
+model = "gpt-6-astra"
 reasoning_effort = "high"
 "#;
         let error = toml::from_str::<ConfigFile>(stale_profile)

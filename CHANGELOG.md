@@ -7,10 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.62.0] - 2026-09-23
+
 ### Changed
 
 - `claude-subscription` matches Claude Code 2.1.280, its login scopes included.
 - `meka profile add` suggests `claude-opus-5-5` for a profile on a Claude account.
+- `meka profile add` suggests `gpt-6-astra` for a profile on an OpenAI account.
 - Claude requests default to 128000 output tokens under adaptive thinking, up from 64000.
 - `claude-subscription` sends `medium` effort when the profile sets none, in place of `high`.
 - The context ceiling defaults to 85% of the window, leaving room for the larger reply.
@@ -2359,7 +2362,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.61.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.62.0...HEAD
+[0.62.0]: https://github.com/k4yt3x/meka/compare/0.61.0...0.62.0
 [0.61.0]: https://github.com/k4yt3x/meka/compare/0.60.0...0.61.0
 [0.60.0]: https://github.com/k4yt3x/meka/compare/0.59.0...0.60.0
 [0.59.0]: https://github.com/k4yt3x/meka/compare/0.58.0...0.59.0

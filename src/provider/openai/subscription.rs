@@ -1224,7 +1224,7 @@ mod tests {
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 credential_for_test(),
-                "gpt-5.6-sol".to_string(),
+                "gpt-6-astra".to_string(),
             )
             .base_url(None)
             .client_id(None)
@@ -1254,7 +1254,7 @@ mod tests {
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 credential_for_test(),
-                "gpt-5.6-sol".to_string(),
+                "gpt-6-astra".to_string(),
             )
             .base_url(None)
             .client_id(None)
@@ -1271,7 +1271,7 @@ mod tests {
             crate::provider::ProviderBuilder::new(
                 crate::config::Backend::ChatGptSubscription,
                 credential_for_test(),
-                "gpt-5.6-sol".to_string(),
+                "gpt-6-astra".to_string(),
             )
             .base_url(None)
             .client_id(None)

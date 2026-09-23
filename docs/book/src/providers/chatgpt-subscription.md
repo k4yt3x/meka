@@ -23,7 +23,7 @@ For the same protocol with an API key, against OpenAI or any server that serves 
 meka account add chatgpt --backend chatgpt-subscription
 # Open the printed URL; sign in to ChatGPT and approve.
 # Tokens are saved to ~/.local/share/meka/meka.db (chmod 0600).
-meka profile add work --account chatgpt --model gpt-5.6-sol
+meka profile add work --account chatgpt --model gpt-6-astra
 ```
 
 `meka account add` binds a local listener on `127.0.0.1:1455` to receive the OAuth callback, matching the redirect URI registered with OpenAI's auth server. If port 1455 is already in use (e.g. you're already running the Codex CLI), free it first.
@@ -42,11 +42,11 @@ backend = "chatgpt-subscription"
 
 [profiles.work]
 account = "chatgpt"
-model   = "gpt-5.6-sol"
+model   = "gpt-6-astra"
 effort  = "xhigh"   # optional; unset sends none, so OpenAI's default applies
 ```
 
-The `effort` field maps to the Responses API `reasoning.effort` knob. When unset the `reasoning` block is omitted and OpenAI applies its own default; meka picks no tier and consults no catalog. An explicit value is absolute: sent verbatim, never clamped.
+The `effort` field maps to the Responses API `reasoning.effort` knob. When unset the `reasoning` block is omitted and OpenAI applies its own default; meka picks no tier and consults no catalog. An explicit value is absolute: sent verbatim, never clamped. The endpoint accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`; Codex's `ultra` is a mode of that client, not a value of the API, and is refused.
 
 ### `base_url`
 
@@ -65,7 +65,7 @@ path has none, so both shapes reach `/backend-api/wham/usage`.
 
 ## Supported models
 
-Whatever your ChatGPT subscription tier exposes. For the current line-up, see [OpenAI's models overview](https://platform.openai.com/docs/models); `meka profile add` suggests `gpt-5.6-sol` for a profile on an OpenAI account. The model field on the request body is forwarded verbatim; meka doesn't gate which model strings are valid.
+Whatever your ChatGPT subscription tier exposes. For the current line-up, see [OpenAI's models overview](https://platform.openai.com/docs/models); `meka profile add` suggests `gpt-6-astra` for a profile on an OpenAI account. The model field on the request body is forwarded verbatim; meka doesn't gate which model strings are valid.
 
 ## How it works
 

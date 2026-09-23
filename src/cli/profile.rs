@@ -192,7 +192,7 @@ fn default_model_for(backend: config::Backend) -> &'static str {
         }
         config::Backend::OpenAiChatCompletions
         | config::Backend::OpenAiResponses
-        | config::Backend::ChatGptSubscription => "gpt-5.6-sol",
+        | config::Backend::ChatGptSubscription => "gpt-6-astra",
     }
 }
 
@@ -1453,11 +1453,11 @@ mod tests {
         );
         assert_eq!(
             default_model_for(config::Backend::OpenAiChatCompletions),
-            "gpt-5.6-sol"
+            "gpt-6-astra"
         );
         assert_eq!(
             default_model_for(config::Backend::ChatGptSubscription),
-            "gpt-5.6-sol"
+            "gpt-6-astra"
         );
     }
 
