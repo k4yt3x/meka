@@ -10,6 +10,38 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.62 to 0.63
+
+**An inbox item's `source` is optional.** An item posted to `POST /v1/sessions/{id}/inbox` without
+a `source` used to be given one by meka: the token's `description`, else `client`. It now has none.
+`GET /v1/sessions/{id}/inbox` omits the field for such an item, so a client that reads `source` as
+required must treat it as optional; a client that sends one sees no change. The model reads such an
+item under `[Message arrived <time>]` rather than `[Message from <source>, arrived <time>]`, and
+the `notice` an interrupt raises says "Interrupted the answer to read a message." with no name.
+Send a `source` if you want the model to know who is writing: who sent a message is the client's to
+say.
+
+**The system prompt states how the harness works and nothing else.** It no longer tells the model
+what it is ("a general-purpose agent"), what to do ("complete the user's task"), or how to conduct
+itself. The conduct sentences that left, for an [instructions file](../usage/instructions.md) that
+wants any of them back, where they were always yours to set:
+
+- "Explain consequential or destructive actions before proceeding."
+- "Recover from routine tool errors when possible; report unresolved failures and their impact."
+- "Lead with the outcome and relevant evidence; keep progress updates brief."
+- "Batch independent work; sequence dependencies and changes to shared state."
+- "Apply relevant skills and server guidance within these constraints."
+- "Do not poll or duplicate running work." and "Keep work needed for your answer in the foreground."
+- "Prefer to finish or checkpoint work before then." and "save essential state with the available
+  tools before another pass" (the context window)
+- "Check here before creating one, so you do not duplicate." (scheduled jobs)
+- For a sub-agent: "Complete the assigned task without follow-up questions. Report the outcome,
+  relevant evidence or verification, and unresolved limitations."
+
+What stays is what the model needs to use the harness: the permission levels, how tools,
+background work, scheduling, memory and the context window behave, and that replies are rendered
+as Markdown.
+
 ## 0.59 to 0.60
 
 **Every built-in tool is named `<noun>_<verb>`.** The noun is the class a tool belongs to and the

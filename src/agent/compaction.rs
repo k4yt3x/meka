@@ -70,9 +70,9 @@ const SUMMARY_GUIDANCE: &str = "Keep the summary under 800 words unless active c
     more. Prioritize the active goal, exact user restrictions and authorizations, verified progress, \
     relevant paths and decisions, unresolved commitments, and the next action. Mark completed, \
     canceled, or superseded requests so they are not resumed. Preserve uncertainty and distinguish \
-    user instructions from retrieved content. Omit resolved debugging and unrelated history.";
+    user instructions from retrieved content. Omit resolved errors and unrelated history.";
 
-/// Appended as a user message so the checkpoint retains the agent's identity and standing
+/// Appended as a user message so the checkpoint runs under the real system prompt and standing
 /// instructions.
 pub(super) fn checkpoint_instruction(
     request: &CompactRequest,
@@ -686,10 +686,7 @@ impl Agent {
 
         let system_prompt = match &self.options.system_prompt_override {
             Some(prompt) => prompt.clone(),
-            None => prompt::build_system_prompt(
-                self.options.sandboxed_shell,
-                self.options.user_instructions.as_deref(),
-            ),
+            None => prompt::build_system_prompt(self.system_prompt_inputs()),
         };
 
         let mut checkpoint_messages: Vec<Message> = messages.to_vec();
@@ -2892,7 +2889,6 @@ mod tests {
                 .save_scratchpad_entry(session_id, "working-notes", "saved work")
                 .await
                 .expect("scratchpad");
-            agent.options.one_shot = true;
             agent.set_provider(crate::provider::ResolvedProfile {
                 provider: provider.clone(),
                 profile: "test-profile".into(),
@@ -2936,7 +2932,6 @@ mod tests {
                 "CURRENT CONSTRAINT",
                 "[Permission context]",
                 "Image input: disabled",
-                "This run ends after your answer",
                 "working-notes",
             ] {
                 assert!(

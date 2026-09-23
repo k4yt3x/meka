@@ -5717,10 +5717,8 @@ mod tests {
         user_input: &str,
     ) -> crate::conversation::Message {
         let block = crate::prompt::build_turn_context(crate::prompt::TurnContext {
-            tools: &crate::prompt::AvailableTools::default(),
             vision: true,
             one_shot: false,
-            background_enabled: false,
             permission,
             approvals: false,
             todos: &crate::todo::TodoState::default(),

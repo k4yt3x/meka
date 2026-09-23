@@ -251,7 +251,7 @@ Internally, compaction does not delete pre-compaction rows from the store. It ap
 
 #### When the summarizer runs instead
 
-A standalone summarizer, with no tools and none of the agent's identity, is the fallback. It runs when:
+A standalone summarizer, with no tools and none of the standing instructions, is the fallback. It runs when:
 
 - The compaction is an **emergency** one, i.e. the provider has already rejected the request for exceeding the window. A checkpoint turn re-sends that same conversation, so it would be refused identically; the summarizer strips images and truncates long blocks, which is what lets it get through.
 - The checkpoint turn **fails or produces nothing usable**.
@@ -295,10 +295,10 @@ Once a turn has been measured, the per-turn context block carries a `[Context bu
 
 ```text
 [Context budget]
-Using ~84k of 200k tokens (42%). The conversation is summarized automatically past
-85%, between turns or between two of your tool rounds, which loses detail; your most
-recent rounds are kept verbatim. Prefer to finish or checkpoint work before then.
+Using ~84k of 200k tokens (42%). Auto-compaction at 85%.
 ```
+
+What happens at the ceiling (a summary between turns or between two tool rounds, which loses detail while recent rounds may be kept verbatim, and what it omits stays reachable through `conversation_search` and `conversation_read`) is stated once in the system prompt rather than on every turn.
 
 The agent is expected to budget its own reading and to decide when a task will fit, so it needs the same number the harness uses. Without it, those are guesses. The line is suppressed when the window is unknown, and on the first turn of a session, when there is no measurement yet rather than a genuine zero.
 

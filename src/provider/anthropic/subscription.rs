@@ -37,6 +37,14 @@ use crate::{
 /// Claude Code system prompt prefix.
 const CC_SYSTEM_PROMPT_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
+/// Opens the block that carries meka's own prompt. The identity line this wire requires is the
+/// first thing the model reads about itself, and a model that believes it names this session
+/// behaves like a coding CLI; naming the line for what it is here keeps the prompt module free of
+/// any provider's wire.
+const CC_IDENTITY_NOTE: &str = "The identity line above is what this API requires of its clients; \
+                                it does not describe this session. The harness is meka, whose \
+                                system prompt follows.";
+
 /// The `claude-subscription` backend: one profile's model and the OAuth credential it bills.
 /// The window at which a profile asks for the 1M-context beta.
 const CONTEXT_1M_TOKENS: u64 = 1_000_000;
@@ -709,7 +717,7 @@ impl ClaudeSubscriptionProvider {
                     },
                     {
                         "type": "text",
-                        "text": system_prompt,
+                        "text": format!("{CC_IDENTITY_NOTE}\n\n{system_prompt}"),
                         "cache_control": breakpoint.global_scope_value()
                     }
                 ]),
@@ -1304,7 +1312,12 @@ mod tests {
         assert!(system[1].get("cache_control").is_none());
 
         assert_eq!(system[2]["type"], "text");
-        assert_eq!(system[2]["text"], "system prompt");
+        // The wire's identity line is named for what it is ahead of meka's prompt, in the same
+        // block, so the array keeps the captured three-block shape.
+        assert_eq!(
+            system[2]["text"],
+            format!("{CC_IDENTITY_NOTE}\n\nsystem prompt")
+        );
         // User system prompt carries cache_control with ttl=1h and scope=global (matches the
         // captured Claude Code CLI breakpoint).
         assert_eq!(
@@ -3280,15 +3293,13 @@ mod tests {
 
         // The agent builds these once per turn. Neither takes the current permission; that's the
         // invariant we're testing.
-        let system = build_system_prompt(true, None);
+        let system = build_system_prompt(crate::prompt::SystemPromptInputs::for_test(true, None));
         let tools = registry.definitions_active(&[]);
 
         let u1_text = {
             let block = build_turn_context(TurnContext {
-                tools: &crate::prompt::AvailableTools::default(),
                 vision: true,
                 one_shot: false,
-                background_enabled: false,
                 permission: Permission::Read,
                 approvals: false,
                 todos: &crate::todo::TodoState::default(),
@@ -3316,15 +3327,14 @@ mod tests {
         // thread via `SharedPermission::set`; here we just re-read the catalog and rebuild
         // everything to prove the outputs don't depend on the live permission state.
 
-        let system_t2 = build_system_prompt(true, None);
+        let system_t2 =
+            build_system_prompt(crate::prompt::SystemPromptInputs::for_test(true, None));
         let tools_t2 = registry.definitions_active(&[]);
 
         let u2_text = {
             let block = build_turn_context(TurnContext {
-                tools: &crate::prompt::AvailableTools::default(),
                 vision: true,
                 one_shot: false,
-                background_enabled: false,
                 permission: Permission::Unrestricted,
                 approvals: false,
                 todos: &crate::todo::TodoState::default(),
@@ -3373,8 +3383,8 @@ mod tests {
 
         // 4. Sanity: the two user messages do differ in their permission context (fresh content on
         //    each turn, not cached yet).
-        assert!(u1_text.contains("Current permission level: read"));
-        assert!(u2_text.contains("Current permission level: unrestricted"));
+        assert!(u1_text.contains("Level: read."));
+        assert!(u2_text.contains("Level: unrestricted."));
         assert_ne!(u1_text, u2_text);
     }
 
@@ -3445,15 +3455,13 @@ mod tests {
         registry.register_deferred_fixture("fixture_deferred");
 
         let provider = provider_for_test();
-        let system = build_system_prompt(true, None);
+        let system = build_system_prompt(crate::prompt::SystemPromptInputs::for_test(true, None));
 
         // Turn 1: empty history, fixture_deferred not yet exposed.
         let u1_text = {
             let block = build_turn_context(crate::prompt::TurnContext {
-                tools: &crate::prompt::AvailableTools::default(),
                 vision: true,
                 one_shot: false,
-                background_enabled: false,
                 permission: Permission::Unrestricted,
                 approvals: false,
                 todos: &crate::todo::TodoState::default(),
@@ -3508,7 +3516,8 @@ mod tests {
         ];
         // System prompt is rebuilt the same way every turn; its content is a function of the
         // catalog, not the messages, so it must not shift when tool_load is invoked.
-        let system_t2 = build_system_prompt(true, None);
+        let system_t2 =
+            build_system_prompt(crate::prompt::SystemPromptInputs::for_test(true, None));
         let tools_t2 = registry.definitions_active(&messages_t2);
         let body_t2 = provider.build_request_body(
             &system_t2,
@@ -3610,7 +3619,8 @@ mod tests {
         registry.register_deferred_fixture("mcp__fs__old_tool");
 
         let provider = provider_for_test();
-        let before_system = build_system_prompt(true, None);
+        let before_system =
+            build_system_prompt(crate::prompt::SystemPromptInputs::for_test(true, None));
         let before_catalog = registry.tool_catalog();
 
         // The server reconnects and advertises a different tool set.
@@ -3620,7 +3630,8 @@ mod tests {
             },
         )]);
 
-        let after_system = build_system_prompt(true, None);
+        let after_system =
+            build_system_prompt(crate::prompt::SystemPromptInputs::for_test(true, None));
         let after_catalog = registry.tool_catalog();
 
         assert_eq!(
@@ -3871,7 +3882,8 @@ mod tests {
         let mut bodies = Vec::with_capacity(levels.len());
         for &level in &levels {
             shared_permission.set_unchecked(level);
-            let system = build_system_prompt(true, None);
+            let system =
+                build_system_prompt(crate::prompt::SystemPromptInputs::for_test(true, None));
             let tools = registry.definitions_active(&[]);
             let messages = vec![Message::user("hello")];
             assert!(

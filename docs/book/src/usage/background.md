@@ -36,8 +36,7 @@ minutes; without `timeout_ms`, the shell's usual thirty-second timeout still app
 That returns something like:
 
 ```text
-Started in the background as task 7f3a1c22 (cargo test --all).
-See [Execution context] for result delivery.
+Started in the background as task 7f3a1c22 (cargo test --all). Use `task_list` for status. Use `task_cancel` to stop it.
 ```
 
 The agent then carries on. When the task ends, its outcome arrives as a new turn:
@@ -54,8 +53,7 @@ Running tasks also appear in the per-turn context under `[Background]`, so the a
 
 ```text
 [Background]
-Running tasks; do not duplicate their work.
-See [Execution context] for result delivery.
+Tasks still running.
 
 - **7f3a1c22**: cargo test --all
 ```

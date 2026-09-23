@@ -664,16 +664,20 @@ pub(crate) fn is_harness_stand_in(text: &str) -> bool {
     text == IMAGE_REDACTION_PLACEHOLDER || text.starts_with(HARNESS_NOTE)
 }
 
-/// How the header meka writes above an inbox item's body begins:
+/// How the header meka writes above an inbox item's body begins when the client named the sender:
 /// `[Message from <source>, arrived <time>]`, then a newline, then the body verbatim. Rendered by
 /// `prompt::render_inbox_item`; read back by [`strip_inbox_header`].
 pub(crate) const INBOX_HEADER_PREFIX: &str = "[Message from ";
+
+/// How the header begins when the client named nobody: `[Message arrived <time>]`. The name is
+/// left out rather than guessed, so the model is never told a sender nobody chose.
+pub(crate) const UNNAMED_INBOX_HEADER_PREFIX: &str = "[Message arrived ";
 
 /// The body of an inbox item as rendered into the conversation, without the header meka wrote
 /// above it; any other text unchanged. What a title reads, so a session opened on an item is
 /// named by the message and not by the header.
 pub(crate) fn strip_inbox_header(text: &str) -> &str {
-    if !text.starts_with(INBOX_HEADER_PREFIX) {
+    if !text.starts_with(INBOX_HEADER_PREFIX) && !text.starts_with(UNNAMED_INBOX_HEADER_PREFIX) {
         return text;
     }
     text.split_once("]\n").map_or(text, |(_, body)| body)
@@ -1397,6 +1401,11 @@ mod tests {
             "{INBOX_HEADER_PREFIX}telegram, arrived 2026-09-16 05:41 +00:00]\nWhat is 5+5?"
         )));
         assert_eq!(log.title(), "What is 5+5?");
+        let mut unnamed = Conversation::new();
+        unnamed.append(Message::user(format!(
+            "{UNNAMED_INBOX_HEADER_PREFIX}2026-09-16 05:41 +00:00]\nWhat is 6+6?"
+        )));
+        assert_eq!(unnamed.title(), "What is 6+6?");
         assert_eq!(
             strip_inbox_header("[Message from nobody"),
             "[Message from nobody"

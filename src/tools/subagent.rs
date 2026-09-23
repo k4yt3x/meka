@@ -1200,7 +1200,7 @@ impl Tool for AgentSteerTool {
         let item = crate::store::inbox::NewInboxItem::from_parts(
             row.id,
             class,
-            "your parent agent",
+            Some("your parent agent".to_string()),
             message,
         )?;
         self.tool_builder_params
@@ -1939,10 +1939,23 @@ async fn build_subagent(
 
     let available = crate::prompt::AvailableTools::new(sub_registry.registered_tool_names());
     let sub_system_prompt = build_subagent_system_prompt(
-        parent_options.sandboxed_shell,
+        crate::prompt::SystemPromptInputs {
+            sandboxed_shell: parent_options.sandboxed_shell,
+            user_instructions: granted_instructions.as_deref(),
+            one_shot: parent_options.one_shot,
+            background: sub_registry
+                .background_enabled()
+                .then(|| crate::prompt::BackgroundTools {
+                    task_list: available.is_available("task_list"),
+                    task_cancel: available.is_available("task_cancel"),
+                }),
+            scheduling: available.is_available("schedule_create"),
+            auto_compact: parent_options.auto_compact,
+            conversation_search: available.is_available("conversation_search"),
+            conversation_read: available.is_available("conversation_read"),
+        },
         &available,
         &spec.inherited_scratchpad,
-        granted_instructions.as_deref(),
     );
 
     Ok(Agent::new_subagent(
@@ -2138,20 +2151,25 @@ fn compose_subagent_task(prompt: Option<&str>, skill_body: Option<&str>) -> Opti
 /// A worker's role and granted standing instructions. Live state uses the same per-turn renderer as
 /// the root.
 fn build_subagent_system_prompt(
-    sandboxed_shell: bool,
+    inputs: crate::prompt::SystemPromptInputs<'_>,
     available: &crate::prompt::AvailableTools,
     inherited_scratchpad: &[String],
-    user_instructions: Option<&str>,
 ) -> String {
-    let mut prompt = crate::prompt::build_system_prompt(sandboxed_shell, user_instructions);
+    let has_instructions = inputs
+        .user_instructions
+        .map(str::trim)
+        .is_some_and(|text| !text.is_empty());
+    let mut prompt = crate::prompt::build_system_prompt(inputs);
     prompt.push_str(
         "\n## Assignment\n\n\
-         You are a sub-agent reporting to your parent agent. Complete the assigned task without \
-         follow-up questions. Your conversation, todo list, and scratchpad entries are private; \
-         filesystem changes are shared within your granted workspace. Report the outcome, relevant \
-         evidence or verification, and unresolved limitations. User-facing persona instructions \
-         concern your parent; your response is a report to it.\n",
+         You were spawned by a parent agent, which receives your final reply as a report; nothing \
+         you ask is answered before then. Your conversation, todo list and scratchpad entries are \
+         private; filesystem changes are shared within your granted workspace.",
     );
+    if has_instructions {
+        prompt.push_str(" The standing instructions above address the parent's user.");
+    }
+    prompt.push('\n');
     if !inherited_scratchpad.is_empty() {
         prompt.push_str("\n## Inherited scratchpad entries\n\n");
         prompt.push_str(
@@ -3982,32 +4000,39 @@ mod tests {
     #[test]
     fn system_prompt_carries_instructions_only_when_granted() {
         let ungranted = build_subagent_system_prompt(
-            false,
+            crate::prompt::SystemPromptInputs::for_test(false, None),
             &crate::prompt::AvailableTools::default(),
             &[],
-            None,
         );
         assert!(!ungranted.contains("Standing instructions"));
 
         let granted = build_subagent_system_prompt(
-            false,
+            crate::prompt::SystemPromptInputs::for_test(
+                false,
+                Some("Never use pip. Always prefer uv."),
+            ),
             &crate::prompt::AvailableTools::default(),
             &[],
-            Some("Never use pip. Always prefer uv."),
         );
         assert!(granted.contains("## Standing instructions"));
         assert!(granted.contains("Never use pip. Always prefer uv."));
         // The worker is told whose rules these are, so persona clauses read as context rather than
-        // as an instruction to address the user directly.
-        assert!(granted.contains("report"), "{granted}");
+        // as an instruction to address the user directly; without a grant there is nothing to say.
+        assert!(
+            granted.contains("The standing instructions above address the parent's user."),
+            "{granted}"
+        );
+        assert!(
+            !ungranted.contains("address the parent's user"),
+            "{ungranted}"
+        );
 
         // Whitespace-only instructions are treated as absent, matching the root agent.
         assert!(
             !build_subagent_system_prompt(
-                false,
+                crate::prompt::SystemPromptInputs::for_test(false, Some("  \n ")),
                 &crate::prompt::AvailableTools::default(),
                 &[],
-                Some("  \n ")
             )
             .contains("Standing instructions")
         );

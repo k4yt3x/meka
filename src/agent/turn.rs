@@ -500,15 +500,12 @@ impl Agent {
         } else {
             Vec::new()
         };
-        let tools = prompt::AvailableTools::new(catalog.into_iter().map(|(name, ..)| name));
         let todos = self.cells.todo_list.get();
         let cwd = self.cells.cwd.get();
         let roots = self.cells.roots.get();
         prompt::build_turn_context(prompt::TurnContext {
-            tools: &tools,
             vision: self.cells.profile.current().vision,
             one_shot: self.options.one_shot,
-            background_enabled: self.tool_registry.background_enabled(),
             permission: self.cells.permission.get(),
             approvals: self.cells.permission.approvals(),
             todos: &todos,
@@ -804,10 +801,7 @@ impl Agent {
         };
         let system_prompt: Arc<str> = match &self.options.system_prompt_override {
             Some(prompt) => Arc::from(prompt.as_str()),
-            None => Arc::from(prompt::build_system_prompt(
-                self.options.sandboxed_shell,
-                self.options.user_instructions.as_deref(),
-            )),
+            None => Arc::from(prompt::build_system_prompt(self.system_prompt_inputs())),
         };
 
         // Proactive pre-send compaction. The reactive check at the top of the turn reads the
@@ -1959,10 +1953,13 @@ impl Agent {
         let count = items.len();
         tracing::info!("an inbox interrupt cut the provider call; {count} item(s) appended");
         let text = match items.as_slice() {
-            [item] => format!(
-                "Interrupted the answer to read a message from '{}'.",
-                item.source
-            ),
+            [
+                crate::store::inbox::InboxItem {
+                    source: Some(source),
+                    ..
+                },
+            ] => format!("Interrupted the answer to read a message from '{source}'."),
+            [_] => "Interrupted the answer to read a message.".to_string(),
             _ => format!("Interrupted the answer to read {count} messages."),
         };
         self.cells
@@ -2328,7 +2325,10 @@ mod tests {
             self.store
                 .inbox_store()
                 .enqueue(NewInboxItem::from_parts(
-                    session_id, self.class, "test", self.body,
+                    session_id,
+                    self.class,
+                    Some("test".to_string()),
+                    self.body,
                 )?)
                 .await?;
             Ok(crate::tools::ToolOutput::text("ran".to_string(), false))
@@ -2500,11 +2500,20 @@ mod tests {
             .expect("create session");
         agent.cells().session_id.set(session_id);
         let inbox = store.inbox_store();
-        let steer = NewInboxItem::from_parts(session_id, InboxClass::Steer, "test", "a steer")
-            .expect("item");
-        let followup =
-            NewInboxItem::from_parts(session_id, InboxClass::Followup, "test", "a followup")
-                .expect("item");
+        let steer = NewInboxItem::from_parts(
+            session_id,
+            InboxClass::Steer,
+            Some("test".to_string()),
+            "a steer",
+        )
+        .expect("item");
+        let followup = NewInboxItem::from_parts(
+            session_id,
+            InboxClass::Followup,
+            Some("test".to_string()),
+            "a followup",
+        )
+        .expect("item");
         inbox.enqueue(steer).await.expect("enqueue");
         inbox.enqueue(followup).await.expect("enqueue");
 
@@ -2541,8 +2550,13 @@ mod tests {
         // With nothing typed, the items are the whole opening message.
         inbox
             .enqueue(
-                NewInboxItem::from_parts(session_id, InboxClass::Steer, "test", "alone")
-                    .expect("item"),
+                NewInboxItem::from_parts(
+                    session_id,
+                    InboxClass::Steer,
+                    Some("test".to_string()),
+                    "alone",
+                )
+                .expect("item"),
             )
             .await
             .expect("enqueue");
@@ -2588,8 +2602,13 @@ mod tests {
         let inbox = store.inbox_store();
         inbox
             .enqueue(
-                NewInboxItem::from_parts(session_id, InboxClass::Steer, "test", "hello?")
-                    .expect("item"),
+                NewInboxItem::from_parts(
+                    session_id,
+                    InboxClass::Steer,
+                    Some("test".to_string()),
+                    "hello?",
+                )
+                .expect("item"),
             )
             .await
             .expect("enqueue");
@@ -2641,7 +2660,10 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
             inbox
-                .enqueue(NewInboxItem::from_parts(session_id, class, "test", body).expect("item"))
+                .enqueue(
+                    NewInboxItem::from_parts(session_id, class, Some("test".to_string()), body)
+                        .expect("item"),
+                )
                 .await
                 .expect("enqueue")
                 .id
@@ -3043,8 +3065,13 @@ mod tests {
         let inbox = store.inbox_store();
         let opener = inbox
             .enqueue(
-                NewInboxItem::from_parts(session_id, InboxClass::Steer, "test", "hello?")
-                    .expect("item"),
+                NewInboxItem::from_parts(
+                    session_id,
+                    InboxClass::Steer,
+                    Some("test".to_string()),
+                    "hello?",
+                )
+                .expect("item"),
             )
             .await
             .expect("enqueue")
@@ -3103,8 +3130,13 @@ mod tests {
         let inbox = store.inbox_store();
         let id = inbox
             .enqueue(
-                NewInboxItem::from_parts(session_id, InboxClass::Steer, "test", "never mind")
-                    .expect("item"),
+                NewInboxItem::from_parts(
+                    session_id,
+                    InboxClass::Steer,
+                    Some("test".to_string()),
+                    "never mind",
+                )
+                .expect("item"),
             )
             .await
             .expect("enqueue")
@@ -7947,6 +7979,8 @@ mod tests {
         registry.enable_background();
         let (mut agent, _store) = agent_with_registry_for_test(provider.clone(), registry).await;
         agent.options.one_shot = true;
+        // The fixture's override would stand in for the prompt this test is about.
+        agent.options.system_prompt_override = None;
         agent.cells.permission.set_approvals(true);
         let mut conversation = Conversation::new();
         for vision in [false, true] {
@@ -7982,10 +8016,15 @@ mod tests {
                 }),
                 "{context}"
             );
-            assert!(context.contains("without another model turn"), "{context}");
             assert!(context.contains("Approvals: off"), "{context}");
             assert!(!context.contains("task_list"), "{context}");
             assert!(!context.contains("task_cancel"), "{context}");
+            // The delivery rule is stated once, in the system prompt the turn sent, and names
+            // only the task tools the session registered: none.
+            let system = &request.system_prompt;
+            assert!(system.contains("without another model turn"), "{system}");
+            assert!(!system.contains("task_list"), "{system}");
+            assert!(!system.contains("task_cancel"), "{system}");
         }
     }
 }

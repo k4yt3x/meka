@@ -130,8 +130,10 @@ pub(crate) struct InboxItem {
     pub(crate) id: Uuid,
     pub(crate) session_id: Uuid,
     pub(crate) class: InboxClass,
-    /// Who sent it, as the header shows it: a token's description, or `your parent agent`.
-    pub(crate) source: String,
+    /// Who sent it, as the header names them: what the client said, or `your parent agent`.
+    /// `None` when the client named nobody, and the header then names nobody: who sent a message
+    /// is the client's fact, not one meka guesses from the token that carried it.
+    pub(crate) source: Option<String>,
     pub(crate) body: String,
     pub(crate) created_at: DateTime<Utc>,
     /// Turns that opened on this item and failed before the provider accepted anything.
@@ -165,7 +167,7 @@ impl InboxItem {
 pub(crate) struct NewInboxItem {
     pub(crate) session_id: Uuid,
     pub(crate) class: InboxClass,
-    pub(crate) source: String,
+    pub(crate) source: Option<String>,
     pub(crate) body: String,
     /// The bearer token that enqueued it, which scopes its idempotency key.
     pub(crate) token_id: Option<String>,
@@ -178,7 +180,7 @@ impl NewInboxItem {
     pub(crate) fn from_parts(
         session_id: Uuid,
         class: InboxClass,
-        source: impl Into<String>,
+        source: Option<String>,
         body: impl Into<String>,
     ) -> Result<Self> {
         let body = body.into();
@@ -188,7 +190,7 @@ impl NewInboxItem {
         Ok(Self {
             session_id,
             class,
-            source: source.into(),
+            source,
             body,
             token_id: None,
             idempotency_key: None,
@@ -283,7 +285,9 @@ impl InboxStore {
                         id.to_string(),
                         item.session_id.to_string(),
                         item.class.name(),
-                        item.source,
+                        // The column was created NOT NULL and only this module reads it, so an
+                        // empty string stands for nobody rather than a rebuild of the table.
+                        item.source.unwrap_or_default(),
                         item.body,
                         item.token_id,
                         item.idempotency_key,
@@ -722,7 +726,7 @@ impl InboxRow {
             session_id: Uuid::parse_str(&self.session_id)
                 .map_err(|error| format!("bad session id: {error}"))?,
             class: self.class.parse()?,
-            source: self.source,
+            source: (!self.source.is_empty()).then_some(self.source),
             body: self.body,
             created_at: stamp(Some(self.created_at))?.ok_or("missing created_at")?,
             attempts: u32::try_from(self.attempts.max(0)).unwrap_or(u32::MAX),
@@ -748,7 +752,8 @@ mod tests {
     }
 
     fn item(session_id: Uuid, class: InboxClass, body: &str) -> NewInboxItem {
-        NewInboxItem::from_parts(session_id, class, "test", body).expect("a non-blank body")
+        NewInboxItem::from_parts(session_id, class, Some("test".to_string()), body)
+            .expect("a non-blank body")
     }
 
     #[tokio::test]
@@ -784,11 +789,34 @@ mod tests {
         assert_ne!(other.id, first.id);
     }
 
+    /// The column holds an empty string for an item nobody was named on, and only this module
+    /// knows that: a reader gets `None` back, never the empty name.
+    #[tokio::test]
+    async fn an_item_named_by_nobody_reads_back_with_no_source() {
+        let (store, session_id) = store_with_session().await;
+        let inbox = store.inbox_store();
+        let unnamed = inbox
+            .enqueue(
+                NewInboxItem::from_parts(session_id, InboxClass::Steer, None, "who's there?")
+                    .expect("item"),
+            )
+            .await
+            .expect("enqueue");
+        let named = inbox
+            .enqueue(item(session_id, InboxClass::Steer, "me"))
+            .await
+            .expect("enqueue");
+        let unnamed = inbox.get(unnamed.id).await.expect("get").expect("row");
+        assert_eq!(unnamed.source, None);
+        let named = inbox.get(named.id).await.expect("get").expect("row");
+        assert_eq!(named.source, Some("test".to_string()));
+    }
+
     #[tokio::test]
     async fn a_blank_body_is_refused_before_it_reaches_the_store() {
         let session_id = Uuid::new_v4();
         assert!(matches!(
-            NewInboxItem::from_parts(session_id, InboxClass::Steer, "test", "  \n"),
+            NewInboxItem::from_parts(session_id, InboxClass::Steer, None, "  \n"),
             Err(MekaError::EmptyPrompt)
         ));
     }

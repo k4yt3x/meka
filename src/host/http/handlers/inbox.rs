@@ -31,15 +31,17 @@ use crate::{
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InboxRequest {
-    /// What the model reads, verbatim under a header naming `source` and when it arrived.
+    /// What the model reads, verbatim under a header naming when it arrived and, when given,
+    /// `source`.
     pub(crate) message: String,
     /// `steer` reaches a running turn at its next round boundary; `interrupt` cuts the answer it
     /// is streaming and is read at the boundary while a tool runs; `followup` waits for the turn
     /// to end. Any of them rides the next turn's opening, or opens one, when nothing is running.
     #[schema(value_type = String)]
     pub(crate) class: InboxClass,
-    /// Who the message is from, as the header names them. Defaults to the token's description,
-    /// then to `client`.
+    /// Who the message is from, as the header names them. Left out or blank, the header names
+    /// nobody: who sent a message is the client's to say, and meka does not guess it from the
+    /// token.
     #[serde(default)]
     pub(crate) source: Option<String>,
 }
@@ -50,7 +52,9 @@ pub(crate) struct InboxItemView {
     pub(crate) id: Uuid,
     pub(crate) session_id: Uuid,
     pub(crate) class: String,
-    pub(crate) source: String,
+    /// Absent when the client named nobody.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<String>,
     /// `pending`, `appended`, `delivered` or `withdrawn`.
     pub(crate) state: String,
     pub(crate) created_at: String,
@@ -132,11 +136,7 @@ pub(crate) async fn enqueue(
     // another process holds are refused before anything is written, and an evicted session is
     // revived so its driver has a runtime to run the item in.
     let entry = ensure_session_loaded(&state, session_id).await?;
-    let source = body
-        .source
-        .filter(|source| !source.trim().is_empty())
-        .or_else(|| principal.description.clone())
-        .unwrap_or_else(|| "client".to_string());
+    let source = body.source.filter(|source| !source.trim().is_empty());
     let mut item = NewInboxItem::from_parts(session_id, body.class, source, body.message.clone())
         .map_err(|error| {
         ProblemDetail::for_error(&error, state.config.relay_provider_errors)

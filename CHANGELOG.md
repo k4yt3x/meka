@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.63.0] - 2026-09-23
+
+### Changed
+
+- **Breaking:** an inbox item's `source` is absent from the API when the client sent none.
+- An inbox item posted without a `source` names nobody in its header instead of the token's label.
+- The per-turn context block carries only what changes; standing rules move to the system prompt.
+- `[Context budget]` names the auto-compaction ceiling instead of restating the policy each turn.
+- The system prompt states how the harness works; conduct and persona are the instructions file's.
+
 ## [0.62.0] - 2026-09-23
 
 ### Changed
@@ -2362,7 +2372,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.62.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.63.0...HEAD
+[0.63.0]: https://github.com/k4yt3x/meka/compare/0.62.0...0.63.0
 [0.62.0]: https://github.com/k4yt3x/meka/compare/0.61.0...0.62.0
 [0.61.0]: https://github.com/k4yt3x/meka/compare/0.60.0...0.61.0
 [0.60.0]: https://github.com/k4yt3x/meka/compare/0.59.0...0.60.0

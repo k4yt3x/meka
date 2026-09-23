@@ -279,7 +279,7 @@ fn offer_background(parameters: &mut serde_json::Value) {
             "type": "boolean",
             "default": false,
             "description":
-                "Return a task id and continue without waiting. Keeps this tool's timeout; see [Execution context] for result delivery.",
+                "Return a task id and continue without waiting; the result is delivered as the system prompt's background rules say. Keeps this tool's timeout.",
         }),
     );
 }

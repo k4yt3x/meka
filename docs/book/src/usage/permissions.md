@@ -368,9 +368,7 @@ meka lists **every registered tool** in the per-turn `<context>` block with its 
 ```text
 <context>
 [Permission context]
-Current permission level: read
-Read-classified tools are allowed.
-Approvals: off. Calls above the level are refused.
+Level: read. Approvals: off.
 
 [Execution context]
 Image input: enabled.
@@ -385,7 +383,7 @@ Working directory: /home/you/project
 </context>
 ```
 
-That short permission section is almost the only permission-dependent content in the request; `[Environment context]` is the other, since it is empty at `none` and gains a writable-roots block at `workspace`. The system prompt and the tools-array schemas stay byte-identical across `/permission` toggles, so mid-session level changes don't invalidate the Claude prompt cache; the entire conversation stays warm.
+The section carries only the two values that change; what each level allows and what the approvals switch does are stated once in the system prompt. That short section is almost the only permission-dependent content in the request; `[Environment context]` is the other, since it is empty at `none` and gains a writable-roots block at `workspace`. The system prompt and the tools-array schemas stay byte-identical across `/permission` toggles, so mid-session level changes don't invalidate the Claude prompt cache; the entire conversation stays warm.
 
 The same reasoning is why the tool catalog itself lives here rather than in the system prompt. Prompt caching is prefix-based, and the system prompt heads that prefix, so anything cached there that later changes (an MCP server connecting late or hot-swapping its tools, a skill being installed) would re-cache the entire conversation behind it. The `<context>` block rides inside your own message instead, so changes are appended rather than rewritten.
 

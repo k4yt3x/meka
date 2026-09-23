@@ -507,7 +507,7 @@ impl Agent {
         self.cells.background_tasks.attach(&task.id, join).await;
 
         let mut notice = format!(
-            "Started in the background as task {} ({}). See [Execution context] for result delivery.",
+            "Started in the background as task {} ({}).",
             task.short_id(),
             task.label,
         );

@@ -46,7 +46,7 @@ impl Tool for MemoryWriteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "memory_write".to_string(),
-            description: "Save durable preferences, constraints, decisions, or facts needed in future sessions. Update an existing name to refine it; omitted fields keep their values. Keep temporary task state in the scratchpad and avoid duplicating code or git history. Write a description that states the useful fact on its own.".to_string(),
+            description: "Save preferences, constraints, decisions, or facts that later sessions need. Update an existing name to refine it; omitted fields keep their values. Temporary task state and large outputs belong in the scratchpad, which later sessions do not read. Write a description that states the useful fact on its own.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

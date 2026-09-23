@@ -8798,9 +8798,13 @@ fn an_inbox_item_on_an_idle_session_starts_a_turn_and_the_feed_reports_its_deliv
         .text()
         .expect("body");
     assert!(
-        transcript.contains("[Message from mekabridge-test, arrived")
-            || transcript.contains("[Message from client, arrived"),
-        "the item opened the turn under meka's header: {transcript}"
+        transcript.contains("[Message arrived "),
+        "the item opened the turn under meka's header, which names nobody when the client named \
+         nobody: {transcript}"
+    );
+    assert!(
+        !transcript.contains("[Message from "),
+        "no sender was guessed for it: {transcript}"
     );
 }
 
@@ -8996,7 +9000,8 @@ fn an_interrupt_cuts_the_streaming_answer_and_the_turn_carries_on() {
     );
     assert_eq!(
         sse_event_data(&body, "notice").expect("notice")["text"],
-        "Interrupted the answer to read a message from 'client'."
+        "Interrupted the answer to read a message.",
+        "the post named nobody, so the notice names nobody"
     );
     assert_eq!(
         sse_event_data(&body, "inbox.delivered").expect("delivered")["item_ids"][0],
@@ -9435,6 +9440,15 @@ fn inbox_items_replay_on_their_key_and_withdraw_only_while_pending() {
     assert_eq!(
         listed["items"].as_array().map(Vec::len),
         Some(2),
+        "{listed}"
+    );
+    // Neither post named a sender, and the listing invents none.
+    assert!(
+        listed["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .all(|item| item.get("source").is_none()),
         "{listed}"
     );
 

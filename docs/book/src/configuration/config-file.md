@@ -624,7 +624,7 @@ The hint is trusted by default because most servers annotate honestly and requir
 
 **Stale config**: entries in `allowed_tools` / `disabled_tools` / `eager_load_tools` / `tool_permissions` that don't match any advertised tool get a `warn!` line at connect time. The server still connects; you just see a heads-up so you can clean up after the server renames a tool. A name that appears in both `eager_load_tools` and `disabled_tools` also warns: the disabled filter wins, so eager-loading the disabled tool is a no-op.
 
-**Visibility across levels**: the resolved permission doesn't hide a tool from the agent. Every registered tool is listed in the per-turn context with its required level noted inline, and a `[Permission context]` section names the current level and states in one line what it allows (it does not enumerate tools; the per-tool levels are in the catalog above it). The agent can still reason about an inaccessible tool and suggest `/permission <level>` to enable it; the permission gate is enforced at dispatch time. Keeping the tool catalog visible across levels is also what lets the Claude prompt cache survive mid-session permission toggles.
+**Visibility across levels**: the resolved permission doesn't hide a tool from the agent. Every registered tool is listed in the per-turn context with its required level noted inline, and a `[Permission context]` section names the current level and whether approvals are on (what each level allows is stated once in the system prompt, and the per-tool levels are in the catalog above it). The agent can still reason about an inaccessible tool and suggest `/permission <level>` to enable it; the permission gate is enforced at dispatch time. Keeping the tool catalog visible across levels is also what lets the Claude prompt cache survive mid-session permission toggles.
 
 #### The stdio server's environment
 
@@ -1161,7 +1161,7 @@ context_ceiling_percent = 70
 
 Run a *checkpoint turn* before each compaction, in which the agent saves anything that must outlive the window and writes the replacement summary itself. See [Compacting a session](../usage/sessions.md#compacting-a-session).
 
-Costs one extra model call per compaction. Turning it off falls back to a standalone summarizer that has no tools and none of the agent's identity, so it cannot save to memory and cannot apply any judgment about what this particular agent is for.
+Costs one extra model call per compaction. Turning it off falls back to a standalone summarizer that has no tools and none of the standing instructions, so it cannot save to memory and cannot apply any judgment about what this particular deployment is for.
 
 Note that this applies to automatic compactions too, so an unattended checkpoint can write memory with nobody watching.
 

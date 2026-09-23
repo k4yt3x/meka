@@ -436,6 +436,26 @@ impl Agent {
         )
     }
 
+    /// What the system prompt is built from. Read once per build and fixed for the session: the
+    /// options never change, and the built-in tools named here are settled before the first turn.
+    fn system_prompt_inputs(&self) -> crate::prompt::SystemPromptInputs<'_> {
+        crate::prompt::SystemPromptInputs {
+            sandboxed_shell: self.options.sandboxed_shell,
+            user_instructions: self.options.user_instructions.as_deref(),
+            one_shot: self.options.one_shot,
+            background: self.tool_registry.background_enabled().then(|| {
+                crate::prompt::BackgroundTools {
+                    task_list: self.tool_registry.get("task_list").is_some(),
+                    task_cancel: self.tool_registry.get("task_cancel").is_some(),
+                }
+            }),
+            scheduling: self.tool_registry.get("schedule_create").is_some(),
+            auto_compact: self.options.auto_compact,
+            conversation_search: self.tool_registry.get("conversation_search").is_some(),
+            conversation_read: self.tool_registry.get("conversation_read").is_some(),
+        }
+    }
+
     /// The occupancy figures behind the `[Context budget]` block the turn path pushes to the model.
     ///
     /// `GET /v1/sessions/{id}/context` deliberately does *not* route through here: it reads the

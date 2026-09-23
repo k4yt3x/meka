@@ -1,6 +1,6 @@
 # Instructions
 
-Standing instructions are your own guidance to the agent, applied to every session on this machine. They land in the system prompt under a `## Standing instructions` heading, and the model is told to follow them within safety requirements.
+Standing instructions are your own guidance to the agent, applied to every session on this machine. They land in the system prompt under a `## Standing instructions` heading, introduced as the installation operator's.
 
 Use them for things that are true of your setup rather than of any one task:
 

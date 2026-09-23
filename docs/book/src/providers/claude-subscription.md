@@ -166,7 +166,7 @@ Sent as an array of three `text` blocks:
 
    `cc_prompt_id` identifies one prompt and stays the same across every request that prompt produces, including the whole tool loop; a sub-agent inherits its spawner's. `cc_turn_origin` says where that prompt came from: `human` for words a person typed through any host, `scheduled` for a fired job, `peer` for inbox items, `task_notification` for finished background work delivering itself; a sub-agent inherits this too. `cc_prev_req` names the `request-id` of the previous response in the same conversation, so it is absent on a conversation's first request. A compaction's requests carry `cc_prev_req` and neither of the other two, which is what Claude Code's own compaction sends.
 2. `You are Claude Code, Anthropic's official CLI for Claude.` (fixed identity prefix).
-3. Your own system prompt, which carries `cache_control: {type: "ephemeral", ttl: "1h", scope: "global"}`.
+3. One sentence naming block 2 for what it is (a requirement of this API that does not describe the session), then meka's system prompt. The block carries `cache_control: {type: "ephemeral", ttl: "1h", scope: "global"}`.
 
 Only block 3 is marked for caching, matching the captured Claude Code CLI wire; `scope: "global"` shares the cached prefix across sessions. Tools carry no `cache_control` (the rolling last-message breakpoint caches the tools+system prefix).
 
