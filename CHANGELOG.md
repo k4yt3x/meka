@@ -7,11 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.64.0] - 2026-09-24
+
 ### Added
 
 - Sessions have a title of their own, shown by every listing in place of the first message's words.
 - Pinned sessions are listed first on every surface, newest pin on top, ahead of the recency order.
 - Session search finds a conversation by its words, from the command line and over the HTTP API.
+- Standing instructions can take more files, such as a project's `AGENTS.md`, named in the config.
 
 ### Changed
 
@@ -2389,7 +2392,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.63.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.64.0...HEAD
+[0.64.0]: https://github.com/k4yt3x/meka/compare/0.63.0...0.64.0
 [0.63.0]: https://github.com/k4yt3x/meka/compare/0.62.0...0.63.0
 [0.62.0]: https://github.com/k4yt3x/meka/compare/0.61.0...0.62.0
 [0.61.0]: https://github.com/k4yt3x/meka/compare/0.60.0...0.61.0

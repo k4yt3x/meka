@@ -1438,10 +1438,129 @@ fn a_json_one_shot_reports_the_turn_s_notices() {
 
 /// A config that lets `file_write` run, since the marker above is the whole measurement.
 fn write_capable_config(install: &Install) {
-    install.write_config(
-        "default_profile = \"mock\"\n\n[accounts.mock]\nbackend = \"anthropic-messages\"\n\n\
-         [profiles.mock]\naccount = \"mock\"\nmodel = \"claude-sonnet-4-5\"\n\n[permissions]\n\
-         default = \"workspace\"\nenabled = [\"read\", \"workspace\"]\n",
+    install.write_config(CAPABLE_CONFIG);
+}
+
+/// The lines `write_capable_config` writes, for a test that appends a table of its own.
+const CAPABLE_CONFIG: &str = "default_profile = \"mock\"\n\n[accounts.mock]\nbackend = \
+                              \"anthropic-messages\"\n\n[profiles.mock]\naccount = \"mock\"\n\
+                              model = \"claude-sonnet-4-5\"\n\n[permissions]\ndefault = \
+                              \"workspace\"\nenabled = [\"read\", \"workspace\"]\n";
+
+/// A project's `AGENTS.md` reaches the system prompt of a session opened in that project, and only
+/// because the config names it: the same launch without the key sends a prompt the file is not
+/// in. The scripted provider is what sees the prompt, so it is the one that can say.
+#[test]
+fn a_session_reads_the_files_its_configuration_names_from_its_own_directory() {
+    const EXPECT_THE_PROJECT_FILE: &str = r#"[
+  [{"type":"expect_system_prompt","contains":"Answer in haiku, this project insists."},
+   {"type":"text","text":"ok"},{"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = Install::new();
+    let project = install.root().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::write(
+        project.join("AGENTS.md"),
+        "Answer in haiku, this project insists.\n",
+    )
+    .expect("write AGENTS.md");
+
+    write_capable_config(&install);
+    let output = run_scripted_from(&install, &project, EXPECT_THE_PROJECT_FILE, &[
+        "--oneshot",
+        "-p",
+        "hi",
+    ]);
+    assert!(
+        !output.status.success(),
+        "nothing in the directory is read until the config names it: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    install.write_config(&format!(
+        "{CAPABLE_CONFIG}\n[instructions]\nfiles = [\"AGENTS.md\"]\n"
+    ));
+    let output = run_scripted_from(&install, &project, EXPECT_THE_PROJECT_FILE, &[
+        "--oneshot",
+        "-p",
+        "hi",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
+}
+
+/// `meka instructions show` and `path` answer for the directory they run in, so what a session
+/// opened there is told is checkable without opening one. A missing entry is listed as absent and
+/// otherwise says nothing.
+#[test]
+fn instructions_show_and_path_read_the_listed_files_from_the_current_directory() {
+    let install = Install::new();
+    let project = install.root().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::write(project.join("AGENTS.md"), "project rules\n").expect("write AGENTS.md");
+    std::fs::write(
+        install.config_dir().join("instructions.md"),
+        "standing rules\n",
+    )
+    .expect("write instructions.md");
+    install.write_config(&format!(
+        "{CAPABLE_CONFIG}\n[instructions]\nfiles = [\"AGENTS.md\", \"missing.md\"]\n"
+    ));
+
+    let output = install
+        .meka(&["instructions", "show"])
+        .current_dir(&project)
+        .output()
+        .expect("run show");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "standing rules\n\nproject rules\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let agents = project.join("AGENTS.md").display().to_string();
+    assert!(
+        stderr.contains(&format!("Files: {agents}")),
+        "the listed file is named as a source of its own: {stderr}"
+    );
+    assert!(
+        !stderr.contains("missing.md"),
+        "an absent entry is not a source: {stderr}"
+    );
+
+    let output = install
+        .meka(&["instructions", "path"])
+        .current_dir(&project)
+        .output()
+        .expect("run path");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let exists_column = |path: &str| -> String {
+        let line = stdout
+            .lines()
+            .find(|line| line.contains(path))
+            .unwrap_or_else(|| panic!("no row for {path}: {stdout}"));
+        line.split_whitespace()
+            .last()
+            .expect("a column")
+            .to_string()
+    };
+    assert_eq!(exists_column(&agents), "yes");
+    assert_eq!(
+        exists_column(&project.join("missing.md").display().to_string()),
+        "no"
     );
 }
 

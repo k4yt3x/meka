@@ -309,9 +309,10 @@ output; don't demote it to `info!`.
   `ConfigFile`'s fields, which is the order a file is best written in: the multi-entry blocks
   first (`default_profile`, `[accounts.*]`, `[profiles.*]`, `[mcp]`), then each flat table from
   the most to the least consequential (`[permissions]`, `[shell]`, `[tools]`, `[subagents]`,
-  `[skills]`, `[memory]`, `[schedule]`, `[background]`, `[session]`, `[thinking]`, `[web]`,
-  `[display]`), and `[serve]` last. A new section is placed by that rule in both, never appended,
-  and a note that is not a key goes in the page's intro, never between sections.
+  `[instructions]`, `[skills]`, `[memory]`, `[schedule]`, `[background]`, `[session]`,
+  `[thinking]`, `[web]`, `[display]`), and `[serve]` last. A new section is placed by that rule
+  in both, never appended, and a note that is not a key goes in the page's intro, never between
+  sections.
 
 ## A profile is indivisible
 

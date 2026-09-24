@@ -576,9 +576,13 @@ pub(crate) enum InstructionsAction {
     ///
     /// Resolution order is `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE`, then `instructions.md`
     /// (or `instructions/`) in the config directory; `--instructions` belongs to a run and is not
-    /// consulted. The text goes to stdout and the source to stderr.
+    /// consulted. The files `[instructions].files` names are read against the current directory
+    /// and follow. The text goes to stdout and the sources to stderr.
     Show,
     /// Print the paths checked for instructions, and whether each exists
+    ///
+    /// The files `[instructions].files` names are listed after the config directory's, resolved
+    /// against the current directory.
     Path,
 }
 

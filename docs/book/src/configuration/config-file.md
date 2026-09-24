@@ -27,7 +27,7 @@ The directory holds two more things that are not config keys. Standing instructi
 └── skills/
 ```
 
-Write `instructions.md`, or split a large set across `instructions/*.md`, and meka reads it at startup into the `## Standing instructions` section of the system prompt; see [Instructions](../usage/instructions.md). To pass the text as a string instead (containers, CI), use `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE`, or `--instructions`.
+Write `instructions.md`, or split a large set across `instructions/*.md`, and meka reads it at startup into the `## Standing instructions` section of the system prompt; see [Instructions](../usage/instructions.md). To pass the text as a string instead (containers, CI), use `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE`, or `--instructions`. Files beyond that path, a project's `AGENTS.md` for one, are named under [`[instructions]`](#instructions).
 
 Everything in that directory is content you put there, so it is safe to keep under version control. Commands that edit the config take a cross-process lock on the directory itself, as does claiming a skill store, so neither leaves a lock file behind; a write is published by renaming a short-lived `config.toml.<pid>.<seq>.tmp` over the target, so that name can appear for the duration of one write. If you are upgrading from a version that wrote `.config.toml.lock`, or `.meka-store.lock` inside a skill store, delete them: nothing reads or writes them any more.
 
@@ -1009,6 +1009,23 @@ The distinction is what config can actually enforce. A *capability* can be withh
 
 The other half of the argument is that the config guardrail existed for a failure mode that no longer applies. It was there because the parent might *forget*, which only matters for things that are on by default. Both of these now default to off, so forgetting produces a clean sub-agent.
 
+## `[instructions]`
+
+Where the standing instructions are read from beyond the conventional path. See [Reading a project's AGENTS.md](../usage/instructions.md#reading-a-projects-agentsmd) in the Instructions guide.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `files` | array | `[]` | Files, or directories of files, read into the standing instructions when a session opens |
+
+```toml
+[instructions]
+files = ["AGENTS.md", "~/notes/meka-site.md"]
+```
+
+A relative entry resolves against the session's working directory, which is how `AGENTS.md` names whichever project the session opens in; an absolute one is read as given, and a leading `~` is expanded. The text follows the standing instructions under the same heading. It is read when the session opens rather than at startup, so a `meka -c` or a new `serve` session sees an edit. An entry that is not there is skipped without a word; one that cannot be read is skipped with a warning.
+
+Empty by default, and deliberately so: a relative entry lets whatever sits in a session's directory speak with the operator's authority, and under `meka serve` the client chooses the directory. Name one only where every directory a session may open in is yours to trust.
+
 ## `[skills]`
 
 Controls the skill store. See the [Skills](../usage/skills.md) guide.
@@ -1035,7 +1052,7 @@ Setting `enabled = false` keeps every skill tool's schema out of every request a
 extra_paths = ["~/.agents/skills"]
 ```
 
-`~/.agents/skills` is the cross-client convention, so pointing at it makes skills installed by other Agent Skills clients visible here. It is not a default: reading a directory outside meka's own namespace is your call. meka's own store is searched first and wins a name collision. There is no automatic project-level scan, for the same reason meka does not read config or instructions from the working directory; name the path here if you want a project's skills read. See [Reading skills from other directories](../usage/skills.md#reading-skills-from-other-directories).
+`~/.agents/skills` is the cross-client convention, so pointing at it makes skills installed by other Agent Skills clients visible here. It is not a default: reading a directory outside meka's own namespace is your call. meka's own store is searched first and wins a name collision. There is no automatic project-level scan, for the same reason meka reads nothing from the working directory that config does not name, the files under [`[instructions]`](#instructions) included; name the path here if you want a project's skills read. See [Reading skills from other directories](../usage/skills.md#reading-skills-from-other-directories).
 
 An entry that repeats an earlier one, or that names meka's own skills directory, is dropped with a warning: it would otherwise be scanned twice and every skill in it reported as shadowed by itself. An empty string is dropped too, since it would expand to your home directory.
 

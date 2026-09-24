@@ -48,6 +48,7 @@ pub(crate) struct ConfigFile {
     pub(crate) shell: Option<ShellConfig>,
     pub(crate) tools: Option<ToolsConfig>,
     pub(crate) subagents: Option<SubagentsConfig>,
+    pub(crate) instructions: Option<InstructionsConfig>,
     pub(crate) skills: Option<SkillsConfig>,
     pub(crate) memory: Option<MemoryConfig>,
     pub(crate) schedule: Option<ScheduleConfig>,
@@ -57,6 +58,26 @@ pub(crate) struct ConfigFile {
     pub(crate) web: Option<WebConfig>,
     pub(crate) display: Option<DisplayConfig>,
     pub(crate) serve: Option<ServeConfig>,
+}
+
+/// `[instructions]` table: where the standing instructions are read from beyond the conventional
+/// path ([`crate::instructions`]).
+///
+/// The text itself stays in files, since prose is miserable to maintain inside a TOML string; what
+/// this table holds is where else to look. Config-only, like `[skills]` and `[memory]`: which files
+/// speak to every session is a property of the installation, not of a run.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InstructionsConfig {
+    /// Files, or directories of files, read into the standing instructions when a session opens.
+    /// Default empty.
+    ///
+    /// A relative entry is resolved against the session's working directory, which is why the list
+    /// is empty unless written: a relative entry lets whatever sits in that directory speak with
+    /// the operator's authority, and under `serve` and ACP the client chooses the directory. Read
+    /// when a session opens rather than at startup for the same reason, see
+    /// `crate::host::build_session_agent`. A leading `~` is expanded (see [`expand_user_path`]).
+    pub(crate) files: Option<Vec<String>>,
 }
 
 /// `[skills]` table: the user-authored skill store ([`crate::skills`]).
@@ -1212,6 +1233,10 @@ pub(crate) struct ResolvedConfig {
     /// later cannot start appearing on the API by accident. Credentials were never in here to
     /// begin with; they live in the database keyed by account name.
     pub(crate) profile_summaries: Vec<ProfileSummary>,
+    /// The files `[instructions].files` names, tilde-expanded and otherwise as written: a relative
+    /// entry stays relative because each session resolves it against its own working directory
+    /// when it opens; see [`InstructionsConfig::files`]. Empty unless configured.
+    pub(crate) instruction_files: Vec<std::path::PathBuf>,
     /// Whether the `skill_read` / `skill_search` tools are registered and the `[Skills]` index
     /// rendered. Defaults to `true`; see [`SkillsConfig`].
     pub(crate) skills_enabled: bool,
@@ -1404,6 +1429,37 @@ fn resolve_skills_extra_paths(raw: &[String], native: Option<&Path>) -> Vec<Path
         if resolved.contains(&path) {
             tracing::warn!(
                 "[skills] extra_paths lists '{entry}' more than once; ignoring the repeat"
+            );
+            continue;
+        }
+        resolved.push(path);
+    }
+    resolved
+}
+
+/// `[instructions].files` as [`ResolvedConfig::instruction_files`] carries it: tilde-expanded,
+/// with the entries a session could not use dropped and named. `pub(crate)` because `meka
+/// instructions` resolves the same list for the directory it runs in.
+///
+/// A repeat would put one file's text into the prompt twice. The empty entry is the one that has
+/// to go: it would expand to `$HOME`, and an entry that is a directory is read whole.
+pub(crate) fn resolve_instruction_files(raw: &[String]) -> Vec<PathBuf> {
+    let mut resolved: Vec<PathBuf> = Vec::new();
+    for entry in raw {
+        if entry.trim().is_empty() {
+            tracing::warn!("[instructions] files contains an empty entry; ignoring it");
+            continue;
+        }
+        let Some(path) = expand_user_path(entry) else {
+            tracing::warn!(
+                "ignoring [instructions] files entry '{entry}': no home directory to expand `~` \
+                 into"
+            );
+            continue;
+        };
+        if resolved.contains(&path) {
+            tracing::warn!(
+                "[instructions] files lists '{entry}' more than once; ignoring the repeat"
             );
             continue;
         }
@@ -1759,6 +1815,14 @@ impl ResolvedConfig {
         let file_session = config_file.session.unwrap_or_default();
         let file_thinking = config_file.thinking.unwrap_or_default();
         let file_tools = config_file.tools.unwrap_or_default();
+        let instruction_files = resolve_instruction_files(
+            config_file
+                .instructions
+                .unwrap_or_default()
+                .files
+                .as_deref()
+                .unwrap_or_default(),
+        );
         let file_skills = config_file.skills.unwrap_or_default();
         let skills_enabled = file_skills.enabled.unwrap_or(true);
         let skills_agent_managed = file_skills.agent_managed.unwrap_or(false);
@@ -1975,6 +2039,7 @@ impl ResolvedConfig {
             mcp_servers,
             mcp_default_permission,
             profile_summaries,
+            instruction_files,
             skills_enabled,
             skills_agent_managed,
             skills_extra_paths,
@@ -3024,6 +3089,26 @@ mod tests {
         );
     }
 
+    /// The empty entry would expand to `$HOME` and, being a directory, be read whole into the
+    /// prompt; a repeat would put one file's text in twice.
+    #[test]
+    fn instruction_files_drop_repeats_and_empty_entries() {
+        let resolved = resolve_instruction_files(&[
+            "AGENTS.md".to_string(),
+            "/srv/notes/site.md".to_string(),
+            "AGENTS.md".to_string(),
+            " ".to_string(),
+        ]);
+        assert_eq!(
+            resolved,
+            vec![
+                PathBuf::from("AGENTS.md"),
+                PathBuf::from("/srv/notes/site.md")
+            ],
+            "order is the order in the prompt, so it has to be preserved"
+        );
+    }
+
     fn fixture_server(name: &str) -> McpServerConfig {
         McpServerConfig {
             name: name.to_string(),
@@ -4024,6 +4109,20 @@ agent_managed = true
             resolved.skills_enabled,
             "agent_managed alone must not disturb the enabled default"
         );
+    }
+
+    /// Empty unless written: a relative entry reads whatever sits in a session's directory into
+    /// the system prompt, so nothing may put one there but the operator.
+    #[test]
+    fn instruction_files_are_empty_unless_the_config_file_names_them() {
+        assert!(resolve_with_config("").instruction_files.is_empty());
+        let resolved = resolve_with_config(
+            "[instructions]\nfiles = [\"AGENTS.md\", \"/srv/notes/site.md\"]\n",
+        );
+        assert_eq!(resolved.instruction_files, vec![
+            PathBuf::from("AGENTS.md"),
+            PathBuf::from("/srv/notes/site.md")
+        ]);
     }
 
     /// `default_required` is only a default for `required`; every consumer downstream reads the

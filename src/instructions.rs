@@ -14,6 +14,11 @@
 //! instruction set is billed once, whereas re-reading it per turn would either invalidate that
 //! prefix whenever the file changed or push the text into the conversation. The cost is that edits
 //! take effect on the next run, which for `meka serve` and `meka acp` means the next restart.
+//!
+//! `[instructions].files` names more places, a project's `AGENTS.md` among them. Those are read
+//! when a session opens rather than at startup, because a relative entry means the session's
+//! working directory, which the REPL takes from where it was launched, a resume from what the row
+//! recorded, and `serve` and ACP from the client, per session.
 
 use std::path::{Path, PathBuf};
 
@@ -132,6 +137,68 @@ pub(crate) fn read_explicit(path: &Path) -> crate::error::Result<Instructions> {
         text,
         source: InstructionsSource::Files(vec![path.to_path_buf()]),
     })
+}
+
+/// Where a `[instructions].files` entry points from `directory`, the session's working directory:
+/// a relative entry is under it, an absolute one is where it says.
+pub(crate) fn listed_path(entry: &Path, directory: &Path) -> PathBuf {
+    if entry.is_absolute() {
+        entry.to_path_buf()
+    } else {
+        directory.join(entry)
+    }
+}
+
+/// Read the files `[instructions].files` names for one session, each through [`listed_path`]. An
+/// entry that is a directory is read the way an explicit one is, any regular file in it.
+///
+/// A missing entry is skipped without a warning, unlike a path `MEKA_INSTRUCTIONS_FILE` names: a
+/// relative entry is absent from most directories by design, and the list wants one rule. A file
+/// that is there but cannot be read still warns, through [`read_file`].
+pub(crate) fn read_files(entries: &[PathBuf], directory: &Path) -> Option<Instructions> {
+    let mut used: Vec<PathBuf> = Vec::new();
+    let mut sections: Vec<String> = Vec::new();
+    for entry in entries {
+        let path = listed_path(entry, directory);
+        if path.is_dir() {
+            if let Some(found) = read_dir(&path, FileFilter::AnyRegularFile) {
+                sections.push(found.text);
+                if let InstructionsSource::Files(paths) = found.source {
+                    used.extend(paths);
+                }
+            }
+            continue;
+        }
+        match read_file(&path) {
+            Some(text) => {
+                sections.push(text);
+                used.push(path);
+            }
+            None if !path.exists() => {
+                let path = path.display();
+                tracing::debug!("no instructions file at '{path}'");
+            }
+            None => {}
+        }
+    }
+    if sections.is_empty() {
+        return None;
+    }
+    Some(Instructions {
+        text: sections.join("\n\n"),
+        source: InstructionsSource::Files(used),
+    })
+}
+
+/// The standing text with a session's listed files after it, separated the way the directory form
+/// separates two files. `None` when neither has anything.
+pub(crate) fn join(standing: Option<String>, listed: Option<Instructions>) -> Option<String> {
+    match (standing, listed) {
+        (Some(standing), Some(listed)) => Some(format!("{standing}\n\n{}", listed.text)),
+        (Some(standing), None) => Some(standing),
+        (None, Some(listed)) => Some(listed.text),
+        (None, None) => None,
+    }
 }
 
 /// Which files in a directory count as instructions.
@@ -408,5 +475,82 @@ mod tests {
         write(temp.path(), "blank.md", "\n\t ");
         assert!(read_file(&temp.path().join("blank.md")).is_none());
         assert!(read_file(&temp.path().join("absent.md")).is_none());
+    }
+
+    /// A relative entry is what the list is for: `AGENTS.md` names whichever project the session
+    /// is in. The directory is the session's, handed in, never the process's.
+    #[test]
+    fn listed_files_resolve_a_relative_entry_against_the_directory_and_keep_an_absolute_one() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        write(project.path(), "AGENTS.md", "project rules\n");
+        write(elsewhere.path(), "site.md", "site rules");
+
+        let entries = [PathBuf::from("AGENTS.md"), elsewhere.path().join("site.md")];
+        let found = read_files(&entries, project.path()).expect("some");
+        assert_eq!(found.text, "project rules\n\nsite rules");
+        assert_eq!(
+            found.source,
+            InstructionsSource::Files(vec![
+                project.path().join("AGENTS.md"),
+                elsewhere.path().join("site.md"),
+            ])
+        );
+    }
+
+    /// Most directories have no `AGENTS.md`, so an absent entry is the ordinary case and reads as
+    /// nothing rather than as the refusal an explicitly named path gets.
+    #[test]
+    fn a_missing_listed_file_is_skipped() {
+        let project = tempfile::tempdir().expect("tempdir");
+        write(project.path(), "AGENTS.md", "project rules");
+        let entries = [PathBuf::from("absent.md"), PathBuf::from("AGENTS.md")];
+        assert_eq!(
+            read_files(&entries, project.path()).expect("some").text,
+            "project rules"
+        );
+        assert!(read_files(&[PathBuf::from("absent.md")], project.path()).is_none());
+    }
+
+    /// A listed directory is one the user named outright, so it takes any regular file, as the
+    /// path `MEKA_INSTRUCTIONS_FILE` names does.
+    #[test]
+    fn a_listed_directory_is_read_like_an_explicitly_named_one() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let rules = project.path().join("rules");
+        std::fs::create_dir(&rules).expect("mkdir");
+        write(&rules, "20-style", "style");
+        write(&rules, "10-scope.md", "scope");
+        let found = read_files(&[PathBuf::from("rules")], project.path()).expect("some");
+        assert_eq!(found.text, "scope\n\nstyle");
+    }
+
+    /// A file that is there but is not text warns and drops out, rather than putting bytes the
+    /// model cannot read into every request.
+    #[test]
+    fn a_listed_file_that_is_not_text_is_skipped() {
+        let project = tempfile::tempdir().expect("tempdir");
+        std::fs::write(project.path().join("AGENTS.md"), [0xff, 0xfe, 0xfd]).expect("write bytes");
+        assert!(read_files(&[PathBuf::from("AGENTS.md")], project.path()).is_none());
+    }
+
+    #[test]
+    fn join_puts_the_listed_files_after_the_standing_text() {
+        let listed = || {
+            Some(Instructions {
+                text: "listed".to_string(),
+                source: InstructionsSource::Files(Vec::new()),
+            })
+        };
+        assert_eq!(
+            join(Some("standing".to_string()), listed()).as_deref(),
+            Some("standing\n\nlisted")
+        );
+        assert_eq!(
+            join(Some("standing".to_string()), None).as_deref(),
+            Some("standing")
+        );
+        assert_eq!(join(None, listed()).as_deref(), Some("listed"));
+        assert_eq!(join(None, None), None);
     }
 }

@@ -94,6 +94,13 @@ pub(crate) enum MockEvent {
     Fail {
         message: String,
     },
+    /// Fails the round the way [`Self::Fail`] does unless the request's system prompt contains
+    /// `contains`. A script's answers never depend on what it was sent, so this is how a test
+    /// driving a real host asserts on the prompt that host built: the recording below is readable
+    /// in-process only.
+    ExpectSystemPrompt {
+        contains: String,
+    },
     /// Synthetic *transient* provider failure. The stream returns
     /// `Err(MekaError::RetryableProvider { .. })` immediately, exercising `Agent::run_streaming`'s
     /// retry-with-backoff path. Each retry consumes one more round from the script, so a
@@ -279,7 +286,7 @@ impl Provider for MockProvider {
         cancellation: CancellationToken,
     ) -> Result<crate::provider::Completion> {
         let CompletionRequest {
-            system_prompt: _,
+            system_prompt,
             messages,
             tools: _,
             thinking,
@@ -308,6 +315,13 @@ impl Provider for MockProvider {
             match event {
                 MockEvent::Fail { message } => {
                     return Err(crate::error::MekaError::Provider(message));
+                }
+                MockEvent::ExpectSystemPrompt { contains } => {
+                    if !system_prompt.contains(&contains) {
+                        return Err(crate::error::MekaError::Provider(system_prompt_complaint(
+                            &contains,
+                        )));
+                    }
                 }
                 MockEvent::FailStream { message } => {
                     return Err(crate::error::MekaError::StreamError(message));
@@ -458,6 +472,13 @@ impl Provider for MockProvider {
                     send_stream_error(&event_sender, &message).await;
                     return Err(crate::error::MekaError::Provider(message));
                 }
+                MockEvent::ExpectSystemPrompt { contains } => {
+                    if !system_prompt.contains(&contains) {
+                        let message = system_prompt_complaint(&contains);
+                        send_stream_error(&event_sender, &message).await;
+                        return Err(crate::error::MekaError::Provider(message));
+                    }
+                }
                 MockEvent::FailStream { message } => {
                     send_stream_error(&event_sender, &message).await;
                     return Err(crate::error::MekaError::StreamError(message));
@@ -560,6 +581,7 @@ impl Provider for MockProvider {
                         MockEvent::Sleep { .. }
                         | MockEvent::Stall { .. }
                         | MockEvent::Fail { .. }
+                        | MockEvent::ExpectSystemPrompt { .. }
                         | MockEvent::FailStream { .. }
                         | MockEvent::FailRetryable { .. }
                         | MockEvent::FailInvalidRequest { .. }
@@ -608,6 +630,12 @@ async fn send_stream_error(event_sender: &mpsc::Sender<StreamEvent>, message: &s
     {
         tracing::trace!("stream event receiver dropped");
     }
+}
+
+/// What a round scripted with [`MockEvent::ExpectSystemPrompt`] fails with. Names the words and
+/// not the prompt: a test reads this off a host's stderr, and the prompt is what it is asserting.
+fn system_prompt_complaint(contains: &str) -> String {
+    format!("mock provider: the system prompt does not contain {contains:?}")
 }
 
 /// The notice a Claude provider sends when it redacts old images, with the report the agent counts.

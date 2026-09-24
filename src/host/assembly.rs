@@ -31,7 +31,9 @@ pub(crate) struct SharedDeps {
     pub(crate) sandbox: crate::sandbox::SandboxResolution,
     /// The dispatcher a scheduled gate's tool probe resolves against.
     pub(crate) gate_tools: Option<Arc<dyn crate::schedule::GateTools>>,
-    /// The user's instructions, resolved once at startup, and where they came from.
+    /// The standing instructions, resolved once at startup, and where they came from. The text
+    /// alone: a session appends the files `[instructions].files` names when it opens, through
+    /// [`session_agent_options`].
     pub(crate) user_instructions: Option<String>,
     pub(crate) user_instructions_source: Option<String>,
     /// Shared by every session this host builds, so two of them writing one file serialize.
@@ -342,6 +344,7 @@ pub(crate) async fn build_session_agent(
         crate::provider::profile_for_config(&shared.store, &shared.config, session_id).await?,
     )
     .await?;
+    let agent_options = session_agent_options(shared, &cwd.get());
     let mut cells = SessionCells::new(
         shared_permission,
         cwd,
@@ -363,12 +366,26 @@ pub(crate) async fn build_session_agent(
         None => cells,
     };
     let session_stats = session_stats_for(&shared.store, session_id).await;
-    assemble_agent(
-        shared.materials(session_stats),
-        cells,
-        shared.agent_options.clone(),
-    )
-    .await
+    assemble_agent(shared.materials(session_stats), cells, agent_options).await
+}
+/// This session's copy of the process-wide options: the standing text, with the files
+/// `[instructions].files` names read against `directory` and appended.
+///
+/// Read here rather than beside the standing text at startup because a relative entry means the
+/// session's directory, which `serve` and ACP take from the client per session and a resume from
+/// the row, so the process has no one answer to give.
+fn session_agent_options(shared: &SharedDeps, directory: &std::path::Path) -> AgentOptions {
+    let mut options = shared.agent_options.clone();
+    if shared.config.instruction_files.is_empty() {
+        return options;
+    }
+    let listed = crate::instructions::read_files(&shared.config.instruction_files, directory);
+    if let Some(found) = &listed {
+        crate::instructions::warn_if_large(found);
+        tracing::info!("instructions loaded from {source}", source = found.source);
+    }
+    options.user_instructions = crate::instructions::join(options.user_instructions.take(), listed);
+    options
 }
 /// What [`ResidentSession::release`] does, for an agent that never became a session: a REPL that
 /// exits before its first turn has a lock slot, a registry and a cancel cell to let go of, and no

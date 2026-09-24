@@ -1228,7 +1228,7 @@ Key points:
 | DELETE | `/v1/memory/{name}` | `memory:w` | Delete a memory |
 | GET | `/v1/mcp/{name}/tools` | `mcp:r` | Tools one MCP server advertises, each with its resolved permission, which step of the resolution chain decided it, whether config lets the agent see it, and whether a `readOnlyHint` the server sent was declined by `trust_read_only_hint = false` |
 | POST | `/v1/mcp/{name}/reconnect` | `mcp:w` | Reconnect an MCP server |
-| GET | `/v1/instructions` | `sessions:r` | Resolved standing instructions |
+| GET | `/v1/instructions` | `sessions:r` | Resolved standing instructions, without the per-session files `[instructions]` names |
 | GET | `/v1/profiles` | read | Configured profiles |
 | GET | `/v1/openapi.json` | None, and off unless `[serve].docs` is set | OpenAPI spec |
 | GET | `/v1/docs` | None, and off unless `[serve].docs` is set | Swagger UI |

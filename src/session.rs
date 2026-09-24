@@ -388,7 +388,8 @@ pub(crate) struct AgentOptions {
     /// this flag.
     pub(crate) compact_checkpoint: bool,
     /// User-authored instructions, surfaced in the system prompt and to sub-agents. Per-run
-    /// `--instructions` overrides the config-file value.
+    /// `--instructions` overrides the config-file value; a session's copy carries the files
+    /// `[instructions].files` names after it.
     pub(crate) user_instructions: Option<String>,
     /// Max time to wait for still-`Pending` MCP servers to settle before the readiness gate
     /// decides. Which servers actually gate is per-server (`[[mcp.servers]].required`), so there

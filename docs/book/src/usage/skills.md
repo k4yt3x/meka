@@ -166,7 +166,7 @@ The default is empty. `~/.agents/skills` has emerged as a cross-client conventio
 
 **Writes never follow.** `skill_write`, `skill_delete`, `meka skill add`, `meka skill remove`, `PUT /v1/skills/{name}` and `DELETE /v1/skills/{name}` all target meka's own store. Asked to write a name that resolves to a skill in a read-only root, they refuse, because writing would create a second copy that shadows the original instead of changing it; the refusal says to edit or remove it where it lives, and the CLI names the directory. This holds whether or not the file there is valid: a directory whose `SKILL.md` does not parse still claims that name, and shadowing a broken skill is the case worth refusing hardest, since nothing then reports the original at all.
 
-There is deliberately no automatic project-level scan. meka does not treat the working directory as trusted anywhere else either, and a cloned repository that could silently add instructions to the agent's context would be exactly that. Name a project's skills directory in `extra_paths` if you want it read.
+There is deliberately no automatic project-level scan. meka reads nothing from the working directory that config does not name, [instructions](./instructions.md#reading-a-projects-agentsmd) included, because a cloned repository that could silently add instructions to the agent's context is exactly the trust it never extends. Name a project's skills directory in `extra_paths` if you want it read.
 
 ## Listing skills
 

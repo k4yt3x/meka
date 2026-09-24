@@ -2938,6 +2938,49 @@ fn create_session_id(harness: &ServeTestHarness) -> String {
         .to_string()
 }
 
+/// The directory a relative `[instructions].files` entry resolves against is the session's, which
+/// under `serve` the client chooses per session, not the one the server runs in: the server's own
+/// directory is the repository, whose `AGENTS.md` says nothing about haiku.
+#[test]
+fn a_session_reads_the_listed_files_from_the_directory_the_client_chose() {
+    let harness = ServeTestHarness::spawn_with_prelude(
+        "[instructions]\nfiles = [\"AGENTS.md\"]\n",
+        "",
+        serde_json::json!([[
+            { "type": "expect_system_prompt", "contains": "Answer in haiku, this project insists." },
+            { "type": "text", "text": "in haiku" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]]),
+    );
+    let project = harness.install.root().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::write(
+        project.join("AGENTS.md"),
+        "Answer in haiku, this project insists.\n",
+    )
+    .expect("write AGENTS.md");
+
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": project.to_string_lossy()}))
+        .send()
+        .expect("create");
+    assert_eq!(create.status(), 201);
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "hi", "stream": false}))
+        .send()
+        .expect("send");
+    let status = response.status();
+    let body: serde_json::Value = response.json().expect("parse");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["final_text"], "in haiku");
+}
+
 /// The whole point of inline image attachments: a client on another host has no filesystem in
 /// common with the agent, so it can't just name a path. The scripted mock ignores the request
 /// body, so this asserts the validate-and-thread path accepts the attachment end to end.
