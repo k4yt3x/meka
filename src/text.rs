@@ -7,6 +7,29 @@ use std::sync::LazyLock;
 use chrono::{DateTime, Local, Utc};
 use regex::Regex;
 
+/// Whether `character` belongs to a script written without spaces between words, which a word
+/// tokenizer therefore cannot segment: SQLite's `unicode61` makes a run of it between two
+/// punctuation marks one token, and a word inside the run is unfindable by a word match. Han,
+/// kana, Hangul, Thai, Lao, Khmer and Myanmar; the list can grow.
+pub(crate) fn is_unspaced_script(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x1000..=0x109F        // Myanmar
+            | 0x0E00..=0x0EFF  // Thai, Lao
+            | 0x1100..=0x11FF  // Hangul jamo
+            | 0x1780..=0x17FF  // Khmer
+            | 0x3040..=0x30FF  // hiragana, katakana
+            | 0x3130..=0x318F  // Hangul compatibility jamo
+            | 0x31F0..=0x31FF  // katakana phonetic extensions
+            | 0x3400..=0x4DBF  // CJK unified ideographs extension A
+            | 0x4E00..=0x9FFF  // CJK unified ideographs
+            | 0xAC00..=0xD7AF  // Hangul syllables
+            | 0xF900..=0xFAFF  // CJK compatibility ideographs
+            | 0xFF66..=0xFF9F  // halfwidth katakana
+            | 0x20000..=0x3134F // CJK unified ideographs extensions B to G
+    )
+}
+
 /// Strip control and format characters that could hijack the terminal or be used as
 /// homograph-style attacks on users reviewing tool output:
 ///

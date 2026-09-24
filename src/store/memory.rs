@@ -527,6 +527,20 @@ impl Terms {
     pub(crate) fn words(&self) -> &[String] {
         &self.0
     }
+
+    /// The terms the index can answer for, and apart from them the ones it cannot: a term holding
+    /// a character of a script written without spaces is matched as a literal substring, since
+    /// `unicode61` makes a run of such text one token and a word inside it is unfindable by
+    /// `MATCH`. Split rather than sent through every tier, so a query mixing scripts is answered
+    /// for both halves instead of for the half the index happens to know.
+    pub(crate) fn split_by_script(&self) -> (Terms, Vec<String>) {
+        let (unspaced, indexable): (Vec<String>, Vec<String>) = self
+            .0
+            .iter()
+            .cloned()
+            .partition(|term| term.chars().any(crate::text::is_unspaced_script));
+        (Terms(indexable), unspaced)
+    }
 }
 
 /// One search result, before the caller decides how much of it to render.
@@ -543,6 +557,9 @@ pub(crate) struct Hit {
     pub(crate) read_count: u32,
     /// The composed [`Ranking::score`]. Higher is better, unlike the raw `bm25` it derives from.
     pub(crate) score: f64,
+    /// How many parts of the query found this memory: one from the tier that answered, one more
+    /// for each scanned term a merge brought in. What [`SearchResults::merge`] orders by first.
+    pub(crate) found_by: u32,
 }
 
 /// What one search found: the ranked hits the caller asked for, and how many there were before the
@@ -557,6 +574,40 @@ pub(crate) struct SearchResults {
     pub(crate) hits: Vec<Hit>,
     pub(crate) matched: usize,
     pub(crate) pool_exhausted: bool,
+}
+
+impl SearchResults {
+    /// These results and `other`'s as one ranked list, at most `limit` long. A memory in both is
+    /// listed once and ordered first, ahead of any found by one side alone, whatever the scores
+    /// say: a word hit's score is a bm25 magnitude and a scan hit's is flat, so adding them would
+    /// let a strong name match outrank a memory that holds every part of the query. Among
+    /// memories found by the same number of parts, the added [`Ranking::score`]s order them.
+    ///
+    /// `matched` stays a lower bound: neither side's unseen matches can be told apart from the
+    /// other's, so the larger count, or the shown union when that is larger, is what is certainly
+    /// true. The pool is exhausted when either side's was.
+    pub(crate) fn merge(mut self, other: SearchResults, limit: usize) -> SearchResults {
+        let matched = self.matched.max(other.matched);
+        for hit in other.hits {
+            match self.hits.iter_mut().find(|known| known.name == hit.name) {
+                Some(known) => {
+                    known.found_by += hit.found_by;
+                    known.score += hit.score;
+                }
+                None => self.hits.push(hit),
+            }
+        }
+        self.hits.sort_by(|left, right| {
+            right
+                .found_by
+                .cmp(&left.found_by)
+                .then(right.score.total_cmp(&left.score))
+        });
+        self.matched = matched.max(self.hits.len());
+        self.pool_exhausted = self.pool_exhausted || other.pool_exhausted;
+        self.hits.truncate(limit);
+        self
+    }
 }
 
 /// The three multipliers that turn textual relevance into "which of these did you actually mean".
@@ -1197,6 +1248,7 @@ impl MemoryStore {
                             read_count: clamp_read_count(row.get(5)?),
                             snippet: row.get(6)?,
                             score: row.get::<_, f64>(7)?,
+                            found_by: 1,
                         })
                     },
                 )?;
@@ -1330,6 +1382,7 @@ impl MemoryStore {
                         // in bm25's own sign convention (negative, more-negative-is-better), so
                         // `Ranking::score` negates it to 1.0 exactly as it does a MATCH hit.
                         score: -1.0,
+                        found_by: 1,
                     })
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -2072,6 +2125,56 @@ mod tests {
             ["note"],
             "and the real memory is still findable"
         );
+    }
+
+    /// A term with a character of an unspaced script is the substring tier's; the rest stay the
+    /// index's, so a query mixing scripts is answered for both halves.
+    #[test]
+    fn terms_split_by_the_script_the_tokenizer_can_index() {
+        let terms = Terms::parse(&["deploy 深圳 iphone手机 tokyo".to_string()]);
+        let (indexable, unspaced) = terms.split_by_script();
+        assert_eq!(indexable.words(), ["deploy", "tokyo"]);
+        assert_eq!(unspaced, ["深圳", "iphone手机"]);
+        let (all, none) = Terms::parse(&["plain words".to_string()]).split_by_script();
+        assert_eq!(all.words(), ["plain", "words"]);
+        assert!(none.is_empty());
+    }
+
+    /// A memory found by both halves of a query is listed once and first, however strong the
+    /// other side's best hit is, and the count stays a lower bound over the union.
+    #[test]
+    fn merged_results_put_a_memory_found_by_both_halves_first() {
+        let hit = |name: &str, score: f64| Hit {
+            name: name.to_string(),
+            description: String::new(),
+            body: String::new(),
+            snippet: String::new(),
+            priority: 5,
+            created: SystemTime::UNIX_EPOCH,
+            read_count: 0,
+            score,
+            found_by: 1,
+        };
+        let by_words = SearchResults {
+            hits: vec![hit("tokyo-guide", 30.0), hit("both", 2.0)],
+            matched: 4,
+            pool_exhausted: false,
+        };
+        let by_substring = SearchResults {
+            hits: vec![hit("office", 2.5), hit("both", 1.5)],
+            matched: 2,
+            pool_exhausted: true,
+        };
+        let merged = by_words.merge(by_substring, 2);
+        let names: Vec<&str> = merged.hits.iter().map(|hit| hit.name.as_str()).collect();
+        assert_eq!(names, ["both", "tokyo-guide"]);
+        assert_eq!(merged.hits[0].found_by, 2);
+        assert_eq!(merged.hits[0].score, 3.5);
+        assert_eq!(
+            merged.matched, 4,
+            "the larger side's count: the unseen cannot be deduplicated, so the union is unknown"
+        );
+        assert!(merged.pool_exhausted);
     }
 
     /// The substring tier ranks before it cuts, and a read does not reindex the document.

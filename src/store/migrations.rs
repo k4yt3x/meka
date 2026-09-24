@@ -298,7 +298,41 @@ const MIGRATIONS: &[Migration] = &[
         name: "sessions_take_a_title_a_pin_and_a_search_index",
         step: Step::Rust(sessions_take_a_title_a_pin_and_a_search_index),
     },
+    // 0.64 folds every diacritic in both full-text indexes, so `viet` finds `Việt`.
+    Migration {
+        name: "search_indexes_fold_every_diacritic",
+        step: Step::Sql(SEARCH_INDEXES_FOLD_EVERY_DIACRITIC),
+    },
 ];
+
+/// Both full-text indexes with `remove_diacritics 2`, which folds every diacritic where the
+/// tokenizer's default folds only the common Latin ones: `viet` did not find `Việt`. A virtual
+/// table's tokenizer cannot be altered, so each is dropped and created again. The memory index
+/// reads its words from the `memories` table, so FTS5's own `rebuild` refills it here and the
+/// open that follows finds it whole; the session index's words are meka's reading of a row, which
+/// a migration may not call for, so it is left empty for `crate::store::search::reconcile_index`
+/// to fill, the pass that fills a fresh store's. Safe to replay: a second run drops, creates and
+/// refills the same tables.
+const SEARCH_INDEXES_FOLD_EVERY_DIACRITIC: &str = "
+    DROP TABLE IF EXISTS memories_fts;
+    CREATE VIRTUAL TABLE memories_fts USING fts5(
+        name,
+        description,
+        tags,
+        body,
+        content = 'memories',
+        content_rowid = 'id',
+        tokenize = 'porter unicode61 remove_diacritics 2'
+    );
+    INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
+    DROP TABLE IF EXISTS messages_fts;
+    CREATE VIRTUAL TABLE messages_fts USING fts5(
+        text,
+        content = '',
+        contentless_delete = 1,
+        tokenize = 'porter unicode61 remove_diacritics 2'
+    );
+";
 
 /// The inbox table. `appended_at` is written by the transaction that writes the conversation row
 /// the item rode; the partial unique index is what makes a client's retry find its earlier row.
@@ -3114,6 +3148,10 @@ mod tests {
             (
                 "sessions_take_a_title_a_pin_and_a_search_index",
                 13895030768240920509_u64,
+            ),
+            (
+                "search_indexes_fold_every_diacritic",
+                7730251297735454426_u64,
             ),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,

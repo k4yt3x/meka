@@ -447,16 +447,21 @@ Tool calls, tool results and the model's thinking are not, so a file the agent r
 its session a match for every word in it; `conversation_search`, which the agent runs within one
 session, still covers those. A session whose title holds every word is listed first, newest first
 among those; the rest are ranked by how well their best message matches. Every word must appear;
-when nothing holds them all, sessions holding any of them are listed, and when nothing holds any,
-the words are tried as prefixes, so `compact` finds `compaction`. Words are matched by their stem,
-so `deployed` finds `deploying`. Chinese, Japanese, Korean and other scripts written without
-spaces are matched character by character, so a word is found inside a sentence and a query of
-one character works.
+when nothing holds them all, the words are tried as prefixes, so `zebra okap` still finds the
+session about zebras and okapis; then sessions holding any of the words are listed, then any as a
+prefix. Words are matched by their stem, so `deployed` finds `deploying`, and every diacritic is
+folded, so `viet` finds `Việt`. Chinese, Japanese, Korean and other scripts written without spaces
+are matched character by character, so a word is found inside a sentence and a query of one
+character works. What the matching does not do: an Arabic word is matched as written, article
+prefix included; a German compound is not split into its parts; Thai is matched by its consonants
+alone. A turn a rewind took out of the model's view is still part of the session, and is still
+found.
 
 Each row shows the session's title and the line of the best-matching message the words were found
-on, cut to fit. `-n` sets how many sessions to show (default 20), `--include-children` adds
-sub-agent sessions, and `--format json` answers `{"sessions": [...]}` with each session's record
-plus `excerpt`. Over HTTP it is [`GET /v1/sessions/search?q=`](http-api.md#titles-pins-and-search).
+on, cut to fit; a line taken from a compaction summary is marked `(summary)`. `-n` sets how many
+sessions to show (default 20), `--include-children` adds sub-agent sessions, and `--format json`
+answers `{"sessions": [...]}` with each session's record plus `excerpt`. Over HTTP it is
+[`GET /v1/sessions/search?q=`](http-api.md#titles-pins-and-search).
 
 The search reads an index the store keeps beside the conversation, a few percent of its size, kept
 in step with every message written and checked on every open. The first launch after upgrading

@@ -708,34 +708,85 @@ impl Tool for MemorySearchTool {
 
         // Four tiers, tried in order and reported by name. Exact handles word endings through the
         // stemmer, prefix handles a truncation or a trailing typo, substring handles text the
-        // tokenizer does not split into words at all, and spelling handles the rest.
+        // tokenizer does not split into words at all, and spelling handles the rest. The index
+        // sees only the terms it can split into words; a term of a script written without spaces
+        // goes to the substring scan every time, not only as a last resort, so a query mixing
+        // scripts is answered for both halves rather than for the half the index knows.
+        let (indexable, unspaced) = terms.split_by_script();
+        // The window each side is asked for. Alone, the tiers answer with `limit` hits. When the
+        // halves of a mixed query are merged, each side is asked for the widest window the tool
+        // ever shows, so a memory past `limit` on words alone still meets its substring hit and
+        // rises; the cut to `limit` is taken after the merge.
+        let window = if unspaced.is_empty() {
+            limit
+        } else {
+            MAX_SEARCH_LIMIT
+        };
         let mut tier = Tier::Exact;
-        let mut results = store.search(terms.match_expression(), limit).await?;
-        if results.hits.is_empty() {
-            tier = Tier::Prefix;
-            results = store.search(terms.prefix_match_expression(), limit).await?;
-        }
-        // Still the prefix tier, in the other direction: the query may be the *longer* derived
-        // form. Longest prefix first, stopping at the first that answers, so the most specific
-        // query that can find anything is the one that does. See
-        // `Terms::trimmed_prefix_match_expressions`.
-        if results.hits.is_empty() {
-            for expression in terms.trimmed_prefix_match_expressions() {
-                results = store.search(expression, limit).await?;
-                if !results.hits.is_empty() {
-                    break;
+        let mut results = SearchResults::default();
+        if !indexable.is_empty() {
+            results = store.search(indexable.match_expression(), window).await?;
+            if results.hits.is_empty() {
+                tier = Tier::Prefix;
+                results = store
+                    .search(indexable.prefix_match_expression(), window)
+                    .await?;
+            }
+            // Still the prefix tier, in the other direction: the query may be the *longer*
+            // derived form. Longest prefix first, stopping at the first that answers, so the
+            // most specific query that can find anything is the one that does. See
+            // `Terms::trimmed_prefix_match_expressions`.
+            if results.hits.is_empty() {
+                for expression in indexable.trimmed_prefix_match_expressions() {
+                    results = store.search(expression, window).await?;
+                    if !results.hits.is_empty() {
+                        break;
+                    }
                 }
             }
         }
-        if results.hits.is_empty() {
+        // The scanned terms that found something and those that found nothing, named apart in
+        // the result so the model is never told a term matched when no memory holds it.
+        let mut scanned: Vec<String> = Vec::new();
+        let mut missed: Vec<String> = Vec::new();
+        if !indexable.is_empty() && results.hits.is_empty() {
+            // Every term takes the scan, the indexable ones included: this is the last resort for
+            // text the tokenizer joined into one token, an identifier or a path as much as a
+            // sentence of Chinese.
             tier = Tier::Substring;
             results = store.substring_search(terms.words(), limit).await?;
+        } else {
+            // One scan per term, so the result can say which terms it answered for. With no
+            // indexable half this is the whole answer rather than a fallback, so the tier is not
+            // the substring one, whose preamble says the words matched nothing.
+            for term in &unspaced {
+                let found = store
+                    .substring_search(std::slice::from_ref(term), window)
+                    .await?;
+                if found.hits.is_empty() {
+                    missed.push(term.clone());
+                } else {
+                    scanned.push(term.clone());
+                    results = results.merge(found, window);
+                }
+            }
+            results.hits.truncate(limit);
         }
 
         let now = std::time::SystemTime::now();
         if !results.hits.is_empty() {
             return Ok(ToolOutput::text(
-                render_hits(tier, &results, limit, now),
+                render_hits(
+                    tier,
+                    ScannedTerms {
+                        found: &scanned,
+                        missed: &missed,
+                        beside_words: !indexable.is_empty(),
+                    },
+                    &results,
+                    limit,
+                    now,
+                ),
                 false,
             ));
         }
@@ -764,15 +815,54 @@ impl Tool for MemorySearchTool {
     }
 }
 
+/// What the substring scan did for the terms the index cannot match, for the result to state:
+/// the model reads which part of its query was answered how, and never that a term matched when
+/// no memory holds it.
+struct ScannedTerms<'a> {
+    /// Terms some memory holds as a literal substring.
+    found: &'a [String],
+    /// Terms no memory holds.
+    missed: &'a [String],
+    /// Whether the rest of the query was matched through the index, so the note can say so.
+    beside_words: bool,
+}
+
+fn quoted_list(terms: &[String]) -> String {
+    terms
+        .iter()
+        .map(|term| format!("'{term}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Render ranked hits: one entry per memory, with its body inlined when short enough.
 fn render_hits(
     tier: Tier,
+    scanned: ScannedTerms<'_>,
     results: &SearchResults,
     limit: usize,
     now: std::time::SystemTime,
 ) -> String {
     let hits = &results.hits;
     let mut out = String::from(tier.preamble());
+    if !scanned.found.is_empty() {
+        out.push_str(&format!(
+            "{} matched as a literal substring, which is how text the word splitter does not \
+             divide is found{}.\n\n",
+            quoted_list(scanned.found),
+            if scanned.beside_words {
+                "; the other terms matched through the index"
+            } else {
+                ""
+            }
+        ));
+    }
+    if !scanned.missed.is_empty() {
+        out.push_str(&format!(
+            "No memory holds {}.\n\n",
+            quoted_list(scanned.missed)
+        ));
+    }
     // The number of *matches*, not the number rendered. Reporting the truncated length as the
     // total reads as "this is everything that matched", which is how a full store becomes a
     // confidently incomplete answer.
@@ -2283,6 +2373,170 @@ mod tests {
                 "{query} must say which tier answered: {out}"
             );
         }
+    }
+
+    /// A query mixing scripts is answered for both halves: the words through the index, the
+    /// Chinese term as a literal substring, said so in the result, a memory holding both ahead of
+    /// one holding either however strong that one's word match, and a term no memory holds
+    /// named as such rather than claimed.
+    #[tokio::test]
+    async fn a_query_mixing_scripts_is_answered_for_both_halves() {
+        let memories = store().await;
+        for (name, description, body) in [
+            (
+                "office",
+                "office location note",
+                "办公室在深圳南山区的科技园",
+            ),
+            (
+                "tokyo-guide",
+                "Tokyo Tokyo Tokyo, a guide to Tokyo",
+                "Ten to seven, JST.",
+            ),
+            ("both", "the office", "地址在深圳南山区, Tokyo hours"),
+        ] {
+            MemoryWriteTool {
+                memories: memories.clone(),
+            }
+            .execute(
+                serde_json::json!({"name": name, "description": description, "body": body}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("write");
+        }
+        async fn search(memories: Arc<MemoryStore>, queries: &[&str]) -> String {
+            MemorySearchTool { memories }
+                .execute(
+                    serde_json::json!({"queries": queries}),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
+                .await
+                .expect("search")
+                .text_content()
+        }
+
+        let out = search(memories.clone(), &["Tokyo 深圳"]).await;
+        for name in ["office", "tokyo-guide", "both"] {
+            assert!(out.contains(name), "{name} missing: {out}");
+        }
+        assert!(
+            out.contains("'深圳' matched as a literal substring"),
+            "{out}"
+        );
+        assert!(
+            out.contains("the other terms matched through the index"),
+            "{out}"
+        );
+        assert!(!out.contains("No word matches"), "{out}");
+        let position = |name: &str| out.find(name).expect("listed");
+        assert!(
+            position("both") < position("tokyo-guide") && position("both") < position("office"),
+            "a memory holding both terms comes first, ahead of the strongest word match: {out}"
+        );
+
+        let missed = search(memories.clone(), &["Tokyo 火星"]).await;
+        assert!(missed.contains("tokyo-guide"), "{missed}");
+        assert!(missed.contains("No memory holds '火星'."), "{missed}");
+        assert!(!missed.contains("'火星' matched"), "{missed}");
+
+        let alone = search(memories.clone(), &["深圳"]).await;
+        assert!(
+            alone.contains("office") && alone.contains("both"),
+            "{alone}"
+        );
+        assert!(
+            !alone.contains("No word matches") && !alone.contains("other terms"),
+            "with no words to match, the scan is the answer and not a fallback: {alone}"
+        );
+    }
+
+    /// Every diacritic is folded, so a word typed without them finds the memory with them.
+    #[tokio::test]
+    async fn a_word_typed_without_its_diacritics_finds_the_memory() {
+        let memories = store().await;
+        MemoryWriteTool {
+            memories: memories.clone(),
+        }
+        .execute(
+            serde_json::json!({
+                "name": "trip",
+                "description": "a trip to Việt Nam",
+                "body": "Hà Nội in the spring",
+            }),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
+        )
+        .await
+        .expect("write");
+        let out = MemorySearchTool { memories }
+            .execute(
+                serde_json::json!({"queries": ["viet"]}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("search")
+            .text_content();
+        assert!(out.contains("trip"), "{out}");
+        assert!(
+            out.starts_with("1 matching memory"),
+            "found at the exact tier, not by spelling distance: {out}"
+        );
+    }
+
+    /// The word half is asked for the widest window before the merge, so a memory that the
+    /// word tier alone would cut still rises when the scan finds it too.
+    #[tokio::test]
+    async fn a_memory_past_the_limit_on_words_alone_rises_when_the_scan_finds_it_too() {
+        let memories = store().await;
+        for index in 0..12 {
+            MemoryWriteTool {
+                memories: memories.clone(),
+            }
+            .execute(
+                serde_json::json!({
+                    "name": format!("tokyo-{index}"),
+                    "description": "a note about Tokyo",
+                    "body": "nothing else",
+                    "priority": 1,
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("write");
+        }
+        MemoryWriteTool {
+            memories: memories.clone(),
+        }
+        .execute(
+            serde_json::json!({
+                "name": "tokyo-office",
+                "description": "a note about Tokyo",
+                "body": "地址在深圳",
+                "priority": 9,
+            }),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
+        )
+        .await
+        .expect("write");
+
+        let out = MemorySearchTool {
+            memories: memories.clone(),
+        }
+        .execute(
+            serde_json::json!({"queries": ["Tokyo 深圳"], "limit": 10}),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
+        )
+        .await
+        .expect("search")
+        .text_content();
+        let first = out
+            .find("tokyo-office")
+            .expect("the memory both halves found is listed");
+        assert!(
+            out.find("tokyo-0").is_none_or(|other| first < other)
+                && out.find("tokyo-1").is_none_or(|other| first < other),
+            "it comes first, though the word tier alone ranks it thirteenth: {out}"
+        );
     }
 
     /// A `limit` the model spelled as a string or a float is honored, and one that is neither a

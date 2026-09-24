@@ -670,6 +670,9 @@ pub(crate) async fn delete_sessions(
         }
     }
 
+    if deleted > 0 {
+        store.optimize_search_index().await?;
+    }
     tracing::info!("deleted {deleted} session(s)");
     // A non-zero exit, because the user named these and a silent skip is indistinguishable from
     // success. The per-id reasons are already on stderr; this is what a script reads.

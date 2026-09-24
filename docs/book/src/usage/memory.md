@@ -96,14 +96,17 @@ age are repeated on each page.
 | Kind | Example | How |
 |---|---|---|
 | Word endings | `preference` finds `prefers` | Porter stemmer, always on |
+| Diacritics | `viet` finds `Việt` | Every diacritic is folded, always on |
 | Typos and truncation | `Tokoy`, `Tok` | Retried as a prefix match, then by spelling distance |
 | Word *beginnings* | `deployment` finds `deploy` | The prefix retry also works the other way |
-| Unsegmented text | `深圳` inside `办公室在深圳南山区` | Retried as a literal substring |
+| Unsegmented text | `深圳` inside `办公室在深圳南山区` | Matched as a literal substring, beside the word matches |
 | Different wording | `verbosity` for `terse` | Pass several phrasings in `queries` |
 
 The second and third rows are the two the stemmer alone does not cover. SQLite's Porter strips inflections (`deploys`, `shipping`, `running`) but not every derivation: `deployment` does not stem to `deploy`, so a search for it used to miss a memory whose body says `Deploys`. The prefix retry therefore runs in both directions, shortening the *query* as well as matching the start of the stored word, and says it was a prefix match either way.
 
-The fourth row is why word-splitting is not the whole story. The tokenizer divides on non-alphanumerics, so Chinese, Japanese and Thai prose, and a long identifier, path or URL, arrive as a single token that only matches in full. When nothing else answers, meka scans for the query as plain text instead, and says that is what it did.
+The fourth row is why word-splitting is not the whole story. The tokenizer divides on non-alphanumerics, so Chinese, Japanese and Thai prose, and a long identifier, path or URL, arrive as a single token that only matches in full. A query term in a script written without spaces is therefore matched as plain text every time, beside the word matches for the rest of the query, and a memory holding both ranks first; the result names the terms the scan answered. When nothing else answers at all, the whole query is scanned as plain text, and the result says that is what it did.
+
+What the matching does not do: an Arabic word is matched as written, article prefix included; a German compound is not split into its parts; Thai is matched by its consonants alone.
 
 The last row is the important one: `queries` is a **list**, and supplying synonyms costs nothing. `["terse", "brevity", "verbosity"]` in one call finds a memory that used any of them, which is the answer to "the agent has to guess the words it used months ago": it does not have to guess right, only to guess several times.
 

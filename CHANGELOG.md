@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A title or a pin leaves `updated_at` alone, so `meka -c` and the listing order do not change.
 - The retention sweep and `meka session delete --older-than-days` spare pinned sessions and parents.
 - The first launch builds the session search index over every stored conversation (upgrade guide).
+- Memory and session search fold every diacritic, so `viet` finds `Việt`.
+
+### Fixed
+
+- Memory search answers a query that mixes Chinese, Japanese or Korean with other scripts for both.
 
 ## [0.63.0] - 2026-09-23
 

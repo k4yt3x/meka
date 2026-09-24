@@ -90,7 +90,8 @@ pub(crate) struct SessionMatchView {
     #[serde(flatten)]
     pub(crate) session: SessionView,
     /// The line of the best-matching message that holds a query term, whitespace collapsed and
-    /// cut short. Omitted for a session found by its title alone.
+    /// cut short, marked `(summary)` when taken from a compaction summary. Omitted for a session
+    /// found by its title alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) excerpt: Option<String>,
 }

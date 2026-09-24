@@ -312,12 +312,13 @@ newest first, and pinning an already pinned session keeps its time. Neither fiel
 `GET /v1/sessions/search?q=<words>` answers `{"sessions": [...]}`: the sessions whose
 conversations hold the words, best first, each the same record `GET /v1/sessions` lists plus an
 `excerpt`, the line of the best-matching message the words were found on, whitespace collapsed
-and cut short. What is searched is what was said, user messages, replies and compaction summaries;
-tool calls, tool results and thinking are not. A session whose title holds every word comes first,
-with an `excerpt` only when its words matched too; the rest are ranked by their best message. Every word must appear; when
-nothing holds them all, sessions holding any are answered, then prefixes of the words, and words
-match by their stem; scripts written without spaces match character by character. `limit` is how
-many at most (default 20, clamped to 1..100) and
+and cut short, marked `(summary)` when taken from a compaction summary. What is searched is what
+was said, user messages, replies and compaction summaries; tool calls, tool results and thinking
+are not. A session whose title holds every word comes first, with an `excerpt` only when its words
+matched too; the rest are ranked by their best message. Every word must appear; when nothing holds
+them all, the words are tried as prefixes, then sessions holding any of them, then any as a
+prefix. Words match by their stem and with every diacritic folded; scripts written without spaces
+match character by character. `limit` is how many at most (default 20, clamped to 1..100) and
 `include_children=true` adds sub-agent sessions. A blank `q` finds nothing. Requires `sessions:r`.
 
 #### Detecting an in-flight turn

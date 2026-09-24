@@ -2840,6 +2840,9 @@ impl Store {
             // file whose lock it cannot take, and this process is holding every one of these.
             drop(held);
         }
+        if sweep.deleted > 0 {
+            self.optimize_search_index().await?;
+        }
         self.prune_orphan_lock_files().await;
         Ok(sweep)
     }

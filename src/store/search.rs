@@ -13,18 +13,22 @@
 //! definition of the words, a door this module does not know about, a restore that lost the
 //! index.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
 use uuid::Uuid;
 
 use super::{
     Store,
     memory::{Terms, canonical_trigger_sql},
-    sessions::{SessionSummary, StoredMessage, decode_event_from_row, spawned_session_sql},
+    sessions::{
+        COMPACT_BOUNDARY_KIND, SessionSummary, StoredMessage, decode_event_from_row,
+        spawned_session_sql,
+    },
 };
 use crate::{
     conversation::{ContentBlock, Event, Message, Role, is_harness_stand_in, strip_inbox_header},
     error::{MekaError, Result},
+    text::is_unspaced_script,
 };
 
 /// Characters an excerpt keeps, enough of a line to recognize the conversation by.
@@ -38,26 +42,53 @@ const EXCERPT_STEM_CHARS: usize = 5;
 pub(crate) struct SessionMatch {
     pub(crate) session: SessionSummary,
     /// The line of the best-matching message that holds a query term, whitespace collapsed and
-    /// cut to [`EXCERPT_CHARS`]. `None` for a session found by its title alone.
+    /// cut to [`EXCERPT_CHARS`], marked `(summary)` when the message is a compaction's summary.
+    /// `None` for a session found by its title alone.
     pub(crate) excerpt: Option<String>,
 }
 
-/// The one trigger the index needs, and the single place its text lives, so [`reconcile_index`]
-/// compares against exactly what it will write. An insert has no trigger because the words are
-/// meka's reading of the row, which SQL cannot make: [`insert_message`] is the insert.
-///
-/// The comment in it is load-bearing. The text is what every open compares, so it carries the
-/// definition the index was built to: when [`indexed_words`] changes what a row contributes,
-/// the number is bumped, every store's trigger stops matching on its next open, and the index is
-/// built again to the new definition. Without that, an index built by an older build would pass
-/// the row-count check forever with words nobody can find.
-const DELETE_TRIGGER: (&str, &str) = (
-    "messages_after_delete",
-    "CREATE TRIGGER IF NOT EXISTS messages_after_delete AFTER DELETE ON messages BEGIN
-         /* indexed words, definition 3 */
-         DELETE FROM messages_fts WHERE rowid = old.id;
-     END;",
-);
+/// The definition of the words the index holds, bumped whenever [`indexed_words`] changes what a
+/// row contributes. It travels in the delete trigger's text, which every open compares, so a
+/// bumped number makes every store's trigger differ on its next open and the index is built
+/// again. `the_definition_number_moves_with_the_words` pins the pair of this number and a digest
+/// of what a fixture of rows yields, so a change to the words without a bump, or a bump without a
+/// change, fails.
+const INDEXED_WORDS_DEFINITION: u32 = 3;
+
+/// The triggers the index needs, and the single place their text lives, so [`reconcile_index`]
+/// compares against exactly what it will write. A delete reaches the index through the first,
+/// which covers a cascade from `sessions`. An in-place rewrite of a row's content drops its entry
+/// through the second, so the count check finds the row to index again from whatever door
+/// rewrote it, a migration step included. An insert has no trigger because the words are meka's
+/// reading of the row, which SQL cannot make: [`insert_message`] is the insert. Every trigger on
+/// `messages` is compared, so a trigger another feature adds to the table has to be added here,
+/// or every open rebuilds the index.
+static TRIGGER_DEFINITIONS: LazyLock<[(&str, String); 2]> = LazyLock::new(|| {
+    [
+        (
+            "messages_after_delete",
+            format!(
+                "CREATE TRIGGER IF NOT EXISTS messages_after_delete AFTER DELETE ON messages BEGIN
+                     /* indexed words, definition {INDEXED_WORDS_DEFINITION} */
+                     DELETE FROM messages_fts WHERE rowid = old.id;
+                 END;"
+            ),
+        ),
+        (
+            "messages_after_update",
+            "CREATE TRIGGER IF NOT EXISTS messages_after_update \
+             AFTER UPDATE OF kind, content ON messages BEGIN
+                 DELETE FROM messages_fts WHERE rowid = old.id;
+             END;"
+                .to_string(),
+        ),
+    ]
+});
+
+/// Rows indexed per transaction when the index is filled: short enough that a `meka serve`
+/// writing to the same store waits well under its busy timeout, long enough that the fill is not
+/// one transaction per row.
+const FILL_BATCH_ROWS: usize = 2_000;
 
 /// The words a row contributes to the index: [`spoken_words_of_row`] with the scripts the
 /// tokenizer cannot segment spaced out, so a Chinese word is found inside a sentence.
@@ -80,29 +111,6 @@ fn spoken_words_of_row(kind: &str, content: &str) -> String {
         _ => return String::new(),
     };
     spoken_words(&message)
-}
-
-/// Whether `character` belongs to a script written without spaces between words, which the
-/// `unicode61` tokenizer therefore cannot segment: a run of it between two punctuation marks is
-/// one token, and a word inside the run is unfindable. Han, kana, Hangul, Thai, Lao, Khmer and
-/// Myanmar; the list can grow.
-fn is_unspaced_script(character: char) -> bool {
-    matches!(
-        character as u32,
-        0x1000..=0x109F        // Myanmar
-            | 0x0E00..=0x0EFF  // Thai, Lao
-            | 0x1100..=0x11FF  // Hangul jamo
-            | 0x1780..=0x17FF  // Khmer
-            | 0x3040..=0x30FF  // hiragana, katakana
-            | 0x3130..=0x318F  // Hangul compatibility jamo
-            | 0x31F0..=0x31FF  // katakana phonetic extensions
-            | 0x3400..=0x4DBF  // CJK unified ideographs extension A
-            | 0x4E00..=0x9FFF  // CJK unified ideographs
-            | 0xAC00..=0xD7AF  // Hangul syllables
-            | 0xF900..=0xFAFF  // CJK compatibility ideographs
-            | 0xFF66..=0xFF9F  // halfwidth katakana
-            | 0x20000..=0x3134F // CJK unified ideographs extensions B to G
-    )
 }
 
 /// `text` with a space between every pair of adjacent characters of which at least one is from
@@ -139,9 +147,10 @@ fn render_term(term: &str, prefix: bool) -> String {
     if prefix { format!("{quoted}*") } else { quoted }
 }
 
-/// The three tiers a query is tried at, narrowest first: every term, any term, any term as a
-/// prefix. Deduplicated, because one term makes the first two the same query, which cannot answer
-/// differently.
+/// The tiers a query is tried at, narrowest first: every term, every term as a prefix, any term,
+/// any term as a prefix. A truncated second word is the common miss, and the second tier answers
+/// it with the narrow set rather than the third with every session holding the first word.
+/// Deduplicated, because one term makes each pair the same query, which cannot answer differently.
 fn tiered_expressions(words: &[String]) -> Vec<String> {
     let join = |prefix: bool, operator: &str| {
         words
@@ -150,12 +159,17 @@ fn tiered_expressions(words: &[String]) -> Vec<String> {
             .collect::<Vec<_>>()
             .join(operator)
     };
-    let mut expressions = vec![
+    let mut expressions: Vec<String> = Vec::new();
+    for expression in [
         join(false, " AND "),
+        join(true, " AND "),
         join(false, " OR "),
         join(true, " OR "),
-    ];
-    expressions.dedup();
+    ] {
+        if !expressions.contains(&expression) {
+            expressions.push(expression);
+        }
+    }
     expressions
 }
 
@@ -207,13 +221,14 @@ pub(super) fn insert_message(
 /// Bring the index into line with the `messages` table and with this build's definition of the
 /// words, on every open.
 ///
-/// The table is created by the schema ledger; the trigger is created here and nowhere else, for
-/// the reasons `crate::store::memory::reconcile_index` gives. Two questions, in order. Is the
-/// trigger this build's, comment and all? If not, the index was built by another build, or never,
-/// and it is built again from every row, in the one transaction that also writes the trigger, so
-/// a crash between the two cannot leave a matching trigger over an index built to the old
-/// definition. Otherwise, does the index hold one row per message? If not, the rows without an
-/// entry are indexed and the entries without a row dropped. The first open after the index was
+/// The table is created by the schema ledger; the triggers are created here and nowhere else, for
+/// the reasons `crate::store::memory::reconcile_index` gives. Two questions, in order. Are the
+/// triggers this build's, definition comment and all? If not, the index was built by another
+/// build, or never: the triggers are replaced and the index emptied in one transaction, so a
+/// crash between the two cannot leave matching triggers over an index built to the old
+/// definition, and the fill that follows is [`repair_a_desynced_index`]'s, which the emptied
+/// index now needs. Otherwise, does the index hold one row per message? If not, the rows without
+/// an entry are indexed and the entries without a row dropped. The first open after the index was
 /// introduced takes the first path, which is also why the ledger step leaves it empty: the words
 /// are meka's reading of a row, and a migration may not call meka.
 ///
@@ -232,10 +247,11 @@ pub(crate) fn reconcile_index(connection: &rusqlite::Connection) -> rusqlite::Re
         })?;
         rows.collect::<rusqlite::Result<_>>()?
     };
-    let (name, sql) = DELETE_TRIGGER;
-    // Every trigger on the table is compared, not only the one by this build's name, so one an
-    // earlier build left under another name does not stay beside it.
-    if existing.len() == 1 && existing.get(name) == Some(&canonical_trigger_sql(sql)) {
+    let current = existing.len() == TRIGGER_DEFINITIONS.len()
+        && TRIGGER_DEFINITIONS
+            .iter()
+            .all(|(name, sql)| existing.get(*name) == Some(&canonical_trigger_sql(sql)));
+    if current {
         return repair_a_desynced_index(connection);
     }
     tracing::info!("building the session search index to this build's definition");
@@ -246,17 +262,23 @@ pub(crate) fn reconcile_index(connection: &rusqlite::Connection) -> rusqlite::Re
     for name in existing.keys() {
         transaction.execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))?;
     }
-    transaction.execute_batch(sql)?;
+    for (_, sql) in TRIGGER_DEFINITIONS.iter() {
+        transaction.execute_batch(sql)?;
+    }
     transaction.execute_batch("INSERT INTO messages_fts(messages_fts) VALUES('delete-all');")?;
-    let indexed = index_rows(&transaction, "")?;
     transaction.commit()?;
-    tracing::info!("built the session search index over {indexed} message(s)");
-    Ok(())
+    repair_a_desynced_index(connection)
 }
 
 /// Index every message without an entry and drop every entry without a message, when the two
-/// counts disagree: a door this module does not know about, or a restore that lost part of the
-/// index. Nothing to do on a healthy store, which two counts establish.
+/// counts disagree: an index [`reconcile_index`] just emptied, a door this module does not know
+/// about, a row rewritten in place, a restore that lost part of the index. Nothing to do on a
+/// healthy store, which two counts establish.
+///
+/// The fill runs in batches of [`FILL_BATCH_ROWS`], each its own transaction, so a store of any
+/// size never holds the write lock for longer than one batch and a `meka serve` mid-turn on the
+/// same store keeps its writes; a crash between batches leaves the counts unequal, and the next
+/// open finishes the job.
 fn repair_a_desynced_index(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
     let (stored, indexed): (i64, i64) = connection.query_row(
         // `messages_fts_docsize` holds one row per indexed document, so it counts what the index
@@ -280,11 +302,22 @@ fn repair_a_desynced_index(connection: &rusqlite::Connection) -> rusqlite::Resul
     for rowid in &stale {
         transaction.execute("DELETE FROM messages_fts WHERE rowid = ?1", [rowid])?;
     }
-    let added = index_rows(
-        &transaction,
-        "WHERE id NOT IN (SELECT rowid FROM messages_fts)",
-    )?;
     transaction.commit()?;
+    let mut added = 0usize;
+    let mut after = 0i64;
+    loop {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let (count, last) = index_rows(&transaction, after)?;
+        transaction.commit()?;
+        added += count;
+        match last {
+            Some(id) if count == FILL_BATCH_ROWS => after = id,
+            _ => break,
+        }
+    }
     tracing::info!(
         "reconciled the session search index: indexed {added} message(s), dropped {} stale row(s)",
         stale.len()
@@ -292,18 +325,22 @@ fn repair_a_desynced_index(connection: &rusqlite::Connection) -> rusqlite::Resul
     Ok(())
 }
 
-/// Index the `messages` rows `where_clause` selects, every row when it is empty, and say how
-/// many. `where_clause` is one of this module's own literals, never anything derived from input.
+/// Index up to [`FILL_BATCH_ROWS`] messages past `after` that have no entry, in id order, and say
+/// how many and the last id taken. The check is against the index's own row table by primary
+/// key, so a batch costs its own rows and not a scan of everything indexed so far.
 fn index_rows(
     transaction: &rusqlite::Transaction<'_>,
-    where_clause: &str,
-) -> rusqlite::Result<usize> {
-    let mut select = transaction.prepare(&format!(
-        "SELECT id, kind, content FROM messages {where_clause} ORDER BY id ASC"
-    ))?;
+    after: i64,
+) -> rusqlite::Result<(usize, Option<i64>)> {
+    let mut select = transaction.prepare(
+        "SELECT id, kind, content FROM messages
+         WHERE id > ?1 AND NOT EXISTS (SELECT 1 FROM messages_fts_docsize WHERE id = messages.id)
+         ORDER BY id ASC
+         LIMIT ?2",
+    )?;
     let mut insert =
         transaction.prepare("INSERT INTO messages_fts (rowid, text) VALUES (?1, ?2)")?;
-    let rows = select.query_map([], |row| {
+    let rows = select.query_map(rusqlite::params![after, FILL_BATCH_ROWS as i64], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
@@ -311,15 +348,35 @@ fn index_rows(
         ))
     })?;
     let mut indexed = 0usize;
+    let mut last = None;
     for row in rows {
         let (id, kind, content) = row?;
         insert.execute(rusqlite::params![id, indexed_words(&kind, &content)])?;
         indexed += 1;
+        last = Some(id);
     }
-    Ok(indexed)
+    Ok((indexed, last))
 }
 
 impl Store {
+    /// Merge the index's segments so the words of deleted messages leave its storage, for the
+    /// doors that delete in bulk. FTS5 keeps a deleted row out of every query at once but keeps
+    /// its postings in the segments until a merge, and a copy of the store taken meanwhile
+    /// carries them; the sweeps and `meka session delete` end with this so that copy does not.
+    pub(crate) async fn optimize_search_index(&self) -> Result<()> {
+        self.connection
+            .call(|connection| {
+                connection
+                    .execute_batch("INSERT INTO messages_fts(messages_fts) VALUES('optimize');")
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!(
+                    "failed to optimize the session search index: {error}"
+                ))
+            })
+    }
+
     /// [`reconcile_index`] on this store, for a test about what it repairs.
     #[cfg(test)]
     pub(crate) async fn reconcile_search_index_for_test(&self) {
@@ -469,7 +526,8 @@ impl Store {
     }
 
     /// The line of message `row` a query term is in, cut to [`EXCERPT_CHARS`]; the first line
-    /// when no line holds one, which stemming makes possible; `None` when the row is gone.
+    /// when no line holds one, which stemming makes possible; marked `(summary)` when the row is
+    /// a compaction's; `None` when the row is gone.
     async fn excerpt_of(&self, row: i64, words: &[String]) -> Result<Option<String>> {
         let text = self
             .connection
@@ -477,16 +535,24 @@ impl Store {
                 let mut statement =
                     connection.prepare("SELECT kind, content FROM messages WHERE id = ?1")?;
                 let mut rows = statement.query_map([row], |row| {
-                    Ok(spoken_words_of_row(
-                        &row.get::<_, String>(0)?,
-                        &row.get::<_, String>(1)?,
-                    ))
+                    let kind: String = row.get(0)?;
+                    let words = spoken_words_of_row(&kind, &row.get::<_, String>(1)?);
+                    Ok((kind, words))
                 })?;
                 rows.next().transpose()
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to read a match: {error}")))?;
-        Ok(text.as_deref().and_then(|text| excerpt_line(text, words)))
+        // A summary reads like something a person said, and was not: it is named as what it is.
+        Ok(text.and_then(|(kind, text)| {
+            excerpt_line(&text, words).map(|line| {
+                if kind == COMPACT_BOUNDARY_KIND {
+                    format!("(summary) {line}")
+                } else {
+                    line
+                }
+            })
+        }))
     }
 }
 
@@ -621,6 +687,11 @@ mod tests {
         let one = session_saying(&store, &["only the zebra here"]).await;
 
         assert_eq!(ids_found(&store, "zebra okapi").await, vec![both]);
+        assert_eq!(
+            ids_found(&store, "zebra okap").await,
+            vec![both],
+            "a truncated second word is answered with the narrow set, not with every zebra"
+        );
         let any = ids_found(&store, "zebra wombat").await;
         assert!(any.contains(&both) && any.contains(&one), "{any:?}");
         assert_eq!(ids_found(&store, "okap").await, vec![both]);
@@ -734,7 +805,12 @@ mod tests {
         assert_eq!(render_term("word", false), "\"word\"");
         assert_eq!(
             tiered_expressions(&["a".to_string(), "b".to_string()]),
-            vec!["\"a\" AND \"b\"", "\"a\" OR \"b\"", "\"a\"* OR \"b\"*"]
+            vec![
+                "\"a\" AND \"b\"",
+                "\"a\"* AND \"b\"*",
+                "\"a\" OR \"b\"",
+                "\"a\"* OR \"b\"*"
+            ]
         );
         assert_eq!(tiered_expressions(&["a".to_string()]), vec![
             "\"a\"", "\"a\"*"
@@ -774,6 +850,173 @@ mod tests {
             vec![session],
             "and a second open finds the trigger current and leaves the index alone"
         );
+    }
+
+    /// A row rewritten in place, from any door, loses its entry through the update trigger and
+    /// is indexed again to its new words on the next open; the counts alone would not have told.
+    #[tokio::test]
+    async fn a_rewritten_row_is_indexed_again_on_the_next_open() {
+        let store = Store::for_test().await;
+        let session = session_saying(&store, &["the old words about cranes"]).await;
+        store
+            .run_sql_for_test("UPDATE messages SET content = 'brand new words about herons'")
+            .await;
+        assert!(ids_found(&store, "cranes").await.is_empty());
+        assert!(ids_found(&store, "herons").await.is_empty());
+        store.reconcile_search_index_for_test().await;
+        assert_eq!(ids_found(&store, "herons").await, vec![session]);
+        assert!(ids_found(&store, "cranes").await.is_empty());
+    }
+
+    /// A fill larger than one batch completes, and leaves one entry per row.
+    #[tokio::test]
+    async fn a_fill_larger_than_one_batch_completes() {
+        let store = Store::for_test().await;
+        let session = session_saying(&store, &["the first row"]).await;
+        // Straight into the table, past the insert door, so the rows have no entries: what a
+        // door this module does not know about would leave.
+        store
+            .run_sql_for_test(&format!(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {})
+                 INSERT INTO messages (session_id, kind, content, created_at)
+                 SELECT '{session}', 'user', 'a pelican numbered ' || i, 'now' FROM n",
+                FILL_BATCH_ROWS + 50
+            ))
+            .await;
+        store.reconcile_search_index_for_test().await;
+        let (stored, indexed) = store.search_index_counts_for_test().await;
+        assert_eq!(stored, indexed);
+        assert_eq!(stored, FILL_BATCH_ROWS as i64 + 51);
+        assert_eq!(ids_found(&store, "pelican").await, vec![session]);
+    }
+
+    /// The definition number and the words a fixture of rows yields are pinned as a pair: a
+    /// change to what a row contributes without a bump, or a bump without a change, fails here
+    /// and names what to do.
+    #[test]
+    fn the_definition_number_moves_with_the_words() {
+        use std::collections::HashSet;
+
+        use crate::conversation::{ContentBlock, Message, Role};
+
+        fn digest(input: &str) -> u64 {
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for byte in input.as_bytes() {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash
+        }
+        let blocks = |blocks: Vec<ContentBlock>| serde_json::to_string(&blocks).expect("json");
+        let text = |text: &str| ContentBlock::Text {
+            text: text.to_string(),
+        };
+        let fixture: Vec<(&str, String)> = vec![
+            ("user", "plain words here".to_string()),
+            (
+                "user",
+                format!(
+                    "{} a stand-in meka wrote",
+                    crate::conversation::HARNESS_NOTE
+                ),
+            ),
+            (
+                "user_blocks",
+                blocks(vec![
+                    ContentBlock::TurnContext {
+                        text: "the context block".to_string(),
+                    },
+                    text("[Message from a client, arrived 2026-01-01 00:00 +00:00]\nthe item"),
+                ]),
+            ),
+            (
+                "assistant",
+                blocks(vec![
+                    ContentBlock::Thinking {
+                        thinking: "private".to_string(),
+                        opaque: None,
+                    },
+                    text("办公室在深圳 iphone手机, a reply"),
+                    ContentBlock::ToolUse {
+                        id: "t1".to_string(),
+                        name: "shell_execute".to_string(),
+                        input: serde_json::json!({"command": "ls"}),
+                    },
+                ]),
+            ),
+            (
+                "tool_results",
+                blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: vec![crate::conversation::ToolResultContent::Text {
+                        text: "a listing".to_string(),
+                    }],
+                    is_error: false,
+                }]),
+            ),
+            (
+                COMPACT_BOUNDARY_KIND,
+                serde_json::to_string(&Event::CompactBoundary {
+                    summary: Message {
+                        role: Role::Assistant,
+                        content: vec![text("the summary")],
+                    },
+                    replaced_count: 2,
+                    loaded_tools_snapshot: HashSet::new(),
+                })
+                .expect("json"),
+            ),
+        ];
+        let words = fixture
+            .iter()
+            .map(|(kind, content)| indexed_words(kind, content))
+            .collect::<Vec<_>>()
+            .join("\u{1e}");
+        assert_eq!(
+            (INDEXED_WORDS_DEFINITION, digest(&words)),
+            (3, 3_619_997_085_987_050_176_u64),
+            "the words a row contributes changed, or the definition number moved without them: \
+             bump INDEXED_WORDS_DEFINITION and pin the new pair here (the words were: {words:?})"
+        );
+    }
+
+    /// An excerpt taken from a compaction summary is marked, since it reads like something a
+    /// person said and was not.
+    #[tokio::test]
+    async fn an_excerpt_from_a_summary_says_so() {
+        use std::collections::HashSet;
+
+        let store = Store::for_test().await;
+        let session = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        store
+            .save_event(session, &Event::CompactBoundary {
+                summary: Message::assistant_text("the summary mentions pelicans"),
+                replaced_count: 0,
+                loaded_tools_snapshot: HashSet::new(),
+            })
+            .await
+            .expect("save");
+        let found = store
+            .search_sessions("pelicans", 10, false)
+            .await
+            .expect("search");
+        assert_eq!(found[0].session.id, session);
+        assert_eq!(
+            found[0].excerpt.as_deref(),
+            Some("(summary) the summary mentions pelicans")
+        );
+    }
+
+    /// Every diacritic is folded, so a word typed without them finds the word with them.
+    #[tokio::test]
+    async fn a_word_typed_without_its_diacritics_is_found() {
+        let store = Store::for_test().await;
+        let session = session_saying(&store, &["a trip to Việt Nam and the Häuser there"]).await;
+        assert_eq!(ids_found(&store, "viet").await, vec![session]);
+        assert_eq!(ids_found(&store, "hauser").await, vec![session]);
     }
 
     /// The excerpt is the line the term is in, found through the stem when the index matched an
