@@ -21,6 +21,19 @@ const SESSION_COLUMNS: [crate::text::Column; 4] = [
     crate::text::Column::remainder("Title"),
 ];
 
+/// What marks a pinned session's title in the listing. On the title rather than in a column of
+/// its own, so an installation with no pins spends nothing on it.
+const PIN_MARK: &str = "*";
+
+/// The search listing's columns: the id prefix, the timestamp, the title cut to a name's width,
+/// and the words the session was found by spending the rest.
+const SEARCH_COLUMNS: [crate::text::Column; 4] = [
+    crate::text::Column::content("ID"),
+    crate::text::Column::content("Updated"),
+    crate::text::Column::capped("Title", crate::text::NAME_WIDTH),
+    crate::text::Column::remainder("Match"),
+];
+
 /// `meka session fork <id>`: copy a session's conversation into a new one and print the new id.
 ///
 /// Output split mirrors [`import_session`]: the bare id on stdout so `id=$(meka session fork …)`
@@ -179,7 +192,125 @@ pub(crate) async fn run_session_subcommand(
             let session_id = store.resolve_session_id(session_id).await?;
             rewind_session_command(store, session_id, *turns).await
         }
+        cli::SessionAction::Set {
+            session_id,
+            field,
+            value,
+        } => {
+            let session_id = store.resolve_session_id(session_id).await?;
+            set_session_field(store, session_id, *field, value).await
+        }
+        cli::SessionAction::Search {
+            query,
+            limit,
+            include_children,
+            format,
+        } => search_sessions(store, query, *limit, *include_children, *format).await,
     }
+}
+
+/// `meka session set <id> title <text>` and `meka session set <id> pinned true|false`: the two
+/// row fields a person sets by hand. Quiet on success; the exit code carries it.
+pub(crate) async fn set_session_field(
+    store: &Store,
+    session_id: uuid::Uuid,
+    field: cli::SessionField,
+    value: &str,
+) -> anyhow::Result<()> {
+    match field {
+        cli::SessionField::Title => {
+            let title = crate::store::normalize_title(value)?;
+            store
+                .update_session(session_id, crate::store::SessionPatch {
+                    title: Some(title.clone()),
+                    ..Default::default()
+                })
+                .await?;
+            match title {
+                Some(title) => tracing::info!("titled session {session_id} '{title}'"),
+                None => tracing::info!("cleared the title of session {session_id}"),
+            }
+        }
+        cli::SessionField::Pinned => {
+            let pinned = match value.trim() {
+                "true" => true,
+                "false" => false,
+                _ => anyhow::bail!("`pinned` takes `true` or `false`"),
+            };
+            store
+                .update_session(session_id, crate::store::SessionPatch {
+                    pinned: Some(pinned),
+                    ..Default::default()
+                })
+                .await?;
+            if pinned {
+                tracing::info!("pinned session {session_id}");
+            } else {
+                tracing::info!("unpinned session {session_id}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `meka session search <query>`: the sessions whose conversations hold the words, best first.
+pub(crate) async fn search_sessions(
+    store: &Store,
+    query: &str,
+    limit: u32,
+    include_children: bool,
+    format: cli::OutputFormat,
+) -> anyhow::Result<()> {
+    let found = store
+        .search_sessions(query, limit as usize, include_children)
+        .await?;
+    if format == cli::OutputFormat::Json {
+        let views: Vec<crate::view::SessionMatchView> = found
+            .iter()
+            .map(crate::view::SessionMatchView::from)
+            .collect();
+        cli::write_json_listing("sessions", &views)?;
+        return Ok(());
+    }
+    if found.is_empty() {
+        crate::streams::write_stderr_line("No matches.");
+        return Ok(());
+    }
+    let resolvable = store.all_session_ids().await?;
+    crate::render::write_stdout(crate::text::format_table(
+        &SEARCH_COLUMNS,
+        &search_rows(&found, &resolvable),
+    ))?;
+    Ok(())
+}
+
+/// One row per match, the id shortened the way [`session_rows`] shortens it.
+fn search_rows(found: &[crate::store::SessionMatch], resolvable: &[String]) -> Vec<Vec<String>> {
+    let ids: Vec<String> = found
+        .iter()
+        .map(|found| found.session.id.to_string())
+        .collect();
+    let id_width = crate::text::unique_prefix_len_within(
+        ids.iter().map(String::as_str),
+        resolvable.iter().map(String::as_str),
+    )
+    .max("ID".len());
+    found
+        .iter()
+        .zip(&ids)
+        .map(|(found, id)| {
+            vec![
+                id.get(..id_width).unwrap_or(id).to_string(),
+                format_stored_timestamp(&found.session.updated_at, Precision::Minutes),
+                crate::text::prose_cell(&found.session.title),
+                found
+                    .excerpt
+                    .as_deref()
+                    .map(crate::text::prose_cell)
+                    .unwrap_or_default(),
+            ]
+        })
+        .collect()
 }
 
 /// `meka session show <id>`: one session, with the id in full.
@@ -236,6 +367,10 @@ async fn show_session(
             "approvals",
             if session.approvals { "on" } else { "off" }.to_string(),
         ),
+        ("pinned", match &session.pinned_at {
+            Some(pinned_at) => format_stored_timestamp(pinned_at, Precision::Seconds),
+            None => "no".to_string(),
+        }),
         (
             "title",
             crate::text::sanitize_to_line(&session.title, usize::MAX),
@@ -342,9 +477,13 @@ fn session_rows(
                 id.get(..id_width).unwrap_or(id).to_string(),
                 format_stored_timestamp(&session.updated_at, Precision::Minutes),
                 session.profile.clone(),
-                // A first message's words: a model composed it, or an API caller sent it through
-                // `POST /v1/sessions`.
-                crate::text::prose_cell(&session.title),
+                // A pin is marked on the label, since the pinned rows sit at the top and the mark
+                // is what says why. The words are a title someone set, or a first message's, which
+                // a model composed or an API caller sent through `POST /v1/sessions`.
+                match session.pinned_at {
+                    Some(_) => format!("{PIN_MARK} {}", crate::text::prose_cell(&session.title)),
+                    None => crate::text::prose_cell(&session.title),
+                },
             ]
         })
         .collect()
@@ -699,6 +838,65 @@ mod tests {
             );
         }
     }
+    /// A pinned session's title carries the mark, and a search row shows the title and the words
+    /// the session was found by.
+    #[tokio::test]
+    async fn a_pinned_session_is_marked_and_a_match_shows_its_words() {
+        let store = Store::for_test().await;
+        let pinned = store
+            .create_session(None, "prof".to_string())
+            .await
+            .expect("create");
+        store
+            .save_event(
+                pinned,
+                &conversation::Event::Append(crate::conversation::Message::user("kept words")),
+            )
+            .await
+            .expect("seed");
+        store
+            .update_session(pinned, crate::store::SessionPatch {
+                pinned: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("pin");
+        let plain = store
+            .create_session(None, "prof".to_string())
+            .await
+            .expect("create");
+        store
+            .save_event(
+                plain,
+                &conversation::Event::Append(crate::conversation::Message::user(
+                    "plain words about herons",
+                )),
+            )
+            .await
+            .expect("seed");
+
+        let (sessions, _) = store
+            .list_sessions(10, false, None, None)
+            .await
+            .expect("list");
+        let rows = session_rows(&sessions, &ids_of(&sessions));
+        assert_eq!(rows[0][3], "* kept words");
+        assert_eq!(rows[1][3], "plain words about herons");
+
+        let found = store
+            .search_sessions("herons", 10, false)
+            .await
+            .expect("search");
+        let ids: Vec<String> = found
+            .iter()
+            .map(|found| found.session.id.to_string())
+            .collect();
+        let rows = search_rows(&found, &ids);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][2], "plain words about herons");
+        assert_eq!(rows[0][3], "plain words about herons");
+    }
+
     /// The profile column takes what real names need, and the preview spends what is left.
     ///
     /// Profile names are descriptive in practice (`openrouter-anthropic-messages` is 29 columns),

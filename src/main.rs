@@ -652,6 +652,8 @@ mod tests {
                     additional_roots: Vec::new(),
                     subagent_spec_json: Some("{\"tools\":[]}".to_string()),
                     profile: "profile".to_string(),
+                    title: None,
+                    pinned_at: None,
                     stats: Default::default(),
                     events: Vec::new(),
                     scratchpad_entries: Vec::new(),

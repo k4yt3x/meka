@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Sessions have a title of their own, shown by every listing in place of the first message's words.
+- Pinned sessions are listed first on every surface, newest pin on top, ahead of the recency order.
+- Session search finds a conversation by its words, from the command line and over the HTTP API.
+
+### Changed
+
+- A title or a pin leaves `updated_at` alone, so `meka -c` and the listing order do not change.
+- The retention sweep and `meka session delete --older-than-days` spare pinned sessions and parents.
+- The first launch builds the session search index over every stored conversation (upgrade guide).
+
 ## [0.63.0] - 2026-09-23
 
 ### Changed

@@ -106,17 +106,18 @@ A session is a persistent conversation with its own working directory, permissio
 ```
 POST   /v1/sessions           Create a session
 GET    /v1/sessions           List sessions (paginated)
+GET    /v1/sessions/search    Find sessions by the words of their conversations
 GET    /v1/sessions/{id}      Get session details
-PATCH  /v1/sessions/{id}      Update permission, approvals, cwd or profile
+PATCH  /v1/sessions/{id}      Update permission, approvals, cwd, profile, title or pin
 DELETE /v1/sessions/{id}      Close and clean up
 POST   /v1/sessions/{id}/fork Branch a copy off a session
 ```
 
-`GET /v1/sessions` is paginated. `limit` is how many to return (default 50, clamped to 1..200),
-most recently updated first. When more remain, the response carries `next_cursor`; pass it back as
-`cursor` for the next page. `include_children=true` lists sub-agent sessions too, and `cwd=<path>`
-keeps only the sessions in that working directory, compared in the canonical spelling every session
-records.
+`GET /v1/sessions` is paginated. `limit` is how many to return (default 50, clamped to 1..200).
+Pinned sessions come first, newest pin on top, then the rest most recently updated first. When
+more remain, the response carries `next_cursor`; pass it back as `cursor` for the next page.
+`include_children=true` lists sub-agent sessions too, and `cwd=<path>` keeps only the sessions in
+that working directory, compared in the canonical spelling every session records.
 
 When creating a session, specify the working directory and optionally a permission level, the
 approvals switch, a profile, and capabilities:
@@ -156,9 +157,11 @@ Create, get, list, fork and `PATCH` all answer with the same session record:
 }
 ```
 
-`created_at` is when the row was made; `updated_at` moves on any session-level change, a `PATCH`
-included; `last_turn_at` is the last successful turn, and `title` is the first user message's
-words, whitespace collapsed and cut to 80 characters.
+`created_at` is when the row was made; `updated_at` moves on a turn and on any change to what the
+session runs as (`permission`, `approvals`, `cwd`, `profile`), a `PATCH` included, but not on a
+title or a pin; `last_turn_at` is the last successful turn, and `title` is the title a client set,
+else the first user message's words, whitespace collapsed and cut to 80 characters. A pinned
+session also carries `pinned_at`.
 
 On every response and event this API sends, a field that has no value is omitted rather than sent
 as `null`. On a session that means `last_turn_at` until a turn has run (and always on a session
@@ -293,6 +296,29 @@ large.
 
 Everything else about the archive is honored as the CLI honors it; see
 [Exporting a session](./sessions.md#exporting-a-session).
+
+#### Titles, pins and search
+
+A session is labeled by its first words until someone titles it. `PATCH /v1/sessions/{id}` with
+`{"title": "Research notes"}` sets the title every surface shows from then on, the CLI and editor
+clients included, and answers with the updated record; an empty string clears it. A title is one
+line of at most 200 characters, whitespace runs collapsed, and a longer one is a `422`. `{"pinned":
+true}` pins the session, which lists it first on every surface and spares it from the retention
+sweep; `{"pinned": false}` unpins it. Pinned sessions order among themselves by `pinned_at`,
+newest first, and pinning an already pinned session keeps its time. Neither field moves
+`updated_at`, so a rename does not reorder the list, and a body naming only these two, or only
+`profile`, works on a session this server has not loaded and on one another process is running.
+
+`GET /v1/sessions/search?q=<words>` answers `{"sessions": [...]}`: the sessions whose
+conversations hold the words, best first, each the same record `GET /v1/sessions` lists plus an
+`excerpt`, the line of the best-matching message the words were found on, whitespace collapsed
+and cut short. What is searched is what was said, user messages, replies and compaction summaries;
+tool calls, tool results and thinking are not. A session whose title holds every word comes first,
+with an `excerpt` only when its words matched too; the rest are ranked by their best message. Every word must appear; when
+nothing holds them all, sessions holding any are answered, then prefixes of the words, and words
+match by their stem; scripts written without spaces match character by character. `limit` is how
+many at most (default 20, clamped to 1..100) and
+`include_children=true` adds sub-agent sessions. A blank `q` finds nothing. Requires `sessions:r`.
 
 #### Detecting an in-flight turn
 

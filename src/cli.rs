@@ -185,6 +185,85 @@ pub(crate) enum SessionAction {
         #[arg(short = 'n', long, default_value = "1")]
         turns: usize,
     },
+    /// Set a session's title or pin it
+    ///
+    /// `title` takes the text, or an empty string to label the session by its first words again;
+    /// `pinned` takes `true` or `false`. Neither moves the session in the listing's recency order.
+    Set {
+        /// Session id, or any unique prefix of one
+        session_id: String,
+        /// The field: title or pinned
+        field: SessionField,
+        /// The title text, or true/false for pinned
+        value: String,
+    },
+    /// Find sessions by the words of their conversations
+    ///
+    /// Searches what was said, not what tools were called with or returned, and lists a session
+    /// whose title holds every word first.
+    Search {
+        /// Words to search for
+        query: String,
+        /// Maximum number of sessions to show
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: u32,
+        /// Include sub-agent sessions
+        #[arg(long)]
+        include_children: bool,
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
+    },
+}
+
+/// The field `meka session set` writes. One spelling, [`Self::name`], on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionField {
+    /// The label every listing shows for the session.
+    Title,
+    /// Whether the session is listed first, ahead of every unpinned one.
+    Pinned,
+}
+
+impl SessionField {
+    /// Every field, in the order the names sort.
+    pub(crate) const ALL: [SessionField; 2] = [Self::Pinned, Self::Title];
+
+    /// The one spelling the command line takes.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Pinned => "pinned",
+        }
+    }
+}
+
+impl std::fmt::Display for SessionField {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for SessionField {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|field| field.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a session field. Supported: {}",
+                    Self::ALL
+                        .iter()
+                        .map(|field| field.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -1078,6 +1157,67 @@ mod tests {
         let cli = Cli::parse_from(["meka", "--skill", "demo", "-p", "extra context"]);
         assert_eq!(cli.skill.as_deref(), Some("demo"));
         assert_eq!(cli.prompt.as_deref(), Some("extra context"));
+    }
+
+    #[test]
+    fn session_set_and_search_parse_and_an_unknown_field_is_refused() {
+        let cli = Cli::parse_from(["meka", "session", "set", "abc", "title", "My  title"]);
+        match cli.command {
+            Some(Command::Session {
+                action:
+                    SessionAction::Set {
+                        session_id,
+                        field,
+                        value,
+                    },
+            }) => {
+                assert_eq!(session_id, "abc");
+                assert_eq!(field, SessionField::Title);
+                assert_eq!(value, "My  title");
+            }
+            other => panic!("expected `session set`, got {other:?}"),
+        }
+        let cli = Cli::parse_from(["meka", "session", "set", "abc", "pinned", "true"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Session {
+                action: SessionAction::Set {
+                    field: SessionField::Pinned,
+                    ..
+                }
+            })
+        ));
+        let error = Cli::try_parse_from(["meka", "session", "set", "abc", "color", "x"])
+            .expect_err("an unknown field must not parse")
+            .to_string();
+        assert!(error.contains("pinned, title"), "{error}");
+
+        let cli = Cli::parse_from([
+            "meka",
+            "session",
+            "search",
+            "blind spot",
+            "-n",
+            "5",
+            "--include-children",
+        ]);
+        match cli.command {
+            Some(Command::Session {
+                action:
+                    SessionAction::Search {
+                        query,
+                        limit,
+                        include_children,
+                        format,
+                    },
+            }) => {
+                assert_eq!(query, "blind spot");
+                assert_eq!(limit, 5);
+                assert!(include_children);
+                assert_eq!(format, OutputFormat::Plain);
+            }
+            other => panic!("expected `session search`, got {other:?}"),
+        }
     }
 
     #[test]

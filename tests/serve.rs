@@ -912,6 +912,201 @@ fn idempotency_key_replays_return_cached_body() {
     );
 }
 
+/// A title and a pin are set through `PATCH`, answered on every session record, and the listing
+/// puts the pinned session first without its `updated_at` moving.
+#[test]
+fn a_title_and_a_pin_are_patched_and_the_listing_puts_the_pin_first() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let create = |harness: &ServeTestHarness| -> serde_json::Value {
+        harness
+            .request(reqwest::Method::POST, "/v1/sessions")
+            .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse")
+    };
+    let older = create(&harness);
+    let newer = create(&harness);
+    let older_id = older["id"].as_str().expect("id").to_string();
+    let newer_id = newer["id"].as_str().expect("id").to_string();
+
+    let patched = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{older_id}"))
+        .json(&serde_json::json!({"title": "  Research   notes ", "pinned": true}))
+        .send()
+        .expect("send");
+    assert_eq!(patched.status(), 200);
+    let body: serde_json::Value = patched.json().expect("parse");
+    assert_eq!(body["title"], "Research notes");
+    assert!(body["pinned_at"].is_string(), "{body}");
+    assert_eq!(
+        body["updated_at"], older["updated_at"],
+        "a label and a pin leave `updated_at` alone"
+    );
+
+    let listed: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/sessions")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let ids: Vec<&str> = listed["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .filter_map(|session| session["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec![older_id.as_str(), newer_id.as_str()]);
+    assert_eq!(listed["sessions"][0]["title"], "Research notes");
+
+    let cleared: serde_json::Value = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{older_id}"))
+        .json(&serde_json::json!({"title": "", "pinned": false}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(cleared["title"], "");
+    assert!(cleared.get("pinned_at").is_none(), "{cleared}");
+    let listed: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/sessions")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(listed["sessions"][0]["id"], newer_id);
+
+    let refused = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{older_id}"))
+        .json(&serde_json::json!({"title": "x".repeat(201)}))
+        .send()
+        .expect("send");
+    assert_eq!(refused.status(), 422);
+}
+
+/// A title or a pin on a session this server has evicted is written to the row without reviving
+/// it, so a client renaming an old conversation does not rebuild an agent for it, and the row is
+/// what every later reader shows.
+#[test]
+fn a_dormant_session_is_titled_and_pinned_without_being_revived() {
+    let harness = ServeTestHarness::spawn(
+        "idle_timeout = \"1s\"\ngc_scan_interval = \"1s\"\n",
+        mock_simple_turn(),
+    );
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("send");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    // One turn, so `/context` has a message count to report while the session is resident; the
+    // count is absent once the entry is evicted, which is the signal below.
+    let turn = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "hello", "stream": false}))
+        .send()
+        .expect("send");
+    assert_eq!(turn.status(), 200, "{}", turn.text().unwrap_or_default());
+    let context_path = format!("/v1/sessions/{id}/context");
+    let message_count = |harness: &ServeTestHarness| -> serde_json::Value {
+        harness
+            .request(reqwest::Method::GET, &context_path)
+            .send()
+            .expect("send")
+            .json::<serde_json::Value>()
+            .expect("parse")["message_count"]
+            .clone()
+    };
+    let dormant_by = Instant::now() + Duration::from_secs(30);
+    while !message_count(&harness).is_null() {
+        assert!(
+            Instant::now() < dormant_by,
+            "the session never left the live map; GC is not evicting it"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let patched = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"title": "Old research", "pinned": true}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        patched.status(),
+        200,
+        "{}",
+        patched.text().unwrap_or_default()
+    );
+    let patched: serde_json::Value = patched.json().expect("parse");
+    assert_eq!(patched["title"], "Old research");
+    assert!(patched["pinned_at"].is_string(), "{patched}");
+    assert!(
+        message_count(&harness).is_null(),
+        "the write revived the session, so it did not take the dormant path"
+    );
+
+    let listed: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/sessions")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(listed["sessions"][0]["id"], id);
+    assert_eq!(listed["sessions"][0]["title"], "Old research");
+    assert!(listed["sessions"][0]["pinned_at"].is_string());
+}
+
+/// The words of a turn find its session, with the line they were found on; an unrelated word
+/// finds nothing.
+#[test]
+fn search_finds_a_session_by_the_words_of_its_turn() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("send");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let turn = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "tell me about kestrels", "stream": false}))
+        .send()
+        .expect("send");
+    assert_eq!(turn.status(), 200);
+
+    let search = |q: &str| -> serde_json::Value {
+        harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/search?q={q}"))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse")
+    };
+    let found = search("kestrels");
+    assert_eq!(found["sessions"][0]["id"], id, "{found}");
+    assert_eq!(found["sessions"][0]["excerpt"], "tell me about kestrels");
+    let by_reply = search("agent");
+    assert_eq!(
+        by_reply["sessions"][0]["id"], id,
+        "the reply's words count too"
+    );
+    assert_eq!(by_reply["sessions"][0]["excerpt"], "hello from agent");
+    assert_eq!(
+        search("wombat")["sessions"]
+            .as_array()
+            .expect("array")
+            .len(),
+        0
+    );
+}
+
 #[test]
 fn patch_session_updates_permission_and_cwd() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());

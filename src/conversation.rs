@@ -913,6 +913,36 @@ pub(crate) enum ContentBlock {
     },
 }
 impl ContentBlock {
+    /// The block as one searchable string, labeled by what it is where it is not plain text, or
+    /// `None` for a block that holds no words: an image, and the context block meka writes ahead
+    /// of a turn. The one definition of a block's text for search, read by the
+    /// `conversation_search` tool over every block and by the session search index over the
+    /// `Text` blocks alone, so what one finds the other can.
+    pub(crate) fn search_text(&self) -> Option<String> {
+        match self {
+            ContentBlock::Text { text } => Some(text.clone()),
+            ContentBlock::TurnContext { .. } | ContentBlock::Image { .. } => None,
+            ContentBlock::Thinking { thinking, .. } => Some(format!("[thinking] {thinking}")),
+            ContentBlock::RedactedThinking { .. } => Some("[redacted thinking]".to_string()),
+            ContentBlock::ToolUse { name, input, .. } => {
+                Some(format!("[tool call: {name}] {input}"))
+            }
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                let label = if *is_error {
+                    "[tool result (error)]"
+                } else {
+                    "[tool result]"
+                };
+                Some(format!(
+                    "{label} {}",
+                    ContentBlock::tool_result_text_content(content)
+                ))
+            }
+        }
+    }
+
     /// Extract the text content of a ToolResult (for display/logging).
     pub(crate) fn tool_result_text_content(content: &[ToolResultContent]) -> String {
         content

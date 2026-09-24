@@ -231,6 +231,10 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
     let authenticated = Router::new()
         .route("/v1/sessions", post(handlers::sessions::create_session))
         .route("/v1/sessions", get(handlers::sessions::list_sessions))
+        .route(
+            "/v1/sessions/search",
+            get(handlers::sessions::search_sessions),
+        )
         .route("/v1/sessions/{id}", get(handlers::sessions::get_session))
         .route(
             "/v1/sessions/{id}",

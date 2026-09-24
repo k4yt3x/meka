@@ -10,6 +10,23 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.63 to 0.64
+
+**The first open builds the session search index.** `meka session search` reads a full-text index
+over the words of every conversation, and the first launch of 0.64 fills it over every session in
+the store, which takes a moment on a large one and is logged at `info`. The index is a few percent
+of the store's size. Nothing else changes about the store's contents.
+
+**A title or a pin does not move `updated_at`.** `PATCH /v1/sessions/{id}` used to move
+`updated_at` for any field; `title` and `pinned` leave it alone, so renaming a session does not
+reorder the listing or change which session `meka -c` continues. A client using `updated_at` to
+detect changes sees a title change only in `title`.
+
+**Pinned sessions are listed first.** `GET /v1/sessions`, ACP `session/list` and `meka session
+list` put pinned sessions ahead of the rest, newest pin on top; the unpinned sessions keep their
+order. A `next_cursor` taken from a 0.63 server is refused by 0.64 as invalid; start the listing
+again.
+
 ## 0.62 to 0.63
 
 **An inbox item's `source` is optional.** An item posted to `POST /v1/sessions/{id}/inbox` without

@@ -409,6 +409,7 @@ pub(crate) async fn create_session(
                 // A root by construction: `POST /v1/sessions` has no way to name a parent, and
                 // a sub-agent session is only ever minted by `agent_spawn` inside a turn.
                 parent_id: None,
+                pinned_at: None,
             },
             last_turn_at: None,
             capabilities,
@@ -646,6 +647,7 @@ pub(crate) async fn fork_session(
                 // same parent, so the copy is a sibling of the original, not a new root, and a
                 // response that said otherwise would disagree with the store.
                 parent_id: forked_info.parent_id,
+                pinned_at: forked_info.pinned_at,
             },
             last_turn_at: None,
             capabilities: entry.capabilities,
@@ -720,42 +722,8 @@ pub(crate) async fn list_sessions(
     // ACP, sub-agent, imported).
     let in_memory = state.sessions.read().await;
     let sessions = rows
-        .into_iter()
-        .map(|row| {
-            let live = in_memory.get(&row.id);
-            // The row answers for an evicted session; a resident one is reported from its cells
-            // and clock, which are what its next turn runs against.
-            let mut session = SessionView::from(&row);
-            if let Some(entry) = live {
-                session.permission = Some(entry.cells().permission.get());
-                session.approvals = entry.cells().permission.approvals();
-                session.created_at = entry.created_at.to_rfc3339();
-                if let Ok(updated_at) = entry.updated_at.read() {
-                    session.updated_at = updated_at.to_rfc3339();
-                }
-            }
-            let last_turn_at = live.and_then(|entry| {
-                entry
-                    .last_turn_at_wall
-                    .read()
-                    .ok()
-                    .and_then(|guard| guard.map(|ts| ts.to_rfc3339()))
-            });
-            // Recover capabilities from the persisted JSON column for evicted rows.
-            let capabilities = live
-                .map(|entry| entry.capabilities)
-                .unwrap_or_else(|| capabilities_from_row(row.capabilities_json.as_deref()));
-            let turn_in_flight = live.is_some_and(|entry| {
-                entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0
-            });
-            SessionResponse {
-                session,
-                last_turn_at,
-                capabilities,
-                turn_in_flight,
-                inbox_pending: None,
-            }
-        })
+        .iter()
+        .map(|row| listed_session(row, in_memory.get(&row.id)))
         .collect();
     drop(in_memory);
 
@@ -763,6 +731,116 @@ pub(crate) async fn list_sessions(
         sessions,
         next_cursor,
     }))
+}
+
+/// A session as a listing answers for it: the row, under what this process knows when the
+/// session is resident. The row answers for an evicted session; a resident one is reported from
+/// its cells and clock, which are what its next turn runs against.
+fn listed_session(
+    row: &crate::store::SessionSummary,
+    live: Option<&SessionEntry>,
+) -> SessionResponse {
+    let mut session = SessionView::from(row);
+    if let Some(entry) = live {
+        session.permission = Some(entry.cells().permission.get());
+        session.approvals = entry.cells().permission.approvals();
+        session.created_at = entry.created_at.to_rfc3339();
+        if let Ok(updated_at) = entry.updated_at.read() {
+            session.updated_at = updated_at.to_rfc3339();
+        }
+    }
+    let last_turn_at = live.and_then(|entry| {
+        entry
+            .last_turn_at_wall
+            .read()
+            .ok()
+            .and_then(|guard| guard.map(|ts| ts.to_rfc3339()))
+    });
+    // Recover capabilities from the persisted JSON column for evicted rows.
+    let capabilities = live
+        .map(|entry| entry.capabilities)
+        .unwrap_or_else(|| capabilities_from_row(row.capabilities_json.as_deref()));
+    let turn_in_flight =
+        live.is_some_and(|entry| entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0);
+    SessionResponse {
+        session,
+        last_turn_at,
+        capabilities,
+        turn_in_flight,
+        inbox_pending: None,
+    }
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub(crate) struct SearchSessionsQuery {
+    /// The words to search for. What was said is searched, not what tools were called with or
+    /// returned; a session whose title holds every word is listed first. Blank finds nothing.
+    pub(crate) q: String,
+    /// How many sessions to answer with at most. Default 20, clamped to 1..100.
+    #[serde(default)]
+    pub(crate) limit: Option<u32>,
+    /// Include sub-agent sessions. Default `false`, like the listing.
+    #[serde(default)]
+    pub(crate) include_children: Option<bool>,
+}
+
+/// A session a search found: the record every listing answers with, plus the words it was found
+/// by.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct SessionMatchResponse {
+    #[serde(flatten)]
+    pub(crate) session: SessionResponse,
+    /// The line of the best-matching message that holds a query term, whitespace collapsed and
+    /// cut short. Omitted for a session found by its title alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) excerpt: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct SearchSessionsResponse {
+    pub(crate) sessions: Vec<SessionMatchResponse>,
+}
+
+/// GET /v1/sessions/search: the sessions whose conversations hold the words of `q`, best first.
+#[utoipa::path(
+    get,
+    path = "/v1/sessions/search",
+    tag = "sessions",
+    params(SearchSessionsQuery),
+    responses(
+        (status = 200, description = "Matching sessions, best first, each with the words it was found by", body = SearchSessionsResponse),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["sessions:r"]))
+)]
+pub(crate) async fn search_sessions(
+    State(state): State<ServerState>,
+    _scoped: scope::Scoped<scope::SessionsRead>,
+    Query(query): Query<SearchSessionsQuery>,
+) -> Result<Json<SearchSessionsResponse>, ProblemDetail> {
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let found = state
+        .shared
+        .store
+        .search_sessions(
+            &query.q,
+            limit as usize,
+            query.include_children.unwrap_or(false),
+        )
+        .await
+        .map_err(|error| ProblemDetail::internal_sanitized("failed to search sessions", error))?;
+    let in_memory = state.sessions.read().await;
+    let sessions = found
+        .iter()
+        .map(|found| SessionMatchResponse {
+            session: listed_session(&found.session, in_memory.get(&found.session.id)),
+            excerpt: found.excerpt.clone(),
+        })
+        .collect();
+    drop(in_memory);
+    Ok(Json(SearchSessionsResponse { sessions }))
 }
 
 /// GET /v1/sessions/{id}: single session metadata.
@@ -831,6 +909,7 @@ pub(crate) async fn get_session(
                 profile: info.profile,
                 title: info.title,
                 parent_id: info.parent_id,
+                pinned_at: info.pinned_at,
             },
             last_turn_at,
             capabilities: entry.capabilities,
@@ -856,14 +935,15 @@ pub(crate) async fn get_session(
     }))
 }
 
-/// Move a session that is not resident onto another profile, without building an agent
-/// for it.
+/// Move a session that is not resident onto another profile, or title or pin it, without building
+/// an agent for it.
 ///
-/// The rescue path for a session whose recorded profile is no longer configured. Nothing here needs
-/// the agent: the row is the thing being changed, there is no in-flight turn to conflict with and
-/// no in-memory mirror to update, and the response comes off the row the way `GET` already answers
-/// for an evicted session. The profile is still resolved first, so a body naming one that cannot
-/// produce a profile is refused before the row moves, exactly as on the resident path.
+/// The rescue path for a session whose recorded profile is no longer configured, and the plain
+/// path for the two fields nothing but the row holds. Nothing here needs the agent: the row is
+/// the thing being changed, there is no in-flight turn to conflict with and no in-memory mirror
+/// to update, and the response comes off the row the way `GET` already answers for an evicted
+/// session. The profile is still resolved first, so a body naming one that cannot produce a
+/// profile is refused before the row moves, exactly as on the resident path.
 ///
 /// `Ok(None)` means the session became resident after all, and the caller must take the resident
 /// path so the agent moves with the row. Everything below rests on "not resident", and the check
@@ -874,71 +954,94 @@ pub(crate) async fn get_session(
 /// as long as it stayed resident. Holding the reconstruction lock for the whole body is what makes
 /// the re-check below conclusive rather than another sample.
 ///
-/// The reconstruction lock answers for *this* process only, so the session lock is taken too. Every
-/// other writer of `sessions.profile` already holds it (a CLI resume, `/profile`, ACP's
-/// `session/set_config_option`, and this handler's own resident path, which holds it through the
-/// entry), which makes "you may move a session's profile only while you own the session" an
-/// invariant rather than a coincidence. Without it, a second `meka serve` on the same store
-/// answers `200` for a session the first one is running: the row moves, `GET /v1/sessions` on
-/// *both* reports the new profile, and the host holding the session goes on building requests for
-/// the old one until eviction.
-async fn repin_dormant_session(
+/// The reconstruction lock answers for *this* process only, so a body naming a profile takes the
+/// session lock too. Every other writer of `sessions.profile` already holds it (a CLI resume,
+/// `/profile`, ACP's `session/set_config_option`, and this handler's own resident path, which
+/// holds it through the entry), which makes "you may move a session's profile only while you own
+/// the session" an invariant rather than a coincidence. Without it, a second `meka serve` on the
+/// same store answers `200` for a session the first one is running: the row moves, `GET
+/// /v1/sessions` on *both* reports the new profile, and the host holding the session goes on
+/// building requests for the old one until eviction. A title or a pin is nothing a running host
+/// caches, so those are written without it: renaming a session from one client while another
+/// process is in it is an ordinary thing to do.
+async fn patch_dormant_session(
     state: &ServerState,
     id: Uuid,
-    profile: &str,
+    profile: Option<&str>,
+    title: Option<Option<String>>,
+    pinned: Option<bool>,
 ) -> Result<Option<Json<SessionResponse>>, ProblemDetail> {
     let _reconstruction = state.reconstruction_locks.lock(id).await;
     if state.sessions.read().await.contains_key(&id) {
         return Ok(None);
     }
     require_session_exists(state, id).await?;
-    // `session-locked`, the same code `ensure_session_loaded` answers a cross-process conflict
-    // with, and for the same reason: this is another process owning the session, not an in-process
-    // turn. Held for the rest of the body, so nothing can attach between here and the write.
-    //
-    // Only a held lock, though. The lock directory failing to open is the operator's fault and
-    // names their path, so it goes to the log as a 500 rather than to the caller as a conflict a
-    // retry would never resolve.
-    let _session = state
-        .shared
-        .store
-        .lock_session(id)
-        .map_err(|error| match error {
-            crate::error::MekaError::SessionLocked(_) => ProblemDetail::new(
-                ErrorKind::SessionLocked,
-                StatusCode::CONFLICT,
-                "another meka process is running this session, so its profile cannot be changed \
-                 from here",
-            )
-            .with("session_id", id.to_string()),
-            other => ProblemDetail::internal_sanitized("failed to lock session for repin", other)
+    if let Some(profile) = profile {
+        // `session-locked`, the same code `ensure_session_loaded` answers a cross-process conflict
+        // with, and for the same reason: this is another process owning the session, not an
+        // in-process turn. Held for the rest of the body, so nothing can attach between here and
+        // the write.
+        //
+        // Only a held lock, though. The lock directory failing to open is the operator's fault and
+        // names their path, so it goes to the log as a 500 rather than to the caller as a conflict
+        // a retry would never resolve.
+        let _session = state
+            .shared
+            .store
+            .lock_session(id)
+            .map_err(|error| match error {
+                crate::error::MekaError::SessionLocked(_) => ProblemDetail::new(
+                    ErrorKind::SessionLocked,
+                    StatusCode::CONFLICT,
+                    "another meka process is running this session, so its profile cannot be \
+                     changed from here",
+                )
                 .with("session_id", id.to_string()),
-        })?;
-    crate::config::require_profile(profile, &state.shared.config.profiles)
-        .map_err(|error| ProblemDetail::for_error(&error, state.config.relay_provider_errors))?;
-    let resolved = crate::provider::resolved_profile(
-        &state.shared.providers,
-        profile.to_string(),
-    )
-    .await
-    // Discriminated, not a blanket 422; see the sibling site in `patch_session`.
-    .map_err(|error| {
-        agent_build_problem(
-            id,
-            &format!("failed to resolve profile '{profile}'"),
-            error,
+                other => {
+                    ProblemDetail::internal_sanitized("failed to lock session for repin", other)
+                        .with("session_id", id.to_string())
+                }
+            })?;
+        crate::config::require_profile(profile, &state.shared.config.profiles).map_err(
+            |error| ProblemDetail::for_error(&error, state.config.relay_provider_errors),
+        )?;
+        let resolved = crate::provider::resolved_profile(
+            &state.shared.providers,
+            profile.to_string(),
         )
-    })?;
+        .await
+        // Discriminated, not a blanket 422; see the sibling site in `patch_session`.
+        .map_err(|error| {
+            agent_build_problem(
+                id,
+                &format!("failed to resolve profile '{profile}'"),
+                error,
+            )
+        })?;
 
-    // Skipped when nothing changes, so a no-op PATCH does not advance `updated_at` that clients
-    // watch for changes. Nothing to reconcile beyond the name: a dormant session has no live agent
-    // to put back in step, which is what the resident path has to do unconditionally. A failed
-    // write fails the request, because the row is the billing record.
-    crate::host::record_profile_switch(&state.shared.store, id, &resolved)
+        // Skipped when nothing changes, so a no-op PATCH does not advance `updated_at` that
+        // clients watch for changes. Nothing to reconcile beyond the name: a dormant session has
+        // no live agent to put back in step, which is what the resident path has to do
+        // unconditionally. A failed write fails the request, because the row is the billing
+        // record.
+        crate::host::record_profile_switch(&state.shared.store, id, &resolved)
+            .await
+            .map_err(|error| {
+                agent_build_problem(id, "failed to record the session's profile", error)
+            })?;
+    }
+    if title.is_some() || pinned.is_some() {
+        crate::host::record_session_change(&state.shared.store, id, crate::store::SessionPatch {
+            title,
+            pinned,
+            ..Default::default()
+        })
         .await
         .map_err(|error| {
-            agent_build_problem(id, "failed to record the session's profile", error)
+            ProblemDetail::internal_sanitized("failed to record the session's title or pin", error)
+                .with("session_id", id.to_string())
         })?;
+    }
 
     // Re-read rather than patching the pre-write copy, so `updated_at` and `profile` are what the
     // store now holds.
@@ -991,6 +1094,15 @@ pub(crate) async fn patch_session(
 ) -> Result<Json<SessionResponse>, ProblemDetail> {
     let body: PatchSessionRequest = serde_json::from_slice(&raw_body)
         .map_err(|error| ProblemDetail::invalid_body("session patch", error))?;
+    // Through the one acceptor every door that sets a title uses, and ahead of everything else,
+    // so a refusal leaves the row and the live cells alone.
+    let new_title = match body.title.as_deref() {
+        Some(raw) => Some(
+            crate::store::normalize_title(raw)
+                .map_err(|error| ProblemDetail::for_error(&error, false))?,
+        ),
+        None => None,
+    };
 
     // Ahead of the dormant fast path below, which is the one branch of this handler that writes a
     // session row without ever building an agent, so it is the one branch
@@ -1006,15 +1118,23 @@ pub(crate) async fn patch_session(
     // profile has left `config.toml`, and reviving it to apply the change is the one thing that
     // cannot work in that state: `ensure_session_loaded` rebuilds the agent, which resolves the
     // very profile that is gone, so the rescue was refused by the failure it was meant to
-    // repair. A session already resident falls through to the path below, because
-    // `ensure_session_loaded` returns it without rebuilding and its live agent has to move with
-    // the row.
+    // repair. The title and the pin live on the row alone, so a body naming only those takes the
+    // same path: nothing about them needs an agent. A session already resident falls through to
+    // the path below, because `ensure_session_loaded` returns it without rebuilding and its live
+    // agent has to move with the row.
     if body.permission.is_none()
         && body.approvals.is_none()
         && body.cwd.is_none()
-        && let Some(name) = body.profile.as_deref()
+        && (body.profile.is_some() || new_title.is_some() || body.pinned.is_some())
         && !state.sessions.read().await.contains_key(&id)
-        && let Some(response) = repin_dormant_session(&state, id, name).await?
+        && let Some(response) = patch_dormant_session(
+            &state,
+            id,
+            body.profile.as_deref(),
+            new_title.clone(),
+            body.pinned,
+        )
+        .await?
     {
         return Ok(response);
     }
@@ -1158,7 +1278,10 @@ pub(crate) async fn patch_session(
             })
             .flatten(),
         roots: None,
+        title: new_title,
+        pinned: body.pinned,
     };
+    let moves_updated_at = patch.moves_updated_at();
     let mutated = !patch.is_empty();
     if mutated {
         // One write for every column, and one policy for a write that fails: a profile that could
@@ -1168,7 +1291,7 @@ pub(crate) async fn patch_session(
         crate::host::record_session_change(&state.shared.store, id, patch)
             .await
             .map_err(|error| {
-                ProblemDetail::internal_sanitized("failed to record the session's profile", error)
+                ProblemDetail::internal_sanitized("failed to record the session change", error)
             })?;
         // Apply the in-memory mirror. `try_set` re-validates against the enabled set as
         // belt-and-braces; a failure here would indicate a config reload race (not currently
@@ -1203,9 +1326,10 @@ pub(crate) async fn patch_session(
         entry.agent.set_provider(resolved);
     }
 
-    // Bump `updated_at` only on actual changes; leave `last_turn_at` alone so the GC
-    // scanner's idle timer tracks profile activity, not metadata edits.
-    if mutated && let Ok(mut guard) = entry.updated_at.write() {
+    // Bump `updated_at` only on the changes the row's own rule moves it for, so the live clock
+    // agrees with the row; leave `last_turn_at` alone so the GC scanner's idle timer tracks
+    // profile activity, not metadata edits.
+    if moves_updated_at && let Ok(mut guard) = entry.updated_at.write() {
         *guard = chrono::Utc::now();
     }
     let cwd_snapshot = entry.cells().cwd.get();
@@ -1242,6 +1366,7 @@ pub(crate) async fn patch_session(
             profile: info.profile,
             title: info.title,
             parent_id: info.parent_id,
+            pinned_at: info.pinned_at,
         },
         last_turn_at,
         capabilities: entry.capabilities,
@@ -1272,6 +1397,14 @@ pub(crate) struct PatchSessionRequest {
     /// reasoning recorded so far stops being visible to the model from the next turn onward.
     #[serde(default)]
     pub(crate) profile: Option<String>,
+    /// The session's title, as every listing shows it. Empty clears it, so the session is labeled
+    /// by its first words again. Absent → keep current. Does not move `updated_at`.
+    #[serde(default)]
+    pub(crate) title: Option<String>,
+    /// Pin or unpin the session. A pinned session is listed first, newest pin on top. Absent →
+    /// keep current. Does not move `updated_at`.
+    #[serde(default)]
+    pub(crate) pinned: Option<bool>,
 }
 
 /// The 409 a mutating session operation gets when it races a turn, from the one mapping every
@@ -1433,10 +1566,10 @@ mod tests {
     /// rebuilt from it agree afterwards -- but not the serialization, which only shows up under a
     /// race it cannot create.
     #[test]
-    fn the_dormant_repin_serializes_against_reconstruction() {
+    fn the_dormant_patch_serializes_against_reconstruction() {
         crate::host::http::reattach::assert_dormant_fast_path_is_serialized(
             include_str!("sessions.rs"),
-            "async fn repin_dormant_session(",
+            "async fn patch_dormant_session(",
             "session_info(id)",
             "record_profile_switch(",
         );

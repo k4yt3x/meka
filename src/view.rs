@@ -25,7 +25,7 @@ use crate::{
     permission::Permission,
     schedule::ScheduledJob,
     skills::{self, Skill},
-    store::SessionSummary,
+    store::{SessionMatch, SessionSummary},
 };
 
 /// A session's row: what `meka session list` prints and what `GET /v1/sessions/{id}` answers with,
@@ -54,12 +54,16 @@ pub(crate) struct SessionView {
     pub(crate) approvals: bool,
     /// The profile this session runs on.
     pub(crate) profile: String,
-    /// The first user message's words, whitespace collapsed and cut to 80 characters. Empty until
-    /// the session has run a turn.
+    /// The title a user set, else the first user message's words, whitespace collapsed and cut to
+    /// 80 characters. Empty until either has happened.
     pub(crate) title: String,
     /// The session this one was spawned from, for a sub-agent; omitted for a root session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) parent_id: Option<Uuid>,
+    /// RFC 3339, when the session was pinned; omitted for a session that is not. Pinned sessions
+    /// are listed first, newest pin on top.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pinned_at: Option<String>,
 }
 
 impl From<&SessionSummary> for SessionView {
@@ -74,6 +78,28 @@ impl From<&SessionSummary> for SessionView {
             profile: session.profile.clone(),
             title: session.title.clone(),
             parent_id: session.parent_id,
+            pinned_at: session.pinned_at.clone(),
+        }
+    }
+}
+
+/// A session `meka session search` found: the record every listing prints, plus the words it was
+/// found by.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SessionMatchView {
+    #[serde(flatten)]
+    pub(crate) session: SessionView,
+    /// The line of the best-matching message that holds a query term, whitespace collapsed and
+    /// cut short. Omitted for a session found by its title alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) excerpt: Option<String>,
+}
+
+impl From<&SessionMatch> for SessionMatchView {
+    fn from(found: &SessionMatch) -> Self {
+        Self {
+            session: SessionView::from(&found.session),
+            excerpt: found.excerpt.clone(),
         }
     }
 }
@@ -597,6 +623,7 @@ mod tests {
             additional_roots: Vec::new(),
             token_id: None,
             parent_id,
+            pinned_at: None,
         }
     }
 

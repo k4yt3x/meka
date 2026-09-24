@@ -109,6 +109,7 @@ stderr, beside the prompts and notices; the model's answers stay on stdout.
 | `/exit` (or `/quit`) | Exit the shell |
 | `/clear` | Clear the terminal screen |
 | `/session` | Show the current session id |
+| `/title [text]` | Show this session's title, or set it |
 | `/permission [none\|read\|workspace\|unrestricted]` | Show or set the permission level |
 | `/approvals [on\|off]` | Show or set whether calls above the level are submitted for approval |
 | `/profile [name]` | Show or change the profile this session runs on |

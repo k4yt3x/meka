@@ -1771,6 +1771,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_slash_command_title() {
+        assert!(matches!(
+            parse_slash_command("/title"),
+            Some(SlashCommand::Title(None))
+        ));
+        assert!(matches!(
+            parse_slash_command("/title   "),
+            Some(SlashCommand::Title(None))
+        ));
+        assert!(matches!(
+            parse_slash_command("/title  Research notes "),
+            Some(SlashCommand::Title(Some(ref text))) if text == "Research notes"
+        ));
+    }
+
+    #[test]
     fn parse_slash_command_permission() {
         assert!(matches!(
             parse_slash_command("/permission"),
@@ -2229,6 +2245,7 @@ mod tests {
             Some(SlashCommand::Help) => "Help",
             Some(SlashCommand::Clear) => "Clear",
             Some(SlashCommand::Session) => "Session",
+            Some(SlashCommand::Title(_)) => "Title",
             Some(SlashCommand::Permission(_)) => "Permission",
             Some(SlashCommand::Approvals(_)) => "Approvals",
             Some(SlashCommand::Profile(_)) => "Profile",

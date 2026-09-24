@@ -1117,6 +1117,8 @@ mod tests {
             additional_roots: Vec::new(),
             subagent_spec_json: None,
             profile: "test-profile".to_string(),
+            title: None,
+            pinned_at: None,
             stats: crate::stats::SessionStatsSnapshot::default(),
             events: Vec::new(),
             scratchpad_entries: Vec::new(),

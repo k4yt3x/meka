@@ -284,7 +284,7 @@ const TRIGGER_DEFINITIONS: [(&str, &str); 3] = [
 /// and turns every process open into three dropped triggers, three recreated ones and a full
 /// `'rebuild'` of the index: measured on a 20,000-memory store, 306 ms for `meka memory get
 /// <name>`, a point lookup, against 3 ms for a command that never opens the store.
-fn canonical_trigger_sql(sql: &str) -> String {
+pub(super) fn canonical_trigger_sql(sql: &str) -> String {
     // Whitespace is collapsed as well: this file's indentation is not something a definition should
     // be considered stale over.
     sql.split_whitespace()

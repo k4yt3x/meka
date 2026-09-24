@@ -448,8 +448,10 @@ pub(crate) async fn resolve_profile_switch(
 /// row: the failure is warned about, loudly, because another process may still read the old value
 /// (a scheduled gate is re-checked against the row, and the next resume opens from it), and the
 /// caller continues. The profile is different: the row is the billing record, and a session running
-/// on a profile its row does not name bills an account no reader can see. A patch carrying one
-/// returns the failure, so the door refuses.
+/// on a profile its row does not name bills an account no reader can see. The title and the pin
+/// are different for the opposite reason: they live on the row and nowhere else, so a write that
+/// failed is the whole command failing. A patch carrying any of the three returns the failure, so
+/// the door refuses.
 ///
 /// Every door handles the result the same way, surfacing whatever comes back; which patches can
 /// fail is this function's to know, not theirs.
@@ -458,11 +460,11 @@ pub(crate) async fn record_session_change(
     session_id: uuid::Uuid,
     patch: crate::store::SessionPatch,
 ) -> crate::error::Result<()> {
-    let carries_profile = patch.profile.is_some();
+    let must_land = patch.profile.is_some() || patch.title.is_some() || patch.pinned.is_some();
     let described = patch.to_string();
     match store.update_session(session_id, patch).await {
         Ok(()) => Ok(()),
-        Err(error) if carries_profile => Err(error),
+        Err(error) if must_land => Err(error),
         Err(error) => {
             tracing::warn!("failed to record {described} for session '{session_id}': {error}");
             Ok(())

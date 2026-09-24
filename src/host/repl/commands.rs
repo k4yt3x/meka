@@ -90,6 +90,44 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             }),
             None => crate::streams::write_stderr_line("No active session yet."),
         },
+        SlashCommand::Title(text) => match (&session_id, text) {
+            (None, _) => crate::streams::write_stderr_line("No active session yet."),
+            (Some(id), Some(text)) => match crate::store::normalize_title(&text) {
+                Ok(title) => {
+                    let shown = title.clone().unwrap_or_default();
+                    match store
+                        .update_session(*id, crate::store::SessionPatch {
+                            title: Some(title),
+                            ..Default::default()
+                        })
+                        .await
+                    {
+                        Ok(()) => with_console(console, |console| {
+                            console.line(&format!(
+                                "Title set to: {}",
+                                crate::text::sanitize_to_line(&shown, usize::MAX)
+                            ))
+                        }),
+                        Err(error) => crate::streams::write_stderr_line(format!(
+                            "Cannot set the title: {error}"
+                        )),
+                    }
+                }
+                Err(error) => crate::streams::write_stderr_line(error.to_string()),
+            },
+            (Some(id), None) => match store.session_info(*id).await {
+                Ok(Some(info)) if !info.title.is_empty() => with_console(console, |console| {
+                    console.line(&format!(
+                        "Title: {}",
+                        crate::text::sanitize_to_line(&info.title, usize::MAX)
+                    ))
+                }),
+                Ok(_) => crate::streams::write_stderr_line("No title yet."),
+                Err(error) => {
+                    crate::streams::write_stderr_line(format!("Cannot read the title: {error}"))
+                }
+            },
+        },
         SlashCommand::Compact(instructions) => {
             let request = crate::session::CompactRequest {
                 origin: crate::session::CompactOrigin::Manual,
@@ -654,6 +692,8 @@ pub(crate) enum SlashCommand {
     Help,
     Clear,
     Session,
+    /// `/title [text]`: show this session's title, or set it.
+    Title(Option<String>),
     Permission(Option<String>),
     /// `/approvals [on|off]`: show or set whether calls above the level are submitted for
     /// approval.
@@ -798,6 +838,7 @@ impl SlashCommand {
             SlashCommand::MemoryList => Answerer::Host,
             SlashCommand::MemoryShow { .. } => Answerer::Host,
             SlashCommand::Rewind { .. } => Answerer::Host,
+            SlashCommand::Title { .. } => Answerer::Host,
             SlashCommand::RewindInvalid(_) => Answerer::Host,
             SlashCommand::ScheduleCancel { .. } => Answerer::Host,
             SlashCommand::ScheduleList => Answerer::Host,
@@ -824,6 +865,9 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "help" | "?" => Some(SlashCommand::Help),
         "clear" => Some(SlashCommand::Clear),
         "session" => Some(SlashCommand::Session),
+        "title" => Some(SlashCommand::Title(
+            argument.filter(|text| !text.is_empty()),
+        )),
         "memory" => Some(parse_memory_slash(argument.as_deref().unwrap_or(""))),
         "schedule" => Some(parse_schedule_slash(argument.as_deref().unwrap_or(""))),
         "task" => Some(parse_task_slash(argument.as_deref().unwrap_or(""))),

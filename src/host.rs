@@ -148,6 +148,13 @@ pub(crate) const COMMANDS: &[HostCommand] = &[
         for_editors: false,
     },
     HostCommand {
+        name: "title",
+        aliases: &[],
+        help: "Show or set this session's title",
+        arg_hint: "[text]",
+        for_editors: false,
+    },
+    HostCommand {
         name: "permission",
         aliases: &[],
         help: "Show or set the permission level",

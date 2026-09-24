@@ -65,41 +65,15 @@ fn append_messages(events: &[Event]) -> Vec<&Message> {
     messages
 }
 
-/// Flatten a message into searchable lines. Non-text blocks are prefixed so a match is
-/// identifiable; images carry no text and are skipped.
+/// Flatten a message into searchable lines: every block's [`ContentBlock::search_text`], which
+/// labels the non-text ones so a match is identifiable and skips what holds no words.
 fn searchable_text(message: &Message) -> String {
-    let mut segments: Vec<String> = Vec::new();
-    for block in &message.content {
-        match block {
-            ContentBlock::Text { text } => segments.push(text.clone()),
-            // meka's own per-turn preamble, restated every turn; not part of the conversation.
-            ContentBlock::TurnContext { .. } => {}
-            ContentBlock::Thinking { thinking, .. } => {
-                segments.push(format!("[thinking] {thinking}"))
-            }
-            ContentBlock::RedactedThinking { .. } => {
-                segments.push("[redacted thinking]".to_string())
-            }
-            ContentBlock::ToolUse { name, input, .. } => {
-                segments.push(format!("[tool call: {name}] {input}"));
-            }
-            ContentBlock::ToolResult {
-                content, is_error, ..
-            } => {
-                let label = if *is_error {
-                    "[tool result (error)]"
-                } else {
-                    "[tool result]"
-                };
-                segments.push(format!(
-                    "{label} {}",
-                    ContentBlock::tool_result_text_content(content)
-                ));
-            }
-            ContentBlock::Image { .. } => {}
-        }
-    }
-    segments.join("\n")
+    message
+        .content
+        .iter()
+        .filter_map(ContentBlock::search_text)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Full, untruncated rendering of a message for `conversation_read`.

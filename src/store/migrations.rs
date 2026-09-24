@@ -292,6 +292,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "gate_tools_take_their_class_first_names",
         step: Step::Rust(gate_tools_take_their_class_first_names),
     },
+    // 0.64 lets a session be titled and pinned, and indexes the conversation's words for `meka
+    // session search`.
+    Migration {
+        name: "sessions_take_a_title_a_pin_and_a_search_index",
+        step: Step::Rust(sessions_take_a_title_a_pin_and_a_search_index),
+    },
 ];
 
 /// The inbox table. `appended_at` is written by the transaction that writes the conversation row
@@ -552,9 +558,9 @@ pub(crate) fn plan(connection: &rusqlite::Connection) -> Result<Plan> {
 /// digest of everything in `sqlite_master` refused a store the moment another tool added a table
 /// beside meka's (a replication tool's sequence table, a hand-made one), and the refusal
 /// prescribed a `-wal` remedy that could not apply. A table missing from this list digests as
-/// empty, so a store that lost one is still refused. The FTS index and its shadow tables are left
-/// out: `memory::store::reconcile_index` rebuilds the index to this build's definition after this
-/// check, so its shape is not the ledger's to pin.
+/// empty, so a store that lost one is still refused. The two FTS indexes and their shadow tables
+/// are left out: `store::memory::reconcile_index` and `store::search::reconcile_index` bring each
+/// to this build's definition after this check, so their shape is not the ledger's to pin.
 const HEAD_TABLES: &[&str] = &[
     "account_credentials",
     "background_tasks",
@@ -572,7 +578,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 4_960_450_522_591_915_780;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 11_383_376_175_894_579_710;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -2538,6 +2544,38 @@ fn gate_tools_take_their_class_first_names(
     Ok(())
 }
 
+/// 0.64: `title` and `pinned_at` on `sessions`, and the contentless full-text index over the
+/// conversation's words that `meka session search` reads.
+///
+/// The index is created empty and never filled here. What a message's words are is meka's own
+/// reading of the row, which a migration may not call, so `crate::store::search::reconcile_index`
+/// indexes every row it finds missing on the open that follows this step. A later step that
+/// rewrites `messages.content` must `DELETE FROM messages_fts`, and that same pass re-indexes
+/// what it emptied.
+fn sessions_take_a_title_a_pin_and_a_search_index(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    for (column, statement) in [
+        ("title", "ALTER TABLE sessions ADD COLUMN title TEXT"),
+        (
+            "pinned_at",
+            "ALTER TABLE sessions ADD COLUMN pinned_at TEXT",
+        ),
+    ] {
+        if !table_has_column(transaction, "sessions", column)? {
+            transaction.execute_batch(statement)?;
+        }
+    }
+    transaction.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+             text,
+             content = '',
+             contentless_delete = 1,
+             tokenize = 'porter unicode61'
+         );",
+    )
+}
+
 /// A root row that recorded no level takes `[permissions].default` once `config.toml` reads.
 ///
 /// [`sessions_carry_approvals`] stamps such a row only when the caller could read the file, and
@@ -3072,6 +3110,10 @@ mod tests {
             (
                 "gate_tools_take_their_class_first_names",
                 1618890790364633461_u64,
+            ),
+            (
+                "sessions_take_a_title_a_pin_and_a_search_index",
+                13895030768240920509_u64,
             ),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,

@@ -32,6 +32,7 @@ pub(crate) mod memory;
 pub(crate) mod migrations;
 pub(crate) mod schedule;
 mod scratchpad;
+mod search;
 mod sessions;
 
 use std::{
@@ -53,9 +54,10 @@ pub(crate) use self::{
     },
     locks::SessionLockSlot,
     scratchpad::{RenameOutcome, ScratchpadEntry},
+    search::SessionMatch,
     sessions::{
         ForkOverrides, ImportSessionRecord, SessionMetaRow, SessionPatch, SessionSummary,
-        SessionSweep, SourceLock, SpawnTerms,
+        SessionSweep, SourceLock, SpawnTerms, normalize_title,
     },
 };
 use crate::error::{MekaError, Result};
@@ -348,6 +350,14 @@ impl Store {
                 // forward. `crate::store::memory` owns the reasoning.
                 crate::store::memory::reconcile_index(connection).map_err(|error| {
                     MekaError::Database(format!("failed to reconcile the memory index: {error}"))
+                })?;
+                // The session search index, for the same reason, and after the ledger for one
+                // more: its first fill is this pass, since the step that created it may not read
+                // a row the way meka does.
+                crate::store::search::reconcile_index(connection).map_err(|error| {
+                    MekaError::Database(format!(
+                        "failed to reconcile the session search index: {error}"
+                    ))
                 })?;
                 Ok((plan, backup))
             })

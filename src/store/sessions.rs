@@ -48,6 +48,10 @@ pub(crate) struct SessionMetaRow {
     /// What the session runs on, so an export carries it and an import can restore it rather than
     /// landing every imported session on the empty profile no configuration can name.
     pub(crate) profile: String,
+    /// The title a user set, or `None` for a session labeled by its first words.
+    pub(crate) title: Option<String>,
+    /// When the session was pinned, or `None` for one that is not.
+    pub(crate) pinned_at: Option<String>,
 }
 /// Per-surface overrides applied to the copy produced by [`Store::fork_session_locked`]. Each
 /// `None` field inherits the source session's value.
@@ -87,6 +91,10 @@ pub(crate) struct ImportSessionRecord {
     /// profile keeps it, and one written before the field existed adopts the importing
     /// installation's default, which is the only thing that can be known about it here.
     pub(crate) profile: String,
+    /// The title the archive carried, already through [`normalize_title`].
+    pub(crate) title: Option<String>,
+    /// When the archived session was pinned, restored as it was written.
+    pub(crate) pinned_at: Option<String>,
     pub(crate) stats: crate::stats::SessionStatsSnapshot,
     /// `(created_at, event)` pairs in chronological order; timestamps are preserved verbatim.
     pub(crate) events: Vec<(String, crate::conversation::Event)>,
@@ -123,7 +131,9 @@ pub(crate) struct SessionSummary {
     /// `Utc::now()` on every reconstruction.
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
-    /// [`crate::conversation::Conversation::title`] of the session, from its first user message.
+    /// The title a user set, else [`crate::conversation::Conversation::title`], the first user
+    /// message's words. One string, because every surface labels a session with it and none of
+    /// them asks which it was.
     pub(crate) title: String,
     /// Working directory captured at session creation. `None` when an archive omitted one and
     /// [`Store::import_sessions`] stored that absence verbatim; ACP-facing code falls
@@ -158,6 +168,9 @@ pub(crate) struct SessionSummary {
     /// receiving a flat list in which a sub-agent is indistinguishable from the agent that
     /// dispatched it.
     pub(crate) parent_id: Option<Uuid>,
+    /// When the session was pinned (RFC 3339), or `None` for one that is not. A listing puts the
+    /// pinned sessions first, newest pin on top.
+    pub(crate) pinned_at: Option<String>,
 }
 /// What a sweep over many sessions did, so its caller can say what it left behind.
 ///
@@ -176,8 +189,9 @@ pub(crate) struct SessionSweep {
 /// leaves that column alone.
 ///
 /// One shape for every writer, so the `updated_at` rule is stated once rather than once per
-/// column. The profile is a name and nothing else, because a profile is an indivisible bundle and
-/// the name is the whole binding.
+/// column: the timestamp moves with the fields that change what the session runs as, and not
+/// with its label or its pin ([`Self::moves_updated_at`]). The profile is a name and nothing
+/// else, because a profile is an indivisible bundle and the name is the whole binding.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct SessionPatch {
     pub(crate) permission: Option<Permission>,
@@ -188,15 +202,28 @@ pub(crate) struct SessionPatch {
     /// Per the ACP spec a non-empty `additionalDirectories` "is the complete resulting
     /// additional-root list", while omitted or empty means none are activated.
     pub(crate) roots: Option<Vec<PathBuf>>,
+    /// The title as [`normalize_title`] settled it: `Some(None)` clears it, so the session is
+    /// labeled by its first words again.
+    pub(crate) title: Option<Option<String>>,
+    /// Pin or unpin. Pinning an already pinned session keeps its original `pinned_at`.
+    pub(crate) pinned: Option<bool>,
 }
 impl SessionPatch {
     /// Whether the patch moves nothing.
     pub(crate) fn is_empty(&self) -> bool {
-        self.permission.is_none()
-            && self.approvals.is_none()
-            && self.cwd.is_none()
-            && self.profile.is_none()
-            && self.roots.is_none()
+        !self.moves_updated_at() && self.title.is_none() && self.pinned.is_none()
+    }
+
+    /// Whether the patch names a field that changes what the session runs as.
+    ///
+    /// Only those move `updated_at`: the listing's order and `meka -c` key on it, so renaming or
+    /// pinning a session from months ago must not make it the one `-c` continues.
+    pub(crate) fn moves_updated_at(&self) -> bool {
+        self.permission.is_some()
+            || self.approvals.is_some()
+            || self.cwd.is_some()
+            || self.profile.is_some()
+            || self.roots.is_some()
     }
 }
 impl std::fmt::Display for SessionPatch {
@@ -220,6 +247,14 @@ impl std::fmt::Display for SessionPatch {
         }
         if let Some(roots) = &self.roots {
             parts.push(format!("{} additional root(s)", roots.len()));
+        }
+        match &self.title {
+            Some(Some(title)) => parts.push(format!("title '{title}'")),
+            Some(None) => parts.push("no title".to_string()),
+            None => {}
+        }
+        if let Some(pinned) = self.pinned {
+            parts.push(if pinned { "pinned" } else { "unpinned" }.to_string());
         }
         if parts.is_empty() {
             return formatter.write_str("nothing");
@@ -276,6 +311,30 @@ pub(super) const NOT_SPOKEN_FOR_BY_A_SCHEDULE: &str = "id NOT IN (SELECT session
          ) \
          SELECT id FROM ancestors \
      )";
+
+/// What the retention sweep may take: a session nobody pinned and no schedule speaks for.
+///
+/// A pin spares the whole parent chain, as a schedule does and for the same reason: a pinned
+/// sub-agent session is cascaded away with a root that expires, so sparing the row alone would
+/// not keep it. [`NOT_SPOKEN_FOR_BY_A_SCHEDULE`] with the pin ahead of it, built once because the
+/// sweep applies it in two statements that are only sound while they agree.
+static EXPIRABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "pinned_at IS NULL \
+         AND id NOT IN ( \
+             WITH RECURSIVE kept(id) AS ( \
+                 SELECT parent_session_id FROM sessions \
+                   WHERE parent_session_id IS NOT NULL AND pinned_at IS NOT NULL \
+                 UNION \
+                 SELECT s.parent_session_id FROM sessions s \
+                   JOIN kept k ON s.id = k.id \
+                  WHERE s.parent_session_id IS NOT NULL \
+             ) \
+             SELECT id FROM kept \
+         ) \
+         AND {NOT_SPOKEN_FOR_BY_A_SCHEDULE}"
+    )
+});
 /// How many sessions a prefix scan fetches before it stops counting.
 ///
 /// A resolution needs at most two: one match resolves, and any second makes it ambiguous. The rest
@@ -329,6 +388,41 @@ static TITLE_ROW_WHERE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
         block_words = is_words("json_extract(json_each.value, '$.text')"),
     )
 });
+/// Characters a title a user sets may hold. Generous next to the 80 a derived title is cut to,
+/// since this one is typed rather than lifted from a message, and the listing cuts it to fit
+/// anyway.
+const TITLE_MAX_CHARS: usize = 200;
+
+/// A title as every door that sets one accepts it: control characters dropped, since a title
+/// reaches terminals and nothing in one is meant to be obeyed; whitespace runs collapsed to one
+/// space, so the label is one line; empty after that means "clear", which is `None`; longer
+/// than [`TITLE_MAX_CHARS`] is refused rather than cut, because the user typed it and would not
+/// see where it was shortened.
+pub(crate) fn normalize_title(raw: &str) -> Result<Option<String>> {
+    let title = raw
+        .chars()
+        .filter(|character| !character.is_control() || character.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        return Ok(None);
+    }
+    if title.chars().count() > TITLE_MAX_CHARS {
+        return Err(MekaError::Usage(format!(
+            "a session title is at most {TITLE_MAX_CHARS} characters"
+        )));
+    }
+    Ok(Some(title))
+}
+
+/// The title every surface shows: the one a user set, else the first words a user said, from the
+/// row [`TITLE_ROW_WHERE_SQL`] selected.
+fn effective_title(set: Option<String>, session: &str, kind: &str, content: String) -> String {
+    set.unwrap_or_else(|| title_of_first_user_row(session, kind, content))
+}
+
 /// A session's title from the row [`TITLE_ROW_WHERE_SQL`] selects, through the one definition in
 /// [`crate::conversation::Conversation::title`]. A `user_blocks` row holds the message's blocks as
 /// JSON; a `user` row is the text itself.
@@ -446,9 +540,6 @@ pub(super) fn decode_event_from_row(
         _ => Ok(None),
     }
 }
-/// Pagination cursor for [`Store::list_sessions`]: encodes the `(updated_at, id)` of the
-/// last row in a page as base64-url JSON. The shape is opaque to clients; they only round-trip it
-/// back as `next_cursor`.
 /// Which rows of a session's log a read takes.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum RowRange {
@@ -489,19 +580,30 @@ fn decode_rows(stored: Vec<StoredMessage>) -> Vec<(String, crate::conversation::
     events
 }
 
+/// Pagination cursor for [`Store::list_sessions`]: a page's last row in the listing's own order,
+/// as base64-url JSON. The shape is opaque to clients; they only round-trip it back as
+/// `next_cursor`.
 #[derive(Serialize, Deserialize)]
 pub(super) struct ListSessionsCursor {
-    #[serde(rename = "u")]
-    pub(super) updated_at: String,
+    /// Whether the row was pinned, which is the group it was listed in.
+    #[serde(rename = "p")]
+    pub(super) pinned: bool,
+    /// The time its group is ordered by: `pinned_at` for a pinned row, else `updated_at`.
+    #[serde(rename = "k")]
+    pub(super) key: String,
     #[serde(rename = "i")]
     pub(super) id: String,
 }
-/// A page's last `(updated_at, id)` as the opaque token a client hands back.
-pub(super) fn encode_list_cursor(updated_at: &str, id: &str) -> String {
+/// A page's last row, in the listing's own order, as the opaque token a client hands back.
+pub(super) fn encode_list_cursor(row: &SessionSummary) -> String {
     use base64::Engine;
     let payload = ListSessionsCursor {
-        updated_at: updated_at.to_string(),
-        id: id.to_string(),
+        pinned: row.pinned_at.is_some(),
+        key: row
+            .pinned_at
+            .clone()
+            .unwrap_or_else(|| row.updated_at.clone()),
+        id: row.id.to_string(),
     };
     #[allow(
         clippy::expect_used,
@@ -511,15 +613,14 @@ pub(super) fn encode_list_cursor(updated_at: &str, id: &str) -> String {
         .expect("ListSessionsCursor is two owned Strings; serialization cannot fail");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
 }
-/// The `(updated_at, id)` a client's token encodes, refused when it is not one this made.
-pub(super) fn decode_list_cursor(token: &str) -> Result<(String, String)> {
+/// The row a client's token encodes, refused when it is not one this made.
+pub(super) fn decode_list_cursor(token: &str) -> Result<ListSessionsCursor> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(token)
         .map_err(|error| MekaError::Database(format!("invalid list cursor: {error}")))?;
-    let cursor: ListSessionsCursor = serde_json::from_slice(&bytes)
-        .map_err(|error| MekaError::Database(format!("invalid list cursor: {error}")))?;
-    Ok((cursor.updated_at, cursor.id))
+    serde_json::from_slice(&bytes)
+        .map_err(|error| MekaError::Database(format!("invalid list cursor: {error}")))
 }
 /// Encode an additional-root list for the `additional_roots_json` column. `None` for the empty case
 /// keeps "no extra roots" as NULL, so the column has one representation for one meaning rather than
@@ -1168,7 +1269,7 @@ impl Store {
                          input_tokens, output_tokens,
                          cache_creation_input_tokens, cache_read_input_tokens,
                          redactions, redacted_images, redacted_bytes,
-                         context_tokens
+                         context_tokens, title
                      )
                      SELECT ?1, ?2, ?2, parent_session_id, subagent_spec_json,
                             COALESCE(?3, cwd), permission, approvals,
@@ -1178,7 +1279,7 @@ impl Store {
                             input_tokens, output_tokens,
                             cache_creation_input_tokens, cache_read_input_tokens,
                             redactions, redacted_images, redacted_bytes,
-                            context_tokens
+                            context_tokens, title
                      FROM sessions WHERE id = ?7",
                     rusqlite::params![
                         new_id_string,
@@ -1205,10 +1306,6 @@ impl Store {
                         "SELECT id, kind, content, created_at FROM messages \
                          WHERE session_id = ?1 ORDER BY id ASC",
                     )?;
-                    let mut insert = transaction.prepare(
-                        "INSERT INTO messages (session_id, kind, content, created_at) \
-                         VALUES (?1, ?2, ?3, ?4)",
-                    )?;
                     let mut link = transaction.prepare(
                         "INSERT OR IGNORE INTO message_blobs (message_id, hash) \
                          SELECT ?1, hash FROM message_blobs WHERE message_id = ?2",
@@ -1223,16 +1320,14 @@ impl Store {
                     })?;
                     for row in rows {
                         let (source_message_id, kind, content, created_at) = row?;
-                        insert.execute(rusqlite::params![
-                            new_id_string,
-                            kind,
-                            content,
-                            created_at
-                        ])?;
-                        link.execute(rusqlite::params![
-                            transaction.last_insert_rowid(),
-                            source_message_id
-                        ])?;
+                        let message_id = super::search::insert_message(
+                            &transaction,
+                            &new_id_string,
+                            &kind,
+                            &content,
+                            &created_at,
+                        )?;
+                        link.execute(rusqlite::params![message_id, source_message_id])?;
                     }
                 }
                 transaction.execute(
@@ -1311,10 +1406,7 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let transaction = connection.transaction()?;
-                transaction.execute(
-                    "INSERT INTO messages (session_id, kind, content, created_at) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![session_id, kind, content, &now],
-                )?;
+                super::search::insert_message(&transaction, &session_id, &kind, &content, &now)?;
                 super::inbox::reset_pending_in(&transaction, &ids, &not_before)?;
                 transaction.execute(
                     "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
@@ -1372,16 +1464,15 @@ impl Store {
             .call(move |connection| -> rusqlite::Result<_> {
                 let transaction = connection.transaction()?;
                 super::blobs::insert_blobs(&transaction, &blobs, &now)?;
-                {
-                    let mut insert = transaction.prepare(
-                        "INSERT INTO messages (session_id, kind, content, created_at) \
-                         VALUES (?1, ?2, ?3, ?4)",
+                for (kind, content, references) in &encoded {
+                    let message_id = super::search::insert_message(
+                        &transaction,
+                        &session_id_str,
+                        kind,
+                        content,
+                        &now,
                     )?;
-                    for (kind, content, references) in &encoded {
-                        insert.execute(rusqlite::params![session_id_str, kind, content, now])?;
-                        let message_id = transaction.last_insert_rowid();
-                        super::blobs::link_message_blobs(&transaction, message_id, references)?;
-                    }
+                    super::blobs::link_message_blobs(&transaction, message_id, references)?;
                 }
                 super::inbox::stamp_appended(&transaction, &appended, &now)?;
                 transaction.execute(
@@ -1432,6 +1523,8 @@ impl Store {
             additional_roots_json: Option<String>,
             subagent_spec_json: Option<String>,
             profile: String,
+            title: Option<String>,
+            pinned_at: Option<String>,
             stats: crate::stats::SessionStatsSnapshot,
             events: Vec<(String, String, String, Vec<String>)>,
             scratchpad_entries: Vec<(String, String)>,
@@ -1476,6 +1569,8 @@ impl Store {
                 additional_roots_json: encode_additional_roots(&record.additional_roots)?,
                 subagent_spec_json: record.subagent_spec_json,
                 profile: record.profile,
+                title: record.title,
+                pinned_at: record.pinned_at,
                 stats: record.stats,
                 events,
                 scratchpad_entries: record.scratchpad_entries,
@@ -1529,8 +1624,9 @@ impl Store {
                              profile, approvals,
                              turns, input_tokens, output_tokens,
                              cache_creation_input_tokens, cache_read_input_tokens,
-                             redactions, redacted_images, redacted_bytes
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                             redactions, redacted_images, redacted_bytes,
+                             title, pinned_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                         rusqlite::params![
                             session.id,
                             session.created_at,
@@ -1551,13 +1647,11 @@ impl Store {
                             session.stats.redactions as i64,
                             session.stats.redacted_images as i64,
                             session.stats.redacted_bytes as i64,
+                            session.title,
+                            session.pinned_at,
                         ],
                     )?;
                     {
-                        let mut insert_event = transaction.prepare(
-                            "INSERT INTO messages (session_id, kind, content, created_at) \
-                             VALUES (?1, ?2, ?3, ?4)",
-                        )?;
                         for (kind, content, created_at, references) in &session.events {
                             // Refused rather than linked to nothing: a reference the archive did
                             // not carry and the store does not hold would be an image no reader
@@ -1568,13 +1662,13 @@ impl Store {
                                      carry and this store does not hold"
                                 )));
                             }
-                            insert_event.execute(rusqlite::params![
-                                session.id,
+                            let message_id = super::search::insert_message(
+                                &transaction,
+                                &session.id,
                                 kind,
                                 content,
-                                created_at
-                            ])?;
-                            let message_id = transaction.last_insert_rowid();
+                                created_at,
+                            )?;
                             super::blobs::link_message_blobs(&transaction, message_id, references)?;
                         }
                     }
@@ -1733,7 +1827,7 @@ impl Store {
                      )
                      SELECT s.id, s.parent_session_id, s.created_at, s.updated_at,
                             s.cwd, s.permission, s.capabilities_json, s.additional_roots_json,
-                            s.subagent_spec_json, s.profile, s.approvals
+                            s.subagent_spec_json, s.profile, s.approvals, s.title, s.pinned_at
                      FROM sessions s JOIN tree ON s.id = tree.id
                      ORDER BY tree.depth ASC, s.created_at ASC, s.id ASC",
                 )?;
@@ -1764,6 +1858,8 @@ impl Store {
                         subagent_spec_json: row.get(8)?,
                         profile: row.get(9)?,
                         approvals: row.get(10)?,
+                        title: row.get(11)?,
+                        pinned_at: row.get(12)?,
                     })
                 })?;
                 let mut out = Vec::new();
@@ -1816,11 +1912,13 @@ impl Store {
                 // expired by the retention sweep despite the turn that wrote it.
                 let transaction = connection.transaction()?;
                 super::blobs::insert_blobs(&transaction, &blobs, &now)?;
-                transaction.execute(
-                    "INSERT INTO messages (session_id, kind, content, created_at) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![session_id.to_string(), kind, content, &now],
+                let message_id = super::search::insert_message(
+                    &transaction,
+                    &session_id.to_string(),
+                    &kind,
+                    &content,
+                    &now,
                 )?;
-                let message_id = transaction.last_insert_rowid();
                 super::blobs::link_message_blobs(&transaction, message_id, &references)?;
                 super::inbox::stamp_appended(&transaction, &appended_inbox_items, &now)?;
                 transaction.execute(
@@ -1949,10 +2047,7 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let transaction = connection.transaction()?;
-                transaction.execute(
-                    "INSERT INTO messages (session_id, kind, content, created_at) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![session_id, kind, content, &now],
-                )?;
+                super::search::insert_message(&transaction, &session_id, &kind, &content, &now)?;
                 super::inbox::reset_appended_in(&transaction, &session_id)?;
                 transaction.execute(
                     "UPDATE sessions SET context_tokens = NULL, updated_at = ?1 WHERE id = ?2",
@@ -2207,7 +2302,8 @@ impl Store {
             })
     }
 
-    /// List sessions, most-recent first. When `include_children` is `false`, sub-agent sessions
+    /// List sessions: the pinned ones first, newest pin on top, then the rest most recently updated
+    /// first. When `include_children` is `false`, sub-agent sessions
     /// (rows with non-NULL `parent_session_id`) are hidden; they're persisted for audit/debug but
     /// shouldn't clutter the user's view of their own conversations. Set to `true` to surface them,
     /// e.g. via `meka session list --include-children`.
@@ -2217,7 +2313,7 @@ impl Store {
     /// `create_session(None, "test-profile".to_string())` recorded no cwd to match against.
     ///
     /// `cursor`, if `Some`, is a previous `next_cursor` value from this method; rows are returned
-    /// strictly *after* the cursor in `(updated_at, id) DESC` order. Returns `(rows, next_cursor)`;
+    /// strictly *after* the cursor in the listing's order. Returns `(rows, next_cursor)`;
     /// `next_cursor` is `Some` iff there is at least one more row past `limit`. Invalid cursors
     /// are rejected with [`MekaError::Database`].
     pub(crate) async fn list_sessions(
@@ -2249,11 +2345,15 @@ impl Store {
                     clauses.push("s.cwd = :cwd");
                 }
                 if cursor_decoded.is_some() {
-                    // Keyset on (updated_at, id) DESC: strictly past the cursor row. Tie-break on
-                    // id keeps pagination stable when multiple sessions share an updated_at.
+                    // Keyset on the listing's own order, strictly past the cursor row: the pinned
+                    // group first, each group by its time, and the id as the tie-break so two
+                    // sessions sharing a timestamp page stably.
                     clauses.push(
-                        "(s.updated_at < :cursor_updated_at \
-                          OR (s.updated_at = :cursor_updated_at AND s.id < :cursor_id))",
+                        "((s.pinned_at IS NOT NULL) < :cursor_pinned \
+                          OR ((s.pinned_at IS NOT NULL) = :cursor_pinned \
+                              AND (COALESCE(s.pinned_at, s.updated_at) < :cursor_key \
+                                   OR (COALESCE(s.pinned_at, s.updated_at) = :cursor_key \
+                                       AND s.id < :cursor_id))))",
                     );
                 }
                 let where_clause = if clauses.is_empty() {
@@ -2264,6 +2364,7 @@ impl Store {
                 let title_row = TITLE_ROW_WHERE_SQL.as_str();
                 let query = format!(
                     "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id, s.profile, s.approvals,
+                            s.title, s.pinned_at,
                             COALESCE(
                               (SELECT content FROM messages
                                WHERE {title_row}
@@ -2278,7 +2379,9 @@ impl Store {
                             ) AS title_kind
                      FROM sessions s
                      {where_clause}
-                     ORDER BY s.updated_at DESC, s.id DESC
+                     ORDER BY (s.pinned_at IS NOT NULL) DESC,
+                              COALESCE(s.pinned_at, s.updated_at) DESC,
+                              s.id DESC
                      LIMIT :limit",
                 );
                 let mut statement = connection.prepare(&query)?;
@@ -2291,9 +2394,10 @@ impl Store {
                 if let Some(ref cwd) = cwd_filter_string {
                     params.push((":cwd", cwd));
                 }
-                if let Some((ref updated_at, ref id)) = cursor_decoded {
-                    params.push((":cursor_updated_at", updated_at));
-                    params.push((":cursor_id", id));
+                if let Some(cursor) = &cursor_decoded {
+                    params.push((":cursor_pinned", &cursor.pinned));
+                    params.push((":cursor_key", &cursor.key));
+                    params.push((":cursor_id", &cursor.id));
                 }
 
                 let rows = statement.query_map(params.as_slice(), |row| {
@@ -2308,8 +2412,10 @@ impl Store {
                     let parent_id: Option<String> = row.get(8)?;
                     let profile: String = row.get(9)?;
                     let approvals: bool = row.get(10)?;
-                    let title_kind: String = row.get(12)?;
-                    let title = title_of_first_user_row(&id_str, &title_kind, row.get(11)?);
+                    let set_title: Option<String> = row.get(11)?;
+                    let pinned_at: Option<String> = row.get(12)?;
+                    let title_kind: String = row.get(14)?;
+                    let title = effective_title(set_title, &id_str, &title_kind, row.get(13)?);
                     Ok((
                         id_str,
                         created_at,
@@ -2323,6 +2429,7 @@ impl Store {
                         profile,
                         approvals,
                         title,
+                        pinned_at,
                     ))
                 })?;
 
@@ -2341,6 +2448,7 @@ impl Store {
                         profile,
                         approvals,
                         title,
+                        pinned_at,
                     ) = row?;
                     let id = Uuid::parse_str(&id_str).map_err(|error| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
@@ -2361,6 +2469,7 @@ impl Store {
                         additional_roots: decode_additional_roots(additional_roots_json.as_deref()),
                         token_id,
                         parent_id: parent_id.as_deref().and_then(|raw| Uuid::parse_str(raw).ok()),
+                        pinned_at,
                     });
                 }
                 Ok(summaries)
@@ -2369,8 +2478,7 @@ impl Store {
             .map(|mut rows| {
                 let next_cursor = if rows.len() > limit as usize {
                     rows.truncate(limit as usize);
-                    rows.last()
-                        .map(|row| encode_list_cursor(&row.updated_at, &row.id.to_string()))
+                    rows.last().map(encode_list_cursor)
                 } else {
                     None
                 };
@@ -2388,6 +2496,7 @@ impl Store {
                 let title_row = TITLE_ROW_WHERE_SQL.as_str();
                 let mut statement = connection.prepare(&format!(
                     "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id, s.profile, s.approvals,
+                            s.title, s.pinned_at,
                             COALESCE(
                               (SELECT content FROM messages
                                WHERE {title_row}
@@ -2415,8 +2524,10 @@ impl Store {
                     let parent_id: Option<String> = row.get(8)?;
                     let profile: String = row.get(9)?;
                     let approvals: bool = row.get(10)?;
-                    let title_kind: String = row.get(12)?;
-                    let title = title_of_first_user_row(&id_str, &title_kind, row.get(11)?);
+                    let set_title: Option<String> = row.get(11)?;
+                    let pinned_at: Option<String> = row.get(12)?;
+                    let title_kind: String = row.get(14)?;
+                    let title = effective_title(set_title, &id_str, &title_kind, row.get(13)?);
                     Ok((
                         id_str,
                         created_at,
@@ -2430,6 +2541,7 @@ impl Store {
                         profile,
                         approvals,
                         title,
+                        pinned_at,
                     ))
                 })?;
                 match rows.next() {
@@ -2447,6 +2559,7 @@ impl Store {
                             profile,
                             approvals,
                             title,
+                            pinned_at,
                         ) = row?;
                         let id = Uuid::parse_str(&id_str).map_err(|error| {
                             rusqlite::Error::InvalidParameterName(error.to_string())
@@ -2471,6 +2584,7 @@ impl Store {
                             parent_id: parent_id
                                 .as_deref()
                                 .and_then(|raw| Uuid::parse_str(raw).ok()),
+                            pinned_at,
                         }))
                     }
                     None => Ok(None),
@@ -2505,6 +2619,26 @@ impl Store {
             return Err(MekaError::SessionNotFound(session_id));
         };
         Ok((lock, summary))
+    }
+
+    /// Make `session` a sub-agent of `parent`, for tests about what a listing or a search hides.
+    #[cfg(test)]
+    pub(crate) async fn mark_spawned_for_test(&self, session: Uuid, parent: Uuid) {
+        self.run_sql_for_test(&format!(
+            "UPDATE sessions SET parent_session_id = '{parent}' WHERE id = '{session}'"
+        ))
+        .await;
+    }
+
+    /// Run one statement against the store, for a test that has to damage or inspect it in a
+    /// way no door offers.
+    #[cfg(test)]
+    pub(crate) async fn run_sql_for_test(&self, sql: &str) {
+        let sql = sql.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> { connection.execute_batch(&sql) })
+            .await
+            .expect("the statement runs");
     }
 
     /// Backdate a session's `updated_at`, for tests that need one to look old to the retention
@@ -2583,9 +2717,10 @@ impl Store {
                 // FK CASCADE sweeps messages, scratchpad entries, and any sub-agent child sessions
                 // of the expired parents.
                 //
-                // A session with a scheduled job still ahead of it is *not* expired, whatever
-                // `updated_at` says; `NOT_SPOKEN_FOR_BY_A_SCHEDULE` says why the whole parent
-                // chain of a job-owning session is spared.
+                // A pinned session is never expired: a pin is the user saying keep this. Nor is a
+                // session with a scheduled job still ahead of it, whatever `updated_at` says;
+                // `NOT_SPOKEN_FOR_BY_A_SCHEDULE` says why the whole parent chain of a job-owning
+                // session is spared.
                 //
                 // Selected rather than deleted outright, because which of these rows may go is not
                 // a question the database can answer: it depends on which of them another process
@@ -2593,8 +2728,9 @@ impl Store {
                 // inside the delete, so splitting one statement into two does not open a window
                 // where a job created in between is cascaded away by a decision taken before it
                 // existed.
+                let expirable = EXPIRABLE.as_str();
                 let mut statement = connection.prepare(&format!(
-                    "SELECT id FROM sessions WHERE updated_at < ?1 AND {NOT_SPOKEN_FOR_BY_A_SCHEDULE}"
+                    "SELECT id FROM sessions WHERE updated_at < ?1 AND {expirable}"
                 ))?;
                 let ids = statement
                     .query_map(rusqlite::params![cutoff_str], |row| row.get::<_, String>(0))?
@@ -2611,7 +2747,7 @@ impl Store {
 
         self.delete_the_unattached_among(
             &expired,
-            NOT_SPOKEN_FOR_BY_A_SCHEDULE,
+            EXPIRABLE.as_str(),
             Some(cutoff_for_delete.as_str()),
         )
         .await
@@ -2733,12 +2869,15 @@ impl Store {
         if patch.is_empty() {
             return Ok(());
         }
+        let moves_updated_at = patch.moves_updated_at();
         let SessionPatch {
             permission,
             approvals,
             cwd,
             profile,
             roots,
+            title,
+            pinned,
         } = patch;
         let permission = permission.map(|level| level.to_string());
         let cwd = cwd.map(|path| path.to_string_lossy().into_owned());
@@ -2748,15 +2887,18 @@ impl Store {
             None => None,
         };
         let id = session_id.to_string();
-        let updated_at = chrono::Utc::now().to_rfc3339();
+        let now = chrono::Utc::now().to_rfc3339();
         let changed = self
             .connection
             .call(move |connection| -> rusqlite::Result<usize> {
                 // Column names come from this list and never from a caller; only the values are
                 // bound.
-                let mut assignments = vec!["updated_at = :updated_at"];
-                let mut params: Vec<(&str, &dyn rusqlite::ToSql)> =
-                    vec![(":updated_at", &updated_at), (":id", &id)];
+                let mut assignments = Vec::new();
+                let mut params: Vec<(&str, &dyn rusqlite::ToSql)> = vec![(":id", &id)];
+                if moves_updated_at {
+                    assignments.push("updated_at = :now");
+                    params.push((":now", &now));
+                }
                 if let Some(permission) = &permission {
                     assignments.push("permission = :permission");
                     params.push((":permission", permission));
@@ -2776,6 +2918,22 @@ impl Store {
                 if let Some(roots) = &roots {
                     assignments.push("additional_roots_json = :roots");
                     params.push((":roots", roots));
+                }
+                if let Some(title) = &title {
+                    assignments.push("title = :title");
+                    params.push((":title", title));
+                }
+                match pinned {
+                    // A pin already set keeps its time, so re-pinning does not move the session
+                    // among the pins.
+                    Some(true) => {
+                        assignments.push("pinned_at = COALESCE(pinned_at, :now)");
+                        if !moves_updated_at {
+                            params.push((":now", &now));
+                        }
+                    }
+                    Some(false) => assignments.push("pinned_at = NULL"),
+                    None => {}
                 }
                 connection.execute(
                     &format!(
@@ -2938,6 +3096,305 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn plain_session(store: &Store, words: &str) -> Uuid {
+        let id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        store.save_message(id, "user", words).await.expect("seed");
+        id
+    }
+
+    async fn row(store: &Store, id: Uuid) -> SessionSummary {
+        store
+            .session_info(id)
+            .await
+            .expect("read")
+            .expect("the row exists")
+    }
+
+    /// A title someone set is the label every reader shows; cleared, the first words are again.
+    #[tokio::test]
+    async fn a_set_title_labels_the_session_and_an_empty_one_clears_it() {
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "first words here").await;
+        assert_eq!(row(&store, id).await.title, "first words here");
+
+        store
+            .update_session(id, SessionPatch {
+                title: Some(normalize_title("  Research   notes ").expect("a title")),
+                ..Default::default()
+            })
+            .await
+            .expect("title");
+        assert_eq!(row(&store, id).await.title, "Research notes");
+        let (listed, _) = store
+            .list_sessions(10, false, None, None)
+            .await
+            .expect("list");
+        assert_eq!(
+            listed[0].title, "Research notes",
+            "the listing reads the same label"
+        );
+        assert_eq!(
+            store.load_session_tree(id).await.expect("tree")[0]
+                .title
+                .as_deref(),
+            Some("Research notes"),
+            "and an export carries the set title, not the effective one"
+        );
+
+        store
+            .update_session(id, SessionPatch {
+                title: Some(None),
+                ..Default::default()
+            })
+            .await
+            .expect("clear");
+        assert_eq!(row(&store, id).await.title, "first words here");
+    }
+
+    /// Whitespace runs collapse, nothing is a clear, and past the cap the title is refused rather
+    /// than cut.
+    #[test]
+    fn a_title_is_one_line_or_nothing_and_never_over_the_cap() {
+        assert_eq!(
+            normalize_title(" a \n  b\tc ").expect("a title"),
+            Some("a b c".to_string())
+        );
+        assert_eq!(
+            normalize_title("red\u{1b}[31m alert\u{7}").expect("a title"),
+            Some("red[31m alert".to_string()),
+            "an escape is dropped, not obeyed by the next terminal that prints the title"
+        );
+        assert_eq!(normalize_title(" \n ").expect("a clear"), None);
+        assert!(normalize_title(&"x".repeat(TITLE_MAX_CHARS)).is_ok());
+        assert!(matches!(
+            normalize_title(&"x".repeat(TITLE_MAX_CHARS + 1)),
+            Err(MekaError::Usage(_))
+        ));
+    }
+
+    /// The listing's order and `meka -c` key on `updated_at`, so a label or a pin must not touch
+    /// it, while a field the session runs as still does.
+    #[tokio::test]
+    async fn a_title_or_a_pin_leaves_updated_at_where_it_was() {
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "words").await;
+        let old = "2020-01-01T00:00:00+00:00";
+        store
+            .set_session_updated_at_for_test(id, old)
+            .await
+            .expect("backdate");
+
+        store
+            .update_session(id, SessionPatch {
+                title: Some(Some("a label".to_string())),
+                pinned: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("label and pin");
+        let labeled = row(&store, id).await;
+        assert_eq!(labeled.updated_at, old);
+        assert!(labeled.pinned_at.is_some());
+
+        store
+            .update_session(id, SessionPatch {
+                pinned: Some(false),
+                ..Default::default()
+            })
+            .await
+            .expect("unpin");
+        let unpinned = row(&store, id).await;
+        assert_eq!(unpinned.updated_at, old);
+        assert_eq!(unpinned.pinned_at, None);
+
+        store
+            .update_session(id, SessionPatch {
+                approvals: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("move");
+        assert_ne!(row(&store, id).await.updated_at, old);
+    }
+
+    /// Pinned first, newest pin on top, the rest by recency; a page cursor walks that same order;
+    /// re-pinning keeps a pin's place.
+    #[tokio::test]
+    async fn pinned_sessions_list_first_newest_pin_on_top_and_page_in_that_order() {
+        let store = Store::for_test().await;
+        let mut ids = Vec::new();
+        for day in 1..=4 {
+            let id = plain_session(&store, "words").await;
+            store
+                .set_session_updated_at_for_test(id, &format!("2026-01-0{day}T00:00:00+00:00"))
+                .await
+                .expect("backdate");
+            ids.push(id);
+        }
+        for (id, pinned_at) in [
+            (ids[0], "2026-03-01T00:00:00+00:00"),
+            (ids[1], "2026-03-02T00:00:00+00:00"),
+        ] {
+            store
+                .update_session(id, SessionPatch {
+                    pinned: Some(true),
+                    ..Default::default()
+                })
+                .await
+                .expect("pin");
+            store
+                .run_sql_for_test(&format!(
+                    "UPDATE sessions SET pinned_at = '{pinned_at}' WHERE id = '{id}'"
+                ))
+                .await;
+        }
+        let expected = vec![ids[1], ids[0], ids[3], ids[2]];
+
+        let (listed, next) = store
+            .list_sessions(10, false, None, None)
+            .await
+            .expect("list");
+        assert_eq!(
+            listed.iter().map(|row| row.id).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(next.is_none());
+
+        let mut paged = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let (page, next) = store
+                .list_sessions(1, false, None, cursor.as_deref())
+                .await
+                .expect("page");
+            paged.extend(page.iter().map(|row| row.id));
+            match next {
+                Some(token) => cursor = Some(token),
+                None => break,
+            }
+        }
+        assert_eq!(paged, expected, "one row per page, in the listing's order");
+
+        store
+            .update_session(ids[0], SessionPatch {
+                pinned: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("re-pin");
+        assert_eq!(
+            row(&store, ids[0]).await.pinned_at.as_deref(),
+            Some("2026-03-01T00:00:00+00:00"),
+            "pinning a pinned session keeps its time"
+        );
+    }
+
+    /// A pin is a keep: the sweep leaves a pinned session alone whatever its age, and the parent
+    /// chain of a pinned sub-agent session with it, since the cascade would take the child; only
+    /// `--all` takes them.
+    #[tokio::test]
+    async fn the_retention_sweep_spares_a_pinned_session_and_the_parents_of_one() {
+        let store = Store::for_test().await;
+        let pinned = plain_session(&store, "kept").await;
+        let plain = plain_session(&store, "swept").await;
+        let root = plain_session(&store, "kept for its child").await;
+        let child = plain_session(&store, "a pinned sub-agent session").await;
+        store.mark_spawned_for_test(child, root).await;
+        let old = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
+        for id in [pinned, plain, root, child] {
+            store
+                .set_session_updated_at_for_test(id, &old)
+                .await
+                .expect("backdate");
+        }
+        for id in [pinned, child] {
+            store
+                .update_session(id, SessionPatch {
+                    pinned: Some(true),
+                    ..Default::default()
+                })
+                .await
+                .expect("pin");
+        }
+
+        let sweep = store
+            .delete_expired_sessions(std::time::Duration::from_secs(30 * 86_400))
+            .await
+            .expect("sweep");
+        assert_eq!(sweep.deleted, 1);
+        assert!(store.session_exists(pinned).await.expect("exists"));
+        assert!(store.session_exists(root).await.expect("exists"));
+        assert!(store.session_exists(child).await.expect("exists"));
+        assert!(!store.session_exists(plain).await.expect("exists"));
+
+        let all = store.delete_all_sessions().await.expect("delete all");
+        assert_eq!(
+            all.deleted, 2,
+            "`--all` means every session, pinned included; the child goes with its root and is \
+             not counted twice"
+        );
+        assert!(!store.session_exists(child).await.expect("exists"));
+    }
+
+    /// The copy names the same conversation, so it keeps the title; it is a new session, so it
+    /// starts unpinned. An import restores both as the archive carried them.
+    #[tokio::test]
+    async fn a_fork_keeps_the_title_and_starts_unpinned_and_an_import_restores_both() {
+        let store = Store::for_test().await;
+        let source = plain_session(&store, "words").await;
+        store
+            .update_session(source, SessionPatch {
+                title: Some(Some("Kept".to_string())),
+                pinned: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("label and pin");
+
+        let copy = store
+            .fork_session_for_test(source, ForkOverrides::default())
+            .await
+            .expect("fork")
+            .expect("the source exists");
+        let copied = row(&store, copy.id).await;
+        assert_eq!(copied.title, "Kept");
+        assert_eq!(copied.pinned_at, None);
+
+        let imported = Uuid::new_v4();
+        store
+            .import_sessions(
+                vec![ImportSessionRecord {
+                    new_id: imported,
+                    new_parent_id: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    cwd: None,
+                    permission: crate::permission::Permission::Read,
+                    approvals: false,
+                    capabilities_json: None,
+                    additional_roots: Vec::new(),
+                    subagent_spec_json: None,
+                    profile: "test-profile".to_string(),
+                    title: Some("From the archive".to_string()),
+                    pinned_at: Some("2026-02-02T00:00:00+00:00".to_string()),
+                    stats: Default::default(),
+                    events: Vec::new(),
+                    scratchpad_entries: Vec::new(),
+                }],
+                Vec::new(),
+            )
+            .await
+            .expect("import");
+        let restored = row(&store, imported).await;
+        assert_eq!(restored.title, "From the archive");
+        assert_eq!(
+            restored.pinned_at.as_deref(),
+            Some("2026-02-02T00:00:00+00:00")
+        );
+    }
 
     /// The regression this whole arrangement exists for: a session created on one profile must
     /// still name that profile afterwards, so resuming it does not silently move the conversation.
@@ -3808,6 +4265,11 @@ mod tests {
             // Copied by a fork: the copy holds the same conversation, so it starts as full as the
             // source was, and its first turn is checked against that rather than an estimate.
             "context_tokens",
+            // Copied by a fork: the label names the conversation, which the copy holds too.
+            "title",
+            // Reset by a fork: a pin is the user's choice about one session, and the copy is a
+            // new one they have not made it about.
+            "pinned_at",
         ]);
     }
 
@@ -3832,6 +4294,8 @@ mod tests {
                     additional_roots: Vec::new(),
                     subagent_spec_json: None,
                     profile: "work".to_string(),
+                    title: None,
+                    pinned_at: None,
                     stats: crate::stats::SessionStatsSnapshot::default(),
                     events: Vec::new(),
                     scratchpad_entries: Vec::new(),
@@ -3865,6 +4329,8 @@ mod tests {
                 cwd: Some(PathBuf::from("/work/new")),
                 profile: Some("beta".to_string()),
                 roots: None,
+                title: None,
+                pinned: None,
             })
             .await
             .expect("move the session");
@@ -5189,6 +5655,8 @@ mod tests {
             additional_roots: Vec::new(),
             subagent_spec_json: parent.map(|_| "{\"tools\":[]}".to_string()),
             profile: "work".to_string(),
+            title: None,
+            pinned_at: None,
             stats: crate::stats::SessionStatsSnapshot::default(),
             events: Vec::new(),
             scratchpad_entries: Vec::new(),
@@ -5244,6 +5712,8 @@ mod tests {
                     ))],
                     subagent_spec_json: None,
                     profile: "work".to_string(),
+                    title: None,
+                    pinned_at: None,
                     stats: crate::stats::SessionStatsSnapshot::default(),
                     events: Vec::new(),
                     scratchpad_entries: Vec::new(),
@@ -6044,6 +6514,8 @@ mod tests {
             additional_roots: Vec::new(),
             subagent_spec_json: None,
             profile: "test-profile".to_string(),
+            title: None,
+            pinned_at: None,
             stats: Default::default(),
             events: vec![(
                 "2026-08-31T00:00:00Z".to_string(),

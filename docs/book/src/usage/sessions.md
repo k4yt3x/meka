@@ -129,11 +129,12 @@ name merely resembles the above.
 
 ## Store schema
 
-The three tables below are the conversation itself. The store holds seven more, which the
-features that own them document: `scheduled_jobs` ([scheduling](./scheduling.md)), `background_tasks`
-([background work](./background.md)), `memories` and its `memories_fts` full-text index
-([memory](./memory.md)), `prompt_history` (the REPL's
-[input history](./interactive-mode.md#input-history)), and `account_credentials` and
+The three tables below are the conversation itself, with `messages_fts`, the full-text index over
+the words of `messages` that [`meka session search`](#searching-sessions) reads. The store holds
+seven more, which the features that own them document: `scheduled_jobs`
+([scheduling](./scheduling.md)), `background_tasks` ([background work](./background.md)),
+`memories` and its `memories_fts` full-text index ([memory](./memory.md)), `prompt_history` (the
+REPL's [input history](./interactive-mode.md#input-history)), and `account_credentials` and
 `mcp_credentials` (secrets, never in `config.toml`).
 
 **sessions**, one row per session:
@@ -154,6 +155,8 @@ features that own them document: `scheduled_jobs` ([scheduling](./scheduling.md)
 | `turns`, `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `redactions`, `redacted_images`, `redacted_bytes` | INTEGER | The cumulative counters behind `/status` |
 | `profile` | TEXT | Profile the session runs on. Never NULL, though a row carried forward from a store that predates the column can hold `''` |
 | `context_tokens` | INTEGER | Context occupancy the provider last reported, which a resume checks its first turn against; NULL until a turn records one, and after a rewind |
+| `title` | TEXT | The title a user set, or NULL for a session labeled by its first words |
+| `pinned_at` | TEXT (RFC 3339) | When the session was pinned, or NULL |
 
 **blobs** and **message_blobs**: image bytes by SHA-256 content hash, and which message rows
 reference them. A message row holds a reference in place of the bytes, so a screenshot read twice is
@@ -195,7 +198,7 @@ If you do want a time window, set it explicitly:
 retention = "30d"   # delete sessions not updated in 30 days, at startup
 ```
 
-With that set, meka deletes matching sessions when the agent starts and says so at `warn` level, so a deletion you configured is still a deletion you see. A session another meka process has open is spared, and so is the one you are resuming with `-c` or `-r`, however old it is. Unset (the default) keeps everything forever.
+With that set, meka deletes matching sessions when the agent starts and says so at `warn` level, so a deletion you configured is still a deletion you see. A session another meka process has open is spared, and so is the one you are resuming with `-c` or `-r`, however old it is; so is a [pinned](#pinning-a-session) session, and one with a scheduled job ahead of it. Unset (the default) keeps everything forever.
 
 To prune on demand instead, delete on your own schedule:
 
@@ -323,10 +326,13 @@ meka session list
 ```
 
 This shows a table with each session's id, last update time (local, with its UTC offset), profile,
-and its title, the words of the first message:
+and its title: the one you [set](#titling-a-session), else the words of the first message. Pinned
+sessions come first, newest pin on top, marked with `*`; the rest follow most recently updated
+first:
 
 ```
 ID        Updated                  Profile   Title
+7c1d9e02  2026-02-20 18:04 +00:00  work      * Research: LLM security blind spots
 550e8400  2026-03-14 12:00 +00:00  work      How do I implement a binary search tree?
 a1b2c3d4  2026-03-13 09:30 +00:00  personal  Fix the login page CSS
 ```
@@ -367,7 +373,7 @@ currently say. `meka profile list` shows them.
 
 Both commands take `--format json`. The listing becomes `{"sessions": [...]}` and `show` one object,
 each session carrying `id`, `created_at`, `updated_at`, `profile`, `title`, `approvals`, and, when
-the row records them, `cwd`, `permission`, `capabilities` and `parent_id`: the fields
+the row records them, `cwd`, `permission`, `capabilities`, `parent_id` and `pinned_at`: the fields
 [`GET /v1/sessions`](http-api.md) returns under the same names, less the two only a running host
 can answer (`turn_in_flight`, `last_turn_at`). Ids are printed in full, and an empty store is
 `{"sessions": []}`.
@@ -376,6 +382,85 @@ can answer (`turn_in_flight`, `last_turn_at`). Ids are printed in full, and an e
 meka session list --format json | jq -r '.sessions[] | "\(.id) \(.profile)"'
 meka session show 550e8400 --format json | jq .cwd
 ```
+
+## Titling a session
+
+A session is labeled by the words of its first message, which is not always what you want to find
+it by later. Give it a title of your own:
+
+```bash
+meka session set 550e8400 title "Research: LLM security blind spots"
+```
+
+The title is what every listing shows from then on: `meka session list`, the web and editor
+clients, and `GET /v1/sessions`, all under the same `title` field. It is one line, at most 200
+characters, and whitespace runs are collapsed. Clear it with an empty string, and the session goes
+back to being labeled by its first words:
+
+```bash
+meka session set 550e8400 title ""
+```
+
+From the REPL, `/title <text>` titles the session you are in and bare `/title` shows the current
+one. Over HTTP it is `PATCH /v1/sessions/{id}` with `{"title": "..."}`. Titling a session does not
+move its `updated_at`, so it stays where it was in the listing and `meka -c` still continues the
+session you last used, not the one you last renamed. A fork carries the title with it, since it
+holds the same conversation, and an export does too.
+
+## Pinning a session
+
+A session you keep coming back to can be pinned, which lists it first, ahead of every unpinned
+session, on every surface:
+
+```bash
+meka session set 550e8400 pinned true
+meka session set 550e8400 pinned false
+```
+
+Pinned sessions are ordered among themselves by when they were pinned, newest on top, so the shelf
+does not reshuffle as you use them; unpin and pin again to move one to the top. `meka session
+show` prints when a session was pinned, the JSON forms carry it as `pinned_at`, and the listing
+marks the title with `*`.
+
+A pin is also a keep: the `[session].retention` sweep and `meka session delete --older-than-days`
+leave a pinned session alone whatever its age, and the parent of a pinned sub-agent session with
+it, since deleting the parent would take the child. `meka session delete <id>` and `--all` still do what
+they say. Like a title, a pin does not move `updated_at` and does not change which session `meka
+-c` continues. A fork is a new session and starts unpinned; an export carries the pin.
+
+## Searching sessions
+
+When you remember what a conversation was about but not which session it was, search the words:
+
+```bash
+meka session search "blind spot timestamp"
+```
+
+```
+ID        Updated                  Title                             Match
+7c1d9e02  2026-02-20 18:04 +00:00  Research: LLM security blind...  The paper's point is that a timestamp in the prompt lets the...
+3e0a77b1  2026-01-08 09:12 +00:00  what does the blind spot pape...  what does the blind spot paper say about timestamps
+```
+
+What is searched is what was said: your messages, the assistant's replies and compaction summaries.
+Tool calls, tool results and the model's thinking are not, so a file the agent read does not make
+its session a match for every word in it; `conversation_search`, which the agent runs within one
+session, still covers those. A session whose title holds every word is listed first, newest first
+among those; the rest are ranked by how well their best message matches. Every word must appear;
+when nothing holds them all, sessions holding any of them are listed, and when nothing holds any,
+the words are tried as prefixes, so `compact` finds `compaction`. Words are matched by their stem,
+so `deployed` finds `deploying`. Chinese, Japanese, Korean and other scripts written without
+spaces are matched character by character, so a word is found inside a sentence and a query of
+one character works.
+
+Each row shows the session's title and the line of the best-matching message the words were found
+on, cut to fit. `-n` sets how many sessions to show (default 20), `--include-children` adds
+sub-agent sessions, and `--format json` answers `{"sessions": [...]}` with each session's record
+plus `excerpt`. Over HTTP it is [`GET /v1/sessions/search?q=`](http-api.md#titles-pins-and-search).
+
+The search reads an index the store keeps beside the conversation, a few percent of its size, kept
+in step with every message written and checked on every open. The first launch after upgrading
+builds it over every existing session, which takes a moment on a large store and is logged.
 
 ## Exporting a session
 
@@ -429,7 +514,7 @@ Read from stdin with `-`:
 cat session.json | meka session import -
 ```
 
-The import preserves the full conversation, per-message timestamps, cumulative stats, scratchpad entries, and the name of the profile the session ran on. That name is all an archive carries about the profile: the settings themselves come from whatever `[profiles.<name>]` and its account say on the installation importing it. An archive naming a profile this installation does not configure, on its root or on a sub-agent spawned with one, is refused rather than restored as a session every resume would refuse; `meka --profile <name> session import` moves every session in the archive onto a configured profile instead, the same explicit act that moves a session on resume. An archive that names no profile adopts this installation's default; if nothing can supply one, because no `default_profile` is set and several profiles are configured, the import is refused: name one with `meka --profile <name> session import`. An archive whose messages reference an image it does not carry and this store does not hold is refused as malformed before anything is written.
+The import preserves the full conversation, per-message timestamps, cumulative stats, scratchpad entries, the title and the pin, and the name of the profile the session ran on. That name is all an archive carries about the profile: the settings themselves come from whatever `[profiles.<name>]` and its account say on the installation importing it. An archive naming a profile this installation does not configure, on its root or on a sub-agent spawned with one, is refused rather than restored as a session every resume would refuse; `meka --profile <name> session import` moves every session in the archive onto a configured profile instead, the same explicit act that moves a session on resume. An archive that names no profile adopts this installation's default; if nothing can supply one, because no `default_profile` is set and several profiles are configured, the import is refused: name one with `meka --profile <name> session import`. An archive whose messages reference an image it does not carry and this store does not hold is refused as malformed before anything is written.
 
 `updated_at` is stamped to the import time rather than restored from the export, so that restoring an archive older than a configured `retention` window isn't undone by the retention sweep on the next launch. `created_at` still carries the original.
 
@@ -449,7 +534,7 @@ meka -r "$(meka session fork 550e8400-e29b-41d4-a716-446655440000)"
 
 Use it to try a different direction from a known-good point, to run a throwaway question against a large accumulated context, or to keep a conversation you're about to compact.
 
-What the copy carries: the full event log, scratchpad entries, working directory, permission level and approvals switch, additional workspace roots, and cumulative stats. What it does **not**: sub-agent sessions (the sub-agent's result already sits in the parent conversation as a tool result, so the copy is complete without them), and the timestamps, which are stamped fresh.
+What the copy carries: the full event log, scratchpad entries, working directory, permission level and approvals switch, additional workspace roots, cumulative stats, and the title, since it names the same conversation. What it does **not**: sub-agent sessions (the sub-agent's result already sits in the parent conversation as a tool result, so the copy is complete without them), the pin, since the copy is a new session, and the timestamps, which are stamped fresh.
 
 A fork of an ordinary session records no link back to the one it came from; it is a root session
 like any other. A fork of a *sub-agent* is the exception: it keeps that sub-agent's parent and
@@ -515,7 +600,9 @@ Delete every session not updated in the last N days:
 meka session delete --older-than-days 90
 ```
 
-This is the manual counterpart to [`retention`](#history-retention). It can't be combined with ids or `--all`, and `0` is refused: it would match everything.
+This is the manual counterpart to [`retention`](#history-retention), and spares what the sweep
+spares: a pinned session, and one with a scheduled job ahead of it. It can't be combined with ids
+or `--all`, and `0` is refused: it would match everything.
 
 Delete all sessions:
 
@@ -524,7 +611,8 @@ meka session delete --all
 ```
 
 `--all` takes no ids of its own: naming some sessions and then asking for every session are two
-different requests, and it refuses rather than quietly doing the wider one.
+different requests, and it refuses rather than quietly doing the wider one. It means every session,
+pinned ones included.
 
 ## Input history
 

@@ -5027,6 +5027,8 @@ mod tests {
             additional_roots: Vec::new(),
             subagent_spec_json: None,
             profile: "test-profile".to_string(),
+            title: None,
+            pinned_at: None,
         }
     }
 

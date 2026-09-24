@@ -147,6 +147,12 @@ pub(crate) struct ExportedSession {
     /// no configuration can name.
     #[serde(default)]
     pub(crate) profile: String,
+    /// The title a user set. Absent from an archive written before it existed, or when none was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) title: Option<String>,
+    /// When the session was pinned, absent when it was not; restored as written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pinned_at: Option<String>,
     pub(crate) stats: crate::stats::SessionStatsSnapshot,
     pub(crate) events: Vec<ExportedEvent>,
     pub(crate) scratchpad_entries: std::collections::BTreeMap<String, String>,
@@ -198,6 +204,8 @@ pub(crate) async fn build_session_export(
             additional_roots: meta.additional_roots,
             subagent_spec_json: meta.subagent_spec_json,
             profile: meta.profile,
+            title: meta.title,
+            pinned_at: meta.pinned_at,
             stats,
             events,
             scratchpad_entries,
@@ -385,6 +393,13 @@ pub(crate) fn plan_import(
             additional_roots: session.additional_roots,
             subagent_spec_json: session.subagent_spec_json,
             profile,
+            // Through the same acceptor every door that sets one uses, so an archive cannot
+            // plant a title no `PATCH` could.
+            title: match session.title.as_deref() {
+                Some(title) => crate::store::normalize_title(title)?,
+                None => None,
+            },
+            pinned_at: session.pinned_at,
             stats: session.stats,
             events: session
                 .events
@@ -531,6 +546,35 @@ mod tests {
 
     /// `--profile` is the explicit act that moves a session: every imported session takes it,
     /// whatever the archive recorded, and a flag naming nothing moves nothing.
+    /// An archive's title goes through the acceptor every door uses: collapsed like a typed one,
+    /// and refused past the cap rather than planted on a row no `PATCH` could produce.
+    #[test]
+    fn an_archived_title_is_accepted_the_way_a_typed_one_is() {
+        let profiles = configured(&["work"]);
+        let import = |title: &str| {
+            let mut archive = archive_on("work");
+            archive.sessions[0].title = Some(title.to_string());
+            archive.sessions[0].pinned_at = Some("2026-02-02T00:00:00+00:00".to_string());
+            plan_import(
+                archive,
+                ImportProfiles {
+                    selected: None,
+                    default: Some("work"),
+                    configured: Some(&profiles),
+                },
+                Some(crate::permission::Permission::Read),
+            )
+        };
+        let plan = import("  Research   notes ").expect("a plan");
+        assert_eq!(plan.records[0].title.as_deref(), Some("Research notes"));
+        assert_eq!(
+            plan.records[0].pinned_at.as_deref(),
+            Some("2026-02-02T00:00:00+00:00")
+        );
+        let message = refusal(import(&"x".repeat(201)));
+        assert!(message.contains("200 characters"), "{message}");
+    }
+
     #[test]
     fn a_profile_flag_moves_every_imported_session_onto_it() {
         let profiles = configured(&["other"]);
