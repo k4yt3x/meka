@@ -1501,6 +1501,15 @@ fn instructions_show_and_path_read_the_listed_files_from_the_current_directory()
     let install = Install::new();
     let project = install.root().join("project");
     std::fs::create_dir_all(&project).expect("project dir");
+    // The child reports its working directory as the OS spells it, which on macOS resolves the
+    // temp directory's symlink into `/private`, so the expected paths are built from that spelling,
+    // minus the `\\?\` prefix Windows' `canonicalize` adds and meka never prints.
+    let project = std::path::PathBuf::from(
+        std::fs::canonicalize(&project)
+            .expect("canonical")
+            .to_string_lossy()
+            .trim_start_matches(r"\\?\"),
+    );
     std::fs::write(project.join("AGENTS.md"), "project rules\n").expect("write AGENTS.md");
     std::fs::write(
         install.config_dir().join("instructions.md"),
