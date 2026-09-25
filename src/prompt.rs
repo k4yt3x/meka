@@ -2129,7 +2129,7 @@ pub(crate) fn build_permission_context(permission: Permission, approvals: bool) 
 /// Naming them is the whole point of tracking them: without this line the model has no way to learn
 /// the other folders exist, and would report a file it cannot find as absent rather than looking.
 /// Emits nothing when the list is empty, so single-root output is unchanged.
-pub(crate) fn build_environment_context(
+fn build_environment_context(
     permission: Permission,
     cwd: &std::path::Path,
     roots: &[std::path::PathBuf],

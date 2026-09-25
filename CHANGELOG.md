@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.64.1] - 2026-09-25
+
+### Fixed
+
+- A sub-agent's prompt no longer repeats the environment context its turn already carries.
+
 ## [0.64.0] - 2026-09-24
 
 ### Added
@@ -2392,7 +2398,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.64.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.64.1...HEAD
+[0.64.1]: https://github.com/k4yt3x/meka/compare/0.64.0...0.64.1
 [0.64.0]: https://github.com/k4yt3x/meka/compare/0.63.0...0.64.0
 [0.63.0]: https://github.com/k4yt3x/meka/compare/0.62.0...0.63.0
 [0.62.0]: https://github.com/k4yt3x/meka/compare/0.61.0...0.62.0

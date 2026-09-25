@@ -13,7 +13,6 @@ use crate::{
     conversation::Conversation,
     error::{MekaError, Result},
     permission::{EnabledPermissions, Permission, SharedPermission},
-    prompt::build_environment_context,
     provider::ToolDefinition,
     session::AgentOptions,
     workspace::{
@@ -641,10 +640,10 @@ impl Tool for AgentSpawnTool {
 
         // Snapshot the parent's cwd once, here, so a parent `/cd` mid-sub-agent execution can't
         // shift the sub-agent's path resolution mid-flight. The same value is written to the
-        // child's session row, handed to its tool registry, and used to render its environment
-        // context; a follow-up reads it back off the row. A bounded worker takes its directory
-        // and its roots from the accepted list instead, and nothing of the parent's: the roots it
-        // holds are exactly what its row and its spec record.
+        // child's session row and handed to its cells, which its tool registry and its turn's
+        // environment context read; a follow-up reads it back off the row. A bounded worker takes
+        // its directory and its roots from the accepted list instead, and nothing of the
+        // parent's: the roots it holds are exactly what its row and its spec record.
         let (sub_cwd_snapshot, sub_additional_roots, sub_roots) = match &bounded {
             Some(workspace) => (
                 workspace.cwd.clone(),
@@ -734,11 +733,6 @@ impl Tool for AgentSpawnTool {
         };
         tracing::info!("spawning sub-agent {sub_session_id} for parent {parent_sid}");
 
-        let sub_roots_snapshot = workspace.roots.get();
-        let environment_context =
-            build_environment_context(sub_perm, &sub_cwd_snapshot, &sub_roots_snapshot);
-        let augmented_prompt = format!("{environment_context}\n{task}");
-
         // The last step that can fail before the worker exists in its own right. Nothing here is
         // reachable in practice (the web client is built from config the root already used, and a
         // fresh registry cannot collide), but the row is already on disk, so a failure would leave
@@ -787,12 +781,12 @@ impl Tool for AgentSpawnTool {
         sub_agent
             .run_turn(
                 &mut messages,
-                crate::agent::TurnInput::from_parts(augmented_prompt, Vec::new()).map_err(
-                    |empty| MekaError::ToolExecution {
+                crate::agent::TurnInput::from_parts(task, Vec::new()).map_err(|empty| {
+                    MekaError::ToolExecution {
                         tool_name: "agent_spawn".to_string(),
                         message: empty.to_string(),
-                    },
-                )?,
+                    }
+                })?,
                 cancellation,
             )
             .await?;
@@ -1453,9 +1447,6 @@ impl Tool for AgentFollowupTool {
                 roots: SharedRoots::new(bounded.additional_roots),
             }
         };
-        let sub_cwd_snapshot = workspace.cwd.get();
-        let roots_snapshot = workspace.roots.get();
-
         let effective_permission = spec.effective_permission(ceiling);
         // `!=`, not `<`. The derived `Ord` is display order, which the enum doc says must not
         // decide authority. `greatest_within_both` never resolves above the recorded rung, so any
@@ -1559,10 +1550,6 @@ impl Tool for AgentFollowupTool {
                 message: format!("failed to load sub-agent conversation: {error}"),
             })?;
 
-        let environment_context =
-            build_environment_context(effective_permission, &sub_cwd_snapshot, &roots_snapshot);
-        let augmented_prompt = format!("{environment_context}\n{prompt}");
-
         // The row has to follow the build, for the reason `agent_spawn` writes it from the same
         // binding: an unpinned worker runs on the parent's profile now, and a follow-up after a
         // `/profile` switch would otherwise bill an account the worker's row does not
@@ -1604,12 +1591,12 @@ impl Tool for AgentFollowupTool {
         sub_agent
             .run_turn(
                 &mut messages,
-                crate::agent::TurnInput::from_parts(augmented_prompt, Vec::new()).map_err(
-                    |empty| MekaError::ToolExecution {
+                crate::agent::TurnInput::from_parts(prompt, Vec::new()).map_err(|empty| {
+                    MekaError::ToolExecution {
                         tool_name: "agent_followup".to_string(),
                         message: empty.to_string(),
-                    },
-                )?,
+                    }
+                })?,
                 cancellation,
             )
             .await?;
@@ -4646,8 +4633,7 @@ mod tests {
         let requests = mock.completions();
         let blocks = last_user_text_blocks(&requests[1]);
         assert_eq!(blocks.len(), 2, "the words, then the steer: {blocks:?}");
-        // A worker's words carry its environment context ahead of them.
-        assert!(blocks[0].ends_with("and then?"), "{}", blocks[0]);
+        assert_eq!(blocks[0], "and then?");
         assert!(
             blocks[1].starts_with("[Message from your parent agent, arrived ")
                 && blocks[1].ends_with("]\ncheck the dates too"),
@@ -6278,6 +6264,13 @@ mod tests {
         assert!(
             first_turn.contains(&extra) && !first_turn.contains(&elsewhere),
             "the worker is told its own additional root and not the parent's: {first_turn}"
+        );
+        // Once, in the turn's own context block. The words the parent hands over used to carry a
+        // second copy from before workers ran through the shared turn path.
+        assert_eq!(
+            first_turn.matches("[Environment context]").count(),
+            1,
+            "the worker reads its environment once: {first_turn}"
         );
 
         let row = store
