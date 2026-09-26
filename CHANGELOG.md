@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** Landlock alone needs ABI v9 (kernel 7.1); older kernels need Bubblewrap at `read`.
 - The Landlock fallback warning names what it cannot stop: file mode, owner and timestamp changes.
 - A kernel with Landlock built in but disabled at boot is reported, with the `lsm=` remedy.
+- **Breaking:** session archives are `format_version` 5, every field required; older ones convert.
 - **Breaking:** compaction `source` is `checkpoint` or `summarizer`; `checkpoint_text` is gone.
 - A checkpoint that ends without submitting a summary falls back to the summarizer.
 - Compaction copies the most recent messages received into the summary; search skips the copies.

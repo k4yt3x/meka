@@ -4,10 +4,11 @@
 use super::*;
 
 /// On-wire format version for `meka session export --format json`. Bumped when the envelope shape
-/// or the underlying [`crate::conversation::Event`] serialization changes incompatibly. An older
-/// archive the migration module knows is brought forward before it is read; `meka session import`
-/// refuses any other version.
-pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 4;
+/// or the underlying [`crate::conversation::Event`] serialization changes, a field added or taken
+/// away included: the reader takes this version's shape alone, and an older archive the migration
+/// module knows is brought forward before it is read. `meka session import` refuses any other
+/// version.
+pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 5;
 /// Decode an archive, refusing one written for another `format_version` before its shape is read.
 ///
 /// The version is read on its own first, because a release that changed the shape also changed
@@ -75,9 +76,7 @@ pub(crate) struct SessionExport {
     /// [`MAX_IMPORT_SESSIONS`] on the parsed body before handing it to [`plan_import`]; see that
     /// constant for why the cap is the handler's and not the planner's.
     pub(crate) sessions: Vec<ExportedSession>,
-    /// The bytes behind every image block in `sessions`, once each. `#[serde(default)]` so an
-    /// archive with no images, or one written by hand, needs no empty list.
-    #[serde(default)]
+    /// The bytes behind every image block in `sessions`, once each; empty when there are none.
     pub(crate) blobs: Vec<ExportedBlob>,
 }
 /// One image's bytes in an archive, under the content hash its blocks reference.
@@ -125,32 +124,22 @@ pub(crate) struct ExportedSession {
     /// The level the session ran at, as its one spelling; an archive naming anything else is
     /// refused at parse rather than written to a row no reader could resolve.
     pub(crate) permission: Option<crate::permission::Permission>,
-    /// Whether calls above the level were submitted for approval. `#[serde(default)]` so an
-    /// archive that omits it imports with the switch off.
-    #[serde(default)]
+    /// Whether calls above the level were submitted for approval.
     pub(crate) approvals: bool,
     pub(crate) capabilities_json: Option<String>,
-    /// Workspace roots beyond `cwd`. `#[serde(default)]` rather than a `format_version` bump:
-    /// [`plan_import`] rejects any version it doesn't equal exactly, so bumping would make every
-    /// export written before this field unimportable, while an absent field already means the
-    /// single-root sessions those exports describe.
-    #[serde(default)]
+    /// Workspace roots beyond `cwd`; empty for a single-root session.
     pub(crate) additional_roots: Vec<std::path::PathBuf>,
-    /// A sub-agent's spawn terms. `#[serde(default)]` for the same reason as `additional_roots`:
-    /// an archive written before the field existed is still importable, and its sub-agents simply
-    /// come back unfollowable rather than unimportable.
-    #[serde(default)]
+    /// A sub-agent's spawn terms; `null` for a session nothing spawned, which an absent key also
+    /// reads as, by serde's rule for an `Option`.
     pub(crate) subagent_spec_json: Option<String>,
-    /// The profile the session ran on. `#[serde(default)]` for the same reason as the two fields
-    /// above: an archive that names none is still importable, and [`plan_import`] settles the
-    /// empty case against the importing installation's default rather than storing a profile
-    /// no configuration can name.
-    #[serde(default)]
+    /// The profile the session ran on; empty when the archive names none, which [`plan_import`]
+    /// settles against the importing installation's default rather than storing a profile no
+    /// configuration can name.
     pub(crate) profile: String,
-    /// The title a user set. Absent from an archive written before it existed, or when none was.
+    /// The title a user set; absent when none was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) title: Option<String>,
-    /// When the session was pinned, absent when it was not; restored as written.
+    /// When the session was pinned; absent when it was not, restored as written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pinned_at: Option<String>,
     pub(crate) stats: crate::stats::SessionStatsSnapshot,
@@ -477,6 +466,32 @@ mod tests {
         assert!(!error.contains("missing field"), "{error}");
     }
 
+    /// The reader takes the current shape alone: a current-version archive missing a field the
+    /// exporter always writes is refused by that field, never defaulted. Anything older reaches
+    /// the migration module's conversion instead, which is the one place that may fill one in.
+    /// `subagent_spec_json` is not in the list: an absent `Option` reads as `null` by serde's own
+    /// rule, the same way `title` and `pinned_at` do.
+    #[test]
+    fn a_current_archive_missing_a_field_is_refused_rather_than_defaulted() {
+        let mut archive = serde_json::to_value(archive_on("work")).expect("serialize");
+        for field in ["approvals", "additional_roots", "profile"] {
+            let mut lacking = archive.clone();
+            lacking["sessions"][0]
+                .as_object_mut()
+                .expect("session")
+                .remove(field);
+            let Err(error) = parse_session_export(lacking.to_string().as_bytes()) else {
+                panic!("`{field}` must be required");
+            };
+            assert!(error.to_string().contains(field), "{error}");
+        }
+        archive.as_object_mut().expect("root").remove("blobs");
+        assert!(
+            parse_session_export(archive.to_string().as_bytes()).is_err(),
+            "`blobs` must be required"
+        );
+    }
+
     /// A one-session archive whose session ran on `profile`.
     fn archive_on(profile: &str) -> SessionExport {
         serde_json::from_value(serde_json::json!({
@@ -491,12 +506,16 @@ mod tests {
                 "updated_at": "2020-01-01T00:00:00Z",
                 "cwd": null,
                 "permission": "read",
+                "approvals": false,
                 "capabilities_json": null,
+                "additional_roots": [],
+                "subagent_spec_json": null,
                 "profile": profile,
                 "stats": crate::stats::SessionStatsSnapshot::default(),
                 "events": [],
                 "scratchpad_entries": {},
             }],
+            "blobs": [],
         }))
         .expect("a well-formed archive")
     }

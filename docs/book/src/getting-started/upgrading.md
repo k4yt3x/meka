@@ -20,6 +20,11 @@ instead of warning, and shell commands at `read` fail until a usable backend exi
 command also runs inside meka's Landlock ruleset there. Affected as of this release: Debian 13,
 RHEL 10, Ubuntu 24.04 and 26.04 LTS without Bubblewrap.
 
+**Session archives are `format_version` 5.** Every field is written, and the ones that used to
+default when absent are now required: `blobs` on the archive, and `approvals`, `additional_roots`
+and `profile` on each session. An archive written by 0.59 through 0.64 still imports, brought
+forward at the door, so only an archive written by hand has to change.
+
 **The `checkpoint_text` compaction source is gone.** `POST /v1/sessions/{id}/compact` and the
 `context.compacted` stream event report `source` as `checkpoint` or `summarizer` only. A
 checkpoint turn that ends without calling `context_replace` now falls back to the summarizer

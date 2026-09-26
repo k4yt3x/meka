@@ -973,12 +973,13 @@ mod tests {
         );
     }
 
-    /// An export written before `additional_roots` existed must still import. This is why the field
-    /// is `#[serde(default)]` instead of a `format_version` bump, which `plan_import` would reject.
+    /// An export written before `additional_roots` existed, at the version those releases wrote,
+    /// still imports: the migration module fills the field at the door, and the planner reads the
+    /// current shape alone.
     #[test]
-    fn plan_import_accepts_an_export_without_additional_roots() {
+    fn plan_import_accepts_an_export_from_before_additional_roots_existed() {
         let json = serde_json::json!({
-            "format_version": SESSION_EXPORT_FORMAT_VERSION,
+            "format_version": 4,
             "meka_version": "0.0.0",
             "exported_at": "2020-01-01T00:00:00Z",
             "root_session_id": "11111111-1111-4111-8111-111111111111",
@@ -995,7 +996,9 @@ mod tests {
                 "scratchpad_entries": {},
             }],
         });
-        let export: SessionExport = serde_json::from_value(json).expect("deserialize");
+        let export = crate::store::export::parse_session_export(json.to_string().as_bytes())
+            .expect("brought forward at the door");
+        assert_eq!(export.format_version, SESSION_EXPORT_FORMAT_VERSION);
         let crate::store::export::ImportPlan {
             records,
             blobs: _,
@@ -1030,11 +1033,16 @@ mod tests {
                 "updated_at": "2020-01-01T00:00:00Z",
                 "cwd": null,
                 "permission": null,
+                "approvals": false,
                 "capabilities_json": null,
+                "additional_roots": [],
+                "subagent_spec_json": null,
+                "profile": "",
                 "stats": crate::stats::SessionStatsSnapshot::default(),
                 "events": [],
                 "scratchpad_entries": {},
             }],
+            "blobs": [],
         });
         let export: SessionExport = serde_json::from_value(json).expect("deserialize");
         let Err(error) = plan_import(
@@ -1077,13 +1085,17 @@ mod tests {
                     "updated_at": "2020-01-01T00:00:00Z",
                     "cwd": null,
                     "permission": null,
+                    "approvals": false,
                     "capabilities_json": null,
+                    "additional_roots": [],
+                    "subagent_spec_json": null,
                     "profile": "work",
                     "base_url_override": base_url,
                     "stats": crate::stats::SessionStatsSnapshot::default(),
                     "events": [],
                     "scratchpad_entries": {},
                 }],
+                "blobs": [],
             })
         };
 

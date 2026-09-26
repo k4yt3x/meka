@@ -14559,6 +14559,14 @@ grace = "0s"
     );
 }
 
+/// Whether a `read` shell's result says this host has no usable sandbox. With none, the tool is
+/// offered at `unrestricted` alone and a call at `read` is refused by level; a pinned backend that
+/// the host cannot run refuses at spawn instead. Tests of the sandbox skip on either, loudly.
+#[cfg(target_os = "linux")]
+fn no_read_sandbox(text: &str) -> bool {
+    text.contains("requires `unrestricted`") || text.contains("is unavailable")
+}
+
 /// A shell at `read` under the Landlock backend cannot read the credential store, through the real
 /// server and the real spawn: the ruleset the tool plans has to name meka's directories as the
 /// ones to step around, and nothing short of a whole turn exercises that wiring. The control read
@@ -14626,7 +14634,7 @@ fn a_read_shell_under_landlock_cannot_read_the_store() {
         })
         .expect("the tool round is in the transcript")
         .to_string();
-    if result.contains("is unavailable") {
+    if no_read_sandbox(&result) {
         eprintln!("skipping: no usable Landlock on this host: {result}");
         return;
     }
@@ -14727,7 +14735,7 @@ fn a_read_shell_inherits_only_its_standard_descriptors() {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        if text.contains("is unavailable") {
+        if no_read_sandbox(&text) {
             eprintln!("skipping backend {backend:?}: no usable sandbox on this host: {text}");
             continue;
         }

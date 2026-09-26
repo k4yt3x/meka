@@ -988,12 +988,16 @@ mod tests {
                     "updated_at": "2020-01-01T00:00:00Z",
                     "cwd": null,
                     "permission": null,
+                    "approvals": false,
                     "capabilities_json": null,
+                    "additional_roots": [],
+                    "subagent_spec_json": null,
                     "profile": "work",
                     "stats": crate::stats::SessionStatsSnapshot::default(),
                     "events": [],
                     "scratchpad_entries": {},
                 }],
+                "blobs": [],
             })
             .to_string(),
         )

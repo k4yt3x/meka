@@ -58,10 +58,32 @@ fn repl_install_with_extra(
     extra_display: &str,
     extra_tables: &str,
 ) -> Install {
+    repl_install_at(
+        "read",
+        newline_before_prompt,
+        newline_after_prompt,
+        extra_display,
+        extra_tables,
+    )
+}
+
+/// [`repl_install_with_extra`] at the one enabled `permission`.
+///
+/// `read` is the default because most of these tests never run a command. One that must, and
+/// is about something other than the sandbox, takes `unrestricted`: at `read` a command needs a
+/// usable sandbox backend, and the CI runners have none, so a background `sleep` there fails at
+/// spawn and a test about the prompt around it fails with it.
+fn repl_install_at(
+    permission: &str,
+    newline_before_prompt: bool,
+    newline_after_prompt: bool,
+    extra_display: &str,
+    extra_tables: &str,
+) -> Install {
     let install = Install::new();
     install.write_config(&format!(
         "default_profile = \"default\"\n\n\
-         [permissions]\ndefault = \"read\"\nenabled = [\"read\"]\n\n\
+         [permissions]\ndefault = \"{permission}\"\nenabled = [\"{permission}\"]\n\n\
          [display]\nnewline_before_prompt = {newline_before_prompt}\n\
          newline_after_prompt = {newline_after_prompt}\n{extra_display}\n\
          [accounts.default]\nbackend = \"openai-chat-completions\"\n\
@@ -795,7 +817,15 @@ fn the_resume_banner_can_be_hidden() {
 /// would put a blank there that nobody chose.
 #[test]
 fn the_shutdown_notice_reads_as_one_block_with_the_exit_banner() {
-    let install = repl_install_with_extra(true, true, "", "\n[background]\nenabled = true\n");
+    // `unrestricted`: the command has to actually run, and the notice is about the prompt, not
+    // the sandbox.
+    let install = repl_install_at(
+        "unrestricted",
+        true,
+        true,
+        "",
+        "\n[background]\nenabled = true\n",
+    );
     let script = r#"[
         [
             { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
@@ -1343,7 +1373,10 @@ fn a_resumed_session_replays_the_reasoning_it_recorded() {
 /// catching it needs an assertion about drawing rather than about the conversation.
 #[test]
 fn a_canceled_task_rides_the_next_prompt_in_the_repl() {
-    let install = repl_install_with_extra(
+    // `unrestricted`: the task has to outlive the cancel, and the delivery is about the prompt,
+    // not the sandbox.
+    let install = repl_install_at(
+        "unrestricted",
         true,
         true,
         "",

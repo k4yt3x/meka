@@ -2433,42 +2433,83 @@ fn rename_tools_0_60_in_spec(spec: &str) -> Option<String> {
     serde_json::to_string(&value).ok()
 }
 
-/// The archive `format_version` 0.59 wrote: the one older version an import still reads.
+/// The archive `format_version` 0.59 wrote.
 const ARCHIVE_FORMAT_0_59: u64 = 3;
+/// The archive `format_version` 0.60 through 0.64 wrote. Those releases added fields to the
+/// session and the envelope without a bump, each defaulted at read, so an archive of this version
+/// may lack any of them.
+const ARCHIVE_FORMAT_0_64: u64 = 4;
 
 /// Bring a session archive written by an older meka to the current shape, reporting whether it
 /// was one. `current` is the version this build writes, handed in as data the way a [`Context`]
 /// is. An archive is not the store, so the ledger never reaches it; this is the archive's one
-/// conversion, and the number of the version it converts lives here and nowhere else.
+/// conversion, and the numbers of the versions it converts live here and nowhere else.
 ///
-/// 0.59's archive differs from the current shape only in the tool names 0.60 changed: the events
-/// are walked by [`rename_tools_0_60`], and each session's spec on its own, since it rides the
-/// archive as a string.
+/// 0.59's archive differs from 0.64's only in the tool names 0.60 changed: the events are walked
+/// by [`rename_tools_0_60`], and each session's spec on its own, since it rides the archive as a
+/// string. Both then take the fields 0.65 requires, by [`require_fields_0_65`].
 pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u64) -> bool {
-    if document
+    match document
         .get("format_version")
         .and_then(|version| version.as_u64())
-        != Some(ARCHIVE_FORMAT_0_59)
     {
-        return false;
+        Some(ARCHIVE_FORMAT_0_59) => {
+            rename_tools_0_60(document);
+            if let Some(sessions) = document
+                .get_mut("sessions")
+                .and_then(|sessions| sessions.as_array_mut())
+            {
+                for session in sessions {
+                    let renamed = session
+                        .get("subagent_spec_json")
+                        .and_then(|spec| spec.as_str())
+                        .and_then(rename_tools_0_60_in_spec);
+                    if let Some(renamed) = renamed {
+                        session["subagent_spec_json"] = renamed.into();
+                    }
+                }
+            }
+        }
+        Some(ARCHIVE_FORMAT_0_64) => {}
+        _ => return false,
     }
-    rename_tools_0_60(document);
+    require_fields_0_65(document);
+    document["format_version"] = current.into();
+    true
+}
+
+/// Every field 0.65 requires that 0.60 through 0.64 added without a bump, filled where absent with
+/// the value its absence meant: no image bytes, no approvals, no roots beyond `cwd`, no spawn
+/// terms, no profile named. Only where absent, so a field the archive did write is kept and a
+/// second pass changes nothing.
+fn require_fields_0_65(document: &mut serde_json::Value) {
+    if let Some(envelope) = document.as_object_mut() {
+        envelope
+            .entry("blobs")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    }
     if let Some(sessions) = document
         .get_mut("sessions")
         .and_then(|sessions| sessions.as_array_mut())
     {
         for session in sessions {
-            let renamed = session
-                .get("subagent_spec_json")
-                .and_then(|spec| spec.as_str())
-                .and_then(rename_tools_0_60_in_spec);
-            if let Some(renamed) = renamed {
-                session["subagent_spec_json"] = renamed.into();
-            }
+            let Some(fields) = session.as_object_mut() else {
+                continue;
+            };
+            fields
+                .entry("approvals")
+                .or_insert(serde_json::Value::Bool(false));
+            fields
+                .entry("additional_roots")
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            fields
+                .entry("subagent_spec_json")
+                .or_insert(serde_json::Value::Null);
+            fields
+                .entry("profile")
+                .or_insert_with(|| serde_json::Value::String(String::new()));
         }
     }
-    document["format_version"] = current.into();
-    true
 }
 
 /// Every stored call, sub-agent spec and finished task takes its 0.60 name.
@@ -3875,6 +3916,69 @@ mod tests {
             Some(
                 r#"{"permission":"read","denied_tools":["file_write","todo_edit","todo_read","todo_write"]}"#
             )
+        );
+        // And the fields 0.59 never wrote arrive with what their absence meant.
+        assert!(export.blobs.is_empty());
+        assert!(!export.sessions[0].approvals);
+        assert!(export.sessions[0].additional_roots.is_empty());
+        assert_eq!(
+            export.sessions[0].profile, "work",
+            "a field written is kept"
+        );
+    }
+
+    /// An archive 0.60 through 0.64 wrote may lack the fields those releases added without a
+    /// version bump. Brought forward, it carries every one with the value its absence meant, a
+    /// field it did write is kept as written, and a second pass over the result changes nothing
+    /// but the version, which it already has.
+    #[test]
+    fn a_0_64_archive_takes_the_fields_it_never_wrote_at_the_door() {
+        use crate::store::export::{SESSION_EXPORT_FORMAT_VERSION, parse_session_export};
+
+        let archive = serde_json::json!({
+            "format_version": 4,
+            "meka_version": "0.64.0",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "cwd": null,
+                "permission": "read",
+                "capabilities_json": null,
+                "stats": crate::stats::SessionStatsSnapshot::default(),
+                "events": [],
+                "scratchpad_entries": {},
+            }],
+        });
+        let export = parse_session_export(archive.to_string().as_bytes())
+            .expect("an archive lacking the fields is brought forward rather than refused");
+        assert_eq!(export.format_version, SESSION_EXPORT_FORMAT_VERSION);
+        assert!(export.blobs.is_empty());
+        let session = &export.sessions[0];
+        assert!(!session.approvals);
+        assert!(session.additional_roots.is_empty());
+        assert!(session.subagent_spec_json.is_none());
+        assert_eq!(session.profile, "");
+
+        let mut written = archive.clone();
+        written["sessions"][0]["profile"] = "work".into();
+        written["sessions"][0]["approvals"] = true.into();
+        let export = parse_session_export(written.to_string().as_bytes()).expect("brought forward");
+        assert_eq!(export.sessions[0].profile, "work");
+        assert!(export.sessions[0].approvals);
+
+        let current = u64::from(SESSION_EXPORT_FORMAT_VERSION);
+        let mut document = archive;
+        assert!(bring_archive_forward(&mut document, current));
+        let once = document.clone();
+        document["format_version"] = 4.into();
+        assert!(bring_archive_forward(&mut document, current));
+        assert_eq!(
+            document, once,
+            "a replay over a converted archive is a no-op"
         );
     }
 
