@@ -18,6 +18,14 @@ checkpoint turn that ends without calling `context_replace` now falls back to th
 instead of having its closing text taken as the summary. A client matching on the old value should
 treat it as `summarizer`, which is what those compactions now produce.
 
+**`file_read` and `scratchpad_read` take `start` and `end`.** Both name the first and last line to
+return, counted from 1 and inclusive, the way a `regex` match reports its line; `offset` and
+`limit` are gone. `file_read` counted `offset` from 0, and `scratchpad_read` took both as bytes. A
+call that still passes the old names reads from the top. A `scratchpad_read` reply now ends on a
+whole line and names the line to continue from rather than a byte offset, and returns as much as
+fits by default. A client that read `file_read`'s `offset` to show a location should read `start`,
+which needs no adjustment.
+
 ## 0.63 to 0.64
 
 **The first open builds the session search index.** `meka session search` reads a full-text index

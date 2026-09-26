@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Compaction copies the most recent messages received into the summary; search skips the copies.
 - Every summary has four sections: rules, commitments and their state, facts, next action.
 - When messages are copied, they take a third of the verbatim budget from the kept recent rounds.
+- **Breaking:** `file_read` and `scratchpad_read` take `start` and `end` lines, counted from 1.
+- A scratchpad read returns what fits by default, ends on a whole line, and names the next line.
+- A windowed file read always ends with the range shown and the file's line count.
+
+### Fixed
+
+- A file read window ending in a blank line no longer misreports the lines it showed.
 
 ## [0.64.1] - 2026-09-25
 

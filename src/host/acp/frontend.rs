@@ -1010,12 +1010,12 @@ pub(super) fn tool_locations(
     };
     raw.map(|path| {
         let mut location = ToolCallLocation::new(resolve_against_cwd(cwd, path));
-        // For `file_read`, point the client at the first line being read. meka's `offset` is
-        // 0-based; ACP line numbers are 1-based.
+        // For `file_read`, point the client at the first line being read; `start` counts from 1,
+        // as ACP's `line` does.
         if name == "file_read"
-            && let Some(offset) = input.get("offset").and_then(|value| value.as_u64())
+            && let Some(start) = input.get("start").and_then(|value| value.as_u64())
         {
-            location = location.line(u32::try_from(offset.saturating_add(1)).unwrap_or(u32::MAX));
+            location = location.line(u32::try_from(start).unwrap_or(u32::MAX));
         }
         vec![location]
     })

@@ -4795,14 +4795,14 @@ enabled = ["read", "unrestricted"]
 
 // === fs/read_text_file line + limit =================================
 
-/// `file_read` asks the editor for the whole document even when the model passed `offset`/`limit`,
+/// `file_read` asks the editor for the whole document even when the model passed `start`/`end`,
 /// and windows what comes back locally.
 ///
 /// Pushing the window down to `fs/read_text_file` looked tidier and cost two things. The freshness
 /// stamp recorded the slice rather than the document, so the next `file_edit` compared a slice
 /// against the whole buffer and refused with a false "changed in the editor". And a response of
-/// exactly `limit` lines was indistinguishable from a file that ended there, so a truncated read
-/// was handed to the model with no notice.
+/// exactly the window's lines was indistinguishable from a file that ended there, so a truncated
+/// read was handed to the model with no notice.
 #[test]
 fn acp_fs_read_text_file_fetches_the_whole_document_and_windows_locally() {
     let on_disk_marker = "DO-NOT-READ-ME-FROM-DISK\n".repeat(100);
@@ -4821,7 +4821,7 @@ fn acp_fs_read_text_file_fetches_the_whole_document_and_windows_locally() {
                     { "type": "tool_use_start", "id": "call_read", "name": "file_read" },
                     {
                         "type": "tool_use_end",
-                        "input": { "path": target.to_string_lossy(), "offset": 9, "limit": 50 }
+                        "input": { "path": target.to_string_lossy(), "start": 10, "end": 59 }
                     },
                     { "type": "message_end", "stop_reason": "tool_use" }
                 ],

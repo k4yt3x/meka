@@ -14,7 +14,10 @@ use tokio::io::AsyncReadExt;
 
 use super::{
     ReadStamp, ReadTracker, Tool, ToolOutput,
-    util::{MAX_SEARCH_MATCHES, canonicalize_for_tool, require_str, search_lines, truncate_string},
+    util::{
+        LineRange, MAX_SEARCH_MATCHES, canonicalize_for_tool, line_range, lines_shown_notice,
+        no_lines_notice, require_str, search_lines, truncate_string,
+    },
 };
 use crate::{
     conversation::ToolResultContent,
@@ -332,9 +335,9 @@ pub(super) async fn resolve_write_target(
 /// file this large is one the model wants a slice of rather than the whole of.
 const MAX_READ_FILE_BYTES: usize = 16 * crate::text::MIB;
 
-/// Lines `file_read` returns when the caller passes no `limit`. Single source of truth for the
-/// description and the runtime default.
-const DEFAULT_LINE_LIMIT: usize = 2000;
+/// Lines a `file_read` returns from `start` when the caller names no `end`. Single source of truth
+/// for the description and the runtime default.
+const DEFAULT_WINDOW_LINES: usize = 2000;
 
 /// Read a file's bytes, bounded by [`MAX_READ_FILE_BYTES`] exactly as the text path is.
 ///
@@ -373,7 +376,7 @@ async fn read_file_to_string(path: &Path) -> std::io::Result<String> {
         .await?;
     if read > MAX_READ_FILE_BYTES {
         return Err(std::io::Error::other(format!(
-            "file is larger than the {} file_read ceiling; pass offset and limit to read it a \
+            "file is larger than the {} file_read ceiling; pass start and end to read it a \
              window at a time, or use shell_execute with a tool that streams (head, tail, grep, \
              sed)",
             crate::text::format_size(MAX_READ_FILE_BYTES),
@@ -388,53 +391,47 @@ fn render_windowed_read(
     path: &str,
     window: String,
     shown_lines: usize,
-    offset: usize,
+    first_index: usize,
     total_lines: usize,
     cut_by_ceiling: bool,
 ) -> String {
+    let start = first_index.saturating_add(1);
     if shown_lines == 0 {
         // Two different facts, and reporting the ceiling as the other misdescribes the file. A
         // minified JSON blob or a base64 capture is one enormous line, so the window is empty
-        // because that single line does not fit, not because the offset ran off the end, and
-        // answering "offset 0 is past the end of a file which has 1 line" is both
+        // because that single line does not fit, not because the start ran off the end, and
+        // answering "start 1 is past the end of a file which has 1 line" is both
         // self-contradictory and reads as "unreadable" when the truth is "ask for it differently".
         if cut_by_ceiling {
             return format!(
-                "(no lines: the first line at offset {} of '{}' is itself larger than the {} \
-                 file_read ceiling, so no whole line fits; use shell_execute with a tool that \
-                 slices by bytes, such as head -c or cut)",
-                offset,
+                "(no lines: line {} of '{}' is itself larger than the {} file_read ceiling, so \
+                 no whole line fits; use shell_execute with a tool that slices by bytes, such as \
+                 head -c or cut)",
+                start,
                 path,
                 crate::text::format_size(MAX_READ_FILE_BYTES),
             );
         }
-        return format!(
-            "(no lines: offset {} is past the end of '{}', which has {} line{})",
-            offset,
-            path,
-            total_lines,
-            if total_lines == 1 { "" } else { "s" },
-        );
+        return no_lines_notice(start, &format!("'{path}'"), total_lines);
     }
 
-    let last_shown = offset.saturating_add(shown_lines);
+    let last_shown = first_index.saturating_add(shown_lines);
     let mut rendered = window;
     if cut_by_ceiling {
-        rendered.push_str(&format!(
-            "\n\n... (showing lines {}-{} of {}; the window stopped at the {} file_read \
-             ceiling, so ask for fewer lines to see the rest)",
-            offset.saturating_add(1),
+        let ceiling = format!(
+            "the window stopped at the {} file_read ceiling",
+            crate::text::format_size(MAX_READ_FILE_BYTES)
+        );
+        rendered.push_str("\n\n... ");
+        rendered.push_str(&lines_shown_notice(
+            start,
             last_shown,
             total_lines,
-            crate::text::format_size(MAX_READ_FILE_BYTES),
+            Some(&ceiling),
         ));
-    } else if last_shown < total_lines {
-        rendered.push_str(&format!(
-            "\n\n... (showing lines {}-{} of {}, use offset/limit to read more)",
-            offset.saturating_add(1),
-            last_shown,
-            total_lines,
-        ));
+    } else {
+        rendered.push_str("\n\n... ");
+        rendered.push_str(&lines_shown_notice(start, last_shown, total_lines, None));
     }
     rendered
 }
@@ -997,7 +994,7 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "file_read".to_string(),
-            description: "Read text or a supported raster image. Text reads return a line range; `regex` returns matching lines instead and ignores `offset`/`limit`. Image reads ignore those text options and require image input to be enabled. Non-native image formats are converted to PNG.".to_string(),
+            description: "Read text or a supported raster image. Text reads return the lines from `start` to `end`; `regex` returns matching `line:text` rows instead, whose line numbers are valid `start` values. Image reads ignore those text options and require image input to be enabled. Non-native image formats are converted to PNG.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1005,17 +1002,19 @@ impl Tool for ReadFileTool {
                         "type": "string",
                         "description": "The file path to read."
                     },
-                    "offset": {
+                    "start": {
                         "type": "integer",
-                        "default": 0,
-                        "description": "Line number to start reading from (0-based). Default: 0."
+                        "minimum": 1,
+                        "description": "First line to return, counted from 1. Default: 1."
                     },
-                    "limit": {
+                    "end": {
                         "type": "integer",
-                        "default": DEFAULT_LINE_LIMIT,
+                        "minimum": 1,
                         "description": format!(
-                            "Maximum number of lines to read; a read that is cut short says so. \
-                             Default: {DEFAULT_LINE_LIMIT}."
+                            "Last line to return, inclusive. Default: {DEFAULT_WINDOW_LINES} \
+                             lines from `start`. A windowed read ends with the range shown and \
+                             the file's line count, and says where to continue when it stopped \
+                             short."
                         )
                     },
                     "regex": {
@@ -1138,12 +1137,7 @@ impl Tool for ReadFileTool {
             }
         }
 
-        let offset = input["offset"]
-            .as_u64()
-            .map(|value| usize::try_from(value).unwrap_or(usize::MAX));
-        let limit = input["limit"]
-            .as_u64()
-            .map(|value| usize::try_from(value).unwrap_or(usize::MAX));
+        let range = line_range(&input, "file_read")?;
         let regex = input.get("regex").and_then(|v| v.as_str());
 
         // Text reads delegate to the editor when it offers `fs.read_text_file`, so the model is
@@ -1201,13 +1195,13 @@ impl Tool for ReadFileTool {
                 // diverts: everything that fits is read whole, so the verbatim-CRLF return and the
                 // freshness stamp below behave exactly as they did.
                 if regex.is_none()
-                    && (offset.is_some() || limit.is_some())
+                    && let Some(range) = range
                     && tokio::fs::metadata(&canonical)
                         .await
                         .is_ok_and(|metadata| metadata.len() > MAX_READ_FILE_BYTES as u64)
                 {
-                    let start = offset.unwrap_or(0);
-                    let span = limit.unwrap_or(DEFAULT_LINE_LIMIT);
+                    let start = range.first_index();
+                    let span = range.count().unwrap_or(DEFAULT_WINDOW_LINES);
                     let (window, shown_lines, total_lines, cut_by_ceiling) = tokio::select! {
                         _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
                         result = read_file_window(&canonical, start, span, MAX_READ_FILE_BYTES) => {
@@ -1257,8 +1251,9 @@ impl Tool for ReadFileTool {
         }
 
         let total_lines = content.lines().count();
-        let effective_offset = offset.unwrap_or(0);
-        let effective_limit = limit.unwrap_or(DEFAULT_LINE_LIMIT);
+        let range = range.unwrap_or(LineRange::WHOLE);
+        let first_index = range.first_index();
+        let window_lines = range.count().unwrap_or(DEFAULT_WINDOW_LINES);
 
         // A read that shows the whole file returns it verbatim, because the windowing below is also
         // a normalization: `lines()` drops `\r` and `join("\n")` drops the trailing newline. The
@@ -1266,52 +1261,45 @@ impl Tool for ReadFileTool {
         // CRLF file it is actually editing, a "not found" whose cause is invisible in both the
         // read and the edit. Windowed reads still normalize; there is no way to slice lines and
         // keep their terminators without deciding which one each line ended with.
-        if effective_offset == 0 && total_lines <= effective_limit {
+        if first_index == 0 && total_lines <= window_lines {
             return Ok(ToolOutput::text(content, false));
         }
 
-        let result: String = content
+        let taken: Vec<&str> = content
             .lines()
-            .skip(effective_offset)
-            .take(effective_limit)
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Disclose the cut whenever one happened, not only for a bare `file_read`.
-        //
-        // `effective_limit` defaults to `DEFAULT_LINE_LIMIT` regardless of whether `offset` was
-        // given, so gating the notice on *both* being absent leaves `file_read({path, offset: 0})`
-        // on a 50,000-line log returning exactly 2,000 lines with no marker and no line count, and
-        // the model answering "the log contains no errors" from four percent of the file. This is
-        // the failure the `file_find` / `file_search` disclosures exist to prevent; a
-        // definitive-sounding answer drawn from a silent truncation is worse than an error.
-        let shown_lines = result.lines().count();
-        // An offset past the end returns nothing, and nothing reads as "the file is empty", which
-        // is a different fact, and the one the model will act on. Say which it is.
-        if shown_lines == 0 && effective_offset >= total_lines {
+            .skip(first_index)
+            .take(window_lines)
+            .collect();
+        if taken.is_empty() {
             return Ok(ToolOutput::text(
-                format!(
-                    "(no lines: offset {} is past the end of '{}', which has {} line{})",
-                    effective_offset,
-                    path,
-                    total_lines,
-                    if total_lines == 1 { "" } else { "s" },
-                ),
+                no_lines_notice(range.start, &format!("'{path}'"), total_lines),
                 false,
             ));
         }
-        let last_shown = effective_offset.saturating_add(shown_lines);
-        let result = if last_shown < total_lines {
-            format!(
-                "{}\n\n... (showing lines {}-{} of {}, use offset/limit to read more)",
-                result,
-                effective_offset.saturating_add(1),
-                last_shown,
-                total_lines,
-            )
-        } else {
-            result
-        };
+        // Counted as taken, not by re-reading the joined text: `lines()` over the join drops a
+        // blank line at the end of the window, and the notice then named a range one short and
+        // sent the model back to a line it had already seen.
+        let shown_lines = taken.len();
+        let result = taken.join("\n");
+
+        // Disclose the window whenever one was applied, not only for a bare `file_read`.
+        //
+        // The window defaults to `DEFAULT_WINDOW_LINES` regardless of whether `start` was given,
+        // so gating the notice on *both* being absent leaves `file_read({path, start: 1})` on a
+        // 50,000-line log returning exactly 2,000 lines with no marker and no line count, and the
+        // model answering "the log contains no errors" from four percent of the file. This is the
+        // failure the `file_find` / `file_search` disclosures exist to prevent; a
+        // definitive-sounding answer drawn from a silent truncation is worse than an error. And
+        // every window ends with the range it showed and the file's line count, whether or not
+        // it reached the end: a bare reply would leave the model unable to tell a window that
+        // ended at the last line from one that ended at `end`, and without the count it needs
+        // for the next range.
+        let last_shown = first_index.saturating_add(shown_lines);
+        let result = format!(
+            "{}\n\n... {}",
+            result,
+            lines_shown_notice(range.start, last_shown, total_lines, None),
+        );
 
         Ok(ToolOutput::text(result, false))
     }
@@ -3162,7 +3150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_file_with_offset_and_limit() {
+    async fn a_read_returns_the_lines_from_start_to_end_inclusive() {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
         let file_path = temp_dir.path().join("test.txt");
         std::fs::write(&file_path, "line0\nline1\nline2\nline3\nline4\n").expect("failed to write");
@@ -3175,8 +3163,8 @@ mod tests {
             .execute(
                 serde_json::json!({
                     "path": file_path.to_str().expect("path"),
-                    "offset": 1,
-                    "limit": 2
+                    "start": 2,
+                    "end": 3
                 }),
                 crate::tools::ToolContext::detached(CancellationToken::new()),
             )
@@ -3809,8 +3797,8 @@ mod tests {
             .execute(
                 serde_json::json!({
                     "path": file_path.to_str().expect("path"),
-                    "offset": 9,
-                    "limit": 50,
+                    "start": 10,
+                    "end": 59,
                 }),
                 crate::tools::ToolContext {
                     frontend: frontend.clone(),
@@ -3887,8 +3875,8 @@ mod tests {
             .execute(
                 serde_json::json!({
                     "path": capture.to_str().expect("path"),
-                    "offset": 3,
-                    "limit": 2,
+                    "start": 4,
+                    "end": 5,
                 }),
                 crate::tools::ToolContext::detached(CancellationToken::new()),
             )
@@ -3930,8 +3918,57 @@ mod tests {
         assert_eq!((shown, total, cut), (3, 4, false));
         let rendered = render_windowed_read("blank-led.txt", window, shown, 0, total, cut);
         assert!(
-            rendered.ends_with("(showing lines 1-3 of 4, use offset/limit to read more)"),
+            rendered.ends_with("(showing lines 1-3 of 4; continue from line 4)"),
             "{rendered}"
+        );
+
+        // A window that reaches the end still names its range and the count, without a
+        // continuation.
+        let (window, shown, total, cut) = read_file_window(&path, 3, 5, 64).await.expect("read");
+        assert_eq!((window.as_str(), shown, total, cut), ("more", 1, 4, false));
+        let rendered = render_windowed_read("blank-led.txt", window, shown, 3, total, cut);
+        assert_eq!(rendered, "more\n\n... (showing lines 4-4 of 4)");
+    }
+
+    /// A window that ends at the last line is still a window: it ends with the range shown and
+    /// the file's line count, so the model can tell it from one that ended at `end` and knows the
+    /// count for its next range. Only a read of the whole file from line 1 is returned bare.
+    #[tokio::test]
+    async fn a_window_that_reaches_the_end_still_names_its_range() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("five.txt");
+        std::fs::write(&file_path, "one\ntwo\nthree\nfour\nfive\n").expect("write");
+
+        let tool = ReadFileTool {
+            read_tracker: tracker_for_test(),
+            site: crate::session::ToolSite::for_test().with_cwd(crate::workspace::cwd_for_test()),
+        };
+        let read = |input: serde_json::Value| {
+            let tool = &tool;
+            async move {
+                tool.execute(
+                    input,
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
+                .await
+                .expect("read")
+                .text_content()
+            }
+        };
+        let path = file_path.to_str().expect("path");
+
+        assert_eq!(
+            read(serde_json::json!({"path": path, "start": 4})).await,
+            "four\nfive\n\n... (showing lines 4-5 of 5)"
+        );
+        assert_eq!(
+            read(serde_json::json!({"path": path, "start": 4, "end": 99})).await,
+            "four\nfive\n\n... (showing lines 4-5 of 5)"
+        );
+        assert_eq!(
+            read(serde_json::json!({"path": path, "start": 1, "end": 5})).await,
+            "one\ntwo\nthree\nfour\nfive\n",
+            "the whole file from line 1 is returned as it is on disk"
         );
     }
 
@@ -3954,7 +3991,7 @@ mod tests {
         assert_eq!((shown, total, cut), (0, 3, true));
         let rendered = render_windowed_read("long.txt", window, shown, 0, total, cut);
         assert!(
-            rendered.starts_with("(no lines: the first line at offset 0"),
+            rendered.starts_with("(no lines: line 1 of 'long.txt' is itself larger"),
             "{rendered}"
         );
     }
@@ -4013,7 +4050,7 @@ mod tests {
 
         let message = error.to_string();
         assert!(
-            message.contains("offset") && message.contains("limit"),
+            message.contains("pass start and end"),
             "the refusal must name the route that does work: {message}"
         );
     }
@@ -4772,8 +4809,137 @@ mod tests {
         assert!(!result.is_error);
     }
 
-    /// An offset past the end of the file returns nothing, and nothing is indistinguishable from
-    /// an empty file, a different fact, and the one the model goes on to act on.
+    /// The line numbers a regex search reports are the line numbers a range read takes: the round
+    /// trip from a match to the lines around it is the reason both are counted from 1.
+    #[tokio::test]
+    async fn a_regex_match_reads_back_by_its_line_number() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("haystack.txt");
+        std::fs::write(&file_path, "alpha\nbeta\nneedle here\ndelta\n").expect("write");
+
+        let tool = ReadFileTool {
+            read_tracker: tracker_for_test(),
+            site: crate::session::ToolSite::for_test().with_cwd(crate::workspace::cwd_for_test()),
+        };
+        let found = tool
+            .execute(
+                serde_json::json!({"path": file_path.to_str().expect("path"), "regex": "needle"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("search");
+        assert_eq!(found.text_content(), "3:needle here");
+
+        let read = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "start": 3,
+                    "end": 3,
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("read");
+        let shown = read.text_content();
+        assert!(
+            shown.starts_with("needle here\n\n"),
+            "line 3 is the line the search named: {shown}"
+        );
+        assert!(
+            shown.ends_with("(showing lines 3-3 of 4; continue from line 4)"),
+            "{shown}"
+        );
+    }
+
+    /// A `0` is a model counting from zero, and clamping it would shift every window it asks for
+    /// by one; a refusal teaches the count. An `end` before the `start` names no lines at all.
+    #[tokio::test]
+    async fn a_range_that_is_not_lines_counted_from_one_is_refused() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("short.txt");
+        std::fs::write(&file_path, "one\ntwo\nthree\n").expect("write");
+
+        let tool = ReadFileTool {
+            read_tracker: tracker_for_test(),
+            site: crate::session::ToolSite::for_test().with_cwd(crate::workspace::cwd_for_test()),
+        };
+        let zero = tool
+            .execute(
+                serde_json::json!({"path": file_path.to_str().expect("path"), "start": 0}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a start of 0 is refused");
+        assert!(
+            zero.to_string()
+                .contains("'start' must be a line number counted from 1, got 0"),
+            "{zero}"
+        );
+
+        let backwards = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "start": 3,
+                    "end": 2,
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("an end before the start is refused");
+        assert!(
+            backwards
+                .to_string()
+                .contains("'end' (2) is before 'start' (3)"),
+            "{backwards}"
+        );
+    }
+
+    /// A blank line is a line the window showed. Counting the window by re-reading its joined
+    /// text dropped a blank line at its end, so the notice named a range one short and sent the
+    /// model back to a line it had already seen; a window of one blank line was reported as
+    /// "lines 2-1".
+    #[tokio::test]
+    async fn a_window_ending_in_a_blank_line_counts_it() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("blanks.txt");
+        std::fs::write(&file_path, "a\n\nb\n\n").expect("write");
+
+        let tool = ReadFileTool {
+            read_tracker: tracker_for_test(),
+            site: crate::session::ToolSite::for_test().with_cwd(crate::workspace::cwd_for_test()),
+        };
+        let read = |input: serde_json::Value| {
+            let tool = &tool;
+            async move {
+                tool.execute(
+                    input,
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
+                .await
+                .expect("read")
+                .text_content()
+            }
+        };
+        let path = file_path.to_str().expect("path");
+
+        assert_eq!(
+            read(serde_json::json!({"path": path, "start": 2, "end": 2})).await,
+            "\n\n... (showing lines 2-2 of 4; continue from line 3)"
+        );
+        assert_eq!(
+            read(serde_json::json!({"path": path, "start": 1, "end": 2})).await,
+            "a\n\n\n... (showing lines 1-2 of 4; continue from line 3)"
+        );
+        assert_eq!(
+            read(serde_json::json!({"path": path, "start": 3})).await,
+            "b\n\n\n... (showing lines 3-4 of 4)"
+        );
+    }
+
+    /// A start past the end of the file returns nothing, and nothing is indistinguishable from an
+    /// empty file, a different fact, and the one the model goes on to act on.
     #[tokio::test]
     async fn read_file_past_the_end_says_so_rather_than_returning_nothing() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -4786,7 +4952,7 @@ mod tests {
         };
         let result = tool
             .execute(
-                serde_json::json!({"path": file_path.to_str().expect("path"), "offset": 100}),
+                serde_json::json!({"path": file_path.to_str().expect("path"), "start": 100}),
                 crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await

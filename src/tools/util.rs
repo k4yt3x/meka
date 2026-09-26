@@ -216,6 +216,101 @@ pub(super) fn search_lines(content: &str, pattern: &str, tool_name: &str) -> Res
     Ok(ToolOutput::text(result, false))
 }
 
+/// The lines a read tool was asked for, as the model wrote them: counted from 1, `end` inclusive,
+/// which is how [`search_lines`] reports a match and how every editor and compiler names a line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LineRange {
+    pub(super) start: usize,
+    pub(super) end: Option<usize>,
+}
+
+impl LineRange {
+    /// Every line from the first.
+    pub(super) const WHOLE: Self = Self {
+        start: 1,
+        end: None,
+    };
+
+    /// The 0-based index of the first line.
+    pub(super) fn first_index(self) -> usize {
+        self.start.saturating_sub(1)
+    }
+
+    /// How many lines the range names, or `None` when it runs to the end.
+    pub(super) fn count(self) -> Option<usize> {
+        self.end
+            .map(|end| end.saturating_sub(self.start).saturating_add(1))
+    }
+}
+
+/// Parse `start` and `end` from a read tool's input. `None` when the call named neither, so a
+/// caller can tell a whole read from a window that happens to begin at line 1. A value that is not
+/// a line number counted from 1 is refused rather than clamped, because a `0` is a model counting
+/// from zero, and clamping it would silently shift every window it asks for by one.
+pub(super) fn line_range(input: &serde_json::Value, tool_name: &str) -> Result<Option<LineRange>> {
+    let start = line_number(input, "start", tool_name)?;
+    let end = line_number(input, "end", tool_name)?;
+    if start.is_none() && end.is_none() {
+        return Ok(None);
+    }
+    let start = start.unwrap_or(1);
+    if let Some(end) = end
+        && end < start
+    {
+        return Err(MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message: format!("'end' ({end}) is before 'start' ({start})"),
+        });
+    }
+    Ok(Some(LineRange { start, end }))
+}
+
+fn line_number(input: &serde_json::Value, key: &str, tool_name: &str) -> Result<Option<usize>> {
+    match input.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => match value
+            .as_u64()
+            .and_then(|number| usize::try_from(number).ok())
+        {
+            Some(number) if number >= 1 => Ok(Some(number)),
+            _ => Err(MekaError::ToolExecution {
+                tool_name: tool_name.to_string(),
+                message: format!("'{key}' must be a line number counted from 1, got {value}"),
+            }),
+        },
+    }
+}
+
+/// The note a read appends after the lines it returned: the range shown, counted from 1, the
+/// total, why it stopped short when it did, and the line to continue from. One wording for every
+/// read tool, so a continuation is written the same way whatever produced the lines.
+pub(super) fn lines_shown_notice(
+    first: usize,
+    last: usize,
+    total: usize,
+    cut: Option<&str>,
+) -> String {
+    let mut notice = format!("(showing lines {first}-{last} of {total}");
+    if let Some(cut) = cut {
+        notice.push_str(", ");
+        notice.push_str(cut);
+    }
+    if last < total {
+        notice.push_str(&format!("; continue from line {}", last + 1));
+    }
+    notice.push(')');
+    notice
+}
+
+/// The reply to a `start` past the last line. Returning nothing would read as "empty", a
+/// different fact, and the one the model would act on.
+pub(super) fn no_lines_notice(start: usize, subject: &str, total: usize) -> String {
+    format!(
+        "(no lines: start {start} is past the end of {subject}, which has {total} line{})",
+        if total == 1 { "" } else { "s" },
+    )
+}
+
 pub(super) fn truncate_string(string: &str, max_length: usize) -> &str {
     if string.len() <= max_length {
         string

@@ -11,19 +11,19 @@ Read the contents of a file at a given path. Supports text files and images.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `path` | string | yes | The file path to read |
-| `offset` | integer | no | Line number to start reading from (0-based) |
-| `limit` | integer | no | Maximum number of lines to read (default: 2000) |
-| `regex` | string | no | Return matching lines (capped, exact value advertised in the tool's parameter schema) instead of a line range. Skipped for image files. |
+| `start` | integer | no | First line to return, counted from 1 (default: 1) |
+| `end` | integer | no | Last line to return, inclusive (default: 2000 lines from `start`) |
+| `regex` | string | no | Return matching `line:text` rows (capped, exact value advertised in the tool's parameter schema) instead of a line range; the line numbers are valid `start` values. Skipped for image files. |
 | `scratchpad` | string | no | Save output to the scratchpad under this name |
 
 ### Behavior
 
-- `limit` defaults to 2000 lines. Whenever the read stops short of the end of the file, whether because of the default or an explicit `limit`, a notice naming the range shown and the total line count is appended. A definitive answer drawn from a silent truncation is worse than an error.
-- Use `offset`/`limit` to page through large files.
+- A read without `end` returns 2000 lines from `start`. Every windowed read ends with a notice naming the range shown and the file's line count; when the read stopped short of the end of the file, whether because of that default or an explicit `end`, the notice also names the line to continue from. A definitive answer drawn from a silent truncation is worse than an error.
+- `start` and `end` count from 1 and include both ends, the way `regex` matches, editors and compilers name lines, so a line number from any of them is a valid `start`. A `start` of 0 is refused rather than shifted, and so is an `end` before the `start`.
 - A single read holds at most 16 MiB in memory. Asking for the whole of a file larger than that is refused, because there is no bounded way to return it; asking for a *window* of one is not, and streams past everything outside the window. So a command-output capture larger than the ceiling stays readable a page at a time, which is what [`shell_execute`](shell.md) promises when it spills one to a file.
 - A read that shows the whole file returns it byte for byte, so a CRLF file stays CRLF and an `old_string` copied out of it applies as written. A windowed read normalizes line endings to `\n`; if a later `file_edit` misses for that reason it says so.
 - Under [ACP](../usage/acp.md) the editor is asked for the whole document and the window is applied here, so both the truncation notice and the freshness fingerprint describe the document rather than the slice.
-- `regex` runs the pattern against each line and returns `line:content` rows (like `grep -n`). It bypasses `offset`/`limit` and is meaningless on image content. Under [ACP](../usage/acp.md) it searches the editor's copy of the file, like any other text read, so a search and the edit that follows it see the same document.
+- `regex` runs the pattern against each line and returns `line:content` rows (like `grep -n`). It bypasses `start`/`end` and is meaningless on image content. Under [ACP](../usage/acp.md) it searches the editor's copy of the file, like any other text read, so a search and the edit that follows it see the same document.
 
 ### Image files
 

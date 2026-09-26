@@ -1859,7 +1859,7 @@ mod tests {
                     name: "scratchpad_read".to_string(),
                 },
                 MockEvent::ToolUseEnd {
-                    input: serde_json::json!({"name": "big", "limit": 100_000}),
+                    input: serde_json::json!({"name": "big"}),
                 },
                 MockEvent::MessageEnd {
                     stop_reason: MockStopReason::ToolUse,

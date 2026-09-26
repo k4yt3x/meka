@@ -995,18 +995,18 @@ mod tests {
     }
 
     #[test]
-    fn tool_locations_read_file_line_from_offset() {
+    fn a_file_read_location_points_at_its_start_line() {
         let cwd = SharedCwd::new(PathBuf::from("/home/agent/proj"));
-        // `file_read` offset is 0-based; ACP `line` is 1-based.
-        let input = serde_json::json!({"path": "src/main.rs", "offset": 41});
+        // `start` counts from 1, as ACP's `line` does.
+        let input = serde_json::json!({"path": "src/main.rs", "start": 42});
         let locations = tool_locations("file_read", &input, &cwd);
         assert_eq!(locations.len(), 1);
         assert_eq!(locations[0].line, Some(42));
-        // No offset -> no line.
-        let no_offset = serde_json::json!({"path": "src/main.rs"});
-        assert_eq!(tool_locations("file_read", &no_offset, &cwd)[0].line, None);
-        // Other path tools never set a line, even with an offset present.
-        let edit = serde_json::json!({"path": "src/main.rs", "offset": 41});
+        // No start -> no line.
+        let no_start = serde_json::json!({"path": "src/main.rs"});
+        assert_eq!(tool_locations("file_read", &no_start, &cwd)[0].line, None);
+        // Other path tools never set a line, even with a start present.
+        let edit = serde_json::json!({"path": "src/main.rs", "start": 42});
         assert_eq!(tool_locations("file_edit", &edit, &cwd)[0].line, None);
     }
 

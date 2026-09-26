@@ -3648,7 +3648,7 @@ mod tests {
                     name: "scratchpad_read".to_string(),
                 },
                 MockEvent::ToolUseEnd {
-                    input: serde_json::json!({"name": "big", "limit": 100_000}),
+                    input: serde_json::json!({"name": "big"}),
                 },
                 MockEvent::MessageEnd {
                     stop_reason: MockStopReason::ToolUse,
@@ -3734,10 +3734,7 @@ mod tests {
             "the whole entry, not a preview: {}",
             &reply[..reply.len().min(200)]
         );
-        assert!(
-            reply.ends_with("(showing bytes 0..100000 of 100000)"),
-            "{reply}"
-        );
+        assert!(reply.ends_with("(showing lines 1-1 of 1)"), "{reply}");
         let entries = store
             .list_scratchpad_entries(session_id)
             .await
@@ -3754,15 +3751,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_whole_read_is_cut_to_the_agents_own_gauge_and_a_measurement_clears_it() {
-        // 120k of 200k used against a ceiling at 160k: 40k tokens of room, which is 40 KB of
-        // digits under the bound, above the inline floor.
-        let (agent, store, messages, session_id) =
-            run_a_whole_read(&"7".repeat(100_000), 120_000, 160_000).await;
+        // 120k of 200k used against a ceiling at 160k: 40k tokens of room, which under the bound
+        // is 404 whole lines of 99 digits and four digits of the next, above the inline floor;
+        // the cut moves back to the end of line 404.
+        let entry = format!("{}\n", "7".repeat(99)).repeat(1000);
+        let (agent, store, messages, session_id) = run_a_whole_read(&entry, 120_000, 160_000).await;
         let reply = the_read_reply(&messages);
         assert!(
             reply.ends_with(
-                "(showing bytes 0..40000 of 100000; cut to what fits in the context window now, \
-                 continue from offset 40000)"
+                "(showing lines 1-404 of 1000, cut to what fits in the context window now; \
+                 continue from line 405)"
             ),
             "{}",
             &reply[reply.len() - 200..]

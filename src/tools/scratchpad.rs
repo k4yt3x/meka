@@ -11,7 +11,10 @@ use uuid::Uuid;
 use super::{
     SpillHint, Tool, ToolOutput,
     context::ContextGauge,
-    util::{MAX_SEARCH_MATCHES, resolve_session_id, search_lines},
+    util::{
+        LineRange, MAX_SEARCH_MATCHES, line_range, lines_shown_notice, no_lines_notice,
+        resolve_session_id, search_lines,
+    },
 };
 use crate::{
     conversation::{ContentBlock, Message, ToolResultContent},
@@ -28,9 +31,6 @@ pub(crate) const MAX_INLINE_RESULT_BYTES: usize = 30_000;
 
 /// Number of bytes included in the inline preview.
 const PREVIEW_BYTES: usize = 2_000;
-
-/// Default byte limit when reading back a persisted output.
-const DEFAULT_READ_LIMIT: usize = 30_000;
 
 /// Build a map from tool_use_id to (tool_name, input) for the ToolUse blocks in an assistant
 /// message.
@@ -59,16 +59,14 @@ fn build_large_output_preview(name: &str, text: &str) -> String {
 
     let mut replacement = format!(
         "<large-output name=\"{}\" size=\"{}\">\n\
-         Output too large ({}). Read with `scratchpad_read`. Use \
-         `limit: {}` to load the full content in one call (a read is cut to what fits in \
-         the context window and says where to continue), or page \
-         with `offset`/`limit` if a partial read is enough.\n\n\
+         Output too large ({}). Read it with `scratchpad_read`: a read returns as much as fits \
+         in the context window and says where to continue; `start` and `end` name a line \
+         range.\n\n\
          Preview (first {} bytes):\n\
          {}",
         name,
         size,
         format_size(size),
-        size,
         preview_end,
         preview,
     );
@@ -338,10 +336,10 @@ impl Tool for ScratchpadReadTool {
             name: "scratchpad_read".to_string(),
             description: format!(
                 "Read a scratchpad entry, including `<large-output>` references and granted parent \
-                 entries. Returns up to {DEFAULT_READ_LIMIT} bytes, further limited by context \
-                 headroom; the result gives a continuation offset. Set `limit` to the entry's size \
-                 for a full read if it fits. `regex` returns up to {MAX_SEARCH_MATCHES} matching lines \
-                 instead of a byte range. Reads are not spilled back to the scratchpad."
+                 entries. Returns the lines from `start` to `end`, cut to what fits in the context \
+                 window, and says where to continue. `regex` returns up to {MAX_SEARCH_MATCHES} \
+                 matching `line:text` rows instead, whose line numbers are valid `start` values. \
+                 Reads are not spilled back to the scratchpad."
             ),
             parameters: serde_json::json!({
                 "type": "object",
@@ -350,27 +348,22 @@ impl Tool for ScratchpadReadTool {
                         "type": "string",
                         "description": "The scratchpad entry name."
                     },
-                    "offset": {
+                    "start": {
                         "type": "integer",
-                        "default": 0,
-                        "description": "Byte offset to start reading from; one that falls inside a \
-                                        multi-byte character moves back to that character's first \
-                                        byte. Default: 0."
+                        "minimum": 1,
+                        "description": "First line to return, counted from 1. Default: 1."
                     },
-                    "limit": {
+                    "end": {
                         "type": "integer",
-                        "default": DEFAULT_READ_LIMIT,
-                        "description": format!(
-                            "Maximum bytes to return, cut to what fits in the context window; a \
-                             range that would end inside a multi-byte character stops before it. \
-                             Default: {DEFAULT_READ_LIMIT}."
-                        )
+                        "minimum": 1,
+                        "description": "Last line to return, inclusive. Default: the last line of \
+                                        the entry."
                     },
                     "regex": {
                         "type": "string",
                         "description": format!(
                             "If provided, search the entry with this regex pattern \
-                             and return matching lines (max {MAX_SEARCH_MATCHES} matches) instead of a byte range."
+                             and return matching lines (max {MAX_SEARCH_MATCHES} matches) instead of a line range."
                         )
                     }
                 },
@@ -395,6 +388,9 @@ impl Tool for ScratchpadReadTool {
                 tool_name: "scratchpad_read".to_string(),
                 message: "missing 'name' parameter".to_string(),
             })?;
+        // Parsed ahead of the load and of the regex path, as `file_read` parses it ahead of its
+        // I/O, so a malformed range is refused the same way whichever tool and mode it came with.
+        let range = line_range(&input, "scratchpad_read")?.unwrap_or(LineRange::WHOLE);
 
         let session_id = resolve_session_id(&self.site.session_id, "scratchpad_read")?;
 
@@ -419,47 +415,112 @@ impl Tool for ScratchpadReadTool {
             return search_lines(&content, pattern, "scratchpad_read");
         }
 
-        read_mode(&content, &input, &self.gauge)
+        read_mode(name, &content, range, &self.gauge)
     }
 }
 
-/// A byte range of an entry, sized against the context: the model chooses how much to read, the
-/// gauge says how much of that fits, and the reply is marked as sized so the spill pass leaves it
-/// inline. Only this path is marked, and only when the gauge could size it: a regex search is
-/// bounded by its match cap and still spills, and so does a read on a window meka does not know,
-/// which would otherwise go out unbounded.
-fn read_mode(content: &str, input: &serde_json::Value, gauge: &ContextGauge) -> Result<ToolOutput> {
-    let offset = usize::try_from(input["offset"].as_u64().unwrap_or(0)).unwrap_or(usize::MAX);
-    let limit = usize::try_from(input["limit"].as_u64().unwrap_or(DEFAULT_READ_LIMIT as u64))
-        .unwrap_or(usize::MAX);
-    let total = content.len();
-
-    if offset >= total {
+/// The lines of an entry from `start` to `end`, bounded to what may go into the context: by the
+/// gauge when the window is known, and at the inline bound, as any other tool's result is, when it
+/// is not. The cut lands on the last line boundary inside the grant, so a reply never ends
+/// mid-line and the model continues from a line it has not seen, except when the first line asked
+/// for is itself larger than the grant, which the reply says. The reply is marked as sized so the
+/// spill pass leaves it inline; a regex search is not, being bounded by its match cap, and so
+/// still spills when a few enormous lines match.
+fn read_mode(
+    name: &str,
+    content: &str,
+    range: LineRange,
+    gauge: &ContextGauge,
+) -> Result<ToolOutput> {
+    let total_lines = content.lines().count();
+    let Some((span_start, span_end)) = line_span(content, range.first_index(), range.count())
+    else {
         return Ok(ToolOutput::text(
-            format!("Offset {offset} exceeds content length ({total} bytes)"),
-            true,
+            no_lines_notice(range.start, &format!("entry '{name}'"), total_lines),
+            false,
         ));
+    };
+    let wanted = &content[span_start..span_end];
+
+    // The grant is charged before the cut is snapped back to a line boundary, so the partial line
+    // is paid for and not sent. The over-charge is at most that one line, which a blob can make
+    // large, and it lasts only until the round's measurement replaces the reservation; the bound
+    // errs on that side by design.
+    let granted = match gauge.reserve(wanted) {
+        Some(granted) => granted,
+        None => MAX_INLINE_RESULT_BYTES.min(wanted.len()),
+    };
+    let granted = wanted.floor_char_boundary(granted);
+    let mut shown = wanted;
+    let mut cut_short = false;
+    let mut first_line_cut = false;
+    if granted < wanted.len() {
+        cut_short = true;
+        // A newline at the grant's edge ends a line the grant holds whole; otherwise the last
+        // newline inside the grant ends the last whole line. Searching only inside the grant
+        // reported a line that fit exactly as one that did not.
+        let boundary = if wanted.as_bytes().get(granted) == Some(&b'\n') {
+            Some(granted)
+        } else {
+            wanted[..granted].rfind('\n')
+        };
+        match boundary {
+            Some(at) => shown = wanted[..at].strip_suffix('\r').unwrap_or(&wanted[..at]),
+            None => {
+                shown = &wanted[..granted];
+                first_line_cut = true;
+            }
+        }
     }
 
-    let start = content.floor_char_boundary(offset);
-    let wanted = content.floor_char_boundary(start.saturating_add(limit).min(total));
-    let sized = gauge.reserve(&content[start..wanted]);
-    let end = sized.map_or(wanted, |granted| start.saturating_add(granted));
-    let slice = &content[start..end];
-
-    let trailer = if end < wanted {
+    let notice = if first_line_cut {
+        let first_line_bytes = wanted
+            .find('\n')
+            .map_or(wanted.len(), |at| wanted[..at].trim_end_matches('\r').len());
         format!(
-            "(showing bytes {start}..{end} of {total}; cut to what fits in the context window \
-             now, continue from offset {end})"
+            "(line {} is {} and does not fit in the context window; showing its first {}. Save \
+             the entry to a file with scratchpad_save_file and cut it with the shell)",
+            range.start,
+            format_size(first_line_bytes),
+            format_size(shown.len()),
         )
     } else {
-        format!("(showing bytes {start}..{end} of {total})")
+        // `shown` never ends with its last line's terminator, so its newlines separate lines.
+        let last = range.start.saturating_add(shown.matches('\n').count());
+        lines_shown_notice(
+            range.start,
+            last,
+            total_lines,
+            cut_short.then_some("cut to what fits in the context window now"),
+        )
     };
-    let mut output = ToolOutput::text(format!("{slice}\n\n{trailer}"), false);
-    if sized.is_some() {
-        output.spill_hint = SpillHint::sized_to_context();
-    }
+    let mut output = ToolOutput::text(format!("{shown}\n\n{notice}"), false);
+    output.spill_hint = SpillHint::sized_to_context();
     Ok(output)
+}
+
+/// The byte span of `count` lines from the 0-based line `first`, or every line from it when
+/// `count` is `None`, ending before the last line's terminator so the notice after the lines
+/// stands apart from them. `None` when `first` is past the last line.
+fn line_span(content: &str, first: usize, count: Option<usize>) -> Option<(usize, usize)> {
+    let mut offset = 0;
+    let mut start = None;
+    let mut end = 0;
+    for (index, piece) in content.split_inclusive('\n').enumerate() {
+        if index == first {
+            start = Some(offset);
+        }
+        if index >= first {
+            let body = piece.strip_suffix('\n').unwrap_or(piece);
+            let body = body.strip_suffix('\r').unwrap_or(body);
+            end = offset + body.len();
+            if count.is_some_and(|count| index + 1 - first >= count) {
+                break;
+            }
+        }
+        offset += piece.len();
+    }
+    start.map(|start| (start, end))
 }
 
 pub(super) struct ScratchpadEditTool {
@@ -1564,7 +1625,7 @@ mod tests {
         };
         let output = tool
             .execute(
-                serde_json::json!({"name": "big", "limit": whole.len()}),
+                serde_json::json!({"name": "big"}),
                 crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
@@ -1579,7 +1640,7 @@ mod tests {
         let assistant_message = make_assistant_message(vec![(
             "call-1",
             "scratchpad_read",
-            serde_json::json!({"name": "big", "limit": whole.len()}),
+            serde_json::json!({"name": "big"}),
         )]);
         let mut results = vec![ContentBlock::ToolResult {
             tool_use_id: "call-1".to_string(),
@@ -1630,13 +1691,19 @@ mod tests {
             .create_session(None, "test-profile".to_string())
             .await
             .expect("create");
-        // Digits, which the bound counts one token each, so a grant reads in bytes.
-        let whole = "7".repeat(300_000);
+        // Lines of 99 digits, which the bound counts one token each and a lone newline as none,
+        // so a grant reads in bytes; each line spells its own number so a window is checked by
+        // its content and not only by its count.
+        let line = |number: usize| format!("{number:0>99}");
+        let whole: String = (1..=3000)
+            .map(|number| format!("{}\n", line(number)))
+            .collect();
         store
             .save_scratchpad_entry(session_id, "big", &whole)
             .await
             .expect("save");
-        // 80% of 200k is 160k; 100k used leaves 60k tokens, so 60 KB of digits.
+        // 80% of 200k is 160k; 100k used leaves 60k tokens: 606 whole lines and six digits of
+        // the next.
         let reserved = Arc::new(AtomicU64::new(0));
         let tool = ScratchpadReadTool {
             gauge: ContextGauge {
@@ -1666,51 +1733,61 @@ mod tests {
             }
         };
 
-        let first = read(serde_json::json!({"name": "big", "limit": 300_000})).await;
-        assert!(
-            first.ends_with(
-                "(showing bytes 0..60000 of 300000; cut to what fits in the context window now, \
-                 continue from offset 60000)"
-            ),
-            "{}",
-            &first[first.len() - 200..]
+        let first = read(serde_json::json!({"name": "big"})).await;
+        let (body, notice) = first
+            .rsplit_once("\n\n")
+            .expect("a notice follows the lines");
+        assert_eq!(
+            notice,
+            "(showing lines 1-606 of 3000, cut to what fits in the context window now; continue \
+             from line 607)"
         );
+        // The grant ended six digits into line 607, and the cut moved back to the end of the line
+        // before it rather than sending a partial line; the six digits are still charged.
+        assert_eq!(body.lines().count(), 606);
+        assert_eq!(body.lines().last(), Some(line(606).as_str()));
         assert_eq!(reserved.load(std::sync::atomic::Ordering::Relaxed), 60_000);
 
         // The headroom is spent, so the second read gets the inline bound and no more: the same
         // as any other tool's result, which the spill pass would have cut there.
-        let second =
-            read(serde_json::json!({"name": "big", "offset": 60_000, "limit": 60_000})).await;
-        assert!(
-            second.contains(&format!(
-                "(showing bytes 60000..{} of 300000; cut to what fits",
-                60_000 + MAX_INLINE_RESULT_BYTES
-            )),
-            "{}",
-            &second[second.len() - 200..]
+        let second = read(serde_json::json!({"name": "big", "start": 607})).await;
+        let (body, notice) = second
+            .rsplit_once("\n\n")
+            .expect("a notice follows the lines");
+        assert!(body.starts_with(&line(607)), "{}", &body[..120]);
+        assert_eq!(
+            notice,
+            "(showing lines 607-906 of 3000, cut to what fits in the context window now; \
+             continue from line 907)"
         );
 
         // A read that fits says nothing about cutting.
-        let third =
-            read(serde_json::json!({"name": "big", "offset": 290_000, "limit": 1_000})).await;
+        let third = read(serde_json::json!({"name": "big", "start": 2991, "end": 3000})).await;
         assert!(
-            third.ends_with("(showing bytes 290000..291000 of 300000)"),
+            third.ends_with("(showing lines 2991-3000 of 3000)"),
             "{}",
             &third[third.len() - 100..]
         );
     }
 
-    /// A window meka does not know sizes nothing, so the reply is left for the spill: marking it
-    /// sized would send an entry of any size inline on a profile with `context_window = 0`.
+    /// A window meka does not know sizes nothing, so the read bounds itself where the spill pass
+    /// would bound any other tool's result, and on a line, so the model continues from one it has
+    /// not seen. Marked as sized because the tool did the bounding: left to the spill pass, the
+    /// notice after the lines would carry the reply over the bound and a read of a spill would be
+    /// spilled again.
     #[tokio::test]
-    async fn a_read_on_an_unknown_window_is_left_for_the_spill() {
+    async fn a_read_on_an_unknown_window_is_bounded_like_any_other_result() {
         let store = Store::for_test().await;
         let session_id = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("create");
         store
-            .save_scratchpad_entry(session_id, "big", &"7".repeat(100_000))
+            .save_scratchpad_entry(
+                session_id,
+                "big",
+                &format!("{}\n", "7".repeat(99)).repeat(1000),
+            )
             .await
             .expect("save");
         let tool = ScratchpadReadTool {
@@ -1723,21 +1800,27 @@ mod tests {
         };
         let output = tool
             .execute(
-                serde_json::json!({"name": "big", "limit": 100_000}),
+                serde_json::json!({"name": "big"}),
                 crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("execute");
-        assert_eq!(output.spill_hint, SpillHint::default());
-        assert!(
-            output
-                .text_content()
-                .ends_with("(showing bytes 0..100000 of 100000)"),
-            "the read itself is whole; the spill pass decides what the model sees"
+        assert_eq!(output.spill_hint, SpillHint::sized_to_context());
+        let text = output.text_content();
+        let (body, notice) = text
+            .rsplit_once("\n\n")
+            .expect("a notice follows the lines");
+        assert_eq!(
+            notice,
+            "(showing lines 1-300 of 1000, cut to what fits in the context window now; continue \
+             from line 301)"
         );
+        // 300 whole lines of 100 bytes, less the newline the cut moved back to.
+        assert_eq!(body.len(), MAX_INLINE_RESULT_BYTES - 1);
+        assert_eq!(body.lines().count(), 300);
     }
 
-    /// Only the byte-range path is sized: a search is bounded by its match cap, reserves nothing,
+    /// Only the line-range path is sized: a search is bounded by its match cap, reserves nothing,
     /// and so must keep spilling when a few enormous lines match.
     #[tokio::test]
     async fn a_regex_search_of_an_entry_is_not_sized() {
@@ -2130,7 +2213,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scratchpad_read_with_offset_and_limit() {
+    async fn a_read_returns_the_lines_from_start_to_end_inclusive() {
         let manager = Store::for_test().await;
         let session_id = manager
             .create_session(None, "test-profile".to_string())
@@ -2138,7 +2221,7 @@ mod tests {
             .expect("create");
 
         manager
-            .save_scratchpad_entry(session_id, "abc", "abcdefghij")
+            .save_scratchpad_entry(session_id, "abc", "one\ntwo\nthree\nfour\nfive\n")
             .await
             .expect("save");
 
@@ -2153,30 +2236,29 @@ mod tests {
 
         let result = tool
             .execute(
-                serde_json::json!({"name": "abc", "offset": 3, "limit": 4}),
+                serde_json::json!({"name": "abc", "start": 2, "end": 4}),
                 crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("execute");
 
-        let text = result.text_content();
-        assert!(text.contains("defg"));
-        assert!(text.contains("showing bytes 3..7 of 10"));
+        assert_eq!(
+            result.text_content(),
+            "two\nthree\nfour\n\n(showing lines 2-4 of 5; continue from line 5)"
+        );
     }
 
-    /// `offset` and `limit` are bytes, and the description says what happens to a boundary inside
-    /// a character: the start moves back to the character's first byte, the end stops before it.
+    /// The line numbers a regex search reports are the line numbers a range read takes: the round
+    /// trip from a match to the lines around it is the reason both are counted from 1.
     #[tokio::test]
-    async fn a_byte_range_inside_a_character_is_moved_to_its_boundaries() {
+    async fn a_regex_match_reads_back_by_its_line_number() {
         let manager = Store::for_test().await;
         let session_id = manager
             .create_session(None, "test-profile".to_string())
             .await
             .expect("create");
-        // `é` is bytes 1..3 and `ü` bytes 4..6, so offset 2 is inside the first and the range's
-        // end at 5 inside the second.
         manager
-            .save_scratchpad_entry(session_id, "accents", "hélüo")
+            .save_scratchpad_entry(session_id, "haystack", "alpha\nbeta\nneedle here\ndelta")
             .await
             .expect("save");
         let tool = ScratchpadReadTool {
@@ -2188,17 +2270,197 @@ mod tests {
                 .with_session_id(session_id_for_test(session_id)),
         };
 
-        let result = tool
+        let found = tool
             .execute(
-                serde_json::json!({"name": "accents", "offset": 2, "limit": 4}),
+                serde_json::json!({"name": "haystack", "regex": "needle"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("search");
+        assert_eq!(found.text_content(), "3:needle here");
+
+        let read = tool
+            .execute(
+                serde_json::json!({"name": "haystack", "start": 3, "end": 3}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("read");
+        assert_eq!(
+            read.text_content(),
+            "needle here\n\n(showing lines 3-3 of 4; continue from line 4)"
+        );
+    }
+
+    /// A single line larger than what fits cannot be paged by line. The reply carries its head,
+    /// cut on a character boundary, and says how big the line is and how to get at the rest,
+    /// rather than returning nothing or a slice ending inside a character.
+    #[tokio::test]
+    async fn a_line_larger_than_what_fits_is_cut_on_a_character_boundary_and_says_so() {
+        let manager = Store::for_test().await;
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        // One byte and then three-byte characters, so the inline bound falls inside one of them.
+        let blob = format!("a{}\nnext\n", "€".repeat(14_000));
+        manager
+            .save_scratchpad_entry(session_id, "blob", &blob)
+            .await
+            .expect("save");
+        let tool = ScratchpadReadTool {
+            gauge: ContextGauge::for_test(),
+            store: manager,
+            parent_session_id: None,
+            inherited_names: Vec::new(),
+            site: crate::session::ToolSite::for_test()
+                .with_session_id(session_id_for_test(session_id)),
+        };
+
+        let output = tool
+            .execute(
+                serde_json::json!({"name": "blob"}),
                 crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("execute");
+        let text = output.text_content();
+        let (body, notice) = text.rsplit_once("\n\n").expect("a notice follows the line");
+        assert_eq!(body.len(), MAX_INLINE_RESULT_BYTES - 2, "{}", &body[..20]);
+        assert!(body.ends_with('€'), "{}", &body[body.len() - 12..]);
+        assert!(
+            notice.starts_with("(line 1 is ")
+                && notice.contains(" and does not fit in the context window; showing its first ")
+                && notice.ends_with("with scratchpad_save_file and cut it with the shell)"),
+            "{notice}"
+        );
+        assert_eq!(output.spill_hint, SpillHint::sized_to_context());
+    }
 
-        let text = result.text_content();
-        assert!(text.starts_with("él\n"), "{text:?}");
-        assert!(text.contains("showing bytes 1..4 of 7"), "{text:?}");
+    /// A grant that ends exactly where a line ends holds that line whole: the newline at its edge
+    /// is the boundary. Searching for one only inside the grant reported the line as too large
+    /// to fit while showing all of it.
+    #[tokio::test]
+    async fn a_grant_that_ends_exactly_at_a_line_end_keeps_the_line_whole() {
+        let manager = Store::for_test().await;
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        // The first line is exactly the inline bound, which is the grant on an unknown window.
+        let entry = format!("{}\nnext\n", "7".repeat(MAX_INLINE_RESULT_BYTES));
+        manager
+            .save_scratchpad_entry(session_id, "edge", &entry)
+            .await
+            .expect("save");
+        let tool = ScratchpadReadTool {
+            gauge: ContextGauge::for_test(),
+            store: manager,
+            parent_session_id: None,
+            inherited_names: Vec::new(),
+            site: crate::session::ToolSite::for_test()
+                .with_session_id(session_id_for_test(session_id)),
+        };
+
+        let output = tool
+            .execute(
+                serde_json::json!({"name": "edge"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("execute");
+        let text = output.text_content();
+        let (body, notice) = text.rsplit_once("\n\n").expect("a notice follows the line");
+        assert_eq!(body.len(), MAX_INLINE_RESULT_BYTES);
+        assert_eq!(
+            notice,
+            "(showing lines 1-1 of 2, cut to what fits in the context window now; continue from \
+             line 2)"
+        );
+    }
+
+    /// A malformed range is refused before the entry is looked at, regex or not, as `file_read`
+    /// refuses one ahead of its I/O: one rule at one door for both tools.
+    #[tokio::test]
+    async fn a_malformed_range_is_refused_even_with_a_regex() {
+        let manager = Store::for_test().await;
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        let tool = ScratchpadReadTool {
+            gauge: ContextGauge::for_test(),
+            store: manager,
+            parent_session_id: None,
+            inherited_names: Vec::new(),
+            site: crate::session::ToolSite::for_test()
+                .with_session_id(session_id_for_test(session_id)),
+        };
+
+        let error = tool
+            .execute(
+                serde_json::json!({"name": "absent", "regex": "x", "start": 0}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a start of 0 is refused before the entry is loaded");
+        assert!(
+            error
+                .to_string()
+                .contains("'start' must be a line number counted from 1, got 0"),
+            "{error}"
+        );
+    }
+
+    /// A `start` past the last line, and an entry with no lines at all, are said in so many
+    /// words: nothing would read as an empty entry, a different fact.
+    #[tokio::test]
+    async fn a_start_past_the_end_of_an_entry_says_so() {
+        let manager = Store::for_test().await;
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        manager
+            .save_scratchpad_entry(session_id, "short", "one\ntwo\n")
+            .await
+            .expect("save");
+        manager
+            .save_scratchpad_entry(session_id, "empty", "")
+            .await
+            .expect("save");
+        let tool = ScratchpadReadTool {
+            gauge: ContextGauge::for_test(),
+            store: manager,
+            parent_session_id: None,
+            inherited_names: Vec::new(),
+            site: crate::session::ToolSite::for_test()
+                .with_session_id(session_id_for_test(session_id)),
+        };
+
+        let past = tool
+            .execute(
+                serde_json::json!({"name": "short", "start": 5}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("execute");
+        assert_eq!(
+            past.text_content(),
+            "(no lines: start 5 is past the end of entry 'short', which has 2 lines)"
+        );
+
+        let empty = tool
+            .execute(
+                serde_json::json!({"name": "empty"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("execute");
+        assert_eq!(
+            empty.text_content(),
+            "(no lines: start 1 is past the end of entry 'empty', which has 0 lines)"
+        );
     }
 
     #[tokio::test]

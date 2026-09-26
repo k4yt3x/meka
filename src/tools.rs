@@ -657,10 +657,10 @@ pub(crate) struct SpillHint {
     /// The name to spill under instead of the tool's own. MCP adapters set it so the entry is
     /// named `mcp_<server>_<remote_tool>`.
     pub(crate) name: Option<String>,
-    /// The tool sized this result against the context itself, so the spill pass leaves it inline
-    /// however large. Only a tool that reserved its bytes on the
-    /// [`crate::tools::context::ContextGauge`] may say so; an unsized result over the bound would
-    /// go out unbounded.
+    /// The tool bounded this result itself, against the
+    /// [`crate::tools::context::ContextGauge`] when the window is known and at the inline bound
+    /// when it is not, so the spill pass leaves it inline however large. Only a tool that did so
+    /// may say so; an unbounded result over the bound would go out unbounded.
     pub(crate) sized_to_context: bool,
 }
 
@@ -673,7 +673,7 @@ impl SpillHint {
         }
     }
 
-    /// Never spill: the tool reserved what it returns.
+    /// Never spill: the tool bounded what it returns.
     pub(crate) fn sized_to_context() -> Self {
         Self {
             name: None,
