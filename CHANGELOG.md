@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bubblewrap shells also run inside Landlock on kernel 6.12+, closing sockets bwrap leaves open.
 - Landlock hides meka's config and credential store from a sandboxed shell.
 - A shell sandboxed by Landlock gets a private temporary directory, named by `TMPDIR`.
+- `bubblewrap-landlock` pins Bubblewrap with the Landlock layer inside, failing closed without it.
 
 ### Changed
 

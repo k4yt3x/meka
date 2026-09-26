@@ -989,7 +989,7 @@ pub(crate) struct Cli {
     #[arg(long = "profile", value_name = "NAME")]
     pub(crate) profile: Option<String>,
 
-    /// Linux sandbox backend: landlock or bubblewrap
+    /// Linux sandbox backend: landlock, bubblewrap or bubblewrap-landlock
     #[arg(long = "sandbox-backend", value_name = "BACKEND")]
     pub(crate) sandbox_backend: Option<crate::config::SandboxBackend>,
 

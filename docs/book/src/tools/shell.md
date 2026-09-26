@@ -83,9 +83,10 @@ An approved command is not an exception: with [approvals](../usage/permissions.m
 
 #### Linux: pick a backend
 
-Linux supports two backends, selected via `[shell].sandbox_backend` in `config.toml`:
+Linux has two sandbox mechanisms and three values for `[shell].sandbox_backend` in `config.toml`:
 
 - **Bubblewrap** (`sandbox_backend = "bubblewrap"`, recommended): wraps the command in `bwrap` with `--ro-bind /`, tmpfs masks over `/run`, `/tmp`, `/var/tmp`, and `$XDG_RUNTIME_DIR`, plus `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks make the dbus session bus, systemd-user socket, and other socket-on-disk IPC paths unreachable, so `systemctl --user start <unit>`, `dbus-send`, and similar state-changing calls fail. Network is not unshared. On a kernel with Landlock ABI v6 (6.12) or newer, the command also runs inside meka's Landlock ruleset: bwrap execs `meka confine`, which enacts the ruleset after the mounts and then runs the shell. That closes what the masks leave open: the abstract socket namespace and signals to outside processes, ioctls on real devices, and from kernel 7.1 a socket under `$HOME` or `/var/lib` too. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled; Ubuntu 24.04 also needs the `bwrap-userns-restrict` AppArmor profile from `apparmor-profiles`.
+- **Bubblewrap with Landlock** (`sandbox_backend = "bubblewrap-landlock"`): the same as Bubblewrap, but the Landlock layer inside is required rather than added where the kernel allows. On a kernel below 6.12 the backend is reported unusable and the shell at `read` fails instead of running under bwrap alone. What the layer closes still follows the kernel, sockets on disk outside the masks only from 7.1. Auto-detection never picks it; pin it on a host where it must be certain the layer is there.
 - **Landlock** (`sandbox_backend = "landlock"`, fallback): uses the [Landlock LSM](https://landlock.io/). Blocks filesystem writes via `landlock_restrict_self`. **Requires ABI v9 (kernel 7.1+)**: that is the first ABI with a right over `connect()` to Unix sockets on disk, and below it a sandboxed shell can invoke state-mutating dbus methods and `systemd-run --user` escapes the filesystem restriction entirely. meka reports Landlock unusable on older kernels rather than sandboxing with a ruleset that leaves that door open, which means kernels below 7.1 (Debian 13, RHEL 10, Ubuntu 24.04 and 26.04 LTS) need Bubblewrap installed for the shell at `read`. Closing that route also breaks socket-based clients such as `docker` and `psql` at `read`. meka's own directories are hidden by never being covered by a rule: reading files is granted per sibling along the path to each of them, so their names and sizes stay visible but their bytes do not, and the one cost is that a workspace root above them (a root at `$HOME`) can create new files only in its subdirectories. What no Landlock ABI mediates is file metadata: a command at `read` can still `chmod`, `chown`, `touch` and set extended attributes on any file you own. Prefer Bubblewrap, whose read-only bind refuses those and which removes the socket-on-disk paths on any kernel.
 
 `sandbox_backend` is unset unless you pin it yourself; no command writes it. When unset, meka probes Bubblewrap once at startup and prefers it when available, falling back to Landlock with one warning at startup: that it did so, and that Landlock cannot stop a command changing a file's mode, owner, timestamps or attributes. Pinning `sandbox_backend = "landlock"` accepts that and silences the warning.
@@ -93,7 +94,7 @@ Linux supports two backends, selected via `[shell].sandbox_backend` in `config.t
 ```toml
 [shell]
 sandbox = true                       # default; set to false to disable
-sandbox_backend = "bubblewrap"       # or "landlock"; unset = auto-detect
+sandbox_backend = "bubblewrap"       # or "landlock" or "bubblewrap-landlock"; unset = auto-detect
 ```
 
 #### macOS and Windows

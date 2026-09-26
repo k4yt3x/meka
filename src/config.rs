@@ -719,16 +719,22 @@ pub(crate) struct ShellConfig {
 /// The wire spelling is [`Self::name`], which the file, the flag and the variable take; `Display`
 /// prints the brand-cased [`Self::display_name`] for prose, so a message reads "Landlock" while the
 /// config key still says `landlock`.
+///
+/// `bubblewrap-landlock` is Bubblewrap with the Landlock layer inside required rather than added
+/// where the kernel allows: a pin for a host where the strongest boundary must be certain, which
+/// fails closed on a kernel that cannot supply the layer. Auto-resolution never picks it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub(crate) enum SandboxBackend {
     Landlock,
     Bubblewrap,
+    BubblewrapLandlock,
 }
 
 impl SandboxBackend {
     /// Every backend, in the order the names sort.
-    pub(crate) const ALL: [SandboxBackend; 2] = [Self::Bubblewrap, Self::Landlock];
+    pub(crate) const ALL: [SandboxBackend; 3] =
+        [Self::Bubblewrap, Self::BubblewrapLandlock, Self::Landlock];
 
     /// The one spelling `[shell].sandbox_backend`, `--sandbox-backend` and `MEKA_SANDBOX_BACKEND`
     /// take.
@@ -736,6 +742,7 @@ impl SandboxBackend {
         match self {
             Self::Landlock => "landlock",
             Self::Bubblewrap => "bubblewrap",
+            Self::BubblewrapLandlock => "bubblewrap-landlock",
         }
     }
 
@@ -744,6 +751,7 @@ impl SandboxBackend {
         match self {
             Self::Landlock => "Landlock",
             Self::Bubblewrap => "Bubblewrap",
+            Self::BubblewrapLandlock => "Bubblewrap with Landlock",
         }
     }
 
@@ -5066,9 +5074,18 @@ thinking = "budgeted"
             "bubblewrap".parse::<SandboxBackend>(),
             Ok(SandboxBackend::Bubblewrap)
         );
+        assert_eq!(
+            "bubblewrap-landlock".parse::<SandboxBackend>(),
+            Ok(SandboxBackend::BubblewrapLandlock)
+        );
         assert!(
             "Bubblewrap".parse::<SandboxBackend>().is_err(),
             "one spelling per backend"
+        );
+        assert_eq!(
+            SandboxBackend::supported(),
+            "bubblewrap, bubblewrap-landlock, landlock",
+            "the refusal lists every spelling, sorted"
         );
         // Unlike the env path, the CLI parse surfaces an error for a bad value.
         assert!("bogus".parse::<SandboxBackend>().is_err());

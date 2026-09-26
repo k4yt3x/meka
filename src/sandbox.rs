@@ -196,6 +196,9 @@ pub(crate) fn resolve_sandbox_backend(
     let backend_probe = match (backend, cached_bubblewrap_probe) {
         (SandboxBackend::Bubblewrap, Some(probe)) => probe,
         (SandboxBackend::Bubblewrap, None) => probe_backend(SandboxBackend::Bubblewrap),
+        (SandboxBackend::BubblewrapLandlock, _) => {
+            probe_backend(SandboxBackend::BubblewrapLandlock)
+        }
         (SandboxBackend::Landlock, _) => probe_backend(SandboxBackend::Landlock),
     };
     (backend, auto_resolved, backend_probe)
@@ -438,6 +441,43 @@ pub(crate) fn probe_backend(backend: crate::config::SandboxBackend) -> BackendPr
     match backend {
         crate::config::SandboxBackend::Landlock => probe_landlock(),
         crate::config::SandboxBackend::Bubblewrap => probe_bubblewrap(),
+        crate::config::SandboxBackend::BubblewrapLandlock => {
+            require_landlock_layer(probe_bubblewrap(), landlock_abi_or_errno())
+        }
+    }
+}
+
+/// The probe for `bubblewrap-landlock`: Bubblewrap's own, refused when the kernel cannot supply
+/// the layer inside it. `kernel` is the Landlock probe's answer, so the reason can say whether a
+/// newer kernel or a boot parameter is the remedy. A refusal of Bubblewrap itself passes through
+/// unchanged, since that is the earlier problem.
+///
+/// Pure, so the refusals can be exercised on a host whose kernel has the layer.
+#[cfg(target_os = "linux")]
+pub(crate) fn require_landlock_layer(
+    probe: BackendProbe,
+    kernel: Result<i32, i32>,
+) -> BackendProbe {
+    match probe {
+        BackendProbe::Ok(SandboxCapability::Bubblewrap {
+            landlock_abi: None, ..
+        }) => {
+            let reason = match kernel {
+                Ok(abi_version) => format!(
+                    "Landlock ABI v{abi_version} cannot supply the layer inside Bubblewrap; \
+                     v{MIN_LAYER_LANDLOCK_ABI} (Linux 6.12+) is required"
+                ),
+                Err(libc::EOPNOTSUPP) => "Landlock is built into this kernel but disabled at \
+                                          boot, so Bubblewrap has no layer inside; add `landlock` \
+                                          to the kernel's `lsm=` list"
+                    .to_string(),
+                Err(_) => "this kernel has no Landlock for the layer inside Bubblewrap (needs \
+                           Linux 6.12+)"
+                    .to_string(),
+            };
+            BackendProbe::Missing { reason }
+        }
+        other => other,
     }
 }
 
@@ -1601,6 +1641,71 @@ mod tests {
             return;
         };
         assert_eq!(landlock_abi, layer_landlock_abi());
+    }
+
+    /// `bubblewrap-landlock` is the pin for a host where the strongest boundary must be certain:
+    /// Bubblewrap alone is refused, with the remedy the kernel calls for, and everything else the
+    /// Bubblewrap probe answers passes through.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn requiring_the_layer_refuses_bubblewrap_alone_and_names_the_remedy() {
+        let bwrap = std::path::PathBuf::from("/usr/bin/bwrap");
+        let alone = || {
+            BackendProbe::Ok(SandboxCapability::Bubblewrap {
+                bwrap_path: bwrap.clone(),
+                landlock_abi: None,
+            })
+        };
+        let too_old =
+            backend_unavailable_reason(&require_landlock_layer(alone(), Ok(4))).expect("refused");
+        assert!(
+            too_old.contains("v4") && too_old.contains("6.12"),
+            "a kernel below the layer's floor is sent after a newer one: {too_old}"
+        );
+        let disabled =
+            backend_unavailable_reason(&require_landlock_layer(alone(), Err(libc::EOPNOTSUPP)))
+                .expect("refused");
+        assert!(disabled.contains("`lsm=`"), "{disabled}");
+        let absent =
+            backend_unavailable_reason(&require_landlock_layer(alone(), Err(libc::ENOSYS)))
+                .expect("refused");
+        assert!(absent.contains("no Landlock"), "{absent}");
+
+        let layered = BackendProbe::Ok(SandboxCapability::Bubblewrap {
+            bwrap_path: bwrap.clone(),
+            landlock_abi: Some(9),
+        });
+        assert!(matches!(
+            require_landlock_layer(layered, Ok(9)),
+            BackendProbe::Ok(SandboxCapability::Bubblewrap {
+                landlock_abi: Some(9),
+                ..
+            })
+        ));
+        let missing = BackendProbe::Missing {
+            reason: "bwrap not found on PATH".to_string(),
+        };
+        assert_eq!(
+            backend_unavailable_reason(&require_landlock_layer(missing, Ok(4))).as_deref(),
+            Some("bwrap not found on PATH"),
+            "Bubblewrap's own refusal comes first"
+        );
+    }
+
+    /// Through the real probe, on a host that has both: the pin resolves to the layered
+    /// capability and never to Bubblewrap alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_layer_pin_probes_to_bubblewrap_with_the_layer_where_both_exist() {
+        match probe_backend(crate::config::SandboxBackend::BubblewrapLandlock) {
+            BackendProbe::Ok(SandboxCapability::Bubblewrap { landlock_abi, .. }) => {
+                assert!(
+                    landlock_abi.is_some(),
+                    "the pin never yields Bubblewrap alone"
+                );
+            }
+            other => eprintln!("skipping: {other:?}"),
+        }
     }
 
     /// Every level maps to exactly one confinement, and only `unrestricted` maps to none.

@@ -919,20 +919,21 @@ Default: `true`
 sandbox = false  # disable the sandboxed shell at read
 ```
 
-The sandbox uses one of two backends on Linux (see [`shell.sandbox_backend`](#shellsandbox_backend)), `sandbox-exec` on macOS, and a duplicated Low-integrity primary token on Windows. On platforms where no backend is usable, shell commands always require `unrestricted` regardless of this setting.
+The sandbox uses Bubblewrap or Landlock on Linux, chosen by [`shell.sandbox_backend`](#shellsandbox_backend), `sandbox-exec` on macOS, and a duplicated Low-integrity primary token on Windows. On platforms where no backend is usable, shell commands always require `unrestricted` regardless of this setting.
 
 ### `shell.sandbox_backend`
 
-Linux-only choice between `"landlock"` and `"bubblewrap"`:
+Linux-only choice between `"landlock"`, `"bubblewrap"` and `"bubblewrap-landlock"`:
 
 - **Bubblewrap** (`"bubblewrap"`) wraps the command in `bwrap` with read-only bind of `/`, tmpfs masks over `/run` / `/tmp` / `/var/tmp` / `$XDG_RUNTIME_DIR`, and `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks hide the dbus session bus and the systemd-user socket, so state-changing IPC calls like `systemctl --user start` and `dbus-send` fail. Network is intentionally not unshared so `curl http://x | pdftotext` still works. On a kernel with Landlock ABI v6 (6.12) or newer the command also runs inside meka's Landlock ruleset, enacted by `meka confine` after the mounts, which closes the abstract namespace, signals and device ioctls, and from kernel 7.1 the sockets the masks do not cover. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
+- **Bubblewrap with Landlock** (`"bubblewrap-landlock"`) is Bubblewrap with the Landlock layer inside required rather than added where the kernel allows: on a kernel below 6.12 the backend is unusable and `shell_execute` at `read` fails, so a pinned value guarantees the layer is applied. What the layer closes still follows the kernel: the abstract namespace, signals and device ioctls from 6.12, sockets on disk outside the masks from 7.1. Auto-detection never picks it; pin it on a host where that guarantee matters more than a working shell.
 - **Landlock** (`"landlock"`) uses the Landlock LSM to block filesystem writes, and requires **ABI v9 (kernel 7.1+)**: the first ABI that can refuse `connect()` to Unix sockets on disk, which is the dbus / systemd-user route out of the sandbox. On an older kernel meka reports the backend unusable rather than leave that door open; install Bubblewrap there. Closing it also costs socket-based clients like `docker` and `psql` at `read`. meka's own directories are hidden by per-sibling read grants, and each command gets a private temporary directory named by `TMPDIR`. No ABI mediates file metadata, so `chmod`, `chown`, `touch` and `setxattr` still succeed at `read`; that is what the startup warning names.
 
 When omitted, meka probes Bubblewrap once at startup. If Bubblewrap is available it auto-picks it; otherwise it auto-picks Landlock and emits a one-shot warning nudging you to install `bubblewrap` for stronger protection. Set the field explicitly to either value (including `"landlock"`) to suppress that warning. No command writes this field; leave it unset to keep auto-detection.
 
 If the configured backend can't be used at runtime (bwrap not installed, user namespaces denied, etc.), `shell_execute` at `read` hard-errors with a message naming the configured backend and the specific failure reason. `read` is not blocked for other tools; only `shell_execute` requires a usable sandbox.
 
-Overridable for one run with `meka --sandbox-backend landlock|bubblewrap`, and for a whole
+Overridable for one run with `meka --sandbox-backend landlock|bubblewrap|bubblewrap-landlock`, and for a whole
 environment with `MEKA_SANDBOX_BACKEND`. Precedence is flag, then environment, then this field.
 
 Default: unset (auto-detect). Ignored on macOS and Windows.
@@ -940,7 +941,7 @@ Default: unset (auto-detect). Ignored on macOS and Windows.
 ```toml
 [shell]
 sandbox = true
-sandbox_backend = "bubblewrap"  # or "landlock"
+sandbox_backend = "bubblewrap"  # or "landlock", or "bubblewrap-landlock" to require the layer
 ```
 
 ## `[tools]`: built-in tool filters
