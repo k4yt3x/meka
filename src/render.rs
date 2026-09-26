@@ -2419,15 +2419,11 @@ pub(crate) fn compaction_summary(outcome: &crate::agent::CompactOutcome) -> Stri
     line.push('.');
     match outcome.source {
         crate::agent::CompactSource::Checkpoint => {}
-        // Both fallbacks are worth naming: the summary is not the one the agent chose to write, so
-        // a user comparing results across compactions has an explanation for the difference.
-        crate::agent::CompactSource::CheckpointText => {
-            line.push_str(
-                " The checkpoint ended without submitting, so its closing text was used.",
-            );
-        }
+        // Worth naming: the summary is not the one the agent chose to write, so a user comparing
+        // results across compactions has an explanation for the difference. Said of the summary
+        // and not of the checkpoint, which may have run and written memories without submitting.
         crate::agent::CompactSource::Summarizer => {
-            line.push_str(" Summarized without a checkpoint.");
+            line.push_str(" Written by the standalone summarizer.");
         }
     }
     if !outcome.memories_written.is_empty() {
@@ -2513,7 +2509,7 @@ mod tests {
         });
         assert_eq!(
             line,
-            "Session compacted (recent turns discarded too). Summarized without a checkpoint."
+            "Session compacted (recent turns discarded too). Written by the standalone summarizer."
         );
     }
 

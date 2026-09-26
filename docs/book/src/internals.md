@@ -120,10 +120,15 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
 4. **Recovery.** A failed request goes through `TurnRecovery`, which decides between a retry, a
    degraded resend and a reported failure. Compaction runs when the context gauge says so, when the
    model asks through `context_compact`, or when the user asks. Checkpoint guidance is built from
-   that request's actual tool set. Summaries prioritize active constraints, authorizations, verified
-   progress, commitments, and the next action; compaction-specific focus does not override those
-   preservation requirements. Every compaction restores full live context before the agent's next
-   request, including memory, discovery, permission, and execution guidance. The world snapshot
+   that request's actual tool set. Every summary, from the checkpoint or the summarizer, has the
+   same four sections: rules and authorizations, commitments and their state, facts established,
+   next action; a compaction-specific focus adds emphasis within them and drops none. The messages
+   received during the summarized turns are copied into the summary message by code, newest first
+   within a third of the verbatim budget when there are any, so what a person sent never depends
+   on the summary. A checkpoint that ends without calling `context_replace` falls back to the
+   summarizer; its closing text is never taken as the summary. Every compaction restores full
+   live context before the agent's next request, including memory, discovery, permission, and
+   execution guidance. The world snapshot
    advances only after the replacement is saved. Finished background outcomes are not delivered
    again during this rebuild.
 5. **Output.** Text, thinking, tool indicators, approval prompts and elicitations all reach the

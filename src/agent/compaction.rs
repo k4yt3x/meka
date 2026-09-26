@@ -2,7 +2,16 @@
 //! and what the model is asked to save first.
 
 use super::*;
-use crate::session::{CompactOrigin, CompactRequest, compaction_tail_budget};
+use crate::{
+    conversation::{
+        COMPACTION_SUMMARY_PREFIX, RETAINED_MESSAGES_END, RETAINED_MESSAGES_HEADER,
+        is_harness_stand_in,
+    },
+    session::{
+        CompactOrigin, CompactRequest, SUMMARY_SHAPE, compaction_retained_budget,
+        compaction_tail_budget, compaction_verbatim_budget,
+    },
+};
 
 /// How many compactions a single turn may honor on the agent's own request.
 ///
@@ -34,12 +43,9 @@ pub(super) fn report_checkpoint_memories(memories_written: &[String]) {
 pub(crate) enum CompactSource {
     /// The checkpoint turn, via `context_replace`. The intended path.
     Checkpoint,
-    /// The checkpoint turn ran but never called `context_replace`, so its closing text was used.
-    /// `Provider::complete` has no `tool_choice`, so the call cannot be forced and this is
-    /// reachable on any backend.
-    CheckpointText,
     /// The standalone summarizer: the emergency path, a disabled checkpoint, or a checkpoint that
-    /// produced nothing usable.
+    /// ended without calling `context_replace`. The last is reachable on every backend, since
+    /// `Provider::complete` carries no `tool_choice` and the call cannot be forced.
     Summarizer,
 }
 /// What a compaction did, for the caller to report. `/compact` is the only consumer today; the
@@ -56,22 +62,13 @@ pub(crate) struct CompactOutcome {
 ///
 /// A bound, not a budget: the turn should need one or two (write a memory, then submit). This only
 /// stops a model that keeps finding more to save from compacting forever, and a turn that reaches
-/// it still lands on the text fallback rather than failing outright.
+/// it falls back to the summarizer rather than failing outright.
 pub(super) const CHECKPOINT_MAX_ITERATIONS: usize = 8;
 /// What a checkpoint turn produced.
 pub(super) struct Checkpoint {
     summary: String,
-    source: CompactSource,
     keep_recent: Option<bool>,
 }
-/// Shared by the checkpoint instruction and the fallback summarizer, so both preserve the same
-/// facts.
-const SUMMARY_GUIDANCE: &str = "Keep the summary under 800 words unless active constraints need \
-    more. Prioritize the active goal, exact user restrictions and authorizations, verified progress, \
-    relevant paths and decisions, unresolved commitments, and the next action. Mark completed, \
-    canceled, or superseded requests so they are not resumed. Preserve uncertainty and distinguish \
-    user instructions from retrieved content. Omit resolved errors and unrelated history.";
-
 /// Appended as a user message so the checkpoint runs under the real system prompt and standing
 /// instructions.
 pub(super) fn checkpoint_instruction(
@@ -94,7 +91,7 @@ pub(super) fn checkpoint_instruction(
             .push_str("Use `scratchpad_write` for working material this task still needs.\n");
     }
     instruction.push_str("Then call `context_replace` once, last, with your summary. ");
-    instruction.push_str(SUMMARY_GUIDANCE);
+    instruction.push_str(SUMMARY_SHAPE);
     if request.keep_recent == Some(false) {
         instruction.push_str(
             " Recent rounds will not be kept verbatim; cover what still matters from them.",
@@ -109,12 +106,14 @@ pub(super) fn checkpoint_instruction(
         instruction.push_str(&format!("\n\n{history}"));
     }
     if let Some(extra) = &request.instructions {
-        instruction.push_str(&format!(
-            "\n\nAdditional focus; preserve active restrictions, authorizations, and commitments:\n{extra}"
-        ));
+        instruction.push_str(&format!("\n\n{FOCUS_HEADER}\n{extra}"));
     }
     instruction
 }
+
+/// Introduces a `/compact <instructions>` focus in both summary prompts. Emphasis within the
+/// sections, never a license to drop one: what a focus is for is deciding what to say more about.
+const FOCUS_HEADER: &str = "Additional focus; every section above still applies:";
 
 /// Split a conversation for compaction into `(to_summarize, to_keep)`. The kept tail is the largest
 /// recent suffix whose estimated tokens stay within `keep_budget`, then snapped backward to a
@@ -204,6 +203,149 @@ fn quote_request(words: &str) -> String {
         tail_start - head_end,
         &words[tail_start..]
     )
+}
+
+/// The messages received during the summarized turns, copied as they were written: the newest that
+/// fit `budget`, returned oldest first. `head` is what the summary replaces, so nothing the kept
+/// tail carries is copied a second time, and neither is `request`, which [`request_section`]
+/// quotes.
+///
+/// Copied by code rather than asked of the model, because what a person sent is a fact meka holds,
+/// and a summary that restates it is a guess made where the truth was at hand. The loss it guards
+/// against is the one the agent cannot notice: a rule left out of a summary is a rule it does not
+/// know to search for.
+fn retained_messages(head: &[Message], request: Option<&str>, budget: u64) -> Vec<String> {
+    let mut selected = Vec::new();
+    // Costed as rendered, quoting and frame included, since that is what enters the window, and
+    // in the estimate the split spends the tail's share in, so the two halves of one budget add up.
+    let mut remaining = budget.saturating_sub(crate::tokens::estimate_text(&retained_section(&[])));
+    for message in head.iter().rev() {
+        let blocks: Vec<&str> = received_blocks(message)
+            .into_iter()
+            .filter(|block| request != Some(*block))
+            .collect();
+        if blocks.is_empty() {
+            continue;
+        }
+        let quoted = quote_lines(&blocks.join("\n\n"));
+        let cost = crate::tokens::estimate_text(&quoted);
+        if cost <= remaining {
+            remaining -= cost;
+            selected.push(quoted);
+            continue;
+        }
+        // The one that overflows keeps its head: a rule is stated at the top of a pasted document
+        // more often than at its end, and the archive keeps all of it either way. The archive
+        // rather than a tool by name, since a worker may lack the tool that reads it.
+        let cut_marker = "> [... cut here; the archive holds all of it ...]";
+        let room = remaining.saturating_sub(crate::tokens::estimate_text(cut_marker));
+        let end = crate::tokens::estimated_prefix_within(&quoted, room);
+        // A cut can land just after a quote mark on a blank line; that mark carries nothing.
+        let kept = quoted[..end]
+            .trim_end_matches(|character: char| character == '>' || character.is_whitespace());
+        if !kept.is_empty() {
+            selected.push(format!("{kept}\n{cut_marker}"));
+        }
+        break;
+    }
+    selected.reverse();
+    selected
+}
+
+/// `text` with every line quoted, the shape an entry of the section takes: a message with
+/// headings or markers of its own cannot then be read as part of the summary.
+fn quote_lines(text: &str) -> String {
+    text.trim_start_matches(['\r', '\n'])
+        .trim_end()
+        .lines()
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The head to summarize, the tail to keep, and the messages received to copy.
+///
+/// Two passes rather than one, so the copy's share of the verbatim budget is spent only when there
+/// is something to copy: a worker's brief is the request in flight and a one-shot run has one
+/// prompt, and cutting their tail for an empty section would keep fewer rounds for nothing. The
+/// first split spends the whole budget on the tail; only when that head holds received messages
+/// is the tail cut to its share and the copy taken from the wider head.
+fn split_and_retain(
+    view: &[Message],
+    keep_recent: bool,
+    request: Option<&str>,
+    context_window: u64,
+) -> (Vec<Message>, Vec<Message>, Vec<String>) {
+    let copy_budget = compaction_retained_budget(context_window);
+    if !keep_recent {
+        // Keeping nothing means the summary has to cover everything, tail included. Only the
+        // checkpoint turn is in a position to ask for this, because it read the whole
+        // conversation; the summarizer is handed the head alone and would drop the rest on the
+        // floor. Honored on the summarizer path anyway by widening what it summarizes.
+        let head = view.to_vec();
+        let retained = retained_messages(&head, request, copy_budget);
+        return (head, Vec::new(), retained);
+    }
+    let full = compute_compaction_split(view, compaction_verbatim_budget(context_window));
+    let retained = retained_messages(&full.0, request, copy_budget);
+    if retained.is_empty() {
+        return (full.0, full.1, retained);
+    }
+    let (head, tail) = compute_compaction_split(view, compaction_tail_budget(context_window));
+    let retained = retained_messages(&head, request, copy_budget);
+    // The cut tail is not always a superset of the full one: a first split that fell under the
+    // split's minimum summarized everything but a trailing prompt, and the second can land on a
+    // boundary whose head holds no received message at all. The rule is that an empty section
+    // costs nothing, so the first split stands then.
+    if retained.is_empty() {
+        let retained = retained_messages(&full.0, request, copy_budget);
+        return (full.0, full.1, retained);
+    }
+    (head, tail, retained)
+}
+
+/// The text blocks of `message` a person sent, or none for an assistant message, a tool-result
+/// carrier with no inbox item beside the results, or text meka wrote in a user message's place: a
+/// stand-in, the nudge after a thinking-only reply, or an earlier compaction's summary, whose own
+/// quotes must not be quoted again. An inbox item keeps the header above it, which is what tells
+/// the reader it was relayed and by whom; without it a relayed message would read as the
+/// operator's own.
+fn received_blocks(message: &Message) -> Vec<&str> {
+    if message.role != Role::User {
+        return Vec::new();
+    }
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text }
+                if !text.trim().is_empty()
+                    && !is_harness_stand_in(text)
+                    && text != super::turn::THINKING_ONLY_NUDGE
+                    && !text.starts_with(COMPACTION_SUMMARY_PREFIX) =>
+            {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The section of a summary message that carries [`retained_messages`], each quoted line by line
+/// so a message with headings of its own cannot be read as a heading of the summary.
+fn retained_section(entries: &[String]) -> String {
+    let mut section = format!(
+        "\n\n{RETAINED_MESSAGES_HEADER}\nThe most recent that fit, quoted for their wording; the \
+         summary above states their standing, and the archive holds the rest.\n"
+    );
+    for entry in entries {
+        section.push('\n');
+        section.push_str(entry);
+        section.push('\n');
+    }
+    section.push('\n');
+    section.push_str(RETAINED_MESSAGES_END);
+    section
 }
 
 /// Whether a kept tail may start on `message`: a plain user message, or an assistant message that
@@ -362,19 +504,18 @@ impl Agent {
                 .last()
                 .is_some_and(|last| last.role == Role::User && !has_tool_results(&last.content));
 
-        // Split into a head to summarize and a recent tail to keep verbatim. The tail is the
-        // largest recent suffix that fits a token budget (~10% of the window, capped), snapped back
-        // to a clean user boundary so tool_use/tool_result pairs are never orphaned.
-        let (to_summarize, to_keep) = if keep_recent {
-            let keep_budget = compaction_tail_budget(self.context_window());
-            compute_compaction_split(messages.as_slice(), keep_budget)
-        } else {
-            // Keeping nothing means the summary has to cover everything, tail included. Only the
-            // checkpoint turn is in a position to ask for this, because it read the whole
-            // conversation; the summarizer is handed the head alone and would drop the rest on the
-            // floor. Honored on the summarizer path anyway by widening what it summarizes.
-            (messages.as_slice().to_vec(), Vec::new())
-        };
+        // Split into a head to summarize and a recent tail to keep verbatim, and copy the
+        // messages received from the head alone: the tail is carried as it is, so a message there
+        // is not copied a second time. The tail is the largest recent suffix that fits a token
+        // budget (~10% of the window, capped), snapped back to a clean user boundary so
+        // tool_use/tool_result pairs are never orphaned. Taken here, before the summarizer
+        // consumes the head.
+        let (to_summarize, to_keep, retained) = split_and_retain(
+            messages.as_slice(),
+            keep_recent,
+            request.request_in_flight.as_deref(),
+            self.context_window(),
+        );
 
         // The first of two places a fired token ends an automatic compaction; the second, after
         // the summary is built, catches an interrupt that lands inside the summarizer. This one is
@@ -392,7 +533,7 @@ impl Agent {
         // accumulator above holds what actually ran, including on the fallback path where the
         // checkpoint half-completed and then failed.
         let (summary_text, source) = match checkpoint {
-            Some(checkpoint) => (checkpoint.summary, checkpoint.source),
+            Some(checkpoint) => (checkpoint.summary, CompactSource::Checkpoint),
             None => (
                 self.summarize_via_provider(&request, to_summarize, &cancellation)
                     .await?,
@@ -403,8 +544,12 @@ impl Agent {
         let world = self.read_world_snapshot(session_id).await;
         let post_context = self.build_post_compact_context(session_id, &world).await;
 
-        let mut context_message =
-            format!("[Conversation summary from session compaction]\n\n{summary_text}");
+        let mut context_message = format!("{COMPACTION_SUMMARY_PREFIX}\n\n{summary_text}");
+        // Before the request section, so the message reads in the order things happened: what was
+        // received and handled, then the request still being answered.
+        if !retained.is_empty() {
+            context_message.push_str(&retained_section(&retained));
+        }
         // The request the running turn is answering, when the split took it into the head: quoted
         // as the user wrote it, for the reason the split keeps a trailing prompt verbatim. A turn
         // that carries on against a paraphrase of its own task drifts from it, and the live case
@@ -432,6 +577,12 @@ impl Agent {
             "\n\n[Continue the work directly from the summary above. Do not acknowledge or recap \
              this summary; resume as if the conversation had not been interrupted.",
         );
+        if !retained.is_empty() {
+            context_message.push_str(
+                " The messages quoted above are there for their wording; the summary states which \
+                 of them are still open.",
+            );
+        }
         if !to_keep.is_empty() {
             context_message.push_str(
                 " Your most recent rounds follow, kept as they were. The post-compaction context \
@@ -589,7 +740,6 @@ impl Agent {
             .emit(FrontendEvent::Compacted {
                 source: match source {
                     CompactSource::Checkpoint => "checkpoint",
-                    CompactSource::CheckpointText => "checkpoint_text",
                     CompactSource::Summarizer => "summarizer",
                 },
                 replaced_count,
@@ -641,8 +791,8 @@ impl Agent {
 
     /// Let the agent summarize itself, saving anything durable on the way past.
     ///
-    /// Returns `None` when the turn produced nothing usable, which is the caller's cue to fall back
-    /// to [`Self::summarize_via_provider`].
+    /// Returns `None` when the turn ended without calling `context_replace`, which is the caller's
+    /// cue to fall back to [`Self::summarize_via_provider`].
     ///
     /// Three things make this better than the standalone summarizer, and all three come from it
     /// being an ordinary turn rather than a special one:
@@ -710,8 +860,6 @@ impl Agent {
             _ => checkpoint_messages.push(Message::user(instruction)),
         }
 
-        let mut last_text = String::new();
-
         for _ in 0..CHECKPOINT_MAX_ITERATIONS {
             // Checked per round as well as inside the tools, so an interrupt ends the checkpoint at
             // the next boundary instead of running out the whole iteration budget. Returning `None`
@@ -755,11 +903,6 @@ impl Agent {
             self.session_stats.record_untracked_tokens(&usage);
             for notice in notices {
                 self.forward_notice(notice).await;
-            }
-
-            let text = assistant_message.text_content();
-            if !text.trim().is_empty() {
-                last_text = text;
             }
 
             let tool_uses: Vec<(String, String, serde_json::Value)> = assistant_message
@@ -901,34 +1044,21 @@ impl Agent {
 
         let submission = crate::sync::lock(&slot).take();
 
-        // Tier 1: the tool was called, which is the path everything else is a hedge against.
+        // The tool was called, or the summarizer writes the summary. There is deliberately no
+        // rung in between that takes the turn's closing text: `Provider::complete` carries no
+        // `tool_choice`, so a model can end the turn on prose, but that prose is as often an
+        // answer to the conversation or a sentence cut off at the iteration cap as it is a
+        // summary, and nothing here can tell which. The summarizer always can.
         if let Some(submission) = submission {
             return Ok(Some(Checkpoint {
                 summary: submission.summary,
-                source: CompactSource::Checkpoint,
                 keep_recent: submission.keep_recent,
             }));
         }
 
-        // Tier 2. `Provider::complete` carries no `tool_choice` on any backend, so the call cannot
-        // be forced and a model that summarized in prose instead has still done the work.
-        let last_text = last_text.trim();
-        if !last_text.is_empty() {
-            tracing::warn!(
-                "checkpoint turn ended without calling context_replace; using its closing text"
-            );
-            return Ok(Some(Checkpoint {
-                summary: last_text.to_string(),
-                source: CompactSource::CheckpointText,
-                // Prose carries no answer to this, so take the safe direction explicitly rather
-                // than returning `None`: `None` defers to the *caller's* `keep_recent`, and a
-                // `context_compact(keep_recent: false)` would then discard the tail on the
-                // strength of a summary the model never actually submitted.
-                keep_recent: Some(true),
-            }));
-        }
-
-        tracing::warn!("checkpoint turn produced no summary; falling back to the summarizer");
+        tracing::warn!(
+            "checkpoint turn ended without calling context_replace; summarizing instead"
+        );
         Ok(None)
     }
 
@@ -951,12 +1081,10 @@ impl Agent {
     ) -> Result<String> {
         let mut system_prompt = format!(
             "Summarize this conversation for the agent continuing the work. Write in second person. \
-             {SUMMARY_GUIDANCE} Quote the current request verbatim if work is still in progress."
+             {SUMMARY_SHAPE}"
         );
         if let Some(instructions) = &request.instructions {
-            system_prompt.push_str(&format!(
-                "\n\nAdditional focus; preserve active restrictions, authorizations, and commitments:\n{instructions}"
-            ));
+            system_prompt.push_str(&format!("\n\n{FOCUS_HEADER}\n{instructions}"));
         }
 
         // Clone and preprocess messages for the summarizer: strip images and truncate large text
@@ -1310,11 +1438,11 @@ mod tests {
         );
     }
 
-    // Compaction strategy selection and the fallback ladder.
+    // Compaction strategy selection and the fallback.
     //
-    // The ladder exists because `Provider::complete` carries no `tool_choice` on any backend, so
-    // `context_replace` cannot be forced. Each rung is reachable in production and so is asserted
-    // here.
+    // The fallback exists because `Provider::complete` carries no `tool_choice` on any backend, so
+    // `context_replace` cannot be forced. Both outcomes are reachable in production and so are
+    // asserted here.
     fn replace_round(summary: &str, keep_recent: Option<bool>) -> Vec<MockEvent> {
         let mut input = serde_json::json!({ "summary": summary });
         if let Some(keep_recent) = keep_recent {
@@ -1597,18 +1725,18 @@ mod tests {
             .iter()
             .map(crate::tokens::estimate_message)
             .sum();
-        assert_eq!(
-            compaction_tail_budget(budget * 10),
-            budget,
-            "the window must reproduce the budget through the tail's clamp"
-        );
+        // The tail takes two thirds of a tenth of the window, with integer division at each step,
+        // so the window that reproduces the budget exactly is found rather than computed.
+        let window = (budget * 15 - 30..=budget * 15 + 30)
+            .find(|window| compaction_tail_budget(*window) == budget)
+            .expect("a window whose tail budget is exactly this one");
         let (_, tail) = compute_compaction_split(messages.as_slice(), budget);
         assert_eq!(
             tail.first().map(|first| first.text_content()),
             Some(crate::agent::turn::THINKING_ONLY_NUDGE.to_string()),
             "the fixture must put the nudge at the head of the tail"
         );
-        agent.set_context_window_for_test(budget * 10);
+        agent.set_context_window_for_test(window);
 
         compact(
             &agent,
@@ -1894,13 +2022,15 @@ mod tests {
         );
     }
 
-    /// Tier 2. The model summarized in prose instead of submitting, which is still the work
-    /// done, so it is used rather than thrown away for a second model call.
+    /// A checkpoint that ends on prose instead of a `context_replace` call is not trusted to have
+    /// written a summary: the prose was an answer to the conversation as often as a summary when
+    /// this was measured, and nothing can tell the two apart. The summarizer writes it instead.
     #[tokio::test]
-    async fn checkpoint_falls_back_to_its_closing_text() {
-        let provider = Arc::new(MockProvider::from_rounds(vec![text_round(
-            "here is the state of things",
-        )]));
+    async fn a_checkpoint_that_never_submits_falls_back_to_the_summarizer() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            text_round("here is the state of things"),
+            text_round("the summarizer's account"),
+        ]));
         let (agent, store) = agent_with_checkpoint(provider, true).await;
         let mut messages = conversation();
 
@@ -1912,16 +2042,17 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome.source, CompactSource::CheckpointText);
+        assert_eq!(outcome.source, CompactSource::Summarizer);
+        let summary = messages.as_slice()[0].text_content();
+        assert!(summary.contains("the summarizer's account"), "{summary}");
         assert!(
-            messages.as_slice()[0]
-                .text_content()
-                .contains("here is the state of things")
+            !summary.contains("here is the state of things"),
+            "{summary}"
         );
     }
 
-    /// Tier 3. A checkpoint that produces neither a call nor text must not lose the conversation;
-    /// the standalone summarizer takes the next round.
+    /// A checkpoint that produces neither a call nor text must not lose the conversation; the
+    /// standalone summarizer takes the next round.
     #[tokio::test]
     async fn checkpoint_producing_nothing_falls_back_to_the_summarizer() {
         let provider = Arc::new(MockProvider::from_rounds(vec![
@@ -2251,14 +2382,16 @@ mod tests {
         assert!(survived, "the user's unanswered request was compacted away");
     }
 
-    /// Tier 2 never saw a `context_replace`, so it cannot know whether the tail is covered.
-    /// Returning `None` deferred that to the caller, letting a `context_compact(keep_recent:
-    /// false)` discard the tail on the strength of a summary the model never submitted.
+    /// A checkpoint that never called `context_replace` cannot have judged whether the tail is
+    /// covered, so a `context_compact(keep_recent: false)` is not honored on its account: the
+    /// summarizer's summary works from an excerpt, and discarding the tail on its strength would
+    /// compound a fallback into data loss.
     #[tokio::test]
-    async fn the_text_fallback_keeps_the_tail_even_when_the_caller_asked_not_to() {
-        let provider = Arc::new(MockProvider::from_rounds(vec![text_round(
-            "now let me save the last one",
-        )]));
+    async fn a_checkpoint_that_never_submits_keeps_the_tail_even_when_the_caller_asked_not_to() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            text_round("now let me save the last one"),
+            text_round("the summarizer's account"),
+        ]));
         let (agent, store) = agent_with_checkpoint(provider, true).await;
         let mut messages = conversation();
 
@@ -2270,12 +2403,357 @@ mod tests {
         })
         .await;
 
-        assert_eq!(outcome.source, CompactSource::CheckpointText);
+        assert_eq!(outcome.source, CompactSource::Summarizer);
         assert!(
             outcome.kept_recent,
             "a stray sentence must not become the whole context"
         );
         assert!(messages.len() > 1);
+    }
+
+    // What compaction copies as it was written, and what it leaves to the summary.
+
+    /// The newest that fit the budget, oldest first when read.
+    #[test]
+    fn retained_messages_are_the_newest_that_fit_returned_oldest_first() {
+        let head = vec![
+            Message::user("first rule: stay polite"),
+            Message::assistant_text("noted"),
+            Message::user("second rule: answer in French"),
+            Message::assistant_text("noted"),
+            Message::user("third rule: no acronyms"),
+            Message::assistant_text("noted"),
+        ];
+        // The section's own frame is paid for first, then the entries as rendered.
+        let two_messages = crate::tokens::estimate_text(&retained_section(&[]))
+            + crate::tokens::estimate_text("> second rule: answer in French")
+            + crate::tokens::estimate_text("> third rule: no acronyms");
+
+        let retained = retained_messages(&head, None, two_messages);
+
+        assert_eq!(retained, vec![
+            "> second rule: answer in French".to_string(),
+            "> third rule: no acronyms".to_string(),
+        ]);
+    }
+
+    /// The one that overflows the budget keeps its beginning and says where it was cut.
+    #[test]
+    fn the_message_that_overflows_the_budget_keeps_its_head() {
+        let head = vec![
+            Message::user("a".repeat(400)),
+            Message::assistant_text("ok"),
+            Message::user("the newest"),
+        ];
+        let budget = crate::tokens::estimate_text(&retained_section(&[]))
+            + crate::tokens::estimate_text("> the newest")
+            + 40;
+
+        let retained = retained_messages(&head, None, budget);
+
+        assert_eq!(retained.len(), 2, "{retained:?}");
+        assert!(retained[0].starts_with("> aaaa"), "{}", retained[0]);
+        assert!(
+            retained[0].ends_with("> [... cut here; the archive holds all of it ...]"),
+            "{}",
+            retained[0]
+        );
+        assert!(retained[0].len() < 400, "{}", retained[0]);
+        assert_eq!(retained[1], "> the newest");
+    }
+
+    /// Blank lines around a message are quoted as nothing, since a quote mark on an empty line
+    /// carries nothing, and a cut keeps what it has when it lands on one.
+    #[test]
+    fn blank_lines_around_a_message_are_not_quoted() {
+        assert_eq!(quote_lines("a line\n\n\n"), "> a line");
+        assert_eq!(quote_lines("\n\na line"), "> a line");
+        let head = vec![Message::user(format!("\n\n{}", "b".repeat(400)))];
+        let budget = crate::tokens::estimate_text(&retained_section(&[])) + 40;
+
+        let retained = retained_messages(&head, None, budget);
+
+        assert_eq!(retained.len(), 1, "{retained:?}");
+        assert!(retained[0].starts_with("> bbbb"), "{}", retained[0]);
+        assert!(
+            retained[0].ends_with("> [... cut here; the archive holds all of it ...]"),
+            "{}",
+            retained[0]
+        );
+    }
+
+    /// A first split that fell under the split's minimum summarizes everything but the trailing
+    /// prompt, and the cut second split can then land on a boundary whose head holds no received
+    /// message. An empty section costs nothing, so the first split stands and the late message is
+    /// still copied.
+    #[test]
+    fn the_first_split_stands_when_the_cut_one_would_copy_nothing() {
+        let mut messages = Conversation::new();
+        messages.append(Message::user(format!(
+            "{COMPACTION_SUMMARY_PREFIX}\n\nan old summary"
+        )));
+        for _ in 0..3 {
+            messages.append(assistant_tool_use());
+            messages.append(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-1".to_string(),
+                    content: vec![crate::conversation::ToolResultContent::Text {
+                        text: "x".repeat(6_000),
+                    }],
+                    is_error: false,
+                }],
+            });
+        }
+        messages.append(Message::user("a rule stated late"));
+        messages.append(Message::assistant_text("noted"));
+        messages.append(Message::user("the trailing prompt"));
+        let view = messages.as_slice();
+        let window = 40_000;
+        let (_, cut_tail) = compute_compaction_split(view, compaction_tail_budget(window));
+        assert!(
+            cut_tail.len() >= 4 && cut_tail.len() < view.len() - 1,
+            "the fixture must make the cut split land above the minimum: {}",
+            cut_tail.len()
+        );
+
+        let (head, tail, retained) =
+            split_and_retain(view, true, Some("the trailing prompt"), window);
+
+        assert_eq!(retained, vec!["> a rule stated late".to_string()]);
+        assert_eq!(tail.len(), 1, "everything but the prompt is summarized");
+        assert_eq!(head.len() + tail.len(), view.len());
+    }
+
+    /// What enters the window is the quoted rendering, two bytes more per line than the words, so
+    /// that is what the budget is spent on: a message of many short lines costed by its words
+    /// alone would be admitted whole and overrun the budget by the quoting of every line.
+    #[test]
+    fn a_message_is_costed_as_rendered() {
+        let many_lines = (0..80).map(|_| "a line").collect::<Vec<_>>().join("\n");
+        let head = vec![Message::user(many_lines.clone())];
+        let frame = crate::tokens::estimate_text(&retained_section(&[]));
+        let as_rendered = crate::tokens::estimate_text(&quote_lines(&many_lines));
+        let by_words = crate::tokens::estimate_text(&many_lines);
+        assert!(as_rendered > by_words + 20, "{as_rendered} vs {by_words}");
+        // Room for the words but not for the rendering.
+        let budget = frame + by_words + 10;
+
+        let retained = retained_messages(&head, None, budget);
+
+        assert_eq!(retained.len(), 1, "{retained:?}");
+        assert!(
+            retained[0].ends_with("> [... cut here; the archive holds all of it ...]"),
+            "costed by its words, the message was admitted whole: {}",
+            retained[0]
+        );
+    }
+
+    /// Text meka wrote in a user message's place was not sent by anyone, and an earlier summary's
+    /// quotes are not quoted again; an inbox item is kept with the header that says who sent it,
+    /// even when it rode a tool-result message.
+    #[test]
+    fn only_what_a_person_sent_is_retained() {
+        use crate::conversation::{HARNESS_NOTE, INBOX_HEADER_PREFIX};
+
+        let relayed = format!("{INBOX_HEADER_PREFIX}alice, arrived 10:00]\nplease call me");
+        let head = vec![
+            Message::user(format!(
+                "{COMPACTION_SUMMARY_PREFIX}\n\nolder summary\n\n{RETAINED_MESSAGES_HEADER}\n> \
+                 quoted before\n{RETAINED_MESSAGES_END}"
+            )),
+            Message::assistant_text("continuing"),
+            Message::user(format!("{HARNESS_NOTE} something meka said")),
+            Message::assistant_text("ok"),
+            Message::user(crate::agent::turn::THINKING_ONLY_NUDGE),
+            Message::assistant_text("sorry"),
+            Message::user("   \n  "),
+            Message::assistant_text("nothing to answer"),
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "t1".to_string(),
+                        content: Vec::new(),
+                        is_error: false,
+                    },
+                    ContentBlock::Text {
+                        text: relayed.clone(),
+                    },
+                ],
+            },
+            Message::assistant_text("will do"),
+        ];
+
+        let retained = retained_messages(&head, None, 10_000);
+
+        assert_eq!(retained, vec![quote_lines(&relayed)]);
+    }
+
+    /// The request a running turn is answering is quoted by its own section, so it is not copied
+    /// here as well.
+    #[test]
+    fn the_request_in_flight_is_not_retained_twice() {
+        let head = vec![
+            Message::user("an earlier question"),
+            Message::assistant_text("an answer"),
+            Message::user("the request being answered"),
+        ];
+
+        let retained = retained_messages(&head, Some("the request being answered"), 10_000);
+
+        assert_eq!(retained, vec!["> an earlier question".to_string()]);
+    }
+
+    /// The live failure: a rule stated in a later turn that the summary left out. Whatever the
+    /// summary says, the rule is in the summary message as written, quoted under the header the
+    /// index knows, oldest first, and the directive says the quoted messages were handled.
+    #[tokio::test]
+    async fn a_rule_the_summary_left_out_is_still_in_the_summary_message_as_written() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![replace_round(
+            "a summary that forgot the rule",
+            Some(false),
+        )]));
+        let (agent, store) = agent_with_checkpoint(provider, true).await;
+        let mut messages = conversation();
+        let rule = "One more rule: the flag must be spelled --quiet with no -q short form.";
+        messages.append(Message::user(rule));
+        messages.append(Message::assistant_text("Noted."));
+
+        let outcome = compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactOrigin::Reactive),
+        )
+        .await;
+
+        assert_eq!(outcome.source, CompactSource::Checkpoint);
+        let summary = messages.as_slice()[0].text_content();
+        assert!(summary.contains(&format!("> {rule}")), "{summary}");
+        assert!(
+            summary.contains("The messages quoted above are there for their wording"),
+            "{summary}"
+        );
+        let start = summary.find(RETAINED_MESSAGES_HEADER).expect("header");
+        let end = summary.find(RETAINED_MESSAGES_END).expect("end");
+        let section = &summary[start..end];
+        let earlier = section
+            .find("user 4")
+            .expect("the message before the rule fits too");
+        let late = section.find(rule).expect("the rule");
+        assert!(earlier < late, "oldest first: {section}");
+        assert!(
+            !summary[end..].contains(rule),
+            "quoted once, in the section: {summary}"
+        );
+    }
+
+    /// The next compaction copies from what was said since the last one, never from the summary
+    /// it replaces: a summary's own quotes are not quoted again, so the section does not grow
+    /// with each pass.
+    #[tokio::test]
+    async fn a_summary_s_own_quotes_are_not_quoted_again() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            replace_round("first summary", Some(false)),
+            replace_round("second summary", Some(false)),
+        ]));
+        let (agent, store) = agent_with_checkpoint(provider, true).await;
+        let mut messages = conversation();
+        messages.append(Message::user("a rule stated late"));
+        messages.append(Message::assistant_text("noted"));
+        compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactOrigin::Reactive),
+        )
+        .await;
+        messages.append(Message::user("a question after the first compaction"));
+        messages.append(Message::assistant_text("an answer"));
+
+        compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactOrigin::Reactive),
+        )
+        .await;
+
+        let summary = messages.as_slice()[0].text_content();
+        assert_eq!(
+            summary.matches(RETAINED_MESSAGES_HEADER).count(),
+            1,
+            "{summary}"
+        );
+        assert!(
+            summary.contains("> a question after the first compaction"),
+            "{summary}"
+        );
+        assert!(!summary.contains("> a rule stated late"), "{summary}");
+        assert!(
+            !summary.contains(&format!("> {COMPACTION_SUMMARY_PREFIX}")),
+            "{summary}"
+        );
+    }
+
+    /// A worker's brief is the request in flight and a long tool loop has no message of anyone's
+    /// in its head, so there is nothing to copy; the tail then keeps the whole verbatim budget
+    /// rather than paying for an empty section.
+    #[test]
+    fn the_tail_keeps_the_whole_verbatim_budget_when_there_is_nothing_to_copy() {
+        let prompt = "the brief";
+        // One brief, then rounds small enough that the two budgets keep different numbers of
+        // them.
+        let mut messages = Conversation::new();
+        messages.append(Message::user(prompt));
+        for round in 0..60 {
+            messages.append(assistant_tool_use());
+            messages.append(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-1".to_string(),
+                    content: vec![crate::conversation::ToolResultContent::Text {
+                        text: format!("result {round} {}", "x".repeat(300)),
+                    }],
+                    is_error: false,
+                }],
+            });
+        }
+        let view = messages.as_slice();
+        let window = 40_000;
+
+        let (head, tail, retained) = split_and_retain(view, true, Some(prompt), window);
+
+        assert!(retained.is_empty(), "{retained:?}");
+        let (_, full_tail) =
+            compute_compaction_split(view, crate::session::compaction_verbatim_budget(window));
+        assert_eq!(tail.len(), full_tail.len());
+        let (_, cut_tail) = compute_compaction_split(view, compaction_tail_budget(window));
+        assert!(tail.len() > cut_tail.len(), "the tail was cut for nothing");
+        assert_eq!(head.len() + tail.len(), view.len());
+    }
+
+    /// When there is something to copy, its share comes out of the tail, not on top of it, so
+    /// what a compaction carries past the boundary stays the size it always was.
+    #[test]
+    fn copying_messages_takes_its_share_from_the_tail() {
+        let mut messages = conversation();
+        messages.append(Message::user("a rule stated late"));
+        messages.append(Message::assistant_text("noted"));
+        let view = messages.as_slice();
+        let window = 40_000;
+
+        let (head, tail, retained) = split_and_retain(view, true, None, window);
+
+        assert!(!retained.is_empty());
+        let (_, cut_tail) = compute_compaction_split(view, compaction_tail_budget(window));
+        assert_eq!(tail.len(), cut_tail.len());
+        assert_eq!(head.len() + tail.len(), view.len());
+        assert_eq!(
+            compaction_retained_budget(window) + compaction_tail_budget(window),
+            crate::session::compaction_verbatim_budget(window)
+        );
     }
 
     /// The checkpoint is the one moment the agent can save what is about to be destroyed, so it
@@ -2710,7 +3188,9 @@ mod tests {
     }
 
     /// A model that never submits must not compact forever. The cap ends the loop, and the run
-    /// still yields a summary via the text tier rather than failing.
+    /// still yields a summary, from the summarizer, rather than failing. The text each round
+    /// opened with is exactly what must not become the summary: it is a sentence about work in
+    /// progress, cut off by the cap.
     #[tokio::test]
     async fn the_iteration_cap_ends_a_checkpoint_that_never_submits() {
         let mut rounds = Vec::new();
@@ -2731,6 +3211,7 @@ mod tests {
                 },
             ]);
         }
+        rounds.push(text_round("the summarizer's account"));
         let provider = Arc::new(MockProvider::from_rounds(rounds));
         let (agent, store) = agent_with_checkpoint(provider, true).await;
         let mut messages = conversation();
@@ -2743,7 +3224,9 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome.source, CompactSource::CheckpointText);
+        assert_eq!(outcome.source, CompactSource::Summarizer);
+        let summary = messages.as_slice()[0].text_content();
+        assert!(!summary.contains("thinking 7"), "{summary}");
         // The registry here is empty, so `memory_write` was refused as unavailable and nothing
         // may be claimed as written.
         assert!(outcome.memories_written.is_empty());

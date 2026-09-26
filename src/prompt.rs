@@ -2377,8 +2377,8 @@ impl ContextBudget {
         // summary happened.
         let fidelity = if self.generation >= 2 {
             format!(
-                " This conversation has been summarized {} times, so early detail is now several \
-                 removes from what was said.",
+                " This conversation has been summarized {} times, so earlier answers and tool \
+                 output are now several removes from what was said.",
                 self.generation
             )
         } else {

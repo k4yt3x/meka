@@ -25,7 +25,10 @@ use crate::{
     error::Result,
     permission::Permission,
     provider::ToolDefinition,
-    session::{CompactOrigin, CompactRequest, PendingCompaction, compaction_tail_budget},
+    session::{
+        CompactOrigin, CompactRequest, PendingCompaction, SUMMARY_SHAPE,
+        compaction_retained_budget, compaction_verbatim_budget,
+    },
     store::Store,
 };
 
@@ -226,9 +229,11 @@ impl Tool for ContextCheckTool {
                      past the window fails the turn.\n"
                 });
                 report.push_str(&format!(
-                    "Compaction may keep about {} tokens of recent rounds verbatim; the rest \
+                    "Compaction may keep about {} tokens verbatim: recent rounds, with up to {} \
+                     of that spent on the messages received as they were written; the rest \
                      becomes a summary.\n",
-                    compaction_tail_budget(window)
+                    compaction_verbatim_budget(window),
+                    compaction_retained_budget(window)
                 ));
             }
         }
@@ -257,8 +262,9 @@ impl Tool for ContextCheckTool {
                       The original turns remain stored.\n"
                     .to_string(),
                 count => format!(
-                    "Compactions so far: {count}. Each one summarizes the previous summary, so early \
-                     detail is now several removes from the original; save essential state with the available tools before another pass.\n"
+                    "Compactions so far: {count}. Each one summarizes the previous summary, so \
+                     earlier answers and tool output are now several removes from the original; \
+                     save essential state with the available tools before another pass.\n"
                 ),
             });
         }
@@ -378,7 +384,7 @@ impl Tool for ContextReplaceTool {
                 "properties": {
                     "summary": {
                         "type": "string",
-                        "description": "The text that will replace the earlier turns. Write it for yourself, in your own voice, as the record you would want to pick the work back up from."
+                        "description": format!("The text that will replace the earlier turns, the record you will pick the work back up from. {SUMMARY_SHAPE}")
                     },
                     "keep_recent": {
                         "type": "boolean",

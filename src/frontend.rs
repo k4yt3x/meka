@@ -490,8 +490,7 @@ pub(crate) enum FrontendEvent {
     /// the REPL and ACP re-read from the agent each turn and so never noticed, but an HTTP client
     /// polling `GET /messages` sees `total` shrink with no explanation unless it is told.
     Compacted {
-        /// `checkpoint`, `checkpoint_text`, or `summarizer`. The three differ in fidelity, not
-        /// just mechanism.
+        /// `checkpoint` or `summarizer`. The two differ in fidelity, not just mechanism.
         source: &'static str,
         /// How many materialized messages the boundary removed.
         ///

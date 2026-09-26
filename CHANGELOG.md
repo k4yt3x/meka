@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** compaction `source` is `checkpoint` or `summarizer`; `checkpoint_text` is gone.
+- A checkpoint that ends without submitting a summary falls back to the summarizer.
+- Compaction copies the most recent messages received into the summary; search skips the copies.
+- Every summary has four sections: rules, commitments and their state, facts, next action.
+- When messages are copied, they take a third of the verbatim budget from the kept recent rounds.
+
 ## [0.64.1] - 2026-09-25
 
 ### Fixed

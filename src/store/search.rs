@@ -105,12 +105,17 @@ fn spoken_words_of_row(kind: &str, content: &str) -> String {
         content: content.to_string(),
         created_at: String::new(),
     };
-    let message = match decode_event_from_row(&row) {
-        Ok(Some(Event::Append(message))) => message,
-        Ok(Some(Event::CompactBoundary { summary, .. })) => summary,
-        _ => return String::new(),
-    };
-    spoken_words(&message)
+    match decode_event_from_row(&row) {
+        Ok(Some(Event::Append(message))) => spoken_words(&message),
+        // Minus the messages the summary quotes as they were written: those are rows this index
+        // already holds, and a second copy would rank the summary above the message itself. No
+        // bump of `INDEXED_WORDS_DEFINITION` came with this: no row written before the markers
+        // existed carries them, so every index already built equals a rebuild of it.
+        Ok(Some(Event::CompactBoundary { summary, .. })) => {
+            crate::conversation::without_retained_messages(&spoken_words(&summary)).into_owned()
+        }
+        _ => String::new(),
+    }
 }
 
 /// `text` with a space between every pair of adjacent characters of which at least one is from
@@ -897,7 +902,7 @@ mod tests {
     fn the_definition_number_moves_with_the_words() {
         use std::collections::HashSet;
 
-        use crate::conversation::{ContentBlock, Message, Role};
+        use crate::conversation::{ContentBlock, Message};
 
         fn digest(input: &str) -> u64 {
             let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -956,11 +961,17 @@ mod tests {
             ),
             (
                 COMPACT_BOUNDARY_KIND,
+                // Shaped the way compaction writes one: a user message opening on the prefix,
+                // with a retained section between the markers, so the digest covers what a
+                // boundary row leaves out as well as what it contributes.
                 serde_json::to_string(&Event::CompactBoundary {
-                    summary: Message {
-                        role: Role::Assistant,
-                        content: vec![text("the summary")],
-                    },
+                    summary: Message::user(format!(
+                        "{}\n\nthe summary\n\n{}\n> the quoted words\n{}\n\n[Post-compaction \
+                         context]\n\nlevel read",
+                        crate::conversation::COMPACTION_SUMMARY_PREFIX,
+                        crate::conversation::RETAINED_MESSAGES_HEADER,
+                        crate::conversation::RETAINED_MESSAGES_END
+                    )),
                     replaced_count: 2,
                     loaded_tools_snapshot: HashSet::new(),
                 })
@@ -974,7 +985,7 @@ mod tests {
             .join("\u{1e}");
         assert_eq!(
             (INDEXED_WORDS_DEFINITION, digest(&words)),
-            (3, 3_619_997_085_987_050_176_u64),
+            (3, 11_673_021_996_248_275_489_u64),
             "the words a row contributes changed, or the definition number moved without them: \
              bump INDEXED_WORDS_DEFINITION and pin the new pair here (the words were: {words:?})"
         );
@@ -1008,6 +1019,36 @@ mod tests {
             found[0].excerpt.as_deref(),
             Some("(summary) the summary mentions pelicans")
         );
+    }
+
+    /// The messages a summary quotes as they were written are rows this index already holds, so
+    /// a summary contributes its own words and not the quotes: otherwise a search for a phrase
+    /// someone wrote would rank the summary beside, or above, the message itself.
+    #[test]
+    fn a_summary_contributes_its_words_and_not_the_messages_it_quotes() {
+        use std::collections::HashSet;
+
+        use crate::conversation::{
+            COMPACTION_SUMMARY_PREFIX, RETAINED_MESSAGES_END, RETAINED_MESSAGES_HEADER,
+        };
+
+        // A quoted message that itself pastes the closing marker must not end the cut early: the
+        // marker counts only at the start of a line, and every quoted line begins with `> `.
+        let summary = format!(
+            "{COMPACTION_SUMMARY_PREFIX}\n\nbirds were discussed\n\n{RETAINED_MESSAGES_HEADER}\n\
+             > {RETAINED_MESSAGES_END} pasted by someone\n> the pelicans nest here\n\
+             {RETAINED_MESSAGES_END}\n\n[Post-compaction context]\n\nlevel read"
+        );
+        let content = serde_json::to_string(&Event::CompactBoundary {
+            summary: Message::user(summary),
+            replaced_count: 2,
+            loaded_tools_snapshot: HashSet::new(),
+        })
+        .expect("json");
+        let words = indexed_words(COMPACT_BOUNDARY_KIND, &content);
+        assert!(words.contains("birds were discussed"), "{words}");
+        assert!(words.contains("level read"), "{words}");
+        assert!(!words.contains("pelicans"), "{words}");
     }
 
     /// Every diacritic is folded, so a word typed without them finds the word with them.

@@ -10,6 +10,14 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.64 to 0.65
+
+**The `checkpoint_text` compaction source is gone.** `POST /v1/sessions/{id}/compact` and the
+`context.compacted` stream event report `source` as `checkpoint` or `summarizer` only. A
+checkpoint turn that ends without calling `context_replace` now falls back to the summarizer
+instead of having its closing text taken as the summary. A client matching on the old value should
+treat it as `summarizer`, which is what those compactions now produce.
+
 ## 0.63 to 0.64
 
 **The first open builds the session search index.** `meka session search` reads a full-text index

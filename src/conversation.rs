@@ -682,6 +682,46 @@ pub(crate) fn strip_inbox_header(text: &str) -> &str {
     }
     text.split_once("]\n").map_or(text, |(_, body)| body)
 }
+/// How the message a compaction writes in place of the summarized turns begins. Read back by the
+/// next compaction, so a summary's own quotes are never quoted a second time.
+pub(crate) const COMPACTION_SUMMARY_PREFIX: &str = "[Conversation summary from session compaction]";
+/// The lines that open and close the section of a summary message where compaction copies the
+/// messages received as they were written. Markers rather than a shape to parse: what lies between
+/// them is a copy of rows the search index already holds, and indexing the copy would rank the
+/// summary above the message it quotes.
+pub(crate) const RETAINED_MESSAGES_HEADER: &str = "[Messages received, as written, oldest first]";
+/// The line that closes the section [`RETAINED_MESSAGES_HEADER`] opens.
+pub(crate) const RETAINED_MESSAGES_END: &str = "[End of messages received]";
+/// `text` with every retained-messages section cut out, markers included; `text` itself when it
+/// has none. A marker counts only at the start of a line: the section quotes every line of what it
+/// carries with `> `, so a marker inside a quoted message never sits there, and a summary that
+/// mentions one mid-sentence is left alone.
+pub(crate) fn without_retained_messages(text: &str) -> std::borrow::Cow<'_, str> {
+    let header = format!("\n{RETAINED_MESSAGES_HEADER}");
+    let end_marker = format!("\n{RETAINED_MESSAGES_END}");
+    let Some(first) = text.find(&header) else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+    let mut stripped = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut start = first;
+    loop {
+        let Some(end) = rest[start..].find(&end_marker) else {
+            stripped.push_str(rest);
+            break;
+        };
+        stripped.push_str(&rest[..start]);
+        rest = &rest[start + end + end_marker.len()..];
+        match rest.find(&header) {
+            Some(next) => start = next,
+            None => {
+                stripped.push_str(rest);
+                break;
+            }
+        }
+    }
+    std::borrow::Cow::Owned(stripped)
+}
 
 /// Replace every image whose bytes disagree with its declared `media_type` with a text note,
 /// returning how many were replaced.

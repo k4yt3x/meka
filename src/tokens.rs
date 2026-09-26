@@ -81,6 +81,14 @@ pub(crate) fn bound_text(text: &str) -> u64 {
     bound.total
 }
 
+/// The longest prefix of `text`, in bytes and on a character boundary, whose [`estimate_text`] is
+/// within `tokens`. The estimate's counterpart of [`prefix_within`], for a cut that is measured
+/// the way the rest of its budget is.
+pub(crate) fn estimated_prefix_within(text: &str, tokens: u64) -> usize {
+    let bytes = usize::try_from(tokens.saturating_mul(BYTES_PER_TOKEN)).unwrap_or(usize::MAX);
+    text.floor_char_boundary(bytes.min(text.len()))
+}
+
 /// The longest prefix of `text`, in bytes and on a character boundary, whose [`bound_text`] is
 /// within `tokens`.
 pub(crate) fn prefix_within(text: &str, tokens: u64) -> usize {
@@ -191,6 +199,17 @@ mod tests {
         assert_eq!(prefix_within("12345", 0), 0);
         assert_eq!(prefix_within("é1", 1), 2);
         assert_eq!(prefix_within("", 5), 0);
+    }
+
+    /// The estimate's cut spends four bytes per token and never lands inside a character.
+    #[test]
+    fn the_estimated_prefix_within_a_budget_ends_on_a_character_boundary() {
+        assert_eq!(estimated_prefix_within("abcdefghij", 1), 4);
+        assert_eq!(estimated_prefix_within("abcdefghij", 3), 10);
+        assert_eq!(estimated_prefix_within("abcdefghij", 0), 0);
+        // Three-byte characters: five tokens is twenty bytes, which lands inside the seventh.
+        assert_eq!(estimated_prefix_within(&"字".repeat(10), 5), 18);
+        assert_eq!(estimated_prefix_within("", 5), 0);
     }
 
     #[test]

@@ -465,8 +465,8 @@ history shows.
 | `instructions` | string | *(none)* | Guidance on what to keep or drop, as `/compact <instructions>` in the REPL |
 | `keep_recent` | bool | *(meka decides)* | Whether to keep the most recent turns verbatim after the summary |
 
-The response carries `source` (`checkpoint`, `checkpoint_text` or `summarizer`) and
-`memories_written`, the memories the checkpoint turn wrote.
+The response carries `source` (`checkpoint` or `summarizer`) and `memories_written`, the
+memories the checkpoint turn wrote.
 
 `POST /v1/sessions/{id}/rewind` drops trailing turns. The body is optional:
 
@@ -593,7 +593,7 @@ Three limits. The event exists only when meka streams from its provider, so a se
 |-------|---------|------|
 | `context.compacted` | `source`, `replaced_count`, `generation` | The conversation was summarized and the window replaced |
 
-`context.compacted` is the one event on this stream that is not additive. Everything else appends, so a client that misses one still holds a prefix of the truth; a compaction *removes* messages the client has already rendered. `source` is `checkpoint`, `checkpoint_text`, or `summarizer` (they differ in fidelity, not just mechanism), `replaced_count` is how many messages the boundary removed from the view (the whole pre-compaction window, including the tail compaction re-appends verbatim), and `generation` counts compactions from 1.
+`context.compacted` is the one event on this stream that is not additive. Everything else appends, so a client that misses one still holds a prefix of the truth; a compaction *removes* messages the client has already rendered. `source` is `checkpoint` or `summarizer` (they differ in fidelity, not just mechanism), `replaced_count` is how many messages the boundary removed from the view (the whole pre-compaction window, including the tail compaction re-appends verbatim), and `generation` counts compactions from 1.
 
 The same information appears on `GET /messages`: the summary message carries a `compaction` object with `replaced_count` and `generation`, and every other message omits the field. Without it a polling client sees `total` shrink with no explanation, which is indistinguishable from the server losing the conversation.
 

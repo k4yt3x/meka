@@ -294,7 +294,8 @@ Where `conversation_*` reads the **archive** (the full log on disk, including tu
 Using 84000 of 200000 tokens (42%).
 Headroom: 86000 tokens before the context ceiling at 85%. Auto-compaction fires there,
 between turns or between two of your tool rounds.
-Compaction may keep about 16000 tokens of recent rounds verbatim; the rest
+Compaction may keep about 16000 tokens verbatim: recent rounds, with up to 5333
+of that spent on the messages received as they were written; the rest
 becomes a summary.
 Fixed overhead: about 12000 tokens of system prompt and tool schemas (estimated).
 Compaction does not reclaim this.

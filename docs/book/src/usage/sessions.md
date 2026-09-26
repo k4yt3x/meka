@@ -228,6 +228,10 @@ With `auto_compact = false` the conversation grows until the provider rejects a 
 
 When a session becomes too long, `/compact` replaces the older turns with a summary. A token-budgeted tail of recent messages may be kept verbatim, without splitting tool calls from their results. If too little older history remains to summarize, the whole conversation is summarized instead; an unanswered trailing prompt is still kept.
 
+Whoever writes the summary, it has four sections: the rules and authorizations the user stated, in their words; each commitment and its state (done, pending, blocked, or superseded) and what must happen before the next; the facts established, each with its source; and the next action. A `/compact <instructions>` focus adds emphasis within those sections and never drops one.
+
+The messages received during the summarized turns are not left to the summary. meka copies the most recent ones into the summary message as they were written, newest first within a third of the verbatim budget, oldest first when read, each quoted line by line; the kept tail takes the other two thirds, or the whole budget when there is nothing to copy. A message relayed from the inbox keeps the header naming who sent it. The one that overflows the budget keeps its beginning; `conversation_read` reaches all of it. Nothing already in the kept tail is copied twice, and a summary's own quotes are never quoted again by the next compaction. The reason is the one loss an agent cannot notice: a restriction stated in a later turn and left out of a summary is gone from the window, and the agent cannot search for a rule it does not know it lost.
+
 By default the summary is written by **the agent itself**, in a *checkpoint turn* that runs before anything is discarded. The agent gets its real system prompt, its memory index, the full conversation, and a small set of tools, and is told its context is about to be replaced. It saves whatever must outlive the window (`memory_write` for facts and decisions that should still be true in a future session, the scratchpad for working material), then calls `context_replace` with the summary.
 
 This matters because compaction is the one moment information is destroyed, and before this it was also the one moment the agent could not act. The alternative, a separate summarizer call, knows nothing about who the agent is or what it is for.
@@ -257,10 +261,8 @@ Internally, compaction does not delete pre-compaction rows from the store. It ap
 A standalone summarizer, with no tools and none of the standing instructions, is the fallback. It runs when:
 
 - The compaction is an **emergency** one, i.e. the provider has already rejected the request for exceeding the window. A checkpoint turn re-sends that same conversation, so it would be refused identically; the summarizer strips images and truncates long blocks, which is what lets it get through.
-- The checkpoint turn **fails or produces nothing usable**.
+- The checkpoint turn **fails or ends without calling `context_replace`**. `tool_choice` isn't available across meka's backends, so the call can't be forced, and a turn that ends on prose instead is not trusted to have written a summary: that prose is as often an answer to the conversation, or a sentence cut off at the checkpoint's round limit, as a summary, and nothing can tell which. Memories the checkpoint wrote before it ended are kept either way.
 - `compact_checkpoint` is off.
-
-There is one rung in between: if the checkpoint turn ends without calling `context_replace` but did write a summary in prose, that text is used. `tool_choice` isn't available across meka's backends, so the call can't be forced.
 
 ```toml
 [session]

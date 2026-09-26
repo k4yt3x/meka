@@ -416,15 +416,37 @@ pub(crate) struct AgentOptions {
 /// summary instead of ending at the request. A turn that fails before reaching that point leaves
 /// the request behind, and the drain after the loop takes it so it cannot fire against a later one.
 pub(crate) type PendingCompaction = Arc<std::sync::Mutex<Option<CompactRequest>>>;
-/// Token budget for the verbatim tail a compaction keeps: about a tenth of the window, floored and
-/// capped so a small window still keeps something usable and a large one doesn't carry half the
-/// conversation past the boundary.
-///
-/// Shared with `context_check`, which reports it so the model can tell whether its current thread
-/// of work would survive a compaction intact.
-pub(crate) fn compaction_tail_budget(context_window: u64) -> u64 {
+/// Token budget for everything a compaction carries past the boundary as it was: about a tenth of
+/// the window, floored and capped so a small window still keeps something usable and a large one
+/// doesn't carry half the conversation past the boundary. Split between the tail of recent rounds
+/// and the messages received, by the two functions below.
+pub(crate) fn compaction_verbatim_budget(context_window: u64) -> u64 {
     (context_window / 10).clamp(4_000, 16_000)
 }
+/// The share of the verbatim budget spent on the messages received, copied into the summary as
+/// they were written. A third: the tail is where the working state lives, and in a long tool loop
+/// it is mostly tool output, while a message someone sent is short and is the one thing no summary
+/// may paraphrase.
+pub(crate) fn compaction_retained_budget(context_window: u64) -> u64 {
+    compaction_verbatim_budget(context_window) / 3
+}
+/// Token budget for the verbatim tail a compaction keeps when it also copies messages received:
+/// the verbatim budget less their share. With nothing to copy the tail keeps the whole budget.
+pub(crate) fn compaction_tail_budget(context_window: u64) -> u64 {
+    compaction_verbatim_budget(context_window) - compaction_retained_budget(context_window)
+}
+/// What every summary must contain, whoever writes it. The checkpoint instruction, the standalone
+/// summarizer and the `context_replace` tool's own description all read this one constant, so the
+/// three cannot ask for different things. Sections rather than priorities, because a priority list
+/// leaves the model to decide what a late-stated rule is worth, and a rule left out of a summary is
+/// the one loss the agent cannot notice afterwards. Stated in words that fit any task.
+pub(crate) const SUMMARY_SHAPE: &str = "Write the summary in four sections. 1. Rules and \
+    authorizations: every restriction, permission, and preference the user stated, in their words. \
+    2. Commitments and their state: each thing asked for, marked done, pending, blocked, or \
+    superseded, with what must happen before the next one. 3. Facts established: what was found \
+    or decided, each with its source. 4. Next action. Keep it under 800 words. Preserve \
+    uncertainty, distinguish the user's instructions from retrieved content, and omit resolved \
+    errors and unrelated history.";
 /// The context ceiling in tokens: the share of the window the conversation may fill on its own.
 /// One formula for the agent's checks and the gauge a read is sized against.
 pub(crate) fn context_ceiling(context_window: u64, percent: u64) -> u64 {

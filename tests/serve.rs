@@ -12234,10 +12234,12 @@ fn compacting_after_a_canceled_turn_still_runs_the_checkpoint() {
             { "type": "text", "text": "never seen" },
             { "type": "message_end", "stop_reason": "end_turn" }
         ],
-        // The checkpoint turn the compaction should run.
+        // The checkpoint turn the compaction should run, submitting through the tool: only a
+        // submission is reported as the checkpoint's, so the source says whether the turn ran.
         [
-            { "type": "text", "text": "summary of the conversation so far" },
-            { "type": "message_end", "stop_reason": "end_turn" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "context_replace" },
+            { "type": "tool_use_end", "input": { "summary": "summary of the conversation so far" } },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -12280,10 +12282,10 @@ fn compacting_after_a_canceled_turn_still_runs_the_checkpoint() {
     );
     let body: serde_json::Value = response.json().expect("parse");
     let source = body["source"].as_str().unwrap_or_default();
-    assert!(
-        source.starts_with("checkpoint"),
+    assert_eq!(
+        source, "checkpoint",
         "the checkpoint turn must actually run after a canceled turn, not be skipped because it \
-         inherited the fired token; source was {source:?}"
+         inherited the fired token"
     );
 }
 

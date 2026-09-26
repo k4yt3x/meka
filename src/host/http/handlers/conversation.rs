@@ -56,9 +56,9 @@ pub(crate) struct CompactRequestBody {
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct CompactResponse {
     pub(crate) session_id: Uuid,
-    /// Which strategy produced the summary: `checkpoint`, `checkpoint_text`, or `summarizer`.
-    /// Reported because they differ in fidelity, not just in mechanism: `summarizer` means the
-    /// checkpoint turn was disabled, failed, or produced nothing usable.
+    /// Which strategy produced the summary: `checkpoint` or `summarizer`. Reported because they
+    /// differ in fidelity, not just in mechanism: `summarizer` means the checkpoint turn was
+    /// disabled, failed, or ended without submitting a summary.
     pub(crate) source: String,
     /// Memories the checkpoint turn wrote, observed from its `memory_write` calls rather than
     /// self-reported, so this cannot disagree with what actually landed on disk.
@@ -196,7 +196,6 @@ pub(crate) async fn compact(
         session_id: id,
         source: match outcome.source {
             CompactSource::Checkpoint => "checkpoint",
-            CompactSource::CheckpointText => "checkpoint_text",
             CompactSource::Summarizer => "summarizer",
         }
         .to_string(),
