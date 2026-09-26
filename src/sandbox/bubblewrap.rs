@@ -11,7 +11,12 @@ pub(super) fn probe_bubblewrap() -> BackendProbe {
     };
 
     match smoke_test_bwrap(&bwrap_path, BWRAP_PROBE_TIMEOUT) {
-        SmokeResult::Success => BackendProbe::Ok(SandboxCapability::Bubblewrap { bwrap_path }),
+        SmokeResult::Success => BackendProbe::Ok(SandboxCapability::Bubblewrap {
+            bwrap_path,
+            // The kernel's Landlock, for the layer `meka confine` enacts inside the sandbox, at the
+            // layer's own floor rather than the standalone backend's.
+            landlock_abi: layer_landlock_abi(),
+        }),
         SmokeResult::UserNamespaceDenied { stderr } => BackendProbe::UserNamespaceDenied { stderr },
         SmokeResult::OtherFailure { reason } => BackendProbe::Missing { reason },
     }

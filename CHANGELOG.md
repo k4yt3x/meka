@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.65.0] - 2026-09-26
+
+### Added
+
+- Bubblewrap shells also run inside Landlock on kernel 6.12+, closing sockets bwrap leaves open.
+- Landlock hides meka's config and credential store from a sandboxed shell.
+- A shell sandboxed by Landlock gets a private temporary directory, named by `TMPDIR`.
+
 ### Changed
 
+- **Breaking:** Landlock alone needs ABI v9 (kernel 7.1); older kernels need Bubblewrap at `read`.
+- The Landlock fallback warning names what it cannot stop: file mode, owner and timestamp changes.
+- A kernel with Landlock built in but disabled at boot is reported, with the `lsm=` remedy.
 - **Breaking:** compaction `source` is `checkpoint` or `summarizer`; `checkpoint_text` is gone.
 - A checkpoint that ends without submitting a summary falls back to the summarizer.
 - Compaction copies the most recent messages received into the summary; search skips the copies.
@@ -2413,7 +2424,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.64.1...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.65.0...HEAD
+[0.65.0]: https://github.com/k4yt3x/meka/compare/0.64.1...0.65.0
 [0.64.1]: https://github.com/k4yt3x/meka/compare/0.64.0...0.64.1
 [0.64.0]: https://github.com/k4yt3x/meka/compare/0.63.0...0.64.0
 [0.63.0]: https://github.com/k4yt3x/meka/compare/0.62.0...0.63.0

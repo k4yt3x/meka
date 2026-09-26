@@ -87,6 +87,21 @@ impl std::error::Error for AlreadyReported {}
 
 fn main() -> anyhow::Result<()> {
     let mut cli = cli::Cli::parse();
+    // `meka confine` is the inside of the Bubblewrap sandbox: bwrap execs meka so the Landlock
+    // ruleset can be enacted after its mounts, and meka then becomes the command. Ahead of tracing
+    // and the runtime, because `landlock_restrict_self` binds the calling thread and `execve`
+    // replaces the process, so nothing started here would outlive it either way.
+    #[cfg(target_os = "linux")]
+    if let Some(cli::Command::Confine {
+        writable,
+        scratch,
+        command,
+    }) = &cli.command
+    {
+        let error = crate::sandbox::run_confined(writable, scratch, command);
+        eprintln!("meka confine: failed to run the command inside the sandbox: {error}");
+        std::process::exit(126);
+    }
     // Before anything else reads the prompt: `-p -` is stdin's, and every later consumer
     // (`overrides()`, the skill prompt, the oneshot check) wants the words rather than the dash.
     cli.read_prompt_from_stdin_if_asked()?;
@@ -271,6 +286,10 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                 }
                 cli::Command::Schedule { action } => {
                     crate::cli::schedule::run(&store, action, cli_ref).await
+                }
+                #[cfg(target_os = "linux")]
+                cli::Command::Confine { .. } => {
+                    anyhow::bail!("`confine` is handled before startup")
                 }
                 #[allow(
                     clippy::unreachable,

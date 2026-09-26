@@ -12225,11 +12225,20 @@ fn a_star_grants_any_origin_and_still_names_the_bearer_header() {
 /// turn left in the session's cell, and a canceled turn leaves that token fired. The checkpoint
 /// turn then returned instantly and compaction fell back to the standalone summarizer -- no
 /// memories written, a worse summary, and a `warn` as the only trace.
+///
+/// The cancel waits for turn one's first delta on the feed, not merely for the session to report
+/// a turn in flight. The mock hands out a scripted round only when a request reaches it, so a
+/// cancel that lands in the window between admission and the provider call leaves round one
+/// queued: the checkpoint turn then consumes it, ends without submitting, and the summarizer
+/// fallback reads the tool-call round meant for the checkpoint, which the mock answers with an
+/// empty summary and the endpoint with a 502. Under load that window was hit about one run in
+/// five, and it is the test's race, not the server's.
 #[test]
 fn compacting_after_a_canceled_turn_still_runs_the_checkpoint() {
     let script = serde_json::json!([
-        // Turn one: slow enough to cancel.
+        // Turn one: announces that the provider was reached, then is slow enough to cancel.
         [
+            { "type": "text", "text": "provider reached" },
             { "type": "sleep", "ms": 4000 },
             { "type": "text", "text": "never seen" },
             { "type": "message_end", "stop_reason": "end_turn" }
@@ -12244,6 +12253,7 @@ fn compacting_after_a_canceled_turn_still_runs_the_checkpoint() {
     ]);
     let harness = ServeTestHarness::spawn("", script);
     let id = start_streaming_session(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
 
     let base_url = harness.base_url.clone();
     let token = harness.token.clone();
@@ -12262,7 +12272,12 @@ fn compacting_after_a_canceled_turn_still_runs_the_checkpoint() {
             .status()
     });
 
-    harness.wait_until_in_flight(&id);
+    // Round one is the canceled turn's from here on: the mock has dequeued it.
+    let seen = read_feed_until(feed, |text| text.contains("provider reached"));
+    assert!(
+        seen.contains("provider reached"),
+        "turn one must reach the provider before it is canceled: {seen}"
+    );
     let cancel = harness
         .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/cancel"))
         .send()
@@ -14542,4 +14557,195 @@ grace = "0s"
         "and nothing was added: {:?}",
         user_texts(&harness, &id)
     );
+}
+
+/// A shell at `read` under the Landlock backend cannot read the credential store, through the real
+/// server and the real spawn: the ruleset the tool plans has to name meka's directories as the
+/// ones to step around, and nothing short of a whole turn exercises that wiring. The control read
+/// proves the refusal is the store's alone. Skips loudly where the kernel has no usable Landlock.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_read_shell_under_landlock_cannot_read_the_store() {
+    // `XDG_DATA_HOME` survives the child's environment scrub, and the harness points it at the
+    // install, so the command names the store without knowing the tempdir.
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
+            { "type": "tool_use_end", "input": {"command":
+                "cat \"$XDG_DATA_HOME/meka/meka.db\" >/dev/null 2>&1 && echo STORE_READABLE || echo STORE_REFUSED; \
+                 cat /etc/passwd >/dev/null 2>&1 && echo CONTROL_OK || echo CONTROL_REFUSED"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn_with_env(
+        "",
+        "",
+        script,
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+        |_| vec![("MEKA_SANDBOX_BACKEND".to_string(), "landlock".to_string())],
+    );
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "permission": "read",
+        }))
+        .send()
+        .expect("create");
+    assert_eq!(create.status(), 201, "a read session is created");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "look", "stream": false}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+
+    let transcript: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let result = transcript["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| {
+            message["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_result"))
+        })
+        .expect("the tool round is in the transcript")
+        .to_string();
+    if result.contains("is unavailable") {
+        eprintln!("skipping: no usable Landlock on this host: {result}");
+        return;
+    }
+    assert!(
+        result.contains("CONTROL_OK"),
+        "a file outside the store reads: {result}"
+    );
+    assert!(
+        result.contains("STORE_REFUSED") && !result.contains("STORE_READABLE"),
+        "the store does not: {result}"
+    );
+}
+
+/// A shell at `read` inherits nothing but its standard descriptors, whatever the backend: the
+/// server holds the store, a listening socket and a client connection open, and a descriptor to
+/// any of them would reach the sandboxed command past every rule, since Landlock and Bubblewrap
+/// judge new opens and mounts rather than what a process already holds. Checked through the real
+/// server, where those descriptors exist. Runs on the backend the host auto-picks and, on Linux,
+/// again with Landlock pinned; skips loudly where no backend is usable. Linux only, since the
+/// observable is `/proc/self/fd`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_read_shell_inherits_only_its_standard_descriptors() {
+    for backend in &[None, Some("landlock")] {
+        let script = serde_json::json!([
+            [
+                { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
+                { "type": "tool_use_end", "input": {"command":
+                    "ls -l /proc/self/fd 2>/dev/null | sed 's/^.*[0-9] -> //' | grep -v '^total'"} },
+                { "type": "message_end", "stop_reason": "tool_use" }
+            ],
+            [
+                { "type": "text", "text": "done" },
+                { "type": "message_end", "stop_reason": "end_turn" }
+            ]
+        ]);
+        let harness = ServeTestHarness::spawn_with_env(
+            "",
+            "",
+            script,
+            "sk_test_token",
+            &["sessions:r", "sessions:w"],
+            |_| {
+                backend
+                    .map(|name| vec![("MEKA_SANDBOX_BACKEND".to_string(), name.to_string())])
+                    .unwrap_or_default()
+            },
+        );
+        let create = harness
+            .request(reqwest::Method::POST, "/v1/sessions")
+            .json(&serde_json::json!({
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "permission": "read",
+            }))
+            .send()
+            .expect("create");
+        assert_eq!(create.status(), 201);
+        let id = create.json::<serde_json::Value>().expect("parse")["id"]
+            .as_str()
+            .expect("id")
+            .to_string();
+        let response = harness
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+            .json(&serde_json::json!({"message": "look", "stream": false}))
+            .send()
+            .expect("send");
+        assert_eq!(response.status(), 200);
+
+        let transcript: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        let round = transcript["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| {
+                message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_result"))
+            })
+            .expect("the tool round is in the transcript");
+        let text = round["content"]
+            .as_array()
+            .expect("blocks")
+            .iter()
+            .filter(|block| block["type"] == "tool_result")
+            .map(|block| match &block["content"] {
+                serde_json::Value::String(text) => text.clone(),
+                serde_json::Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|part| part["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.contains("is unavailable") {
+            eprintln!("skipping backend {backend:?}: no usable sandbox on this host: {text}");
+            continue;
+        }
+        // Every target is stdin's `/dev/null`, one of the two output pipes, or `ls`'s own handle
+        // on the directory it lists.
+        let targets: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        let allowed = |line: &str| {
+            line.ends_with("/dev/null") || line.contains("pipe:[") || line.ends_with("/fd")
+        };
+        let stray: Vec<&&str> = targets.iter().filter(|line| !allowed(line)).collect();
+        assert!(
+            !targets.is_empty() && stray.is_empty(),
+            "backend {backend:?}: a sandboxed shell holds only stdio and the listing's own \
+             handle, got {targets:?} with strays {stray:?}"
+        );
+    }
 }

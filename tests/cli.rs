@@ -3383,3 +3383,65 @@ fn tool_list_prints_json_with_the_source_and_status_of_each_tool() {
         assert!(tool["deferred"].is_boolean(), "{tool}");
     }
 }
+
+/// `meka confine` is the inside of the Bubblewrap sandbox: it enacts the Landlock ruleset and
+/// becomes the command. Checked on its own here, without bwrap, by what lands on disk. Skips
+/// loudly where the kernel has no usable Landlock, which the verb reports through exit 126.
+#[cfg(target_os = "linux")]
+#[test]
+fn confine_refuses_writes_outside_the_roots_and_allows_them_inside() {
+    let probe = meka()
+        .args(["confine", "--", "true"])
+        .output()
+        .expect("spawn meka");
+    if !probe.status.success() {
+        let stderr = String::from_utf8_lossy(&probe.stderr);
+        assert_eq!(
+            probe.status.code(),
+            Some(126),
+            "a confinement that cannot be enacted exits 126: {stderr}"
+        );
+        eprintln!("skipping: {}", stderr.trim());
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let work = temp.path().join("work");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir(&work).expect("work");
+    std::fs::create_dir(&outside).expect("outside");
+    let script = format!(
+        "echo in > {}/inside.txt 2>/dev/null || exit 3\n\
+         if echo out > {}/escaped.txt 2>/dev/null; then exit 4; fi\n\
+         exit 0",
+        work.display(),
+        outside.display()
+    );
+    let status = meka()
+        .args(["confine", "--writable"])
+        .arg(&work)
+        .args(["--", "sh", "-c", &script])
+        .status()
+        .expect("spawn meka");
+    match status.code() {
+        Some(0) => {}
+        Some(3) => panic!("the write inside the root was refused"),
+        Some(4) => panic!("the write outside every root was permitted"),
+        other => panic!("the confined shell did not run: exit {other:?}"),
+    }
+    assert!(work.join("inside.txt").exists());
+    assert!(!outside.join("escaped.txt").exists());
+
+    // The failure path: a command that cannot be run leaves the verb with nothing to become, and
+    // what the tool sees is the exit code and the message, so both are pinned.
+    let failed = meka()
+        .args(["confine", "--", "/nonexistent/meka-probe"])
+        .output()
+        .expect("spawn meka");
+    assert_eq!(failed.status.code(), Some(126));
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains("failed to run the command inside the sandbox"),
+        "the verb says what went wrong: {stderr}"
+    );
+}

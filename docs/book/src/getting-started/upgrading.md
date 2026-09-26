@@ -12,6 +12,14 @@ and `-shm` companions with the file.
 
 ## 0.64 to 0.65
 
+**Landlock on its own needs ABI v9 (kernel 7.1).** Below that the kernel cannot refuse a
+`connect()` to a Unix socket on disk, so a shell at `read` could reach D-Bus and `systemd-run
+--user` and have them act on its behalf. meka now reports the backend unusable on such a kernel
+instead of warning, and shell commands at `read` fail until a usable backend exists. Install
+`bubblewrap`, which works on any kernel with user namespaces; on a kernel of 6.12 or newer the
+command also runs inside meka's Landlock ruleset there. Affected as of this release: Debian 13,
+RHEL 10, Ubuntu 24.04 and 26.04 LTS without Bubblewrap.
+
 **The `checkpoint_text` compaction source is gone.** `POST /v1/sessions/{id}/compact` and the
 `context.compacted` stream event report `source` as `checkpoint` or `summarizer` only. A
 checkpoint turn that ends without calling `context_replace` now falls back to the summarizer

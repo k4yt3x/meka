@@ -38,32 +38,32 @@ At **`read`**, commands run inside a sandbox that blocks writes to the user's re
 | Surface | Blocked | Allowed |
 |---|---|---|
 | Filesystem writes outside tmp / Low-integrity paths | ✓ | |
-| Filesystem reads | | ✓ |
+| File metadata changes (mode, owner, timestamps, extended attributes) | Bubblewrap / macOS / Windows | Landlock alone, on every kernel |
+| Filesystem reads outside meka's own directories | | ✓ |
+| Unix sockets the Bubblewrap masks do not cover (`$HOME`, `/var/lib`, the abstract namespace) | Landlock, and Bubblewrap on kernel 7.1+ (6.12+ for the abstract namespace) | Bubblewrap on older kernels / Windows |
 | Program execution | | ✓ |
 | Outbound network (TCP/UDP) | | ✓ |
-| dbus / systemd-user state mutations | Bubblewrap / macOS / Landlock on kernel 7.1+ | Landlock below kernel 7.1 / Windows |
+| dbus / systemd-user state mutations | Bubblewrap / macOS / Landlock | Windows |
 | Mach IPC state mutation (launchd, pasteboard, LaunchServices) | macOS | Linux / Windows |
 | COM / RPC to Low-integrity-accepting services (Windows) | | ✓ |
 | Inheritance of sensitive parent env vars (API keys, OAuth tokens, …) | ✓ (all platforms) | |
 
 The sandbox is not an adversarial containment boundary; it's defense-in-depth against an agent accidentally modifying user data. Set permission to `none` if you don't trust a turn at all.
 
-#### Scratch space: one place the backends genuinely differ
+#### Scratch space
 
-A confined command may or may not get a writable temporary directory, and this is the one difference between backends big enough to change which commands work:
+A confined command gets somewhere to write temporary files, and where that is differs by backend:
 
 | Backend | Scratch space | Effect |
 |---|---|---|
-| Bubblewrap (`read`) | Private `/tmp` tmpfs | `mktemp`, `git`, `python`, `gpg`, `pip` all work |
-| Landlock (`read`) | None | Anything that writes a temp file is denied |
+| Bubblewrap (`read`) | Private `/tmp` tmpfs, gone with the sandbox | `mktemp`, Python's `tempfile`, `gcc`, `patch` and `pip` builds all work |
+| Landlock (`read` and `workspace`) | A private directory per command, named by `TMPDIR`, `TMP` and `TEMP`, removed when the command ends | The same tools work; a program with a literal `/tmp` in it is still refused |
 | Windows `workspace` | None outside the roots | `New-TemporaryFile` is denied (measured) |
 | macOS Seatbelt (`read`) | Per-backend; see below | |
 
-Under Bubblewrap the child gets a private writable `/tmp`, so `mktemp` succeeds and the write goes nowhere real. Under Landlock there is no such directory and the write is simply denied, which takes `git`'s index lock, Python's `tempfile`, `gpg` and `pip` with it. The same is true of `workspace` on Windows outside the granted roots.
+Under Bubblewrap the child writes into an in-memory `/tmp` that vanishes with the sandbox, so nothing real is touched. Landlock can only decide which real paths a process may touch, so meka creates an owner-only directory under the temp directory for each command, grants it in the ruleset, points `TMPDIR` at it and removes it afterwards; a directory a crash left behind is swept a day later. `git` needs none of this: its lock file lives inside the repository, which is read-only under both backends alike.
 
-This divergence is deliberate. Granting a scratch directory under Landlock would weaken what `read` promises on the backend that currently keeps that promise strictly, so the narrower behavior stays.
-
-The practical cost is diagnostic: the model sees a bare `Permission denied` naming a path in `/tmp` (or `%TEMP%`), with nothing in the message connecting it to the sandbox, and cannot act on it. If a command fails that way and you expected it to work, install `bwrap` for Landlock hosts, or add the directory it wants as a writable root at `workspace`.
+The practical cost is diagnostic: a program that ignores `TMPDIR` sees a bare `Permission denied` naming a path in `/tmp` (or `%TEMP%` on Windows), with nothing in the message connecting it to the sandbox. If a command fails that way and you expected it to work, add the directory it wants as a writable root at `workspace`.
 
 #### Environment variable scrubbing
 
@@ -85,10 +85,10 @@ An approved command is not an exception: with [approvals](../usage/permissions.m
 
 Linux supports two backends, selected via `[shell].sandbox_backend` in `config.toml`:
 
-- **Bubblewrap** (`sandbox_backend = "bubblewrap"`, recommended): wraps the command in `bwrap` with `--ro-bind /`, tmpfs masks over `/run`, `/tmp`, `/var/tmp`, and `$XDG_RUNTIME_DIR`, plus `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks make the dbus session bus, systemd-user socket, and other socket-on-disk IPC paths unreachable, so `systemctl --user start <unit>`, `dbus-send`, and similar state-changing calls fail. Network is not unshared. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
-- **Landlock** (`sandbox_backend = "landlock"`, legacy / fallback): uses the [Landlock LSM](https://landlock.io/). Blocks filesystem writes via `landlock_restrict_self`. **Requires ABI v3 (kernel 6.2+)**: below that the kernel does not mediate `truncate(2)`, so a sandboxed command could still empty an existing file despite every open-for-write being denied. meka reports Landlock unusable on those kernels rather than sandboxing with a ruleset that does not enforce what `read` promises, which means kernels 5.13–6.1 need Bubblewrap installed for the shell at `read`. On kernel 7.1+ (ABI v9) Landlock also blocks `connect()` to every Unix socket on disk, which closes the dbus / systemd-user route out of the sandbox but likewise breaks socket-based clients such as `docker` and `psql` at `read`. **Between ABI v3 and v9 that right does not exist**, so a sandboxed shell can invoke state-mutating dbus methods and `systemd-run --user` escapes the filesystem restriction entirely; meka warns at startup naming exactly which mitigations the running ABI lacks. Prefer Bubblewrap, which removes those sockets on any kernel.
+- **Bubblewrap** (`sandbox_backend = "bubblewrap"`, recommended): wraps the command in `bwrap` with `--ro-bind /`, tmpfs masks over `/run`, `/tmp`, `/var/tmp`, and `$XDG_RUNTIME_DIR`, plus `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks make the dbus session bus, systemd-user socket, and other socket-on-disk IPC paths unreachable, so `systemctl --user start <unit>`, `dbus-send`, and similar state-changing calls fail. Network is not unshared. On a kernel with Landlock ABI v6 (6.12) or newer, the command also runs inside meka's Landlock ruleset: bwrap execs `meka confine`, which enacts the ruleset after the mounts and then runs the shell. That closes what the masks leave open: the abstract socket namespace and signals to outside processes, ioctls on real devices, and from kernel 7.1 a socket under `$HOME` or `/var/lib` too. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled; Ubuntu 24.04 also needs the `bwrap-userns-restrict` AppArmor profile from `apparmor-profiles`.
+- **Landlock** (`sandbox_backend = "landlock"`, fallback): uses the [Landlock LSM](https://landlock.io/). Blocks filesystem writes via `landlock_restrict_self`. **Requires ABI v9 (kernel 7.1+)**: that is the first ABI with a right over `connect()` to Unix sockets on disk, and below it a sandboxed shell can invoke state-mutating dbus methods and `systemd-run --user` escapes the filesystem restriction entirely. meka reports Landlock unusable on older kernels rather than sandboxing with a ruleset that leaves that door open, which means kernels below 7.1 (Debian 13, RHEL 10, Ubuntu 24.04 and 26.04 LTS) need Bubblewrap installed for the shell at `read`. Closing that route also breaks socket-based clients such as `docker` and `psql` at `read`. meka's own directories are hidden by never being covered by a rule: reading files is granted per sibling along the path to each of them, so their names and sizes stay visible but their bytes do not, and the one cost is that a workspace root above them (a root at `$HOME`) can create new files only in its subdirectories. What no Landlock ABI mediates is file metadata: a command at `read` can still `chmod`, `chown`, `touch` and set extended attributes on any file you own. Prefer Bubblewrap, whose read-only bind refuses those and which removes the socket-on-disk paths on any kernel.
 
-`sandbox_backend` is unset unless you pin it yourself; no command writes it. When unset, meka probes Bubblewrap once at startup and prefers it when available, falling back to Landlock with one warning at startup: that it did so, that Landlock isolates less, and that it cannot hide meka's config and credential store from a sandboxed command. Pinning `sandbox_backend = "landlock"` accepts that and silences the warning.
+`sandbox_backend` is unset unless you pin it yourself; no command writes it. When unset, meka probes Bubblewrap once at startup and prefers it when available, falling back to Landlock with one warning at startup: that it did so, and that Landlock cannot stop a command changing a file's mode, owner, timestamps or attributes. Pinning `sandbox_backend = "landlock"` accepts that and silences the warning.
 
 ```toml
 [shell]

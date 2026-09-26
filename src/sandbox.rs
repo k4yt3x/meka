@@ -1,8 +1,11 @@
 //! Filesystem sandboxing for read-only command execution.
 //!
 //! On Linux there are two backends. Bubblewrap (`bwrap --ro-bind /` plus tmpfs masks) is preferred
-//! whenever it is installed and its user-namespace smoke test passes; Landlock LSM is the fallback,
-//! and requires ABI v3 (kernel 6.2+) because `truncate(2)` is unmediated below it (see
+//! whenever it is installed and its user-namespace smoke test passes, and on a kernel with a usable
+//! Landlock the command inside it also runs under meka's Landlock ruleset, enacted by `meka
+//! confine` after bwrap's mounts, so the sockets the masks do not cover and every device ioctl are
+//! refused too. Landlock LSM alone is the fallback, and requires ABI v9 (kernel 7.1+), the first
+//! with a right over pathname Unix sockets (see
 //! `MIN_LANDLOCK_ABI`, which is Linux-only and so deliberately not an intra-doc link: the link
 //! would be unresolvable on the two targets where the item does not exist, and CI gates rustdoc on
 //! all three). On macOS, uses `sandbox-exec`. On Windows there are two mechanisms rather than one:
@@ -14,9 +17,11 @@
 //! unconfined.
 //!
 //! **What every backend does not restrict**: reads. A sandboxed child can read any file the user
-//! can, including credential files, and the network is deliberately left open on all of them. The
-//! boundary these enforce is "this command cannot change the machine", not "this command cannot see
-//! or send anything".
+//! can, other than meka's own directories, and the network is deliberately left open on all of
+//! them. The boundary these enforce is "this command cannot change the machine", not "this command
+//! cannot see or send anything". Landlock alone also cannot stop a command changing a file's mode,
+//! owner, timestamps or extended attributes: no ABI has a right for those, and Bubblewrap's
+//! read-only bind is what refuses them.
 
 #[cfg(target_os = "linux")]
 mod bubblewrap;
@@ -221,19 +226,27 @@ pub(crate) fn resolve_sandbox_backend(
 /// and `pre_exec` hook to use.
 #[derive(Debug, Clone)]
 pub(crate) enum SandboxCapability {
-    /// Linux: filesystem-write restriction via Landlock LSM (kernel 5.13+). Below ABI v9 the kernel
-    /// has no right governing `connect(2)` on a *pathname* Unix socket, so dbus and systemd-user
-    /// stay reachable and a confined process can have them write on its behalf; from v9 that right
-    /// is handled and granted nowhere, which also costs socket-based clients like `docker` and
-    /// `psql`. Prefer Bubblewrap when available: its tmpfs masks remove the sockets outright, on
-    /// every kernel.
+    /// Linux: filesystem-write restriction via Landlock LSM at ABI v9 (kernel 7.1) or newer, with
+    /// meka's own directories hidden by never being covered by a rule and a private scratch
+    /// directory per command. v9 is the first ABI with a right over `connect(2)` on a *pathname*
+    /// Unix socket; it is handled and granted nowhere, so dbus and systemd-user are out of reach,
+    /// which also costs socket-based clients like `docker` and `psql`. An older kernel is refused
+    /// rather than warned about. No ABI mediates `chmod(2)`, `chown(2)`, `utime(2)` or
+    /// `setxattr(2)`, so a command at `read` can still change a file's metadata; Bubblewrap's
+    /// read-only bind is what refuses those, which is why it stays preferred.
     #[cfg(target_os = "linux")]
     Landlock { abi_version: i32 },
     /// Linux: read-only root bind via `bwrap --ro-bind /` plus tmpfs masks over `/tmp`, `/run`,
-    /// `/var/tmp`, and `$XDG_RUNTIME_DIR`. Blocks both filesystem writes and IPC-socket mutation;
-    /// network is unrestricted.
+    /// `/var/tmp`, and `$XDG_RUNTIME_DIR`. Blocks filesystem writes, metadata changes and the
+    /// socket-on-disk IPC under the masks; network is unrestricted. `landlock_abi` is the kernel's
+    /// Landlock ABI when it clears the layer's own floor (v6, kernel 6.12): the command then also
+    /// runs under meka's ruleset, enacted inside the sandbox by `meka confine`, which closes the
+    /// abstract namespace and signals, and from v9 the sockets outside the masks too.
     #[cfg(target_os = "linux")]
-    Bubblewrap { bwrap_path: std::path::PathBuf },
+    Bubblewrap {
+        bwrap_path: std::path::PathBuf,
+        landlock_abi: Option<i32>,
+    },
     /// macOS: `sandbox-exec` with the hardened SBPL profile defined in
     /// [`seatbelt::SANDBOX_PROFILE_READONLY`]. Blocks filesystem writes and IPC mutation (no
     /// launchd, pasteboard, LaunchServices, etc.); network is unrestricted.
@@ -377,46 +390,18 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
         }
 
         // Quiet once the backend is pinned: a user who wrote `landlock` into the config chose it
-        // over Bubblewrap, and the shell page documents what that accepts. The store is named
-        // because Landlock rules only ever add access, so there is no way to subtract meka's own
-        // directories from the read grant on `/`, or from a workspace root that contains them;
-        // Bubblewrap masks both.
+        // over Bubblewrap, and the shell page documents what that accepts. Metadata changes are
+        // named because no Landlock ABI mediates them and nothing else would say so: `chmod 777`
+        // on a credential file succeeds at `read`, and Bubblewrap's read-only bind is what
+        // refuses it.
         if context == WarnContext::Startup
             && state.auto_resolved
             && matches!(state.backend, crate::config::SandboxBackend::Landlock)
         {
             tracing::warn!(
-                "sandboxing with Landlock because Bubblewrap is unavailable; Landlock isolates \
-                 less and cannot hide meka's config and credential store; pin the sandbox backend \
-                 to 'landlock' to silence this warning"
-            );
-        }
-
-        // Warn 3: the ABI clears `MIN_LANDLOCK_ABI` so the filesystem is genuinely write-protected,
-        // but the mitigations added after v3 are absent. Each is a real hole a command at `read`
-        // can walk through (a D-Bus or `systemd-run --user` call reaches a privileged
-        // daemon that will happily write on its behalf), and none of them is visible to the
-        // user otherwise, so the gap is named rather than left to the kernel version.
-        if context == WarnContext::Startup
-            && let BackendProbe::Ok(SandboxCapability::Landlock { abi_version }) = &state.probe
-            && *abi_version < 9
-        {
-            let mut missing: Vec<&str> = Vec::new();
-            if *abi_version < 5 {
-                missing.push("device ioctls");
-            }
-            if *abi_version < 6 {
-                missing.push("abstract Unix sockets and cross-domain signals");
-            }
-            missing.push("pathname Unix sockets");
-            // Deliberately does not name Bubblewrap as the remedy. Measured: bwrap masks four
-            // directories and unmounts nothing else, and it never unshares the network namespace,
-            // so a socket in the abstract namespace or under `$HOME` stays reachable from inside
-            // it. On this axis Landlock at v9 is the stronger backend, and sending a user to
-            // install bwrap to close these channels would send them the wrong way.
-            let missing = missing.join(", ");
-            tracing::warn!(
-                "Landlock ABI v{abi_version} does not restrict {missing}; only a newer kernel does"
+                "sandboxing with Landlock because Bubblewrap is unavailable; Landlock cannot stop \
+                 a command changing a file's mode, owner, timestamps or attributes; pin the \
+                 sandbox backend to 'landlock' to silence this warning"
             );
         }
     }
@@ -1042,7 +1027,7 @@ mod tests {
         let unpinned = startup_warnings(&landlock_state(true));
         assert!(
             unpinned.contains("because Bubblewrap is unavailable")
-                && unpinned.contains("cannot hide meka's config and credential store")
+                && unpinned.contains("mode, owner, timestamps or attributes")
                 && unpinned.contains("to silence this warning"),
             "an unpinned fallback names the cause, the cost and the remedy: {unpinned:?}"
         );
@@ -1050,45 +1035,6 @@ mod tests {
         assert!(
             !pinned.contains("Bubblewrap"),
             "a pinned backend is not argued with: {pinned:?}"
-        );
-    }
-
-    /// Between ABI 3 and 9 the filesystem is genuinely write-protected but the later mitigations
-    /// are absent, and the warning naming them is the only way a user learns which.
-    ///
-    /// Without the block a host believes `read` restricts more than the running kernel actually
-    /// does.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_landlock_abi_below_9_names_the_mitigations_it_does_not_provide() {
-        // v3 clears the floor, so this is the "protected, but not fully" band the warning owns.
-        for (abi, expected) in [
-            (3, vec![
-                "device ioctls",
-                "abstract Unix sockets",
-                "pathname Unix sockets",
-            ]),
-            (6, vec!["pathname Unix sockets"]),
-        ] {
-            let logged = startup_warnings(&super::SandboxState {
-                probe: super::BackendProbe::Ok(super::SandboxCapability::Landlock {
-                    abi_version: abi,
-                }),
-                ..landlock_state(false)
-            });
-            for gap in expected {
-                assert!(
-                    logged.contains(gap),
-                    "ABI v{abi} must name '{gap}' as unrestricted: {logged:?}"
-                );
-            }
-        }
-
-        // v9 has them all, so there is nothing to warn about and a warning would be noise.
-        let logged = startup_warnings(&landlock_state(false));
-        assert!(
-            !logged.contains("does not restrict"),
-            "v9 restricts all of them; warning anyway trains the user to ignore it: {logged:?}"
         );
     }
 
@@ -1517,20 +1463,20 @@ mod tests {
         assert!(handled_access_for_abi(9) & LANDLOCK_ACCESS_FS_RESOLVE_UNIX != 0);
     }
 
-    /// Below ABI v3 the ruleset does not handle `LANDLOCK_ACCESS_FS_TRUNCATE`, so a sandboxed child
-    /// can still empty an existing file even though every open-for-write is denied. meka documents
-    /// the `read` level as write-protecting the filesystem, so the only honest answer on such a
-    /// kernel is to report the backend unusable and let the shell tool hard-error, rather than
-    /// to sandbox with a ruleset that does not enforce what was promised.
+    /// Below ABI v9 the ruleset has no right over pathname Unix sockets, so a sandboxed child can
+    /// still hand its work to D-Bus or `systemd-run --user`, whatever the filesystem rules say.
+    /// meka documents `read` as "this command cannot change the machine", so the only honest
+    /// answer on such a kernel is to report the backend unusable and let the shell tool
+    /// hard-error, rather than to sandbox with a ruleset that leaves that door open.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_landlock_abi_below_the_truncate_floor_is_reported_unusable() {
-        for abi in [1, 2] {
-            let probe = landlock_probe_from_abi(Some(abi));
+    fn a_landlock_abi_below_the_socket_floor_is_reported_unusable() {
+        for abi in [1, 3, 6, 8] {
+            let probe = landlock_probe_from_abi(Ok(abi));
             let reason = backend_unavailable_reason(&probe)
                 .unwrap_or_else(|| panic!("ABI v{abi} must not be accepted"));
             assert!(
-                reason.contains("truncate(2)"),
+                reason.contains("Unix sockets"),
                 "the reason must name what is unenforced, got: {reason}"
             );
         }
@@ -1539,10 +1485,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_landlock_abi_at_or_above_the_floor_is_accepted() {
-        for abi in [MIN_LANDLOCK_ABI, 6, 9] {
+        for abi in [MIN_LANDLOCK_ABI, 10] {
             assert!(
                 matches!(
-                    landlock_probe_from_abi(Some(abi)),
+                    landlock_probe_from_abi(Ok(abi)),
                     BackendProbe::Ok(SandboxCapability::Landlock { abi_version }) if abi_version == abi
                 ),
                 "ABI v{abi} should be accepted"
@@ -1552,17 +1498,32 @@ mod tests {
 
     /// A kernel with no Landlock at all and one whose Landlock is too old are both unusable, but a
     /// user can only act on the difference: the first needs a newer kernel or Bubblewrap, the
-    /// second is specifically about `truncate(2)`. Keep the two messages distinct.
+    /// second names the sockets its ABI leaves open. Keep the two messages distinct.
     #[cfg(target_os = "linux")]
     #[test]
     fn absent_landlock_and_too_old_landlock_report_different_reasons() {
-        let absent = backend_unavailable_reason(&landlock_probe_from_abi(None))
+        let absent = backend_unavailable_reason(&landlock_probe_from_abi(Err(libc::ENOSYS)))
             .expect("no Landlock must be unusable");
-        let too_old = backend_unavailable_reason(&landlock_probe_from_abi(Some(1)))
-            .expect("ABI v1 must be unusable");
+        let too_old = backend_unavailable_reason(&landlock_probe_from_abi(Ok(8)))
+            .expect("ABI v8 must be unusable");
         assert_ne!(absent, too_old);
         assert!(absent.contains("5.13"), "got: {absent}");
-        assert!(too_old.contains("6.2"), "got: {too_old}");
+        assert!(too_old.contains("7.1"), "got: {too_old}");
+    }
+
+    /// The layer inside Bubblewrap has its own, lower floor: it only adds to a boundary bwrap
+    /// already holds, and v6 is where it first adds anything. The standalone floor must not leak
+    /// into it, or every bwrap host below kernel 7.1 would lose the layer for nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_layer_floor_sits_below_the_standalone_floor_at_the_first_useful_abi() {
+        assert_eq!(MIN_LAYER_LANDLOCK_ABI, 6);
+        assert_eq!(
+            layer_landlock_abi(),
+            landlock_abi_or_errno()
+                .ok()
+                .filter(|abi| *abi >= MIN_LAYER_LANDLOCK_ABI)
+        );
     }
 
     #[test]
@@ -1617,7 +1578,7 @@ mod tests {
         }
         let probe = probe_backend(crate::config::SandboxBackend::Bubblewrap);
         match probe {
-            BackendProbe::Ok(SandboxCapability::Bubblewrap { bwrap_path }) => {
+            BackendProbe::Ok(SandboxCapability::Bubblewrap { bwrap_path, .. }) => {
                 assert!(bwrap_path.is_absolute());
             }
             BackendProbe::UserNamespaceDenied { .. } => {
@@ -1625,6 +1586,21 @@ mod tests {
             }
             other => panic!("unexpected probe result: {other:?}"),
         }
+    }
+
+    /// The Bubblewrap probe carries the kernel's Landlock for the layer inside, read through the
+    /// same floor as the Landlock backend: a probe that dropped it would run every bwrap shell one
+    /// layer short, and nothing would say so.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_bubblewrap_probe_carries_the_kernels_landlock() {
+        let BackendProbe::Ok(SandboxCapability::Bubblewrap { landlock_abi, .. }) =
+            probe_backend(crate::config::SandboxBackend::Bubblewrap)
+        else {
+            eprintln!("skipping: bubblewrap is not usable on this host");
+            return;
+        };
+        assert_eq!(landlock_abi, layer_landlock_abi());
     }
 
     /// Every level maps to exactly one confinement, and only `unrestricted` maps to none.

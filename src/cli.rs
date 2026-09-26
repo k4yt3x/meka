@@ -86,6 +86,23 @@ pub(crate) enum Command {
         #[arg(long, value_name = "ADDR")]
         bind: Option<String>,
     },
+    /// Run a command inside the sandbox's Landlock layer (internal)
+    ///
+    /// Spawned by `shell_execute` inside Bubblewrap, which has no Landlock support of its own; not
+    /// for direct use.
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    Confine {
+        /// Directory the command may write beneath (repeatable)
+        #[arg(long = "writable", value_name = "PATH")]
+        writable: Vec<std::path::PathBuf>,
+        /// Throwaway space the command may fill, without reaching a socket in it (repeatable)
+        #[arg(long = "scratch", value_name = "PATH")]
+        scratch: Vec<std::path::PathBuf>,
+        /// The command to become, after `--`
+        #[arg(last = true, required = true, value_name = "COMMAND")]
+        command: Vec<std::ffi::OsString>,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]

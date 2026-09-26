@@ -21,6 +21,22 @@ use crate::{
 /// and the description shown to the agent.
 const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The directories Bubblewrap masks with a private tmpfs: where socket-on-disk IPC lives, replaced
+/// by empty, writable, throwaway space.
+#[cfg(target_os = "linux")]
+fn bwrap_masks() -> Vec<std::path::PathBuf> {
+    let mut masks: Vec<std::path::PathBuf> = ["/tmp", "/run", "/var/tmp"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR")
+        && std::path::Path::new(&xdg).is_absolute()
+    {
+        masks.push(xdg.into());
+    }
+    masks
+}
+
 /// Every bwrap argument up to the `--` separator, for `writable` roots.
 ///
 /// Factored out of the spawn so the ordering rule below is testable without a live child. Order is
@@ -51,12 +67,6 @@ fn bwrap_args(
         "/dev",
         "--proc",
         "/proc",
-        "--tmpfs",
-        "/tmp",
-        "--tmpfs",
-        "/run",
-        "--tmpfs",
-        "/var/tmp",
         "--unshare-user",
         "--unshare-pid",
         "--unshare-uts",
@@ -67,11 +77,9 @@ fn bwrap_args(
     .map(std::ffi::OsString::from)
     .collect();
 
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR")
-        && std::path::Path::new(&xdg).is_absolute()
-    {
+    for mask in bwrap_masks() {
         args.push("--tmpfs".into());
-        args.push(xdg.into());
+        args.push(mask.into());
     }
 
     // The working directory, read-only, after the masks and before the writable binds.
@@ -126,6 +134,66 @@ fn bwrap_args(
     args.push("--chdir".into());
     args.push(cwd.into());
     args
+}
+
+/// The command Bubblewrap execs when the kernel has a usable Landlock: meka itself, reached as
+/// `program`, which enacts the ruleset after bwrap's mounts and then becomes the shell.
+///
+/// The workspace roots are writable; every mask and `/dev` are scratch. The masks because bwrap
+/// already made them writable throwaway space and the layer must not take that back, though a
+/// socket from outside that a bind put under one stays out of reach; `/dev` because bwrap's is the
+/// private minimal set rather than the host's devices, and refusing an ioctl there would only break
+/// pty allocation (`script`, `expect`). Private directories are not passed: the masks hide them,
+/// and a walk inside the sandbox would find only empty tmpfs.
+#[cfg(target_os = "linux")]
+fn inner_confinement_argv(
+    program: &std::path::Path,
+    writable: &[std::path::PathBuf],
+) -> Vec<std::ffi::OsString> {
+    let mut argv: Vec<std::ffi::OsString> = vec![program.into(), "confine".into()];
+    for root in writable {
+        argv.push("--writable".into());
+        argv.push(root.into());
+    }
+    let mut scratch = bwrap_masks();
+    scratch.push("/dev".into());
+    for directory in scratch {
+        argv.push("--scratch".into());
+        argv.push(directory.into());
+    }
+    argv.push("--".into());
+    argv
+}
+
+/// The executable that enacts the Landlock layer inside the sandbox: this process's own, opened
+/// through `/proc/self/exe`, which names the running image even after the file behind it was
+/// replaced or deleted. Bubblewrap execs it through the descriptor rather than a path, so a
+/// package upgrade under a running server does not break the shell until a restart.
+///
+/// An error rather than a fallback to bwrap alone: a command run one layer short would report
+/// nothing, and `/proc/self/exe` is unreadable only on a host where `/proc` itself is missing.
+#[cfg(target_os = "linux")]
+fn inner_layer_executable() -> Result<std::fs::File> {
+    #[cfg(test)]
+    let opened = INNER_LAYER_EXECUTABLE
+        .with(|slot| slot.borrow().as_ref().map(std::fs::File::try_clone))
+        .unwrap_or_else(|| std::fs::File::open("/proc/self/exe"));
+    #[cfg(not(test))]
+    let opened = std::fs::File::open("/proc/self/exe");
+    opened.map_err(|error| MekaError::ToolExecution {
+        tool_name: "shell_execute".to_string(),
+        message: format!(
+            "failed to open meka's own executable for the sandbox's Landlock layer: {error}"
+        ),
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    /// The executable [`inner_layer_executable`] hands to bwrap under test, when a test has set
+    /// one: the built `meka`, since the test binary has no `confine` verb.
+    static INNER_LAYER_EXECUTABLE: std::cell::RefCell<Option<std::fs::File>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 pub(crate) struct ExecuteCommandTool {
@@ -418,23 +486,51 @@ impl Tool for ExecuteCommandTool {
             cmd
         };
 
+        // The executable that enacts the Landlock layer inside Bubblewrap, held open from here to
+        // the spawn: the sandbox execs it through the descriptor, which the `pre_exec` below lets
+        // through, and the verb closes it again before becoming the command.
+        #[cfg(target_os = "linux")]
+        let inner_executable: Option<std::fs::File> = match (sandboxed, &self.sandbox_capability) {
+            (
+                true,
+                crate::sandbox::SandboxCapability::Bubblewrap {
+                    landlock_abi: Some(_),
+                    ..
+                },
+            ) => Some(inner_layer_executable()?),
+            _ => None,
+        };
+
         #[cfg(target_os = "linux")]
         let mut command_builder = if sandboxed
-            && let crate::sandbox::SandboxCapability::Bubblewrap { bwrap_path } =
+            && let crate::sandbox::SandboxCapability::Bubblewrap { bwrap_path, .. } =
                 &self.sandbox_capability
         {
             // Bubblewrap path: `--ro-bind /` enforces "no writes", `--unshare-*` cuts off PID /
             // user / UTS / IPC views, tmpfs masks over `/run`, `/tmp`, `/var/tmp`, and
             // `$XDG_RUNTIME_DIR` make the dbus and systemd-user sockets unreachable so the agent
             // can't `dbus-send` state-changing methods. `--unshare-net` is intentionally absent;
-            // network must stay open for `curl | pdftotext` and similar pipelines.
+            // network must stay open for `curl | pdftotext` and similar pipelines. The Landlock
+            // layer inside closes what the masks do not reach: a socket under `$HOME`, the
+            // abstract namespace, device ioctls.
             let mut cmd = tokio::process::Command::new(bwrap_path);
             cmd.args(bwrap_args(
                 confinement.writable(),
                 &self.site.cwd.get(),
                 &crate::workspace::private_directories(),
             ));
-            cmd.arg("--").arg("sh").arg("-c").arg(&command);
+            cmd.arg("--");
+            if let Some(executable) = &inner_executable {
+                let program = format!(
+                    "/proc/self/fd/{}",
+                    std::os::fd::AsRawFd::as_raw_fd(executable)
+                );
+                cmd.args(inner_confinement_argv(
+                    std::path::Path::new(&program),
+                    confinement.writable(),
+                ));
+            }
+            cmd.arg("sh").arg("-c").arg(&command);
             cmd
         } else {
             let mut cmd = tokio::process::Command::new("sh");
@@ -442,38 +538,48 @@ impl Tool for ExecuteCommandTool {
             cmd
         };
 
+        // The Landlock dialect's ABI, when this command runs under it.
+        #[cfg(target_os = "linux")]
+        let landlock_abi: Option<i32> = match (sandboxed, &self.sandbox_capability) {
+            (true, crate::sandbox::SandboxCapability::Landlock { abi_version }) => {
+                Some(*abi_version)
+            }
+            _ => None,
+        };
+        // A private temporary directory, for the Landlock dialect only: Bubblewrap's tmpfs over
+        // `/tmp` already gives its child one. Created ahead of the grants so the ruleset can name
+        // it.
+        #[cfg(target_os = "linux")]
+        let scratch = match landlock_abi {
+            Some(_) => CommandScratch::create().await,
+            None => None,
+        };
+
         // Unix: place the child in its own session/process group via `setsid` so timeouts and
         // cancellation can kill the whole tree (including backgrounded grandchildren such as
         // `(sleep 3600 &)`) via `kill(-pgid, …)`. On Linux the Landlock setup runs in the same
-        // closure, because `pre_exec` overwrites rather than chains. Landlock is applied only for
-        // the Landlock capability; under Bubblewrap, the `--ro-bind /` mount layer already
-        // enforces "no writes" and layering both is fragile to test across kernels.
+        // closure, because `pre_exec` overwrites rather than chains, and only for the Landlock
+        // dialect: under Bubblewrap the ruleset is enacted inside the sandbox by `meka confine`,
+        // after bwrap's mounts, because a domain that handles any filesystem right refuses
+        // `mount(2)`.
         #[cfg(unix)]
         {
-            // Built here, in the parent, because `pre_exec` runs after `fork` in a single-threaded
-            // child where allocating is not async-signal-safe. A root whose bytes contain a NUL
-            // cannot become a `CString`; dropping it leaves that root read-only, which is the
-            // restrictive direction.
+            // Planned here, in the parent, because `pre_exec` runs after `fork` in a
+            // single-threaded child where reading the filesystem and allocating are not
+            // async-signal-safe.
             #[cfg(target_os = "linux")]
-            let landlock_writable: Vec<std::ffi::CString> = confinement
-                .writable()
-                .iter()
-                .filter_map(|root| {
-                    std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(root.as_os_str()))
-                        .ok()
-                })
-                .collect();
-            #[cfg(target_os = "linux")]
-            let landlock_abi: Option<i32> = if sandboxed {
-                if let crate::sandbox::SandboxCapability::Landlock { abi_version } =
-                    self.sandbox_capability
-                {
-                    Some(abi_version)
-                } else {
-                    None
+            let grants: Vec<crate::sandbox::LandlockGrant> = match landlock_abi {
+                Some(abi) => {
+                    let scratch: Vec<std::path::PathBuf> =
+                        scratch.iter().map(|scratch| scratch.path.clone()).collect();
+                    crate::sandbox::landlock_grants(
+                        abi,
+                        confinement.writable(),
+                        &scratch,
+                        &crate::workspace::private_directories(),
+                    )
                 }
-            } else {
-                None
+                None => Vec::new(),
             };
 
             unsafe {
@@ -484,9 +590,22 @@ impl Tool for ExecuteCommandTool {
                     if libc::setsid() == -1 {
                         return Err(std::io::Error::last_os_error());
                     }
+                    // The layer's executable rides into Bubblewrap on its descriptor, which stays
+                    // close-on-exec until here so no other child of meka inherits it. `fcntl(2)`
+                    // is async-signal-safe.
+                    #[cfg(target_os = "linux")]
+                    if let Some(executable) = &inner_executable
+                        && libc::fcntl(
+                            std::os::fd::AsRawFd::as_raw_fd(executable),
+                            libc::F_SETFD,
+                            0,
+                        ) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
                     #[cfg(target_os = "linux")]
                     if let Some(abi) = landlock_abi {
-                        crate::sandbox::apply_landlock(abi, &landlock_writable)
+                        crate::sandbox::apply_landlock(abi, &grants)
                             .map_err(std::io::Error::from_raw_os_error)?;
                     }
                     Ok(())
@@ -506,20 +625,39 @@ impl Tool for ExecuteCommandTool {
             command_builder.env_clear();
             command_builder.envs(crate::sandbox::sandbox_child_env());
         }
+        // Where the command's temporary files go: its own scratch directory, which the ruleset
+        // grants. All three spellings, since programs disagree on which one they read.
+        #[cfg(target_os = "linux")]
+        if let Some(scratch) = &scratch {
+            for name in ["TMPDIR", "TMP", "TEMP"] {
+                command_builder.env(name, &scratch.path);
+            }
+        }
 
         // Resolve commands against the agent's per-session cwd, not the process cwd. `/cd` mutates
         // the agent's cwd; this is how it actually reaches the child.
         command_builder.current_dir(self.site.cwd.get());
 
-        let mut child = command_builder
+        let spawned = command_builder
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|error| MekaError::ToolExecution {
-                tool_name: "shell_execute".to_string(),
-                message: format!("failed to spawn command: {error}"),
-            })?;
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(error) => {
+                // The scratch directory was created for a command that never started; a day's
+                // sweep would collect it, but there is no reason to leave it that long.
+                #[cfg(target_os = "linux")]
+                if let Some(scratch) = scratch {
+                    scratch.remove().await;
+                }
+                return Err(MekaError::ToolExecution {
+                    tool_name: "shell_execute".to_string(),
+                    message: format!("failed to spawn command: {error}"),
+                });
+            }
+        };
 
         // Drain stdout/stderr on dedicated tasks that start *before* the wait.
         // `tokio::process::Child::wait()` does not read the pipes; a child writing past the OS pipe
@@ -539,8 +677,8 @@ impl Tool for ExecuteCommandTool {
         });
 
         // wait_with_output() consumes the child, so use wait() + manual stdout/stderr reading
-        // instead to allow kill on cancellation.
-        tokio::select! {
+        // instead to allow kill on cancellation. Every arm lands on the scratch removal below.
+        let outcome = tokio::select! {
             _ = cancellation.cancelled() => {
                 kill_child_tree(&mut child).await;
                 stdout_task.abort();
@@ -559,31 +697,133 @@ impl Tool for ExecuteCommandTool {
                 )
                 .with_metadata(timed_out_exit_metadata()))
             }
-            status = child.wait() => {
-                let status = status.map_err(|error| MekaError::ToolExecution {
-                    tool_name: "shell_execute".to_string(),
-                    message: format!("failed to wait for command: {error}"),
-                })?;
+            status = child.wait() => finish_command(status, stdout_task, stderr_task).await,
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(scratch) = scratch {
+            scratch.remove().await;
+        }
+        outcome
+    }
+}
 
-                let exit_code = status.code().unwrap_or(-1);
-                // A backgrounded grandchild can keep the pipe open past the direct child's exit;
-                // cap the drain so the tool call can't hang, attaching a truncation note if the cap
-                // fires.
-                let (stdout_content, stdout_timed_out) =
-                    join_drain_with_timeout(stdout_task, DRAIN_TIMEOUT).await;
-                let (stderr_content, stderr_timed_out) =
-                    join_drain_with_timeout(stderr_task, DRAIN_TIMEOUT).await;
+/// The result of a command that ran to its end: its exit status with what the drains collected.
+async fn finish_command(
+    status: std::io::Result<std::process::ExitStatus>,
+    stdout_task: tokio::task::JoinHandle<String>,
+    stderr_task: tokio::task::JoinHandle<String>,
+) -> Result<ToolOutput> {
+    let status = status.map_err(|error| MekaError::ToolExecution {
+        tool_name: "shell_execute".to_string(),
+        message: format!("failed to wait for command: {error}"),
+    })?;
 
-                // No output-length truncation here: the agent layer's `persist_oversized_results`
-                // auto-persists any oversized result to the scratchpad losslessly. Truncating here
-                // would corrupt binary-in-base64 pipelines (see #1 in the trial feedback).
-                let mut output =
-                    assemble_command_output(&stdout_content, &stderr_content, exit_code);
-                if stdout_timed_out || stderr_timed_out {
-                    append_drain_truncation_note(&mut output, stdout_timed_out, stderr_timed_out);
-                }
-                Ok(output.with_metadata(command_exit_metadata(&status)))
+    let exit_code = status.code().unwrap_or(-1);
+    // A backgrounded grandchild can keep the pipe open past the direct child's exit; cap the drain
+    // so the tool call can't hang, attaching a truncation note if the cap fires.
+    let (stdout_content, stdout_timed_out) =
+        join_drain_with_timeout(stdout_task, DRAIN_TIMEOUT).await;
+    let (stderr_content, stderr_timed_out) =
+        join_drain_with_timeout(stderr_task, DRAIN_TIMEOUT).await;
+
+    // No output-length truncation here: the agent layer's `persist_oversized_results`
+    // auto-persists any oversized result to the scratchpad losslessly. Truncating here would
+    // corrupt binary-in-base64 pipelines (see #1 in the trial feedback).
+    let mut output = assemble_command_output(&stdout_content, &stderr_content, exit_code);
+    if stdout_timed_out || stderr_timed_out {
+        append_drain_truncation_note(&mut output, stdout_timed_out, stderr_timed_out);
+    }
+    Ok(output.with_metadata(command_exit_metadata(&status)))
+}
+
+/// A command's private temporary directory under the Landlock dialect, named by `TMPDIR`.
+///
+/// Bubblewrap's child writes scratch into a tmpfs that vanishes with the sandbox; Landlock can only
+/// decide which real paths a process may touch, so the nearest thing is a real directory that is
+/// nobody else's, granted to this one command and removed when it ends. Under the temp directory
+/// rather than meka's own: that is where throwaway files belong, it is usually memory-backed and
+/// cleared at boot, and meka's directories are the ones the ruleset hides.
+///
+/// `mktemp`, Python's `tempfile`, `gcc` without `-pipe` and `patch` all honor `TMPDIR`; a program
+/// with a literal `/tmp` still fails, as before.
+#[cfg(target_os = "linux")]
+struct CommandScratch {
+    path: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl CommandScratch {
+    const PREFIX: &str = "meka-command-scratch-";
+
+    /// Create one, owner-only. `None` when the temp directory refuses, in which case the command
+    /// runs without scratch space, as it did before there was any.
+    async fn create() -> Option<Self> {
+        let directory = std::env::temp_dir();
+        let path = directory.join(format!("{}{}", Self::PREFIX, uuid::Uuid::new_v4()));
+        let created = tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || {
+                sweep_stale_scratch(&directory);
+                let mut builder = std::fs::DirBuilder::new();
+                std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+                builder.create(&path)
             }
+        })
+        .await;
+        match created {
+            Ok(Ok(())) => Some(Self { path }),
+            Ok(Err(error)) => {
+                let path = path.display();
+                tracing::warn!(
+                    "failed to create the scratch directory '{path}': {error}; the command runs \
+                     without one"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "failed to create the scratch directory: {error}; the command runs without one"
+                );
+                None
+            }
+        }
+    }
+
+    /// Remove it with everything the command left behind. A failure is logged, and the directory
+    /// is swept later like a capture, so nothing accumulates for good.
+    async fn remove(self) {
+        if let Err(error) = tokio::fs::remove_dir_all(&self.path).await {
+            let path = self.path.display();
+            tracing::warn!("failed to remove the scratch directory '{path}': {error}");
+        }
+    }
+}
+
+/// Remove the scratch directories a crash or a kill left behind, once they are older than
+/// [`CAPTURE_RETENTION`]. Only meka's own names, so a stranger's directory in a shared temp
+/// directory is not meka's to delete.
+#[cfg(target_os = "linux")]
+fn sweep_stale_scratch(directory: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_ours = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(CommandScratch::PREFIX));
+        if !is_ours {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .map(|modified| modified.elapsed().is_ok_and(|age| age > CAPTURE_RETENTION))
+            .unwrap_or(false);
+        if stale && let Err(error) = std::fs::remove_dir_all(&path) {
+            let path = path.display();
+            tracing::warn!("failed to remove the stale scratch directory '{path}': {error}");
         }
     }
 }
@@ -1265,6 +1505,56 @@ mod tests {
             Permission::Unrestricted,
             crate::permission::EnabledPermissions::ALL,
         )
+    }
+
+    /// Every text block of a tool output, joined.
+    #[cfg(target_os = "linux")]
+    pub(super) fn text_of(output: &ToolOutput) -> String {
+        output
+            .content
+            .iter()
+            .filter_map(|content| {
+                if let crate::conversation::ToolResultContent::Text { text } = content {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// The sweep removes only meka's own stale scratch directories: a fresh one belongs to a
+    /// running command, and a stranger's directory in a shared temp directory is not meka's to
+    /// delete however old it is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_sweep_removes_only_meka_s_own_stale_scratch_directories() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path();
+        let stale = base.join("meka-command-scratch-stale");
+        let fresh = base.join("meka-command-scratch-fresh");
+        let stranger = base.join("someone-elses-old-directory");
+        for directory in [&stale, &fresh, &stranger] {
+            std::fs::create_dir(directory).expect("create");
+            std::fs::write(directory.join("left-behind.txt"), "x").expect("fill");
+        }
+        let old = std::time::SystemTime::now()
+            - (CAPTURE_RETENTION + std::time::Duration::from_secs(3600));
+        for directory in [&stale, &stranger] {
+            std::fs::File::open(directory)
+                .expect("open")
+                .set_times(std::fs::FileTimes::new().set_modified(old))
+                .expect("age the directory");
+        }
+
+        sweep_stale_scratch(base);
+
+        assert!(
+            !stale.exists(),
+            "a stale scratch directory of ours is removed"
+        );
+        assert!(fresh.exists(), "a fresh one is a running command's");
+        assert!(stranger.exists(), "a stranger's directory is left alone");
     }
 
     /// Construct an `ExecuteCommandTool` for tests with a backend probe matching whatever the host
@@ -2771,6 +3061,59 @@ mod tests {
             );
         }
 
+        /// The layer is told to keep writable exactly what bwrap made writable: the roots as
+        /// roots, every mask and `/dev` as scratch, never the other way around, since a mask
+        /// passed as a root would hand back the sockets a bind can put under it. Its argv ends in
+        /// `--`, so the shell after it is never read as a flag.
+        #[test]
+        fn the_inner_layer_keeps_the_roots_the_masks_and_dev_writable() {
+            let text = strings(&super::inner_confinement_argv(
+                std::path::Path::new("/proc/self/fd/7"),
+                &[PathBuf::from("/home/someone/work")],
+            ));
+            assert_eq!(&text[..2], ["/proc/self/fd/7", "confine"]);
+            let after = |flag: &str| -> Vec<&str> {
+                text.windows(2)
+                    .filter(|window| window[0] == flag)
+                    .map(|window| window[1].as_str())
+                    .collect()
+            };
+            assert_eq!(after("--writable"), ["/home/someone/work"]);
+            let scratch = after("--scratch");
+            for expected in ["/tmp", "/run", "/var/tmp", "/dev"] {
+                assert!(
+                    scratch.contains(&expected),
+                    "'{expected}' must stay writable inside, as scratch: {text:?}"
+                );
+            }
+            assert_eq!(text.last().map(String::as_str), Some("--"));
+        }
+
+        /// The built `meka` beside the test binary (`target/debug/meka`), which `cargo test`
+        /// builds for the integration tests. A test binary has no `confine` verb, so the layer's
+        /// tests need the real one; absent (a bare `cargo test --bin meka`), they skip loudly.
+        pub(super) fn meka_binary_for_test() -> Option<PathBuf> {
+            let binary = std::env::current_exe()
+                .ok()?
+                .parent()?
+                .parent()?
+                .join("meka");
+            binary.is_file().then_some(binary)
+        }
+
+        pub(super) fn on_path(name: &str) -> Option<PathBuf> {
+            let path = std::env::var_os("PATH")?;
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(name))
+                .find(|candidate| candidate.is_file())
+        }
+
+        fn strings(args: &[std::ffi::OsString]) -> Vec<String> {
+            args.iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        }
+
         fn which_bwrap() -> Option<std::path::PathBuf> {
             let path = std::env::var_os("PATH")?;
             std::env::split_paths(&path)
@@ -2838,7 +3181,339 @@ mod tests {
             let bwrap_path = std::env::split_paths(&path)
                 .map(|dir| dir.join("bwrap"))
                 .find(|candidate| candidate.is_file())?;
-            Some(crate::sandbox::SandboxCapability::Bubblewrap { bwrap_path })
+            // The layer inside needs the built `meka`, which a test binary is not; without it the
+            // leg exercises bwrap alone.
+            let landlock_abi = match super::bubblewrap_boundary::meka_binary_for_test()
+                .and_then(|binary| std::fs::File::open(binary).ok())
+            {
+                Some(executable) => {
+                    super::super::INNER_LAYER_EXECUTABLE
+                        .with(|slot| *slot.borrow_mut() = Some(executable));
+                    crate::sandbox::layer_landlock_abi()
+                }
+                None => None,
+            };
+            Some(crate::sandbox::SandboxCapability::Bubblewrap {
+                bwrap_path,
+                landlock_abi,
+            })
+        }
+
+        /// One `read` call through the tool under `capability`, from `cwd`, and the text it
+        /// returned.
+        #[cfg(target_os = "linux")]
+        async fn read_shell_text(
+            capability: crate::sandbox::SandboxCapability,
+            cwd: &std::path::Path,
+            command: &str,
+        ) -> String {
+            let mut tool = super::tool_for_test(
+                crate::permission::SharedPermission::new(
+                    Permission::Read,
+                    crate::permission::EnabledPermissions::ALL,
+                ),
+                true,
+            );
+            tool.backend_probe = crate::sandbox::BackendProbe::Ok(capability.clone());
+            tool.sandbox_capability = capability;
+            tool.site.cwd = crate::workspace::SharedCwd::new(cwd.to_path_buf());
+            let result = tool
+                .execute(
+                    serde_json::json!({"command": command}),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
+                .await
+                .expect("the shell itself must run");
+            super::text_of(&result)
+        }
+
+        /// The layer reaches the tool's own spawn, not only the argv helpers: a `read` call under
+        /// Bubblewrap with a usable Landlock refuses what bwrap alone permits. `/proc/self/comm`
+        /// is the dependency-free observable: bwrap's fresh procfs lets a process rename itself,
+        /// and the ruleset grants nothing under `/proc`.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_bubblewrapped_tool_call_runs_inside_the_landlock_layer() {
+            let Some(crate::sandbox::SandboxCapability::Bubblewrap {
+                bwrap_path,
+                landlock_abi: Some(abi),
+            }) = a_backend_detect_does_not_name()
+            else {
+                eprintln!(
+                    "skipping: bwrap, the built meka binary and a usable Landlock are all needed"
+                );
+                return;
+            };
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cwd = crate::workspace::canonical_for_test(temp.path());
+            let rename = "echo meka > /proc/self/comm 2>/dev/null && echo RENAMED || echo REFUSED";
+
+            let layered = read_shell_text(
+                crate::sandbox::SandboxCapability::Bubblewrap {
+                    bwrap_path: bwrap_path.clone(),
+                    landlock_abi: Some(abi),
+                },
+                &cwd,
+                rename,
+            )
+            .await;
+            assert!(
+                layered.contains("REFUSED"),
+                "the layer grants nothing under /proc: {layered}"
+            );
+            let alone = read_shell_text(
+                crate::sandbox::SandboxCapability::Bubblewrap {
+                    bwrap_path,
+                    landlock_abi: None,
+                },
+                &cwd,
+                rename,
+            )
+            .await;
+            assert!(
+                alone.contains("RENAMED"),
+                "bwrap alone lets a process rename itself, so the refusal above is the layer's: \
+                 {alone}"
+            );
+        }
+
+        /// The property the layer exists for, through the tool: a pathname socket the masks leave
+        /// reachable. The socket sits in the cwd, which the recipe binds back in read-only under
+        /// the `/tmp` mask, and `connect(2)` on a socket inode is not a write, so bwrap alone
+        /// reaches it, the same route a socket under `$HOME` takes on a real machine. It is also
+        /// the case that decides how the masks are granted inside: as scratch, without socket
+        /// resolution, or this very socket would be reachable through the grant on `/tmp`.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_bubblewrapped_tool_call_refuses_a_socket_the_masks_leave_reachable() {
+            let Some(crate::sandbox::SandboxCapability::Bubblewrap {
+                bwrap_path,
+                landlock_abi: Some(abi),
+            }) = a_backend_detect_does_not_name()
+            else {
+                eprintln!(
+                    "skipping: bwrap, the built meka binary and a usable Landlock are all needed"
+                );
+                return;
+            };
+            if abi < 9 || super::bubblewrap_boundary::on_path("python3").is_none() {
+                eprintln!("skipping: needs Landlock ABI 9 and python3 to connect with");
+                return;
+            }
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cwd = crate::workspace::canonical_for_test(temp.path());
+            let socket = cwd.join("outside.sock");
+            let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("listen");
+            let connect = format!(
+                "python3 -c \"import socket; socket.socket(socket.AF_UNIX).connect('{}')\" \
+                 2>/dev/null && echo CONNECTED || echo REFUSED",
+                socket.display()
+            );
+
+            let layered = read_shell_text(
+                crate::sandbox::SandboxCapability::Bubblewrap {
+                    bwrap_path: bwrap_path.clone(),
+                    landlock_abi: Some(abi),
+                },
+                &cwd,
+                &connect,
+            )
+            .await;
+            assert!(
+                layered.contains("REFUSED"),
+                "the layer refuses the socket: {layered}"
+            );
+            let alone = read_shell_text(
+                crate::sandbox::SandboxCapability::Bubblewrap {
+                    bwrap_path,
+                    landlock_abi: None,
+                },
+                &cwd,
+                &connect,
+            )
+            .await;
+            assert!(
+                alone.contains("CONNECTED"),
+                "bwrap alone reaches a socket outside its masks, so the refusal is the layer's: \
+                 {alone}"
+            );
+        }
+
+        /// The layer is reached through a descriptor of the running image, not a path, so the
+        /// binary being replaced or deleted under a running meka changes nothing: an upgrade
+        /// under `meka serve` must not break every sandboxed command until a restart.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn the_layer_survives_its_executable_being_replaced() {
+            let Some(crate::sandbox::SandboxCapability::Bubblewrap {
+                bwrap_path,
+                landlock_abi: Some(abi),
+            }) = a_backend_detect_does_not_name()
+            else {
+                eprintln!(
+                    "skipping: bwrap, the built meka binary and a usable Landlock are all needed"
+                );
+                return;
+            };
+            let binary = super::bubblewrap_boundary::meka_binary_for_test().expect("checked above");
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cwd = crate::workspace::canonical_for_test(temp.path());
+            let copy = cwd.join("meka-that-will-be-gone");
+            std::fs::copy(&binary, &copy).expect("copy the binary");
+            let executable = std::fs::File::open(&copy).expect("open the copy");
+            std::fs::remove_file(&copy).expect("delete the copy while it is open");
+            super::super::INNER_LAYER_EXECUTABLE.with(|slot| *slot.borrow_mut() = Some(executable));
+
+            let layered = read_shell_text(
+                crate::sandbox::SandboxCapability::Bubblewrap {
+                    bwrap_path,
+                    landlock_abi: Some(abi),
+                },
+                &cwd,
+                "echo meka > /proc/self/comm 2>/dev/null && echo RENAMED || echo REFUSED",
+            )
+            .await;
+            assert!(
+                layered.contains("REFUSED"),
+                "the layer ran from an executable that no longer exists on disk: {layered}"
+            );
+        }
+
+        /// The scratch directory is removed when a command is killed too, on timeout and on
+        /// cancellation, not only when it ends on its own. Run at `workspace` so the command can
+        /// leave the directory's name in the root before it stalls, since a killed command's
+        /// output is not returned.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_killed_landlock_shell_still_loses_its_scratch_directory() {
+            let capability = crate::sandbox::detect();
+            if !matches!(
+                capability,
+                crate::sandbox::SandboxCapability::Landlock { .. }
+            ) {
+                eprintln!("skipping: no usable Landlock on this host");
+                return;
+            }
+            let temp = tempfile::tempdir().expect("tempdir");
+            let root = crate::workspace::canonical_for_test(temp.path());
+
+            for (label, timeout_ms, cancel_after) in [
+                ("timeout", 500u64, None),
+                (
+                    "cancellation",
+                    30_000,
+                    Some(std::time::Duration::from_millis(300)),
+                ),
+            ] {
+                let mut tool = super::tool_for_test(
+                    crate::permission::SharedPermission::new(
+                        Permission::Workspace,
+                        crate::permission::EnabledPermissions::ALL,
+                    ),
+                    true,
+                );
+                tool.backend_probe = crate::sandbox::BackendProbe::Ok(capability.clone());
+                tool.sandbox_capability = capability.clone();
+                tool.site.cwd = crate::workspace::SharedCwd::new(root.clone());
+                tool.scope = crate::workspace::WriteScope::confined(vec![root.clone()]);
+                let marker = root.join(format!("{label}.marker"));
+                let token = CancellationToken::new();
+                if let Some(delay) = cancel_after {
+                    let token = token.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        token.cancel();
+                    });
+                }
+
+                let result = tool
+                    .execute(
+                        serde_json::json!({
+                            "command": format!("echo \"$TMPDIR\" > {} && sleep 30", marker.display()),
+                            "timeout_ms": timeout_ms,
+                        }),
+                        crate::tools::ToolContext::detached(token),
+                    )
+                    .await;
+                match label {
+                    "timeout" => {
+                        let text = super::text_of(&result.expect("a timeout is a result"));
+                        assert!(text.contains("timed out"), "{label}: {text}");
+                    }
+                    _ => assert!(
+                        matches!(result, Err(MekaError::Interrupted)),
+                        "{label}: a canceled command is interrupted: {result:?}"
+                    ),
+                }
+
+                let scratch = std::path::PathBuf::from(
+                    std::fs::read_to_string(&marker)
+                        .expect("the command wrote its scratch path before stalling")
+                        .trim(),
+                );
+                assert!(
+                    scratch
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("meka-command-scratch-")),
+                    "{label}: TMPDIR named the scratch directory: {scratch:?}"
+                );
+                assert!(
+                    !scratch.exists(),
+                    "{label}: the scratch directory is removed after the kill"
+                );
+            }
+        }
+
+        /// A shell under Landlock gets a private temporary directory: `mktemp` works at `read`,
+        /// `TMPDIR` names it, and it is gone when the command is.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_landlock_shell_gets_scratch_space_that_is_removed_after_the_command() {
+            let capability = crate::sandbox::detect();
+            if !matches!(
+                capability,
+                crate::sandbox::SandboxCapability::Landlock { .. }
+            ) {
+                eprintln!("skipping: no usable Landlock on this host");
+                return;
+            }
+            let mut tool = super::tool_for_test(
+                crate::permission::SharedPermission::new(
+                    Permission::Read,
+                    crate::permission::EnabledPermissions::ALL,
+                ),
+                true,
+            );
+            tool.backend_probe = crate::sandbox::BackendProbe::Ok(capability.clone());
+            tool.sandbox_capability = capability;
+
+            let result = tool
+                .execute(
+                    serde_json::json!({
+                        "command": "f=$(mktemp) && echo \"$f\" && echo \"$TMPDIR\"",
+                    }),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
+                .await
+                .expect("the shell itself must run");
+            let text = super::text_of(&result);
+            let mut lines = text.lines();
+            let file = std::path::PathBuf::from(lines.next().unwrap_or_default());
+            let scratch = std::path::PathBuf::from(lines.next().unwrap_or_default());
+            let named = scratch
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("meka-command-scratch-"));
+            assert!(
+                scratch.starts_with(std::env::temp_dir()) && named,
+                "TMPDIR names the command's own scratch directory: {text:?}"
+            );
+            assert!(file.starts_with(&scratch), "mktemp lands in it: {text:?}");
+            assert!(
+                !scratch.exists(),
+                "the scratch directory is removed after the command: {text:?}"
+            );
         }
 
         /// macOS has one `read`-level backend and `detect()` names it, so there is nothing to add.

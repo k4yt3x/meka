@@ -99,8 +99,8 @@ Four limits, stated plainly because none of them is visible from the inside:
 
 | Platform | Backend | Confines the shell |
 |----------|---------|--------------------|
-| Linux | Bubblewrap (preferred) | Yes: read-only root bind, plus a writable bind per root |
-| Linux | Landlock (fallback) | Yes: one path-beneath rule per root |
+| Linux | Bubblewrap (preferred) | Yes: read-only root bind, plus a writable bind per root, with the Landlock ruleset inside where the kernel has one |
+| Linux | Landlock (fallback) | Yes: one path-beneath rule per root, or one per sibling where the root contains meka's directories |
 | macOS | `sandbox-exec` | Yes: writable subpath per root |
 | Windows | `WRITE_RESTRICTED` token + per-root ACE | Yes: writes are permitted only where a workspace capability has an ACE |
 
@@ -115,10 +115,13 @@ the credential store even from a workspace root at `$HOME` that contains it, and
 `file_write` and `file_edit` refuse a target under them whatever roots the session holds. The
 in-process read tools (`file_read`, `file_search`, `file_find`, `scratchpad_load_file`) refuse
 them below `unrestricted` too, and a search from a root above them steps around them. Landlock
-and the Windows token cannot express that denial: their rules only add access, so under either a
-command at `read` can still read the store, and a workspace root containing it can write it.
-Windows says so at startup, and Landlock does too unless `sandbox_backend` pins it. Only
-`unrestricted` writes there on the backends that can hide it.
+rules only add access, so meka hides them there by never covering them: reading files is granted
+per sibling along the path to each, which keeps their names and sizes visible and their bytes
+not, and a workspace root above them is split the same way, at the cost that a new file under
+such a root can land only in one of its subdirectories. The Windows token cannot express the
+denial at all: under it a command at `read` can still read the store, and a workspace root
+containing it can write it, which Windows says at startup. Only `unrestricted` writes there on
+the other backends.
 
 Windows works differently enough to be worth stating. meka mints a deterministic capability SID per
 workspace root, adds an inheritable write ACE for it on that root, and runs the shell under a
@@ -425,7 +428,7 @@ Two things the sandbox deliberately does **not** restrict, on every backend:
 
 On Windows, `workspace` extends that first point to meka's own process. Its `WRITE_RESTRICTED` token restricts writes only, and unlike `read` it deliberately leaves the integrity label at the parent's level, so a confined command can open meka with `PROCESS_VM_READ` and read its memory. Measured on Windows 11: `OpenProcess` succeeds and `ReadProcessMemory` returns data. This is the one respect in which `workspace` confines less than `read`, whose Low-integrity token Windows blocks from opening a medium-integrity process at all. It grants nothing that reading `meka.db` would not, which a command at either level can already do, but it is worth knowing if you were treating `workspace` as strictly wider than `read` in every direction. They are not ordered that way; see the ladder note above.
 
-If no sandbox backend is usable, shell commands at `read` **fail** rather than running unconfined. On Linux that means Bubblewrap (preferred whenever `bwrap` is installed) or Landlock at ABI v3 or newer. Landlock below v3 does not mediate `truncate(2)`, so a "read-only" command could still empty an existing file, and meka refuses it rather than promise a protection the kernel is not enforcing. Kernels 5.13–6.1 therefore need `bwrap` installed for the shell at `read`; `meka` says so at startup.
+If no sandbox backend is usable, shell commands at `read` **fail** rather than running unconfined. On Linux that means Bubblewrap (preferred whenever `bwrap` is installed) or Landlock at ABI v9 or newer. Landlock below v9 cannot refuse a `connect()` to a Unix socket on disk, so a "read-only" command could still reach D-Bus and `systemd-run --user` and have them act on its behalf, and meka refuses it rather than promise a protection the kernel is not enforcing. Kernels below 7.1 therefore need `bwrap` installed for the shell at `read`; `meka` says so at startup.
 
 If you ask the agent to modify a file:
 
@@ -459,7 +462,7 @@ For a server you have not audited, either pin its tools explicitly with [`tool_p
 
 So the honest statement of `read`'s filesystem guarantee is: your tree is safe from meka's built-in tools, plus whichever MCP servers you have chosen to trust.
 
-> **Note:** The read-only sandbox uses Bubblewrap or Landlock (ABI v3+, kernel 6.2+) on Linux, `sandbox-exec` on macOS, and a Low-integrity token on Windows. See [Shell](../tools/shell.md#read-only-sandbox) for what each backend covers. Where no backend is usable, shell commands are not available at `read` or `workspace`. You can disable sandboxed shell execution by setting `sandbox = false` under `[shell]` in the config file (see [Config file](../configuration/config-file.md)), which makes `shell_execute` require `unrestricted` instead.
+> **Note:** The read-only sandbox uses Bubblewrap or Landlock (ABI v9+, kernel 7.1+) on Linux, `sandbox-exec` on macOS, and a Low-integrity token on Windows. See [Shell](../tools/shell.md#read-only-sandbox) for what each backend covers. Where no backend is usable, shell commands are not available at `read` or `workspace`. You can disable sandboxed shell execution by setting `sandbox = false` under `[shell]` in the config file (see [Config file](../configuration/config-file.md)), which makes `shell_execute` require `unrestricted` instead.
 
 ### Workspace
 
