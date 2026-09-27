@@ -220,21 +220,20 @@ pub(crate) fn is_system_root(path: &Path) -> bool {
     is_masked_root(path, &private_directories())
 }
 
-/// meka's own directories: the config directory, the data directory holding the credential store,
-/// and the command-output captures.
+/// meka's own directories: the config directory and the data directory holding the credential
+/// store.
 ///
 /// Every sandbox dialect that can hides these from a confined shell, and the write fence refuses a
 /// target under them whatever roots the session holds. The shell's environment is already scrubbed
 /// because a leaked secret plus the open network is a live exfiltration vector under prompt
 /// injection; the same secrets sit in `meka.db` at a path any shell can guess, so leaving the disk
 /// door open while guarding the environment one guarded nothing. Canonicalized where they exist,
-/// so a symlinked home matches the path the kernel reports; deduplicated because the capture
-/// directory usually sits under the data directory.
+/// so a symlinked home matches the path the kernel reports; deduplicated because an override can
+/// point both at one place.
 pub(crate) fn private_directories() -> Vec<PathBuf> {
     let candidates = [
         crate::paths::meka_config_dir(),
         crate::paths::meka_data_dir(),
-        Some(crate::paths::command_output_dir()),
     ];
     private_directories_among(candidates.into_iter().flatten())
 }
@@ -246,7 +245,7 @@ fn private_directories_among(candidates: impl IntoIterator<Item = PathBuf>) -> V
     for directory in candidates {
         // Only a directory that exists: bubblewrap mounts its mask over a path in the bound root,
         // and there is nothing to hide where nothing is. And never one the system masks already
-        // cover, which happens when captures fall back to the temp directory: taking `/tmp` as
+        // cover, which an override pointed at `/tmp` itself would produce: taking `/tmp` as
         // private would make every working directory under it read as masked, and a `read`-level
         // session there would lose sight of its own files.
         let Ok(directory) = std::fs::canonicalize(&directory).map(strip_verbatim) else {
@@ -1150,8 +1149,8 @@ mod tests {
     }
 
     /// A private directory is one that exists, is a directory, and is not already a system mask.
-    /// The last case is the one the capture directory produces when it falls back to the temp
-    /// directory: taking `/tmp` as private would mask every working directory under it.
+    /// The last case is what an override pointed at `/tmp` itself would produce: taking `/tmp` as
+    /// private would mask every working directory under it.
     #[test]
     fn a_private_directory_is_an_existing_directory_that_is_not_a_system_mask() {
         let temp = tempfile::tempdir().expect("tempdir");

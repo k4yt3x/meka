@@ -60,8 +60,8 @@ Search file contents using a regex pattern. Powered by the ripgrep library.
 
 - Searches recursively through directories, without following symlinked directories.
 - Skips hidden files (starting with `.`), the `target` and `node_modules` directories, and, below
-  `unrestricted`, meka's own private directories: the config directory, the data directory holding
-  `meka.db`, and the command-output captures. `file_find` steps around the same three.
+  `unrestricted`, meka's own private directories: the config directory and the data directory
+  holding `meka.db`. `file_find` steps around the same two.
 - **`.gitignore` is not honored.** Only the matcher comes from ripgrep; the walk is meka's own, and
   those exclusions govern the walk. A build directory that is ignored but not named above is
   searched, so pass `glob` or `path` to stay out of one.

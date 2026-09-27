@@ -296,12 +296,14 @@ impl Tool for ExecuteCommandTool {
             description: format!(
                 "{} Each call starts in the session's working directory; shell state does not \
                  persist between calls. At restricted levels a suitable sandbox is required. \
-                 Background execution keeps `timeout_ms` unchanged.",
+                 Background execution keeps `timeout_ms` unchanged. A command that prints more \
+                 than {} is stopped.",
                 if cfg!(windows) {
                     "Run PowerShell syntax via `powershell.exe -Command`. Do not nest another `powershell -Command`."
                 } else {
                     "Run a POSIX shell command via `sh -c`. Use POSIX quoting."
                 },
+                crate::text::format_size(MAX_OUTPUT_BYTES),
             ),
             parameters: serde_json::json!({
                 "type": "object",
@@ -546,14 +548,6 @@ impl Tool for ExecuteCommandTool {
             }
             _ => None,
         };
-        // A private temporary directory, for the Landlock dialect only: Bubblewrap's tmpfs over
-        // `/tmp` already gives its child one. Created ahead of the grants so the ruleset can name
-        // it.
-        #[cfg(target_os = "linux")]
-        let scratch = match landlock_abi {
-            Some(_) => CommandScratch::create().await,
-            None => None,
-        };
 
         // Unix: place the child in its own session/process group via `setsid` so timeouts and
         // cancellation can kill the whole tree (including backgrounded grandchildren such as
@@ -567,18 +561,18 @@ impl Tool for ExecuteCommandTool {
             // Planned here, in the parent, because `pre_exec` runs after `fork` in a
             // single-threaded child where reading the filesystem and allocating are not
             // async-signal-safe.
+            // No scratch paths: Landlock alone offers a command no temporary directory, because
+            // the only one it could offer is a real directory under the real `/tmp`, and below
+            // `unrestricted` meka writes to nothing but its store. Bubblewrap's tmpfs is the
+            // answer for a tool that needs one.
             #[cfg(target_os = "linux")]
             let grants: Vec<crate::sandbox::LandlockGrant> = match landlock_abi {
-                Some(abi) => {
-                    let scratch: Vec<std::path::PathBuf> =
-                        scratch.iter().map(|scratch| scratch.path.clone()).collect();
-                    crate::sandbox::landlock_grants(
-                        abi,
-                        confinement.writable(),
-                        &scratch,
-                        &crate::workspace::private_directories(),
-                    )
-                }
+                Some(abi) => crate::sandbox::landlock_grants(
+                    abi,
+                    confinement.writable(),
+                    &[],
+                    &crate::workspace::private_directories(),
+                ),
                 None => Vec::new(),
             };
 
@@ -625,39 +619,20 @@ impl Tool for ExecuteCommandTool {
             command_builder.env_clear();
             command_builder.envs(crate::sandbox::sandbox_child_env());
         }
-        // Where the command's temporary files go: its own scratch directory, which the ruleset
-        // grants. All three spellings, since programs disagree on which one they read.
-        #[cfg(target_os = "linux")]
-        if let Some(scratch) = &scratch {
-            for name in ["TMPDIR", "TMP", "TEMP"] {
-                command_builder.env(name, &scratch.path);
-            }
-        }
 
         // Resolve commands against the agent's per-session cwd, not the process cwd. `/cd` mutates
         // the agent's cwd; this is how it actually reaches the child.
         command_builder.current_dir(self.site.cwd.get());
 
-        let spawned = command_builder
+        let mut child = command_builder
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn();
-        let mut child = match spawned {
-            Ok(child) => child,
-            Err(error) => {
-                // The scratch directory was created for a command that never started; a day's
-                // sweep would collect it, but there is no reason to leave it that long.
-                #[cfg(target_os = "linux")]
-                if let Some(scratch) = scratch {
-                    scratch.remove().await;
-                }
-                return Err(MekaError::ToolExecution {
-                    tool_name: "shell_execute".to_string(),
-                    message: format!("failed to spawn command: {error}"),
-                });
-            }
-        };
+            .spawn()
+            .map_err(|error| MekaError::ToolExecution {
+                tool_name: "shell_execute".to_string(),
+                message: format!("failed to spawn command: {error}"),
+            })?;
 
         // Drain stdout/stderr on dedicated tasks that start *before* the wait.
         // `tokio::process::Child::wait()` does not read the pipes; a child writing past the OS pipe
@@ -667,165 +642,146 @@ impl Tool for ExecuteCommandTool {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let relay = OutputRelay::for_call(&context);
+        let budget = Arc::new(OutputBudget::new(MAX_OUTPUT_BYTES));
+        let stop = tokio_util::sync::CancellationToken::new();
         let stdout_task = tokio::spawn({
             let relay = relay.clone();
-            async move { read_to_string_best_effort(stdout, relay).await }
+            let budget = Arc::clone(&budget);
+            let stop = stop.clone();
+            async move { drain_output(stdout, relay, budget, stop).await }
         });
         let stderr_task = tokio::spawn({
             let relay = relay.clone();
-            async move { read_to_string_best_effort(stderr, relay).await }
+            let budget = Arc::clone(&budget);
+            let stop = stop.clone();
+            async move { drain_output(stderr, relay, budget, stop).await }
         });
 
         // wait_with_output() consumes the child, so use wait() + manual stdout/stderr reading
-        // instead to allow kill on cancellation. Every arm lands on the scratch removal below.
-        let outcome = tokio::select! {
+        // instead to allow kill on cancellation. `biased`, so a bound reached in the same instant
+        // the child exits is reported as the bound: the random pick would otherwise call the
+        // command clean while its last reads were never taken.
+        tokio::select! {
+            biased;
             _ = cancellation.cancelled() => {
                 kill_child_tree(&mut child).await;
                 stdout_task.abort();
                 stderr_task.abort();
                 Err(MekaError::Interrupted)
             }
+            _ = budget.exhausted.cancelled() => {
+                kill_child_tree(&mut child).await;
+                let drained = collect_drains(stdout_task, stderr_task, &stop).await;
+                Ok(killed_command_output(&drained, &output_bound_reason()))
+            }
             _ = tokio::time::sleep(timeout) => {
                 kill_child_tree(&mut child).await;
-                stdout_task.abort();
-                stderr_task.abort();
-                // Timed out means we killed it, so report the kill rather than inventing an exit
-                // code; a frontend rendering a terminal shows "terminated" instead of "exit 0".
-                Ok(ToolOutput::text(
-                    format!("Command timed out after {}ms", timeout.as_millis()),
-                    true,
-                )
-                .with_metadata(timed_out_exit_metadata()))
+                let drained = collect_drains(stdout_task, stderr_task, &stop).await;
+                Ok(killed_command_output(&drained, &timed_out_reason(timeout, &budget)))
             }
-            status = child.wait() => finish_command(status, stdout_task, stderr_task).await,
-        };
-        #[cfg(target_os = "linux")]
-        if let Some(scratch) = scratch {
-            scratch.remove().await;
+            status = child.wait() => {
+                finish_command(status, stdout_task, stderr_task, &stop, &budget).await
+            }
         }
-        outcome
     }
 }
 
 /// The result of a command that ran to its end: its exit status with what the drains collected.
+///
+/// The drains may still cross the bound here: a child exits once its last write fits in the pipe,
+/// so it can finish within a pipe's worth of the bound and leave the crossing to the collection
+/// below. That output is cut like a killed command's, and the result says so first, because a clean
+/// exit code over an incomplete transcript is the one shape the record must never take.
 async fn finish_command(
     status: std::io::Result<std::process::ExitStatus>,
     stdout_task: tokio::task::JoinHandle<String>,
     stderr_task: tokio::task::JoinHandle<String>,
+    stop: &tokio_util::sync::CancellationToken,
+    budget: &OutputBudget,
 ) -> Result<ToolOutput> {
     let status = status.map_err(|error| MekaError::ToolExecution {
         tool_name: "shell_execute".to_string(),
         message: format!("failed to wait for command: {error}"),
     })?;
 
-    let exit_code = status.code().unwrap_or(-1);
-    // A backgrounded grandchild can keep the pipe open past the direct child's exit; cap the drain
-    // so the tool call can't hang, attaching a truncation note if the cap fires.
-    let (stdout_content, stdout_timed_out) =
-        join_drain_with_timeout(stdout_task, DRAIN_TIMEOUT).await;
-    let (stderr_content, stderr_timed_out) =
-        join_drain_with_timeout(stderr_task, DRAIN_TIMEOUT).await;
+    let drained = collect_drains(stdout_task, stderr_task, stop).await;
+    if drained.stopped_early {
+        tracing::warn!(
+            "command output drain stopped after {DRAIN_TIMEOUT:?}; a background process may be \
+             holding the pipe open"
+        );
+    }
+
+    if budget.exhausted.is_cancelled() {
+        return Ok(led_by_reason(&drained, &output_cut_note())
+            .with_metadata(command_exit_metadata(&status)));
+    }
 
     // No output-length truncation here: the agent layer's `persist_oversized_results`
     // auto-persists any oversized result to the scratchpad losslessly. Truncating here would
     // corrupt binary-in-base64 pipelines (see #1 in the trial feedback).
-    let mut output = assemble_command_output(&stdout_content, &stderr_content, exit_code);
-    if stdout_timed_out || stderr_timed_out {
-        append_drain_truncation_note(&mut output, stdout_timed_out, stderr_timed_out);
+    let exit_code = status.code().unwrap_or(-1);
+    let mut output = assemble_command_output(&drained.stdout, &drained.stderr, exit_code);
+    if drained.stopped_early {
+        append_drain_stopped_note(&mut output);
     }
     Ok(output.with_metadata(command_exit_metadata(&status)))
 }
 
-/// A command's private temporary directory under the Landlock dialect, named by `TMPDIR`.
-///
-/// Bubblewrap's child writes scratch into a tmpfs that vanishes with the sandbox; Landlock can only
-/// decide which real paths a process may touch, so the nearest thing is a real directory that is
-/// nobody else's, granted to this one command and removed when it ends. Under the temp directory
-/// rather than meka's own: that is where throwaway files belong, it is usually memory-backed and
-/// cleared at boot, and meka's directories are the ones the ruleset hides.
-///
-/// `mktemp`, Python's `tempfile`, `gcc` without `-pipe` and `patch` all honor `TMPDIR`; a program
-/// with a literal `/tmp` still fails, as before.
-#[cfg(target_os = "linux")]
-struct CommandScratch {
-    path: std::path::PathBuf,
+/// The result of a command meka killed, at its timeout or at the output bound: the reason, then
+/// everything it printed up to the kill. A frontend rendering a terminal shows "terminated" rather
+/// than an exit code.
+fn killed_command_output(drained: &DrainedOutput, reason: &str) -> ToolOutput {
+    led_by_reason(drained, reason).with_metadata(killed_exit_metadata())
 }
 
-#[cfg(target_os = "linux")]
-impl CommandScratch {
-    const PREFIX: &str = "meka-command-scratch-";
-
-    /// Create one, owner-only. `None` when the temp directory refuses, in which case the command
-    /// runs without scratch space, as it did before there was any.
-    async fn create() -> Option<Self> {
-        let directory = std::env::temp_dir();
-        let path = directory.join(format!("{}{}", Self::PREFIX, uuid::Uuid::new_v4()));
-        let created = tokio::task::spawn_blocking({
-            let path = path.clone();
-            move || {
-                sweep_stale_scratch(&directory);
-                let mut builder = std::fs::DirBuilder::new();
-                std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-                builder.create(&path)
-            }
-        })
-        .await;
-        match created {
-            Ok(Ok(())) => Some(Self { path }),
-            Ok(Err(error)) => {
-                let path = path.display();
-                tracing::warn!(
-                    "failed to create the scratch directory '{path}': {error}; the command runs \
-                     without one"
-                );
-                None
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "failed to create the scratch directory: {error}; the command runs without one"
-                );
-                None
-            }
-        }
+/// A failed result that states `reason` first and carries what the command printed after it.
+///
+/// The reason leads because the output can be 64 MiB and every surface shows a result's head (the
+/// scratchpad preview, a background outcome, the REPL banner), so a reason at the end would be the
+/// one line nobody reads; the record holds all of it either way.
+fn led_by_reason(drained: &DrainedOutput, reason: &str) -> ToolOutput {
+    let mut text = reason.to_string();
+    let printed = join_streams(&drained.stdout, &drained.stderr);
+    if !printed.is_empty() {
+        text.push('\n');
+        text.push_str(&printed);
     }
-
-    /// Remove it with everything the command left behind. A failure is logged, and the directory
-    /// is swept later like a capture, so nothing accumulates for good.
-    async fn remove(self) {
-        if let Err(error) = tokio::fs::remove_dir_all(&self.path).await {
-            let path = self.path.display();
-            tracing::warn!("failed to remove the scratch directory '{path}': {error}");
-        }
+    let mut output = ToolOutput::text(text, true);
+    if drained.stopped_early {
+        append_drain_stopped_note(&mut output);
     }
+    output
 }
 
-/// Remove the scratch directories a crash or a kill left behind, once they are older than
-/// [`CAPTURE_RETENTION`]. Only meka's own names, so a stranger's directory in a shared temp
-/// directory is not meka's to delete.
-#[cfg(target_os = "linux")]
-fn sweep_stale_scratch(directory: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_ours = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(CommandScratch::PREFIX));
-        if !is_ours {
-            continue;
-        }
-        let stale = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .map(|modified| modified.elapsed().is_ok_and(|age| age > CAPTURE_RETENTION))
-            .unwrap_or(false);
-        if stale && let Err(error) = std::fs::remove_dir_all(&path) {
-            let path = path.display();
-            tracing::warn!("failed to remove the stale scratch directory '{path}': {error}");
-        }
+/// Why a command was killed at its timeout, in the words the model and every test read. When the
+/// drains also reached the bound while the command died, the result says that too, since the
+/// transcript is then cut as well as ended.
+fn timed_out_reason(timeout: std::time::Duration, budget: &OutputBudget) -> String {
+    let mut reason = format!("Command timed out after {}ms", timeout.as_millis());
+    if budget.exhausted.is_cancelled() {
+        reason.push('\n');
+        reason.push_str(&output_cut_note());
     }
+    reason
+}
+
+/// Why a command was killed at the output bound. Names the bound, so the model reruns with a
+/// narrower command rather than a longer timeout.
+fn output_bound_reason() -> String {
+    format!(
+        "Command stopped: its output exceeded {}",
+        crate::text::format_size(MAX_OUTPUT_BYTES)
+    )
+}
+
+/// What a result says when the output reached the bound while the command was ending for another
+/// reason, or on its own: the transcript stops there, whatever the exit status says.
+fn output_cut_note() -> String {
+    format!(
+        "Output exceeded {}; what the command printed past that point is not included",
+        crate::text::format_size(MAX_OUTPUT_BYTES)
+    )
 }
 
 /// Terminate the child and, on Unix, its entire process group. Called on timeout and on
@@ -862,9 +818,10 @@ async fn kill_child_tree(child: &mut tokio::process::Child) {
     }
 }
 
-/// Upper bound on draining a child's stdout/stderr after it has exited. A backgrounded grandchild
-/// that inherited the pipe write handle can keep the pipe open past the direct child's exit; rather
-/// than block the tool call we cap the drain, abort it, and attach a truncation note.
+/// Upper bound on draining a child's stdout/stderr after it has exited or been killed. A
+/// backgrounded grandchild that inherited the pipe write handle can keep the pipe open past the
+/// direct child's exit; rather than block the tool call, the drains are told to stop and return
+/// what they have, and the result says so.
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Forwards a running command's output to the frontend as it is produced. Cloned into both drain
@@ -900,213 +857,93 @@ impl OutputRelay {
     }
 }
 
-/// How much of one stream meka will hold in the turn's memory before moving it to a file.
+/// How much a command may print, stdout and stderr together, before meka stops it.
 ///
-/// There is no cap on how much a command may print, and there should not be: `shell_execute` was
-/// deliberately changed to stop truncating at 30 KB. But a drain accumulating one unbounded
-/// `Vec<u8>` takes the process down with any command that writes faster than the turn ends, `cat
-/// /dev/zero` being the extreme. Past this point the bytes go to disk and the result names the
-/// file, so the output is still complete and still reachable, just not resident.
-const MAX_RESIDENT_OUTPUT_BYTES: usize = 8 * crate::text::MIB;
+/// Every byte under the bound is kept: in memory while the command runs, then in the scratchpad
+/// when the result is too large for the conversation. So a bound is the only thing standing between
+/// a command that writes faster than the turn ends (`cat /dev/zero`, a runaway build log) and the
+/// process going down with it. Reaching it kills the command and says so, the way the timeout does,
+/// rather than dropping part of what was printed: an elided middle is a hole in the record for the
+/// operator and the agent alike, and a stopped command is something the agent can rerun narrower.
+///
+/// Above the largest legitimate outputs measured (a whole `git log -p`, an `ls -lR /usr`, both in
+/// the tens of MiB) and well below the runaway cases.
+const MAX_OUTPUT_BYTES: usize = 64 * crate::text::MIB;
 
-/// How much of each end of an overflowing stream stays in the result inline. Enough that the model
-/// can see how the command started and how it ended without opening the capture.
+/// One command's share of [`MAX_OUTPUT_BYTES`], held by both of its drains.
 ///
-/// Read alongside [`crate::background::OUTCOME_INLINE_LIMIT`], which is eight times smaller and
-/// keeps only the head. A backgrounded command's *delivered outcome* therefore shows less than its
-/// tool result would have, and shows a different part of it. See that constant for why the
-/// asymmetry is intended and what it costs.
-const OUTPUT_WINDOW_BYTES: usize = 32 * crate::text::KIB;
-
-/// Where an overflowing stream's bytes are going.
-///
-/// Three states rather than an `Option`, because "not needed yet" and "tried and failed" call for
-/// opposite responses at the next chunk and an `Option` collapsed them into one. A failure read as
-/// "not capturing yet", so the ceiling was re-crossed 8 MiB later and the whole opening sequence
-/// ran again: a second file, and `head` overwritten with a slice from the middle of the stream that
-/// the result then presented as the beginning.
-enum Capture {
-    /// The stream still fits inline. The only state from which capture can begin.
-    NotNeeded,
-    Writing(std::path::PathBuf, tokio::fs::File),
-    /// Capture was attempted and could not be relied on. Terminal: the notice discloses the loss
-    /// rather than naming a file, and no second attempt is made.
-    Failed,
+/// Shared rather than split per stream, so a command that prints everything on one stream gets the
+/// whole bound, and one that splits its output cannot double it.
+struct OutputBudget {
+    remaining: std::sync::atomic::AtomicUsize,
+    /// Fires when a drain has spent the budget. The spawn waits on it beside the timeout.
+    exhausted: tokio_util::sync::CancellationToken,
 }
 
-/// Keep only the last `limit` bytes, dropping from the front. Returns how many were dropped.
-///
-/// The count is what keeps the relay cursor aligned. `relayed` is an index into this buffer, so a
-/// trim has to shift it by exactly what was removed. Clamping it to the new length instead marked
-/// the carried incomplete-UTF-8 bytes as already sent; the next chunk then began on continuation
-/// bytes, `valid_up_to()` returned 0, and a whole read vanished from the live stream. It
-/// self-corrected only when a read happened to end on a character boundary, so ASCII output never
-/// showed it.
-fn trim_front_to(buffer: &mut Vec<u8>, limit: usize) -> usize {
-    if buffer.len() > limit {
-        let dropped = buffer.len() - limit;
-        buffer.drain(..dropped);
-        dropped
-    } else {
-        0
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Test hook making the capture-failure arms reachable.
-    ///
-    /// There is no other way in. Both directories `capture_path` can pick fall back to each other
-    /// by design, so no environment a test could arrange reliably fails the open, and those arms
-    /// are exactly where the state machine can go wrong. Thread-local rather than a static so a
-    /// test that sets it cannot disturb the capture tests running beside it; `#[tokio::test]` is
-    /// single-threaded, so the value is visible across the awaits below.
-    static FORCE_CAPTURE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// How long a command-output capture survives before the next overflow sweeps it.
-const CAPTURE_RETENTION: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-
-/// Delete captures older than [`CAPTURE_RETENTION`].
-///
-/// Runs on the overflow path rather than on a timer: an overflow is rare, so this costs a directory
-/// read on the one occasion something is about to be written anyway, and a meka that never
-/// overflows never needs the sweep. No failure is fatal: a capture that cannot be removed is not a
-/// reason to fail the command whose output is about to be written beside it.
-///
-/// Matches only meka's own names, so a file someone else left in a shared temp directory is not
-/// meka's to delete.
-async fn sweep_stale_captures(directory: &std::path::Path) {
-    let Ok(mut entries) = tokio::fs::read_dir(directory).await else {
-        return;
-    };
-    loop {
-        let entry = match entries.next_entry().await {
-            Ok(Some(entry)) => entry,
-            Ok(None) => break,
-            // An entry that cannot be read is skipped, not a reason to stop sweeping the rest.
-            Err(_) => continue,
-        };
-        let path = entry.path();
-        let is_ours = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                (name.starts_with("command-output-") || name.starts_with("meka-command-output-"))
-                    && name.ends_with(".log")
-            });
-        if !is_ours {
-            continue;
-        }
-        let stale = entry
-            .metadata()
-            .await
-            .and_then(|metadata| metadata.modified())
-            .map(|modified| modified.elapsed().is_ok_and(|age| age > CAPTURE_RETENTION))
-            .unwrap_or(false);
-        if stale && let Err(error) = tokio::fs::remove_file(&path).await {
-            let path = path.display();
-            tracing::warn!("failed to remove stale capture '{path}': {error}");
+impl OutputBudget {
+    fn new(bytes: usize) -> Self {
+        Self {
+            remaining: std::sync::atomic::AtomicUsize::new(bytes),
+            exhausted: tokio_util::sync::CancellationToken::new(),
         }
     }
-}
 
-/// Where an overflowing stream is captured. One file per stream per command, named unguessably so
-/// two concurrent commands cannot collide and a predictable name cannot be pre-created by something
-/// else.
-///
-/// The cache directory rather than `std::env::temp_dir()`, because on most Linux systems `/tmp` is
-/// a tmpfs: capturing there would move the bytes out of the heap and straight back into RAM, which
-/// is the thing the capture exists to avoid.
-///
-/// Sweeps captures older than [`CAPTURE_RETENTION`] on the way past. These files are named in a
-/// tool result the model has already read, so deleting one is deleting something a resumed session
-/// may still refer to, but they are 8 MiB or more each and nothing else ever removes them, so a
-/// machine that runs long builds accumulates them until the disk notices. A day is well past the
-/// point where the conversation that produced one is still acting on it.
-async fn capture_path() -> std::path::PathBuf {
-    #[cfg(test)]
-    if FORCE_CAPTURE_FAILURE.with(std::cell::Cell::get) {
-        // A parent that does not exist, so `File::create` fails on every platform.
-        return std::env::temp_dir()
-            .join(format!("meka-absent-{}", uuid::Uuid::new_v4()))
-            .join("capture.log");
-    }
-
-    // One resolver, shared with the sandbox masks that hide this directory from the confined
-    // shell: a capture holds a command's whole output, which is as sensitive as the command.
-    let directory = crate::paths::command_output_dir();
-    sweep_stale_captures(&directory).await;
-    if let Err(error) = tokio::fs::create_dir_all(&directory).await {
-        let path = directory.display();
-        tracing::warn!(
-            "failed to create the capture directory '{path}': {error}; using the temp directory"
-        );
-        // Swept too, or a host whose cache directory cannot be created accumulates captures
-        // there for good: the retention rule holds for whichever directory the captures land in.
-        let fallback = std::env::temp_dir();
-        sweep_stale_captures(&fallback).await;
-        return fallback.join(format!("meka-command-output-{}.log", uuid::Uuid::new_v4()));
-    }
-    directory.join(format!("command-output-{}.log", uuid::Uuid::new_v4()))
-}
-
-/// Create a capture file readable only by its owner.
-///
-/// A command's output is as sensitive as the command: `env`, a `curl -v` with an `Authorization`
-/// header, a database dump. meka is careful to write its database at 0600 and its directories at
-/// 0700; this file was created at whatever the umask allowed, in a directory shared with every
-/// other user on the host on some configurations. Set before the first write, so the bytes are
-/// never briefly visible at a looser mode.
-async fn create_capture_file(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
-    #[cfg(unix)]
-    {
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .await
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows ACLs inherit from the parent directory, which is the user's own cache directory.
-        tokio::fs::File::create(path).await
+    /// Spend `bytes`. `false` when they did not fit, at which point the budget is exhausted and
+    /// stays so; the chunk that crossed the line is kept, so the record ends on a whole read.
+    fn spend(&self, bytes: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let before = self
+            .remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                Some(remaining.saturating_sub(bytes))
+            })
+            .unwrap_or(0);
+        if before >= bytes {
+            return true;
+        }
+        self.exhausted.cancel();
+        false
     }
 }
 
-/// Read a child pipe to EOF, relaying each chunk as it arrives.
+/// Read a child pipe until EOF, the budget runs out, or `stop` fires, relaying each chunk as it
+/// arrives and returning everything read.
 ///
 /// Reads bytes rather than `read_to_string` because a chunk boundary can fall inside a multi-byte
 /// character: the trailing incomplete sequence is carried over to the next read instead of being
 /// relayed as replacement characters. What is relayed still covers the whole stream, so the live
 /// view is unaffected by how the reads happened to split.
 ///
-/// The returned string is the whole stream unless it outgrew [`MAX_RESIDENT_OUTPUT_BYTES`], in
-/// which case it is the two ends plus a line naming the file holding all of it.
-async fn read_to_string_best_effort<R>(reader: Option<R>, relay: Option<OutputRelay>) -> String
+/// Whichever way the read ends, the returned string is everything the drain took in. The spawn
+/// decides what to say about a stream that ended early; this function never drops a byte it read.
+async fn drain_output<R>(
+    reader: Option<R>,
+    relay: Option<OutputRelay>,
+    budget: Arc<OutputBudget>,
+    stop: tokio_util::sync::CancellationToken,
+) -> String
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
     let Some(mut reader) = reader else {
         return String::new();
     };
 
-    // `content` holds the whole stream until it outgrows the ceiling. After that it holds only the
-    // trailing window, `head` holds the leading one, and `capture` has every byte.
     let mut content: Vec<u8> = Vec::new();
-    let mut head: Vec<u8> = Vec::new();
-    let mut capture = Capture::NotNeeded;
-    let mut total: usize = 0;
     let mut relayed = 0usize;
     let mut buffer = [0u8; 8192];
     loop {
-        match reader.read(&mut buffer).await {
+        // `read` is cancel-safe on a pipe: a read that has not completed has copied nothing, so
+        // stopping here loses nothing already produced.
+        let read = tokio::select! {
+            read = reader.read(&mut buffer) => read,
+            _ = stop.cancelled() => break,
+        };
+        match read {
             Ok(0) => break,
             Ok(read) => {
                 let chunk = &buffer[..read];
-                total += read;
                 content.extend_from_slice(chunk);
 
                 if let Some(relay) = &relay {
@@ -1126,72 +963,10 @@ where
                     }
                 }
 
-                match &mut capture {
-                    // Already capturing: the chunk goes to the file and `content` keeps only the
-                    // trailing window. A write failure stops the capture rather than the command;
-                    // the result then reports the truncation honestly instead of naming a file that
-                    // does not hold what it claims.
-                    Capture::Writing(path, file) => {
-                        if let Some(error) = file.write_all(chunk).await.err() {
-                            let path = path.clone();
-                            let displayed = path.display();
-                            tracing::warn!(
-                                "failed to write command output capture '{displayed}': {error}"
-                            );
-                            capture = Capture::Failed;
-                            // The notice below stops naming this file, so nothing would ever come
-                            // back for it, and what it holds is a prefix of a stream that kept
-                            // going. Leaving up to `MAX_RESIDENT_OUTPUT_BYTES` of it in the cache
-                            // directory after a write failure (most often a full disk) is the
-                            // wrong moment to be untidy.
-                            if let Err(error) = tokio::fs::remove_file(&path).await {
-                                let path = path.display();
-                                tracing::warn!(
-                                    "failed to remove the partial capture '{path}': {error}"
-                                );
-                            }
-                        }
-                        relayed = relayed
-                            .saturating_sub(trim_front_to(&mut content, OUTPUT_WINDOW_BYTES));
-                    }
-                    // Capture is off for the rest of the stream. Keep trimming anyway: the point of
-                    // the ceiling is the residency bound, which holds whether or not the bytes are
-                    // reaching a file.
-                    Capture::Failed => {
-                        relayed = relayed
-                            .saturating_sub(trim_front_to(&mut content, OUTPUT_WINDOW_BYTES));
-                    }
-                    // The one crossing of the ceiling. `head` is taken here, before anything can
-                    // fail, because this is the last moment `content` still starts at byte zero.
-                    // Re-entering this arm later would overwrite it with a mid-stream slice, and a
-                    // capture that opened on the second attempt would hold only the bytes from
-                    // that point on while the notice called it complete.
-                    Capture::NotNeeded if content.len() > MAX_RESIDENT_OUTPUT_BYTES => {
-                        head = content[..OUTPUT_WINDOW_BYTES.min(content.len())].to_vec();
-                        let path = capture_path().await;
-                        capture = match create_capture_file(&path).await {
-                            Ok(mut file) => match file.write_all(&content).await {
-                                Ok(()) => Capture::Writing(path, file),
-                                Err(error) => {
-                                    let path = path.display();
-                                    tracing::warn!(
-                                        "failed to write command output capture '{path}': {error}"
-                                    );
-                                    Capture::Failed
-                                }
-                            },
-                            Err(error) => {
-                                let path = path.display();
-                                tracing::warn!(
-                                    "failed to create command output capture '{path}': {error}"
-                                );
-                                Capture::Failed
-                            }
-                        };
-                        relayed = relayed
-                            .saturating_sub(trim_front_to(&mut content, OUTPUT_WINDOW_BYTES));
-                    }
-                    Capture::NotNeeded => {}
+                // After the chunk is kept, so the record ends on what was actually read; the spawn
+                // kills the command, and this drain has nothing more to take from it.
+                if !budget.spend(read) {
+                    break;
                 }
             }
             Err(error) => {
@@ -1201,46 +976,62 @@ where
         }
     }
 
-    // `tokio::fs::File` hands writes to the blocking pool and does not flush when it is dropped, so
-    // without this the tail of the capture is lost and the file does not hold what the notice below
-    // says it does.
-    if let Capture::Writing(path, file) = &mut capture
-        && let Err(error) = file.flush().await
-    {
-        let path = path.clone();
-        let displayed = path.display();
-        tracing::warn!("failed to flush command output capture '{displayed}': {error}");
-        capture = Capture::Failed;
-        if let Err(error) = tokio::fs::remove_file(&path).await {
-            let path = path.display();
-            tracing::warn!("failed to remove the unflushed capture '{path}': {error}");
-        }
-    }
-
     // Lossy rather than a hard error: a command that emits a stray non-UTF-8 byte (a progress bar
     // in a foreign encoding, a binary blob on stderr) should still hand the model everything else
     // it printed.
-    if head.is_empty() {
-        return String::from_utf8_lossy(&content).into_owned();
-    }
+    String::from_utf8_lossy(&content).into_owned()
+}
 
-    let elided = total.saturating_sub(head.len() + content.len());
-    let middle = match &capture {
-        Capture::Writing(path, _) => format!(
-            "\n\n... ({} bytes elided; the complete output is at {}) ...\n\n",
-            elided,
-            path.display()
-        ),
-        Capture::Failed | Capture::NotNeeded => format!(
-            "\n\n... ({elided} bytes elided; capturing them to a file failed, see the log) ...\n\n"
-        ),
+/// What the two drains returned, and whether they were stopped before the pipes closed.
+struct DrainedOutput {
+    stdout: String,
+    stderr: String,
+    /// A grandchild kept a pipe open past [`DRAIN_TIMEOUT`], so the drains were told to stop and
+    /// anything printed after that is not in `stdout` or `stderr`.
+    stopped_early: bool,
+}
+
+/// Join both drains, waiting at most [`DRAIN_TIMEOUT`] in total for the pipes to close.
+///
+/// A drain that has not reached EOF by then is told to stop and returns what it has, so a
+/// backgrounded grandchild holding the pipe delays the result by the timeout and costs the output
+/// it prints afterwards, never the output already read.
+async fn collect_drains(
+    mut stdout_task: tokio::task::JoinHandle<String>,
+    mut stderr_task: tokio::task::JoinHandle<String>,
+    stop: &tokio_util::sync::CancellationToken,
+) -> DrainedOutput {
+    let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
+    let mut stopped_early = false;
+    let stdout = join_drain_by(&mut stdout_task, deadline, stop, &mut stopped_early).await;
+    let stderr = join_drain_by(&mut stderr_task, deadline, stop, &mut stopped_early).await;
+    DrainedOutput {
+        stdout,
+        stderr,
+        stopped_early,
+    }
+}
+
+/// One drain's result by `deadline`. Past it, `stop` is fired and the drain is joined for what it
+/// has, which it returns as soon as it sees the signal.
+async fn join_drain_by(
+    task: &mut tokio::task::JoinHandle<String>,
+    deadline: tokio::time::Instant,
+    stop: &tokio_util::sync::CancellationToken,
+    stopped_early: &mut bool,
+) -> String {
+    let joined = match tokio::time::timeout_at(deadline, &mut *task).await {
+        Ok(joined) => joined,
+        Err(_elapsed) => {
+            *stopped_early = true;
+            stop.cancel();
+            task.await
+        }
     };
-    format!(
-        "{}{}{}",
-        String::from_utf8_lossy(&head),
-        middle,
-        String::from_utf8_lossy(&content)
-    )
+    joined.unwrap_or_else(|error| {
+        tracing::debug!("drain task failed: {error}");
+        String::new()
+    })
 }
 
 /// Structured exit status for frontends that render a terminal. `ExitStatus::code()` is `None`
@@ -1278,11 +1069,11 @@ fn signal_name(number: i32) -> String {
     }
 }
 
-/// Exit status for a command meka killed for exceeding its timeout. The child is torn down without
-/// its status being reaped, so there is nothing to read it from. On Unix the kill really is a
-/// signal ([`kill_child_tree`]); Windows has no signals, and claiming one there would put a name in
-/// the client's terminal that never existed on that platform.
-fn timed_out_exit_metadata() -> crate::frontend::ToolOutputMetadata {
+/// Exit status for a command meka killed, at its timeout or at the output bound. The child is torn
+/// down without its status being reaped, so there is nothing to read it from. On Unix the kill
+/// really is a signal ([`kill_child_tree`]); Windows has no signals, and claiming one there would
+/// put a name in the client's terminal that never existed on that platform.
+fn killed_exit_metadata() -> crate::frontend::ToolOutputMetadata {
     crate::frontend::ToolOutputMetadata::CommandExit {
         exit_code: None,
         #[cfg(unix)]
@@ -1292,17 +1083,23 @@ fn timed_out_exit_metadata() -> crate::frontend::ToolOutputMetadata {
     }
 }
 
-fn assemble_command_output(stdout: &str, stderr: &str, exit_code: i32) -> ToolOutput {
-    let mut result_text = String::new();
+/// Both streams as one text, stderr under its own divider when both have something to show.
+fn join_streams(stdout: &str, stderr: &str) -> String {
+    let mut text = String::new();
     if !stdout.is_empty() {
-        result_text.push_str(stdout);
+        text.push_str(stdout);
     }
     if !stderr.is_empty() {
-        if !result_text.is_empty() {
-            result_text.push_str("\n--- stderr ---\n");
+        if !text.is_empty() {
+            text.push_str("\n--- stderr ---\n");
         }
-        result_text.push_str(stderr);
+        text.push_str(stderr);
     }
+    text
+}
+
+fn assemble_command_output(stdout: &str, stderr: &str, exit_code: i32) -> ToolOutput {
+    let mut result_text = join_streams(stdout, stderr);
     if exit_code != 0 {
         result_text.push_str(&format!("\nExit code: {exit_code}"));
     }
@@ -1333,9 +1130,8 @@ fn assemble_command_output(stdout: &str, stderr: &str, exit_code: i32) -> ToolOu
 /// future refactor could wrap the child in a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
 /// Consequently, a grandchild that inherits the pipe write handles can keep the pipe alive past the
 /// direct child's exit; the drain tasks would then block on `ReadFile` until the grandchild
-/// finally exits. To bound the tool-call wall time we cap every drain await with [`DRAIN_TIMEOUT`];
-/// on timeout the drain task is aborted, any output already read is lost, and we attach a
-/// diagnostic note so the model can reason about truncation.
+/// finally exits. To bound the tool-call wall time the drains are collected under
+/// [`DRAIN_TIMEOUT`] and told to stop at it, keeping what they read.
 #[cfg(windows)]
 async fn run_windows_sandboxed(
     command: &str,
@@ -1364,21 +1160,32 @@ async fn run_windows_sandboxed(
     let stderr = sandboxed.take_stderr().map(tokio::fs::File::from_std);
 
     let child = Arc::new(sandboxed);
+    let budget = Arc::new(OutputBudget::new(MAX_OUTPUT_BYTES));
+    let stop = tokio_util::sync::CancellationToken::new();
     let stdout_task = tokio::spawn({
         let relay = relay.clone();
-        async move { read_to_string_best_effort(stdout, relay).await }
+        let budget = Arc::clone(&budget);
+        let stop = stop.clone();
+        async move { drain_output(stdout, relay, budget, stop).await }
     });
-    let stderr_task = tokio::spawn(async move { read_to_string_best_effort(stderr, relay).await });
+    let stderr_task = tokio::spawn({
+        let budget = Arc::clone(&budget);
+        let stop = stop.clone();
+        async move { drain_output(stderr, relay, budget, stop).await }
+    });
 
     let wait_child = Arc::clone(&child);
     // `tokio::select!` requires the future passed to the happy-path branch (`join = ...`) to be
-    // polled without consuming ownership of the handle, because the other two branches need to move
+    // polled without consuming ownership of the handle, because the other branches need to move
     // the same handle into `abort_after_timeout` if their future resolves first. Polling `&mut
     // wait_handle` satisfies `JoinHandle`'s `Future` impl (it has a `&mut self`-based `poll`)
     // without committing the move until we know which branch wins.
     let mut wait_handle = tokio::task::spawn_blocking(move || wait_child.wait_blocking());
 
+    // `biased` for the reason the Unix spawn gives: a bound reached as the child exits is the
+    // bound, not a clean exit.
     tokio::select! {
+        biased;
         _ = cancellation.cancelled() => {
             if let Err(error) = child.kill() {
                 tracing::debug!("failed to kill sandboxed child: {error}");
@@ -1388,71 +1195,28 @@ async fn run_windows_sandboxed(
             abort_after_timeout(stderr_task, POST_KILL_TIMEOUT).await;
             Err(MekaError::Interrupted)
         }
+        _ = budget.exhausted.cancelled() => {
+            if let Err(error) = child.kill() {
+                tracing::debug!("failed to kill sandboxed child: {error}");
+            }
+            abort_after_timeout(wait_handle, POST_KILL_TIMEOUT).await;
+            let drained = collect_drains(stdout_task, stderr_task, &stop).await;
+            Ok(killed_command_output(&drained, &output_bound_reason()))
+        }
         _ = tokio::time::sleep(timeout) => {
             if let Err(error) = child.kill() {
                 tracing::debug!("failed to kill sandboxed child: {error}");
             }
             abort_after_timeout(wait_handle, POST_KILL_TIMEOUT).await;
-            abort_after_timeout(stdout_task, POST_KILL_TIMEOUT).await;
-            abort_after_timeout(stderr_task, POST_KILL_TIMEOUT).await;
-            Ok(ToolOutput::text(
-                format!("Command timed out after {}ms", timeout.as_millis()),
-                true,
-            )
-            .with_metadata(timed_out_exit_metadata()))
+            let drained = collect_drains(stdout_task, stderr_task, &stop).await;
+            Ok(killed_command_output(&drained, &timed_out_reason(timeout, &budget)))
         }
         join = &mut wait_handle => {
-            let status = join
-                .map_err(|error| MekaError::ToolExecution {
-                    tool_name: "shell_execute".to_string(),
-                    message: format!("wait task panicked: {error}"),
-                })?
-                .map_err(|error| MekaError::ToolExecution {
-                    tool_name: "shell_execute".to_string(),
-                    message: format!("failed to wait for command: {error}"),
-                })?;
-
-            let exit_code = status.code().unwrap_or(-1);
-            let (stdout_content, stdout_timed_out) =
-                join_drain_with_timeout(stdout_task, DRAIN_TIMEOUT).await;
-            let (stderr_content, stderr_timed_out) =
-                join_drain_with_timeout(stderr_task, DRAIN_TIMEOUT).await;
-            if stdout_timed_out || stderr_timed_out {
-                tracing::warn!(
-                    "sandboxed command output drain timed out after {DRAIN_TIMEOUT:?}; \
-                     a background process may be holding the pipe open");
-            }
-            let mut output =
-                assemble_command_output(&stdout_content, &stderr_content, exit_code);
-            if stdout_timed_out || stderr_timed_out {
-                append_drain_truncation_note(
-                    &mut output,
-                    stdout_timed_out,
-                    stderr_timed_out,
-                );
-            }
-            Ok(output.with_metadata(command_exit_metadata(&status)))
-        }
-    }
-}
-
-/// Await a `JoinHandle<String>` up to `timeout`. If the timeout expires the task is aborted and an
-/// empty string is returned alongside `timed_out=true` so the caller can surface a truncation note.
-async fn join_drain_with_timeout(
-    mut task: tokio::task::JoinHandle<String>,
-    timeout: std::time::Duration,
-) -> (String, bool) {
-    tokio::select! {
-        result = &mut task => match result {
-            Ok(content) => (content, false),
-            Err(error) => {
-                tracing::debug!("drain task failed: {error}");
-                (String::new(), false)
-            }
-        },
-        _ = tokio::time::sleep(timeout) => {
-            task.abort();
-            (String::new(), true)
+            let status = join.map_err(|error| MekaError::ToolExecution {
+                tool_name: "shell_execute".to_string(),
+                message: format!("wait task panicked: {error}"),
+            })?;
+            finish_command(status, stdout_task, stderr_task, &stop, &budget).await
         }
     }
 }
@@ -1472,25 +1236,16 @@ async fn abort_after_timeout<T: 'static>(
     }
 }
 
-fn append_drain_truncation_note(
-    output: &mut ToolOutput,
-    stdout_timed_out: bool,
-    stderr_timed_out: bool,
-) {
-    let note = match (stdout_timed_out, stderr_timed_out) {
-        (true, true) => {
-            "\n(stdout/stderr drain timed out; output may be truncated: a background process likely held the pipe open past the child's exit)"
-        }
-        (true, false) => {
-            "\n(stdout drain timed out; output may be truncated: a background process likely held the pipe open past the child's exit)"
-        }
-        (false, true) => {
-            "\n(stderr drain timed out; output may be truncated: a background process likely held the pipe open past the child's exit)"
-        }
-        (false, false) => return,
-    };
+/// Tell the model that the drains were stopped with a pipe still open, so output printed after
+/// that point by whatever held it is not in the result.
+fn append_drain_stopped_note(output: &mut ToolOutput) {
+    let note = format!(
+        "\n(a background process kept the output pipe open for {} seconds past the command's \
+         exit; anything it printed after that is not included)",
+        DRAIN_TIMEOUT.as_secs()
+    );
     if let Some(crate::conversation::ToolResultContent::Text { text }) = output.content.last_mut() {
-        text.push_str(note);
+        text.push_str(&note);
     }
 }
 
@@ -1523,38 +1278,59 @@ mod tests {
             .collect()
     }
 
-    /// The sweep removes only meka's own stale scratch directories: a fresh one belongs to a
-    /// running command, and a stranger's directory in a shared temp directory is not meka's to
-    /// delete however old it is.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_sweep_removes_only_meka_s_own_stale_scratch_directories() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let base = temp.path();
-        let stale = base.join("meka-command-scratch-stale");
-        let fresh = base.join("meka-command-scratch-fresh");
-        let stranger = base.join("someone-elses-old-directory");
-        for directory in [&stale, &fresh, &stranger] {
-            std::fs::create_dir(directory).expect("create");
-            std::fs::write(directory.join("left-behind.txt"), "x").expect("fill");
+    /// A frontend that keeps every output delta it is handed, so a test can see what the relay
+    /// sent and when.
+    #[derive(Default)]
+    struct ChunkRecorder {
+        chunks: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ChunkRecorder {
+        fn relayed(&self) -> String {
+            self.chunks.lock().expect("lock").concat()
         }
-        let old = std::time::SystemTime::now()
-            - (CAPTURE_RETENTION + std::time::Duration::from_secs(3600));
-        for directory in [&stale, &stranger] {
-            std::fs::File::open(directory)
-                .expect("open")
-                .set_times(std::fs::FileTimes::new().set_modified(old))
-                .expect("age the directory");
+    }
+
+    #[async_trait]
+    impl crate::frontend::Frontend for ChunkRecorder {
+        async fn emit(&self, event: crate::frontend::FrontendEvent) {
+            if let crate::frontend::FrontendEvent::ToolCallOutputDelta { chunk, .. } = event
+                && let Ok(mut chunks) = self.chunks.lock()
+            {
+                chunks.push(chunk);
+            }
         }
 
-        sweep_stale_scratch(base);
+        async fn request_permission(
+            &self,
+            _request: crate::frontend::PermissionRequest,
+        ) -> crate::frontend::PermissionOutcome {
+            crate::frontend::PermissionOutcome::Deny
+        }
+    }
 
-        assert!(
-            !stale.exists(),
-            "a stale scratch directory of ours is removed"
-        );
-        assert!(fresh.exists(), "a fresh one is a running command's");
-        assert!(stranger.exists(), "a stranger's directory is left alone");
+    /// A relay into `recorder`, tagged as one tool call.
+    fn relay_into(recorder: &Arc<ChunkRecorder>) -> Option<OutputRelay> {
+        let frontend: Arc<dyn crate::frontend::Frontend> = recorder.clone();
+        Some(OutputRelay {
+            frontend,
+            tool_call_id: "call_1".to_string(),
+        })
+    }
+
+    /// A drain over `reader` with the real bound and nothing telling it to stop: what a command
+    /// that behaves gets.
+    async fn drain_for_test<R>(reader: R, relay: Option<OutputRelay>) -> String
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        drain_output(
+            Some(reader),
+            relay,
+            Arc::new(OutputBudget::new(MAX_OUTPUT_BYTES)),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
     }
 
     /// Construct an `ExecuteCommandTool` for tests with a backend probe matching whatever the host
@@ -1622,9 +1398,9 @@ mod tests {
         );
 
         let crate::frontend::ToolOutputMetadata::CommandExit { exit_code, signal } =
-            timed_out_exit_metadata()
+            killed_exit_metadata()
         else {
-            panic!("timeout must report a command exit");
+            panic!("a kill must report a command exit");
         };
         assert_eq!(
             exit_code, None,
@@ -1669,41 +1445,14 @@ mod tests {
     /// split on every character.
     #[tokio::test]
     async fn reader_relays_chunks_without_splitting_characters() {
-        #[derive(Default)]
-        struct ChunkRecorder {
-            chunks: std::sync::Mutex<Vec<String>>,
-        }
-
-        #[async_trait]
-        impl crate::frontend::Frontend for ChunkRecorder {
-            async fn emit(&self, event: crate::frontend::FrontendEvent) {
-                if let crate::frontend::FrontendEvent::ToolCallOutputDelta { chunk, .. } = event
-                    && let Ok(mut chunks) = self.chunks.lock()
-                {
-                    chunks.push(chunk);
-                }
-            }
-
-            async fn request_permission(
-                &self,
-                _request: crate::frontend::PermissionRequest,
-            ) -> crate::frontend::PermissionOutcome {
-                crate::frontend::PermissionOutcome::Deny
-            }
-        }
-
         let recorder = Arc::new(ChunkRecorder::default());
-        let frontend: Arc<dyn crate::frontend::Frontend> = recorder.clone();
-        let relay = Some(OutputRelay {
-            frontend,
-            tool_call_id: "call_1".to_string(),
-        });
+        let relay = relay_into(&recorder);
 
         let source = "ünïcödé ✓ done\n";
         // `tokio::io::AsyncRead` over a byte slice yields whatever the caller's buffer allows, so
         // cap reads at one byte to guarantee every multi-byte character straddles a read.
         let reader = tokio::io::AsyncReadExt::take(source.as_bytes(), u64::MAX);
-        let collected = read_to_string_best_effort(Some(OneByteAtATime(reader)), relay).await;
+        let collected = drain_for_test(OneByteAtATime(reader), relay).await;
 
         assert_eq!(collected, source, "the full stream must survive intact");
         let chunks = recorder.chunks.lock().expect("lock").clone();
@@ -1718,227 +1467,159 @@ mod tests {
         );
     }
 
-    /// The relay must survive the stream outgrowing the ceiling.
-    ///
-    /// `relayed` is an index into the same buffer the capture trims, so the trim has to shift it by
-    /// what was dropped rather than clamp it to the new length. That marked the carried
-    /// incomplete-UTF-8 bytes as sent, so the next read began mid-character, `valid_up_to()`
-    /// returned 0, and its whole 8 KB vanished from the live stream while still reaching the
-    /// capture. Only multi-byte output shows it, and only once past the ceiling: the two conditions
-    /// this test puts together, which is why neither existing test caught it.
+    /// The relay must reassemble to the source across a stream of many reads, each carrying a
+    /// partial character into the next: `relayed` is a cursor into the drain's buffer, and a cursor
+    /// that drifts by one byte loses a whole read from the live view while the result stays
+    /// complete, which no single-read test can show.
     #[tokio::test]
-    async fn the_relay_loses_nothing_when_the_stream_outgrows_the_ceiling() {
-        #[derive(Default)]
-        struct ChunkRecorder {
-            chunks: std::sync::Mutex<Vec<String>>,
-        }
-
-        #[async_trait]
-        impl crate::frontend::Frontend for ChunkRecorder {
-            async fn emit(&self, event: crate::frontend::FrontendEvent) {
-                if let crate::frontend::FrontendEvent::ToolCallOutputDelta { chunk, .. } = event
-                    && let Ok(mut chunks) = self.chunks.lock()
-                {
-                    chunks.push(chunk);
-                }
-            }
-
-            async fn request_permission(
-                &self,
-                _request: crate::frontend::PermissionRequest,
-            ) -> crate::frontend::PermissionOutcome {
-                crate::frontend::PermissionOutcome::Deny
-            }
-        }
-
+    async fn the_relay_loses_nothing_across_a_stream_of_many_reads() {
         // A 3-byte character repeated, so no power-of-two read size can land on a boundary and
         // every read carries a partial character into the next.
         let unit = "日";
-        let source = unit.repeat(MAX_RESIDENT_OUTPUT_BYTES / unit.len() + 4096);
-        assert!(source.len() > MAX_RESIDENT_OUTPUT_BYTES, "must overflow");
+        let source = unit.repeat(crate::text::MIB / unit.len() + 4096);
 
         let recorder = Arc::new(ChunkRecorder::default());
-        let frontend: Arc<dyn crate::frontend::Frontend> = recorder.clone();
-        let relay = Some(OutputRelay {
-            frontend,
-            tool_call_id: "call_1".to_string(),
-        });
+        let relay = relay_into(&recorder);
 
-        let collected = read_to_string_best_effort(
-            Some(std::io::Cursor::new(source.clone().into_bytes())),
-            relay,
-        )
-        .await;
+        let collected =
+            drain_for_test(std::io::Cursor::new(source.clone().into_bytes()), relay).await;
 
+        assert_eq!(collected, source, "the result is the whole stream");
         let chunks = recorder.chunks.lock().expect("lock").clone();
         assert_eq!(
             chunks.concat(),
             source,
-            "every byte printed must reach the client, capture or no capture",
+            "every byte printed must reach the client",
         );
         assert!(
             !chunks.iter().any(|chunk| chunk.contains('\u{fffd}')),
             "and no chunk may be cut mid-character",
         );
-
-        // Clean up the capture the overflow created.
-        if let Some(start) = collected.find("the complete output is at ") {
-            let start = start + "the complete output is at ".len();
-            if let Some(end) = collected[start..].find(')') {
-                let _ = std::fs::remove_file(std::path::Path::new(&collected[start..start + end]));
-            }
-        }
     }
 
-    /// A command that outruns the turn must not take the process with it, and must not lose what
-    /// it printed either. Past the ceiling the stream goes to a file and the result carries both
-    /// ends plus the path, so the model sees the shape and can read the rest.
+    /// A drain stops reading once the budget is spent, keeps every byte it read including the
+    /// chunk that crossed the line, and raises the signal the spawn kills the command on. Nothing
+    /// is elided: what the model gets is a prefix of what the command printed.
     #[tokio::test]
-    async fn an_oversized_stream_is_captured_to_a_file_rather_than_held_in_memory() {
-        // One byte more than the ceiling, with distinct ends so both are identifiable.
-        let mut source = Vec::with_capacity(MAX_RESIDENT_OUTPUT_BYTES + 64);
+    async fn a_drain_stops_at_the_output_bound_and_keeps_what_it_read() {
+        let bound = 100 * crate::text::KIB;
+        let mut source = Vec::with_capacity(3 * bound);
         source.extend_from_slice(b"FIRST-LINE\n");
-        source.resize(MAX_RESIDENT_OUTPUT_BYTES + 32, b'x');
-        source.extend_from_slice(b"\nLAST-LINE\n");
-        let total = source.len();
+        source.resize(3 * bound, b'x');
+        let budget = Arc::new(OutputBudget::new(bound));
 
-        let collected =
-            read_to_string_best_effort(Some(std::io::Cursor::new(source.clone())), None).await;
+        let collected = drain_output(
+            Some(std::io::Cursor::new(source.clone())),
+            None,
+            Arc::clone(&budget),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
 
         assert!(
-            collected.len() < total,
-            "the result must not carry the whole stream inline"
+            budget.exhausted.is_cancelled(),
+            "spending the budget must raise the signal"
         );
         assert!(
-            collected.starts_with("FIRST-LINE\n"),
-            "the head must survive"
+            collected.len() >= bound && collected.len() < source.len(),
+            "the drain stops at the bound, not before and not at EOF: {} bytes",
+            collected.len()
         );
-        assert!(collected.ends_with("LAST-LINE\n"), "the tail must survive");
-        assert!(
-            collected.contains("bytes elided"),
-            "the cut must be disclosed: {}",
-            &collected[..collected.len().min(200)]
-        );
-
-        // Nothing is lost: the notice names a file holding every byte.
-        let marker = "the complete output is at ";
-        let start = collected.find(marker).expect("capture path") + marker.len();
-        let end = collected[start..].find(')').expect("capture path end") + start;
-        let path = std::path::PathBuf::from(&collected[start..end]);
-        let captured = std::fs::read(&path).expect("read capture");
-        std::fs::remove_file(&path).expect("clean up capture");
         assert_eq!(
-            captured.len(),
-            source.len(),
-            "the capture must hold the whole stream"
+            collected.as_bytes(),
+            &source[..collected.len()],
+            "what was kept is a prefix of the stream"
         );
-        assert_eq!(captured, source, "the capture must hold the whole stream");
     }
 
-    /// Captures are 8 MiB or more each, and nothing else ever removes them: a machine that runs
-    /// long builds accumulates one per overflow until the disk notices. The sweep runs on the
-    /// overflow path, so it costs a directory read only when something is about to be written
-    /// anyway, and it touches only meka's own names.
+    /// Both of a command's drains draw on one budget, so output split across stdout and stderr is
+    /// bounded as a whole rather than at twice the bound.
     #[tokio::test]
-    async fn stale_captures_are_swept_and_other_files_are_left_alone() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let old =
-            std::time::SystemTime::now() - (CAPTURE_RETENTION + std::time::Duration::from_secs(60));
+    async fn two_drains_share_one_budget() {
+        let bound = 100 * crate::text::KIB;
+        let budget = Arc::new(OutputBudget::new(bound));
+        // Each stream alone fits; together they do not.
+        let each = vec![b'y'; bound * 3 / 4];
 
-        let stale = directory.path().join("command-output-abc.log");
-        let fresh = directory.path().join("command-output-def.log");
-        let theirs = directory.path().join("someone-elses.log");
-        for path in [&stale, &fresh, &theirs] {
-            std::fs::write(path, b"x").expect("seed");
+        let (stdout, stderr) = tokio::join!(
+            drain_output(
+                Some(std::io::Cursor::new(each.clone())),
+                None,
+                Arc::clone(&budget),
+                tokio_util::sync::CancellationToken::new(),
+            ),
+            drain_output(
+                Some(std::io::Cursor::new(each.clone())),
+                None,
+                Arc::clone(&budget),
+                tokio_util::sync::CancellationToken::new(),
+            ),
+        );
+
+        assert!(budget.exhausted.is_cancelled(), "the pair spent the budget");
+        assert!(
+            stdout.len() + stderr.len() < 2 * each.len(),
+            "one of the drains stopped short: {} + {}",
+            stdout.len(),
+            stderr.len()
+        );
+        assert!(
+            stdout.len() + stderr.len() >= bound,
+            "and not before the bound was reached: {} + {}",
+            stdout.len(),
+            stderr.len()
+        );
+    }
+
+    /// A drain told to stop returns what it has read so far rather than waiting for a pipe that
+    /// something else is holding open; that is what makes a grandchild cost only its later output.
+    #[tokio::test]
+    async fn a_drain_told_to_stop_returns_what_it_has() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let recorder = Arc::new(ChunkRecorder::default());
+        let drain = tokio::spawn({
+            let stop = stop.clone();
+            let relay = relay_into(&recorder);
+            async move {
+                drain_output(
+                    Some(reader),
+                    relay,
+                    Arc::new(OutputBudget::new(MAX_OUTPUT_BYTES)),
+                    stop,
+                )
+                .await
+            }
+        });
+
+        writer.write_all(b"partial output\n").await.expect("write");
+        writer.flush().await.expect("flush");
+        // The writer stays open, so EOF never comes; only the signal ends the drain. Sent once the
+        // relay shows the drain has taken the bytes, so the test never races the read.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while recorder.relayed() != "partial output\n" {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the drain must read what was written"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        for path in [&stale, &theirs] {
-            filetime::set_file_mtime(path, filetime::FileTime::from_system_time(old))
-                .expect("age the file");
-        }
+        stop.cancel();
 
-        sweep_stale_captures(directory.path()).await;
-
-        assert!(!stale.exists(), "an old capture must go");
-        assert!(
-            fresh.exists(),
-            "a recent one is still referenced by a live conversation"
-        );
-        assert!(
-            theirs.exists(),
-            "a file meka did not write is not meka's to delete, however old",
-        );
+        let collected = tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+            .await
+            .expect("the drain returns promptly once told to stop")
+            .expect("the drain task completes");
+        assert_eq!(collected, "partial output\n");
+        drop(writer);
     }
 
-    /// A capture file holds a command's whole output, which is as sensitive as the command: `env`,
-    /// a `curl -v` carrying an `Authorization` header, a database dump. It was created at whatever
-    /// the umask allowed, in a cache directory that on some setups is world-traversable, while meka
-    /// takes care to write its database at 0600 and its directories at 0700.
-    #[cfg(unix)]
+    /// The common case must be untouched: byte-for-byte what was printed.
     #[tokio::test]
-    async fn a_capture_file_is_readable_only_by_its_owner() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut source = Vec::with_capacity(MAX_RESIDENT_OUTPUT_BYTES + 64);
-        source.extend_from_slice(b"FIRST-LINE\n");
-        source.resize(MAX_RESIDENT_OUTPUT_BYTES + 32, b'x');
-        source.extend_from_slice(b"\nLAST-LINE\n");
-
-        let collected = read_to_string_best_effort(Some(std::io::Cursor::new(source)), None).await;
-
-        let marker = "the complete output is at ";
-        let start = collected.find(marker).expect("capture path") + marker.len();
-        let end = collected[start..].find(')').expect("capture path end") + start;
-        let path = std::path::PathBuf::from(&collected[start..end]);
-
-        let mode = std::fs::metadata(&path)
-            .expect("stat capture")
-            .permissions()
-            .mode()
-            & 0o777;
-        std::fs::remove_file(&path).expect("clean up capture");
-        assert_eq!(mode, 0o600, "got {mode:o}");
-    }
-
-    /// When the capture cannot be opened, the head still has to be the head.
-    ///
-    /// A failed capture left as "not capturing yet" runs the whole opening sequence again when the
-    /// ceiling is crossed a second time 8 MiB later, overwriting `head` with a slice from the
-    /// middle of the stream, which the result then prints as the beginning under a notice that
-    /// names the elision but not the lie. The same re-entry could also open a capture on the second
-    /// attempt, holding only the bytes from that point on while the notice called it the complete
-    /// output.
-    #[tokio::test]
-    async fn a_failed_capture_keeps_the_real_head_and_does_not_retry() {
-        FORCE_CAPTURE_FAILURE.with(|forced| forced.set(true));
-
-        // Past the ceiling twice, so the arm that opens the capture is reached more than once.
-        let mut source = Vec::with_capacity(MAX_RESIDENT_OUTPUT_BYTES * 2 + 64);
-        source.extend_from_slice(b"FIRST-LINE\n");
-        source.resize(MAX_RESIDENT_OUTPUT_BYTES * 2 + 32, b'x');
-        source.extend_from_slice(b"\nLAST-LINE\n");
-
-        let collected = read_to_string_best_effort(Some(std::io::Cursor::new(source)), None).await;
-        FORCE_CAPTURE_FAILURE.with(|forced| forced.set(false));
-
-        assert!(
-            collected.starts_with("FIRST-LINE\n"),
-            "the head must still be the start of the stream, got: {}",
-            &collected[..collected.len().min(80)],
-        );
-        assert!(collected.ends_with("LAST-LINE\n"), "the tail must survive");
-        assert!(
-            collected.contains("capturing them to a file failed"),
-            "and the notice must say the bytes are gone rather than name a file: {}",
-            &collected[..collected.len().min(200)],
-        );
-    }
-
-    /// The common case must be untouched: no file, no notice, byte-for-byte what was printed.
-    #[tokio::test]
-    async fn an_ordinary_stream_is_returned_whole_with_no_capture() {
+    async fn a_stream_within_the_bound_is_returned_whole() {
         let source = b"just a normal amount of output\n".to_vec();
-        let collected =
-            read_to_string_best_effort(Some(std::io::Cursor::new(source.clone())), None).await;
+        let collected = drain_for_test(std::io::Cursor::new(source.clone()), None).await;
         assert_eq!(collected.as_bytes(), source.as_slice());
     }
 
@@ -2015,6 +1696,197 @@ mod tests {
         assert!(
             !marker.exists(),
             "grandchild survived timeout and created marker at {marker:?}"
+        );
+    }
+
+    /// A command that outgrows the bound is stopped, and everything it printed up to the stop is in
+    /// the result: the record is complete, the model is told why the command ended and how much it
+    /// printed, and the kill is reported the way the timeout's is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_that_prints_past_the_bound_is_stopped_and_its_output_kept() {
+        let tool = tool_for_test(shared_permission_for_test(), false);
+        // Past the bound by a margin, with a recognizable first line, so the result can be checked
+        // for both ends of what it must hold.
+        let past_the_bound = MAX_OUTPUT_BYTES + 4 * crate::text::MIB;
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "command": format!(
+                        "echo FIRST-LINE; head -c {past_the_bound} /dev/zero | tr '\\0' x; \
+                         echo NEVER-REACHED"
+                    ),
+                    "timeout_ms": 60_000u64,
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("a stopped command is a result");
+
+        assert!(result.is_error, "a stopped command is a failed call");
+        let text = result.text_content();
+        assert!(
+            text.starts_with(&format!("{}\nFIRST-LINE\n", output_bound_reason())),
+            "the reason leads and what the command printed follows: {text:.120}"
+        );
+        assert!(
+            text.len() >= MAX_OUTPUT_BYTES,
+            "everything read up to the bound is kept, got {} bytes",
+            text.len()
+        );
+        assert!(
+            !text.contains("NEVER-REACHED"),
+            "the command was stopped rather than run to its end"
+        );
+        let Some(crate::frontend::ToolOutputMetadata::CommandExit { exit_code, signal }) =
+            result.frontend_metadata
+        else {
+            panic!("expected CommandExit metadata");
+        };
+        assert_eq!(exit_code, None, "a killed command has no exit code");
+        assert_eq!(signal.as_deref(), Some("SIGKILL"));
+    }
+
+    /// A child exits once its last write fits in the pipe, so it can finish within a pipe's worth
+    /// of the bound and leave the crossing to the drains' collection. That result must not read as
+    /// a clean exit: it leads with the cut and is an error, whatever the exit status says.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_whose_drains_reach_the_bound_after_it_exits_is_not_reported_clean() {
+        use std::os::unix::process::ExitStatusExt;
+        let budget = OutputBudget::new(16);
+        assert!(!budget.spend(32), "the budget is spent past its bound");
+        let stdout_task = tokio::spawn(async { "printed before the cut\n".to_string() });
+        let stderr_task = tokio::spawn(async { String::new() });
+
+        let result = finish_command(
+            Ok(std::process::ExitStatus::from_raw(0)),
+            stdout_task,
+            stderr_task,
+            &tokio_util::sync::CancellationToken::new(),
+            &budget,
+        )
+        .await
+        .expect("a result");
+
+        assert!(result.is_error, "a cut transcript is never a clean result");
+        let text = result.text_content();
+        assert!(
+            text.starts_with(&format!("{}\nprinted before the cut\n", output_cut_note())),
+            "the cut leads and the output follows: {text}"
+        );
+        let Some(crate::frontend::ToolOutputMetadata::CommandExit { exit_code, signal }) =
+            result.frontend_metadata
+        else {
+            panic!("expected CommandExit metadata");
+        };
+        assert_eq!(exit_code, Some(0), "the real exit status is still reported");
+        assert_eq!(signal, None);
+    }
+
+    /// End to end, a command whose output ends within a pipe's worth past the bound may exit
+    /// before or after the drains cross it, so either the bound arm or the exit arm can win.
+    /// Whichever does, the result is an error that leads with the bound.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_ending_just_past_the_bound_is_never_reported_clean() {
+        let tool = tool_for_test(shared_permission_for_test(), false);
+        let just_past = MAX_OUTPUT_BYTES + 100;
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "command": format!("head -c {just_past} /dev/zero | tr '\\0' x"),
+                    "timeout_ms": 60_000u64,
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("a result");
+
+        assert!(
+            result.is_error,
+            "output past the bound is never a clean result"
+        );
+        let text = result.text_content();
+        assert!(
+            text.starts_with(&output_bound_reason()) || text.starts_with(&output_cut_note()),
+            "the result leads with the bound either way: {text:.120}"
+        );
+        assert!(
+            text.len() >= MAX_OUTPUT_BYTES,
+            "everything read up to the bound is kept, got {} bytes",
+            text.len()
+        );
+    }
+
+    /// A command killed at its timeout keeps what it printed before the kill. A build that logged
+    /// for twenty-nine seconds and died at thirty used to come back as the timeout line alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_command_keeps_the_output_it_printed() {
+        let tool = tool_for_test(shared_permission_for_test(), false);
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "command": "echo before-the-stall; echo on-stderr >&2; sleep 30",
+                    "timeout_ms": 300u64,
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("a timeout is a result");
+
+        assert!(result.is_error);
+        let text = result.text_content();
+        let reason = timed_out_reason(
+            std::time::Duration::from_millis(300),
+            &OutputBudget::new(MAX_OUTPUT_BYTES),
+        );
+        assert!(
+            text.starts_with(&format!("{reason}\nbefore-the-stall\n")),
+            "the timeout is stated first and stdout printed before the kill follows: {text}"
+        );
+        assert!(
+            text.ends_with("--- stderr ---\non-stderr\n"),
+            "and so does stderr: {text}"
+        );
+    }
+
+    /// A grandchild that keeps the pipe open past the command's exit delays the result by the drain
+    /// timeout and costs only what it prints afterwards; what the command itself printed is kept,
+    /// and the result says why the pipe was abandoned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pipe_held_open_by_a_grandchild_does_not_lose_the_output_already_read() {
+        let tool = tool_for_test(shared_permission_for_test(), false);
+        // The shell exits at once; the backgrounded `sleep` inherits stdout and holds it open for
+        // longer than the drain timeout, then ends on its own.
+        let hold = DRAIN_TIMEOUT.as_secs() + 3;
+        let started = std::time::Instant::now();
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "command": format!("echo kept; sleep {hold} &"),
+                    "timeout_ms": 60_000u64,
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("the command itself succeeds");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(hold),
+            "the result arrives at the drain timeout, not when the grandchild lets go"
+        );
+        assert!(!result.is_error, "the command exited 0");
+        let text = result.text_content();
+        assert!(
+            text.starts_with("kept\n"),
+            "the output read before the pipe was abandoned is kept: {text}"
+        );
+        assert!(
+            text.contains("kept the output pipe open"),
+            "and the result says the drain stopped early: {text}"
         );
     }
 
@@ -2234,8 +2106,8 @@ mod tests {
         assert!(!result.is_error, "large output spuriously flagged as error");
         let text = result.text_content();
         assert!(
-            !text.contains("drain timed out"),
-            "unexpected drain-timeout note: {text:.200}"
+            !text.contains("kept the output pipe open"),
+            "unexpected drain note: {text:.200}"
         );
         assert!(
             text.trim().len() >= 5_242_880,
@@ -3379,97 +3251,13 @@ mod tests {
             );
         }
 
-        /// The scratch directory is removed when a command is killed too, on timeout and on
-        /// cancellation, not only when it ends on its own. Run at `workspace` so the command can
-        /// leave the directory's name in the root before it stalls, since a killed command's
-        /// output is not returned.
+        /// A shell under Landlock alone has no temporary directory: `TMPDIR` is not set for it and
+        /// `mktemp` is refused at `read`. Below `unrestricted` meka writes to nothing but its
+        /// store, and a real directory under the real `/tmp` was the one thing the Landlock dialect
+        /// wrote outside it.
         #[cfg(target_os = "linux")]
         #[tokio::test]
-        async fn a_killed_landlock_shell_still_loses_its_scratch_directory() {
-            let capability = crate::sandbox::detect();
-            if !matches!(
-                capability,
-                crate::sandbox::SandboxCapability::Landlock { .. }
-            ) {
-                eprintln!("skipping: no usable Landlock on this host");
-                return;
-            }
-            let temp = tempfile::tempdir().expect("tempdir");
-            let root = crate::workspace::canonical_for_test(temp.path());
-
-            for (label, timeout_ms, cancel_after) in [
-                ("timeout", 500u64, None),
-                (
-                    "cancellation",
-                    30_000,
-                    Some(std::time::Duration::from_millis(300)),
-                ),
-            ] {
-                let mut tool = super::tool_for_test(
-                    crate::permission::SharedPermission::new(
-                        Permission::Workspace,
-                        crate::permission::EnabledPermissions::ALL,
-                    ),
-                    true,
-                );
-                tool.backend_probe = crate::sandbox::BackendProbe::Ok(capability.clone());
-                tool.sandbox_capability = capability.clone();
-                tool.site.cwd = crate::workspace::SharedCwd::new(root.clone());
-                tool.scope = crate::workspace::WriteScope::confined(vec![root.clone()]);
-                let marker = root.join(format!("{label}.marker"));
-                let token = CancellationToken::new();
-                if let Some(delay) = cancel_after {
-                    let token = token.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        token.cancel();
-                    });
-                }
-
-                let result = tool
-                    .execute(
-                        serde_json::json!({
-                            "command": format!("echo \"$TMPDIR\" > {} && sleep 30", marker.display()),
-                            "timeout_ms": timeout_ms,
-                        }),
-                        crate::tools::ToolContext::detached(token),
-                    )
-                    .await;
-                match label {
-                    "timeout" => {
-                        let text = super::text_of(&result.expect("a timeout is a result"));
-                        assert!(text.contains("timed out"), "{label}: {text}");
-                    }
-                    _ => assert!(
-                        matches!(result, Err(MekaError::Interrupted)),
-                        "{label}: a canceled command is interrupted: {result:?}"
-                    ),
-                }
-
-                let scratch = std::path::PathBuf::from(
-                    std::fs::read_to_string(&marker)
-                        .expect("the command wrote its scratch path before stalling")
-                        .trim(),
-                );
-                assert!(
-                    scratch
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with("meka-command-scratch-")),
-                    "{label}: TMPDIR named the scratch directory: {scratch:?}"
-                );
-                assert!(
-                    !scratch.exists(),
-                    "{label}: the scratch directory is removed after the kill"
-                );
-            }
-        }
-
-        /// A shell under Landlock gets a private temporary directory: `mktemp` works at `read`,
-        /// `TMPDIR` names it, and it is gone when the command is.
-        #[cfg(target_os = "linux")]
-        #[tokio::test]
-        async fn a_landlock_shell_gets_scratch_space_that_is_removed_after_the_command() {
+        async fn a_landlock_shell_has_no_temp_space() {
             let capability = crate::sandbox::detect();
             if !matches!(
                 capability,
@@ -3491,29 +3279,22 @@ mod tests {
             let result = tool
                 .execute(
                     serde_json::json!({
-                        "command": "f=$(mktemp) && echo \"$f\" && echo \"$TMPDIR\"",
+                        "command": "echo \"TMPDIR=${TMPDIR-unset}\"; mktemp && echo CREATED",
                     }),
                     crate::tools::ToolContext::detached(CancellationToken::new()),
                 )
                 .await
                 .expect("the shell itself must run");
             let text = super::text_of(&result);
-            let mut lines = text.lines();
-            let file = std::path::PathBuf::from(lines.next().unwrap_or_default());
-            let scratch = std::path::PathBuf::from(lines.next().unwrap_or_default());
-            let named = scratch
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("meka-command-scratch-"));
+            assert!(result.is_error, "mktemp is refused: {text}");
+            // The scrubbed environment passes the parent's own `TMPDIR` through when there is one,
+            // so the child sees exactly that and never a directory meka made for it.
+            let inherited = std::env::var("TMPDIR").unwrap_or_else(|_| "unset".to_string());
             assert!(
-                scratch.starts_with(std::env::temp_dir()) && named,
-                "TMPDIR names the command's own scratch directory: {text:?}"
+                text.contains(&format!("TMPDIR={inherited}\n")),
+                "no temporary directory of meka's is offered: {text}"
             );
-            assert!(file.starts_with(&scratch), "mktemp lands in it: {text:?}");
-            assert!(
-                !scratch.exists(),
-                "the scratch directory is removed after the command: {text:?}"
-            );
+            assert!(!text.contains("CREATED"), "{text}");
         }
 
         /// macOS has one `read`-level backend and `detect()` names it, so there is nothing to add.

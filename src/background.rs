@@ -223,11 +223,9 @@ impl BackgroundTasks {
 /// a scratchpad entry and the turn carries the head plus the entry name: a twenty-minute build log
 /// would otherwise land in the conversation permanently, for a result that mattered once.
 ///
-/// Coupled to `tools::shell`'s `OUTPUT_WINDOW_BYTES`, which is eight times larger and keeps both
-/// ends of an overflowing stream; `split_outcome` keeps only the head, because an outcome arrives
-/// unbidden and should cost less window than a result the model asked for. Raising this one past
-/// that one would deliver a turn wider than the tool's own result. Nothing is lost either way: the
-/// scratchpad holds all of it.
+/// `split_outcome` keeps only the head, because an outcome arrives unbidden and should cost less
+/// window than a result the model asked for. Nothing is lost either way: the scratchpad holds all
+/// of it.
 pub(crate) const OUTCOME_INLINE_LIMIT: usize = 4 * crate::text::KIB;
 
 /// Longest task label shown in the `[Background]` index and in delivered headers.

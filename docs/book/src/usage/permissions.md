@@ -108,8 +108,8 @@ Under Bubblewrap, `/tmp`, `/run` and `/var/tmp` are masked with a tmpfs, so path
 merely unwritable but invisible. A workspace root under `/tmp` is bound after the mask and stays
 reachable.
 
-meka's own directories are hidden too: the config directory, the data directory holding
-`meka.db` and every account credential, and the command-output captures. Bubblewrap masks them
+meka's own directories are hidden too: the config directory and the data directory holding
+`meka.db` and every account credential. Bubblewrap masks them
 after every workspace bind and `sandbox-exec` denies them last, so a confined command cannot read
 the credential store even from a workspace root at `$HOME` that contains it, and the in-process
 `file_write` and `file_edit` refuse a target under them whatever roots the session holds. The

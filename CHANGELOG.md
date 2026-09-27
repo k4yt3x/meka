@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.66.0] - 2026-09-27
+
+### Changed
+
+- A command may print 64 MiB across stdout and stderr; past that it is stopped and told why.
+- A command killed at its timeout or the output bound keeps everything it printed in its result.
+
+### Removed
+
+- Command-output capture files and the cache directory; a large output lives in the scratchpad.
+- The Landlock shell's private temporary directory; a tool that needs one wants Bubblewrap.
+
 ## [0.65.0] - 2026-09-26
 
 ### Added
@@ -2426,7 +2438,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.65.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.66.0...HEAD
+[0.66.0]: https://github.com/k4yt3x/meka/compare/0.65.0...0.66.0
 [0.65.0]: https://github.com/k4yt3x/meka/compare/0.64.1...0.65.0
 [0.64.1]: https://github.com/k4yt3x/meka/compare/0.64.0...0.64.1
 [0.64.0]: https://github.com/k4yt3x/meka/compare/0.63.0...0.64.0

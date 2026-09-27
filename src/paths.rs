@@ -67,17 +67,6 @@ pub(crate) fn meka_config_dir() -> Option<PathBuf> {
 pub(crate) fn meka_data_dir() -> Option<PathBuf> {
     data_dir_override().or_else(|| dirs::data_dir().map(|base| base.join("meka")))
 }
-/// Where `shell_execute` spools a command's output when it overflows the inline result.
-///
-/// `MEKA_DATA_DIR` first, so a run isolated to a scratch directory keeps its captures there too
-/// rather than dropping them in the real user's cache; otherwise the platform cache directory,
-/// since a capture is reproducible from the command that made it; otherwise the temp directory.
-pub(crate) fn command_output_dir() -> PathBuf {
-    data_dir_override()
-        .map(|path| path.join("command-output"))
-        .or_else(|| dirs::cache_dir().map(|directory| directory.join("meka")))
-        .unwrap_or_else(std::env::temp_dir)
-}
 /// `config.toml`'s path, under [`meka_config_dir`].
 pub(crate) fn config_file_path() -> Option<PathBuf> {
     meka_config_dir().map(|dir| dir.join("config.toml"))

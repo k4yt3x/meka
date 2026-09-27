@@ -393,6 +393,73 @@ fn no_module_reaches_a_layer_above_or_beside_it() {
     );
 }
 
+/// Files whose production code may name the process's temp directory, and why. An honest ledger
+/// like [`TOLERATED`]: an entry that stops being true fails the test too.
+const TEMP_DIRECTORY_USERS: &[(&str, &str)] = &[
+    (
+        "src/cli/memory.rs",
+        "`meka memory edit` hands the body to `$EDITOR` through a file, at the user's command",
+    ),
+    (
+        "src/store.rs",
+        "an in-memory store, which only tests open, needs a lock directory somewhere",
+    ),
+];
+
+/// Below `unrestricted`, the meka process writes to its store and nothing else. Production code
+/// names the temp directory only where [`TEMP_DIRECTORY_USERS`] says, and the platform cache
+/// directory nowhere. A new use of either is a new door out of the store, and has to be argued for
+/// in the ledger rather than slipped in as a fallback.
+#[test]
+fn production_code_names_the_temp_directory_only_where_the_ledger_says() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    source_files(&root.join("src"), &mut files);
+    files.sort();
+
+    let allowed: BTreeSet<&str> = TEMP_DIRECTORY_USERS.iter().map(|(file, _)| *file).collect();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut violations = Vec::new();
+
+    for path in &files {
+        let relative = path
+            .strip_prefix(root)
+            .expect("a path under the manifest directory")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source = fs::read_to_string(path).expect("read a source file");
+        let code = strip_test_code(&source)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if code.contains("cache_dir()") {
+            violations.push(format!("{relative} names the platform cache directory"));
+        }
+        if code.contains("temp_dir()") {
+            if allowed.contains(relative.as_str()) {
+                seen.insert(relative);
+            } else {
+                violations.push(format!("{relative} names the temp directory"));
+            }
+        }
+    }
+
+    for (file, _) in TEMP_DIRECTORY_USERS {
+        if !seen.contains(*file) {
+            violations.push(format!(
+                "{file} no longer names the temp directory; remove it from the ledger"
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "writes outside the store:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
 #[test]
 fn code_is_not_an_edge() {
     let source = "use crate::store::Store;\n#[cfg(test)]\nmod tests {\n    use crate::host::Sessions;\n    let close = \"\\n    }\\n\"; let open = '{'; // a brace: }\n    let raw = r#\"}\"#;\n}\n#[cfg(test)]\nuse crate::cli::Cli;\n#[cfg(test)]\n#[allow(dead_code)]\nfn helper() { crate::render::x(); }\nfn kept() { crate::agent::y(); }\n";

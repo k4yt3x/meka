@@ -10,6 +10,21 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.65 to 0.66
+
+**A shell under Landlock alone has no temporary directory.** 0.65 gave each Landlock-confined
+command a private directory under `/tmp`, named by `TMPDIR`. That was the one thing meka wrote
+outside its own store below `unrestricted`, and it is gone: `mktemp`, Python's `tempfile`, `gcc`
+and `patch` fail at `read` under Landlock as they did through 0.64. Install `bubblewrap`, whose
+private `/tmp` is a tmpfs inside the sandbox and touches nothing real, or add the directory a tool
+needs as a writable root at `workspace`.
+
+**Command output is bounded at 64 MiB and never spooled to disk.** A command that prints more
+than that across stdout and stderr is stopped, and the result carries everything it printed up to
+the stop. The capture files that used to hold an overflowing stream, under the platform cache
+directory or `MEKA_DATA_DIR/command-output`, are no longer written; any left from earlier releases
+can be deleted. A command killed at its timeout now keeps what it printed before the kill.
+
 ## 0.64 to 0.65
 
 **Landlock on its own needs ABI v9 (kernel 7.1).** Below that the kernel cannot refuse a

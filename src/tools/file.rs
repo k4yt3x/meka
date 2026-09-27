@@ -329,10 +329,10 @@ pub(super) async fn resolve_write_target(
 
 /// Ceiling on what one `file_read` will pull into memory.
 ///
-/// Sits above `MAX_RESIDENT_OUTPUT_BYTES` (8 MiB) on purpose: a command's output is produced by a
-/// process meka is already streaming and can spill, while a file is read whole in one call, and the
-/// text ends up in the conversation where the window is the real limit long before this is. Any
-/// file this large is one the model wants a slice of rather than the whole of.
+/// Far below the shell's output bound on purpose: a command's output is the record of what it did
+/// and is kept whole, while a file is read in one call and the text ends up in the conversation,
+/// where the window is the real limit long before this is. Any file this large is one the model
+/// wants a slice of rather than the whole of, and the file stays on disk to be sliced.
 const MAX_READ_FILE_BYTES: usize = 16 * crate::text::MIB;
 
 /// Lines a `file_read` returns from `start` when the caller names no `end`. Single source of truth

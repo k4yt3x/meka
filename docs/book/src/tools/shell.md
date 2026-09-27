@@ -19,9 +19,9 @@ Execute a shell command and return its output.
 - Executes the command via `sh -c "<command>"` on Unix, or `powershell.exe -NoProfile -NonInteractive -Command "<command>"` on Windows, whether or not the command is sandboxed.
 - Captures both stdout and stderr.
 - Returns the exit code along with the output if non-zero.
-- Oversized output is losslessly persisted to the scratchpad by the agent layer; the tool does not truncate what it returns to the agent, up to the residency ceiling below.
-- There is no cap on how much a command may print, but there is a cap on how much of it meka holds in memory. Past 8 MiB on one stream the bytes are written to a file instead, and the tool result carries the first and last 32 KiB plus that file's path, so the whole capture stays reachable with `file_read`. The file goes under `MEKA_DATA_DIR/command-output` when that variable is set, else the platform cache directory's `meka` subdirectory, else the temp directory; the temp directory is also the fallback when that directory cannot be created. Captures older than a day are swept on the way past. This exists because a command that writes faster than the turn ends (`cat /dev/zero`, a runaway build log) previously grew one buffer until the process died.
-- Default timeout is 30 seconds. If the command exceeds the timeout, it is killed (on Unix, via the process group so backgrounded grandchildren are caught too).
+- Oversized output is losslessly persisted to the scratchpad by the agent layer; the tool never truncates what it returns to the agent.
+- A command may print up to 64 MiB across stdout and stderr. Past that it is stopped, the way a timeout stops it, and the result states the reason and then carries everything it printed up to the stop. Nothing is elided and nothing is written to disk: the whole output is in the result, and in the scratchpad when it is too large for the conversation. The bound exists because a command that writes faster than the turn ends (`cat /dev/zero`, a runaway build log) would otherwise grow one buffer until the process died; a command that hits it wants a narrower rerun (`grep`, `head`, `tail`), not a larger bound.
+- Default timeout is 30 seconds. If the command exceeds the timeout, it is killed (on Unix, via the process group so backgrounded grandchildren are caught too), and the result keeps what it printed before the kill.
 - Supports cancellation: pressing Ctrl+C while a command is running kills the child process.
 
 ### Shell-specific semantics
@@ -52,18 +52,18 @@ The sandbox is not an adversarial containment boundary; it's defense-in-depth ag
 
 #### Scratch space
 
-A confined command gets somewhere to write temporary files, and where that is differs by backend:
+Whether a confined command has somewhere to write temporary files differs by backend:
 
 | Backend | Scratch space | Effect |
 |---|---|---|
 | Bubblewrap (`read`) | Private `/tmp` tmpfs, gone with the sandbox | `mktemp`, Python's `tempfile`, `gcc`, `patch` and `pip` builds all work |
-| Landlock (`read` and `workspace`) | A private directory per command, named by `TMPDIR`, `TMP` and `TEMP`, removed when the command ends | The same tools work; a program with a literal `/tmp` in it is still refused |
+| Landlock (`read` and `workspace`) | None outside the roots | Those tools fail with `Permission denied` |
 | Windows `workspace` | None outside the roots | `New-TemporaryFile` is denied (measured) |
 | macOS Seatbelt (`read`) | Per-backend; see below | |
 
-Under Bubblewrap the child writes into an in-memory `/tmp` that vanishes with the sandbox, so nothing real is touched. Landlock can only decide which real paths a process may touch, so meka creates an owner-only directory under the temp directory for each command, grants it in the ruleset, points `TMPDIR` at it and removes it afterwards; a directory a crash left behind is swept a day later. `git` needs none of this: its lock file lives inside the repository, which is read-only under both backends alike.
+Under Bubblewrap the child writes into an in-memory `/tmp` that exists only inside the sandbox's mount namespace, so nothing real is touched. Landlock can only decide which real paths a process may touch, and the only temporary directory meka could offer there would be a real one under the real `/tmp`; below `unrestricted` meka writes to nothing but its own store, so it offers none. A tool that needs temp files under Landlock is the reason to install Bubblewrap. `git` needs none of this: its lock file lives inside the repository, which is read-only under both backends alike.
 
-The practical cost is diagnostic: a program that ignores `TMPDIR` sees a bare `Permission denied` naming a path in `/tmp` (or `%TEMP%` on Windows), with nothing in the message connecting it to the sandbox. If a command fails that way and you expected it to work, add the directory it wants as a writable root at `workspace`.
+The practical cost is diagnostic: the failure is a bare `Permission denied` naming a path in `/tmp` (or `%TEMP%` on Windows), with nothing in the message connecting it to the sandbox. If a command fails that way and you expected it to work, add the directory it wants as a writable root at `workspace`.
 
 #### Environment variable scrubbing
 
