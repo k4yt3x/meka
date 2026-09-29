@@ -3663,14 +3663,17 @@ model = "gpt-5"
 /// as a single turn; i.e. the agent loop doesn't serialize across sessions.
 #[test]
 fn multi_session_parallel_happy_path() {
+    // Long enough that the overhead of a spawned server and two clients on a loaded shared
+    // runner, which passes a second and a half on Windows, stays well inside one sleep.
+    const TURN_SLEEP: Duration = Duration::from_millis(3000);
     let script = serde_json::json!([
         [
-            { "type": "sleep", "ms": 2000 },
+            { "type": "sleep", "ms": TURN_SLEEP.as_millis() },
             { "type": "text", "text": "done" },
             { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "type": "sleep", "ms": 2000 },
+            { "type": "sleep", "ms": TURN_SLEEP.as_millis() },
             { "type": "text", "text": "done" },
             { "type": "message_end", "stop_reason": "end_turn" }
         ]
@@ -3716,12 +3719,13 @@ fn multi_session_parallel_happy_path() {
         handle.join().expect("join");
     }
     let elapsed = started_at.elapsed();
-    // Each turn sleeps ~2000ms, so a serialized run would take ≥4000ms. The 3500ms bound
-    // clears the ~2000ms parallel time plus process-spawn and connection overhead (notably
-    // higher on Windows CI) while staying well under the serial time.
+    // A sleep never returns early, so a serialized run cannot finish before both have elapsed
+    // back to back: twice the sleep is the exact floor of the outcome ruled out here, and a
+    // tighter bound would only be a guess at the overhead.
+    let serial_floor = TURN_SLEEP * 2;
     assert!(
-        elapsed < Duration::from_millis(3500),
-        "parallel turns should complete in <3500ms; elapsed={elapsed:?}",
+        elapsed < serial_floor,
+        "parallel turns should complete in under {serial_floor:?}; elapsed={elapsed:?}",
     );
 }
 

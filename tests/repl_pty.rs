@@ -989,7 +989,8 @@ fn a_thinking_block_sits_inside_the_brackets() {
 
 /// Reasoning arrives in chunks that stop wherever the provider's tokenizer did, so a block is one
 /// block however it was cut up: one `Thinking... ` label, and words split across a chunk boundary
-/// rejoined rather than shown broken.
+/// rejoined rather than shown broken. The block opens behind the live indicator, whose row the
+/// label takes over at the first chunk, so that row is counted once too.
 ///
 /// The markers go too. Reasoning is markdown on the backends that emit a summary, where every part
 /// opens with a `**Bold header**` line, so a renderer that shows the asterisks shows them on every
@@ -997,7 +998,8 @@ fn a_thinking_block_sits_inside_the_brackets() {
 #[test]
 fn a_thinking_block_split_across_deltas_renders_as_one() {
     const SPLIT: &str = r#"[
- [{"type":"thinking_delta","text":"**Weighing the op"},
+ [{"type":"thinking_progress"},
+  {"type":"thinking_delta","text":"**Weighing the op"},
   {"type":"thinking_delta","text":"tions**\n\nBoth are fine."},
   {"type":"thinking_complete"},
   {"type":"text","text":"Here is the answer."},

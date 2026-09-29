@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.68.0] - 2026-09-29
+
 ### Added
 
 - `turn.started` carries `source: "compaction"` for the checkpoint turn `POST /compact` runs.
@@ -38,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `POST /compact` runs on the session's recorded profile and finishes after the client hangs up.
+- `show_content = true`: `Thinking...` appears as reasoning starts, not a paragraph later.
 - A stopped turn no longer resets the context reading to zero; the last measurement stands.
 - `/rewind` forgets the files the model had read, as a compaction does, so a later edit re-reads.
 - A steer that landed during a tool round no longer counts as a turn in `agent_list` or `/history`.
@@ -2498,7 +2501,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.67.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.68.0...HEAD
+[0.68.0]: https://github.com/k4yt3x/meka/compare/0.67.0...0.68.0
 [0.67.0]: https://github.com/k4yt3x/meka/compare/0.66.0...0.67.0
 [0.66.0]: https://github.com/k4yt3x/meka/compare/0.65.0...0.66.0
 [0.65.0]: https://github.com/k4yt3x/meka/compare/0.64.1...0.65.0

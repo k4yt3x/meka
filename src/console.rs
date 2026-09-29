@@ -429,6 +429,18 @@ impl Console {
     }
 
     fn act(&mut self, action: Action) {
+        // A streaming block spends its label ahead of the text it holds, so between two deltas
+        // its cursor may sit mid-row. `step` does not model that row, and does not need to: it is
+        // ended here, ahead of every action, so nothing that prints can land on it. Ended by the
+        // renderer rather than with a newline of this module's own, because the block resumes
+        // below with its indent only if its lead saw the row end.
+        let ended = self
+            .stream
+            .as_mut()
+            .map(|open| (open.kind, open.renderer.end_open_row()));
+        if let Some((kind, Err(error))) = ended {
+            self.lost_output(lost_output_of(kind), error);
+        }
         let (emit, next) = step(self.state, self.spacing, action);
         self.state = next;
         match emit.settle {
@@ -650,6 +662,15 @@ impl Console {
         self.open_stream_kind() == Some(StreamKind::Thinking)
     }
 
+    /// Whether a streaming block has left the cursor mid-row, for the tests of the door that ends
+    /// it.
+    #[cfg(test)]
+    pub(crate) fn has_open_row(&self) -> bool {
+        self.stream
+            .as_ref()
+            .is_some_and(|open| open.renderer.is_row_open())
+    }
+
     /// Whether this episode has printed anything, for [`crate::relay`]'s tests.
     ///
     /// The one bit of console state a caller outside this module can observe without a terminal,
@@ -792,6 +813,28 @@ mod tests {
 
     fn total_blanks(emits: &[Emit]) -> usize {
         emits.iter().map(blanks).sum()
+    }
+
+    /// A log line arriving while a thinking block holds its first paragraph lands under the label
+    /// rather than on its row, and the block stays open to continue below it.
+    #[test]
+    fn a_foreign_write_ends_the_row_a_streaming_block_left_open() {
+        let mut console = Console::new(NEITHER, RenderMode::Raw);
+        console.open_episode(RowState::Empty, Neighbor::Prompt);
+        console.thinking_delta("partial");
+        assert!(
+            console.has_open_row(),
+            "the label leaves the cursor mid-row"
+        );
+        console.announce_foreign_output();
+        assert!(
+            !console.has_open_row(),
+            "the row is ended before the foreign line"
+        );
+        assert!(
+            console.has_open_thinking(),
+            "and the block is still open to continue"
+        );
     }
 
     /// One typed line, answered by a turn that streams text: the shape every other case is a

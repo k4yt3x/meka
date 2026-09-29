@@ -69,8 +69,8 @@ pub(super) struct ThinkingIndicator {
 pub(super) enum IndicatorAction {
     /// Leave the line open: the indicator is redrawing itself.
     Keep,
-    /// Erase without a trace, because real thinking text is about to render in its place and would
-    /// otherwise print the `Thinking...` prefix twice for one phase of reasoning.
+    /// Erase without a trace, because the thinking block's own label is about to render in its
+    /// place and would otherwise print `Thinking...` twice for one phase of reasoning.
     Erase,
     /// Write the withheld newline, making the last figure drawn a permanent line.
     Commit,

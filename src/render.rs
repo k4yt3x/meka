@@ -317,7 +317,9 @@ impl StreamingRenderer {
     /// [`crate::console::RowState`] honest: it tracks who has parked the cursor mid-row, and a
     /// renderer holding a terminator back would be a third such writer that the state machine does
     /// not model. A mid-turn `tracing` line would then be appended to the model's last row instead
-    /// of settling it first, and a piped answer would end without a newline.
+    /// of settling it first, and a piped answer would end without a newline. The one row left open
+    /// on purpose is the label's, spent ahead of its text by [`Self::open_lead`]; the console ends
+    /// it through [`Self::end_open_row`] before any other writer prints.
     fn write(&mut self, text: &str) -> io::Result<()> {
         if text.is_empty() {
             return Ok(());
@@ -351,10 +353,44 @@ impl StreamingRenderer {
     /// Close the block: drop the blank rows held behind it, and end the row if one is still open.
     fn settle_last_row(&mut self) -> io::Result<()> {
         self.held_blank_rows = 0;
+        self.end_open_row()
+    }
+
+    /// End the row if one is open, for another writer about to take the terminal mid-block.
+    ///
+    /// Goes through the lead, so the block resumes below the foreign line behind its indent
+    /// rather than at column zero. The held blank rows stay held: they separate this block's text
+    /// from its own continuation, which the foreign line does not change.
+    pub(crate) fn end_open_row(&mut self) -> io::Result<()> {
         if !std::mem::take(&mut self.row_open) {
             return Ok(());
         }
         self.write_through("\n")
+    }
+
+    /// Whether the last write left the cursor mid-row, for the console's tests.
+    #[cfg(test)]
+    pub(crate) fn is_row_open(&self) -> bool {
+        self.row_open
+    }
+
+    /// Write the lead's label ahead of its text, at the first delta of the block.
+    ///
+    /// Every mode holds text back until it settles (a line, a paragraph, a whole table), so
+    /// nothing else can mark the phase while the first of it is still arriving. On the REPL the
+    /// label takes the row the transient indicator gives up at this same delta, which otherwise
+    /// stays blank for as long as the first paragraph takes.
+    fn open_lead(&mut self) -> io::Result<()> {
+        let Some((lead, owes)) = self.lead.as_mut() else {
+            return Ok(());
+        };
+        if *owes != Owes::Opening {
+            return Ok(());
+        }
+        let label = format!("{}", lead.opening.with(lead.color));
+        *owes = Owes::Nothing;
+        self.row_open = true;
+        self.write_bytes(&label)
     }
 
     /// The write itself, once what to write has been decided.
@@ -370,12 +406,17 @@ impl StreamingRenderer {
                 std::borrow::Cow::Owned(led)
             }
         };
+        self.write_bytes(&text)
+    }
+
+    /// The bytes as they leave, to the sink or to a test's capture.
+    fn write_bytes(&mut self, text: &str) -> io::Result<()> {
         #[cfg(test)]
         if let Some(capture) = self.capture.as_mut() {
-            capture.push_str(&text);
+            capture.push_str(text);
             return Ok(());
         }
-        self.sink.write(&text)
+        self.sink.write(text)
     }
 
     /// Write one line of *plain* text, wrapped to the budget when there is one.
@@ -442,6 +483,7 @@ impl StreamingRenderer {
                 return Ok(());
             }
             self.started = true;
+            self.open_lead()?;
             trimmed
         };
 
@@ -2284,6 +2326,36 @@ mod tests {
     fn a_full_thinking_block_is_stripped_but_keeps_its_lines() {
         let body = thinking_rows("one\n\u{1b}[2Jtwo\nthree", RenderMode::Raw, TEST_WIDTH);
         assert_eq!(body, "Thinking... one\n  two\n  three\n");
+    }
+
+    /// The label goes out with the first delta, ahead of the text every mode holds back, so the
+    /// row the indicator gives up is never blank. A row another writer ends mid-hold is continued
+    /// below behind the indent, with the held text intact.
+    #[test]
+    fn the_label_is_spent_on_the_first_delta_not_the_first_settled_row() {
+        for mode in [RenderMode::Raw, RenderMode::Termimad] {
+            let mut renderer = super::StreamingRenderer::for_thinking(mode).capturing(TEST_WIDTH);
+            renderer
+                .push_delta("partial")
+                .expect("a captured write cannot fail");
+            assert_eq!(
+                strip_ansi_escapes(renderer.captured()),
+                "Thinking... ",
+                "{mode:?}: the label waits for the paragraph"
+            );
+            renderer
+                .end_open_row()
+                .expect("a captured write cannot fail");
+            renderer
+                .push_delta(" rest\n\n")
+                .expect("a captured write cannot fail");
+            renderer.finish().expect("a captured write cannot fail");
+            assert_eq!(
+                strip_ansi_escapes(renderer.captured()),
+                "Thinking... \n  partial rest\n",
+                "{mode:?}"
+            );
+        }
     }
 
     /// A paragraph break between two chunks survives, having been held across the gap.
