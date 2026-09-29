@@ -103,9 +103,13 @@ pub(super) fn back_up_before_migrating(
     Ok(Some(target))
 }
 
-/// Flush `path`'s bytes to the disk.
+/// Flush `path`'s bytes to the disk. Opened for writing, because Windows flushes only a handle
+/// that may write; a read-only one is refused with access denied.
 fn sync_file(path: &Path) -> std::io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()
 }
 
 /// Flush the directory entries of `directory` to the disk, which is what makes a rename durable.

@@ -451,6 +451,13 @@ impl Tool for ExecuteCommandTool {
             .await;
         }
 
+        // Admitted as sandboxed on the probe, spawned on the capability: the two agree today, and
+        // this is what keeps a disagreement from running the command unconfined.
+        #[cfg(windows)]
+        if sandboxed {
+            return Err(unconfinable_command());
+        }
+
         #[cfg(windows)]
         let mut command_builder = {
             // Wrap with the UTF-8 output prelude so pipe output matches what the sandboxed path
