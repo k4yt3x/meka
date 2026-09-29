@@ -1269,6 +1269,7 @@ impl Store {
                          input_tokens, output_tokens,
                          cache_creation_input_tokens, cache_read_input_tokens,
                          redactions, redacted_images, redacted_bytes,
+                         prompt_index, turn_index,
                          context_tokens, title
                      )
                      SELECT ?1, ?2, ?2, parent_session_id, subagent_spec_json,
@@ -1279,6 +1280,7 @@ impl Store {
                             input_tokens, output_tokens,
                             cache_creation_input_tokens, cache_read_input_tokens,
                             redactions, redacted_images, redacted_bytes,
+                            prompt_index, turn_index,
                             context_tokens, title
                      FROM sessions WHERE id = ?7",
                     rusqlite::params![
@@ -1625,8 +1627,8 @@ impl Store {
                              turns, input_tokens, output_tokens,
                              cache_creation_input_tokens, cache_read_input_tokens,
                              redactions, redacted_images, redacted_bytes,
-                             title, pinned_at
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                             title, pinned_at, prompt_index, turn_index
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
                         rusqlite::params![
                             session.id,
                             session.created_at,
@@ -1649,6 +1651,8 @@ impl Store {
                             session.stats.redacted_bytes as i64,
                             session.title,
                             session.pinned_at,
+                            session.stats.turn_position.map(|position| position.prompt_index as i64),
+                            session.stats.turn_position.map(|position| position.turn_index as i64),
                         ],
                     )?;
                     {
@@ -1951,7 +1955,9 @@ impl Store {
                          cache_read_input_tokens = ?6,
                          redactions = ?7,
                          redacted_images = ?8,
-                         redacted_bytes = ?9
+                         redacted_bytes = ?9,
+                         prompt_index = ?10,
+                         turn_index = ?11
                      WHERE id = ?1",
                     rusqlite::params![
                         session_id.to_string(),
@@ -1963,6 +1969,12 @@ impl Store {
                         stats.redactions as i64,
                         stats.redacted_images as i64,
                         stats.redacted_bytes as i64,
+                        stats
+                            .turn_position
+                            .map(|position| position.prompt_index as i64),
+                        stats
+                            .turn_position
+                            .map(|position| position.turn_index as i64),
                     ],
                 )?;
                 Ok(())
@@ -1982,12 +1994,26 @@ impl Store {
                 let result = connection.query_row(
                     "SELECT turns, input_tokens, output_tokens,
                             cache_creation_input_tokens, cache_read_input_tokens,
-                            redactions, redacted_images, redacted_bytes
+                            redactions, redacted_images, redacted_bytes,
+                            prompt_index, turn_index
                      FROM sessions WHERE id = ?1",
                     rusqlite::params![session_id.to_string()],
                     |row| {
+                        // Both columns or neither: a session that numbers nothing holds NULL in
+                        // each, and a pair with one side missing is a row nothing here wrote.
+                        let turn_position =
+                            match (row.get::<_, Option<i64>>(8)?, row.get::<_, Option<i64>>(9)?) {
+                                (Some(prompt_index), Some(turn_index)) => {
+                                    Some(crate::stats::TurnPosition {
+                                        prompt_index: prompt_index as u64,
+                                        turn_index: turn_index as u64,
+                                    })
+                                }
+                                _ => None,
+                            };
                         Ok(crate::stats::SessionStatsSnapshot {
                             turns: row.get::<_, i64>(0)? as u64,
+                            turn_position,
                             input_tokens: row.get::<_, i64>(1)? as u64,
                             output_tokens: row.get::<_, i64>(2)? as u64,
                             cache_creation_input_tokens: row.get::<_, i64>(3)? as u64,
@@ -3538,6 +3564,10 @@ mod tests {
         store
             .save_session_stats(id, &crate::stats::SessionStatsSnapshot {
                 turns: 3,
+                turn_position: Some(crate::stats::TurnPosition {
+                    prompt_index: 2,
+                    turn_index: 3,
+                }),
                 input_tokens: 4242,
                 ..Default::default()
             })
@@ -3596,6 +3626,14 @@ mod tests {
             .expect("copy stats");
         assert_eq!(copy_stats.turns, 3);
         assert_eq!(copy_stats.input_tokens, 4242);
+        assert_eq!(
+            copy_stats.turn_position,
+            Some(crate::stats::TurnPosition {
+                prompt_index: 2,
+                turn_index: 3,
+            }),
+            "the copy continues numbering where the source stood"
+        );
         assert!(
             copy.token_id.is_none(),
             "the bearer-token fingerprint is never inherited"
@@ -4273,6 +4311,9 @@ mod tests {
             // Reset by a fork: a pin is the user's choice about one session, and the copy is a
             // new one they have not made it about.
             "pinned_at",
+            // Copied by a fork: the copy continues numbering its turns where the source stood.
+            "prompt_index",
+            "turn_index",
         ]);
     }
 
@@ -5073,6 +5114,10 @@ mod tests {
 
         let snapshot = crate::stats::SessionStatsSnapshot {
             turns: 5,
+            turn_position: Some(crate::stats::TurnPosition {
+                prompt_index: 4,
+                turn_index: 5,
+            }),
             input_tokens: 100,
             output_tokens: 50,
             cache_creation_input_tokens: 10,
@@ -5105,6 +5150,20 @@ mod tests {
             .await
             .expect("load unknown");
         assert_eq!(unknown.turns, 0);
+        // A session that numbers nothing holds NULL in both columns and comes back that way.
+        store
+            .save_session_stats(session_id, &crate::stats::SessionStatsSnapshot {
+                turn_position: None,
+                ..snapshot.clone()
+            })
+            .await
+            .expect("save unnumbered");
+        let unnumbered = store
+            .load_session_stats(session_id)
+            .await
+            .expect("load unnumbered");
+        assert_eq!(unnumbered.turn_position, None);
+        assert_eq!(unnumbered.turns, 5);
     }
 
     #[tokio::test]

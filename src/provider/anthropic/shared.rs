@@ -139,7 +139,7 @@ pub(super) fn model_is_haiku(model: &str) -> bool {
 /// first-party feature an arbitrary endpoint may not implement.
 ///
 /// The `max_tokens` sent when the profile states no `max_output_tokens`: 128000 under adaptive
-/// thinking, which is what Claude Code 2.1.280 sends for Opus 5.5 (verified by wire capture), the
+/// thinking, which is what Claude Code 2.1.284 sends for Opus 5.5 (verified by wire capture), the
 /// model `profile add` suggests, and the most every model that takes adaptive thinking accepts;
 /// 32000 otherwise, raised to twice the budget under budgeted thinking when that is more. Claude
 /// Code reads the figure off a per-model catalog, which says 64000 for the rest of the line-up;
@@ -204,7 +204,7 @@ pub(super) fn model_supports_modern_features(model: &str) -> bool {
 }
 
 /// Whether a Claude model accepts the `temperature` sampling parameter. Mirrors Claude Code
-/// 2.1.280's gate, an **allowlist** of the models released before Opus 4.7, which still accept
+/// 2.1.284's gate, an **allowlist** of the models released before Opus 4.7, which still accept
 /// sampling params: the Claude 3.x line, Opus 4.0/4.1/4.5/4.6, Sonnet 4.0/4.5/4.6, and Haiku 4.5.
 /// Everything newer (Opus 4.7 and up, Sonnet 5, Fable/Mythos 5) rejects `temperature` with a 400.
 ///
@@ -234,7 +234,7 @@ pub(super) fn model_supports_temperature(model: &str) -> bool {
 
 /// Whether a Claude model accepts `output_config.effort`.
 ///
-/// A denylist mirroring Claude Code 2.1.280's own gate, which excludes the Claude 3.x line, Opus
+/// A denylist mirroring Claude Code 2.1.284's own gate, which excludes the Claude 3.x line, Opus
 /// 4.0/4.1, Sonnet 4.0/4.5 and Haiku 4.5 and sends the field to everything else on the first-party
 /// endpoint. Same reasoning and same single caller as
 /// [`model_supports_mid_conversation_system`]: an unrecognized name here is one *newer* than the
@@ -261,7 +261,7 @@ pub(super) fn model_supports_effort(model: &str) -> bool {
 /// The effort `claude-subscription` sends when the profile configures none.
 ///
 /// Claude Code reads a per-model `default_effort` out of a table bundled in its binary and clamps
-/// it to what that model accepts. `medium` is the 2.1.280 table's figure for Opus 5.5, the model
+/// it to what that model accepts. `medium` is the 2.1.284 table's figure for Opus 5.5, the model
 /// `profile add` suggests; most other entries say `high`, Opus 4.7's says `xhigh`, and `high` is
 /// what Claude Code falls back to for a model the table does not list.
 ///
@@ -275,7 +275,7 @@ pub(super) const DEFAULT_EFFORT: &str = "medium";
 /// Whether a Claude model supports mid-conversation system messages (the
 /// `mid-conversation-system-2026-04-07` beta).
 ///
-/// A **denylist**, mirroring Claude Code 2.1.280's gate model for model: the Claude 3.x line, Opus
+/// A **denylist**, mirroring Claude Code 2.1.284's gate model for model: the Claude 3.x line, Opus
 /// 4.0/4.1/4.5/4.6/4.7, Sonnet 4.0/4.5/4.6 and Haiku 4.5 are excluded, and everything else on the
 /// first-party endpoint is sent it. The direction is the opposite of
 /// [`model_supports_temperature`]'s and deliberately so, because the two fail in opposite ways: an
@@ -306,17 +306,17 @@ pub(super) fn model_supports_mid_conversation_system(model: &str) -> bool {
 /// Whether a Claude model takes Claude Code's per-turn effort statements (the
 /// `per-turn-control-2026-07-01` beta).
 ///
-/// An **allowlist**, because that is the direction Claude Code 2.1.280's own gate points: it
+/// An **allowlist**, because that is the direction Claude Code 2.1.284's own gate points: it
 /// reads the `per_turn_effort` capability off the model catalog bundled in its binary, and a
-/// model the catalog does not list gets nothing. The catalog grants it to Opus 5.5 and Fable 5.1
-/// alone, so an unrecognized name, which in practice means one newer than this list, resolves to
-/// `false` and the beta is omitted, which every model tolerates.
+/// model the catalog does not list gets nothing. The catalog grants it to Opus 5.5, Sonnet 5.5
+/// and Fable 5.1 alone, so an unrecognized name, which in practice means one newer than this
+/// list, resolves to `false` and the beta is omitted, which every model tolerates.
 pub(super) fn model_supports_per_turn_effort(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     let Some(version) = parse_model_version(&lower) else {
         return false;
     };
-    if lower.contains("opus") {
+    if lower.contains("opus") || lower.contains("sonnet") {
         version == (5, 5)
     } else if lower.contains("fable") {
         version == (5, 1)
@@ -328,17 +328,17 @@ pub(super) fn model_supports_per_turn_effort(model: &str) -> bool {
 /// Whether a Claude model accepts tool changes mid-conversation (the
 /// `mid-conversation-tool-changes-2026-07-01` beta).
 ///
-/// Claude Code 2.1.280 sends it where it sends the mid-conversation system beta, minus the one
-/// catalog entry that has `mid_conv_system` without `mid_conv_tool_change`, which is Sonnet 5; a
-/// model its catalog does not list is sent both. So this is
-/// [`model_supports_mid_conversation_system`]'s denylist plus Sonnet 5, pointed the same way for
-/// the same reason.
+/// Claude Code 2.1.284 sends it where it sends the mid-conversation system beta, minus the two
+/// catalog entries that have `mid_conv_system` without `mid_conv_tool_change`, which are Sonnet 5
+/// and Sonnet 5.5; a model its catalog does not list is sent both. So this is
+/// [`model_supports_mid_conversation_system`]'s denylist plus the two Sonnets, pointed the same
+/// way for the same reason.
 pub(super) fn model_supports_mid_conversation_tool_changes(model: &str) -> bool {
     if !model_supports_mid_conversation_system(model) {
         return false;
     }
     let lower = model.to_ascii_lowercase();
-    !(lower.contains("sonnet") && parse_model_version(&lower) == Some((5, 0)))
+    !(lower.contains("sonnet") && matches!(parse_model_version(&lower), Some((5, 0) | (5, 5))))
 }
 
 /// The name of an SSE frame: the `type` the data names, else the `event:` line.
@@ -364,7 +364,7 @@ pub(super) enum CacheBreakpoint {
 }
 
 impl CacheBreakpoint {
-    fn value(self) -> serde_json::Value {
+    pub(super) fn value(self) -> serde_json::Value {
         match self {
             Self::Ephemeral => serde_json::json!({"type": "ephemeral"}),
             Self::OneHour => serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
@@ -2306,8 +2306,8 @@ mod tests {
     }
 
     #[test]
-    fn per_turn_effort_goes_to_the_two_models_the_catalog_grants_it() {
-        for model in ["claude-opus-5-5", "claude-fable-5-1"] {
+    fn per_turn_effort_goes_to_the_three_models_the_catalog_grants_it() {
+        for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"] {
             assert!(model_supports_per_turn_effort(model), "{model}");
         }
         // An allowlist: the rest of the line-up and anything newer are left out, since Claude
@@ -2326,7 +2326,7 @@ mod tests {
     }
 
     #[test]
-    fn mid_conversation_tool_changes_follow_the_system_beta_except_on_sonnet_5() {
+    fn mid_conversation_tool_changes_follow_the_system_beta_except_on_the_sonnets() {
         for model in [
             "claude-opus-4-8",
             "claude-opus-5",
@@ -2342,6 +2342,7 @@ mod tests {
         }
         for model in [
             "claude-sonnet-5",
+            "claude-sonnet-5-5",
             "claude-sonnet-4-6",
             "claude-opus-4-7",
             "claude-haiku-4-5",

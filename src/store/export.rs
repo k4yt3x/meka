@@ -8,7 +8,7 @@ use super::*;
 /// away included: the reader takes this version's shape alone, and an older archive the migration
 /// module knows is brought forward before it is read. `meka session import` refuses any other
 /// version.
-pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 5;
+pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 6;
 /// Decode an archive, refusing one written for another `format_version` before its shape is read.
 ///
 /// The version is read on its own first, because a release that changed the shape also changed

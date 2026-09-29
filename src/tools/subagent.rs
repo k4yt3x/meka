@@ -1945,14 +1945,22 @@ async fn build_subagent(
         &spec.inherited_scratchpad,
     );
 
+    // A worker two levels down names the worker that spawned it, the way Claude Code's nested
+    // sub-agent names its parent; the root is no agent in that sense and is not named.
+    let parent_agent_id = (spec.absolute_depth >= 2)
+        .then(|| params.cells.session_id.get())
+        .flatten()
+        .map(crate::provider::WorkerIdentity::agent_id_for);
     Ok(Agent::new_subagent(
         &params.materials,
         sub_cells,
         sub_registry,
         &parent_options,
         sub_system_prompt,
-        call.prompt_id,
-        call.turn_origin,
+        crate::agent::WorkerLineage {
+            prompt_id: call.prompt_id,
+            parent_agent_id,
+        },
     ))
 }
 
@@ -6695,7 +6703,6 @@ mod tests {
             session_id: None,
             tool_call_id: None,
             prompt_id: Some(prompt_id),
-            turn_origin: Some(crate::provider::TurnOrigin::Scheduled),
             frontend: Arc::new(crate::frontend::SilentFrontend),
             cancellation: CancellationToken::new(),
         };
@@ -6715,11 +6722,21 @@ mod tests {
             vec![Some(spawning_prompt)],
             "the spawned worker's request must bill to the prompt that spawned it"
         );
-        assert_eq!(
-            provider.completion_turn_origins(),
-            vec![Some(crate::provider::TurnOrigin::Scheduled)],
-            "and report where that prompt came from"
+        // The id alone: Claude Code's sub-agent requests name neither an origin nor a position.
+        assert_eq!(provider.completion_turn_origins(), vec![None]);
+        assert_eq!(provider.completion_turn_positions(), vec![None]);
+        // And they name the worker itself, in Claude Code's sub-agent id shape; a first-level
+        // worker has no worker above it to name.
+        let workers = provider.completion_workers();
+        let identity = workers[0].as_ref().expect("a worker names itself");
+        assert_eq!(identity.agent_id.len(), 17, "{}", identity.agent_id);
+        assert!(identity.agent_id.starts_with('a'));
+        assert!(
+            identity.agent_id[1..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
         );
+        assert_eq!(identity.parent_agent_id, None);
 
         let followup_prompt = Uuid::new_v4();
         let followup = followup_tool_for(params, provider.clone());
@@ -6734,6 +6751,45 @@ mod tests {
             provider.completion_prompt_ids(),
             vec![Some(spawning_prompt), Some(followup_prompt)],
             "a follow-up's request must bill to the prompt that asked for it"
+        );
+    }
+
+    /// A worker spawned by a worker names its spawner, the way Claude Code's nested sub-agent
+    /// carries its parent's agent id; the spawner's id is the one its own requests carry.
+    #[tokio::test]
+    async fn a_nested_workers_requests_name_the_worker_that_spawned_it() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+        );
+        let provider = mock(vec![text_round("spawned")]);
+        let spawn = AgentSpawnTool {
+            // The spawner sits one level down: it is a worker itself.
+            absolute_depth: 1,
+            remaining_depth: 2,
+            ..spawn_tool_for(params, provider.clone())
+        };
+        spawn
+            .execute(
+                serde_json::json!({ "prompt": "look into it", "permission": "read" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        let workers = provider.completion_workers();
+        let identity = workers[0].as_ref().expect("a worker names itself");
+        assert_eq!(
+            identity.parent_agent_id.as_deref(),
+            Some(crate::provider::WorkerIdentity::agent_id_for(parent_sid).as_str())
+        );
+        assert_ne!(
+            Some(identity.agent_id.as_str()),
+            identity.parent_agent_id.as_deref()
         );
     }
 

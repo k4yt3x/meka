@@ -153,6 +153,7 @@ REPL's [input history](./interactive-mode.md#input-history)), and `account_crede
 | `additional_roots_json` | TEXT | Workspace roots beyond `cwd` |
 | `subagent_spec_json` | TEXT | The terms a sub-agent was spawned under |
 | `turns`, `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `redactions`, `redacted_images`, `redacted_bytes` | INTEGER | The cumulative counters behind `/status` |
+| `prompt_index`, `turn_index` | INTEGER | The position of the last turn opened, which the Claude subscription wire reports; both NULL on a session that numbers nothing, which is one that had turns before the columns existed |
 | `profile` | TEXT | Profile the session runs on. Never NULL, though a row carried forward from a store that predates the column can hold `''` |
 | `context_tokens` | INTEGER | Context occupancy the provider last reported, which a resume checks its first turn against; NULL until a turn records one, and after a rewind |
 | `title` | TEXT | The title a user set, or NULL for a session labeled by its first words |
@@ -499,7 +500,7 @@ Pass `--format json` for a structured export instead of rendered Markdown:
 meka session export 550e8400-e29b-41d4-a716-446655440000 --format json
 ```
 
-This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, and scratchpad entries. The archive carries `format_version: 4`, and an import refuses any other version rather than guessing at its shape, except a 0.59 archive (`format_version: 3`), which differs only in the tool names 0.60 changed and is converted as it is read. Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
+This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, and scratchpad entries. The archive carries `format_version: 6`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 5), which is brought forward as it is read. Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
 
 ## Importing a session
 

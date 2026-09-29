@@ -4,7 +4,7 @@
 //! All fields are lock-free atomics so any task can update without contention; readers take a
 //! [`SessionStatsSnapshot`] for display.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 /// What one image-redaction pass removed from a request body.
 ///
@@ -20,10 +20,28 @@ pub(crate) struct Redaction {
     pub(crate) positions: Vec<crate::image::RedactedImage>,
 }
 
-/// A session's lifetime counters, updated by the agent as turns complete.
-#[derive(Debug, Default)]
+/// Where a turn stands in its conversation, as Claude Code stamps it on the message that opens a
+/// turn and reports it in its billing header: `turn_index` is the turn's 1-based ordinal and
+/// `prompt_index` counts the turns a person opened up to and including it, so it never exceeds
+/// `turn_index`. Every request of a turn carries the same pair. Before any turn is stamped both
+/// are zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TurnPosition {
+    pub(crate) prompt_index: u64,
+    pub(crate) turn_index: u64,
+}
+
+/// A session's lifetime counters, updated by the agent as turns complete, and the position of the
+/// turn it last opened.
+#[derive(Debug)]
 pub(crate) struct SessionStats {
     turns: AtomicU64,
+    /// Whether the session numbers its turns at all. The store says which sessions do not, as a
+    /// position of `NULL`, and nothing here decides it: a session that numbers nothing stays that
+    /// way, and every session starts numbering unless its row says otherwise.
+    numbered: AtomicBool,
+    prompt_index: AtomicU64,
+    turn_index: AtomicU64,
     input_tokens: AtomicU64,
     output_tokens: AtomicU64,
     cache_creation_input_tokens: AtomicU64,
@@ -33,12 +51,22 @@ pub(crate) struct SessionStats {
     redacted_bytes: AtomicU64,
 }
 
+impl Default for SessionStats {
+    fn default() -> Self {
+        Self::from_snapshot(&SessionStatsSnapshot::default())
+    }
+}
+
 impl SessionStats {
     /// Rebuild the counters from a persisted snapshot, so a resumed session continues its lifetime
     /// totals instead of restarting at zero.
     pub(crate) fn from_snapshot(snapshot: &SessionStatsSnapshot) -> Self {
+        let position = snapshot.turn_position.unwrap_or_default();
         Self {
             turns: AtomicU64::new(snapshot.turns),
+            numbered: AtomicBool::new(snapshot.turn_position.is_some()),
+            prompt_index: AtomicU64::new(position.prompt_index),
+            turn_index: AtomicU64::new(position.turn_index),
             input_tokens: AtomicU64::new(snapshot.input_tokens),
             output_tokens: AtomicU64::new(snapshot.output_tokens),
             cache_creation_input_tokens: AtomicU64::new(snapshot.cache_creation_input_tokens),
@@ -47,6 +75,22 @@ impl SessionStats {
             redacted_images: AtomicU64::new(snapshot.redacted_images),
             redacted_bytes: AtomicU64::new(snapshot.redacted_bytes),
         }
+    }
+
+    /// Stamp the turn about to open with its position and return it, or `None` for a session
+    /// that numbers nothing. Stamped at the open rather than at the close because the number is
+    /// the turn's whether or not it finishes.
+    pub(crate) fn stamp_turn(&self, human: bool) -> Option<TurnPosition> {
+        if !self.numbered.load(Relaxed) {
+            return None;
+        }
+        let position = TurnPosition {
+            prompt_index: self.prompt_index.load(Relaxed) + u64::from(human),
+            turn_index: self.turn_index.load(Relaxed) + 1,
+        };
+        self.prompt_index.store(position.prompt_index, Relaxed);
+        self.turn_index.store(position.turn_index, Relaxed);
+        Some(position)
     }
 
     /// Roll a successful turn's usage into the running totals.
@@ -88,6 +132,10 @@ impl SessionStats {
     pub(crate) fn snapshot(&self) -> SessionStatsSnapshot {
         SessionStatsSnapshot {
             turns: self.turns.load(Relaxed),
+            turn_position: self.numbered.load(Relaxed).then(|| TurnPosition {
+                prompt_index: self.prompt_index.load(Relaxed),
+                turn_index: self.turn_index.load(Relaxed),
+            }),
             input_tokens: self.input_tokens.load(Relaxed),
             output_tokens: self.output_tokens.load(Relaxed),
             cache_creation_input_tokens: self.cache_creation_input_tokens.load(Relaxed),
@@ -100,9 +148,11 @@ impl SessionStats {
 }
 
 /// [`SessionStats`] at one instant, as the session row persists them.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionStatsSnapshot {
     pub(crate) turns: u64,
+    /// The position of the last turn opened, or `None` for a session that numbers nothing.
+    pub(crate) turn_position: Option<TurnPosition>,
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) cache_creation_input_tokens: u64,
@@ -110,6 +160,23 @@ pub(crate) struct SessionStatsSnapshot {
     pub(crate) redactions: u64,
     pub(crate) redacted_images: u64,
     pub(crate) redacted_bytes: u64,
+}
+
+/// A session that has done nothing yet: every counter zero, numbering from the first turn.
+impl Default for SessionStatsSnapshot {
+    fn default() -> Self {
+        Self {
+            turns: 0,
+            turn_position: Some(TurnPosition::default()),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            redactions: 0,
+            redacted_images: 0,
+            redacted_bytes: 0,
+        }
+    }
 }
 
 impl SessionStatsSnapshot {
@@ -246,10 +313,69 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_takes_the_next_position_and_only_a_person_advances_the_prompt_count() {
+        let stats = SessionStats::default();
+        assert_eq!(
+            stats.stamp_turn(true),
+            Some(TurnPosition {
+                prompt_index: 1,
+                turn_index: 1
+            })
+        );
+        assert_eq!(
+            stats.stamp_turn(false),
+            Some(TurnPosition {
+                prompt_index: 1,
+                turn_index: 2
+            })
+        );
+        assert_eq!(
+            stats.stamp_turn(true),
+            Some(TurnPosition {
+                prompt_index: 2,
+                turn_index: 3
+            })
+        );
+        let snapshot = stats.snapshot();
+        assert_eq!(
+            snapshot.turn_position,
+            Some(TurnPosition {
+                prompt_index: 2,
+                turn_index: 3
+            })
+        );
+        // A resume continues from where the row left off.
+        let resumed = SessionStats::from_snapshot(&snapshot);
+        assert_eq!(
+            resumed.stamp_turn(true),
+            Some(TurnPosition {
+                prompt_index: 3,
+                turn_index: 4
+            })
+        );
+    }
+
+    #[test]
+    fn a_session_that_numbers_nothing_stays_that_way() {
+        let stats = SessionStats::from_snapshot(&SessionStatsSnapshot {
+            turns: 5,
+            turn_position: None,
+            ..Default::default()
+        });
+        assert_eq!(stats.stamp_turn(true), None);
+        assert_eq!(stats.stamp_turn(true), None, "and it stays that way");
+        assert_eq!(stats.snapshot().turn_position, None);
+    }
+
+    #[test]
     fn from_snapshot_seeds_all_fields() {
         // Resume rebuilds the live counters from the persisted snapshot.
         let snapshot = SessionStatsSnapshot {
             turns: 3,
+            turn_position: Some(TurnPosition {
+                prompt_index: 2,
+                turn_index: 3,
+            }),
             input_tokens: 10,
             output_tokens: 20,
             cache_creation_input_tokens: 30,
@@ -260,6 +386,7 @@ mod tests {
         };
         let round = SessionStats::from_snapshot(&snapshot).snapshot();
         assert_eq!(round.turns, 3);
+        assert_eq!(round.turn_position, snapshot.turn_position);
         assert_eq!(round.input_tokens, 10);
         assert_eq!(round.output_tokens, 20);
         assert_eq!(round.cache_creation_input_tokens, 30);

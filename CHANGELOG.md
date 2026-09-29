@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.67.0] - 2026-09-28
+
+### Changed
+
+- The `claude-subscription` backend matches Claude Code 2.1.284.
+- The session archive format is now version 6. Archives from 0.59 on still import.
+
 ## [0.66.0] - 2026-09-27
 
 ### Changed
@@ -2438,7 +2445,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.66.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.67.0...HEAD
+[0.67.0]: https://github.com/k4yt3x/meka/compare/0.66.0...0.67.0
 [0.66.0]: https://github.com/k4yt3x/meka/compare/0.65.0...0.66.0
 [0.65.0]: https://github.com/k4yt3x/meka/compare/0.64.1...0.65.0
 [0.64.1]: https://github.com/k4yt3x/meka/compare/0.64.0...0.64.1

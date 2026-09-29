@@ -19,8 +19,9 @@ use crate::{
     error::{MekaError, Result},
 };
 
-/// Claude Code version string. Single source of truth defined in `build.rs`.
-pub(super) const CC_VERSION: &str = env!("CC_VERSION");
+/// Claude Code version whose wire this module mirrors. A bump is verified against a capture of
+/// the real client first, because the server refuses a version too old for a new model.
+pub(super) const CC_VERSION: &str = "2.1.284";
 
 /// Fingerprint salt. `MHE` in the shipped 2.1.241 binary, present unchanged in 2.1.263.
 const FINGERPRINT_SALT: &str = "59cf53e54c78";
@@ -73,14 +74,15 @@ fn compute_fingerprint_from_messages(messages: &[Message]) -> String {
 /// real attestation by [`patch_request_body`] after serialization.
 ///
 /// The optional segments follow in the order Claude Code's builder emits them (2.1.241 through
-/// 2.1.280, verified against wire captures): `cch`, then `cc_workload`, `cc_is_subagent`,
-/// `cc_prev_req`, `cc_prompt_id`, `cc_turn_origin`. meka never has a workload, so that one is
-/// always absent; the rest appear exactly when their source does.
+/// 2.1.284, verified against wire captures): `cch`, then `cc_workload`, `cc_is_subagent`,
+/// `cc_prev_req`, `cc_prompt_id`, `cc_turn_origin`, and since 2.1.284 the pair `cc_prompt_index`
+/// and `cc_turn_index`, which go together or not at all. meka never has a workload, so that one
+/// is always absent; the rest appear exactly when their source does.
 pub(super) fn generate_billing_header(
     messages: &[Message],
     attribution: &crate::provider::Attribution,
 ) -> String {
-    let subagent = if attribution.subagent {
+    let subagent = if attribution.worker.is_some() {
         " cc_is_subagent=true;"
     } else {
         ""
@@ -97,14 +99,24 @@ pub(super) fn generate_billing_header(
         .turn_origin
         .map(|origin| format!(" cc_turn_origin={};", origin.name()))
         .unwrap_or_default();
+    let position = attribution
+        .turn_position
+        .map(|position| {
+            format!(
+                " cc_prompt_index={}; cc_turn_index={};",
+                position.prompt_index, position.turn_index
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch=00000;{}{}{}{}",
+        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch=00000;{}{}{}{}{}",
         CC_VERSION,
         compute_fingerprint_from_messages(messages),
         subagent,
         previous_request,
         prompt,
         origin,
+        position,
     )
 }
 
@@ -506,7 +518,7 @@ fn stainless_os() -> &'static str {
 /// Applies all HTTP headers Claude Code sends, in the order it sends them.
 ///
 /// The order is not cosmetic: HTTP/2 preserves it, so it is as much a client signature as the
-/// values are. What the 2.1.241 through 2.1.280 wire captures show is the Stainless SDK's
+/// values are. What the 2.1.241 through 2.1.284 wire captures show is the Stainless SDK's
 /// `Headers` object serialized in a case-sensitive sort (uppercase before lowercase), then the
 /// transport's own `Connection` / `Host` / `Accept-Encoding` / `Content-Length` after it.
 /// `reqwest`'s `HeaderMap` iterates in insertion order, so inserting in that order reproduces it.
@@ -570,14 +582,21 @@ pub(super) fn apply_headers(
         .header("Accept-Encoding", "gzip, deflate, br, zstd")
 }
 
-/// The headers Claude Code 2.1.280 adds about the request itself, in the sorted position the
+/// The headers Claude Code 2.1.284 adds about the request itself, in the sorted position the
 /// captures show them: `x-cc-*` ahead of `x-claude-code-*`, each group alphabetical. Two facts
 /// go out twice because Claude Code keeps a first-party name and a gateway-hint name for each
 /// and sends both to Anthropic.
 ///
-/// A worker's turn names its agent type as `custom`: a meka sub-agent is defined by the call that
-/// spawned it, which is Claude Code's `agent:custom` query source. Its compaction names none, the
-/// way Claude Code's `compact` query source has none.
+/// A worker's requests name the worker by id, and a nested worker's name its spawner too, the way
+/// Claude Code's sub-agent context does on every request the sub-agent makes. A worker's turn
+/// names its agent type as `general-purpose`: an `Agent` call with no custom agent definition
+/// runs Claude Code's built-in general-purpose agent, which is what a meka worker is (2.1.284
+/// sub-agent capture). Its compaction names no type, the way Claude Code's `compact` query
+/// source has none.
+///
+/// Since 2.1.284 the prompt id goes out as a header as well as in the billing header, on every
+/// request that has one: a turn's, and a worker's, whose client is built with the prompt id it
+/// inherited; a compaction has none and sends none.
 fn apply_request_hints(
     mut request: reqwest::RequestBuilder,
     attribution: &crate::provider::Attribution,
@@ -588,8 +607,11 @@ fn apply_request_hints(
     if let Some(kind) = attribution.context_compacted {
         request = request.header("x-cc-context-compacted", kind.name());
     }
-    if attribution.subagent && attribution.compaction.is_none() {
-        request = request.header("x-claude-code-agent-type", "custom");
+    if let Some(worker) = &attribution.worker {
+        request = request.header("x-claude-code-agent-id", worker.agent_id.as_str());
+        if attribution.compaction.is_none() {
+            request = request.header("x-claude-code-agent-type", "general-purpose");
+        }
     }
     if let Some(kind) = attribution.compaction {
         request = request.header("x-claude-code-compaction", kind.name());
@@ -597,8 +619,18 @@ fn apply_request_hints(
     if let Some(kind) = attribution.context_compacted {
         request = request.header("x-claude-code-context-compacted", kind.name());
     }
+    if let Some(parent) = attribution
+        .worker
+        .as_ref()
+        .and_then(|worker| worker.parent_agent_id.as_deref())
+    {
+        request = request.header("x-claude-code-parent-agent-id", parent);
+    }
     if let Some(durations) = render_tool_durations(&attribution.previous_tool_durations) {
         request = request.header("x-claude-code-prev-tool-durations", durations);
+    }
+    if let Some(prompt_id) = attribution.prompt_id {
+        request = request.header("x-claude-code-prompt-id", prompt_id.to_string());
     }
     if let Some(class) = attribution.request_class() {
         request = request.header("x-claude-code-request-class", class);
@@ -855,18 +887,33 @@ mod tests {
         *crate::sync::lock(&previous) = Some("req_011abc".to_string());
         let prompt_id = Uuid::new_v4();
         let attribution = crate::provider::Attribution {
-            subagent: true,
+            worker: Some(crate::provider::WorkerIdentity::for_test()),
             prompt_id: Some(prompt_id),
             previous_request: Some(previous),
             turn_origin: Some(crate::provider::TurnOrigin::Scheduled),
+            turn_position: Some(crate::stats::TurnPosition {
+                prompt_index: 2,
+                turn_index: 3,
+            }),
             ..Default::default()
         };
         let header = generate_billing_header(&[Message::user("hello")], &attribution);
         let expected_tail = format!(
             " cc_is_subagent=true; cc_prev_req=req_011abc; cc_prompt_id={prompt_id}; \
-             cc_turn_origin=scheduled;"
+             cc_turn_origin=scheduled; cc_prompt_index=2; cc_turn_index=3;"
         );
         assert!(header.ends_with(&expected_tail), "{header}");
+        // A turn of a session that numbers nothing reports the origin and no
+        // position: the pair goes together or not at all.
+        let unstamped = crate::provider::Attribution {
+            turn_origin: Some(crate::provider::TurnOrigin::Human),
+            ..Default::default()
+        };
+        let header = generate_billing_header(&[Message::user("hello")], &unstamped);
+        assert!(
+            header.ends_with("cch=00000; cc_turn_origin=human;"),
+            "{header}"
+        );
         // A compaction reports neither a prompt nor an origin.
         let compaction = crate::provider::Attribution {
             compaction: Some(crate::provider::CompactionKind::Auto),
@@ -904,6 +951,34 @@ mod tests {
         assert!(rendered.len() <= TOOL_DURATIONS_MAX_CHARS);
     }
 
+    /// A worker's turn is the built-in general-purpose agent, the type an `Agent` call without a
+    /// custom definition runs and the one the 2.1.284 sub-agent capture names.
+    #[test]
+    fn a_workers_turn_names_the_general_purpose_agent_type() {
+        let worker = crate::provider::Attribution {
+            worker: Some(crate::provider::WorkerIdentity {
+                agent_id: "ad90b2c445429009b".to_string(),
+                parent_agent_id: None,
+            }),
+            previous_message: Some(crate::provider::PreviousMessageSlot::default()),
+            ..Default::default()
+        };
+        let request = apply_headers(
+            reqwest::Client::new().post("http://127.0.0.1:9/v1/messages"),
+            "Authorization",
+            "Bearer x",
+            "session",
+            None,
+            Some(&worker),
+        )
+        .build()
+        .unwrap();
+        let header = |name: &str| request.headers().get(name).and_then(|v| v.to_str().ok());
+        assert_eq!(header("x-claude-code-agent-type"), Some("general-purpose"));
+        assert_eq!(header("x-claude-code-agent-id"), Some("ad90b2c445429009b"));
+        assert_eq!(header("x-claude-code-parent-agent-id"), None);
+    }
+
     /// The request hints sit where Claude Code's sorted headers put them: after `x-app`, ahead of
     /// `x-client-request-id`, `x-cc-*` before `x-claude-code-*`, each group alphabetical.
     #[test]
@@ -930,6 +1005,7 @@ mod tests {
         };
         let slot = crate::provider::PreviousMessageSlot::default();
         let turn = crate::provider::Attribution {
+            prompt_id: Some(Uuid::new_v4()),
             previous_message: Some(slot),
             context_compacted: Some(crate::provider::CompactionKind::Auto),
             previous_tool_durations: vec![crate::provider::ToolDuration {
@@ -942,27 +1018,54 @@ mod tests {
             "x-cc-context-compacted",
             "x-claude-code-context-compacted",
             "x-claude-code-prev-tool-durations",
+            "x-claude-code-prompt-id",
             "x-claude-code-request-class",
             "x-client-request-id",
         ]);
         let compaction = crate::provider::Attribution {
-            subagent: true,
+            worker: Some(crate::provider::WorkerIdentity::for_test()),
             compaction: Some(crate::provider::CompactionKind::Manual),
             ..Default::default()
         };
         assert_eq!(names_after_x_app(compaction), vec![
             "x-cc-compaction-request",
+            "x-claude-code-agent-id",
             "x-claude-code-compaction",
             "x-claude-code-request-class",
             "x-client-request-id",
         ]);
         let worker = crate::provider::Attribution {
-            subagent: true,
+            worker: Some(crate::provider::WorkerIdentity::for_test()),
+            prompt_id: Some(Uuid::new_v4()),
             previous_message: Some(crate::provider::PreviousMessageSlot::default()),
             ..Default::default()
         };
-        assert_eq!(names_after_x_app(worker), vec![
+        assert_eq!(names_after_x_app(worker.clone()), vec![
+            "x-claude-code-agent-id",
             "x-claude-code-agent-type",
+            "x-claude-code-prompt-id",
+            "x-claude-code-request-class",
+            "x-client-request-id",
+        ]);
+        // A nested worker names its spawner between the compaction facts and the durations, where
+        // the 2.1.284 capture of a sub-agent's sub-agent has it.
+        let nested = crate::provider::Attribution {
+            worker: Some(crate::provider::WorkerIdentity {
+                agent_id: "a3d59c0258d7ff7a0".to_string(),
+                parent_agent_id: Some("ad90b2c445429009b".to_string()),
+            }),
+            previous_tool_durations: vec![crate::provider::ToolDuration {
+                name: "file_read".to_string(),
+                elapsed: std::time::Duration::from_millis(3),
+            }],
+            ..worker
+        };
+        assert_eq!(names_after_x_app(nested), vec![
+            "x-claude-code-agent-id",
+            "x-claude-code-agent-type",
+            "x-claude-code-parent-agent-id",
+            "x-claude-code-prev-tool-durations",
+            "x-claude-code-prompt-id",
             "x-claude-code-request-class",
             "x-client-request-id",
         ]);

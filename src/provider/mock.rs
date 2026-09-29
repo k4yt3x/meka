@@ -197,6 +197,10 @@ pub(crate) struct MockProvider {
     completion_prompt_ids: Mutex<Vec<Option<uuid::Uuid>>>,
     /// Where each `complete` call said its prompt came from, in call order, for the same reason.
     completion_turn_origins: Mutex<Vec<Option<crate::provider::TurnOrigin>>>,
+    /// Where each `complete` call said its turn stood, in call order, for the same reason.
+    completion_turn_positions: Mutex<Vec<Option<crate::stats::TurnPosition>>>,
+    /// How each `complete` call named its worker, in call order, for the same reason.
+    completion_workers: Mutex<Vec<Option<crate::provider::WorkerIdentity>>>,
     /// What each [`Provider::stream`] call was handed, in order.
     ///
     /// The streaming counterpart to [`Self::completions`], and added for the same reason plus one
@@ -231,6 +235,8 @@ pub(crate) struct StreamRequest {
     pub(crate) prompt_id: Option<uuid::Uuid>,
     /// Where that prompt came from, recorded for the same reason.
     pub(crate) turn_origin: Option<crate::provider::TurnOrigin>,
+    /// Where that prompt's turn stood, recorded for the same reason.
+    pub(crate) turn_position: Option<crate::stats::TurnPosition>,
     /// The session the request named, for the same reason: a ChatGPT request sends it as its
     /// cache affinity, and a turn that reads it before the session exists sends none.
     pub(crate) session_id: Option<uuid::Uuid>,
@@ -266,6 +272,18 @@ impl MockProvider {
         crate::sync::lock(&self.completion_turn_origins).clone()
     }
 
+    /// The turn position behind each `complete` call so far, in order.
+    #[cfg(test)]
+    pub(crate) fn completion_turn_positions(&self) -> Vec<Option<crate::stats::TurnPosition>> {
+        crate::sync::lock(&self.completion_turn_positions).clone()
+    }
+
+    /// The worker identity behind each `complete` call so far, in order.
+    #[cfg(test)]
+    pub(crate) fn completion_workers(&self) -> Vec<Option<crate::provider::WorkerIdentity>> {
+        crate::sync::lock(&self.completion_workers).clone()
+    }
+
     /// A provider that replays `rounds`, one per call, and answers nothing once they are spent.
     pub(crate) fn from_rounds(rounds: Vec<Vec<MockEvent>>) -> Self {
         Self {
@@ -297,6 +315,8 @@ impl Provider for MockProvider {
         crate::sync::lock(&self.completions).push(messages.to_vec());
         crate::sync::lock(&self.completion_prompt_ids).push(attribution.prompt_id);
         crate::sync::lock(&self.completion_turn_origins).push(attribution.turn_origin);
+        crate::sync::lock(&self.completion_turn_positions).push(attribution.turn_position);
+        crate::sync::lock(&self.completion_workers).push(attribution.worker.clone());
 
         let events = {
             let mut rounds = crate::sync::lock(&self.rounds);
@@ -452,6 +472,7 @@ impl Provider for MockProvider {
             tools: tools.to_vec(),
             prompt_id: attribution.prompt_id,
             turn_origin: attribution.turn_origin,
+            turn_position: attribution.turn_position,
             session_id: attribution.session_id,
         });
 

@@ -126,16 +126,18 @@ meka forwards the model string verbatim and doesn't gate which strings are valid
 - `User-Agent: claude-cli/<version> (external, cli)`
 - `X-Claude-Code-Session-Id: <uuid>` (per-process)
 - Stainless SDK identification headers (`x-stainless-*`)
-- `x-claude-code-request-class`: `main` for a turn of the conversation, `subagent` for a sub-agent's turn (with `x-claude-code-agent-type: custom`), `compaction` for a compaction's requests
+- `x-claude-code-request-class`: `main` for a turn of the conversation, `subagent` for a sub-agent's turn (with `x-claude-code-agent-type: general-purpose`, the built-in agent an `Agent` call without a custom definition runs), `compaction` for a compaction's requests
+- `x-claude-code-agent-id`: on every request a sub-agent makes, its compaction's included, an id in Claude Code's sub-agent shape (`a` and sixteen hex digits) derived from the sub-agent's session; `x-claude-code-parent-agent-id` on a nested sub-agent's, naming the sub-agent that spawned it
+- `x-claude-code-prompt-id`: the same id the billing header's `cc_prompt_id` carries, on every request that has one, which a compaction's do not
 - `x-claude-code-prev-tool-durations`: on the request after a tool round, `name=milliseconds` per call the round ran, `;`-separated, in dispatch order
 - `x-cc-compaction-request` and `x-claude-code-compaction`: on a compaction's requests, what set it going: `manual` for `/compact`, `POST /compact` and `context_compact`, `auto` for a ceiling crossed, `reactive` for a request the provider refused as too large
 - `x-cc-context-compacted` and `x-claude-code-context-compacted`: the same word on the conversation's first request after a compaction
 
-These four are what Claude Code 2.1.280 says about each request; for the two compaction facts it keeps a first-party name and a gateway-hint name and sends both.
+These are what Claude Code 2.1.284 says about each request; for the two compaction facts it keeps a first-party name and a gateway-hint name and sends both.
 
 ### Beta header
 
-Composed dynamically from the model, window and thinking settings, mirroring Claude Code's own assembly. Order is significant; the list below matches the Claude Code 2.1.280 interactive-CLI wire capture on Opus 5.5 (tools present, thinking on, display updates) exactly:
+Composed dynamically from the model, window and thinking settings, mirroring Claude Code's own assembly. Order is significant; the list below matches the Claude Code 2.1.284 interactive-CLI wire capture on Opus 5.5 (tools present, thinking on, display updates) exactly:
 
 | Beta | When |
 |------|------|
@@ -148,27 +150,27 @@ Composed dynamically from the model, window and thinking settings, mirroring Cla
 | `context-management-2025-06-27` | Any modern Claude (4.x+) |
 | `prompt-caching-scope-2026-01-05` | Always |
 | `mid-conversation-system-2026-04-07` | Everything except Claude 3.x, Opus 4.7 and older, Sonnet 4.6 and older, and Haiku 4.5 |
-| `per-turn-control-2026-07-01` | Opus 5.5 and Fable 5.1, the two models Claude Code's bundled catalog grants per-turn effort; nothing newer, since Claude Code sends nothing for a model its catalog does not list |
-| `mid-conversation-tool-changes-2026-07-01` | Wherever the mid-conversation system beta goes, except Sonnet 5 |
+| `per-turn-control-2026-07-01` | Opus 5.5, Sonnet 5.5 and Fable 5.1, the three models Claude Code's bundled catalog grants per-turn effort; nothing newer, since Claude Code sends nothing for a model its catalog does not list |
+| `mid-conversation-tool-changes-2026-07-01` | Wherever the mid-conversation system beta goes, except Sonnet 5 and Sonnet 5.5 |
 | `advanced-tool-use-2025-11-20` | When the request carries tools (meka always does) |
 | `effort-2025-11-24` | Every model that takes an effort at all, whether or not the profile set one |
-| `fallback-credit-2026-06-01` | Always. Claude Code latches it on every interactive turn; it only advertises that the server may answer with a fallback credit, and meka sends no `fallbacks` of its own |
+| `fallback-credit-2026-06-01` | A compaction's requests only. Claude Code 2.1.284 arms it on a turn only while its UI shows a fallback model, which the capture never did, and on a compaction whenever the model has a refusal fallback in its catalog; it only advertises that the server may answer with a fallback credit, and meka sends no `fallbacks` of its own |
 | `thinking-binding-controls-2026-08-01` | Any modern Claude with thinking on. Nothing in the body goes with it: Claude Code leaves the binding behavior to the server |
 | `thinking-display-updates-2026-08-18` | Any modern Claude with thinking on under `thinking_display = "updates"`, paired with `thinking.display = "updates"` |
-| `extended-cache-ttl-2025-04-11` | Every request but a compaction's, which takes the API's own TTL; see [Cache control](#cache-control) |
+| `extended-cache-ttl-2025-04-11` | Every request but a compaction's and a sub-agent's, which take the API's own TTL; see [Cache control](#cache-control) |
 | `cache-diagnosis-2026-04-07` | Always, paired with the body's `diagnostics.previous_message_id`: the id of the previous response's message, or `null` on a conversation's first request and after a resume |
 
 ### System prompt
 
 Sent as an array of three `text` blocks:
 
-1. `x-anthropic-billing-header: cc_version=<version>.<fingerprint>; cc_entrypoint=cli; cch=<xxHash64-attestation>;` plus, when they apply, ` cc_is_subagent=true;`, ` cc_prev_req=<request id>;`, ` cc_prompt_id=<uuid>;` and ` cc_turn_origin=<origin>;`, in that order. The fingerprint suffix is a 3-character hex hash derived from the first user message (`SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3]`); the `cch` token is xxHash64 of a filtered copy of the serialized request body, computed and patched in just before send.
+1. `x-anthropic-billing-header: cc_version=<version>.<fingerprint>; cc_entrypoint=cli; cch=<xxHash64-attestation>;` plus, when they apply, ` cc_is_subagent=true;`, ` cc_prev_req=<request id>;`, ` cc_prompt_id=<uuid>;`, ` cc_turn_origin=<origin>;` and ` cc_prompt_index=<n>; cc_turn_index=<n>;`, in that order. The fingerprint suffix is a 3-character hex hash derived from the first user message (`SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3]`); the `cch` token is xxHash64 of a filtered copy of the serialized request body, computed and patched in just before send.
 
-   `cc_prompt_id` identifies one prompt and stays the same across every request that prompt produces, including the whole tool loop; a sub-agent inherits its spawner's. `cc_turn_origin` says where that prompt came from: `human` for words a person typed through any host, `scheduled` for a fired job, `peer` for inbox items, `task_notification` for finished background work delivering itself; a sub-agent inherits this too. `cc_prev_req` names the `request-id` of the previous response in the same conversation, so it is absent on a conversation's first request. A compaction's requests carry `cc_prev_req` and neither of the other two, which is what Claude Code's own compaction sends.
-2. `You are Claude Code, Anthropic's official CLI for Claude.` (fixed identity prefix).
-3. One sentence naming block 2 for what it is (a requirement of this API that does not describe the session), then meka's system prompt. The block carries `cache_control: {type: "ephemeral", ttl: "1h", scope: "global"}`.
+   `cc_prompt_id` identifies one prompt and stays the same across every request that prompt produces, including the whole tool loop; a sub-agent inherits its spawner's. `cc_turn_origin` says where that prompt came from: `human` for words a person typed through any host, `scheduled` for a fired job, `peer` for inbox items, `task_notification` for finished background work delivering itself. `cc_turn_index` is the turn's 1-based ordinal in its session and `cc_prompt_index` counts the turns a person opened up to and including it; the pair is stamped when a turn opens and survives a resume, a fork and a compaction. A session that already had turns before meka numbered them sends no pair at all, as Claude Code does for a transcript it did not number. `cc_prev_req` names the `request-id` of the previous response in the same conversation, so it is absent on a conversation's first request. A sub-agent's requests carry `cc_is_subagent`, `cc_prev_req` and the prompt id, and neither the origin nor the position, which is what Claude Code's own sub-agent sends; a compaction's carry `cc_prev_req` and none of the others, which is what its compaction sends.
+2. `You are Claude Code, Anthropic's official CLI for Claude.` (fixed identity prefix). A sub-agent's request opens with `You are a Claude agent, built on Anthropic's Claude Agent SDK.` instead, the line Claude Code's own sub-agents carry, and that block is a breakpoint of its own: `cache_control: {type: "ephemeral"}`.
+3. One sentence naming block 2 for what it is (a requirement of this API that does not describe the session), then meka's system prompt. The block carries `cache_control: {type: "ephemeral", ttl: "1h", scope: "global"}`; on a sub-agent's request `{type: "ephemeral"}` alone.
 
-Only block 3 is marked for caching, matching the captured Claude Code CLI wire; `scope: "global"` shares the cached prefix across sessions. Tools carry no `cache_control` (the rolling last-message breakpoint caches the tools+system prefix).
+Only block 3 is marked for caching on a turn of the conversation, matching the captured Claude Code CLI wire; `scope: "global"` shares the cached prefix across sessions. Tools carry no `cache_control` (the rolling last-message breakpoint caches the tools+system prefix).
 
 ### Body key order
 
@@ -201,7 +203,7 @@ Claude Code never leaves `output_config.effort` to the server on a model that ta
 | profile sets nothing | `medium` |
 | model takes no effort | nothing, and no beta; a configured value is dropped with a warning |
 
-One value for every model, not a copy of that table. `medium` is what the 2.1.280 table says for Opus 5.5, the model `meka profile add` suggests; most other entries say `high`, Opus 4.7's says `xhigh`, and `high` is what Claude Code falls back to for any model the table does not list. Carrying the per-model figures instead would add facts about Anthropic's data that go stale on their release schedule and buy nothing, because the server cannot tell a default meka chose from a value you configured. Models that take no effort at all are the Claude 3.x line, Opus 4.0/4.1, Sonnet 4.0/4.5 and Haiku 4.5.
+One value for every model, not a copy of that table. `medium` is what the 2.1.284 table says for Opus 5.5, the model `meka profile add` suggests, and for Sonnet 5.5; most other entries say `high`, Opus 4.7's says `xhigh`, and `high` is what Claude Code falls back to for any model the table does not list. Carrying the per-model figures instead would add facts about Anthropic's data that go stale on their release schedule and buy nothing, because the server cannot tell a default meka chose from a value you configured. Models that take no effort at all are the Claude 3.x line, Opus 4.0/4.1, Sonnet 4.0/4.5 and Haiku 4.5.
 
 A value you configure is absolute. Claude Code silently lowers `xhigh` or `max` to `high` on a model whose bundled entry lacks the capability; meka does not, because that table is a snapshot of someone else's system and quietly overriding what you asked for on the strength of it is worse than letting the API answer.
 
@@ -209,7 +211,7 @@ Only `claude-subscription` does this. `anthropic-messages` still omits `effort` 
 
 ### Cache control
 
-The most recent message's last content block and the user system prompt carry `cache_control: {type: "ephemeral", ttl: "1h"}`. The 1h TTL is what an OAuth subscriber's Claude Code turn carries on the wire. A compaction's requests carry the breakpoints without the TTL and without the `extended-cache-ttl-2025-04-11` beta, as Claude Code's do: the summary is read once, and an hour of cache would be paid for and never read back.
+The most recent message's last content block and the user system prompt carry `cache_control: {type: "ephemeral", ttl: "1h"}`. The 1h TTL is what an OAuth subscriber's Claude Code turn carries on the wire. A compaction's requests carry the breakpoints without the TTL and without the `extended-cache-ttl-2025-04-11` beta, as Claude Code's do: the summary is read once, and an hour of cache would be paid for and never read back. A sub-agent's requests carry them the same way, and without `scope: "global"`, which is the sub-agent wire Claude Code 2.1.284 sends.
 
 Caching is prefix-based: the tools array precedes the system prompt, which precedes the messages, so a byte changing early invalidates everything after it. meka is built so that nothing which changes mid-session sits in that prefix.
 

@@ -245,7 +245,6 @@ impl Agent {
                 session_id,
                 tool_call_id: Some(tool_call_id.to_string()),
                 prompt_id: attribution.prompt_id,
-                turn_origin: attribution.turn_origin,
                 frontend: Arc::clone(&self.cells.frontend),
                 cancellation,
             })
@@ -379,7 +378,6 @@ impl Agent {
         attribution: &crate::provider::Attribution,
     ) -> crate::tools::ToolOutput {
         let prompt_id = attribution.prompt_id;
-        let turn_origin = attribution.turn_origin;
         let session_id = match self.admit_detach(session_id).await {
             Ok(session_id) => session_id,
             Err(refusal) => return refusal,
@@ -455,7 +453,6 @@ impl Agent {
                     session_id: Some(session_id),
                     tool_call_id: Some(tool_call_id),
                     prompt_id,
-                    turn_origin,
                     frontend,
                     cancellation: scoped.clone(),
                 };

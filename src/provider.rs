@@ -53,7 +53,7 @@ use crate::{
 /// Claude Code's OAuth client id, which the `claude-subscription` backend authenticates as.
 pub(crate) const DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID: &str =
     "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-/// The token endpoint Claude Code 2.1.280 exchanges the login code at and refreshes against
+/// The token endpoint Claude Code 2.1.284 exchanges the login code at and refreshes against
 /// (`TOKEN_URL` in the binary); `[accounts.<name>].oauth_token_url` overrides it.
 pub(crate) const DEFAULT_CLAUDE_SUBSCRIPTION_TOKEN_URL: &str =
     "https://platform.claude.com/v1/oauth/token";
@@ -228,6 +228,33 @@ pub(crate) struct ToolDuration {
     pub(crate) elapsed: std::time::Duration,
 }
 
+/// How a worker's requests name it, the way Claude Code's sub-agent headers do: its own id, and
+/// its spawner's when the spawner is itself a worker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkerIdentity {
+    pub(crate) agent_id: String,
+    pub(crate) parent_agent_id: Option<String>,
+}
+
+impl WorkerIdentity {
+    /// Claude Code mints a sub-agent id as `a` and eight random bytes in hex, and its sanitizer
+    /// normalizes every form to that shape (2.1.284: `ad90b2c445429009b`). meka's comes from the
+    /// worker's session id instead, so it is stable across the worker's turns and follow-ups and
+    /// a nested worker can name its spawner's without being told.
+    pub(crate) fn agent_id_for(session_id: Uuid) -> String {
+        let hex = session_id.simple().to_string();
+        format!("a{}", &hex[..16])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            agent_id: Self::agent_id_for(Uuid::new_v4()),
+            parent_agent_id: None,
+        }
+    }
+}
+
 /// Who a request is for, as the billing header has to describe it.
 ///
 /// None of this can live on the provider: one `Arc<dyn Provider>` serves the main agent and every
@@ -240,8 +267,8 @@ pub(crate) struct ToolDuration {
 /// conversation's first request omits `cc_prev_req`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Attribution {
-    /// Whether this is a sub-agent's request (`cc_is_subagent`).
-    pub(crate) subagent: bool,
+    /// Set on a worker's requests (`cc_is_subagent`, `x-claude-code-agent-id`).
+    pub(crate) worker: Option<WorkerIdentity>,
     /// The prompt this request serves (`cc_prompt_id`).
     pub(crate) prompt_id: Option<Uuid>,
     /// Where the last response's id is kept, for `cc_prev_req`. Shared with the conversation that
@@ -257,6 +284,9 @@ pub(crate) struct Attribution {
     pub(crate) session_id: Option<Uuid>,
     /// Where the prompt this request answers came from (`cc_turn_origin`). A compaction has none.
     pub(crate) turn_origin: Option<TurnOrigin>,
+    /// Where the turn stands in its conversation (`cc_prompt_index` and `cc_turn_index`). A
+    /// compaction has none, and neither does a turn of a session that numbers nothing.
+    pub(crate) turn_position: Option<crate::stats::TurnPosition>,
     /// Set on a compaction's own requests: what set it going, for the compaction headers.
     pub(crate) compaction: Option<CompactionKind>,
     /// Set on the first request of the conversation after a compaction: what set that compaction
@@ -275,7 +305,7 @@ impl Attribution {
     pub(crate) fn request_class(&self) -> Option<&'static str> {
         if self.compaction.is_some() {
             Some("compaction")
-        } else if self.subagent {
+        } else if self.worker.is_some() {
             Some("subagent")
         } else if self.is_conversation_turn() {
             Some("main")
@@ -346,6 +376,17 @@ mod attribution_tests {
     use super::*;
 
     #[test]
+    fn a_worker_id_takes_claude_code_s_sub_agent_shape() {
+        let session = Uuid::parse_str("ad90b2c4-4542-9009-b3d5-9c0258d7ff7a").unwrap();
+        let id = WorkerIdentity::agent_id_for(session);
+        // `a` and sixteen hex digits, as the client's own sanitizer normalizes every id to; the
+        // same session gives the same id, so a worker's turns and follow-ups agree.
+        assert_eq!(id, "aad90b2c445429009");
+        assert_eq!(id.len(), 17);
+        assert_eq!(WorkerIdentity::agent_id_for(session), id);
+    }
+
+    #[test]
     fn a_request_is_classed_as_a_compaction_before_a_worker_before_a_turn() {
         let slot = PreviousMessageSlot::default();
         let turn = Attribution {
@@ -354,7 +395,7 @@ mod attribution_tests {
         };
         assert_eq!(turn.request_class(), Some("main"));
         let worker = Attribution {
-            subagent: true,
+            worker: Some(WorkerIdentity::for_test()),
             ..turn.clone()
         };
         assert_eq!(worker.request_class(), Some("subagent"));

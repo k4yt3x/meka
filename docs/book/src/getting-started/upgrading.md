@@ -10,6 +10,14 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.66 to 0.67
+
+**Session archives are `format_version` 6.** Each session's `stats` carries a `turn_position`,
+the pair the Claude subscription wire reports, or `null` for a session that numbers nothing. An
+archive written by 0.59 through 0.66 still imports, brought forward at the door. A session that
+already had turns before this release never numbers them, on the store and in an archive alike,
+because nobody numbered those; every session created from now on does.
+
 ## 0.65 to 0.66
 
 **A shell under Landlock alone has no temporary directory.** 0.65 gave each Landlock-confined

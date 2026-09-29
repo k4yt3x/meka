@@ -689,6 +689,10 @@ mod tests {
             .expect("tool output");
         let stats = crate::stats::SessionStatsSnapshot {
             turns: 3,
+            turn_position: Some(crate::stats::TurnPosition {
+                prompt_index: 2,
+                turn_index: 3,
+            }),
             input_tokens: 1000,
             ..Default::default()
         };
@@ -832,6 +836,13 @@ mod tests {
             .expect("load stats");
         assert_eq!(imported_stats.turns, 3);
         assert_eq!(imported_stats.input_tokens, 1000);
+        assert_eq!(
+            imported_stats.turn_position,
+            Some(crate::stats::TurnPosition {
+                prompt_index: 2,
+                turn_index: 3,
+            })
+        );
         assert_eq!(
             manager
                 .load_all_scratchpad_entries(root_new_id)

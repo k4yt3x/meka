@@ -303,7 +303,38 @@ const MIGRATIONS: &[Migration] = &[
         name: "search_indexes_fold_every_diacritic",
         step: Step::Sql(SEARCH_INDEXES_FOLD_EVERY_DIACRITIC),
     },
+    // The subscription wire reports where a turn stands in its session, so a session numbers each
+    // turn it opens. A session that already had turns numbers nothing, since nobody numbered
+    // those, and this step is where that is decided.
+    Migration {
+        name: "sessions_number_their_turns",
+        step: Step::Rust(sessions_number_their_turns),
+    },
 ];
+
+/// The position of the last turn a session opened, beside the eight cumulative counters: `NULL`
+/// in both for a session that numbers nothing, zero in both for one numbering from its next turn.
+/// A row with turns behind it takes `NULL`, which no reader could work out for itself once the
+/// column exists, so it is settled here; a row without turns and every row inserted from now on
+/// takes the column's default. Safe to replay: a column that exists is left alone, along with the
+/// rows it already settled.
+fn sessions_number_their_turns(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let mut added = false;
+    for column in ["prompt_index", "turn_index"] {
+        if !table_has_column(transaction, "sessions", column)? {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE sessions ADD COLUMN {column} INTEGER DEFAULT 0"
+            ))?;
+            added = true;
+        }
+    }
+    if added {
+        transaction.execute_batch(
+            "UPDATE sessions SET prompt_index = NULL, turn_index = NULL WHERE turns > 0",
+        )?;
+    }
+    Ok(())
+}
 
 /// Both full-text indexes with `remove_diacritics 2`, which folds every diacritic where the
 /// tokenizer's default folds only the common Latin ones: `viet` did not find `Việt`. A virtual
@@ -612,7 +643,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 11_383_376_175_894_579_710;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 6_765_195_325_341_607_469;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -2439,6 +2470,8 @@ const ARCHIVE_FORMAT_0_59: u64 = 3;
 /// session and the envelope without a bump, each defaulted at read, so an archive of this version
 /// may lack any of them.
 const ARCHIVE_FORMAT_0_64: u64 = 4;
+/// The archive `format_version` 0.65 and 0.66 wrote, whose stats carry no turn position.
+const ARCHIVE_FORMAT_0_66: u64 = 5;
 
 /// Bring a session archive written by an older meka to the current shape, reporting whether it
 /// was one. `current` is the version this build writes, handed in as data the way a [`Context`]
@@ -2447,7 +2480,8 @@ const ARCHIVE_FORMAT_0_64: u64 = 4;
 ///
 /// 0.59's archive differs from 0.64's only in the tool names 0.60 changed: the events are walked
 /// by [`rename_tools_0_60`], and each session's spec on its own, since it rides the archive as a
-/// string. Both then take the fields 0.65 requires, by [`require_fields_0_65`].
+/// string. Both then take the fields 0.65 requires, by [`require_fields_0_65`], and every version
+/// before 0.67 takes the turn position 0.67 records, by [`number_turns_0_67`].
 pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u64) -> bool {
     match document
         .get("format_version")
@@ -2470,12 +2504,45 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
                 }
             }
         }
-        Some(ARCHIVE_FORMAT_0_64) => {}
+        Some(ARCHIVE_FORMAT_0_64) | Some(ARCHIVE_FORMAT_0_66) => {}
         _ => return false,
     }
     require_fields_0_65(document);
+    number_turns_0_67(document);
     document["format_version"] = current.into();
     true
+}
+
+/// The turn position 0.67 records on each session's stats, by the rule the store's own step
+/// applies: a session with turns behind it numbers nothing, `null`, and one without numbers from
+/// its next turn, zero in both. Only where absent, so an archive that carries one is kept and a
+/// second pass changes nothing.
+fn number_turns_0_67(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        let Some(stats) = session
+            .get_mut("stats")
+            .and_then(|stats| stats.as_object_mut())
+        else {
+            continue;
+        };
+        let turns = stats
+            .get("turns")
+            .and_then(|turns| turns.as_u64())
+            .unwrap_or(0);
+        stats.entry("turn_position").or_insert_with(|| {
+            if turns > 0 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!({"prompt_index": 0, "turn_index": 0})
+            }
+        });
+    }
 }
 
 /// Every field 0.65 requires that 0.60 through 0.64 added without a bump, filled where absent with
@@ -3194,6 +3261,7 @@ mod tests {
                 "search_indexes_fold_every_diacritic",
                 7730251297735454426_u64,
             ),
+            ("sessions_number_their_turns", 14854401362647262172_u64),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
         /// every column-zero function it calls, recursively. What a Rust step does is its body and
@@ -3979,6 +4047,106 @@ mod tests {
         assert_eq!(
             document, once,
             "a replay over a converted archive is a no-op"
+        );
+    }
+
+    /// The one place that decides which sessions number their turns: a row with turns behind it
+    /// takes `NULL`, a row without takes zero, and a replay changes neither.
+    #[test]
+    fn a_session_with_turns_behind_it_numbers_nothing_and_an_empty_one_numbers_from_zero() {
+        let mut connection = store_as_0_42_left_it();
+        plant_session(&connection, "old");
+        plant_session(&connection, "empty");
+        connection
+            .execute("UPDATE sessions SET stat_turns = 3 WHERE id = 'old'", [])
+            .expect("turns behind it");
+        let plan = plan(&connection).expect("plan");
+        apply(&mut connection, plan, &Context::default()).expect("apply");
+        fn position(connection: &rusqlite::Connection, id: &str) -> (Option<i64>, Option<i64>) {
+            connection
+                .query_row(
+                    "SELECT prompt_index, turn_index FROM sessions WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("row")
+        }
+        assert_eq!(position(&connection, "old"), (None, None));
+        assert_eq!(position(&connection, "empty"), (Some(0), Some(0)));
+        // A row inserted afterwards numbers from zero without anyone saying so.
+        plant_session(&connection, "new");
+        assert_eq!(position(&connection, "new"), (Some(0), Some(0)));
+        // A replay over settled rows changes nothing, whatever the counters say by then.
+        connection
+            .execute("UPDATE sessions SET turns = 2 WHERE id = 'new'", [])
+            .expect("a turn since");
+        let transaction = connection.transaction().expect("transaction");
+        sessions_number_their_turns(&transaction).expect("replay");
+        transaction.commit().expect("commit");
+        assert_eq!(position(&connection, "old"), (None, None));
+        assert_eq!(position(&connection, "new"), (Some(0), Some(0)));
+    }
+
+    /// A 0.66 archive's stats take the position by the same rule, and a converted one is kept.
+    #[test]
+    fn a_format_5_archive_takes_a_turn_position_by_its_turns() {
+        let session = |id: &str, turns: u64| {
+            serde_json::json!({
+                "id": id,
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "cwd": null,
+                "permission": "read",
+                "capabilities_json": null,
+                "approvals": false,
+                "additional_roots": [],
+                "subagent_spec_json": null,
+                "profile": "work",
+                "stats": {
+                    "turns": turns,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "redactions": 0,
+                    "redacted_images": 0,
+                    "redacted_bytes": 0,
+                },
+                "events": [],
+                "scratchpad_entries": {},
+            })
+        };
+        let mut document = serde_json::json!({
+            "format_version": 5,
+            "meka_version": "0.66.0",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "blobs": [],
+            "sessions": [
+                session("11111111-1111-4111-8111-111111111111", 3),
+                session("22222222-2222-4222-8222-222222222222", 0),
+            ],
+        });
+        assert!(bring_archive_forward(&mut document, 6));
+        assert_eq!(
+            document["sessions"][0]["stats"]["turn_position"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            document["sessions"][1]["stats"]["turn_position"],
+            serde_json::json!({"prompt_index": 0, "turn_index": 0})
+        );
+        let once = document.clone();
+        document["format_version"] = 5.into();
+        assert!(bring_archive_forward(&mut document, 6));
+        assert_eq!(document, once, "a replay is a no-op");
+        let export = crate::store::export::parse_session_export(once.to_string().as_bytes())
+            .expect("a converted archive reads");
+        assert_eq!(export.sessions[0].stats.turn_position, None);
+        assert_eq!(
+            export.sessions[1].stats.turn_position,
+            Some(crate::stats::TurnPosition::default())
         );
     }
 

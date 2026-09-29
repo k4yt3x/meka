@@ -583,24 +583,46 @@ impl Agent {
             .await
     }
 
-    /// Who this turn's requests are for. A worker answers its parent's prompt, so it carries the
-    /// id and the origin its parent's turn handed the spawning call rather than minting its own;
-    /// the root agent mints an id per turn and reports where the turn's prompt came from. The
-    /// previous-request slot is the agent's own, so a conversation names its own last response
-    /// and never a sibling's.
+    /// Who this turn's requests are for. The root agent mints an id per turn and reports where
+    /// the turn's prompt came from and where the turn stands. A worker answers its parent's
+    /// prompt, so it carries the id its parent's turn handed the spawning call rather than
+    /// minting its own, and reports no origin and no position: Claude Code stamps neither on a
+    /// sub-agent's messages, so its sub-agent's requests carry `cc_is_subagent` and the prompt
+    /// id and nothing else of these (2.1.280 and 2.1.284 captures). The previous-request slot is
+    /// the agent's own, so a conversation names its own last response and never a sibling's.
     fn turn_attribution(
         &self,
         origin: crate::provider::TurnOrigin,
+        turn_position: Option<crate::stats::TurnPosition>,
     ) -> crate::provider::Attribution {
+        let worker = self.role.is_worker();
         crate::provider::Attribution {
-            subagent: self.role.is_worker(),
+            worker: self.worker_identity(),
             prompt_id: Some(self.role.inherited_prompt_id().unwrap_or_else(Uuid::new_v4)),
             previous_request: Some(Arc::clone(&self.previous_request)),
             previous_message: Some(Arc::clone(&self.previous_message)),
             session_id: self.cells.session_id.get(),
-            turn_origin: Some(self.role.inherited_turn_origin().unwrap_or(origin)),
+            turn_origin: (!worker).then_some(origin),
+            turn_position,
             ..Default::default()
         }
+    }
+
+    /// Where the turn about to open stands in its conversation. A worker shares its parent's
+    /// counters, so it must not stamp them, and its requests report no position anyway; the
+    /// root stamps the next one. The stamp reaches the row with the closing write, not one of
+    /// its own: a write on the path to every turn's first request is a round trip the turn
+    /// waits for, and what it would buy is one number kept across a resume that interrupts a
+    /// turn before its first request, which the counter keeps within the process regardless.
+    fn open_turn_position(
+        &self,
+        origin: crate::provider::TurnOrigin,
+    ) -> Option<crate::stats::TurnPosition> {
+        if self.role.is_worker() {
+            return None;
+        }
+        self.session_stats
+            .stamp_turn(origin == crate::provider::TurnOrigin::Human)
     }
 
     /// Park the lock on a session this agent has just created where the host can reach it.
@@ -670,7 +692,8 @@ impl Agent {
             id
         };
         // After the session exists, so the first turn's requests name it as the others do.
-        let attribution = self.turn_attribution(origin);
+        let turn_position = self.open_turn_position(origin);
+        let attribution = self.turn_attribution(origin, turn_position);
 
         self.cells.frontend.emit(FrontendEvent::TurnStarted).await;
 
@@ -2731,6 +2754,109 @@ mod tests {
             Some(crate::provider::TurnOrigin::Scheduled),
             Some(crate::provider::TurnOrigin::Human),
         ]);
+        // The position goes with it: the job's turn is the first and no person opened it, the
+        // typed one is the second and the first a person opened.
+        let positions: Vec<_> = provider
+            .streams()
+            .iter()
+            .map(|request| request.turn_position)
+            .collect();
+        assert_eq!(positions, vec![
+            Some(crate::stats::TurnPosition {
+                prompt_index: 0,
+                turn_index: 1
+            }),
+            Some(crate::stats::TurnPosition {
+                prompt_index: 1,
+                turn_index: 2
+            }),
+        ]);
+    }
+
+    /// A turn that never closes still took its number: the turn after a canceled one is the
+    /// second, and the row learns both numbers when that one closes.
+    #[tokio::test]
+    async fn a_turn_canceled_before_its_first_request_still_took_its_number() {
+        let (agent, provider, store, session, _frontend) =
+            agent_with_session(vec![text_round("ok")]).await;
+        let mut messages = Conversation::new();
+        let canceled = CancellationToken::new();
+        canceled.cancel();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("hello".into(), Vec::new()).expect("a prompt"),
+                canceled,
+            )
+            .await
+            .expect_err("a canceled turn does not run");
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("again".into(), Vec::new()).expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the next turn runs");
+        let second = Some(crate::stats::TurnPosition {
+            prompt_index: 2,
+            turn_index: 2,
+        });
+        let positions: Vec<_> = provider
+            .streams()
+            .iter()
+            .map(|request| request.turn_position)
+            .collect();
+        assert_eq!(positions, vec![second], "the canceled turn was the first");
+        let row = store.load_session_stats(session).await.expect("stats");
+        assert_eq!(row.turns, 1, "one turn closed");
+        assert_eq!(row.turn_position, second);
+    }
+
+    /// Every request of a turn carries the turn's position, the tool round's included, and the
+    /// row keeps it once the turn closes.
+    #[tokio::test]
+    async fn a_turns_position_is_on_every_request_and_on_the_row() {
+        // A call to a tool that does not exist: the agent answers it with an error result and
+        // comes straight back, which is the second request of the same turn.
+        let (agent, provider, store, session, _frontend) = agent_with_session(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-0".to_string(),
+                    name: "no_such_tool".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: crate::provider::mock::MockStopReason::ToolUse,
+                },
+            ],
+            text_round("ok"),
+        ])
+        .await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("read it".into(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+        let positions: Vec<_> = provider
+            .streams()
+            .iter()
+            .map(|request| request.turn_position)
+            .collect();
+        let first = Some(crate::stats::TurnPosition {
+            prompt_index: 1,
+            turn_index: 1,
+        });
+        assert_eq!(positions, vec![first, first]);
+        let row = store.load_session_stats(session).await.expect("stats");
+        assert_eq!(row.turn_position, first);
     }
 
     fn a_stalled_answer(first: &str, rest: &str) -> Vec<MockEvent> {

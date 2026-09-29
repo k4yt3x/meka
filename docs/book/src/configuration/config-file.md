@@ -245,7 +245,7 @@ Override the per-request output (completion) token cap. When unset, each backend
 | Claude, `off` | 32000 |
 | Every other backend | the endpoint's own |
 
-The Claude figures are meka's own defaults for the two Anthropic backends. The adaptive one is what Claude Code 2.1.280 sends for Opus 5.5, the model `meka profile add` suggests, and the most any model that takes adaptive thinking accepts; Claude Code's per-model catalog says 64000 for the rest of the line-up, and stating a figure here replaces the default. The OpenAI backends send no cap unless the profile states one, because each reaches whatever `base_url` names and the endpoint's default is that endpoint's fact.
+The Claude figures are meka's own defaults for the two Anthropic backends. The adaptive one is what Claude Code 2.1.284 sends for Opus 5.5, the model `meka profile add` suggests, and the most any model that takes adaptive thinking accepts; Claude Code's per-model catalog says the same for Sonnet 5.5 and 64000 for the rest of the line-up, and stating a figure here replaces the default. The OpenAI backends send no cap unless the profile states one, because each reaches whatever `base_url` names and the endpoint's default is that endpoint's fact.
 
 Under `thinking = "budgeted"` the value must exceed the profile's resolved thinking budget ([`thinking_budget`](#thinking_budget), else [`[thinking].budget`](#thinkingbudget), else 16000). `meka profile add` and `meka profile set` both refuse a profile that fails this, and it is validated again at startup.
 

@@ -9598,9 +9598,11 @@ fn cancel_with_a_stale_turn_id_is_refused_and_the_live_one_is_honored() {
 /// item still waiting can be taken back, since one in the conversation is already the model's.
 #[test]
 fn inbox_items_replay_on_their_key_and_withdraw_only_while_pending() {
+    // The hold has to outlast seven round trips below, each with a store write, before the
+    // withdraw; Windows CI ran them past a three-second hold once, and the item was taken.
     let script = serde_json::json!([
         [
-            { "type": "sleep", "ms": 3000 },
+            { "type": "sleep", "ms": 10000 },
             { "type": "text", "text": "slow reply" },
             { "type": "message_end", "stop_reason": "end_turn" }
         ],

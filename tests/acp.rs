@@ -5060,9 +5060,11 @@ fn acp_canceling_a_running_turn_leaves_the_next_one_alone() {
     let session_id = harness.new_session();
 
     // Cancel only once the turn is provably streaming, so this tests the in-flight door rather
-    // than racing the between-turns one it is meant to be distinguished from.
+    // than racing the between-turns one it is meant to be distinguished from. The wait ends at
+    // the first token, so a wide barrier costs nothing on a fast runner and everything is lost
+    // without it on a slow one, which Windows CI has been.
     let id_1 = harness.prompt(&session_id, "first");
-    let barrier = Instant::now() + Duration::from_secs(3);
+    let barrier = Instant::now() + Duration::from_secs(10);
     let started = read_until(&mut harness.reader, barrier, |line| {
         line.contains("first starting...")
     });

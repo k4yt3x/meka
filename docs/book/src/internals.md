@@ -146,7 +146,7 @@ columns of the twelve tables in `HEAD_TABLES`. The last two entries are `session
 
 | Table | Owner | Columns and indexes |
 |-------|-------|---------------------|
-| `sessions` | `store/sessions.rs` | `id`, `created_at`, `updated_at`, `parent_session_id`, `cwd`, `permission`, `approvals`, `profile`, `capabilities_json`, `token_id`, `additional_roots_json`, `subagent_spec_json`, `context_tokens`, and the eight cumulative counters `turns`, `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `redactions`, `redacted_images`, `redacted_bytes`. `idx_sessions_updated_at`, `idx_sessions_parent_session_id`. |
+| `sessions` | `store/sessions.rs` | `id`, `created_at`, `updated_at`, `parent_session_id`, `cwd`, `permission`, `approvals`, `profile`, `capabilities_json`, `token_id`, `additional_roots_json`, `subagent_spec_json`, `context_tokens`, the eight cumulative counters `turns`, `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `redactions`, `redacted_images`, `redacted_bytes`, and the position of the last turn opened, `prompt_index` and `turn_index`, both NULL on a session that numbers nothing. `idx_sessions_updated_at`, `idx_sessions_parent_session_id`. |
 | `messages` | `store/sessions.rs` | `id`, `session_id`, `kind`, `content`, `created_at`. `idx_messages_session_id`, `idx_messages_session_id_kind`. |
 | `account_credentials` | `store/credentials.rs` | `account`, `credentials_json`, `updated_at`. |
 | `mcp_credentials` | `store/credentials.rs` | `server`, `kind`, `secret`, `updated_at`; keyed by `(server, kind)`, so a client secret and its refreshable bundle coexist. |

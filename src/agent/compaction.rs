@@ -777,7 +777,7 @@ impl Agent {
     /// is the last user message the header reads, and that one carries no prompt id or origin.
     fn compaction_attribution(&self, request: &CompactRequest) -> crate::provider::Attribution {
         crate::provider::Attribution {
-            subagent: self.role.is_worker(),
+            worker: self.worker_identity(),
             previous_request: Some(Arc::clone(&self.previous_request)),
             // A compaction is a side query, not a message of the conversation: its response must
             // not become the conversation's previous message, and Claude Code's side queries
@@ -997,7 +997,6 @@ impl Agent {
                                             session_id,
                                             tool_call_id: Some(tool_use_id.clone()),
                                             prompt_id: attribution.prompt_id,
-                                            turn_origin: attribution.turn_origin,
                                             frontend: Arc::clone(&self.cells.frontend),
                                             cancellation: cancellation.clone(),
                                         },

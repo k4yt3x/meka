@@ -130,46 +130,38 @@ pub(crate) struct Agent {
     last_accepted_len: std::sync::atomic::AtomicUsize,
 }
 
+/// What a worker descends from: the prompt its spawning call answered, so its requests bill to
+/// it, and its spawner's agent id when the spawner is itself a worker. The prompt id alone of the
+/// spawning turn's attribution: Claude Code stamps neither an origin nor a position on a
+/// sub-agent's messages, so a sub-agent's requests report neither.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct WorkerLineage {
+    pub(crate) prompt_id: Option<uuid::Uuid>,
+    pub(crate) parent_agent_id: Option<String>,
+}
+
 /// Whether an agent is the session's own or a worker spawned from it, and everything that follows
 /// from that in one place: whose prompt its requests bill to, whether it persists the shared
 /// statistics onto its row, whether it consults the MCP manager, and whether it may detach work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentRole {
     Root,
-    /// A worker answers its parent's prompt, so it carries the id and the origin its parent's
-    /// turn handed the spawning call rather than minting its own.
-    Worker {
-        inherited_prompt_id: Option<uuid::Uuid>,
-        inherited_turn_origin: Option<crate::provider::TurnOrigin>,
-    },
+    Worker(WorkerLineage),
 }
 
 impl AgentRole {
-    pub(crate) fn is_worker(self) -> bool {
-        matches!(self, Self::Worker { .. })
+    pub(crate) fn is_worker(&self) -> bool {
+        matches!(self, Self::Worker(_))
     }
 
-    pub(crate) fn is_root(self) -> bool {
+    pub(crate) fn is_root(&self) -> bool {
         matches!(self, Self::Root)
     }
 
-    fn inherited_prompt_id(self) -> Option<uuid::Uuid> {
+    fn inherited_prompt_id(&self) -> Option<uuid::Uuid> {
         match self {
             Self::Root => None,
-            Self::Worker {
-                inherited_prompt_id,
-                ..
-            } => inherited_prompt_id,
-        }
-    }
-
-    fn inherited_turn_origin(self) -> Option<crate::provider::TurnOrigin> {
-        match self {
-            Self::Root => None,
-            Self::Worker {
-                inherited_turn_origin,
-                ..
-            } => inherited_turn_origin,
+            Self::Worker(lineage) => lineage.prompt_id,
         }
     }
 }
@@ -361,10 +353,7 @@ impl Agent {
         tool_registry: ToolRegistry,
         parent_options: &AgentOptions,
         sub_system_prompt: String,
-        // The prompt the spawning call answered and where it came from, so the worker's requests
-        // bill to it.
-        inherited_prompt_id: Option<uuid::Uuid>,
-        inherited_turn_origin: Option<crate::provider::TurnOrigin>,
+        lineage: WorkerLineage,
     ) -> Self {
         let options = AgentOptions {
             sandboxed_shell: parent_options.sandboxed_shell,
@@ -402,11 +391,22 @@ impl Agent {
             cells,
             tool_registry,
             options,
-            AgentRole::Worker {
-                inherited_prompt_id,
-                inherited_turn_origin,
-            },
+            AgentRole::Worker(lineage),
         )
+    }
+
+    /// How this agent's requests name it when it is a worker: its id from its own session, its
+    /// spawner's from the lineage. `None` for the root, and for a worker before its session
+    /// exists, which no request precedes.
+    pub(crate) fn worker_identity(&self) -> Option<crate::provider::WorkerIdentity> {
+        let AgentRole::Worker(lineage) = &self.role else {
+            return None;
+        };
+        let session_id = self.cells.session_id.get()?;
+        Some(crate::provider::WorkerIdentity {
+            agent_id: crate::provider::WorkerIdentity::agent_id_for(session_id),
+            parent_agent_id: lineage.parent_agent_id.clone(),
+        })
     }
 
     /// Whether this agent detaches tool calls and carries their outcomes: `[background] enabled`,
