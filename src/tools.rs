@@ -173,7 +173,7 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 /// it asked to be detached.
 ///
 /// Removing rather than ignoring is the point: the property is spliced in by
-/// [`ToolRegistry::definitions_active_with_loaded`] and is meka's, so forwarding it would hand an
+/// [`ToolRegistry::active_tools`] and is meka's, so forwarding it would hand an
 /// MCP server a key it never advertised.
 ///
 /// Unless the tool advertised it first, in which case the argument is passed straight through and
@@ -249,6 +249,18 @@ pub(crate) fn detachable(name: &str) -> bool {
     name != "context_compact"
 }
 
+/// The level a call to `name` must clear: the `[tools.tool_permissions]` override when one names
+/// it, else `own`, the level the tool declares. The one spelling of the rule that decides whether
+/// a call runs, for every site that asks: dispatch, the gate, `tool_load`'s listing and the
+/// catalog.
+pub(crate) fn effective_permission(
+    overrides: &HashMap<String, Permission>,
+    name: &str,
+    own: Permission,
+) -> Permission {
+    overrides.get(name).copied().unwrap_or(own)
+}
+
 /// Splice `background` into one tool's schema.
 ///
 /// Done here, on the definitions handed to the provider, rather than declared per-tool the way
@@ -257,9 +269,9 @@ pub(crate) fn detachable(name: &str) -> bool {
 /// exception to passing an MCP server's `input_schema` through verbatim (see `crate::mcp`): the
 /// property is meka's own, and [`take_background_flag`] strips it before the adapter forwards the
 /// arguments.
-fn offer_background(parameters: &mut serde_json::Value) {
+fn offer_background(parameters: &mut serde_json::Value) -> bool {
     let Some(object) = parameters.as_object_mut() else {
-        return;
+        return false;
     };
     // A schema with no `properties` describes a tool taking no arguments in the shape every
     // provider expects; creating the map here would change what the tool advertises.
@@ -267,22 +279,33 @@ fn offer_background(parameters: &mut serde_json::Value) {
         .get_mut("properties")
         .and_then(serde_json::Value::as_object_mut)
     else {
-        return;
+        return false;
     };
     // Never shadow a real parameter: a server that already advertises `background` owns the name.
     if properties.contains_key(BACKGROUND_PARAMETER) {
-        return;
+        return false;
     }
-    properties.insert(
-        BACKGROUND_PARAMETER.to_string(),
-        serde_json::json!({
-            "type": "boolean",
-            "default": false,
-            "description":
-                "Return a task id and continue without waiting; the result is delivered as the system prompt's background rules say. Keeps this tool's timeout.",
-        }),
-    );
+    properties.insert(BACKGROUND_PARAMETER.to_string(), background_property());
+    true
 }
+
+/// The `background` property as spliced into a schema.
+fn background_property() -> serde_json::Value {
+    serde_json::json!({
+        "type": "boolean",
+        "default": false,
+        "description":
+            "Return a task id and continue without waiting; the result is delivered as the system prompt's background rules say. Keeps this tool's timeout.",
+    })
+}
+
+/// What [`offer_background`] adds to a schema's cost, for the gauge; the same for every tool, so
+/// measured once.
+static BACKGROUND_PROPERTY_TOKENS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    crate::tokens::estimate_text(BACKGROUND_PARAMETER).saturating_add(crate::tokens::estimate_text(
+        &background_property().to_string(),
+    ))
+});
 
 /// An advisory appended to a `tool_result` when the call and the tool's advertised schema disagree,
 /// or `None` when they don't.
@@ -789,8 +812,9 @@ impl ToolContext {
 /// loop runs all tool calls in a single assistant message in parallel via `join_all`.
 #[async_trait]
 pub(crate) trait Tool: Send + Sync {
-    /// Schema surfaced to the model (name + description + JSON-schema for parameters). Called once
-    /// per registry build, not per call.
+    /// Schema surfaced to the model (name + description + JSON-schema for parameters). Called when
+    /// the tool is registered, which keeps the answer, and once per call for its schema; never per
+    /// lookup, so a built-in may construct it from `json!` each time.
     fn definition(&self) -> ToolDefinition;
     /// Lowest permission level that may invoke this tool. The dispatch loop refuses the call, or
     /// submits it for approval, when the current level is below this.

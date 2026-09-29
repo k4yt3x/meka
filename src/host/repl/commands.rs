@@ -95,12 +95,15 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             (Some(id), Some(text)) => match crate::store::normalize_title(&text) {
                 Ok(title) => {
                     let shown = title.clone().unwrap_or_default();
-                    match store
-                        .update_session(*id, crate::store::SessionPatch {
+                    match crate::host::record_session_change(
+                        store,
+                        *id,
+                        crate::store::SessionPatch {
                             title: Some(title),
                             ..Default::default()
-                        })
-                        .await
+                        },
+                    )
+                    .await
                     {
                         Ok(()) => with_console(console, |console| {
                             console.line(&format!(
@@ -183,11 +186,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                         messages.pop_repair();
                         with_console(console, |console| console.error(&error));
                     } else {
-                        agent.reset_conversation_markers().await;
-                        // The gauge described turns that are gone; an estimate of what is
-                        // left stands in until the next measurement, or the next turn's
-                        // check reads the dropped turns as still there.
-                        agent.cells().seed_context_estimate(messages.as_slice());
+                        agent.reset_conversation_markers(messages.as_slice()).await;
                         with_console(console, |console| {
                             console.hint(&format!("Rewound {turns} turn(s)."))
                         });
@@ -196,7 +195,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                 // No session means nothing was ever persisted, so the in-memory rewind
                 // (which did happen) is the whole story.
                 (None, Some(_)) => {
-                    agent.reset_conversation_markers().await;
+                    agent.reset_conversation_markers(messages.as_slice()).await;
                     with_console(console, |console| {
                         console.hint(&format!("Rewound {turns} turn(s)."))
                     });

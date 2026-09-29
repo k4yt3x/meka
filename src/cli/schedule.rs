@@ -391,7 +391,7 @@ async fn show_job(
     let job = resolve_job(store, id_prefix, scope).await?;
     let level = with_levels(store, config, vec![job]).await;
     let Some((job, level)) = level.into_iter().next() else {
-        return Err(MekaError::Config(format!(
+        return Err(MekaError::Usage(format!(
             "scheduled job '{id_prefix}' was already gone"
         )));
     };
@@ -517,7 +517,7 @@ async fn resolve_job(
     scope: Option<uuid::Uuid>,
 ) -> Result<crate::schedule::ScheduledJob> {
     let no_match = || {
-        Err(MekaError::Config(format!(
+        Err(MekaError::Usage(format!(
             "no scheduled job matching '{id_prefix}'"
         )))
     };
@@ -538,7 +538,7 @@ async fn resolve_job(
         (Some(job), None) => Ok(job),
         // Full ids, as `resolve_session_id` reports: every match shares the prefix, so echoing it
         // back twice names nothing the caller could retype.
-        (Some(first), Some(second)) => Err(MekaError::Config(format!(
+        (Some(first), Some(second)) => Err(MekaError::Usage(format!(
             "ambiguous job id '{}' matches at least: {}, {}",
             id_prefix, first.id, second.id
         ))),
@@ -555,7 +555,7 @@ async fn cancel(store: &Store, id_prefix: &str) -> Result<()> {
             tracing::info!("canceled scheduled job {id}", id = job.id);
             Ok(())
         }
-        false => Err(MekaError::Config(format!(
+        false => Err(MekaError::Usage(format!(
             "scheduled job '{}' was already gone",
             job.short_id()
         ))),

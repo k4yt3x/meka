@@ -357,7 +357,8 @@ For the whole id, and the working directory and permission the table has no room
 meka session show 550e8400
 ```
 
-By default the 20 most recent sessions are shown. Use `-n` to change:
+By default the 20 most recent sessions are shown. Use `-n` to change, and `-n 0` to show every
+session; `meka session search` takes the same flag:
 
 ```bash
 meka session list -n 50
@@ -426,9 +427,10 @@ show` prints when a session was pinned, the JSON forms carry it as `pinned_at`, 
 marks the title with `*`.
 
 A pin is also a keep: the `[session].retention` sweep and `meka session delete --older-than-days`
-leave a pinned session alone whatever its age, and the parent of a pinned sub-agent session with
-it, since deleting the parent would take the child. `meka session delete <id>` and `--all` still do what
-they say. Like a title, a pin does not move `updated_at` and does not change which session `meka
+leave a pinned session alone whatever its age. A session expires as a tree, by the age of its
+root: a pin or a scheduled job anywhere in the tree keeps the root and every sub-agent under it,
+and a root that expires takes its sub-agents with it. `meka session delete <id>` and `--all` still
+do what they say. Like a title, a pin does not move `updated_at` and does not change which session `meka
 -c` continues. A fork is a new session and starts unpinned; an export carries the pin.
 
 ## Searching sessions

@@ -421,9 +421,13 @@ impl Store {
         include_children: bool,
     ) -> Result<Vec<SessionMatch>> {
         let terms = Terms::parse(&[query.to_string()]);
-        if terms.is_empty() || limit == 0 {
+        if terms.is_empty() {
             return Ok(Vec::new());
         }
+        // Zero is every match, as it is on every other listing that takes a count.
+        let limit = if limit == 0 { usize::MAX } else { limit };
+        // SQLite reads a negative `LIMIT` as no limit.
+        let sql_limit: i64 = i64::try_from(limit).unwrap_or(-1);
         let words = terms.words().to_vec();
         let words_for_titles = words.clone();
         let expressions = tiered_expressions(&words);
@@ -482,7 +486,7 @@ impl Store {
                 let mut ranked: Vec<(String, i64)> = Vec::new();
                 for expression in &expressions {
                     let rows = statement
-                        .query_map(rusqlite::params![expression, limit as i64], |row| {
+                        .query_map(rusqlite::params![expression, sql_limit], |row| {
                             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
                         })?;
                     ranked = rows.collect::<rusqlite::Result<_>>()?;
@@ -619,6 +623,25 @@ mod tests {
             .into_iter()
             .map(|found| found.session.id)
             .collect()
+    }
+
+    /// `-n 0` is every match, as it is on every other listing that takes a count.
+    #[tokio::test]
+    async fn a_zero_limit_finds_every_match() {
+        let store = Store::for_test().await;
+        for _ in 0..3 {
+            session_saying(&store, &["egrets by the water"]).await;
+        }
+        let found = store
+            .search_sessions("egrets", 0, false)
+            .await
+            .expect("search");
+        assert_eq!(found.len(), 3);
+        let found = store
+            .search_sessions("egrets", 2, false)
+            .await
+            .expect("search");
+        assert_eq!(found.len(), 2);
     }
 
     /// What meka wrote into a user message is not what the person said: a harness note and the

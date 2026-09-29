@@ -217,11 +217,6 @@ pub(super) fn watch_for_interrupts(
         }
     }))
 }
-pub(super) fn has_tool_results(content: &[ContentBlock]) -> bool {
-    content
-        .iter()
-        .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
-}
 /// Split the unavailable MCP servers into the ones that stop the turn and the ones that don't.
 ///
 /// Only `required` servers gate. Whether a missing server should halt work is a property of that
@@ -398,6 +393,45 @@ pub(super) fn strip_images_and_truncate(content: &mut [ContentBlock]) {
             _ => {}
         }
     }
+}
+
+/// What a turn opens on: the words, images, inbox items and delivered outcomes its input carried.
+struct TurnMaterials {
+    words: String,
+    images: Vec<ImageSource>,
+    inbox: Vec<crate::store::inbox::InboxItem>,
+    outcomes: Option<String>,
+}
+
+/// A turn's opening as appended and persisted: the message, and what settling the turn needs to
+/// know about it.
+struct TurnOpening {
+    user_message: Message,
+    inbox_ids: Vec<Uuid>,
+    /// The world snapshot the model had seen before this turn rendered its own, for a turn that
+    /// is withdrawn.
+    world_state_rollback: Option<prompt::WorldSnapshot>,
+    /// Whether the opening carried the resume notice, which a withdrawal puts back.
+    resumed: bool,
+    suspect_floor: usize,
+    prompt_only_events: usize,
+    user_eagerly_saved: bool,
+}
+
+/// The state a turn's rounds share, so the loop and the phases it calls read one thing.
+struct TurnRun {
+    session_id: Uuid,
+    cancellation: CancellationToken,
+    attribution: crate::provider::Attribution,
+    system_prompt: Arc<str>,
+    user_message: Message,
+    recovery: TurnRecovery,
+    /// Token usage across every provider call within the turn.
+    turn_usage: crate::stats::TokenUsage,
+    /// What the previous round ran, for every request until the next round replaces it: a repair
+    /// or a mid-turn compaction re-sends the same continuation, which Claude Code reports the
+    /// same way.
+    last_round_durations: Vec<crate::provider::ToolDuration>,
 }
 
 /// What a streaming attempt reported about itself while it ran, read back by the retry policy and
@@ -659,37 +693,9 @@ impl Agent {
         // leaves no trace in the conversation.
         self.await_mcp_ready().await?;
 
-        let existing = self.cells.session_id.get();
-        let session_id = if let Some(session_id) = existing {
-            session_id
-        } else {
-            // Created and locked in one step, the lock taken first. See
-            // [`crate::store::Store::create_session_locked`] for why the order is the
-            // whole of it.
-            let (created, lock) = self
-                .store
-                .create_session_locked(
-                    Some(self.cells.cwd.get()),
-                    // The level this session starts at. The row is the one answer every process
-                    // reads for a scheduled gate, and a row with no level runs nothing; the REPL
-                    // keeps it current through `ReplEvent::PermissionChanged`, ACP through
-                    // `session/set_mode`. The approvals switch travels beside it for a resume.
-                    self.cells.permission.get().to_string(),
-                    self.cells.permission.approvals(),
-                    None,
-                    None,
-                    self.profile(),
-                )
-                .await?;
-            let id = created.id;
-            self.hold_the_lock_on_a_created_session(lock.ok());
-            // The cell is the one holder: every tool and the host read the id from here.
-            self.cells.session_id.set(id);
-            self.cells
-                .frontend
-                .emit(FrontendEvent::SessionStarted { id })
-                .await;
-            id
+        let session_id = match self.cells.session_id.get() {
+            Some(session_id) => session_id,
+            None => self.create_session_for_turn().await?,
         };
         // After the session exists, so the first turn's requests name it as the others do.
         let turn_position = self.open_turn_position(origin);
@@ -697,38 +703,146 @@ impl Agent {
 
         self.cells.frontend.emit(FrontendEvent::TurnStarted).await;
 
-        // Auto-compact if the last turn's context occupancy exceeded the ceiling fraction of the
-        // context window. This check runs between turns, before the loop opens, which is why it
-        // needs no re-anchoring of its own. Compaction itself is not confined here: the emergency
-        // retry, the agent's own `context_compact` and the same check after each round all run
-        // inside the loop and re-anchor through `TurnRecovery::after_conversation_rewrite`.
-        // Whether a compaction was attempted before the loop opened, so the check between rounds
-        // treats the crossing as answered: a first round still over the ceiling after one gets
-        // nothing from a second pass against the same conversation, and one that failed would fail
-        // the same way.
-        let mut compacted_before_the_loop = false;
-        if let Some(ceiling) = self.auto_compact_ceiling() {
-            let last_tokens = self.cells.context_occupancy();
-            if last_tokens > ceiling && messages.len() > 1 {
-                let window = self.context_window();
-                tracing::info!(
-                    "auto-compacting: {last_tokens} tokens in context exceeds the ceiling of \
-                     {ceiling} on the {window} window"
-                );
-                compacted_before_the_loop = true;
-                if let Err(error) = self
-                    .compact_session(
-                        messages,
-                        CompactRequest::new(CompactOrigin::Reactive),
-                        cancellation.clone(),
-                    )
-                    .await
-                {
-                    tracing::warn!("auto-compact failed: {error}");
-                }
-            }
-        }
+        let mut compacted_before_the_loop =
+            self.compact_before_the_loop(messages, &cancellation).await;
 
+        let mut opening = self
+            .open_turn(messages, session_id, TurnMaterials {
+                words,
+                images,
+                inbox,
+                outcomes,
+            })
+            .await?;
+        let system_prompt: Arc<str> = match &self.options.system_prompt_override {
+            Some(prompt) => Arc::from(prompt.as_str()),
+            None => Arc::from(prompt::build_system_prompt(self.system_prompt_inputs())),
+        };
+        compacted_before_the_loop |= self
+            .compact_for_projection(messages, &system_prompt, &cancellation, &mut opening)
+            .await;
+
+        let mut run = TurnRun {
+            session_id,
+            cancellation,
+            attribution,
+            system_prompt,
+            user_message: opening.user_message.clone(),
+            recovery: TurnRecovery {
+                suspect_floor: opening.suspect_floor,
+                prompt_only_events: opening.prompt_only_events,
+                overflow_retries: 0,
+                requested_compactions: 0,
+                ceiling_compacted: compacted_before_the_loop,
+                // An outcome-only or image-only turn has no words to quote.
+                request_in_flight: Some(request_in_flight).filter(|words| !words.trim().is_empty()),
+                tiers_tried: 0,
+                pending_repair: None,
+                user_saved: opening.user_eagerly_saved,
+                inbox_ids: opening.inbox_ids.clone(),
+                thinking_only_nudged: false,
+                outage_reprieve_used: false,
+            },
+            // Accumulated across every provider call within this turn so the per-turn display
+            // reflects the whole turn (including tool-execution loops), not just the final
+            // round-trip.
+            turn_usage: crate::stats::TokenUsage::default(),
+            last_round_durations: Vec::new(),
+        };
+
+        let result = self.run_rounds(messages, &mut run).await;
+        self.settle_turn(messages, run, &opening, retention, &result)
+            .await;
+        result
+    }
+
+    /// Create and lock the session this agent's first turn runs in, and seed the cell every tool
+    /// and the host read the id from.
+    async fn create_session_for_turn(&self) -> Result<Uuid> {
+        // Created and locked in one step, the lock taken first. See
+        // [`crate::store::Store::create_session_locked`] for why the order is the whole of it.
+        let (created, lock) = self
+            .store
+            .create_session_locked(
+                Some(self.cells.cwd.get()),
+                // The level this session starts at. The row is the one answer every process
+                // reads for a scheduled gate, and a row with no level runs nothing; the REPL
+                // keeps it current through `ReplEvent::PermissionChanged`, ACP through
+                // `session/set_mode`. The approvals switch travels beside it for a resume.
+                self.cells.permission.get().to_string(),
+                self.cells.permission.approvals(),
+                None,
+                None,
+                self.profile(),
+            )
+            .await?;
+        let id = created.id;
+        self.hold_the_lock_on_a_created_session(lock.ok());
+        // The cell is the one holder: every tool and the host read the id from here.
+        self.cells.session_id.set(id);
+        self.cells
+            .frontend
+            .emit(FrontendEvent::SessionStarted { id })
+            .await;
+        Ok(id)
+    }
+
+    /// Auto-compact if the last turn's context occupancy exceeded the ceiling fraction of the
+    /// context window; whether a compaction was attempted.
+    ///
+    /// This check runs between turns, before the loop opens, which is why it needs no
+    /// re-anchoring of its own. Compaction itself is not confined here: the emergency retry, the
+    /// agent's own `context_compact` and the same check after each round all run inside the loop
+    /// and re-anchor through `TurnRecovery::after_conversation_rewrite`. The answer lets the check
+    /// between rounds treat the crossing as answered: a first round still over the ceiling after
+    /// one gets nothing from a second pass against the same conversation, and one that failed
+    /// would fail the same way.
+    async fn compact_before_the_loop(
+        &self,
+        messages: &mut Conversation,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        let Some(ceiling) = self.auto_compact_ceiling() else {
+            return false;
+        };
+        let last_tokens = self.cells.context_occupancy();
+        if last_tokens <= ceiling || messages.len() <= 1 {
+            return false;
+        }
+        let window = self.context_window();
+        tracing::info!(
+            "auto-compacting: {last_tokens} tokens in context exceeds the ceiling of {ceiling} \
+             on the {window} window"
+        );
+        if let Err(error) = self
+            .compact_session(
+                messages,
+                CompactRequest::new(CompactOrigin::Reactive),
+                cancellation.clone(),
+            )
+            .await
+        {
+            tracing::warn!("auto-compact failed: {error}");
+        }
+        true
+    }
+
+    /// Open the turn: render the world state, read what arrived in the inbox, build the user
+    /// message, append it and persist it. [`MekaError::EmptyPrompt`] when everything the turn was
+    /// opened on was withdrawn while it was starting, with the world snapshot rolled back to what
+    /// the model has seen.
+    async fn open_turn(
+        &self,
+        messages: &mut Conversation,
+        session_id: Uuid,
+        materials: TurnMaterials,
+    ) -> Result<TurnOpening> {
+        let TurnMaterials {
+            words,
+            images,
+            inbox,
+            outcomes,
+        } = materials;
         // The snapshot rolls back with a withdrawn opening; compaction publishes its own snapshot
         // only after saving the replacement context.
         let current = self.read_world_snapshot(session_id).await;
@@ -797,18 +911,18 @@ impl Agent {
                 text: prompt::render_inbox_item(item, false),
             }));
         let inbox_ids: Vec<Uuid> = inbox.iter().map(|item| item.id).collect();
-        // Captured around the append rather than in the `TurnRecovery` literal below, which is
-        // built after a proactive compaction may have moved the conversation under both. See their
+        // Captured around the append rather than in the `TurnRecovery` literal, which is built
+        // after a proactive compaction may have moved the conversation under both. See their
         // field documentation for what each one is measured against. The compaction, if it runs,
         // then replaces this with `SUSPECT_FLOOR_AFTER_REWRITE`.
-        let mut suspect_floor = messages.len();
+        let suspect_floor = messages.len();
         messages.append(user_message.clone());
         let prompt_only_events = messages.events_len();
         // Persist the user message eagerly, before the first provider call, or a crash during the
         // provider round trip would lose it from disk. On a transient database failure the lazy
-        // save path below retries; `user_eagerly_saved` suppresses double-writes on the happy path.
+        // save path retries; `user_eagerly_saved` suppresses double-writes on the happy path.
         let user_event = crate::conversation::Event::Append(user_message.clone());
-        let mut user_eagerly_saved = match self
+        let user_eagerly_saved = match self
             .store
             .save_event_marking_inbox(session_id, &user_event, &inbox_ids)
             .await
@@ -822,840 +936,857 @@ impl Agent {
                 false
             }
         };
-        let system_prompt: Arc<str> = match &self.options.system_prompt_override {
-            Some(prompt) => Arc::from(prompt.as_str()),
-            None => Arc::from(prompt::build_system_prompt(self.system_prompt_inputs())),
+        Ok(TurnOpening {
+            user_message,
+            inbox_ids,
+            world_state_rollback,
+            resumed,
+            suspect_floor,
+            prompt_only_events,
+            user_eagerly_saved,
+        })
+    }
+
+    /// Proactive pre-send compaction; whether one was attempted.
+    ///
+    /// The reactive check at the top of the turn reads the *previous* round's reported usage, so
+    /// a turn whose own input jumps over the window (a huge paste, a large tool result carried in)
+    /// would be sent uncompacted and hard-fail. Project this request locally (conversation +
+    /// system prompt) and compact before sending if it would cross the ceiling.
+    /// `estimate_messages` under-reads (no tool schemas), so this is a floor that complements,
+    /// not replaces, the reactive check and the overflow recovery in the loop.
+    async fn compact_for_projection(
+        &self,
+        messages: &mut Conversation,
+        system_prompt: &str,
+        cancellation: &CancellationToken,
+        opening: &mut TurnOpening,
+    ) -> bool {
+        let Some(ceiling) = self.auto_compact_ceiling() else {
+            return false;
+        };
+        if messages.len() <= 1 {
+            return false;
+        }
+        let projected = crate::tokens::estimate_messages(messages.as_slice())
+            .saturating_add(crate::tokens::estimate_text(system_prompt));
+        if projected <= ceiling {
+            return false;
+        }
+        let window = self.context_window();
+        tracing::info!(
+            "proactive compaction: projected {projected} input tokens exceeds the ceiling of \
+             {ceiling} on the {window} window"
+        );
+        match self
+            .compact_session(
+                messages,
+                CompactRequest::new(CompactOrigin::Proactive),
+                cancellation.clone(),
+            )
+            .await
+        {
+            // The floor captured at the append counts messages that no longer exist. Left as it
+            // was, it lands past the end of the collapsed conversation, clamps to the length, and
+            // leaves the degrade-and-retry nothing to look at for the whole turn. See
+            // `SUSPECT_FLOOR_AFTER_REWRITE`.
+            //
+            // The rewrite persisted the prompt too, in the kept tail or inside the boundary's
+            // summary, whatever became of the eager save. Saving it again on the 2xx would put a
+            // second copy after the boundary.
+            Ok(_) => {
+                opening.suspect_floor = SUSPECT_FLOOR_AFTER_REWRITE;
+                // The rewrite carried the prompt to disk where the eager save could not, and with
+                // it the items it holds; see `stamp_appended_after_rewrite`.
+                if !opening.user_eagerly_saved
+                    && let Err(error) = self
+                        .store
+                        .inbox_store()
+                        .stamp_appended_after_rewrite(&opening.inbox_ids)
+                        .await
+                {
+                    tracing::warn!("failed to stamp the inbox items a rewrite persisted: {error}");
+                }
+                opening.user_eagerly_saved = true;
+            }
+            Err(error) => tracing::warn!("proactive compaction failed: {error}"),
+        }
+        true
+    }
+
+    /// The rounds of one turn: a request, its answer, and the tools it called, until the model
+    /// stops calling any or something ends the turn.
+    async fn run_rounds(
+        &self,
+        messages: &mut Conversation,
+        run: &mut TurnRun,
+    ) -> Result<TurnOutcome> {
+        let session_id = run.session_id;
+        loop {
+            // Both exits undo an unvindicated repair first. A degrade that has been applied but
+            // not yet retried is parked in memory with no `Event::Repair` on disk, and these are
+            // the two ways out of the round that skip the error arm entirely: a repair fires,
+            // `continue` returns here, and the turn ends before the provider ever judged it.
+            // Leaving it applied would have the model reasoning from a conversation the store has
+            // never heard of, while `GET /messages` still serves the original with its revision
+            // unmoved. Under ACP `client_disconnected` becomes true precisely while a turn is
+            // stalled on a failing provider, which is when a repair is most likely to be in
+            // flight.
+            if run.cancellation.is_cancelled() {
+                run.recovery.undo_rejected_repair(messages);
+                return Err(MekaError::Interrupted);
+            }
+            // Bail out if the frontend has noticed its client went away (e.g. ACP stdio
+            // disconnect). No point burning more provider tokens for an audience that won't see
+            // the output. REPL frontends report `false` here, so this is a no-op for them.
+            if self.cells.frontend.client_disconnected() {
+                run.recovery.undo_rejected_repair(messages);
+                return Err(MekaError::Interrupted);
+            }
+
+            // Conversation length behind this request, stamped onto `last_accepted_len` when the
+            // provider takes it.
+            let sent_len = messages.len();
+            // The round's own token, a child of the turn's: an inbox interrupt fires it, so the
+            // call returns the way a stop makes it return, and `cancellation` still says which of
+            // the two happened.
+            let round = run.cancellation.child_token();
+            let mut progress = StreamProgress::default();
+            let (call_result, loaded) = self
+                .request_round(messages, run, &round, &mut progress)
+                .await;
+
+            let (mut assistant_message, stop_reason, usage) = match call_result {
+                Ok(value) => value,
+                Err(MekaError::ContextOverflow(message))
+                    if self.auto_compact_ceiling().is_some()
+                        && messages.len() > 1
+                        && run.recovery.overflow_retries < MAX_OVERFLOW_RETRIES =>
+                {
+                    run.recovery
+                        .recover_from_context_overflow(self, messages, &run.cancellation, message)
+                        .await?;
+                    continue;
+                }
+                Err(MekaError::Interrupted)
+                    if round.is_cancelled() && !run.cancellation.is_cancelled() =>
+                {
+                    // An inbox interrupt dropped the request before the provider answered, so
+                    // nothing was judged and nothing streamed: the message joins the prompt and
+                    // the request goes again with it. A repair riding the request is put back
+                    // without its tier being counted, since the provider never saw it.
+                    run.recovery.unjudge_repair(messages);
+                    self.absorb_interrupt(
+                        session_id,
+                        messages,
+                        &mut run.recovery,
+                        &run.user_message,
+                        None,
+                    )
+                    .await?;
+                    continue;
+                }
+                Err(error) => {
+                    // Unconditionally, before deciding anything else. A repair still applied here
+                    // is one the provider has just refused a second time, so it was not the fix
+                    // whatever happens next: another tier measures itself against the
+                    // conversation as it really is, and a turn that gives up leaves memory and
+                    // store agreeing.
+                    run.recovery.undo_rejected_repair(messages);
+                    if !refusal_may_blame_content(&error, progress.content_started) {
+                        // The same treatment an interrupt gives a half-streamed answer: the text
+                        // the user watched arrive is kept, without the tool calls that never ran.
+                        //
+                        // The prompt goes first, as it does on the interrupt arm below: this is
+                        // the one exit ahead of the 2xx that persists a row, so a partial written
+                        // while the prompt's eager save had failed would replay as an answer
+                        // ahead of its question. A prompt the store still cannot take gets no row
+                        // for its answer either.
+                        if let Some(partial) = progress.partial.take() {
+                            match run
+                                .recovery
+                                .ensure_prompt_saved(self, session_id, &run.user_message)
+                                .await
+                            {
+                                Ok(()) => {
+                                    self.keep_partial_answer(session_id, messages, partial)
+                                        .await
+                                }
+                                Err(save_error) => tracing::warn!(
+                                    "dropping the partial answer: failed to persist its prompt: \
+                                     {save_error}"
+                                ),
+                            }
+                        }
+                        return Err(error);
+                    }
+                    run.recovery
+                        .repair_rejected_content(self, messages, error, &run.cancellation)
+                        .await?;
+                    continue;
+                }
+            };
+
+            self.accept_round(run, sent_len, &usage, progress.cut).await;
+
+            if let Err(error) = run
+                .recovery
+                .ensure_prompt_saved(self, session_id, &run.user_message)
+                .await
+            {
+                // The one exit between a 2xx and the persist below, so the repair the 2xx just
+                // vindicated has to be put back rather than left applied: persisting it on top of
+                // a store whose opening message is missing is exactly what the failure above
+                // forbids. Undoing also restores the trailing `Event::Append` that the post-loop
+                // `pop_unsaved` looks for, which a trailing `Event::Repair` would have made it
+                // silently skip, stranding the prompt in memory too.
+                run.recovery.undo_rejected_repair(messages);
+                return Err(error);
+            }
+
+            run.recovery
+                .persist_vindicated_repair(self, session_id)
+                .await;
+
+            // And the model has read whatever inbox items the body carried, which is the fact
+            // their producers are waiting on. One turn runs per session, so every appended,
+            // undelivered item of this session was in this body. After the prompt's save, which is
+            // what stamps the opening's items when the eager save had failed; asked before it,
+            // they would not be appended yet and would be reported read by some later request.
+            match self.store.inbox_store().mark_delivered(session_id).await {
+                Ok(item_ids) if !item_ids.is_empty() => {
+                    self.cells
+                        .frontend
+                        .emit(FrontendEvent::InboxDelivered { item_ids })
+                        .await;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!("failed to mark inbox items delivered: {error}");
+                }
+            }
+
+            // What the request budget took out of the body, recorded once, so the body that fit
+            // is the body every later request sends and the cache prefix ahead of this turn
+            // holds. Ahead of the interrupt and thinking-only exits below, because a redaction is
+            // a fact about the request the provider just accepted rather than about how the round
+            // ends. Before the round's own messages are appended, since the positions are
+            // relative to the tail of the view as the request saw it.
+            let redacted = std::mem::take(&mut *crate::sync::lock(&self.pending_redactions));
+            if !redacted.is_empty() {
+                let redaction = messages.redact_images(redacted);
+                // Its own write rather than part of the round's, which the exits below never
+                // reach. A failed write leaves the view redacted in memory, so the turn goes on;
+                // the cost is one more redaction after a resume.
+                if let Err(error) = self.store.save_event(session_id, &redaction).await {
+                    tracing::warn!("failed to persist the image redaction: {error}");
+                }
+            }
+
+            if run.cancellation.is_cancelled() {
+                // Interrupted mid-stream. Persist the partial assistant text so it survives resume
+                // instead of being discarded, but drop any `tool_use` blocks first: no tools run
+                // on an interrupt, so a persisted `tool_use` would be orphaned (no matching
+                // `tool_result`) and the provider would reject the next request. Only persist
+                // when text actually streamed; a partial with no text (interrupted before any
+                // output, or mid-thinking) has nothing worth restoring.
+                let partial = assistant_message.without_tool_use();
+                if partial
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text { .. }))
+                {
+                    messages.append(partial.clone());
+                    if let Err(error) = self
+                        .store
+                        .save_events_atomic(session_id, vec![crate::conversation::Event::Append(
+                            partial,
+                        )])
+                        .await
+                    {
+                        tracing::warn!(
+                            "failed to persist interrupted partial assistant message: {error}"
+                        );
+                    }
+                }
+                return Err(MekaError::Interrupted);
+            }
+            if progress.cut {
+                // An inbox interrupt cut the stream after the provider had answered. What arrived
+                // is kept as the answer so far, the message follows it, and the turn goes on:
+                // same turn, no terminal, the way a person is cut off and told the next thing.
+                self.absorb_interrupt(
+                    session_id,
+                    messages,
+                    &mut run.recovery,
+                    &run.user_message,
+                    Some(assistant_message),
+                )
+                .await?;
+                continue;
+            }
+
+            // Run tools based on the *presence* of tool-call blocks, not the reported stop reason:
+            // stop reasons are advisory and providers sometimes mislabel a tool turn as a plain
+            // end, but any tool call the model made must be answered with a result or the next
+            // request is invalid. Only complete tool calls reach the content blocks, so executing
+            // whatever is present is safe.
+            let has_tool_calls = assistant_message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+            let has_visible_text = has_visible_text(&assistant_message.content);
+
+            if !self.options.streaming {
+                self.show_whole_reply(&assistant_message).await;
+            }
+
+            if should_nudge_thinking_only(
+                has_tool_calls,
+                has_visible_text,
+                &stop_reason,
+                run.recovery.thinking_only_nudged,
+            ) {
+                run.recovery
+                    .nudge_thinking_only(
+                        self,
+                        session_id,
+                        messages,
+                        &assistant_message,
+                        &stop_reason,
+                    )
+                    .await?;
+                continue;
+            }
+
+            // No tool call and no visible text, and the nudge above didn't fire (already used this
+            // turn, or a stop reason with its own handling such as refusal / max tokens). Surface
+            // a stand-in in the assistant's place and persist it so the message is non-empty: an
+            // empty content array is invalid on the next request and breaks resume, and a silent
+            // turn leaves the user with nothing.
+            if !has_tool_calls && !has_visible_text {
+                let notice = empty_turn_notice(&stop_reason);
+                self.cells
+                    .frontend
+                    .emit(FrontendEvent::AssistantTextDelta(notice.clone()))
+                    .await;
+                assistant_message
+                    .content
+                    .push(ContentBlock::Text { text: notice });
+            }
+
+            // Append in memory now so the next iteration sees the full state; defer the DB save
+            // to the branches below (atomic with results on the tool path, standalone otherwise).
+            messages.append(assistant_message.clone());
+            let round_events = vec![crate::conversation::Event::Append(
+                assistant_message.clone(),
+            )];
+
+            if !has_tool_calls {
+                // No tool calls: the assistant message stands alone and ends the turn. Save it
+                // before returning so the persistent log includes it.
+                self.store
+                    .save_events_atomic(session_id, round_events)
+                    .await?;
+                return Ok(match stop_reason {
+                    StopReason::MaxTokens => TurnOutcome::MaxTokens,
+                    StopReason::Refusal(text) if !text.is_empty() => TurnOutcome::Refusal(text),
+                    // An empty refusal body carries no text, so fall back to the assistant
+                    // message's text (the model's own refusal, or the stand-in above).
+                    StopReason::Refusal(_) => {
+                        TurnOutcome::Refusal(assistant_message.text_content())
+                    }
+                    _ => TurnOutcome::EndTurn,
+                });
+            }
+
+            // Surface a provider that mislabeled the stop reason, the bug this presence check
+            // guards against.
+            if !matches!(stop_reason, StopReason::ToolUse) {
+                tracing::warn!(
+                    "assistant message carries tool calls but stop_reason is {stop_reason:?}; \
+                     executing them anyway"
+                );
+            }
+            self.run_tool_round(messages, run, &assistant_message, &loaded, round_events)
+                .await?;
+
+            // A compaction `context_compact` asked for, run here rather than after the loop so
+            // the agent that chose the moment gets to act on the result: it takes its checkpoint,
+            // then this turn carries on against the summary.
+            let compaction_attempted_this_round =
+                self.compact_at_the_agents_request(messages, run).await;
+            self.compact_between_rounds(messages, run, compaction_attempted_this_round)
+                .await;
+        }
+    }
+
+    /// One request: the active tool set, the overhead it costs the gauge, and the provider's
+    /// answer, streamed or whole. Returns the tools the model has loaded with it, which the tool
+    /// round reads too.
+    async fn request_round(
+        &self,
+        messages: &Conversation,
+        run: &mut TurnRun,
+        round: &CancellationToken,
+        progress: &mut StreamProgress,
+    ) -> (
+        Result<(Message, StopReason, crate::stats::TokenUsage)>,
+        Vec<String>,
+    ) {
+        // Whatever a request that never reached this point reported is not about the view this
+        // request is built from.
+        crate::sync::lock(&self.pending_redactions).clear();
+        // The conversation as it stands, whole. The context ceiling and compaction are its only
+        // bound: a cap on the message count drops history nothing has summarized, and the model
+        // forgets it with no trace on any surface. Copied for the streaming path alone, whose
+        // spawned task needs an owned slice.
+        let api_messages: &[Message] = messages.as_slice();
+
+        // Recompute the active tool set every iteration so a `tool_load` call earlier in this
+        // turn becomes visible to the model on the very next request, without mutating any
+        // registry state. Append-only growth keeps the tools array's cache prefix stable.
+        //
+        // Read from events (not the materialized slice) so the deferred-tool snapshot stored on
+        // `Event::CompactBoundary` survives across compaction; otherwise tools the model loaded
+        // pre-compaction would silently drop out of the active set on the next turn.
+        let loaded =
+            crate::tools::load_tool::extract_loaded_tool_names_from_events(messages.events());
+        let active = self.tool_registry.active_tools(&loaded);
+        let tools: Arc<[ToolDefinition]> = Arc::from(active.definitions);
+
+        // The part of the window that is not conversation, for `context_check` to report.
+        // Re-stamped per round because the active tool set grows as `tool_load` pulls in deferred
+        // schemas. Written, never read by the agent: an estimate is fine for informing the
+        // model's decision, while the agent's own thresholds run off the provider's exact
+        // numbers.
+        self.cells.context_overhead.store(
+            crate::tokens::estimate_text(&run.system_prompt).saturating_add(active.schema_tokens),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        let watcher = watch_for_interrupts(
+            self.store.inbox_store(),
+            run.session_id,
+            run.recovery.inbox_ids.clone(),
+            round.clone(),
+        );
+        let request_attribution = run.attribution.for_request(
+            run.last_round_durations.clone(),
+            self.take_context_compacted(),
+        );
+        // Streaming and blocking paths converge on `(Message, StopReason, TokenUsage)`. The
+        // blocking provider call surfaces notices in its return tuple (no event channel); they
+        // are forwarded to the frontend here so the user sees the same advisories the streaming
+        // path emits inline via `StreamEvent::Notice`.
+        let call_result = if self.options.streaming {
+            self.run_streaming(
+                Arc::clone(&run.system_prompt),
+                Arc::from(api_messages),
+                tools,
+                request_attribution,
+                round.clone(),
+                progress,
+            )
+            .await
+        } else {
+            // Non-streaming is fully atomic (nothing is visible until this returns `Ok`), so
+            // `content_started` is always `false` here, and every retryable failure is retried up
+            // to the cap regardless of prior attempts.
+            match complete_with_retry(
+                "the turn's provider call",
+                &self.provider(),
+                CompletionRequest::new(&run.system_prompt, api_messages, &tools)
+                    .attributed(request_attribution),
+                round,
+                round,
+            )
+            .await
+            {
+                Ok(crate::provider::Completion {
+                    message,
+                    stop_reason,
+                    usage,
+                    notices,
+                }) => {
+                    for notice in notices {
+                        self.forward_notice(notice).await;
+                    }
+                    Ok((message, stop_reason, usage))
+                }
+                Err(error) => Err(error),
+            }
+        };
+        // Before the tools run, or the poll would go on for the length of the round.
+        drop(watcher);
+        (call_result, loaded)
+    }
+
+    /// The provider accepted the request: everything in it is known-good, its usage is the
+    /// occupancy the gauge and the ceiling read, and it counts toward the turn.
+    async fn accept_round(
+        &self,
+        run: &mut TurnRun,
+        sent_len: usize,
+        usage: &crate::stats::TokenUsage,
+        cut: bool,
+    ) {
+        // Only what comes after the accepted body can be blamed for a later rejection.
+        self.last_accepted_len
+            .store(sent_len, std::sync::atomic::Ordering::Relaxed);
+        run.recovery.note_request_accepted();
+
+        // Total of all tiers including output = everything in context as of this exchange, which
+        // is what the next request re-sends (minus the new user prompt). Summing the input tiers
+        // + output (Claude reports cached tokens in separate fields) is the true occupancy and
+        // what the `/status` gauge and the auto-compact ceiling read.
+        //
+        // Unless the stream was cut before it measured anything: a stream a stop ends before its
+        // last event, on a backend that reports usage there alone (both OpenAI wires), has
+        // measured nothing, and recording its zero would read as an empty context: the ceiling
+        // check would stay silent until the next uncut round. The last measurement stands
+        // instead. A reply that arrived whole and reports nothing is recorded as it always was: a
+        // zero from a server that ignores `include_usage` is all the gauge can know, and the
+        // reservations a measurement clears must not outlive the round that made them.
+        if !(cut && usage.is_empty()) {
+            self.record_context_tokens(
+                usage
+                    .input_tokens
+                    .saturating_add(usage.cache_creation_input_tokens)
+                    .saturating_add(usage.cache_read_input_tokens)
+                    .saturating_add(usage.output_tokens),
+            )
+            .await;
+        }
+        let turn_usage = &mut run.turn_usage;
+        turn_usage.input_tokens = turn_usage.input_tokens.saturating_add(usage.input_tokens);
+        turn_usage.output_tokens = turn_usage.output_tokens.saturating_add(usage.output_tokens);
+        turn_usage.cache_creation_input_tokens = turn_usage
+            .cache_creation_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
+        turn_usage.cache_read_input_tokens = turn_usage
+            .cache_read_input_tokens
+            .saturating_add(usage.cache_read_input_tokens);
+        tracing::debug!(
+            "round usage: input={} cache_creation={} cache_read={} output={} messages={sent_len} \
+             subagent={}",
+            usage.input_tokens,
+            usage.cache_creation_input_tokens,
+            usage.cache_read_input_tokens,
+            usage.output_tokens,
+            !self.role.is_root()
+        );
+    }
+
+    /// Show a whole reply the way the streaming path showed it as it arrived.
+    ///
+    /// The blocking path returns the message whole, with no event channel to have put anything
+    /// on while it was being written. Every frontend renders assistant text from
+    /// `AssistantTextDelta` and nothing else carries it, so without this a turn that succeeded
+    /// shows the user nothing at all. Emitted per round, matching the streaming path, so text the
+    /// model writes before a tool call still precedes the indicator `execute_tool_calls` emits for
+    /// it, and ahead of the thinking-only nudge, so a round that reasoned without answering still
+    /// shows its reasoning as it does when streaming.
+    ///
+    /// Reasoning goes through the same shape, delta then block, which is what makes
+    /// `ThinkingDelta`'s promise hold on this path too: a frontend reading the deltas gets one
+    /// covering the whole block rather than nothing at all.
+    async fn show_whole_reply(&self, assistant_message: &Message) {
+        for block in &assistant_message.content {
+            match block {
+                ContentBlock::Text { text } => {
+                    self.cells
+                        .frontend
+                        .emit(FrontendEvent::AssistantTextDelta(text.clone()))
+                        .await;
+                }
+                // `trim` rather than `is_empty`, matching the question replay asks of the same
+                // block in `render::render_message_history`: a block of whitespace has nothing to
+                // show, and the two must not disagree about that or a resumed transcript gains a
+                // block the live turn skipped.
+                ContentBlock::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
+                    self.cells
+                        .frontend
+                        .emit(FrontendEvent::ThinkingDelta(thinking.clone()))
+                        .await;
+                    self.cells
+                        .frontend
+                        .emit(FrontendEvent::ThinkingBlock {
+                            content: thinking.clone(),
+                        })
+                        .await;
+                }
+                ContentBlock::RedactedThinking { .. } => {
+                    self.cells
+                        .frontend
+                        .emit(FrontendEvent::ThinkingDelta(
+                            crate::conversation::REDACTED_THINKING.to_string(),
+                        ))
+                        .await;
+                    self.cells
+                        .frontend
+                        .emit(FrontendEvent::ThinkingBlock {
+                            content: crate::conversation::REDACTED_THINKING.to_string(),
+                        })
+                        .await;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Run the round's tool calls, size their results, read what arrived while they ran, and
+    /// persist the round as one unit with the assistant message that opened it.
+    async fn run_tool_round(
+        &self,
+        messages: &mut Conversation,
+        run: &mut TurnRun,
+        assistant_message: &Message,
+        loaded: &[String],
+        mut round_events: Vec<crate::conversation::Event>,
+    ) -> Result<()> {
+        let session_id = run.session_id;
+        let (mut tool_results, tool_durations) = self
+            .execute_tool_calls(
+                assistant_message,
+                loaded,
+                &run.attribution,
+                run.cancellation.clone(),
+            )
+            .await;
+        run.last_round_durations = tool_durations;
+
+        if let Err(error) = crate::tools::scratchpad::save_explicit_scratchpad_results(
+            &self.store,
+            session_id,
+            &self.tool_registry.inherited_scratchpad_names(),
+            assistant_message,
+            &mut tool_results,
+        )
+        .await
+        {
+            tracing::warn!("failed to save explicit scratchpad results: {error}");
+        }
+
+        // Take the per-turn hints. This both snapshots them for the call below and clears them,
+        // so a long session doesn't accumulate entries for tool calls that already ran.
+        let hints_snapshot = std::mem::take(&mut *self.scratchpad_hints.write().await);
+        if let Err(error) = crate::tools::scratchpad::persist_oversized_results(
+            &self.store,
+            session_id,
+            assistant_message,
+            &mut tool_results,
+            &hints_snapshot,
+        )
+        .await
+        {
+            tracing::warn!("failed to persist oversized tool results: {error}");
+        }
+
+        // The round boundary is where a message that arrived while the tools ran is read: after
+        // the results, in the same user message, which every wire accepts and which keeps the
+        // cache prefix ahead of it intact. Steers and interrupts, which nothing cuts a tool for; a
+        // followup waits for the turn to end. Read here and stamped with the round below, so the
+        // text and the stamp are one write.
+        let steering = match self
+            .store
+            .inbox_store()
+            .take_pending(
+                session_id,
+                &[
+                    crate::store::inbox::InboxClass::Steer,
+                    crate::store::inbox::InboxClass::Interrupt,
+                ],
+                chrono::Utc::now(),
+            )
+            .await
+        {
+            Ok(mut items) => {
+                // Pending still, if the prompt's save failed and the lazy one is yet to run;
+                // carried already, either way.
+                items.retain(|item| !run.recovery.inbox_ids.contains(&item.id));
+                items
+            }
+            Err(error) => {
+                tracing::warn!("failed to read the inbox at a round boundary: {error}");
+                Vec::new()
+            }
+        };
+        tool_results.extend(steering.iter().map(|item| ContentBlock::Text {
+            text: prompt::render_inbox_item(item, true),
+        }));
+        let steered: Vec<Uuid> = steering.iter().map(|item| item.id).collect();
+
+        let result_message = Message {
+            role: Role::User,
+            content: tool_results,
         };
 
-        // Proactive pre-send compaction. The reactive check at the top of the turn reads the
-        // *previous* round's reported usage, so a turn whose own input jumps over the window (a
-        // huge paste, a large tool result carried in) would be sent uncompacted and hard-fail.
-        // Project this request locally (conversation + system prompt) and compact before sending if
-        // it would cross the ceiling. `estimate_messages` under-reads (no tool schemas), so this
-        // is a floor that complements, not replaces, the reactive check and the overflow recovery
-        // below.
-        if let Some(ceiling) = self.auto_compact_ceiling()
-            && messages.len() > 1
+        // Save assistant + tool-results together in one transaction. Both rows commit or neither
+        // does: no dangling assistant-with-tool_use that the provider would reject on the next
+        // iteration.
+        //
+        // The results reach memory *before* the save is judged, for the same reason. The tools
+        // have run, so the only conversation that describes what happened is one that ends on
+        // their results; breaking out with the assistant's calls still unanswered left the
+        // session refused by the provider on every later turn until a `/rewind`. A store that
+        // cannot take the round leaves disk one round behind memory, which a resume reads as a
+        // prompt with no reply and never as a half round, since the pair is written as one unit
+        // or not at all.
+        round_events.push(crate::conversation::Event::Append(result_message.clone()));
+        let tool_calls = result_message.content.len();
+        messages.append(result_message);
+        self.store
+            .save_events_atomic_marking_inbox(session_id, round_events, &steered)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    "failed to persist a tool round ({tool_calls} tool call(s)); a resume will \
+                     not carry it: {error}"
+                );
+                error
+            })
+    }
+
+    /// Run the compaction `context_compact` asked for during this round, if any; whether one was
+    /// attempted.
+    ///
+    /// After the whole batch, not the moment the tool ran: a `context_compact` issued alongside
+    /// other calls lets their results into the conversation being summarized, and `keep_recent`
+    /// (default true) keeps that fresh tail verbatim.
+    async fn compact_at_the_agents_request(
+        &self,
+        messages: &mut Conversation,
+        run: &mut TurnRun,
+    ) -> bool {
+        // The guard is dropped before the `.await` below; held across one it would make this
+        // future non-`Send` and break every `tokio::spawn` of a turn.
+        let Some(request) = crate::sync::lock(&self.cells.pending_compaction).take() else {
+            return false;
+        };
+        // An early-out, not the safety net. `context_compact` ignores its cancellation token, so
+        // the request outlives an interrupt; starting a compaction on a turn the user has stopped
+        // spends a checkpoint attempt and a summarizer call for a result that is then thrown
+        // away. The guarantee that the window survives lives at the other end, in
+        // `compact_session`, which refuses to rewrite on a fired token and catches the interrupt
+        // that arrives after this point too. The loop head breaks the turn on the next pass, so
+        // dropping the request here is all that is owed.
+        if run.cancellation.is_cancelled() {
+            tracing::debug!("dropping a compaction request on an interrupted turn");
+            return false;
+        }
+        if run.recovery.requested_compactions >= MAX_REQUESTED_COMPACTIONS {
+            tracing::info!(
+                "ignoring a second compaction request in one turn; the agent may ask again next \
+                 turn"
+            );
+            return false;
+        }
+        run.recovery.requested_compactions += 1;
+        tracing::info!("compacting at the agent's request");
+        match self
+            .compact_session(
+                messages,
+                request.answering(run.recovery.request_in_flight.clone()),
+                run.cancellation.clone(),
+            )
+            .await
         {
-            let projected = crate::tokens::estimate_messages(messages.as_slice())
-                .saturating_add(crate::tokens::estimate_text(&system_prompt));
-            if projected > ceiling {
+            // Every index the turn holds addresses the conversation this just replaced.
+            Ok(_) => run.recovery.after_conversation_rewrite(),
+            // An interrupt is not a failure to report: the loop's own check breaks the turn on
+            // the next pass, and warning here would put a line about compaction in front of every
+            // Ctrl+C that lands during one.
+            Err(_) if run.cancellation.is_cancelled() => {}
+            // Non-fatal otherwise, as it is on the post-loop path: the turn's own work is what the
+            // user asked for, and it can still finish uncompacted.
+            Err(error) => tracing::warn!("requested compaction failed: {error}"),
+        }
+        true
+    }
+
+    /// The question the turn's start asks, asked after every round: the checks between turns let
+    /// a long tool loop carry the context any distance past the ceiling, with the provider's
+    /// rejection as the only stop. Here the overshoot is one round's results. The occupancy is
+    /// the round's own measurement plus what its whole reads reserved; the rest of its results
+    /// are bounded and land in the next measurement.
+    ///
+    /// Once per crossing: a compaction that leaves the context past the line, this round's own
+    /// included, gets nothing from a second pass, so the flag holds until a measurement reads
+    /// under the ceiling. An attempt the agent made this round counts whether or not it
+    /// succeeded: a second try against the same conversation would fail the same way.
+    async fn compact_between_rounds(
+        &self,
+        messages: &mut Conversation,
+        run: &mut TurnRun,
+        attempted_this_round: bool,
+    ) {
+        let occupancy = self.cells.context_occupancy();
+        match self.auto_compact_ceiling() {
+            Some(ceiling) if occupancy > ceiling => {
+                if attempted_this_round || run.recovery.ceiling_compacted {
+                    run.recovery.ceiling_compacted = true;
+                    return;
+                }
+                if run.cancellation.is_cancelled() {
+                    return;
+                }
+                run.recovery.ceiling_compacted = true;
                 let window = self.context_window();
                 tracing::info!(
-                    "proactive compaction: projected {projected} input tokens exceeds the \
-                     ceiling of {ceiling} on the {window} window"
+                    "compacting between rounds: {occupancy} tokens in context exceeds the ceiling \
+                     of {ceiling} on the {window} window"
                 );
-                compacted_before_the_loop = true;
                 match self
                     .compact_session(
                         messages,
-                        CompactRequest::new(CompactOrigin::Proactive),
-                        cancellation.clone(),
+                        CompactRequest::new(CompactOrigin::Reactive)
+                            .answering(run.recovery.request_in_flight.clone()),
+                        run.cancellation.clone(),
                     )
                     .await
                 {
-                    // The floor captured above counts messages that no longer exist. Left as it
-                    // was, it lands past the end of the collapsed conversation, clamps to the
-                    // length, and leaves the degrade-and-retry nothing to look at for the whole
-                    // turn. See `SUSPECT_FLOOR_AFTER_REWRITE`.
-                    //
-                    // The rewrite persisted the prompt too, in the kept tail or inside the
-                    // boundary's summary, whatever became of the eager save. Saving it again on
-                    // the 2xx would put a second copy after the boundary.
-                    Ok(_) => {
-                        suspect_floor = SUSPECT_FLOOR_AFTER_REWRITE;
-                        // The rewrite carried the prompt to disk where the eager save could not,
-                        // and with it the items it holds; see `stamp_appended_after_rewrite`.
-                        if !user_eagerly_saved
-                            && let Err(error) = self
-                                .store
-                                .inbox_store()
-                                .stamp_appended_after_rewrite(&inbox_ids)
-                                .await
-                        {
-                            tracing::warn!(
-                                "failed to stamp the inbox items a rewrite persisted: {error}"
-                            );
-                        }
-                        user_eagerly_saved = true;
-                    }
-                    Err(error) => tracing::warn!("proactive compaction failed: {error}"),
+                    Ok(_) => run.recovery.after_conversation_rewrite(),
+                    Err(_) if run.cancellation.is_cancelled() => {}
+                    Err(error) => tracing::warn!("compaction between rounds failed: {error}"),
                 }
             }
+            _ => run.recovery.ceiling_compacted = false,
         }
+    }
 
-        let mut recovery = TurnRecovery {
-            suspect_floor,
-            prompt_only_events,
-            overflow_retries: 0,
-            requested_compactions: 0,
-            ceiling_compacted: compacted_before_the_loop,
-            // An outcome-only or image-only turn has no words to quote.
-            request_in_flight: Some(request_in_flight).filter(|words| !words.trim().is_empty()),
-            tiers_tried: 0,
-            pending_repair: None,
-            user_saved: user_eagerly_saved,
-            inbox_ids,
-            thinking_only_nudged: false,
-            outage_reprieve_used: false,
-        };
-
-        // Accumulate token usage across every provider call within this turn so the per-turn
-        // display reflects the whole turn (including tool-execution loops), not just the final
-        // round-trip.
-        let mut turn_usage = crate::stats::TokenUsage::default();
-        // What the previous round ran, for every request until the next round replaces it: a
-        // repair or a mid-turn compaction re-sends the same continuation, which Claude Code
-        // reports the same way.
-        let mut last_round_durations: Vec<crate::provider::ToolDuration> = Vec::new();
-
-        let result: Result<TurnOutcome> = 'turn: {
-            loop {
-                // Both exits undo an unvindicated repair first. A degrade that has been applied but
-                // not yet retried is parked in memory with no `Event::Repair` on disk, and these
-                // are the two ways out of the round that skip the error arm entirely: a repair
-                // fires, `continue` returns here, and the turn ends before the provider ever judged
-                // it. Leaving it applied would have the model reasoning from a conversation the
-                // store has never heard of, while `GET /messages` still serves the original with
-                // its revision unmoved. Under ACP `client_disconnected` becomes true precisely
-                // while a turn is stalled on a failing provider, which is when a repair is most
-                // likely to be in flight.
-                if cancellation.is_cancelled() {
-                    recovery.undo_rejected_repair(messages);
-                    break 'turn Err(MekaError::Interrupted);
-                }
-                // Bail out if the frontend has noticed its client went away (e.g. ACP stdio
-                // disconnect). No point burning more provider tokens for an audience that won't see
-                // the output. REPL frontends report `false` here, so this is a no-op for them.
-                if self.cells.frontend.client_disconnected() {
-                    recovery.undo_rejected_repair(messages);
-                    break 'turn Err(MekaError::Interrupted);
-                }
-
-                // Conversation length behind this request, stamped onto `last_accepted_len` when
-                // the provider takes it.
-                let sent_len = messages.len();
-
-                // Whatever a request that never reached this point reported is not about the view
-                // this request is built from.
-                crate::sync::lock(&self.pending_redactions).clear();
-                // The conversation as it stands, whole. The context ceiling and compaction are its
-                // only bound: a cap on the message count drops history nothing has summarized, and
-                // the model forgets it with no trace on any surface. Copied for the streaming path
-                // alone, whose spawned task needs an owned slice.
-                let api_messages: &[Message] = messages.as_slice();
-
-                // Recompute the active tool set every iteration so a `tool_load` call earlier in
-                // this turn becomes visible to the model on the very next request, without
-                // mutating any registry state. Append-only growth keeps the tools array's cache
-                // prefix stable.
-                //
-                // Read from events (not the materialized slice) so the deferred-tool snapshot
-                // stored on `Event::CompactBoundary` survives across compaction; otherwise tools
-                // the model loaded pre-compaction would silently drop out of the active set on the
-                // next turn.
-                let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(
-                    messages.events(),
-                );
-                let tools: Arc<[ToolDefinition]> =
-                    Arc::from(self.tool_registry.definitions_active_with_loaded(&loaded));
-
-                // The part of the window that is not conversation, for `context_check` to report.
-                // Re-stamped per round because the active tool set grows as `tool_load` pulls in
-                // deferred schemas. Written, never read by the agent: an estimate is fine for
-                // informing the model's decision, while the agent's own thresholds run off the
-                // provider's exact numbers.
-                self.cells.context_overhead.store(
-                    tools
-                        .iter()
-                        .map(|tool| {
-                            crate::tokens::estimate_text(&tool.name)
-                                .saturating_add(crate::tokens::estimate_text(&tool.description))
-                                .saturating_add(crate::tokens::estimate_text(
-                                    &tool.parameters.to_string(),
-                                ))
-                        })
-                        .fold(
-                            crate::tokens::estimate_text(&system_prompt),
-                            |total, cost| total.saturating_add(cost),
-                        ),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-
-                // Streaming and blocking paths converge on `(Message, StopReason, TokenUsage)`. The
-                // blocking provider call surfaces notices in its return tuple (no event channel);
-                // we forward them to the frontend here so the user sees the same advisories the
-                // streaming path emits inline via `StreamEvent::Notice`.
-                let mut progress = StreamProgress::default();
-                // The round's own token, a child of the turn's: an inbox interrupt fires it, so
-                // the call returns the way a stop makes it return, and `cancellation` still says
-                // which of the two happened.
-                let round = cancellation.child_token();
-                let watcher = watch_for_interrupts(
-                    self.store.inbox_store(),
-                    session_id,
-                    recovery.inbox_ids.clone(),
-                    round.clone(),
-                );
-                let request_attribution = attribution
-                    .for_request(last_round_durations.clone(), self.take_context_compacted());
-                let call_result: Result<(Message, StopReason, crate::stats::TokenUsage)> = if self
-                    .options
-                    .streaming
-                {
-                    self.run_streaming(
-                        Arc::clone(&system_prompt),
-                        Arc::from(api_messages),
-                        tools,
-                        request_attribution.clone(),
-                        round.clone(),
-                        &mut progress,
-                    )
-                    .await
-                } else {
-                    // Non-streaming is fully atomic (nothing is visible until this returns
-                    // `Ok`), so `content_started` is always `false` here, so every retryable
-                    // failure is retried up to the cap regardless of prior attempts.
-                    let mut retries = 0u32;
-                    let started = std::time::Instant::now();
-                    loop {
-                        match self
-                            .provider()
-                            .complete(
-                                CompletionRequest::new(&system_prompt, api_messages, &tools)
-                                    .attributed(request_attribution.clone()),
-                                round.clone(),
-                            )
-                            .await
-                        {
-                            Ok(crate::provider::Completion {
-                                message,
-                                stop_reason,
-                                usage,
-                                notices,
-                            }) => {
-                                for notice in notices {
-                                    self.forward_notice(notice).await;
-                                }
-                                break Ok((message, stop_reason, usage));
-                            }
-                            Err(error) => {
-                                match should_retry_provider_error(
-                                    &error,
-                                    false,
-                                    retries,
-                                    started.elapsed(),
-                                ) {
-                                    Some(delay) => {
-                                        retries += 1;
-                                        let ceiling = crate::provider::retry::MAX_PROVIDER_RETRIES;
-                                        tracing::warn!(
-                                            "provider request failed transiently (attempt \
-                                             {retries}/{ceiling}), retrying in {delay:?}: {error}"
-                                        );
-                                        tokio::select! {
-                                            _ = tokio::time::sleep(delay) => {}
-                                            _ = round.cancelled() => break Err(MekaError::Interrupted),
-                                        }
-                                    }
-                                    None => break Err(error),
-                                }
-                            }
-                        }
-                    }
-                };
-                // Before the tools run, or the poll would go on for the length of the round.
-                drop(watcher);
-
-                let (mut assistant_message, stop_reason, usage) = match call_result {
-                    Ok(value) => value,
-                    Err(MekaError::ContextOverflow(message))
-                        if self.auto_compact_ceiling().is_some()
-                            && messages.len() > 1
-                            && recovery.overflow_retries < MAX_OVERFLOW_RETRIES =>
-                    {
-                        if let Err(error) = recovery
-                            .recover_from_context_overflow(self, messages, &cancellation, message)
-                            .await
-                        {
-                            break 'turn Err(error);
-                        }
-                        continue;
-                    }
-                    Err(MekaError::Interrupted)
-                        if round.is_cancelled() && !cancellation.is_cancelled() =>
-                    {
-                        // An inbox interrupt dropped the request before the provider answered, so
-                        // nothing was judged and nothing streamed: the message joins the prompt
-                        // and the request goes again with it. A repair riding the request is put
-                        // back without its tier being counted, since the provider never saw it.
-                        recovery.unjudge_repair(messages);
-                        if let Err(error) = self
-                            .absorb_interrupt(
-                                session_id,
-                                messages,
-                                &mut recovery,
-                                &user_message,
-                                None,
-                            )
-                            .await
-                        {
-                            break 'turn Err(error);
-                        }
-                        continue;
-                    }
-                    Err(error) => {
-                        // Unconditionally, before deciding anything else. A repair still applied
-                        // here is one the provider has just refused a second time, so it was not
-                        // the fix whatever happens next: another tier measures itself against the
-                        // conversation as it really is, and a turn that gives up leaves memory and
-                        // store agreeing.
-                        recovery.undo_rejected_repair(messages);
-                        if !refusal_may_blame_content(&error, progress.content_started) {
-                            // The same treatment an interrupt gives a half-streamed answer: the
-                            // text the user watched arrive is kept, without the tool calls that
-                            // never ran.
-                            //
-                            // The prompt goes first, as it does on the interrupt arm below: this
-                            // is the one exit ahead of the 2xx that persists a row, so a partial
-                            // written while the prompt's eager save had failed would replay as an
-                            // answer ahead of its question. A prompt the store still cannot take
-                            // gets no row for its answer either.
-                            if let Some(partial) = progress.partial.take() {
-                                match recovery
-                                    .ensure_prompt_saved(self, session_id, &user_message)
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        self.keep_partial_answer(session_id, messages, partial)
-                                            .await
-                                    }
-                                    Err(save_error) => tracing::warn!(
-                                        "dropping the partial answer: failed to persist its \
-                                         prompt: {save_error}"
-                                    ),
-                                }
-                            }
-                            break 'turn Err(error);
-                        }
-                        if let Err(error) = recovery
-                            .repair_rejected_content(self, messages, error, &cancellation)
-                            .await
-                        {
-                            break 'turn Err(error);
-                        }
-                        continue;
-                    }
-                };
-
-                // The provider accepted this body, so everything in it is known-good and only what
-                // comes after can be blamed for a later rejection.
-                self.last_accepted_len
-                    .store(sent_len, std::sync::atomic::Ordering::Relaxed);
-                recovery.note_request_accepted();
-
-                // Total of all tiers including output = everything in context as of this exchange,
-                // which is what the next request re-sends (minus the new user prompt). Summing the
-                // input tiers + output (Claude reports cached tokens in separate fields) is the
-                // true occupancy and what the `/status` gauge and the auto-compact ceiling read.
-                self.record_context_tokens(
-                    usage
-                        .input_tokens
-                        .saturating_add(usage.cache_creation_input_tokens)
-                        .saturating_add(usage.cache_read_input_tokens)
-                        .saturating_add(usage.output_tokens),
-                )
-                .await;
-                turn_usage.input_tokens =
-                    turn_usage.input_tokens.saturating_add(usage.input_tokens);
-                turn_usage.output_tokens =
-                    turn_usage.output_tokens.saturating_add(usage.output_tokens);
-                turn_usage.cache_creation_input_tokens = turn_usage
-                    .cache_creation_input_tokens
-                    .saturating_add(usage.cache_creation_input_tokens);
-                turn_usage.cache_read_input_tokens = turn_usage
-                    .cache_read_input_tokens
-                    .saturating_add(usage.cache_read_input_tokens);
-                tracing::debug!(
-                    "round usage: input={} cache_creation={} cache_read={} output={} \
-                     messages={sent_len} subagent={}",
-                    usage.input_tokens,
-                    usage.cache_creation_input_tokens,
-                    usage.cache_read_input_tokens,
-                    usage.output_tokens,
-                    !self.role.is_root()
-                );
-
-                if let Err(error) = recovery
-                    .ensure_prompt_saved(self, session_id, &user_message)
-                    .await
-                {
-                    // The one exit between a 2xx and the persist below, so the repair the 2xx just
-                    // vindicated has to be put back rather than left applied: persisting it on top
-                    // of a store whose opening message is missing is exactly what the failure above
-                    // forbids. Undoing also restores the trailing `Event::Append` that the
-                    // post-loop `pop_unsaved` looks for, which a trailing `Event::Repair` would
-                    // have made it silently skip, stranding the prompt in memory too.
-                    recovery.undo_rejected_repair(messages);
-                    break 'turn Err(error);
-                }
-
-                recovery.persist_vindicated_repair(self, session_id).await;
-
-                // And the model has read whatever inbox items the body carried, which is the fact
-                // their producers are waiting on. One turn runs per session, so every appended,
-                // undelivered item of this session was in this body. After the prompt's save,
-                // which is what stamps the opening's items when the eager save had failed; asked
-                // before it, they would not be appended yet and would be reported read by some
-                // later request.
-                match self.store.inbox_store().mark_delivered(session_id).await {
-                    Ok(item_ids) if !item_ids.is_empty() => {
-                        self.cells
-                            .frontend
-                            .emit(FrontendEvent::InboxDelivered { item_ids })
-                            .await;
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::warn!("failed to mark inbox items delivered: {error}");
-                    }
-                }
-
-                // What the request budget took out of the body, recorded once, so the body that fit
-                // is the body every later request sends and the cache prefix ahead of this turn
-                // holds. Ahead of the interrupt and thinking-only exits below, because a redaction
-                // is a fact about the request the provider just accepted rather than about how the
-                // round ends. Before the round's own messages are appended, since the positions
-                // are relative to the tail of the view as the request saw it.
-                let redacted = std::mem::take(&mut *crate::sync::lock(&self.pending_redactions));
-                if !redacted.is_empty() {
-                    let redaction = messages.redact_images(redacted);
-                    // Its own write rather than part of the round's, which the exits below never
-                    // reach. A failed write leaves the view redacted in memory, so the turn goes
-                    // on; the cost is one more redaction after a resume.
-                    if let Err(error) = self.store.save_event(session_id, &redaction).await {
-                        tracing::warn!("failed to persist the image redaction: {error}");
-                    }
-                }
-
-                if cancellation.is_cancelled() {
-                    // Interrupted mid-stream. Persist the partial assistant text so it survives
-                    // resume instead of being discarded, but drop any `tool_use` blocks first: no
-                    // tools run on an interrupt, so a persisted `tool_use` would be orphaned (no
-                    // matching `tool_result`) and the provider would reject the next request. Only
-                    // persist when text actually streamed; a partial with no text (interrupted
-                    // before any output, or mid-thinking) has nothing worth restoring.
-                    let partial = assistant_message.without_tool_use();
-                    if partial
-                        .content
-                        .iter()
-                        .any(|block| matches!(block, ContentBlock::Text { .. }))
-                    {
-                        messages.append(partial.clone());
-                        if let Err(error) = self
-                            .store
-                            .save_events_atomic(session_id, vec![
-                                crate::conversation::Event::Append(partial),
-                            ])
-                            .await
-                        {
-                            tracing::warn!(
-                                "failed to persist interrupted partial assistant message: {error}"
-                            );
-                        }
-                    }
-                    break 'turn Err(MekaError::Interrupted);
-                }
-                if progress.cut {
-                    // An inbox interrupt cut the stream after the provider had answered. What
-                    // arrived is kept as the answer so far, the message follows it, and the turn
-                    // goes on: same turn, no terminal, the way a person is cut off and told the
-                    // next thing.
-                    if let Err(error) = self
-                        .absorb_interrupt(
-                            session_id,
-                            messages,
-                            &mut recovery,
-                            &user_message,
-                            Some(assistant_message),
-                        )
-                        .await
-                    {
-                        break 'turn Err(error);
-                    }
-                    continue;
-                }
-
-                // Run tools based on the *presence* of tool-call blocks, not the reported stop
-                // reason: stop reasons are advisory and providers sometimes mislabel a tool turn as
-                // a plain end, but any tool call the model made must be answered with a result or
-                // the next request is invalid. Only complete tool calls reach the content blocks,
-                // so executing whatever is present is safe.
-                let has_tool_calls = assistant_message
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
-                let has_visible_text = has_visible_text(&assistant_message.content);
-
-                // The blocking path returns the message whole, with no event channel to have put
-                // anything on while it was being written. Every frontend renders assistant text
-                // from `AssistantTextDelta` and nothing else carries it, so without this a turn
-                // that succeeded shows the user nothing at all. Emitted per round, matching the
-                // streaming path, so text the model writes before a tool call still precedes the
-                // indicator `execute_tool_calls` emits for it, and ahead of the thinking-only
-                // nudge, so a round that reasoned without answering still shows its reasoning as
-                // it does when streaming.
-                //
-                // Reasoning goes through the same shape, delta then block, which is what makes
-                // `ThinkingDelta`'s promise hold on this path too: a frontend reading the deltas
-                // gets one covering the whole block rather than nothing at all.
-                if !self.options.streaming {
-                    for block in &assistant_message.content {
-                        match block {
-                            ContentBlock::Text { text } => {
-                                self.cells
-                                    .frontend
-                                    .emit(FrontendEvent::AssistantTextDelta(text.clone()))
-                                    .await;
-                            }
-                            // `trim` rather than `is_empty`, matching the question replay asks of
-                            // the same block in `render::render_message_history`: a block of
-                            // whitespace has nothing to show, and the two must not disagree about
-                            // that or a resumed transcript gains a block the live turn skipped.
-                            ContentBlock::Thinking { thinking, .. }
-                                if !thinking.trim().is_empty() =>
-                            {
-                                self.cells
-                                    .frontend
-                                    .emit(FrontendEvent::ThinkingDelta(thinking.clone()))
-                                    .await;
-                                self.cells
-                                    .frontend
-                                    .emit(FrontendEvent::ThinkingBlock {
-                                        content: thinking.clone(),
-                                    })
-                                    .await;
-                            }
-                            ContentBlock::RedactedThinking { .. } => {
-                                self.cells
-                                    .frontend
-                                    .emit(FrontendEvent::ThinkingDelta(
-                                        crate::conversation::REDACTED_THINKING.to_string(),
-                                    ))
-                                    .await;
-                                self.cells
-                                    .frontend
-                                    .emit(FrontendEvent::ThinkingBlock {
-                                        content: crate::conversation::REDACTED_THINKING.to_string(),
-                                    })
-                                    .await;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                if should_nudge_thinking_only(
-                    has_tool_calls,
-                    has_visible_text,
-                    &stop_reason,
-                    recovery.thinking_only_nudged,
-                ) {
-                    if let Err(error) = recovery
-                        .nudge_thinking_only(
-                            self,
-                            session_id,
-                            messages,
-                            &assistant_message,
-                            &stop_reason,
-                        )
-                        .await
-                    {
-                        break 'turn Err(error);
-                    }
-                    continue;
-                }
-
-                // No tool call and no visible text, and the nudge above didn't fire (already used
-                // this turn, or a stop reason with its own handling such as refusal / max tokens).
-                // Surface a stand-in in the assistant's place and persist it so the message is
-                // non-empty: an empty content array is invalid on the next request and breaks
-                // resume, and a silent turn leaves the user with nothing.
-                if !has_tool_calls && !has_visible_text {
-                    let notice = empty_turn_notice(&stop_reason);
-                    self.cells
-                        .frontend
-                        .emit(FrontendEvent::AssistantTextDelta(notice.clone()))
-                        .await;
-                    assistant_message
-                        .content
-                        .push(ContentBlock::Text { text: notice });
-                }
-
-                // Append in memory now so the next iteration sees the full state; defer the DB save
-                // to the branches below (atomic with results on the tool path, standalone
-                // otherwise).
-                messages.append(assistant_message.clone());
-                let mut round_events = vec![crate::conversation::Event::Append(
-                    assistant_message.clone(),
-                )];
-
-                if has_tool_calls {
-                    // Surface a provider that mislabeled the stop reason, the bug this presence
-                    // check guards against.
-                    if !matches!(stop_reason, StopReason::ToolUse) {
-                        tracing::warn!(
-                            "assistant message carries tool calls but stop_reason is \
-                             {stop_reason:?}; executing them anyway"
-                        );
-                    }
-
-                    let (mut tool_results, tool_durations) = self
-                        .execute_tool_calls(
-                            &assistant_message,
-                            &loaded,
-                            &attribution,
-                            cancellation.clone(),
-                        )
-                        .await;
-                    last_round_durations = tool_durations;
-
-                    if let Err(error) = crate::tools::scratchpad::save_explicit_scratchpad_results(
-                        &self.store,
-                        session_id,
-                        &self.tool_registry.inherited_scratchpad_names(),
-                        &assistant_message,
-                        &mut tool_results,
-                    )
-                    .await
-                    {
-                        tracing::warn!("failed to save explicit scratchpad results: {error}");
-                    }
-
-                    // Take the per-turn hints. This both snapshots them for the call below and
-                    // clears them, so a long session doesn't accumulate entries for tool calls that
-                    // already ran. No clone needed.
-                    let hints_snapshot = std::mem::take(&mut *self.scratchpad_hints.write().await);
-                    if let Err(error) = crate::tools::scratchpad::persist_oversized_results(
-                        &self.store,
-                        session_id,
-                        &assistant_message,
-                        &mut tool_results,
-                        &hints_snapshot,
-                    )
-                    .await
-                    {
-                        tracing::warn!("failed to persist oversized tool results: {error}");
-                    }
-
-                    // The round boundary is where a message that arrived while the tools ran is
-                    // read: after the results, in the same user message, which every wire accepts
-                    // and which keeps the cache prefix ahead of it intact. Steers and interrupts,
-                    // which nothing cuts a tool for; a followup waits for the turn to end. Read
-                    // here and stamped with the round below, so the text and the stamp are one
-                    // write.
-                    let steering = match self
-                        .store
-                        .inbox_store()
-                        .take_pending(
-                            session_id,
-                            &[
-                                crate::store::inbox::InboxClass::Steer,
-                                crate::store::inbox::InboxClass::Interrupt,
-                            ],
-                            chrono::Utc::now(),
-                        )
-                        .await
-                    {
-                        Ok(mut items) => {
-                            // Pending still, if the prompt's save failed and the lazy one is
-                            // yet to run; carried already, either way.
-                            items.retain(|item| !recovery.inbox_ids.contains(&item.id));
-                            items
-                        }
-                        Err(error) => {
-                            tracing::warn!("failed to read the inbox at a round boundary: {error}");
-                            Vec::new()
-                        }
-                    };
-                    tool_results.extend(steering.iter().map(|item| ContentBlock::Text {
-                        text: prompt::render_inbox_item(item, true),
-                    }));
-                    let steered: Vec<Uuid> = steering.iter().map(|item| item.id).collect();
-
-                    let result_message = Message {
-                        role: Role::User,
-                        content: tool_results,
-                    };
-
-                    // Save assistant + tool-results together in one transaction. Both rows commit
-                    // or neither does: no dangling assistant-with-tool_use that the provider would
-                    // reject on the next iteration.
-                    //
-                    // The results reach memory *before* the save is judged, for the same reason.
-                    // The tools have run, so the only conversation that describes what happened
-                    // is one that ends on their results; breaking out with the assistant's calls
-                    // still unanswered left the session refused by the provider on every later
-                    // turn until a `/rewind`. A store that cannot take the round leaves disk one
-                    // round behind memory, which a resume reads as a prompt with no reply and
-                    // never as a half round, since the pair is written as one unit or not at all.
-                    round_events.push(crate::conversation::Event::Append(result_message.clone()));
-                    let tool_calls = result_message.content.len();
-                    messages.append(result_message);
-                    if let Err(error) = self
-                        .store
-                        .save_events_atomic_marking_inbox(session_id, round_events, &steered)
-                        .await
-                    {
-                        tracing::warn!(
-                            "failed to persist a tool round ({tool_calls} tool call(s)); a resume \
-                             will not carry it: {error}"
-                        );
-                        break 'turn Err(error);
-                    }
-
-                    // A compaction `context_compact` asked for, run here rather than after the
-                    // loop so the agent that chose the moment gets to act on the result: it takes
-                    // its checkpoint, then this turn carries on against the summary.
-                    //
-                    // After the whole batch, not the moment the tool ran: a `context_compact`
-                    // issued alongside other calls lets their results into the conversation being
-                    // summarized, and `keep_recent` (default true) keeps that fresh tail verbatim.
-                    //
-                    // The guard is dropped before the `.await` below; held across one it would make
-                    // this future non-`Send` and break every `tokio::spawn` of a turn.
-                    let requested = crate::sync::lock(&self.cells.pending_compaction).take();
-                    let mut compaction_attempted_this_round = false;
-                    if let Some(request) = requested {
-                        // An early-out, not the safety net. `context_compact` ignores its
-                        // cancellation token, so the request outlives an interrupt; starting a
-                        // compaction on a turn the user has stopped spends a checkpoint attempt
-                        // and a summarizer call for a result that is then thrown away. The
-                        // guarantee that the window survives lives at the other end, in
-                        // `compact_session`, which refuses to rewrite on a fired token and catches
-                        // the interrupt that arrives after this point too. The loop head breaks
-                        // the turn on the next pass, so dropping the request here is all that is
-                        // owed.
-                        if cancellation.is_cancelled() {
-                            tracing::debug!("dropping a compaction request on an interrupted turn");
-                        } else if recovery.requested_compactions < MAX_REQUESTED_COMPACTIONS {
-                            recovery.requested_compactions += 1;
-                            compaction_attempted_this_round = true;
-                            tracing::info!("compacting at the agent's request");
-                            match self
-                                .compact_session(
-                                    messages,
-                                    request.answering(recovery.request_in_flight.clone()),
-                                    cancellation.clone(),
-                                )
-                                .await
-                            {
-                                // Every index the turn holds addresses the conversation this just
-                                // replaced.
-                                Ok(_) => recovery.after_conversation_rewrite(),
-                                // An interrupt is not a failure to report: the loop's own check
-                                // breaks the turn on the next pass, and warning here would put a
-                                // line about compaction in front of every Ctrl+C that lands
-                                // during one.
-                                Err(_) if cancellation.is_cancelled() => {}
-                                // Non-fatal otherwise, as it is on the post-loop path: the turn's
-                                // own work is what the user asked for, and it can still finish
-                                // uncompacted.
-                                Err(error) => {
-                                    tracing::warn!("requested compaction failed: {error}")
-                                }
-                            }
-                        } else {
-                            tracing::info!(
-                                "ignoring a second compaction request in one turn; the agent may \
-                                 ask again next turn"
-                            );
-                        }
-                    }
-
-                    // The question the turn's start asks, asked after every round: the checks
-                    // between turns let a long tool loop carry the context any distance past the
-                    // ceiling, with the provider's rejection as the only stop. Here the overshoot
-                    // is one round's results. The occupancy is the round's own measurement plus
-                    // what its whole reads reserved; the rest of its results are bounded and land
-                    // in the next measurement.
-                    //
-                    // Once per crossing: a compaction that leaves the context past the line, this
-                    // round's own included, gets nothing from a second pass, so the flag holds
-                    // until a measurement reads under the ceiling. An attempt the agent made this
-                    // round counts whether or not it succeeded: a second try against the same
-                    // conversation would fail the same way.
-                    match self.auto_compact_ceiling() {
-                        Some(ceiling) if self.cells.context_occupancy() > ceiling => {
-                            if compaction_attempted_this_round || recovery.ceiling_compacted {
-                                recovery.ceiling_compacted = true;
-                            } else if !cancellation.is_cancelled() {
-                                recovery.ceiling_compacted = true;
-                                let occupancy = self.cells.context_occupancy();
-                                let window = self.context_window();
-                                tracing::info!(
-                                    "compacting between rounds: {occupancy} tokens in context \
-                                     exceeds the ceiling of {ceiling} on the {window} window"
-                                );
-                                match self
-                                    .compact_session(
-                                        messages,
-                                        CompactRequest::new(CompactOrigin::Reactive)
-                                            .answering(recovery.request_in_flight.clone()),
-                                        cancellation.clone(),
-                                    )
-                                    .await
-                                {
-                                    Ok(_) => recovery.after_conversation_rewrite(),
-                                    Err(_) if cancellation.is_cancelled() => {}
-                                    Err(error) => {
-                                        tracing::warn!("compaction between rounds failed: {error}")
-                                    }
-                                }
-                            }
-                        }
-                        _ => recovery.ceiling_compacted = false,
-                    }
-                } else {
-                    // No tool calls: the assistant message stands alone and ends the turn. Save it
-                    // before breaking so the persistent log includes it.
-                    if let Err(error) = self
-                        .store
-                        .save_events_atomic(session_id, round_events)
-                        .await
-                    {
-                        break 'turn Err(error);
-                    }
-                    break 'turn match stop_reason {
-                        StopReason::MaxTokens => Ok(TurnOutcome::MaxTokens),
-                        StopReason::Refusal(text) if !text.is_empty() => {
-                            Ok(TurnOutcome::Refusal(text))
-                        }
-                        // An empty refusal body carries no text, so fall back to the assistant
-                        // message's text (the model's own refusal, or the stand-in above).
-                        StopReason::Refusal(_) => {
-                            Ok(TurnOutcome::Refusal(assistant_message.text_content()))
-                        }
-                        _ => Ok(TurnOutcome::EndTurn),
-                    };
-                }
-            }
-        };
-
+    /// Settle the turn whatever its result: the counters, the usage event, what becomes of a
+    /// prompt the turn could not answer, and a compaction request the loop's own drain never
+    /// reached.
+    async fn settle_turn(
+        &self,
+        messages: &mut Conversation,
+        run: TurnRun,
+        opening: &TurnOpening,
+        retention: PromptRetention,
+        result: &Result<TurnOutcome>,
+    ) {
+        let TurnRun {
+            session_id,
+            cancellation,
+            recovery,
+            turn_usage,
+            ..
+        } = run;
         // Rolled into the session-level counters surfaced by `/status` here rather than inside
-        // the inner loop, so a single reading reflects whole turns. A completed turn counts as
-        // one; a turn that failed or was canceled still spent what its finished rounds reported,
-        // and that spend is kept the way compaction's is, without counting a turn.
+        // the round, so a single reading reflects whole turns. A completed turn counts as one; a
+        // turn that failed or was canceled still spent what its finished rounds reported, and
+        // that spend is kept the way compaction's is, without counting a turn.
         if result.is_ok() {
             self.session_stats.record_turn(&turn_usage);
         } else {
             self.session_stats.record_untracked_tokens(&turn_usage);
         }
         // Persist the cumulative counters onto the session row so `/status` survives resume.
-        // Best-effort: a DB hiccup must not fail the turn. Only the root agent writes; a sub-agent
-        // shares the parent's `SessionStats` (rolling its usage into the parent's totals) but owns
-        // a child session row, so letting it write would stamp the parent-inclusive totals onto
-        // the child.
+        // Best-effort: a DB hiccup must not fail the turn. Only the root agent writes; a
+        // sub-agent shares the parent's `SessionStats` (rolling its usage into the parent's
+        // totals) but owns a child session row, so letting it write would stamp the
+        // parent-inclusive totals onto the child.
         if (result.is_ok() || !turn_usage.is_empty())
             && self.role.is_root()
             && let Err(error) = self
@@ -1675,13 +1806,13 @@ impl Agent {
             self.cells.frontend.emit(FrontendEvent::TurnFinished).await;
         }
 
-        match &result {
-            // A prompt its caller will produce again is withdrawn when the turn produced nothing at
-            // all, however it ended: a recurring job regenerates it on its next occurrence, and a
-            // drained `meka serve` hands the occurrence back, so keeping it guarantees a duplicate;
-            // an HTTP client that asked for this resends. The log-length condition is the one that
-            // decides: an unchanged count since the prompt means nothing appended, where the
-            // materialized tail alone cannot tell a prompt from a compaction summary.
+        match result {
+            // A prompt its caller will produce again is withdrawn when the turn produced nothing
+            // at all, however it ended: a recurring job regenerates it on its next occurrence, and
+            // a drained `meka serve` hands the occurrence back, so keeping it guarantees a
+            // duplicate; an HTTP client that asked for this resends. The log-length condition is
+            // the one that decides: an unchanged count since the prompt means nothing appended,
+            // where the materialized tail alone cannot tell a prompt from a compaction summary.
             // `a_fire_interrupted_before_it_began_withdraws_its_prompt` pins the shape.
             Err(_)
                 if retention == PromptRetention::Withdraw
@@ -1691,13 +1822,13 @@ impl Agent {
                 recovery
                     .withdraw_unanswered_prompt(self, session_id, messages)
                     .await;
-                *self.last_rendered_world.write().await = world_state_rollback;
-                if resumed {
+                *self.last_rendered_world.write().await = opening.world_state_rollback.clone();
+                if opening.resumed {
                     messages.restore_resumed_notice();
                 }
             }
             Err(MekaError::Interrupted) if !recovery.user_saved => {
-                let user_event = crate::conversation::Event::Append(user_message.clone());
+                let user_event = crate::conversation::Event::Append(opening.user_message.clone());
                 if let Err(error) = self
                     .store
                     .save_event_marking_inbox(session_id, &user_event, &recovery.inbox_ids)
@@ -1708,8 +1839,8 @@ impl Agent {
             }
             // Saved rather than popped, because `Keep` means the prompt carries something that
             // exists nowhere else. This arm is reached only when the eager persist failed, so
-            // popping would take a delivered background outcome out of the conversation as well as
-            // off disk, and its row is already stamped and never handed out again.
+            // popping would take a delivered background outcome out of the conversation as well
+            // as off disk, and its row is already stamped and never handed out again.
             //
             // Reached by dropping `messages` under a live connection; see
             // `a_kept_prompt_survives_a_turn_whose_store_could_not_persist_it`.
@@ -1718,7 +1849,7 @@ impl Agent {
                     && !recovery.user_saved
                     && retention == PromptRetention::Keep =>
             {
-                let user_event = crate::conversation::Event::Append(user_message.clone());
+                let user_event = crate::conversation::Event::Append(opening.user_message.clone());
                 if let Err(error) = self
                     .store
                     .save_event_marking_inbox(session_id, &user_event, &recovery.inbox_ids)
@@ -1735,48 +1866,44 @@ impl Agent {
                         .await;
                 }
                 // The popped message carried this turn's world-state announcement, so put the
-                // snapshot back to what the model has actually seen. The next turn then re-renders
-                // the change rather than assuming it was already delivered.
-                *self.last_rendered_world.write().await = world_state_rollback;
-                // Same withdrawal for the resume notice, which rode that message and nothing else.
-                if resumed {
+                // snapshot back to what the model has actually seen. The next turn then
+                // re-renders the change rather than assuming it was already delivered.
+                *self.last_rendered_world.write().await = opening.world_state_rollback.clone();
+                // Same withdrawal for the resume notice, which rode that message and nothing
+                // else.
+                if opening.resumed {
                     messages.restore_resumed_notice();
                 }
             }
             _ => {}
         }
 
-        // The sweeper for a request the tool loop's own drain never reached. A turn that parked one
-        // and then failed before that drain is the only way to arrive here holding a request, and
-        // the `result.is_ok()` below then declines to act on it, so this exists to empty the slot,
-        // not to compact: the slot outlives the turn.
+        // The sweeper for a request the tool loop's own drain never reached. A turn that parked
+        // one and then failed before that drain is the only way to arrive here holding a request,
+        // and the `result.is_ok()` below then declines to act on it, so this exists to empty the
+        // slot, not to compact: the slot outlives the turn.
         //
-        // Taken in its own binding rather than inside the `if` below so the `std::sync::MutexGuard`
-        // is dropped before the `.await`; held across one it would make this future non-`Send` and
-        // break every `tokio::spawn` of a turn.
+        // Taken in its own binding rather than inside the `if` below so the
+        // `std::sync::MutexGuard` is dropped before the `.await`; held across one it would make
+        // this future non-`Send` and break every `tokio::spawn` of a turn.
         //
-        // Taken unconditionally, so a request left behind by a turn that then failed cannot linger
-        // and fire against a later, unrelated turn.
+        // Taken unconditionally, so a request left behind by a turn that then failed cannot
+        // linger and fire against a later, unrelated turn.
         let requested_compaction = crate::sync::lock(&self.cells.pending_compaction).take();
         // Acted on only when the turn succeeded: an interrupted or failed turn has just popped or
         // repaired its own messages, and compacting on top of that would rewrite a conversation
-        // still being put back together. The request is dropped rather than deferred; the agent can
-        // ask again on a turn that works.
+        // still being put back together. The request is dropped rather than deferred; the agent
+        // can ask again on a turn that works.
         if let Some(request) = requested_compaction
             && result.is_ok()
         {
             tracing::info!("compacting at the agent's request");
-            if let Err(error) = self
-                .compact_session(messages, request, cancellation.clone())
-                .await
-            {
+            if let Err(error) = self.compact_session(messages, request, cancellation).await {
                 // Non-fatal, and deliberately not surfaced as a turn error: the turn itself
                 // succeeded, and its answer is what the user asked for.
                 tracing::warn!("requested compaction failed: {error}");
             }
         }
-
-        result
     }
 
     /// Hand a provider advisory to the frontend, counting what it reports against this session.
@@ -2213,7 +2340,7 @@ impl Agent {
                         })
                         .await;
                 }
-                StreamEvent::ToolCallRejected { id, name, reason } => {
+                StreamEvent::ToolCallRefused { id, name, reason } => {
                     // A malformed tool-call arrived (bad JSON). The accumulator keeps a `ToolUse`
                     // block with a sentinel marker so the shape of the assistant message stays
                     // valid for the API round-trip, and `resolve_and_execute_tool` sees the marker
@@ -2883,6 +3010,123 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A stream cut by a stop on a backend that reports usage only with its last event has
+    /// measured nothing. The gauge keeps the last measurement rather than reading zero, which
+    /// would silence the ceiling check until the next uncut round.
+    #[tokio::test]
+    async fn a_cut_stream_leaves_the_last_occupancy_standing() {
+        let (agent, _provider, store, session_id, _frontend) = agent_with_session(vec![
+            vec![
+                MockEvent::Usage { input_tokens: 500 },
+                MockEvent::Text {
+                    text: "measured".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: crate::provider::mock::MockStopReason::EndTurn,
+                },
+            ],
+            a_stalled_answer("the first half", " never sent"),
+        ])
+        .await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("measure".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the measured turn runs");
+        assert_eq!(agent.cells().context_occupancy(), 500);
+
+        let cancellation = CancellationToken::new();
+        let stop = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                cancellation.cancel();
+            }
+        });
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("again".to_string(), Vec::new())
+                    .expect("a prompt"),
+                cancellation,
+            )
+            .await;
+        stop.await.expect("the stop landed");
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "the stream was cut: {outcome:?}"
+        );
+        assert_eq!(
+            agent.cells().context_occupancy(),
+            500,
+            "the cut round measured nothing, so the last measurement stands"
+        );
+        assert_eq!(
+            store.load_context_tokens(session_id).await.expect("load"),
+            Some(500),
+            "and the row keeps it too"
+        );
+    }
+
+    /// A reply that arrived whole and reports no usage still records: the measurement, whatever
+    /// it says, is what clears the reservation a whole read made this round, and a backend that
+    /// never reports usage would otherwise pile reservations up across rounds until every read
+    /// was cut to the floor. Only a stream cut before it measured keeps the last figure.
+    #[tokio::test]
+    async fn an_uncut_round_that_reports_no_usage_still_clears_the_reservation() {
+        let (agent, _provider, _store, _session_id, _frontend) =
+            agent_with_session(vec![text_round("unmeasured")]).await;
+        agent
+            .cells()
+            .context_reserved
+            .store(1_000, std::sync::atomic::Ordering::Relaxed);
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+        assert_eq!(
+            agent.cells().context_occupancy(),
+            0,
+            "the round measured nothing and said so; the reservation went with it"
+        );
+    }
+
+    /// A rewind is a rewrite like a compaction: what the model was shown of files and of its own
+    /// argument mistakes goes with the turns, or a `file_edit` after `/rewind` trusts a read the
+    /// model no longer holds and a repeated mistake gets no hint.
+    #[tokio::test]
+    async fn a_rewrite_forgets_the_files_read_and_the_advisories_shown() {
+        let (agent, _provider, _store, _session_id, _frontend) =
+            agent_with_session(vec![text_round("ok")]).await;
+        agent
+            .tool_registry()
+            .record_read_for_test(std::path::PathBuf::from("/tmp/read.txt"))
+            .await;
+        crate::sync::lock(&agent.schema_advisories_sent).insert("file_edit".to_string());
+        agent.cells().record_context_tokens(1_000);
+
+        agent.reset_conversation_markers(&[]).await;
+
+        assert_eq!(agent.tool_registry().tracked_reads_for_test().await, 0);
+        assert!(crate::sync::lock(&agent.schema_advisories_sent).is_empty());
+        assert_eq!(
+            agent.cells().context_occupancy(),
+            0,
+            "an emptied conversation reads as turn zero"
+        );
     }
 
     /// An interrupt does not wait for the answer being streamed: the stream is dropped, the text
@@ -6746,7 +6990,7 @@ mod tests {
             .expect("first turn succeeds");
 
         assert!(messages.rewind(1).is_some(), "the turn is rewound away");
-        agent.reset_conversation_markers().await;
+        agent.reset_conversation_markers(messages.as_slice()).await;
 
         agent
             .run_turn(

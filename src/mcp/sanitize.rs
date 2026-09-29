@@ -1,7 +1,7 @@
-//! String hygiene helpers for data crossing the MCP boundary. Strips invisible/control characters
-//! that could be used for prompt injection or UI spoofing (RTL/LTR overrides, zero-width joiners,
-//! C0/C1 controls) and normalizes MCP server names to the alphabet accepted by provider tool
-//! schemas.
+//! Names crossing the MCP boundary: the server names meka refuses, and the normalization of a
+//! server name to the alphabet provider tool schemas accept. Text a server sends (descriptions,
+//! progress, stderr, results) is sanitized where it enters through `crate::text::sanitize_to_line`
+//! and its siblings, not here.
 
 /// Reserved server names that collide with meka internals or with the tool namespace separator.
 /// Connection requests for these names are rejected.

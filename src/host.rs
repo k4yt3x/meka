@@ -99,6 +99,38 @@ pub(crate) async fn sweep_expired_sessions(
     Ok(())
 }
 
+/// Wait for a termination signal: SIGTERM or Ctrl+C on Unix, Ctrl+C elsewhere. The one watch both
+/// servers drain on, so the two cannot differ about what ends a process.
+pub(crate) async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to install SIGTERM handler: {error}; relying on Ctrl+C only"
+                    );
+                    if let Err(error) = tokio::signal::ctrl_c().await {
+                        tracing::warn!("failed to listen for Ctrl+C: {error}");
+                    }
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received, draining"),
+            _ = term.recv() => tracing::info!("SIGTERM received, draining"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!("failed to listen for Ctrl+C: {error}");
+        }
+        tracing::info!("Ctrl+C received, draining");
+    }
+}
+
 /// A slash command a host answers itself. The REPL offers every one; an editor over ACP is told
 /// about the ones marked `for_editors`, as its `available_commands`.
 ///

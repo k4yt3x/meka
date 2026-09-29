@@ -482,6 +482,10 @@ impl Tool for ExecuteCommandTool {
             cmd.args(&params);
             cmd.arg("sh").arg("-c").arg(&command);
             cmd
+        } else if sandboxed {
+            // Admitted as sandboxed on the probe, spawned on the capability: the two agree today,
+            // and this is what keeps a disagreement from running the command unconfined.
+            return Err(unconfinable_command());
         } else {
             let mut cmd = tokio::process::Command::new("sh");
             cmd.arg("-c").arg(&command);
@@ -534,6 +538,15 @@ impl Tool for ExecuteCommandTool {
             }
             cmd.arg("sh").arg("-c").arg(&command);
             cmd
+        } else if sandboxed
+            && !matches!(
+                self.sandbox_capability,
+                crate::sandbox::SandboxCapability::Landlock { .. }
+            )
+        {
+            // Admitted as sandboxed on the probe, spawned on the capability: the two agree today,
+            // and this is what keeps a disagreement from running the command unconfined.
+            return Err(unconfinable_command());
         } else {
             let mut cmd = tokio::process::Command::new("sh");
             cmd.arg("-c").arg(&command);
@@ -624,15 +637,17 @@ impl Tool for ExecuteCommandTool {
         // the agent's cwd; this is how it actually reaches the child.
         command_builder.current_dir(self.site.cwd.get());
 
-        let mut child = command_builder
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|error| MekaError::ToolExecution {
-                tool_name: "shell_execute".to_string(),
-                message: format!("failed to spawn command: {error}"),
-            })?;
+        let mut child = ChildGroup(
+            command_builder
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|error| MekaError::ToolExecution {
+                    tool_name: "shell_execute".to_string(),
+                    message: format!("failed to spawn command: {error}"),
+                })?,
+        );
 
         // Drain stdout/stderr on dedicated tasks that start *before* the wait.
         // `tokio::process::Child::wait()` does not read the pipes; a child writing past the OS pipe
@@ -789,6 +804,61 @@ fn output_cut_note() -> String {
 /// `kill(-pgid, …)` reaches every backgrounded descendant it spawned (`(sleep 3600 &)` survives a
 /// plain `child.kill()` but is caught here). The fallback `child.kill().await` is a no-op on Unix
 /// once the group has been signaled but still the right primitive on Windows.
+/// The refusal for a command admitted at a level that confines it when no backend can: it fails
+/// toward not running, never toward a plain `sh -c`.
+fn unconfinable_command() -> MekaError {
+    MekaError::ToolExecution {
+        tool_name: "shell_execute".to_string(),
+        message: "cannot confine the command: no sandbox backend is available at this level"
+            .to_string(),
+    }
+}
+
+/// The command's child, killed with its whole process group when the value is dropped.
+///
+/// The `select!` arms below kill the group on a stop, a timeout and an exhausted bound, but a
+/// caller that drops the `execute` future never reaches them: a gate's `tokio::time::timeout`
+/// drops it and only then fires the token, and nothing else reaps the group, so without this
+/// every evaluation of a `shell_execute` gate would leave its command running. `Drop` is
+/// synchronous, so there is no grace signal here; a child the arms already killed and reaped has
+/// no id and is not signaled.
+struct ChildGroup(tokio::process::Child);
+
+impl std::ops::Deref for ChildGroup {
+    type Target = tokio::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ChildGroup {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ChildGroup {
+    fn drop(&mut self) {
+        let Some(pid) = self.0.id() else {
+            return;
+        };
+        #[cfg(unix)]
+        {
+            // SAFETY: `kill(2)` is always safe to call; `setsid` in `pre_exec` made the child's
+            // pid its group id, so `-pid` names the whole tree.
+            let killed = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+            if killed != 0 {
+                let error = std::io::Error::last_os_error();
+                tracing::debug!("failed to kill process group {pid} on drop: {error}");
+            }
+        }
+        if let Err(error) = self.0.start_kill() {
+            tracing::debug!("failed to kill child {pid} on drop: {error}");
+        }
+    }
+}
+
 async fn kill_child_tree(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
@@ -1696,6 +1766,67 @@ mod tests {
         assert!(
             !marker.exists(),
             "grandchild survived timeout and created marker at {marker:?}"
+        );
+    }
+
+    /// A command admitted as sandboxed is refused when the capability cannot confine it, never
+    /// run through a plain `sh -c`: the probe that admits and the capability that spawns agree
+    /// today, and this is what a disagreement costs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_sandboxed_command_with_no_backend_is_refused_not_run_bare() {
+        let tool = ExecuteCommandTool {
+            scope: crate::workspace::WriteScope::unconfined(),
+            sandbox_capability: crate::sandbox::SandboxCapability::Unavailable,
+            sandbox_backend: crate::config::SandboxBackend::Landlock,
+            backend_probe: crate::sandbox::BackendProbe::Ok(
+                crate::sandbox::SandboxCapability::Landlock { abi_version: 9 },
+            ),
+            sandbox_enabled: true,
+            site: crate::session::ToolSite::for_test()
+                .with_permission(crate::permission::SharedPermission::new(
+                    Permission::Read,
+                    crate::permission::EnabledPermissions::ALL,
+                ))
+                .with_cwd(crate::workspace::cwd_for_test()),
+        };
+        let error = tool
+            .execute(
+                serde_json::json!({ "command": "true" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("nothing can confine it, so it does not run");
+        assert!(error.to_string().contains("cannot confine"), "{error}");
+    }
+
+    /// Dropping the future is as safe as canceling it: a caller that times the tool out by
+    /// dropping `execute` (a gate) never reaches the arms that kill the group, and the command
+    /// would run on to its own end. The sleep's odd duration is what the process list is
+    /// searched for.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_execute_kills_the_command_and_its_group() {
+        let tool = tool_for_test(shared_permission_for_test(), false);
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            tool.execute(
+                serde_json::json!({ "command": "sleep 31.4159 & sleep 31.4159", "timeout_ms": 60_000u64 }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            ),
+        )
+        .await;
+        assert!(dropped.is_err(), "the future was dropped by the timeout");
+        // The kill is synchronous; the reaping is the kernel's, so a moment for it.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let listing = std::process::Command::new("ps")
+            .args(["-eo", "args"])
+            .output()
+            .expect("ps runs");
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(
+            !listing.contains("sleep 31.4159"),
+            "the command and its group must be gone once the future is dropped:\n{listing}"
         );
     }
 

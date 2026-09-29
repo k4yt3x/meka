@@ -374,7 +374,7 @@ pub(crate) async fn create_session(
     };
     entry.frontend.install_feed(
         session_uuid,
-        crate::host::http::http_frontend::FEED_BROADCAST_CAPACITY,
+        crate::host::http::feed::FEED_BROADCAST_CAPACITY,
         state.config.stream_replay_events,
         Some(state.webhooks.clone()),
     );
@@ -489,20 +489,18 @@ pub(crate) async fn fork_session(
         .await
         .map_err(|error| ProblemDetail::internal_sanitized("failed to read session", error))?
     {
-        let detail = match terms.parent {
+        // `spawn_terms` rather than the parent link, so this names the id the caller sent even
+        // for an imported sub-agent. Keyed on the link alone, that case falls through: the copy
+        // is made, `ensure_session_loaded` refuses *it*, and the rollback runs, so the caller
+        // gets a 422 naming an id it has never seen, for a row that no longer exists.
+        let remedy = match terms.parent {
             Some(parent) => format!(
-                "session '{id}' is a sub-agent of '{parent}', so a copy of it cannot be driven; \
-                 continue it with `agent_followup` from '{parent}'"
+                ", so a copy of it cannot be driven; continue it with `agent_followup` from \
+                 '{parent}'"
             ),
-            // `spawn_terms` rather than the parent link, so this names the id the caller sent even
-            // for an imported sub-agent. Keyed on the link alone, that case falls through: the copy
-            // is made, `ensure_session_loaded` refuses *it*, and the rollback runs, so the caller
-            // gets a 422 naming an id it has never seen, for a row that no longer exists.
-            None => format!(
-                "session '{id}' is a sub-agent whose parent is not in this store, so neither it \
-                 nor a copy of it can be driven"
-            ),
+            None => ", so neither it nor a copy of it can be driven".to_string(),
         };
+        let detail = format!("{}{remedy}", terms.describe(id));
         return Err(ProblemDetail::new(
             ErrorKind::SessionNotDrivable,
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -689,6 +687,7 @@ async fn roll_back_fork(state: &ServerState, forked: Uuid) {
         (status = 200, description = "Page of sessions", body = ListSessionsResponse),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 422, description = "The cursor is not one this server issued (`/errors/invalid-body`)", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["sessions:r"]))
@@ -715,7 +714,13 @@ pub(crate) async fn list_sessions(
             query.cursor.as_deref(),
         )
         .await
-        .map_err(|error| ProblemDetail::internal_sanitized("failed to list sessions", error))?;
+        .map_err(|error| match error {
+            // A cursor this server did not issue is the caller's to fix, in the store's words.
+            crate::error::MekaError::Usage(_) => {
+                ProblemDetail::for_error(&error, state.config.relay_provider_errors)
+            }
+            error => ProblemDetail::internal_sanitized("failed to list sessions", error),
+        })?;
 
     // Enrich DB rows with live in-memory metadata where available; sessions with no in-memory entry
     // fall back to persisted columns, which are NULL for rows the HTTP server did not create (REPL,
@@ -1440,12 +1445,24 @@ pub(crate) async fn delete_session(
     // Refuse DELETE while a turn is in flight: silently destroying agent work would surprise
     // callers. DB-delete runs BEFORE the in-memory remove so a transient DB failure leaves
     // the session usable (client can retry).
+    //
+    // The conversation is taken as well as the counter read, as fork, PATCH, compact and rewind
+    // take it: an out-of-band turn holds the conversation before it admits itself, so between
+    // its `still_resident` and its `admit` the counter reads zero while the turn is already on
+    // its way. Held until the entry is out of the map, so that turn finds no entry rather than a
+    // removed one.
+    let mut conversation_held = None;
     {
         let map = state.sessions.read().await;
-        if let Some(entry) = map.get(&id)
-            && entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0
-        {
-            return Err(turn_in_flight_conflict(id, "delete the session"));
+        if let Some(entry) = map.get(&id) {
+            if entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                return Err(turn_in_flight_conflict(id, "delete the session"));
+            }
+            conversation_held = Some(
+                Arc::clone(&entry.conversation)
+                    .try_lock_owned()
+                    .map_err(|_| turn_in_flight_conflict(id, "delete the session"))?,
+            );
         }
         let present_in_memory = map.contains_key(&id);
         drop(map);
@@ -1495,6 +1512,12 @@ pub(crate) async fn delete_session(
         }
         map.remove(&id)
     };
+    drop(conversation_held);
+    // Every reader of the feed is told the session is gone by the feed ending, rather than left
+    // on a channel nothing will publish to again.
+    if let Some(entry) = &removed {
+        entry.frontend.close_feed();
+    }
 
     // A failure here leaves the row in place with the entry already evicted, so the session is
     // still usable: the next request re-attaches it from the row it just failed to delete.

@@ -410,7 +410,6 @@ pub(crate) async fn rewind_session_command(
     };
     store.save_rewind(session_id, &event).await?;
 
-    tracing::info!("rewound {turns} turn(s) from session {session_id}");
     crate::streams::write_stderr_line(format!(
         "Rewound {} turn(s); {} message(s) remain, and `meka session export` still shows the \
          dropped ones.",
@@ -595,7 +594,6 @@ pub(crate) async fn import_session(
     let count = records.len();
     store.import_sessions(records, blobs).await?;
 
-    tracing::info!("imported {count} session(s) as root {root_new_id}");
     crate::streams::write_stderr_line(format!(
         "Imported {count} session(s); resume the root with `meka -r {root_new_id}`"
     ));
@@ -1039,5 +1037,55 @@ mod tests {
             sessions.is_empty(),
             "a refused import writes nothing: {sessions:?}"
         );
+    }
+
+    /// Zero days means "not updated since this instant", i.e. everything. Easy to type when you
+    /// meant "today's", and unrecoverable, so it is refused rather than run.
+    #[tokio::test]
+    async fn delete_older_than_zero_days_is_refused() {
+        let manager = crate::store::Store::for_test().await;
+        let error = crate::cli::session::delete_sessions(&manager, &[], false, Some(0))
+            .await
+            .expect_err("zero must be refused");
+        assert!(error.to_string().contains("--all"), "{error}");
+    }
+
+    /// The flag has to reach `delete_expired_sessions(days)` and nothing else: routing it to
+    /// `delete_all_sessions` would pass every error-path test in this file while wiping the DB.
+    #[tokio::test]
+    async fn delete_older_than_days_deletes_only_the_old() {
+        let manager = crate::store::Store::for_test().await;
+        let old = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create old");
+        let recent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create recent");
+        let backdated = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
+        manager
+            .set_session_updated_at_for_test(old, &backdated)
+            .await
+            .expect("backdate");
+
+        crate::cli::session::delete_sessions(&manager, &[], false, Some(30))
+            .await
+            .expect("sweep");
+
+        assert!(!manager.session_exists(old).await.expect("exists"));
+        assert!(manager.session_exists(recent).await.expect("exists"));
+    }
+
+    /// No selector at all should say what the options are, not silently do nothing.
+    #[tokio::test]
+    async fn delete_with_no_selector_explains_itself() {
+        let manager = crate::store::Store::for_test().await;
+        let error = crate::cli::session::delete_sessions(&manager, &[], false, None)
+            .await
+            .expect_err("no selector must be an error");
+        let text = error.to_string();
+        assert!(text.contains("--older-than-days"), "{text}");
+        assert!(text.contains("--all"), "{text}");
     }
 }

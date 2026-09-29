@@ -1111,6 +1111,15 @@ fn skill_context_header(skill: &Skill) -> String {
         "Base directory for this skill and its bundled files: {}",
         skill.source_dir.display()
     );
+    // The store sits under meka's config directory, which the shell sandbox masks below
+    // `unrestricted`; the in-process readers are what reach it, and the model is told so rather
+    // than left to try a command that finds nothing there.
+    if crate::paths::skills_dir().is_some_and(|store| skill.source_dir.starts_with(store)) {
+        header.push_str(
+            "\nRead its bundled files with `file_read`; a shell command cannot see this directory \
+             below `unrestricted`.",
+        );
+    }
     if let Some(compatibility) = skill.compatibility.as_deref() {
         // Bounded and sanitized here rather than at parse: this is the render path, so both cost
         // the model a few characters and cost the file nothing. Doing either on the way in would
@@ -1192,6 +1201,20 @@ pub(crate) fn validate_addressable_name(name: &str) -> Result<(), String> {
     if let Some(bad) = name.chars().find(|ch| *ch == '/' || *ch == '\\') {
         return Err(format!(
             "skill name '{name}' contains '{bad}'; a skill name is one directory, not a path"
+        ));
+    }
+    // As the platform reads it, not as the characters look: on Windows `C:..` has no separator
+    // and is a drive prefix followed by the parent directory, and `root.join` of a path with a
+    // prefix replaces the root.
+    let mut components = std::path::Path::new(name).components();
+    let one_directory = matches!(
+        components.next(),
+        Some(std::path::Component::Normal(only)) if only == name
+    ) && components.next().is_none();
+    if !one_directory {
+        return Err(format!(
+            "skill name '{name}' is not one directory name; a skill name has no drive, root or \
+             parent in it"
         ));
     }
     // Last, because it is the expensive one and because its message is about rendering rather than
@@ -3810,5 +3833,16 @@ mod tests {
     async fn skill_cache_with_no_root_is_empty() {
         let cache = SkillCache::for_root(None);
         assert!(cache.current().await.skills.is_empty());
+    }
+
+    /// On Windows a drive prefix has no separator in it, and `root.join` of a path that carries a
+    /// prefix leaves the root: `C:..` is the parent of the current directory on that drive.
+    #[cfg(windows)]
+    #[test]
+    fn a_skill_name_with_a_drive_prefix_is_refused() {
+        for name in ["C:..", "D:", "C:skill"] {
+            let error = validate_addressable_name(name).expect_err(name);
+            assert!(error.contains("not one directory name"), "{error}");
+        }
     }
 }

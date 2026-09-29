@@ -290,7 +290,9 @@ long as it lasted. A **one-shot** keeps its prompt, because nothing will produce
 is retired as soon as the turn is delivered, so that message is the last trace the reminder ever
 fired. A turn that got as far as running a tool keeps everything either way, since there is real work behind
 it. Failures are recorded regardless: `meka serve` logs them and sends a `schedule.fired` webhook
-with `status: "failed"`.
+with `status: "failed"`, or `"not_run"` when the job's session could not be opened for it (its
+profile left `config.toml`, or the session is gone), in which case the fire is tried again when its
+lease expires.
 
 ## Unattended turns and permissions
 

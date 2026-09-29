@@ -114,7 +114,11 @@ after every workspace bind and `sandbox-exec` denies them last, so a confined co
 the credential store even from a workspace root at `$HOME` that contains it, and the in-process
 `file_write` and `file_edit` refuse a target under them whatever roots the session holds. The
 in-process read tools (`file_read`, `file_search`, `file_find`, `scratchpad_load_file`) refuse
-them below `unrestricted` too, and a search from a root above them steps around them. Landlock
+them below `unrestricted` too, and a search from a root above them steps around them. The one exception is meka's own skills store, `skills/` under the config directory, which those readers reach at every level: a skill's bundled files are what its body tells the agent to read, and nothing secret lives there. The same
+readers refuse a process's own `/proc` directory (`/proc/<pid>`, `/proc/self`,
+`/proc/thread-self`), whose `environ`, `cmdline`, `fd` and `mem` carry what the process was given,
+meka's own environment and an MCP server's credential included; the system-wide files beside them
+(`/proc/meminfo`, `/proc/cpuinfo`, `/proc/mounts`) stay readable. Landlock
 rules only add access, so meka hides them there by never covering them: reading files is granted
 per sibling along the path to each, which keeps their names and sizes visible and their bytes
 not, and a workspace root above them is split the same way, at the cost that a new file under

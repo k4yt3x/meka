@@ -18,6 +18,11 @@ pub(crate) struct ScheduleStore {
     pub(crate) connection: std::sync::Arc<tokio_rusqlite::Connection>,
     memory: std::sync::Arc<SchedulerMemory>,
 }
+/// The ids of jobs a listing could not decode and has already warned about, per process.
+static UNREADABLE_JOBS_WARNED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
 impl ScheduleStore {
     /// A handle on the table over `connection`, sharing the scheduler's memory of held jobs.
     pub(crate) fn new(
@@ -146,6 +151,8 @@ impl ScheduleStore {
     /// Shared row decoder. A row that fails to decode (hand-edited spec, a `kind` from a future
     /// version) is skipped with a warning rather than failing the whole query: one bad row must not
     /// stop every other job in the database from firing.
+    /// Every listing decodes every row, on every poll; the jobs already warned about, so the
+    /// warning is said once per process rather than once per poll.
     pub(crate) async fn query_scheduled_jobs(
         &self,
         sql: String,
@@ -187,7 +194,17 @@ impl ScheduleStore {
                 let id = row.id.clone();
                 row.decode()
                     .inspect_err(|error| {
-                        tracing::warn!("skipping unreadable scheduled job {id}: {error}");
+                        // Once per job per process: every scheduler poll in every process lists
+                        // the jobs, and a row that never decodes would otherwise warn every
+                        // five seconds for as long as it stood.
+                        if crate::sync::lock(&UNREADABLE_JOBS_WARNED).insert(id.clone()) {
+                            tracing::warn!(
+                                "skipping unreadable scheduled job {id}: {error}; cancel it by \
+                                 id with `meka schedule cancel`"
+                            );
+                        } else {
+                            tracing::debug!("skipping unreadable scheduled job {id}: {error}");
+                        }
                     })
                     .ok()
             })
@@ -213,16 +230,28 @@ impl ScheduleStore {
             return Ok(None);
         }
         let wanted = crate::text::id_prefix_for_matching(id_prefix);
-        let jobs = self.list_scheduled_jobs(session_id).await?;
-        let matches: Vec<&ScheduledJob> = jobs
-            .iter()
-            .filter(|job| job.id.starts_with(&wanted))
-            .collect();
+        // Resolved over the raw ids, not the decoded listing: a row this build cannot decode is
+        // skipped by every listing, and a job nobody can list must still be a job somebody can
+        // cancel, or it warns on every poll and keeps its session out of retention for good.
+        let session = session_id.to_string();
+        let ids: Vec<String> = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement =
+                    connection.prepare("SELECT id FROM scheduled_jobs WHERE session_id = ?1")?;
+                let ids = statement
+                    .query_map([session], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok(ids)
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to list job ids: {error}")))?;
+        let matches: Vec<&String> = ids.iter().filter(|id| id.starts_with(&wanted)).collect();
         let id = match matches.as_slice() {
             [] => return Ok(None),
-            [job] => job.id.clone(),
+            [id] => (*id).clone(),
             several => {
-                return Err(MekaError::Config(format!(
+                return Err(MekaError::Usage(format!(
                     "'{}' matches {} jobs; use a longer id",
                     id_prefix,
                     several.len()
@@ -654,6 +683,60 @@ impl ScheduledJobRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row this build cannot decode is still a job somebody can cancel: resolved over the raw
+    /// ids, since every listing skips it, and left uncancelable it warns on every poll and keeps
+    /// its session out of retention for good.
+    #[tokio::test]
+    async fn an_unreadable_job_can_still_be_canceled_by_id() {
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        let id = Uuid::new_v4().to_string();
+        let row_id = id.clone();
+        let session = session_id.to_string();
+        store
+            .connection
+            .call(move |connection| -> rusqlite::Result<()> {
+                connection.execute(
+                    "INSERT INTO scheduled_jobs (id, session_id, kind, spec, prompt, created_at, \
+                     next_fire_at) VALUES (?1, ?2, 'bogus', 'nothing this build reads', 'p', ?3, ?3)",
+                    rusqlite::params![row_id, session, chrono::Utc::now().to_rfc3339()],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("a row no build decodes");
+        assert!(
+            store
+                .schedule_store()
+                .list_scheduled_jobs(session_id)
+                .await
+                .expect("list")
+                .is_empty(),
+            "the listing skips it"
+        );
+        let canceled = store
+            .schedule_store()
+            .cancel_scheduled_job(session_id, &id[..8])
+            .await
+            .expect("cancel resolves by raw id");
+        assert_eq!(canceled.as_deref(), Some(id.as_str()));
+        let left: i64 = store
+            .connection
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT count(*) FROM scheduled_jobs WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .expect("count");
+        assert_eq!(left, 0, "the row is gone");
+    }
 
     async fn job_fixture(
         store: &Store,

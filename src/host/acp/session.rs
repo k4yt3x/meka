@@ -30,40 +30,6 @@ pub(super) fn parse_session_id(
     uuid::Uuid::parse_str(session_id)
         .map_err(|_| invalid_params_error(format!("malformed sessionId: {session_id}")))
 }
-/// Move a session's agent onto whatever its row currently names, before a turn runs on it.
-///
-/// **The row is the carrier, and the only one.** `session/set_config_option` moves the agent
-/// itself, but every other writer of the row (`meka -r --profile`, a `PATCH` on a server sharing
-/// the store) reaches this process only through the row, and this is what applies it. A resolved
-/// profile parked on the session entry is drained only by `session/prompt`, so a scheduled fire or
-/// a background-outcome turn runs on, and bills, the profile the user has left, while the row,
-/// both pickers and the reported window all say otherwise. A parked value was a second carrier of
-/// a fact the row already held, and it could lose to any other writer of that row.
-///
-/// Cheap when nothing has changed: one indexed row read and a comparison, with no resolution at all
-/// unless the two differ.
-///
-/// Must be called under the runtime mutex, which is what makes "the agent this turn is about to
-/// use" the thing being moved.
-pub(super) async fn apply_recorded_profile(
-    state: &ServerState,
-    agent: &crate::agent::Agent,
-    session_uuid: uuid::Uuid,
-) -> anyhow::Result<()> {
-    let Some(recorded) = state.shared.store.recorded_profile(session_uuid).await? else {
-        // No row, so nothing names a profile to move to. Reachable only for a session deleted from
-        // under a live entry; its turn is going to fail on the write either way.
-        return Ok(());
-    };
-    if recorded == agent.profile() {
-        return Ok(());
-    }
-    let profile = recorded.clone();
-    let resolved = crate::provider::resolved_profile(&state.shared.providers, recorded).await?;
-    agent.set_provider(resolved);
-    tracing::info!("moved session {session_uuid} onto profile '{profile}'");
-    Ok(())
-}
 /// Aborts a background task when the value is dropped. `run_acp` has several exit paths, and a
 /// scheduler that outlived them would keep running turns against a connection nobody is reading.
 pub(super) struct AbortOnDrop(pub(super) tokio::task::JoinHandle<()>);
@@ -184,14 +150,17 @@ pub(super) async fn acp_run_until_disconnect(
         _ = stdin_eof.cancelled() => {
             tracing::info!("ACP client disconnected (stdin EOF); shutting down");
         }
-        _ = acp_shutdown_signal() => {
-            tracing::info!("received termination signal; shutting down ACP server");
+        _ = crate::host::wait_for_shutdown_signal() => {
+            tracing::info!("shutting down the ACP server");
         }
     }
-    drain_acp_sessions(&state).await;
-    if tokio::time::timeout(ACP_DRAIN_TIMEOUT, wait_for_sessions_idle(&state))
-        .await
-        .is_err()
+    state.sessions.cancel_every_turn().await;
+    if tokio::time::timeout(
+        ACP_DRAIN_TIMEOUT,
+        state.sessions.wait_for_turns_to_unwind(|| false),
+    )
+    .await
+    .is_err()
     {
         tracing::warn!("ACP shutdown drain timed out; abandoning in-flight turn(s)");
     }
@@ -265,63 +234,6 @@ pub(super) fn spawn_idle_session_sweep(state: Arc<ServerState>) -> tokio::task::
     })
 }
 
-/// Cancel every active session's in-flight turn. Mirrors `crate::host::http`'s drain.
-///
-/// Through the cell, not the live token alone: a prompt admitted but not yet published has no
-/// token, and only the cell's epoch bump reaches it. Firing the live tokens left such a prompt to
-/// run its whole turn during the drain and then be abandoned.
-pub(super) async fn drain_acp_sessions(state: &ServerState) {
-    let sessions = state.sessions.read().await;
-    for entry in sessions.values() {
-        entry.cancel.cancel();
-    }
-}
-/// Resolve once no session is running a turn. The prompt handler holds `entry.runtime`'s lock for
-/// the whole turn, so a successful `try_lock` on every session means all turns have unwound.
-pub(super) async fn wait_for_sessions_idle(state: &ServerState) {
-    loop {
-        let all_idle = {
-            let sessions = state.sessions.read().await;
-            sessions
-                .values()
-                .all(|entry| entry.conversation.try_lock().is_ok())
-        };
-        if all_idle {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-}
-/// Wait for a cross-platform termination signal: SIGTERM or Ctrl-C on unix, Ctrl-C elsewhere.
-/// Mirrors `crate::host::http`'s `shutdown_signal`.
-pub(super) async fn acp_shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut terminate) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = terminate.recv() => {}
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "failed to install SIGTERM handler: {error}; relying on Ctrl+C only"
-                );
-                if let Err(error) = tokio::signal::ctrl_c().await {
-                    tracing::warn!("failed to listen for Ctrl+C: {error}");
-                }
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::warn!("failed to listen for Ctrl+C: {error}");
-        }
-    }
-}
 /// What a reopening client's workspace changes on the row: its `cwd` wins (consistent with
 /// `session/new`'s captured cwd), and its `additionalDirectories` are the complete resulting list,
 /// so an empty one clears the column. Only what differs is named, so a reopen that changes nothing
@@ -755,16 +667,16 @@ pub(super) async fn handle_fork_session(
     // here, an imported sub-agent among them.
     match state.shared.store.spawn_terms(source_uuid).await {
         Ok(Some(terms)) => {
-            return responder.respond_with_error(invalid_params_error(match terms.parent {
-                Some(parent) => format!(
-                    "session {source_uuid} is a sub-agent of session {parent}, so a copy of it \
-                     cannot be driven; continue it with `agent_followup` there"
-                ),
-                None => format!(
-                    "session {source_uuid} is a sub-agent whose parent is not in this store, so a \
-                     copy of it cannot be driven"
-                ),
-            }));
+            let remedy = match terms.parent {
+                Some(_) => {
+                    ", so a copy of it cannot be driven; continue it with `agent_followup` there"
+                }
+                None => ", so a copy of it cannot be driven",
+            };
+            return responder.respond_with_error(invalid_params_error(format!(
+                "{}{remedy}",
+                terms.describe(source_uuid)
+            )));
         }
         // Not this door's refusal to make: `fork_session_locked` answers an unknown id below.
         Ok(None) => {}

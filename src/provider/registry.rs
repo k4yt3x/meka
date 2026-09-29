@@ -12,6 +12,8 @@ pub(crate) struct ProviderBuilder {
     pub(super) base_url: Option<String>,
     pub(super) client_id: Option<String>,
     pub(super) oauth_token_url: Option<String>,
+    /// See `AccountConfig::interleaved_thinking`; read by `anthropic-messages` alone.
+    pub(super) interleaved_thinking: bool,
     pub(super) token_store: Option<Arc<TokenStore>>,
     /// Account name the credential is stored under; OAuth providers use it to write refreshed
     /// tokens back to the right `account_credentials` row. Required by both subscription backends;
@@ -39,6 +41,7 @@ impl ProviderBuilder {
             base_url: None,
             client_id: None,
             oauth_token_url: None,
+            interleaved_thinking: true,
             token_store: None,
             credential_key: None,
             thinking: ThinkingMode::Off,
@@ -73,6 +76,12 @@ impl ProviderBuilder {
 
     /// Sink for refreshed OAuth tokens. Consumed by both subscription backends; when `None`,
     /// refreshed tokens are held in memory only.
+    /// Whether the endpoint takes the `interleaved-thinking` beta; `anthropic-messages` alone.
+    pub(crate) fn interleaved_thinking(mut self, value: bool) -> Self {
+        self.interleaved_thinking = value;
+        self
+    }
+
     pub(crate) fn token_store(mut self, value: Option<Arc<TokenStore>>) -> Self {
         self.token_store = value;
         self
@@ -451,9 +460,7 @@ impl ProviderRegistry {
         let settings = self.settings(profile)?;
 
         #[cfg(any(debug_assertions, feature = "mock-provider"))]
-        if let Ok(scripted) = self.scripted.lock()
-            && let Some(scripted) = scripted.as_ref()
-        {
+        if let Some(scripted) = crate::sync::lock(&self.scripted).as_ref() {
             return Ok((Arc::clone(scripted), settings));
         }
 
@@ -483,8 +490,7 @@ impl ProviderRegistry {
             .token_store
             .account_credential_version(&settings.account)
             .await?;
-        if let Ok(built) = self.built.lock()
-            && let Some(existing) = built.get(&key)
+        if let Some(existing) = crate::sync::lock(&self.built).get(&key)
             && existing.credential_version == credential_version
         {
             return Ok((Arc::clone(&existing.provider), settings));
@@ -495,6 +501,7 @@ impl ProviderRegistry {
         let needs_token_store = matches!(credential, AuthCredential::OAuthToken { .. });
         let provider = ProviderBuilder::new(settings.backend, credential, model)
             .base_url(settings.base_url.clone())
+            .interleaved_thinking(settings.interleaved_thinking)
             .client_id(settings.client_id.clone())
             .credential_key(Some(settings.account.clone()))
             .oauth_token_url(settings.oauth_token_url.clone())
@@ -508,32 +515,31 @@ impl ProviderRegistry {
             .max_request_bytes(settings.max_request_bytes)
             .build()?;
 
-        match self.built.lock() {
-            Ok(mut built) => {
-                let cached = built.entry(key).or_insert_with(|| CachedProvider {
-                    credential_version: credential_version.clone(),
+        let provider = {
+            let mut built = crate::sync::lock(&self.built);
+            let cached = built.entry(key).or_insert_with(|| CachedProvider {
+                credential_version: credential_version.clone(),
+                provider: Arc::clone(&provider),
+            });
+            // Whoever got here first wins, and a loser drops its own build rather than replacing
+            // a provider another turn may already be using, unless what is there was built from a
+            // credential that has since been superseded, which is the case this call exists to
+            // serve.
+            //
+            // Two builds spanning two rotations can land out of order and leave the older one
+            // cached. That converges rather than sticking: the tag records which credential the
+            // entry was built from, so the next ask compares it against the row and rebuilds.
+            if cached.credential_version != credential_version {
+                *cached = CachedProvider {
+                    credential_version,
                     provider: Arc::clone(&provider),
-                });
-                // Whoever got here first wins, and a loser drops its own build rather than
-                // replacing a provider another turn may already be using, unless what is there
-                // was built from a credential that has since been superseded, which is the case
-                // this call exists to serve.
-                //
-                // Two builds spanning two rotations can land out of order and leave the older one
-                // cached. That converges rather than sticking: the tag records which credential the
-                // entry was built from, so the next ask compares it against the row and rebuilds.
-                if cached.credential_version != credential_version {
-                    *cached = CachedProvider {
-                        credential_version,
-                        provider: Arc::clone(&provider),
-                    };
-                }
-                Ok((Arc::clone(&cached.provider), settings))
+                };
             }
-            // A poisoned cache costs reuse, not correctness: the provider just built is complete
-            // and usable, and the next ask builds another.
-            Err(_) => Ok((provider, settings)),
-        }
+            let provider = Arc::clone(&cached.provider);
+            drop(built);
+            provider
+        };
+        Ok((provider, settings))
     }
 
     pub(super) async fn credential_for(&self, account: &str) -> Result<AuthCredential> {
@@ -555,9 +561,7 @@ impl ProviderRegistry {
     /// Install a scripted provider in place of every profile's. Debug builds only.
     #[cfg(any(debug_assertions, feature = "mock-provider"))]
     pub(crate) fn install_scripted(&self, provider: Arc<dyn Provider>) {
-        if let Ok(mut scripted) = self.scripted.lock() {
-            *scripted = Some(provider);
-        }
+        *crate::sync::lock(&self.scripted) = Some(provider);
     }
 }
 
@@ -861,5 +865,78 @@ impl PublishedProfile {
             context_window: 0,
             vision: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The regression the whole feature exists for, at the one door every turn-running site goes
+    /// through: a session that named a profile keeps it, whatever the process default now is.
+    #[tokio::test]
+    async fn a_recorded_binding_beats_the_process_default() {
+        let manager = crate::store::Store::for_test().await;
+        let id = manager
+            .create_session(None, "openaiprof".to_string())
+            .await
+            .expect("create");
+
+        let resolved =
+            crate::provider::resolve_session_profile(&manager, Ok("claudeprof"), Some(id))
+                .await
+                .expect("resolves");
+
+        assert_eq!(resolved, "openaiprof");
+    }
+
+    /// A session that does not exist yet is the only case the configured default answers.
+    #[tokio::test]
+    async fn a_session_that_does_not_exist_yet_takes_the_default() {
+        let manager = crate::store::Store::for_test().await;
+
+        let resolved = crate::provider::resolve_session_profile(&manager, Ok("claudeprof"), None)
+            .await
+            .expect("resolves");
+
+        assert_eq!(resolved, "claudeprof");
+    }
+
+    /// With nothing configured there is no profile to fall back to, and inventing one would be the
+    /// silent redirection this door exists to prevent.
+    #[tokio::test]
+    async fn no_configured_profile_is_an_error_rather_than_an_empty_one() {
+        let manager = crate::store::Store::for_test().await;
+
+        let error = crate::provider::resolve_session_profile(
+            &manager,
+            Err("no profiles configured. Run `meka profile add <name>`."),
+            None,
+        )
+        .await
+        .expect_err("nothing to resolve to");
+
+        assert!(
+            error.to_string().contains("meka profile add"),
+            "the refusal should say how to fix it: {error}"
+        );
+    }
+
+    /// The reason travels: `validate()` raises no ambiguous default for a resume, so a resume that
+    /// *does* fall through to needing one has to carry the message that says what to do rather
+    /// than a generic "nothing configured".
+    #[tokio::test]
+    async fn a_resume_that_needs_a_default_reports_why_there_is_none() {
+        let manager = crate::store::Store::for_test().await;
+        let ambiguous = "multiple profiles configured (personal, side); run \
+                         `meka profile use <name>` to pick a default, or pass `--profile <name>`.";
+
+        // `None` session id: `-c` on a store with nothing to resume lands here.
+        let error = crate::provider::resolve_session_profile(&manager, Err(ambiguous), None)
+            .await
+            .expect_err("no default to fall back to");
+
+        let crate::error::MekaError::Config(message) = error else {
+            panic!("a missing default is a configuration error: {error}");
+        };
+        assert_eq!(message, ambiguous);
     }
 }

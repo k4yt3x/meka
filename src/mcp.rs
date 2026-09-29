@@ -7,6 +7,7 @@ pub(crate) mod auth;
 pub(crate) mod connector;
 pub(crate) mod expand;
 pub(crate) mod handler;
+pub(crate) mod policy;
 pub(crate) mod progress;
 pub(crate) mod resource_updates;
 pub(crate) mod sanitize;
@@ -18,6 +19,11 @@ use std::{
 };
 
 pub(crate) use handler::{CallContext, McpTool};
+use policy::*;
+pub(crate) use policy::{
+    AdvertisedTool, PermissionSource, resolve_tool_permission, tool_is_allowed,
+    tool_should_eager_load, warn_on_stale_tool_config,
+};
 use rmcp::{
     Peer, RoleClient,
     model::{
@@ -224,6 +230,35 @@ pub(crate) struct NotConnected {
     pub(crate) state: ServerState,
 }
 
+/// The manager a retried entry heals into, and the default its tools are classified against.
+pub(crate) struct BackgroundRetry {
+    pub(crate) manager: std::sync::Weak<McpClientManager>,
+    pub(crate) mcp_default_permission: Option<Permission>,
+}
+
+/// `error` with the URLs in its words redacted, as `connector::record_connect_failure` redacts
+/// what it records: a reconnect's refusal reaches the model and the session's history too, and a
+/// server's `url` may name its key in the query string.
+fn redact_mcp_error(error: MekaError) -> MekaError {
+    match error {
+        MekaError::McpConnection {
+            server_name,
+            message,
+        } => MekaError::McpConnection {
+            server_name,
+            message: crate::text::redact_urls(&message),
+        },
+        MekaError::McpAuth {
+            server_name,
+            message,
+        } => MekaError::McpAuth {
+            server_name,
+            message: crate::text::redact_urls(&message),
+        },
+        other => other,
+    }
+}
+
 /// Holds the lifecycle state of a single MCP server plus reconnection machinery. Wrapped in an
 /// [`Arc`] and shared between the manager, the per-server tool adapters, and the resource/prompt
 /// builtin tools so every caller sees the current service (or the current failure) via
@@ -258,6 +293,10 @@ pub(crate) struct ServerEntry {
     /// configured timeout applies to `tools/list` but silently not to `resources/read` or
     /// `prompts/get`.
     pub(crate) request_timeout: OnceLock<std::time::Duration>,
+    /// What [`connector::retry_until_connected`] needs to own this entry once a reconnect gives
+    /// up, set when the connector starts; an entry of a manager that never started one (a
+    /// throwaway for `meka mcp reconnect`) has no background to hand it to.
+    pub(crate) background_retry: OnceLock<BackgroundRetry>,
     /// How many tools the last `tools/list` dropped to stay under [`MAX_MCP_TOOLS_PER_SERVER`].
     /// Recorded so the cap is *disclosed* rather than only logged: a tool that vanished between
     /// what the server offers and what meka registered is indistinguishable, from the outside,
@@ -364,19 +403,25 @@ impl ServerEntry {
         }
     }
 
-    /// Attempt to reconnect this server with exponential backoff. Serialized via `reconnect_lock`
-    /// so concurrent tool calls don't stampede. If another caller already reopened the transport,
-    /// returns immediately.
+    /// Reopen this server's transport after it closed under a `Connected` state, serialized on
+    /// `reconnect_lock` so concurrent tool calls do not stampede; a caller that finds the
+    /// transport reopened already returns at once. Each attempt is bounded by the connect timeout
+    /// and raced against `cancellation`, so a peer that accepts the connection and never answers
+    /// `initialize` cannot hold a turn past a stop. Giving up leaves the entry `Failed` and hands
+    /// it to the background retry, so `meka mcp list` says what is true and a later call is
+    /// refused in the state's words rather than paying the whole backoff again.
     ///
     /// Schedule: 1s, 2s, 4s, 8s, 16s, capped at 30s, max 5 attempts. Only remote (HTTP) transports
     /// go through backoff; a dead stdio child has to be respawned and retry-after-sleep doesn't
     /// help.
-    ///
-    /// The connect future is `!Send` for an OAuth-authenticated server (rmcp's auth module holds a
-    /// `!Sync` closure slot across an await), so the reconnect is driven on a `spawn_blocking`
-    /// thread with the outer runtime's `Handle` to keep `Tool::execute`'s `Send` bound satisfied.
-    pub(crate) async fn reconnect(self: &Arc<Self>) -> Result<()> {
-        let _guard = self.reconnect_lock.lock().await;
+    pub(crate) async fn reconnect(
+        self: &Arc<Self>,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        let _guard = tokio::select! {
+            guard = self.reconnect_lock.lock() => guard,
+            _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
+        };
 
         if !self.needs_reconnect().await {
             return Ok(());
@@ -392,17 +437,34 @@ impl ServerEntry {
             "MCP server '{server_name}' transport closed; attempting reconnect",
             server_name = self.server_name
         );
+        self.reconnect_attempts(cancellation).await
+    }
 
+    /// The attempts [`Self::reconnect`] makes and what giving up leaves behind, under the lock the
+    /// caller holds.
+    ///
+    /// The connect future is `!Send` for an OAuth-authenticated server (rmcp's auth module holds a
+    /// `!Sync` closure slot across an await), so each attempt is driven on a `spawn_blocking`
+    /// thread with the outer runtime's `Handle` to keep `Tool::execute`'s `Send` bound satisfied.
+    /// A bound or a stop that fires leaves that thread to its own end; nothing waits on it.
+    async fn reconnect_attempts(
+        self: &Arc<Self>,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
         let max_attempts: u32 = match self.config.transport {
             McpTransport::Stdio => 1,
             McpTransport::Http => 5,
         };
+        let bound = self.request_timeout();
         let mut last_error: Option<MekaError> = None;
         for attempt in 0..max_attempts {
             if attempt > 0 {
                 // 1s, 2s, 4s, 8s, 16s, capped at 30s.
                 let delay_secs = std::cmp::min(30u64, 1u64 << (attempt - 1));
-                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
+                    _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
+                }
             }
             let handle = tokio::runtime::Handle::current();
             let server_name = self.server_name.clone();
@@ -410,18 +472,21 @@ impl ServerEntry {
             let token_store = self.token_store.clone();
             let client_context = Arc::clone(&self.client_context);
 
-            let result = tokio::task::spawn_blocking(move || {
+            let connect = tokio::task::spawn_blocking(move || {
                 handle.block_on(connector::connect_server(
                     &server_name,
                     &config,
                     token_store.as_ref(),
                     &client_context,
                 ))
-            })
-            .await;
+            });
+            let result = tokio::select! {
+                result = tokio::time::timeout(bound, connect) => result,
+                _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
+            };
 
             match result {
-                Ok(Ok(new_service)) => {
+                Ok(Ok(Ok(new_service))) => {
                     self.record_instructions(
                         new_service
                             .peer()
@@ -439,7 +504,8 @@ impl ServerEntry {
                     self.relist_after_reconnect().await;
                     return Ok(());
                 }
-                Ok(Err(error)) => {
+                Ok(Ok(Err(error))) => {
+                    let error = redact_mcp_error(error);
                     tracing::warn!(
                         "MCP server '{server_name}' reconnect attempt {attempt} failed: {error}",
                         server_name = self.server_name,
@@ -447,7 +513,7 @@ impl ServerEntry {
                     );
                     last_error = Some(error);
                 }
-                Err(join_error) => {
+                Ok(Err(join_error)) => {
                     tracing::warn!(
                         "MCP server '{server_name}' reconnect task join error on attempt {attempt}: {join_error}",
                         server_name = self.server_name,
@@ -458,12 +524,45 @@ impl ServerEntry {
                         message: format!("reconnect task join error: {join_error}"),
                     });
                 }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        "MCP server '{server_name}' reconnect attempt {attempt} timed out after {bound:?}",
+                        server_name = self.server_name,
+                        attempt = attempt + 1
+                    );
+                    last_error = Some(MekaError::McpConnection {
+                        server_name: self.server_name.clone(),
+                        message: format!("reconnect timed out after {bound:?}"),
+                    });
+                }
             }
         }
-        Err(last_error.unwrap_or_else(|| MekaError::McpConnection {
+
+        // Given up: the entry says so, through the door every connect failure is recorded by,
+        // and the background retry owns it from here. Left `Connected` over the dead transport,
+        // `meka mcp list` says connected, every later call pays the whole backoff again, and
+        // nothing retries in between.
+        let error = last_error.unwrap_or_else(|| MekaError::McpConnection {
             server_name: self.server_name.clone(),
-            message: format!("exhausted {max_attempts} reconnect attempts"),
-        }))
+            message: "reconnect made no attempt".to_string(),
+        });
+        let cause = match &error {
+            MekaError::McpConnection { message, .. } | MekaError::McpAuth { message, .. } => {
+                message.clone()
+            }
+            other => other.to_string(),
+        };
+        connector::record_connect_failure(self, &self.server_name, cause).await;
+        if let Some(retry) = self.background_retry.get() {
+            tokio::spawn(connector::retry_until_connected(
+                Arc::clone(self),
+                retry.manager.clone(),
+                retry.mcp_default_permission,
+                bound,
+                connector::INITIAL_RETRY_BACKOFF,
+            ));
+        }
+        Err(error)
     }
 
     /// Re-list this server's tools after a reconnect has swapped in a new transport.
@@ -610,16 +709,13 @@ impl McpClientManager {
             // the request cannot succeed, and the string names a secret the operator meant to
             // keep out of the file. `config.toml`'s own `${VAR}` fails closed the same way.
             let refused = (!is_disabled && unresolved.in_secret_bearing_fields).then(|| {
+                let what = unresolved.describe();
                 tracing::warn!(
-                    "MCP server '{name}' will not connect: {names:?} is unset and named in its `headers` \
-                     or `env`",
-                    name = config.name,
-                    names = unresolved.names
+                    "MCP server '{name}' will not connect: {what}, in its `args`, `env`, `url` or \
+                     `headers`",
+                    name = config.name
                 );
-                format!(
-                    "environment variable(s) {:?} are unset and named in `headers` or `env`",
-                    unresolved.names
-                )
+                format!("{what}, in `args`, `env`, `url` or `headers`")
             });
             let initial_state = if is_disabled {
                 ServerState::Disabled
@@ -642,6 +738,7 @@ impl McpClientManager {
                 refused,
                 instructions: std::sync::RwLock::new(None),
                 request_timeout: OnceLock::new(),
+                background_retry: OnceLock::new(),
                 dropped_tools: std::sync::atomic::AtomicUsize::new(0),
             });
             // A refused entry is not pending: it is failed for good, and the connector's
@@ -757,6 +854,19 @@ impl McpClientManager {
             if entry.request_timeout.set(runtime.connect_timeout).is_err() {
                 tracing::debug!(
                     "MCP server {server_name} already has its request timeout",
+                    server_name = entry.server_name
+                );
+            }
+            if entry
+                .background_retry
+                .set(BackgroundRetry {
+                    manager: Arc::downgrade(self),
+                    mcp_default_permission: self.mcp_default_permission,
+                })
+                .is_err()
+            {
+                tracing::debug!(
+                    "MCP server {server_name} already has its background retry",
                     server_name = entry.server_name
                 );
             }
@@ -1004,12 +1114,15 @@ impl McpClientManager {
                 // timeout, so an endpoint that blackholes connections would hold this request far
                 // past the budget the caller passed in. The re-list it ends with carries its own
                 // bound, so this covers the whole of it either way.
-                tokio::time::timeout(connect_timeout, entry.reconnect())
-                    .await
-                    .map_err(|_| MekaError::McpConnection {
-                        server_name: server_name.to_string(),
-                        message: format!("reconnect did not complete within {connect_timeout:?}"),
-                    })??;
+                tokio::time::timeout(
+                    connect_timeout,
+                    entry.reconnect(&tokio_util::sync::CancellationToken::new()),
+                )
+                .await
+                .map_err(|_| MekaError::McpConnection {
+                    server_name: server_name.to_string(),
+                    message: format!("reconnect did not complete within {connect_timeout:?}"),
+                })??;
             }
             ServerState::Failed { .. } => {
                 // Under `reconnect_lock`, which is the same guard `retry_until_connected` takes
@@ -1191,233 +1304,6 @@ impl McpClientManager {
     }
 }
 
-/// Decide whether a tool advertised by a server should be registered. Applies `allowed_tools`
-/// (restrict-in, when set and non-empty) then `disabled_tools` (always-remove). Both fields can
-/// coexist: the allow-list acts as a restriction, and the block-list subtracts from whatever
-/// remains. A tool passes iff it survives both checks.
-pub(crate) fn tool_is_allowed(server_config: &McpServerConfig, tool_raw_name: &str) -> bool {
-    if let Some(allow) = server_config.allowed_tools.as_deref()
-        && !allow.is_empty()
-        && !allow.iter().any(|t| t == tool_raw_name)
-    {
-        return false;
-    }
-    if let Some(deny) = server_config.disabled_tools.as_deref()
-        && deny.iter().any(|t| t == tool_raw_name)
-    {
-        return false;
-    }
-    true
-}
-
-/// Whether the given raw tool name is in this server's
-/// [`eager_load_tools`][McpServerConfig::eager_load_tools] list. Mirrors [`tool_is_allowed`]'s
-/// shape. When true, the registration sites skip `mark_deferred` so the tool ships in the cacheable
-/// tools-array prefix from the first turn instead of after a `tool_load` round-trip.
-pub(crate) fn tool_should_eager_load(server_config: &McpServerConfig, tool_raw_name: &str) -> bool {
-    server_config
-        .eager_load_tools
-        .as_ref()
-        .is_some_and(|list| list.iter().any(|n| n == tool_raw_name))
-}
-
-/// Warn once per entry in `allowed_tools` / `disabled_tools` / `eager_load_tools` /
-/// `tool_permissions` that names nothing the server currently advertises, and once per tool that
-/// is both disabled and eager-loaded. A warning rather than a failed connect, because tool lists
-/// change between server releases and a hard error on every rename would be hostile.
-pub(crate) fn warn_on_stale_tool_config(
-    server_name: &str,
-    server_config: &McpServerConfig,
-    advertised: &std::collections::HashSet<&str>,
-) {
-    if let Some(allow) = server_config.allowed_tools.as_deref() {
-        for name in allow {
-            if !advertised.contains(name.as_str()) {
-                tracing::warn!(
-                    "MCP server '{server_name}': allowed_tools entry '{name}' names no advertised tool"
-                );
-            }
-        }
-    }
-    if let Some(deny) = server_config.disabled_tools.as_deref() {
-        for name in deny {
-            if !advertised.contains(name.as_str()) {
-                tracing::warn!(
-                    "MCP server '{server_name}': disabled_tools entry '{name}' names no advertised tool"
-                );
-            }
-        }
-    }
-    if let Some(eager) = server_config.eager_load_tools.as_deref() {
-        let disabled = server_config.disabled_tools.as_deref().unwrap_or(&[]);
-        for name in eager {
-            if !advertised.contains(name.as_str()) {
-                tracing::warn!(
-                    "MCP server '{server_name}': eager_load_tools entry '{name}' names no advertised tool"
-                );
-            }
-            if disabled.iter().any(|d| d == name) {
-                tracing::warn!(
-                    "MCP server '{server_name}': eager_load_tools entry '{name}' is also in disabled_tools, \
-                     so it is never registered"
-                );
-            }
-        }
-    }
-    if let Some(permissions) = server_config.tool_permissions.as_ref() {
-        for key in permissions.keys() {
-            if !advertised.contains(key.as_str()) {
-                tracing::warn!(
-                    "MCP server '{server_name}': tool_permissions key '{key}' names no advertised tool"
-                );
-            }
-        }
-    }
-}
-
-/// Resolve the required permission for a single MCP tool. Applies the
-/// layered policy documented in `docs/book/src/configuration/config-file.md`:
-///
-/// 1. `server.tool_permissions[tool]`: per-tool user override.
-/// 2. `server.permission`: server-level user override.
-/// 3. `tool.annotations.readOnlyHint` advertised by the server: `true` → Read, `false` →
-///    Unrestricted. The `true` half is skipped when the server sets `trust_read_only_hint = false`.
-/// 4. `mcp.default_permission`: global fallback when no hint exists.
-/// 5. Hardcoded `Unrestricted`: ultimate strict fallback.
-///
-/// User config at steps 1/2 always beats the server's hints. Hints beat the global fallback so a
-/// `readOnlyHint = false` destructive tool isn't silently promoted to Read just because the user
-/// opted into a lenient global default.
-pub(crate) fn resolve_tool_permission(
-    tool_raw_name: &str,
-    tool_annotations: Option<&rmcp::model::ToolAnnotations>,
-    server_config: &McpServerConfig,
-    mcp_default: Option<Permission>,
-) -> Permission {
-    resolve_tool_permission_with_source(tool_raw_name, tool_annotations, server_config, mcp_default)
-        .0
-}
-
-/// Identifies which step of the 5-step resolution chain produced a tool's permission. Used by `meka
-/// mcp tools <name>` so users can see which knob is driving each tool's classification when editing
-/// allow/block lists or per-tool overrides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PermissionSource {
-    ToolOverride,
-    ServerOverride,
-    ReadOnlyHint,
-    GlobalDefault,
-    Fallback,
-}
-
-impl PermissionSource {
-    /// Short human label matching the config keys users would edit.
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::ToolOverride => "tool_permission",
-            Self::ServerOverride => "server_permission",
-            Self::ReadOnlyHint => "readOnlyHint",
-            Self::GlobalDefault => "default_permission",
-            Self::Fallback => "fallback",
-        }
-    }
-}
-
-/// A tool advertised by an MCP server, paired with the resolved permission and the source step of
-/// the resolution chain. Returned by [`McpClientManager::list_advertised_tools`] and printed by
-/// `meka mcp tools <server>`.
-pub(crate) struct AdvertisedTool {
-    /// Raw name as advertised by the server. Use this value in `allowed_tools` / `disabled_tools`
-    /// / `tool_permissions` config.
-    pub(crate) raw_name: String,
-    /// Sanitized + truncated description (same pipeline as registered tools).
-    pub(crate) description: String,
-    /// Output of the 5-step permission resolution.
-    pub(crate) resolved_permission: Permission,
-    /// Which step of the chain won.
-    pub(crate) permission_source: PermissionSource,
-    /// `false` if currently filtered out by `allowed_tools` / `disabled_tools`, i.e. the agent
-    /// would never see this tool.
-    pub(crate) allowed: bool,
-    /// The server advertised `readOnlyHint: true` and `trust_read_only_hint = false` withheld it,
-    /// so resolution fell through to the steps below.
-    ///
-    /// Carried separately because [`Self::permission_source`] names only what *won*, and a
-    /// declined hint by definition did not. Without it the one thing the setting exists to do
-    /// is invisible at the one place a user checks it: `meka mcp tools` would show
-    /// `default_permission` either way, so a server advertising no hint and a server whose
-    /// hint was refused would read identically.
-    pub(crate) read_only_hint_declined: bool,
-}
-
-/// Same resolution as [`resolve_tool_permission`] but also returns which step of the chain fired,
-/// so `meka mcp tools` can show the user exactly why a given tool has its current permission.
-fn resolve_tool_permission_with_source(
-    tool_raw_name: &str,
-    tool_annotations: Option<&rmcp::model::ToolAnnotations>,
-    server_config: &McpServerConfig,
-    mcp_default: Option<Permission>,
-) -> (Permission, PermissionSource) {
-    // 1. Per-tool override.
-    if let Some(permission) = server_config
-        .tool_permissions
-        .as_ref()
-        .and_then(|map| map.get(tool_raw_name))
-    {
-        return (*permission, PermissionSource::ToolOverride);
-    }
-    // 2. Server-level override.
-    if let Some(permission) = server_config.permission {
-        return (permission, PermissionSource::ServerOverride);
-    }
-    // 3. Server-advertised readOnlyHint.
-    //
-    // The two directions are not symmetric, so they are gated differently. A hint of `false` only
-    // ever *raises* the requirement to Unrestricted, so believing it costs nothing and it is always
-    // honored. A hint of `true` *lowers* the requirement to Read, and that is the direction in
-    // which a wrong or dishonest hint matters: MCP tools run in the server's own process with no
-    // sandbox, so a tool wrongly classified Read can write the user's tree while meka sits at
-    // `read`. `trust_read_only_hint = false` withholds exactly that, leaving the hint advisory for
-    // display and dropping the tool through to the strict fallback, past the global default, for
-    // the reason step 4 gives.
-    let mut hint_declined = false;
-    if let Some(annotations) = tool_annotations
-        && let Some(hint) = annotations.read_only_hint
-    {
-        if !hint {
-            return (Permission::Unrestricted, PermissionSource::ReadOnlyHint);
-        }
-        if server_config.trust_read_only_hint.unwrap_or(true) {
-            return (Permission::Read, PermissionSource::ReadOnlyHint);
-        }
-        hint_declined = true;
-    }
-    // 4. Global [mcp].default_permission, but not for a hint this server was refused.
-    //
-    // A declined hint skips straight to the strict fallback, because otherwise the knob is
-    // display-only in exactly the configuration where it matters most. `default_permission =
-    // "read"` would send a refused `readOnlyHint: true` back to `Read` here, which is bit-for-bit
-    // the outcome of trusting it: the tool registers at `Read` and dispatches unapproved at
-    // `--permission read`. `"none"` is worse, since a required level of `None` is permitted at
-    // every tier. Either way the user set a per-server flag saying "do not take this server's word
-    // for it" and a global convenience setting would quietly take its word for it anyway.
-    //
-    // Per-server beats global, which is the direction the rest of this chain already runs: steps 1
-    // and 2 are the per-server `tool_permissions` / `permission` overrides and they are checked
-    // above. Those remain the way to put a distrusted server's tool back within reach of `read`.
-    if !hint_declined && let Some(permission) = mcp_default {
-        return (permission, PermissionSource::GlobalDefault);
-    }
-    // 5. Hardcoded strict fallback.
-    //
-    // `Unrestricted`, never `Workspace`, and this is load-bearing rather than incidental. An MCP
-    // tool runs inside the server's own process, which meka does not sandbox and cannot confine to
-    // a workspace root, so an unannotated tool reachable from `workspace` would make that level's
-    // central promise false for every MCP user while looking exactly like it worked. The rung has
-    // to be the one that promises no boundary, because that is the only one this tool honors.
-    (Permission::Unrestricted, PermissionSource::Fallback)
-}
-
 /// Whether a server offered `readOnlyHint: true` and resolution refused it.
 ///
 /// A hint that *won* is reported as [`PermissionSource::ReadOnlyHint`], so anything else means the
@@ -1539,7 +1425,9 @@ pub(crate) async fn list_resources(
         match peer.list_all_resources().await {
             Ok(resources) => Ok(resources),
             Err(ServiceError::TransportClosed) => {
-                entry.reconnect().await?;
+                entry
+                    .reconnect(&tokio_util::sync::CancellationToken::new())
+                    .await?;
                 let peer = entry.require_connected().await?;
                 peer.list_all_resources()
                     .await
@@ -1568,7 +1456,9 @@ pub(crate) async fn read_resource(
         match peer.read_resource(params.clone()).await {
             Ok(result) => Ok(result),
             Err(ServiceError::TransportClosed) => {
-                entry.reconnect().await?;
+                entry
+                    .reconnect(&tokio_util::sync::CancellationToken::new())
+                    .await?;
                 let peer = entry.require_connected().await?;
                 peer.read_resource(params)
                     .await
@@ -1595,7 +1485,9 @@ pub(crate) async fn list_prompts(
         match peer.list_all_prompts().await {
             Ok(prompts) => Ok(prompts),
             Err(ServiceError::TransportClosed) => {
-                entry.reconnect().await?;
+                entry
+                    .reconnect(&tokio_util::sync::CancellationToken::new())
+                    .await?;
                 let peer = entry.require_connected().await?;
                 peer.list_all_prompts()
                     .await
@@ -1681,7 +1573,9 @@ pub(crate) async fn get_prompt(
         match peer.get_prompt(params.clone()).await {
             Ok(result) => Ok(result),
             Err(ServiceError::TransportClosed) => {
-                entry.reconnect().await?;
+                entry
+                    .reconnect(&tokio_util::sync::CancellationToken::new())
+                    .await?;
                 let peer = entry.require_connected().await?;
                 peer.get_prompt(params)
                     .await
@@ -2264,6 +2158,7 @@ mod tests {
             refused: None,
             instructions: std::sync::RwLock::new(None),
             request_timeout: OnceLock::new(),
+            background_retry: OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         })
     }
@@ -2418,7 +2313,10 @@ mod tests {
             "the stub was supposed to exit and close the transport"
         );
 
-        entry.reconnect().await.expect("reconnect");
+        entry
+            .reconnect(&tokio_util::sync::CancellationToken::new())
+            .await
+            .expect("reconnect");
 
         assert!(
             registry.get("mcp__stub__create_page").is_some(),
@@ -2690,6 +2588,143 @@ mod tests {
             }
             other => panic!("expected McpConnection, got: {other:?}"),
         }
+    }
+
+    /// A call to a server still connecting is refused in the state's own words, ahead of the
+    /// retry that reconnects a closed transport: reported as a closed transport, a server that
+    /// never came up reads as a fault in the connection rather than as what it is.
+    #[tokio::test]
+    async fn a_call_to_a_server_still_connecting_is_refused_in_its_own_words() {
+        let tool = handler::McpTool {
+            namespaced_name: "mcp__pending-srv__ping".to_string(),
+            remote_tool_name: "ping".to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object"}),
+            permission: Permission::Read,
+            entry: pending_entry("pending-srv", McpTransport::Http),
+            annotations: None,
+            meta: None,
+            title: None,
+        };
+        let context = handler::CallContext {
+            session_id: None,
+            tool_call_id: None,
+            frontend: Arc::new(crate::frontend::testing::RecordingFrontend::new()),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+        let error = tool
+            .call(None, &context)
+            .await
+            .expect_err("a server still connecting takes no call");
+        match error {
+            MekaError::McpConnection {
+                server_name,
+                message,
+            } => {
+                assert_eq!(server_name, "pending-srv");
+                assert!(message.contains("connecting"), "got: {message}");
+            }
+            other => panic!("expected McpConnection, got: {other:?}"),
+        }
+    }
+
+    /// A stdio entry whose child never speaks MCP: the connect waits on `initialize` until the
+    /// child exits.
+    #[cfg(unix)]
+    fn silent_stdio_entry(name: &str) -> Arc<ServerEntry> {
+        let mut config = McpServerConfig::for_test(name);
+        config.transport = McpTransport::Stdio;
+        config.url = None;
+        config.command = Some("sleep".to_string());
+        config.args = Some(vec!["3".to_string()]);
+        Arc::new(ServerEntry {
+            server_name: name.to_string(),
+            config,
+            token_store: None,
+            client_context: McpClientContext::new(),
+            state: RwLock::new(ServerState::Pending),
+            reconnect_lock: Mutex::new(()),
+            refused: None,
+            instructions: std::sync::RwLock::new(None),
+            request_timeout: OnceLock::new(),
+            background_retry: OnceLock::new(),
+            dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// A reconnect is bounded, and leaves the entry `Failed` when it gives up. Unbounded, a peer
+    /// that accepts the connection and never answers `initialize` holds the turn for as long as it
+    /// pleases; a give-up that leaves the state `Connected` over the dead transport has `meka mcp
+    /// list` say connected and every later call pay the whole backoff again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reconnect_gives_up_within_its_bound_and_leaves_the_entry_failed() {
+        let entry = silent_stdio_entry("silent");
+        entry
+            .request_timeout
+            .set(std::time::Duration::from_millis(200))
+            .expect("unset");
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            entry.reconnect_attempts(&tokio_util::sync::CancellationToken::new()),
+        )
+        .await
+        .expect("the bound ends the attempt, not the test's deadline");
+        assert!(
+            matches!(outcome, Err(MekaError::McpConnection { .. })),
+            "{outcome:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the bound, not the child's own exit, ended the attempt: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(
+                entry.state().await,
+                ServerState::Failed { ref error, .. } if error.contains("timed out")
+            ),
+            "giving up is recorded, so the background retry owns the entry"
+        );
+    }
+
+    /// A stop reaches a reconnect in flight: the call's token ends the wait at once, rather than
+    /// after the bound, so Ctrl+C and `session/cancel` land during a reconnect as they land
+    /// during the call itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_ends_a_reconnect_at_once() {
+        let entry = silent_stdio_entry("silent");
+        entry
+            .request_timeout
+            .set(std::time::Duration::from_secs(10))
+            .expect("unset");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let stop = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                cancellation.cancel();
+            }
+        });
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            entry.reconnect_attempts(&cancellation),
+        )
+        .await
+        .expect("the stop ends the attempt, not the test's deadline");
+        stop.await.expect("the stop landed");
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "{outcome:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

@@ -64,14 +64,15 @@ $ meka account whoami --format json
   "profile": "work",
   "account": "claude-max",
   "backend": "claude-subscription",
-  "auth": { "valid": true, "expires_at": 1782971829, "expires_in_seconds": 20709 },
+  "auth": { "valid": true, "expires_at": "2026-06-29T12:37:09+00:00", "expires_in_seconds": 20709 },
   "identity": { "plan": "claude_max", "tier": "default_claude_max_20x",
                 "subscription_status": "active", "role": "admin", ... }
 }
 ```
 
-`identity` is `null` when the backend has no identity endpoint. `expires_at` / `expires_in_seconds`
-are in seconds; a negative `expires_in_seconds` (or `valid: false`) means "run `meka account login`".
+`identity` is `null` when the backend has no identity endpoint. `expires_at` is RFC 3339 and
+`expires_in_seconds` is in seconds; a negative `expires_in_seconds` (or `valid: false`) means "run
+`meka account login`".
 
 ## `meka account stats`
 

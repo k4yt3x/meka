@@ -69,7 +69,7 @@ pub(crate) fn requested_tool_names(input: &serde_json::Value) -> Vec<String> {
 ///
 /// A batch that resolved some names and not others returns a non-error result, so every name it
 /// carried is recorded here. Harmless: a name with no registry entry matches nothing when the
-/// active set is assembled (see [`ToolRegistry::definitions_active_with_loaded`]).
+/// active set is assembled (see [`ToolRegistry::active_tools`]).
 ///
 /// Test-only, because the answer it gives is not the one production wants: a materialized slice
 /// shows only the `tool_load` exchanges still standing in the current view, and a compaction or a
@@ -363,7 +363,7 @@ pub(crate) fn warn_on_stale_subagent_config(denials: &ToolDenials, configured_se
         );
     }
 }
-pub(super) type ToolSet = Arc<std::sync::RwLock<Vec<Arc<dyn Tool>>>>;
+pub(super) type ToolSet = Arc<std::sync::RwLock<Registered>>;
 /// Tool registry. Backed by an `Arc<RwLock<Vec<Arc<dyn Tool>>>>` so MCP notification handlers can
 /// swap a server's tools in place on `tools/list_changed`. Individual registrations only hold the
 /// write lock briefly; dispatch clones the matching `Arc<dyn Tool>` out of the lock before awaiting
@@ -405,6 +405,89 @@ pub(crate) struct ToolRegistry {
     /// on the root agent's registry.
     pub(super) inherited_scratchpad_names: Arc<std::sync::RwLock<Vec<String>>>,
 }
+/// The registered tools in registration order, each with the definition it answered when it was
+/// registered, indexed by name.
+///
+/// The order is kept because the provider sees it: a stable tools array is what a cache prefix
+/// is. The index is what makes a lookup by name one hash rather than a walk, and the stored
+/// definition is what makes handing one out a clone rather than a rebuild: a built-in constructs
+/// its schema from `json!` on every `definition()` call, and a registry of a few hundred MCP tools
+/// would answer a name lookup by constructing all of them. The estimate beside each is the
+/// schema's token cost, summed per round for the context gauge, so a round pays one addition per
+/// active tool rather than one serialization.
+#[derive(Default)]
+pub(super) struct Registered {
+    entries: Vec<RegisteredTool>,
+    by_name: HashMap<String, usize>,
+}
+
+/// One registered tool: the tool, the definition it gave, and what that definition costs.
+pub(super) struct RegisteredTool {
+    pub(super) tool: Arc<dyn Tool>,
+    pub(super) definition: ToolDefinition,
+    pub(super) schema_tokens: u64,
+}
+
+impl Registered {
+    pub(super) fn contains(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+    }
+
+    pub(super) fn get(&self, name: &str) -> Option<&RegisteredTool> {
+        self.by_name
+            .get(name)
+            .and_then(|&index| self.entries.get(index))
+    }
+
+    /// Append `tool`, which the caller has checked is not registered under its name.
+    pub(super) fn push(&mut self, tool: Arc<dyn Tool>) {
+        let definition = tool.definition();
+        let schema_tokens = crate::tokens::estimate_text(&definition.name)
+            .saturating_add(crate::tokens::estimate_text(&definition.description))
+            .saturating_add(crate::tokens::estimate_text(
+                &definition.parameters.to_string(),
+            ));
+        self.by_name
+            .insert(definition.name.clone(), self.entries.len());
+        self.entries.push(RegisteredTool {
+            tool,
+            definition,
+            schema_tokens,
+        });
+    }
+
+    /// Drop every tool `keep` refuses, keeping the order of the rest.
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&ToolDefinition) -> bool) {
+        self.entries.retain(|entry| keep(&entry.definition));
+        self.by_name = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.definition.name.clone(), index))
+            .collect();
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = &RegisteredTool> {
+        self.entries.iter()
+    }
+
+    pub(super) fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries
+            .iter()
+            .map(|entry| entry.definition.name.as_str())
+    }
+
+    pub(super) fn tools(&self) -> impl Iterator<Item = &Arc<dyn Tool>> {
+        self.entries.iter().map(|entry| &entry.tool)
+    }
+}
+
+/// The tools a request carries, and what their schemas cost the window.
+pub(crate) struct ActiveTools {
+    pub(crate) definitions: Vec<ToolDefinition>,
+    pub(crate) schema_tokens: u64,
+}
+
 impl ToolRegistry {
     /// Empty registry with the default filter: no built-ins, no MCP tools. Used by out-of-band CLI
     /// commands that spin up a manager for a single RPC (`meka mcp reconnect`, `meka mcp tools`)
@@ -423,7 +506,7 @@ impl ToolRegistry {
     ) -> Self {
         let overrides = filter.permission_overrides.clone();
         Self {
-            tools: Arc::new(std::sync::RwLock::new(Vec::new())),
+            tools: Arc::new(std::sync::RwLock::new(Registered::default())),
             deferred: Arc::new(std::sync::RwLock::new(HashSet::new())),
             permission_overrides: Arc::new(overrides),
             builtin_filter: Arc::new(filter),
@@ -496,10 +579,26 @@ impl ToolRegistry {
         true
     }
 
-    /// Clear the read-tracker. Called on conversation compaction: the model's context is reset, so
-    /// a follow-up `file_edit` should re-read the file rather than trust a pre-compaction read.
+    /// Clear the read-tracker. Called when the conversation is rewritten (a compaction, a
+    /// rewind): the model's context is reset, so a follow-up `file_edit` should re-read the file
+    /// rather than trust a read the model no longer holds.
     pub(crate) async fn clear_read_tracker(&self) {
         self.read_tracker.write().await.clear();
+    }
+
+    /// How many files the tracker holds a read of.
+    #[cfg(test)]
+    pub(crate) async fn tracked_reads_for_test(&self) -> usize {
+        self.read_tracker.read().await.len()
+    }
+
+    /// Record a read of `path` as `file_read` would, for a test of what forgets it.
+    #[cfg(test)]
+    pub(crate) async fn record_read_for_test(&self, path: PathBuf) {
+        self.read_tracker
+            .write()
+            .await
+            .insert(path, crate::tools::ReadStamp::of_delegated(""));
     }
 
     /// Every clone of one registry reports the same number, and no live registry shares it with
@@ -512,7 +611,7 @@ impl ToolRegistry {
     pub(crate) fn register(&self, tool: Arc<dyn Tool>) -> Result<()> {
         let name = tool.definition().name;
         let mut tools = crate::sync::write(&self.tools);
-        if tools.iter().any(|t| t.definition().name == name) {
+        if tools.contains(&name) {
             return Err(crate::error::MekaError::ToolRegistration {
                 message: format!("tool name '{name}' is already registered"),
             });
@@ -541,12 +640,14 @@ impl ToolRegistry {
         let prefix = format!("mcp__{server_name}__");
         let mut tools = crate::sync::write(&self.tools);
         let removed: Vec<String> = tools
-            .iter()
-            .filter(|t| t.definition().name.starts_with(&prefix))
-            .map(|t| t.definition().name)
+            .names()
+            .filter(|name| name.starts_with(&prefix))
+            .map(str::to_string)
             .collect();
-        tools.retain(|t| !t.definition().name.starts_with(&prefix));
-        tools.extend(new_tools);
+        tools.retain(|definition| !definition.name.starts_with(&prefix));
+        for tool in new_tools {
+            tools.push(tool);
+        }
         drop(tools);
 
         if !removed.is_empty() {
@@ -615,8 +716,8 @@ impl ToolRegistry {
     /// imposes no order, which is all a "did you mean" lookup needs.
     pub(crate) fn registered_tool_names(&self) -> Vec<String> {
         crate::sync::read(&self.tools)
-            .iter()
-            .map(|tool| tool.definition().name)
+            .names()
+            .map(str::to_string)
             .collect()
     }
 
@@ -628,22 +729,25 @@ impl ToolRegistry {
 
     pub(crate) fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         crate::sync::read(&self.tools)
-            .iter()
-            .find(|tool| tool.definition().name == name)
-            .cloned()
+            .get(name)
+            .map(|entry| Arc::clone(&entry.tool))
     }
 
-    /// Effective required permission: override wins, else the tool's hardcoded
-    /// `Tool::required_permission()`. `None` if not registered.
+    /// The level a call to `name` must clear, by [`crate::tools::effective_permission`]; `None`
+    /// for a name that is not registered, an override or not, so an override cannot admit a
+    /// probe that matches nothing.
     pub(crate) fn required_permission_for(&self, name: &str) -> Option<Permission> {
-        if let Some(permission) = self.permission_overrides.get(name) {
-            return Some(*permission);
-        }
-        self.get(name).map(|tool| tool.required_permission())
+        self.get(name).map(|tool| {
+            crate::tools::effective_permission(
+                &self.permission_overrides,
+                name,
+                tool.required_permission(),
+            )
+        })
     }
 
     /// Slice-based convenience wrapper for tests: composes [`extract_loaded_tool_names`] with
-    /// [`Self::definitions_active_with_loaded`]. Production code goes through the events-aware path
+    /// [`Self::active_tools`]. Production code goes through the events-aware path
     /// (see [`crate::tools::load_tool::extract_loaded_tool_names_from_events`]) so
     /// `Event::CompactBoundary::loaded_tools_snapshot` survives across compaction; a slice-only
     /// scan loses the snapshot.
@@ -682,15 +786,28 @@ impl ToolRegistry {
     /// rewrites part of the array and cannot be avoided when a server withdraws a tool, but it is
     /// confined here: the system prompt ahead of the array is unaffected, so the blast radius is
     /// the array rather than the whole conversation.
+    #[cfg(test)]
     pub(crate) fn definitions_active_with_loaded(&self, loaded: &[String]) -> Vec<ToolDefinition> {
+        self.active_tools(loaded).definitions
+    }
+
+    /// The tools a request carries: every tool that is not deferred, in registration order, then
+    /// the deferred ones `loaded` names, in the order they were loaded, so the array only ever
+    /// grows at its end and the cache prefix ahead of it stands. With what their schemas cost, for
+    /// the gauge.
+    pub(crate) fn active_tools(&self, loaded: &[String]) -> ActiveTools {
         let deferred = crate::sync::read(&self.deferred);
         let tools = crate::sync::read(&self.tools);
 
-        let mut definitions: Vec<ToolDefinition> = tools
+        let mut definitions: Vec<ToolDefinition> = Vec::new();
+        let mut schema_tokens: u64 = 0;
+        for entry in tools
             .iter()
-            .filter(|tool| !deferred.contains(&tool.definition().name))
-            .map(|tool| tool.definition())
-            .collect();
+            .filter(|entry| !deferred.contains(&entry.definition.name))
+        {
+            definitions.push(entry.definition.clone());
+            schema_tokens = schema_tokens.saturating_add(entry.schema_tokens);
+        }
 
         for name in loaded {
             // Names that aren't deferred are already in the active half; a name with no registry
@@ -699,8 +816,9 @@ impl ToolRegistry {
             if !deferred.contains(name) {
                 continue;
             }
-            if let Some(tool) = tools.iter().find(|tool| &tool.definition().name == name) {
-                definitions.push(tool.definition());
+            if let Some(entry) = tools.get(name) {
+                definitions.push(entry.definition.clone());
+                schema_tokens = schema_tokens.saturating_add(entry.schema_tokens);
             }
         }
         drop(tools);
@@ -711,11 +829,16 @@ impl ToolRegistry {
                 if !crate::tools::detachable(&definition.name) {
                     continue;
                 }
-                offer_background(&mut definition.parameters);
+                if offer_background(&mut definition.parameters) {
+                    schema_tokens = schema_tokens.saturating_add(*BACKGROUND_PROPERTY_TOKENS);
+                }
             }
         }
 
-        definitions
+        ActiveTools {
+            definitions,
+            schema_tokens,
+        }
     }
 
     /// Returns (name, description, required_permission, is_deferred) for every registered tool.
@@ -726,15 +849,20 @@ impl ToolRegistry {
         let deferred = crate::sync::read(&self.deferred);
         let mut entries: Vec<(String, String, Permission, bool)> = crate::sync::read(&self.tools)
             .iter()
-            .map(|tool| {
-                let def = tool.definition();
+            .map(|entry| {
+                let def = &entry.definition;
                 let is_deferred = deferred.contains(&def.name);
-                let required = self
-                    .permission_overrides
-                    .get(&def.name)
-                    .copied()
-                    .unwrap_or_else(|| tool.required_permission());
-                (def.name, def.description, required, is_deferred)
+                let required = crate::tools::effective_permission(
+                    &self.permission_overrides,
+                    &def.name,
+                    entry.tool.required_permission(),
+                );
+                (
+                    def.name.clone(),
+                    def.description.clone(),
+                    required,
+                    is_deferred,
+                )
             })
             .collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1036,11 +1164,11 @@ impl ToolRegistry {
             .filter_map(|name| self.get(name))
             .filter(|tool| {
                 let definition = tool.definition();
-                let required = self
-                    .permission_overrides
-                    .get(&definition.name)
-                    .copied()
-                    .unwrap_or_else(|| tool.required_permission());
+                let required = crate::tools::effective_permission(
+                    &self.permission_overrides,
+                    &definition.name,
+                    tool.required_permission(),
+                );
                 approvals || permission.allows(required)
             })
             .collect();
@@ -1079,9 +1207,6 @@ impl ToolRegistry {
             context_ceiling_percent: options.context_ceiling_percent,
             auto_compact: options.auto_compact,
         });
-        if materials.background.enabled {
-            registry.enable_background();
-        }
         // The `context_*` tools read the same cells the agent gauges with, so the two never
         // disagree about occupancy or about a compaction one of them asked for.
         registry.register_context_tools(

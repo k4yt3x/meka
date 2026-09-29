@@ -52,6 +52,10 @@ pub(crate) struct AccountConfig {
     pub(crate) oauth_token_url: Option<String>,
     /// OAuth client id override (advanced; `claude-subscription` / `chatgpt-subscription`).
     pub(crate) client_id: Option<String>,
+    /// Whether the endpoint takes the `interleaved-thinking` beta, which `anthropic-messages`
+    /// sends whenever thinking is on. Unset is `true`, the direct API's answer; an endpoint
+    /// that refuses the header sets it `false`. The other backends never read it.
+    pub(crate) interleaved_thinking: Option<bool>,
     pub(crate) device_id: Option<String>,
 }
 /// One named profile from `[profiles.<name>]`: which account it bills, and what meka asks that
@@ -113,6 +117,7 @@ pub(crate) const ACCOUNT_KEY_ORDER: &[&str] = &[
     "base_url",
     "oauth_token_url",
     "client_id",
+    "interleaved_thinking",
     "device_id",
 ];
 /// [`ProfileConfig`]'s field order, as the key names a `config.toml` profile table carries.
@@ -189,6 +194,8 @@ pub(crate) struct ProfileSettings {
     pub(crate) base_url: Option<String>,
     pub(crate) oauth_token_url: Option<String>,
     pub(crate) client_id: Option<String>,
+    /// See [`AccountConfig::interleaved_thinking`]; resolved to the default here.
+    pub(crate) interleaved_thinking: bool,
     pub(crate) device_id: String,
     pub(crate) model: Option<String>,
     pub(crate) context_window: Option<u64>,
@@ -295,6 +302,7 @@ pub(crate) fn resolve_profile(
         base_url: account.base_url.clone(),
         oauth_token_url: account.oauth_token_url.clone(),
         client_id: account.client_id.clone(),
+        interleaved_thinking: account.interleaved_thinking.unwrap_or(true),
         device_id,
         model: profile.model.clone(),
         context_window: profile.context_window.or(session_context_window),
@@ -902,6 +910,7 @@ mod tests {
             "base_url = \"https://api.anthropic.com\"\n",
             "oauth_token_url = \"https://example.invalid/token\"\n",
             "client_id = \"a-client\"\n",
+            "interleaved_thinking = false\n",
             "device_id = \"a-device\"\n",
             "\n",
             "[profiles.work]\n",

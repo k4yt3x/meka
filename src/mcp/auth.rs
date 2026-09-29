@@ -142,8 +142,9 @@ pub(crate) async fn revoke_stored_token(
         if !response.status().is_success() {
             continue;
         }
-        // Bytes before parsing, so the cap applies: Content-Length is server-supplied.
-        let Ok(bytes) = response.bytes().await else {
+        // Bounded as it arrives rather than after: Content-Length is server-supplied, and a body
+        // read whole before the cap is checked is a body the cap did not bound.
+        let Some(bytes) = read_bounded(response, METADATA_BODY_CAP).await else {
             continue;
         };
         if let Some(endpoint) = extract_revocation_endpoint(&bytes, METADATA_BODY_CAP) {
@@ -299,6 +300,18 @@ fn extract_bearer_param(header: &str, key: &str) -> Option<String> {
         return Some(unquoted.to_string());
     }
     None
+}
+
+/// The body, or `None` once it has grown past `cap` or the connection failed.
+async fn read_bounded(mut response: reqwest::Response, cap: usize) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if bytes.len().saturating_add(chunk.len()) > cap {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Some(bytes)
 }
 
 /// Parse an OAuth authorization-server metadata JSON document and return the `revocation_endpoint`

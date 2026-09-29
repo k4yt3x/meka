@@ -90,13 +90,13 @@ impl Tool for FindFilesTool {
             Some(raw) => vec![crate::workspace::resolve_against_cwd(&self.site.cwd, raw)],
             None => crate::workspace::glob_roots(&self.site.cwd, &self.site.roots),
         };
-        let private = crate::workspace::private_directories_hidden_at(self.site.permission.get());
+        let fence = crate::workspace::ReadFence::at(self.site.permission.get());
         let mut full_patterns: Vec<String> = Vec::with_capacity(base_paths.len());
         for base in &base_paths {
             // A root the caller named inside meka's own directories is refused, as
             // `file_search` refuses it; a walk that reaches them from above skips what it finds
             // there in `run_walk`.
-            if crate::workspace::resolves_into_private(base, &private) {
+            if fence.hides(base) {
                 return Err(MekaError::ToolExecution {
                     tool_name: "file_find".to_string(),
                     message: format!(
@@ -150,7 +150,7 @@ impl Tool for FindFilesTool {
         // the ceiling. `run_walk` walks the roots in order under this single deadline.
         let budget = WalkBudget::new(cancellation.clone());
         let walk =
-            tokio::task::spawn_blocking(move || run_walk(&full_patterns, cap, &budget, &private));
+            tokio::task::spawn_blocking(move || run_walk(&full_patterns, cap, &budget, &fence));
 
         // Race the walk against the token rather than just awaiting it. The walk checks the same
         // token itself, but `glob`'s iterator does its directory reads inside `next()`, so a walk
@@ -181,7 +181,7 @@ fn run_walk(
     full_patterns: &[String],
     cap: usize,
     budget: &WalkBudget,
-    private: &[std::path::PathBuf],
+    fence: &crate::workspace::ReadFence,
 ) -> Result<FindOutcome> {
     let mut matches: Vec<String> = Vec::new();
     // Roots are kept even when one nests inside another (see `glob_roots`), so a pattern that
@@ -235,7 +235,7 @@ fn run_walk(
             match entry {
                 // `glob` follows symlinked directories, so a match is judged on its real path: a
                 // link out of the workspace into the store must not list what the store holds.
-                Ok(path) if crate::workspace::resolves_into_private(&path, private) => {}
+                Ok(path) if fence.hides(&path) => {}
                 Ok(path) => {
                     let rendered = path.display().to_string();
                     if full_patterns.len() > 1 && !seen.insert(rendered.clone()) {
@@ -538,8 +538,13 @@ mod tests {
 
         let budget =
             WalkBudget::with_budget(CancellationToken::new(), std::time::Duration::from_secs(0));
-        let outcome =
-            run_walk(&[pattern], 500, &budget, &[]).expect("walk should return, not error");
+        let outcome = run_walk(
+            &[pattern],
+            500,
+            &budget,
+            &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
+        )
+        .expect("walk should return, not error");
         assert!(outcome.timed_out, "expired budget must stop the walk");
     }
 
@@ -554,7 +559,12 @@ mod tests {
             "[unterminated",
         );
         let budget = WalkBudget::new(CancellationToken::new());
-        let Err(error) = run_walk(&[pattern], 500, &budget, &[]) else {
+        let Err(error) = run_walk(
+            &[pattern],
+            500,
+            &budget,
+            &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
+        ) else {
             panic!("a malformed caller pattern must not be swallowed");
         };
         assert!(
@@ -585,7 +595,13 @@ mod tests {
             "*.txt",
         );
         let budget = WalkBudget::new(CancellationToken::new());
-        let outcome = run_walk(&[pattern], 500, &budget, &[]).expect("walk");
+        let outcome = run_walk(
+            &[pattern],
+            500,
+            &budget,
+            &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
+        )
+        .expect("walk");
 
         assert_eq!(outcome.total, 1, "must not match the decoy directory");
         assert!(outcome.matches[0].ends_with("a.txt"));
@@ -604,8 +620,13 @@ mod tests {
         ];
 
         let budget = WalkBudget::new(CancellationToken::new());
-        let outcome =
-            run_walk(&patterns, 500, &budget, &[]).expect("walk should return, not error");
+        let outcome = run_walk(
+            &patterns,
+            500,
+            &budget,
+            &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
+        )
+        .expect("walk should return, not error");
 
         assert_eq!(outcome.total, 2, "both roots must be searched");
         assert!(outcome.matches.iter().any(|m| m.ends_with("a.txt")));
@@ -631,8 +652,13 @@ mod tests {
             format!("{}/*.md", top.path().to_string_lossy()),
         ];
         let budget = WalkBudget::new(CancellationToken::new());
-        let outcome =
-            run_walk(&patterns, 500, &budget, &[]).expect("walk should return, not error");
+        let outcome = run_walk(
+            &patterns,
+            500,
+            &budget,
+            &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
+        )
+        .expect("walk should return, not error");
 
         assert!(
             outcome.matches.iter().any(|m| m.ends_with("README.md")),
@@ -658,8 +684,13 @@ mod tests {
             format!("{}/**/*.md", nested.to_string_lossy()),
         ];
         let budget = WalkBudget::new(CancellationToken::new());
-        let outcome =
-            run_walk(&patterns, 500, &budget, &[]).expect("walk should return, not error");
+        let outcome = run_walk(
+            &patterns,
+            500,
+            &budget,
+            &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
+        )
+        .expect("walk should return, not error");
 
         assert_eq!(
             outcome.matches.len(),
@@ -686,8 +717,13 @@ mod tests {
 
         let budget =
             WalkBudget::with_budget(CancellationToken::new(), std::time::Duration::from_secs(0));
-        let outcome =
-            run_walk(&patterns, 500, &budget, &[]).expect("walk should return, not error");
+        let outcome = run_walk(
+            &patterns,
+            500,
+            &budget,
+            &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
+        )
+        .expect("walk should return, not error");
 
         assert!(outcome.timed_out, "expired budget must stop the walk");
         assert_eq!(

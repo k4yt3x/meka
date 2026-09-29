@@ -165,12 +165,12 @@ pub(crate) async fn show(
 
 /// `meka memory add <name> --description <text> [flags]`: write a memory by hand.
 pub(crate) async fn run_add(store: &MemoryStore, args: AddArgs<'_>) -> Result<()> {
-    memory::validate_memory_name(args.name).map_err(MekaError::Config)?;
+    memory::validate_memory_name(args.name).map_err(MekaError::Usage)?;
     if !memory::description_says_something(args.description) {
-        return Err(MekaError::Config("description cannot be empty".to_string()));
+        return Err(MekaError::Usage("description cannot be empty".to_string()));
     }
     if store.get(args.name).await?.is_some() && !args.force {
-        return Err(MekaError::Config(format!(
+        return Err(MekaError::Usage(format!(
             "memory '{}' already exists; pass `--force` to overwrite",
             args.name
         )));
@@ -178,13 +178,13 @@ pub(crate) async fn run_add(store: &MemoryStore, args: AddArgs<'_>) -> Result<()
 
     let body = match (args.body, args.from_file) {
         (Some(_), Some(_)) => {
-            return Err(MekaError::Config(
+            return Err(MekaError::Usage(
                 "`--body` cannot be combined with `--from-file`".to_string(),
             ));
         }
         (Some(body), None) => Some(body.to_string()),
         (None, Some(file)) => Some(std::fs::read_to_string(file).map_err(|error| {
-            MekaError::Config(format!("failed to read {}: {}", file.display(), error))
+            MekaError::io(format!("failed to read {}: {}", file.display(), error))
         })?),
         // Omitted entirely, which the upsert reads as "leave whatever is there". `--force` with no
         // `--body` is a metadata edit, and demoting the note's contents to nothing on a call that
@@ -201,7 +201,7 @@ pub(crate) async fn run_add(store: &MemoryStore, args: AddArgs<'_>) -> Result<()
     let tags = if args.tags.is_empty() {
         None
     } else {
-        Some(memory::normalize_tags(args.tags).map_err(MekaError::Config)?)
+        Some(memory::normalize_tags(args.tags).map_err(MekaError::Usage)?)
     };
 
     let written = store
@@ -234,7 +234,7 @@ pub(crate) async fn run_edit(store: &MemoryStore, name: &str) -> Result<()> {
     // records that rows carrying names meka would not accept exist in the wild, and this function
     // joins the name onto a temp directory: `meka memory edit ../pwned` wrote the note's body to
     // `/tmp/pwned.md`, outside the directory the cleanup below removes, where it then stayed.
-    memory::validate_memory_name(name).map_err(MekaError::Config)?;
+    memory::validate_memory_name(name).map_err(MekaError::Usage)?;
     let entry = require_memory(store, name).await?;
 
     // `create_dir` rather than `create_dir_all`, on a name nothing else can be using: this fails
@@ -250,11 +250,11 @@ pub(crate) async fn run_edit(store: &MemoryStore, name: &str) -> Result<()> {
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&directory)
-            .map_err(|error| MekaError::Config(format!("failed to create a temp dir: {error}")))?;
+            .map_err(|error| MekaError::io(format!("failed to create a temp dir: {error}")))?;
     }
     #[cfg(not(unix))]
     std::fs::create_dir(&directory)
-        .map_err(|error| MekaError::Config(format!("failed to create a temp dir: {error}")))?;
+        .map_err(|error| MekaError::io(format!("failed to create a temp dir: {error}")))?;
     // Named for the memory and suffixed `.md`, so the editor picks the right syntax mode and its
     // title bar says which note this is.
     let scratch = memory::memory_file_in(&directory, name);
@@ -355,9 +355,9 @@ fn discard_scratch(directory: &Path) {
 fn unsaved_edit(directory: &Path, scratch: &Path, original: &str, reason: String) -> MekaError {
     let Some(kept) = unstored_work(directory, scratch, original) else {
         discard_scratch(directory);
-        return MekaError::Config(reason);
+        return MekaError::Usage(reason);
     };
-    MekaError::Config(format!(
+    MekaError::Usage(format!(
         "{reason}. Your edit was not saved; it is in {}",
         kept.display()
     ))
@@ -407,13 +407,13 @@ fn unstored_work(directory: &Path, scratch: &Path, original: &str) -> Option<Pat
     }
 }
 
-/// The message inside a `MekaError`, without the `configuration error:` prefix `Display` adds.
+/// The message inside a `MekaError`, without the prefix `Display` adds to a configuration error.
 ///
 /// [`unsaved_edit`] composes a new error out of an existing one, and re-rendering it through
-/// `to_string` produced `configuration error: configuration error: ...`.
+/// `to_string` would prefix the prefix.
 fn reason_of(error: MekaError) -> String {
     match error {
-        MekaError::Config(message) => message,
+        MekaError::Config(message) | MekaError::Usage(message) => message,
         other => other.to_string(),
     }
 }
@@ -424,7 +424,7 @@ fn reason_of(error: MekaError) -> String {
 /// whether the text in it made it to the store.
 fn edit_in(scratch: &Path, original: &str) -> Result<String> {
     let mut command = crate::entry::editor_command(scratch)
-        .ok_or_else(|| MekaError::Config("no editor: set `$VISUAL` or `$EDITOR`".to_string()))?;
+        .ok_or_else(|| MekaError::Usage("no editor: set `$VISUAL` or `$EDITOR`".to_string()))?;
     // 0600, and `create_new` so an existing path is never written through. See the directory mode
     // in `run_edit`: this is somebody's note landing in a world-readable `/tmp`.
     let mut options = std::fs::OpenOptions::new();
@@ -439,27 +439,27 @@ fn edit_in(scratch: &Path, original: &str) -> Result<String> {
         options
             .open(scratch)
             .and_then(|mut file| file.write_all(original.as_bytes()))
-            .map_err(|error| MekaError::Config(format!("failed to write a temp file: {error}")))?;
+            .map_err(|error| MekaError::io(format!("failed to write a temp file: {error}")))?;
     }
     let status = command
         .status()
-        .map_err(|error| MekaError::Config(format!("failed to launch your editor: {error}")))?;
+        .map_err(|error| MekaError::io(format!("failed to launch your editor: {error}")))?;
     if !status.success() {
-        return Err(MekaError::Config(format!(
+        return Err(MekaError::Usage(format!(
             "your editor exited with {status}; the memory is unchanged"
         )));
     }
     std::fs::read_to_string(scratch)
-        .map_err(|error| MekaError::Config(format!("failed to read the edited body back: {error}")))
+        .map_err(|error| MekaError::io(format!("failed to read the edited body back: {error}")))
 }
 
 /// `meka memory remove <name>`: delete the memory.
 pub(crate) async fn run_remove(store: &MemoryStore, name: &str) -> Result<()> {
     // The lookup rule, not the write rule. Refusing to *delete* a name this store would not have
     // written is what left a row nothing meka ships could remove.
-    memory::validate_memory_lookup(name).map_err(MekaError::Config)?;
+    memory::validate_memory_lookup(name).map_err(MekaError::Usage)?;
     if !store.delete(name).await? {
-        return Err(MekaError::Config(format!("no memory named '{name}'")));
+        return Err(MekaError::Usage(format!("no memory named '{name}'")));
     }
     tracing::info!("removed memory '{name}'");
     Ok(())
@@ -484,7 +484,7 @@ pub(crate) async fn run_export(store: &MemoryStore, directory: &Path) -> Result<
     match std::fs::read_dir(directory) {
         Ok(mut entries) => {
             if entries.next().is_some() {
-                return Err(MekaError::Config(format!(
+                return Err(MekaError::Usage(format!(
                     "{} is not empty; point `--dir` at a new or empty directory",
                     directory.display()
                 )));
@@ -492,7 +492,7 @@ pub(crate) async fn run_export(store: &MemoryStore, directory: &Path) -> Result<
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing_directory = true,
         Err(error) => {
-            return Err(MekaError::Config(format!(
+            return Err(MekaError::io(format!(
                 "failed to read {}: {}",
                 directory.display(),
                 error
@@ -525,7 +525,7 @@ pub(crate) async fn run_export(store: &MemoryStore, directory: &Path) -> Result<
         })
         .collect();
     if !unusable.is_empty() {
-        return Err(MekaError::Config(format!(
+        return Err(MekaError::Usage(format!(
             "nothing exported: {} memor{} cannot be written out ({}); repair each with \
              `meka memory add <name> --force --description <text>` or remove it",
             unusable.len(),
@@ -557,7 +557,7 @@ pub(crate) async fn run_export(store: &MemoryStore, directory: &Path) -> Result<
             // of the memories and reports success, and the retry answers "is not empty" rather
             // than naming the cause.
             let remaining = remove_partial_export(&written, directory, created_directory);
-            return Err(MekaError::Config(format!(
+            return Err(MekaError::io(format!(
                 "failed to write {}: {}; nothing was exported{}",
                 path.display(),
                 error,
@@ -612,17 +612,17 @@ fn create_private_export_dir(directory: &Path) -> Result<()> {
             parents.mode(0o700);
         }
         parents.create(parent).map_err(|error| {
-            MekaError::Config(format!("failed to create {}: {}", parent.display(), error))
+            MekaError::io(format!("failed to create {}: {}", parent.display(), error))
         })?;
     }
     builder.create(directory).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
-            return MekaError::Config(format!(
+            return MekaError::Usage(format!(
                 "{} was created while this export was starting; point `--dir` somewhere else",
                 directory.display()
             ));
         }
-        MekaError::Config(format!(
+        MekaError::io(format!(
             "failed to create {}: {}",
             directory.display(),
             error
@@ -682,7 +682,7 @@ pub(crate) async fn run_verify(store: &MemoryStore, rebuild: bool) -> Result<()>
             );
             Ok(())
         }
-        Err(error) => Err(MekaError::Config(format!(
+        Err(error) => Err(MekaError::Usage(format!(
             "{error}; regenerate it with `meka memory verify --rebuild`"
         ))),
     }
@@ -697,7 +697,7 @@ async fn require_memory(store: &MemoryStore, name: &str) -> Result<memory::Memor
     store
         .get(name)
         .await?
-        .ok_or_else(|| MekaError::Config(format!("no memory named '{name}'")))
+        .ok_or_else(|| MekaError::Usage(format!("no memory named '{name}'")))
 }
 
 pub(crate) async fn run_memory_subcommand(

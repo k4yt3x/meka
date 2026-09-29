@@ -287,7 +287,7 @@ impl BackgroundStore {
         match matches.len() {
             0 => Ok(None),
             1 => Ok(matches.into_iter().next()),
-            _ => Err(MekaError::Config(format!(
+            _ => Err(MekaError::Usage(format!(
                 "task id '{}' is ambiguous; it matches {} tasks",
                 id_prefix,
                 matches.len()

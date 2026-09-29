@@ -17,6 +17,28 @@ pub(super) fn approval_input(input: &serde_json::Value, detach: bool) -> serde_j
     shown
 }
 
+/// What the loop resolved: the call's id, its tool's name and its arguments as the model sent
+/// them.
+pub(super) struct ResolvedCall<'a> {
+    pub(super) tool_call_id: &'a str,
+    pub(super) name: &'a str,
+    pub(super) input: &'a serde_json::Value,
+}
+
+/// Which door a resolved call comes through; see [`Agent::run_admitted_call`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CallDoor {
+    /// Inline dispatch: every door, and a `background: true` is honored.
+    Dispatch,
+    /// A checkpoint tool: every door, and a `background: true` is stripped, since a checkpoint
+    /// tool runs inline whatever the model asked.
+    Checkpoint,
+    /// The checkpoint's own `context_replace`, which no level refuses: it performs no action, it
+    /// hands the summary back, and asking the user to approve the checkpoint's own conclusion
+    /// would let a denial silently drop the compaction to the fallback summarizer.
+    CheckpointSubmission,
+}
+
 impl Agent {
     /// `loaded` is the turn's active-tool set, used only to tell a call made against a schema the
     /// model has actually seen from one made blind; see [`Self::schema_advisory`].
@@ -59,17 +81,30 @@ impl Agent {
         let futures = planned.iter().map(|(id, name, input)| {
             let cancellation = cancellation.clone();
             async move {
+                use futures::FutureExt;
                 let started = std::time::Instant::now();
-                let output = self
-                    .resolve_and_execute_tool(
-                        id.as_str(),
-                        name.as_str(),
-                        input,
-                        loaded,
-                        attribution,
-                        cancellation,
-                    )
-                    .await;
+                // Caught as the background path catches it. The assistant's `tool_use` is already
+                // in memory when the tools run, so a panic that takes the turn down leaves the
+                // conversation ending on a call with no result, and every later request is
+                // rejected until the session is evicted.
+                let run = self.resolve_and_execute_tool(
+                    id.as_str(),
+                    name.as_str(),
+                    input,
+                    loaded,
+                    attribution,
+                    cancellation,
+                );
+                let output = match std::panic::AssertUnwindSafe(run).catch_unwind().await {
+                    Ok(output) => output,
+                    Err(_) => {
+                        tracing::error!("tool '{name}' panicked");
+                        crate::tools::ToolOutput::text(
+                            format!("The tool '{name}' panicked while running."),
+                            true,
+                        )
+                    }
+                };
                 (output, started.elapsed())
             }
         });
@@ -177,6 +212,40 @@ impl Agent {
             return crate::tools::ToolOutput::text(format!("Unknown tool: '{name}'.{hint}"), true);
         };
 
+        self.run_admitted_call(
+            &tool,
+            ResolvedCall {
+                tool_call_id,
+                name,
+                input,
+            },
+            loaded,
+            attribution,
+            cancellation,
+            CallDoor::Dispatch,
+        )
+        .await
+    }
+
+    /// Run one call the loop has resolved to `tool`, through every door in order: the level read
+    /// at the enforcement site, `admit_tool_call`, `admit_arguments`, the tool's own refusal at
+    /// that level, the approval prompt, then the tool itself, and the schema advisory on the way
+    /// back. The one sequence for inline dispatch and the checkpoint turn, so a door added here is
+    /// a door both have; a copy per caller is a door one of them forgets.
+    pub(super) async fn run_admitted_call(
+        &self,
+        tool: &Arc<dyn crate::tools::Tool>,
+        call: ResolvedCall<'_>,
+        loaded: &[String],
+        attribution: &crate::provider::Attribution,
+        cancellation: CancellationToken,
+        door: CallDoor,
+    ) -> crate::tools::ToolOutput {
+        let ResolvedCall {
+            tool_call_id,
+            name,
+            input,
+        } = call;
         // Read at the enforcement site, so a level cycled or a switch toggled during dispatch
         // means the next call rather than a snapshot captured earlier in the loop.
         let required = self
@@ -184,13 +253,16 @@ impl Agent {
             .required_permission_for(name)
             .unwrap_or_else(|| tool.required_permission());
         let permission = self.cells.permission.get();
-        let admission = crate::tools::admit_tool_call(
-            name,
-            required,
-            permission,
-            self.cells.permission.approvals(),
-            tool.runs_outside_confinement(),
-        );
+        let admission = match door {
+            CallDoor::Dispatch | CallDoor::Checkpoint => crate::tools::admit_tool_call(
+                name,
+                required,
+                permission,
+                self.cells.permission.approvals(),
+                tool.runs_outside_confinement(),
+            ),
+            CallDoor::CheckpointSubmission => crate::tools::Admission::Run,
+        };
         if let crate::tools::Admission::Refuse(refusal) = admission {
             return *refusal;
         }
@@ -210,6 +282,10 @@ impl Agent {
             Err(refusal) => return refusal,
         };
         let input = &input;
+        // A checkpoint tool runs inline whatever the model asked: the flag is stripped like
+        // everywhere else and not honored, since a task outliving the checkpoint would report
+        // into a conversation the summary has replaced.
+        let detach = detach && matches!(door, CallDoor::Dispatch);
 
         // A detached call that cannot start is refused here, ahead of the approval prompt. Every
         // refusal `start_background_call` makes needs nothing but what is known now, so asking the
@@ -238,10 +314,10 @@ impl Agent {
         }
 
         let mut output = if detach {
-            self.start_background_call(&tool, tool_call_id, name, input, session_id, attribution)
+            self.start_background_call(tool, tool_call_id, name, input, session_id, attribution)
                 .await
         } else {
-            Self::run_tool(&*tool, input, crate::tools::ToolContext {
+            Self::run_tool(&**tool, input, crate::tools::ToolContext {
                 session_id,
                 tool_call_id: Some(tool_call_id.to_string()),
                 prompt_id: attribution.prompt_id,
@@ -626,6 +702,74 @@ mod tests {
     fn a_non_object_input_is_left_alone() {
         let input = serde_json::json!("bare");
         assert_eq!(super::approval_input(&input, true), input);
+    }
+
+    /// A tool that panics is a failed result, not a dead turn: the assistant's `tool_use` is
+    /// already in memory when the tools run, and a panic that unwinds the turn leaves the
+    /// conversation ending on a call with no result, rejected by the provider on every later
+    /// request until the session is evicted.
+    #[tokio::test]
+    async fn a_tool_that_panics_is_a_failed_result() {
+        use crate::provider::mock::MockProvider;
+
+        struct Panicking;
+
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for Panicking {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "panicking".to_string(),
+                    description: "fixture".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                    ..Default::default()
+                }
+            }
+
+            fn required_permission(&self) -> crate::permission::Permission {
+                crate::permission::Permission::Read
+            }
+
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _context: crate::tools::ToolContext,
+            ) -> crate::error::Result<crate::tools::ToolOutput> {
+                panic!("the fixture panics")
+            }
+        }
+
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(Panicking))
+            .expect("registration");
+        let (agent, _store) =
+            agent_with_registry_for_test(Arc::new(MockProvider::from_rounds(vec![])), registry)
+                .await;
+        let call = crate::conversation::Message {
+            role: crate::conversation::Role::Assistant,
+            content: vec![crate::conversation::ContentBlock::ToolUse {
+                id: "call-1".to_string(),
+                name: "panicking".to_string(),
+                input: serde_json::json!({}),
+            }],
+        };
+        let (results, _durations) = agent
+            .execute_tool_calls(
+                &call,
+                &[],
+                &crate::provider::Attribution::default(),
+                CancellationToken::new(),
+            )
+            .await;
+        let crate::conversation::ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &results[0]
+        else {
+            panic!("a result for the call: {results:?}");
+        };
+        assert!(is_error);
+        let text = crate::conversation::ContentBlock::tool_result_text_content(content);
+        assert!(text.contains("panicked"), "{text}");
     }
 
     /// A tool that runs outside any confinement meka can apply is refused at `workspace`, for

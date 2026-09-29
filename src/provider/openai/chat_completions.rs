@@ -131,10 +131,7 @@ impl OpenAiChatCompletionsProvider {
         for message in messages {
             match message.role {
                 Role::User => {
-                    let has_tool_results = message
-                        .content
-                        .iter()
-                        .any(|block| matches!(block, ContentBlock::ToolResult { .. }));
+                    let has_tool_results = !message.opens_turn();
 
                     if has_tool_results {
                         for block in &message.content {
@@ -359,7 +356,7 @@ impl OpenAiChatCompletionsProvider {
                 content_blocks.push(
                     match crate::provider::finalize_tool_arguments(&name, arguments_str) {
                         Ok(input) => ContentBlock::ToolUse { id, name, input },
-                        Err(reason) => crate::provider::rejected_tool_use(id, name, reason),
+                        Err(reason) => crate::provider::refused_tool_use(id, name, reason),
                     },
                 );
             }
@@ -424,19 +421,16 @@ impl Provider for OpenAiChatCompletionsProvider {
         )
         .await?;
 
-        let status = response.status();
         let retry_after = crate::error::parse_retry_after(response.headers());
+        let response = crate::provider::succeeded(
+            response,
+            "completion",
+            crate::error::ProviderRequest::Completion,
+            &cancellation,
+        )
+        .await?;
         let response_text =
             crate::error::read_whole_reply(response, retry_after, &cancellation).await?;
-
-        if !status.is_success() {
-            return Err(crate::error::provider_http_error(
-                status,
-                &response_text,
-                retry_after,
-                crate::error::ProviderRequest::Completion,
-            ));
-        }
 
         let response_json: serde_json::Value = serde_json::from_str(&response_text)
             .map_err(|error| MekaError::Provider(format!("invalid JSON response: {error}")))?;

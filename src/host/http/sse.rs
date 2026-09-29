@@ -16,7 +16,7 @@ use crate::{
 
 /// One SSE event emitted on the wire. Monotonic `id` per session, which is what makes
 /// `Last-Event-ID` resumption work: a re-attaching client names the last id it saw and the replay
-/// ring hands back everything after it. See [`crate::host::http::http_frontend::SessionFeed`].
+/// ring hands back everything after it. See [`crate::host::http::feed::SessionFeed`].
 #[derive(Debug, Clone)]
 pub(crate) struct SseEvent {
     /// `None` on a transient event ([`SseEventType::is_transient`]), which is progress rather

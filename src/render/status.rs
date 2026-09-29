@@ -4,6 +4,12 @@
 use super::*;
 use crate::streams::{write_stderr, write_stderr_line};
 
+/// Print the status under its heading.
+pub(crate) fn render_session_status(text: &str) {
+    render_heading("Session status");
+    write_stderr(text);
+}
+
 pub(crate) fn render_session_id(label: &str, id: &str) {
     write_stderr_line(format!("{label}: {id}").with(Color::DarkGrey));
 }
@@ -60,22 +66,22 @@ pub(crate) fn format_session_status(
     compactions: u64,
 ) -> String {
     let total_in = snap.total_input_tokens();
-    let mut out = String::new();
+    let mut fields: Vec<(&str, String)> = Vec::new();
     // Ordered like the profile these lines are resolved from: the account and its backend first,
     // then the model, then the model-tied knobs in the order `[profiles.<name>]` declares them
     // (`context_window`, `effort`, `thinking`), so the block reads beside the config it came from.
     // The cumulative counters follow, and answer a different question.
     if let Some(profile) = model.profile {
-        out.push_str(&format!("  Profile:         {profile}\n"));
+        fields.push(("Profile", profile.to_string()));
     }
     // The backend rides with the account rather than the profile because it is the account's
     // fact: two profiles on one account state it the same.
     // Both come off one settings lookup, so they are present together or absent together.
     if let (Some(account), Some(backend)) = (model.account, model.backend) {
-        out.push_str(&format!("  Account:         {account} ({backend})\n"));
+        fields.push(("Account", format!("{account} ({backend})")));
     }
     if let Some(name) = model.model {
-        out.push_str(&format!("  Model:           {name}\n"));
+        fields.push(("Model", name.to_string()));
     }
     // Live context occupancy: how full the window was on the last request. Distinct from the
     // cumulative "Input tokens" total below, which sums every turn's usage for the whole session.
@@ -88,16 +94,19 @@ pub(crate) fn format_session_status(
     if context_window > 0 {
         let pct = ((context_tokens as f64 / context_window as f64) * 100.0).round() as u64;
         let remaining = context_window.saturating_sub(context_tokens);
-        out.push_str(&format!(
-            "  Context:         {} / {} ({}% used, {} left)\n",
-            format_token_count(context_tokens),
-            format_token_count(context_window),
-            pct,
-            format_token_count(remaining)
+        fields.push((
+            "Context",
+            format!(
+                "{} / {} ({}% used, {} left)",
+                format_token_count(context_tokens),
+                format_token_count(context_window),
+                pct,
+                format_token_count(remaining)
+            ),
         ));
     }
     if let Some(effort) = model.effort {
-        out.push_str(&format!("  Effort:          {effort}\n"));
+        fields.push(("Effort", effort.to_string()));
     }
     // Anthropic-only, and omitted elsewhere for the same reason `Effort` is omitted when unset: a
     // status block should report what the request carries, and `thinking` is not a field an OpenAI
@@ -106,39 +115,42 @@ pub(crate) fn format_session_status(
         .backend
         .is_some_and(crate::config::Backend::takes_thinking)
     {
-        out.push_str(&format!("  Thinking:        {}\n", model.thinking.name()));
+        fields.push(("Thinking", model.thinking.name().to_string()));
     }
-    out.push_str(&format!("  Turns:           {}\n", snap.turns));
-    out.push_str(&format!("  Compactions:     {compactions}\n"));
-    out.push_str(&format!(
-        "  Input tokens:    {}  (cache hit: {}%)\n",
-        format_token_count(total_in),
-        snap.cache_hit_pct()
+    fields.push(("Turns", snap.turns.to_string()));
+    fields.push(("Compactions", compactions.to_string()));
+    fields.push((
+        "Input tokens",
+        format!(
+            "{} (cache hit: {}%)",
+            format_token_count(total_in),
+            snap.cache_hit_pct()
+        ),
     ));
-    out.push_str(&format!(
-        "  Output tokens:   {}\n",
-        format_token_count(snap.output_tokens)
+    fields.push(("Output tokens", format_token_count(snap.output_tokens)));
+    fields.push((
+        "Redactions",
+        if snap.redactions > 0 {
+            format!(
+                "{} ({} image{}, ~{} freed)",
+                snap.redactions,
+                snap.redacted_images,
+                if snap.redacted_images == 1 { "" } else { "s" },
+                crate::text::format_size(
+                    usize::try_from(snap.redacted_bytes).unwrap_or(usize::MAX)
+                )
+            )
+        } else {
+            "0".to_string()
+        },
     ));
-    if snap.redactions > 0 {
-        out.push_str(&format!(
-            "  Redactions:      {} ({} image{}, ~{} freed)\n",
-            snap.redactions,
-            snap.redacted_images,
-            if snap.redacted_images == 1 { "" } else { "s" },
-            crate::text::format_size(usize::try_from(snap.redacted_bytes).unwrap_or(usize::MAX))
-        ));
-    } else {
-        out.push_str("  Redactions:      0\n");
-    }
-    out.push_str(&format!("  Messages:        {message_count}\n"));
-    out
+    fields.push(("Messages", message_count.to_string()));
+    // Indented under the heading the caller prints, and aligned by the one field formatter.
+    crate::text::format_fields(&fields)
+        .lines()
+        .map(|line| format!("  {line}\n"))
+        .collect()
 }
-/// Print the status under its heading.
-pub(crate) fn render_session_status(text: &str) {
-    render_heading("Session status");
-    write_stderr(text);
-}
-
 /// Plain-text (no ANSI) rendering of account rate-limit usage, shared by the REPL/ACP `/usage`
 /// command and the `meka account usage` CLI. Kept ANSI-free so the CLI can pipe it into scripts
 /// unchanged; the trailing newline lets callers `print!`/`eprint!` it directly.
@@ -154,9 +166,15 @@ pub(crate) fn format_account_usage(usage: &crate::provider::AccountUsage) -> Str
             .map(format_reset_time)
             .map(|when| format!("  (resets {when})"))
             .unwrap_or_default();
-        out.push_str(&format!(
-            "  {:<18} {} {:>3}% used{}\n",
+        // Padded by display width, not char count, so a wide label does not push its bar over.
+        let label = format!(
+            "{}{}",
             window.label,
+            " ".repeat(18usize.saturating_sub(crate::text::display_width(&window.label)))
+        );
+        out.push_str(&format!(
+            "  {} {} {:>3}% used{}\n",
+            label,
             usage_bar(percent),
             percent.round() as u64,
             reset
@@ -371,13 +389,20 @@ mod tests {
             ],
             "{body}"
         );
-        assert!(
-            body.contains("  Profile:         p\n")
-                && body.contains("  Account:         a (anthropic-messages)\n"),
+        let value_of = |label: &str| {
+            body.lines()
+                .find_map(|line| line.trim_start().strip_prefix(label))
+                .map(|rest| rest.trim_start_matches(':').trim().to_string())
+        };
+        assert_eq!(value_of("Profile").as_deref(), Some("p"), "{body}");
+        assert_eq!(
+            value_of("Account").as_deref(),
+            Some("a (anthropic-messages)"),
             "the backend is the account's fact and sits beside it: {body}"
         );
-        assert!(
-            body.contains("  Compactions:     3\n"),
+        assert_eq!(
+            value_of("Compactions").as_deref(),
+            Some("3"),
             "the count is a counter of the session, beside its turns: {body}"
         );
     }

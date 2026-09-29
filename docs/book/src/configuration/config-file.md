@@ -167,6 +167,20 @@ gateway serving `/chat/completions` at its root is legitimate and meka cannot te
 missing `/v1`. If an OpenAI-compatible endpoint 404s, check that the base carries the version segment
 its documentation shows.
 
+### `interleaved_thinking`
+
+Whether the endpoint takes the `interleaved-thinking` beta header, which `anthropic-messages`
+sends whenever thinking is on. Unset is `true`, which is what Anthropic's own API needs to think
+between tool calls; an endpoint that refuses the header sets it `false`. The other backends never
+read it, and `meka account add --interleaved-thinking` refuses it for them.
+
+```toml
+[accounts.gateway]
+backend = "anthropic-messages"
+base_url = "https://gateway.example.test"
+interleaved_thinking = false
+```
+
 ### `oauth_token_url`
 
 The OAuth token endpoint meka posts to, for the initial code exchange at `meka account add` /
@@ -367,7 +381,7 @@ store, never the config file.
 
 | Command | Action |
 |---|---|
-| `meka account add <name> [--backend B] [--base-url U] [--client-id ID] [--oauth-token-url U] [--api-key-stdin]` | Add an account. Prompts for the backend and base URL when not flagged, then acquires the secret (OAuth login for `claude-subscription` / `chatgpt-subscription`, API-key prompt for `anthropic-messages` / `openai-chat-completions` / `openai-responses`). `--api-key-stdin` reads the key from stdin instead, and then needs `--backend` as a flag too, since a prompt would consume the piped key; it is refused for the two subscription backends, which have no key to read. `--client-id` and `--oauth-token-url` are dropped with a warning on an API-key backend, which never reads them. `device_id` has no flag, because meka resolves and persists it itself. |
+| `meka account add <name> [--backend B] [--base-url U] [--client-id ID] [--oauth-token-url U] [--interleaved-thinking BOOL] [--api-key-stdin]` | Add an account. Prompts for the backend and base URL when not flagged, then acquires the secret (OAuth login for `claude-subscription` / `chatgpt-subscription`, API-key prompt for `anthropic-messages` / `openai-chat-completions` / `openai-responses`). `--api-key-stdin` reads the key from stdin instead, and then needs `--backend` as a flag too, since a prompt would consume the piped key; it is refused for the two subscription backends, which have no key to read. `--client-id` and `--oauth-token-url` are dropped with a warning on an API-key backend, which never reads them. `device_id` has no flag, because meka resolves and persists it itself. |
 | `meka account list` | List configured accounts with backend, base URL, and whether each has a stored credential; `--format json` prints the same as one document. Also names any stored credential that no account claims (see [Leftover credentials](#leftover-credentials)). |
 | `meka account login <name> [--api-key-stdin]` | Re-acquire the secret for an existing account (re-authenticate, recover from a dead OAuth refresh token, or rotate an API key). `--api-key-stdin` reads the key from stdin for scripted rotation, and is refused on the subscription backends, which have no key to read. Every setting on the account is kept. |
 | `meka account remove <name>` | Delete the stored credential from the store and remove the `[accounts.<name>]` entry from the config file. Refused while any profile names the account, naming the profiles: remove or repoint those first. Works on a name with only one of the two halves, so it can clean up after a hand-edit. |
@@ -579,7 +593,7 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `url` | HTTP only | URL of the MCP server endpoint. |
 | `auth` | No | OAuth authentication configuration (see below). Mutually exclusive with a stored bearer token. |
 | `headers` | No | Custom HTTP headers to include with every request (HTTP only). |
-| `headers_helper` | No | Path to an executable whose stdout (`Name: Value\n` lines) is merged over `headers` at connect-time (HTTP only). Executed with `MEKA_MCP_SERVER_NAME` / `MEKA_MCP_SERVER_URL` in env; 15 s timeout. |
+| `headers_helper` | No | Path to an executable whose stdout (`Name: Value\n` lines) is merged over `headers` at connect-time (HTTP only). Absolute, or relative to the directory `config.toml` is in; a bare name is not searched on `PATH`. Executed with `MEKA_MCP_SERVER_NAME` / `MEKA_MCP_SERVER_URL` in env; 15 s timeout. |
 | `permission` | No | Server-wide permission override: `none`, `read`, `workspace` or `unrestricted`. Applies to every tool on this server, beating the `readOnlyHint` the server advertises and the `[mcp].default_permission` global fallback. Any other value is refused at startup, naming the line, the way an unknown key is. See *Permission resolution* below. |
 | `allowed_tools` | No | Optional allow-list of raw tool names (the form the server advertises, not the `server__tool` namespaced form). When set and non-empty, only these tools are registered; all others from this server are ignored. |
 | `disabled_tools` | No | Optional block-list of raw tool names. Applied **after** `allowed_tools`; tools listed here are never registered. Both lists can coexist; the net set is `allowed_tools \ disabled_tools`. |
@@ -733,7 +747,7 @@ Tool and resource descriptions returned from MCP servers are truncated at 2048 c
 
 ### Environment variable substitution
 
-Every string field listed above (command, args, env values, url, headers values, `headers_helper`) supports `${VAR}` and `${VAR:-default}` expansion from the process environment. A missing variable with no default is logged at startup and left literal in `command`, `args` and `url`; in `env` or `headers`, where a credential lives, it fails closed instead: the server is marked failed and never connected, so a literal `Bearer ${TOKEN}` is not sent to anyone. Use this to avoid committing secrets:
+Every string field listed above (command, args, env values, url, headers values, `headers_helper`) supports `${VAR}` and `${VAR:-default}` expansion from the process environment. A missing variable with no default is logged at startup. In `command` or `headers_helper` it is left literal, naming a program that will not be found; in `args`, `env`, `url` or `headers`, which reach the other side, it fails closed instead: the server is marked failed and never connected, so a literal `Bearer ${TOKEN}` or `?key=${KEY}` is not sent to anyone. A reference the grammar does not accept (an unclosed `${`, an empty name, a default that opens another reference) is treated the same way. A `$NAME` without braces is not a reference and is passed through, for a child shell to expand. Use this to avoid committing secrets:
 
 ```toml
 [[mcp.servers]]
@@ -1118,7 +1132,7 @@ Controls tool calls the agent starts and does not wait for. See the [Background 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | bool | `false` | Offer the `background` parameter and register the `task_*` tools |
-| `max_tasks` | int | `10` | Concurrent tasks per session, refused at dispatch |
+| `max_tasks` | int | `10` | Concurrent tasks per session, refused at dispatch; `0` is refused at startup while `enabled` |
 
 ```toml
 [background]
@@ -1587,6 +1601,8 @@ input_style = "none"    # or "cyan", "bold", "dim", etc.
 ## `[serve]`
 
 Configuration for `meka serve`, the HTTP API server. See the [HTTP API](../usage/http-api.md) usage guide for a full walkthrough.
+
+A `${VAR}` in a `[serve]` value (a token, a webhook URL) is expanded from the process environment by the grammar the MCP fields use, `${VAR:-default}` included. A name the environment does not supply and no default covers refuses the server at startup, since a token left reading `${VAR}` would be an auth-bypass-shaped configuration; so does a reference the grammar does not accept (an unclosed `${`, an empty name, a default that opens another reference), which would otherwise become the token as written.
 
 ### `serve.bind`
 

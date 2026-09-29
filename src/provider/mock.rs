@@ -406,11 +406,10 @@ impl Provider for MockProvider {
                             text: std::mem::take(&mut text),
                         });
                     }
-                    if !thinking.is_empty() || opaque.is_some() {
-                        content.push(ContentBlock::Thinking {
-                            thinking: std::mem::take(&mut thinking),
-                            opaque,
-                        });
+                    if let Some(block) =
+                        ContentBlock::replayable_thinking(std::mem::take(&mut thinking), opaque)
+                    {
+                        content.push(block);
                     }
                 }
                 MockEvent::ToolUseStart { id, name } => {

@@ -176,7 +176,7 @@ pub(crate) enum StreamEvent {
     /// Emitted in lieu of `ToolUseEnd` when the accumulated tool-call arguments fail to parse as
     /// JSON. The agent layer must not execute the tool; it should surface the parse error back to
     /// the model as a `ToolResult { is_error: true }` instead.
-    ToolCallRejected {
+    ToolCallRefused {
         id: String,
         name: String,
         reason: String,

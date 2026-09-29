@@ -61,9 +61,12 @@ pub(crate) enum McpCredentialKind {
     OAuth,
 }
 impl McpCredentialKind {
+    /// Every kind, in the order the names sort.
+    pub(crate) const ALL: [Self; 3] = [Self::Bearer, Self::ClientSecret, Self::OAuth];
+
     /// The stored discriminator. Values are part of the schema, so they are written out here rather
     /// than derived from the variant names, which are free to be renamed.
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Bearer => "bearer",
             Self::ClientSecret => "client_secret",
@@ -71,7 +74,7 @@ impl McpCredentialKind {
         }
     }
 
-    /// What to call this kind when telling the user about it. Deliberately not [`Self::as_str`]:
+    /// What to call this kind when telling the user about it. Deliberately not [`Self::name`]:
     /// that one is a schema value and must not drift to suit a sentence.
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -79,6 +82,31 @@ impl McpCredentialKind {
             Self::ClientSecret => "client secret",
             Self::OAuth => "OAuth tokens",
         }
+    }
+}
+impl std::fmt::Display for McpCredentialKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+impl std::str::FromStr for McpCredentialKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a credential kind. Supported: {}",
+                    Self::ALL
+                        .iter()
+                        .map(|kind| kind.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
     }
 }
 /// The credential tables of the store, handed out by [`Store::token_store`].
@@ -387,7 +415,7 @@ impl TokenStore {
         kind: McpCredentialKind,
     ) -> Result<Option<String>> {
         let server_name = server_name.to_string();
-        let kind = kind.as_str();
+        let kind = kind.name();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let result = connection.query_row(
@@ -461,7 +489,7 @@ impl TokenStore {
         secret: &str,
     ) -> Result<()> {
         let server_name = server_name.to_string();
-        let kind = kind.as_str();
+        let kind = kind.name();
         let secret = secret.to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -495,7 +523,7 @@ impl TokenStore {
         kind: McpCredentialKind,
     ) -> Result<()> {
         let server_name = server_name.to_string();
-        let kind = kind.as_str();
+        let kind = kind.name();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
@@ -623,17 +651,6 @@ impl std::fmt::Debug for AuthCredential {
                 .field("expires_at", expires_at)
                 .field("account_id", account_id)
                 .finish(),
-        }
-    }
-}
-impl AuthCredential {
-    /// The request header this credential is presented in, as `(name, value)`.
-    pub(crate) fn auth_header(&self) -> (&'static str, String) {
-        match self {
-            AuthCredential::ApiKey(key) => ("x-api-key", key.clone()),
-            AuthCredential::OAuthToken { access_token, .. } => {
-                ("Authorization", crate::text::bearer(access_token))
-            }
         }
     }
 }
@@ -832,7 +849,7 @@ mod tests {
         );
     }
 
-    /// The two strings a kind carries answer to different masters: `as_str` is schema and must
+    /// The two strings a kind carries answer to different masters: `name` is schema and must
     /// never move, `label` is prose and is free to. Printing the schema token where the prose
     /// belongs is the drift worth pinning, since it reads as almost right.
     #[test]
@@ -848,11 +865,11 @@ mod tests {
             ),
             (McpCredentialKind::OAuth, "oauth", "OAuth tokens"),
         ] {
-            assert_eq!(kind.as_str(), stored, "the stored discriminator moved");
+            assert_eq!(kind.name(), stored, "the stored discriminator moved");
             assert_eq!(kind.label(), shown, "the label the user reads moved");
             assert_ne!(
                 kind.label(),
-                kind.as_str(),
+                kind.name(),
                 "a label that is the schema value is a schema token leaking into the UI"
             );
         }

@@ -109,21 +109,54 @@ pub(crate) async fn refuse_a_spawned_session(
     // Refused here rather than at the import, because import restoring a whole tree is a case it
     // has to keep: a child whose parent *is* in the archive keeps its link and is caught by the
     // parent check. What no legitimate door produces is spawn terms with no parent.
-    let Some(crate::store::SpawnTerms { parent }) = store.spawn_terms(session_id).await? else {
+    let Some(terms) = store.spawn_terms(session_id).await? else {
         return Ok(());
     };
-    let door = match parent {
-        Some(parent) => {
-            format!("is a sub-agent of session {parent}; continue it with `agent_followup` there")
-        }
+    let remedy = match terms.parent {
+        Some(_) => "; continue it with `agent_followup` there",
         // An imported sub-agent whose parent did not come with it. There is no session to point at,
         // so say what it is rather than naming a door that is not there.
-        None => {
-            "is a sub-agent whose parent is not in this store, so it cannot be driven".to_string()
-        }
+        None => ", so it cannot be driven",
     };
-    Err(crate::error::MekaError::SessionNotDrivable(format!("session {session_id} {door}")).into())
+    Err(crate::error::MekaError::SessionNotDrivable(format!(
+        "{}{remedy}",
+        terms.describe(session_id)
+    ))
+    .into())
 }
+/// Move a session's agent onto whatever its row currently names, before a turn runs on it.
+///
+/// **The row is the carrier, and the only one.** A host's own profile switch moves the agent
+/// itself, but the row is the billing record, and a turn that ran on another profile than the
+/// row names would bill an account the record does not. The session lock refuses every other
+/// meka process a write to a resident row, so this defends the record against a hand-edited row,
+/// which is the guard a store created five minutes ago needs as much as an old one: read where the
+/// data is read, on every server's turn doors, the out-of-band ones included, so a scheduled fire
+/// or a background-outcome turn cannot run on, and bill, a profile the row has left.
+///
+/// Cheap when nothing has changed: one indexed row read and a comparison, with no resolution at
+/// all unless the two differ. Must be called under the conversation lock, which is what makes
+/// "the agent this turn is about to use" the thing being moved.
+pub(crate) async fn apply_recorded_profile(
+    shared: &SharedDeps,
+    agent: &crate::agent::Agent,
+    session_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    let Some(recorded) = shared.store.recorded_profile(session_id).await? else {
+        // No row, so nothing names a profile to move to. Reachable only for a session deleted
+        // from under a live entry; its turn is going to fail on the write either way.
+        return Ok(());
+    };
+    if recorded == agent.profile() {
+        return Ok(());
+    }
+    let profile = recorded.clone();
+    let resolved = crate::provider::resolved_profile(&shared.providers, recorded).await?;
+    agent.set_provider(resolved);
+    tracing::info!("moved session {session_id} onto profile '{profile}'");
+    Ok(())
+}
+
 /// Build the process-wide [`SharedDeps`] for `meka acp`. Sets up the provider, MCP wiring, skill
 /// cache, sandbox capability probe, and the shared `agent_options` template. Each ACP session later
 /// calls [`build_session_agent`] against the resulting struct to spin up its own per-session
@@ -864,5 +897,218 @@ impl SharedDeps {
             subagents: self.config.subagents.clone(),
             subagent_max_depth: self.config.subagent_max_depth,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both arms, against real rows rather than a fabricated `parent_id`.
+    ///
+    /// The refusal is what keeps a sub-agent's spawn terms meaningful, so a predicate that answered
+    /// wrongly in either direction is serious in both directions: admitting a sub-agent reopens the
+    /// escalation, and refusing a root session would break every host at once.
+    ///
+    /// `None` is asserted too, because that is what every fresh session passes and a check that
+    /// tried to read a row for it would refuse the case it exists to allow.
+    #[tokio::test]
+    async fn a_session_another_one_spawned_cannot_be_built_as_a_plain_agent() {
+        let manager = crate::store::Store::for_test().await;
+        let parent = manager
+            .create_session(None, "profile")
+            .await
+            .expect("a root session");
+        let (sub_agent, _lock) = manager
+            .create_child_session(
+                parent,
+                None,
+                Vec::new(),
+                None,
+                "read".to_string(),
+                "profile".to_string(),
+            )
+            .await
+            .expect("a sub-agent of that session");
+
+        refuse_a_spawned_session(&manager, None)
+            .await
+            .expect("a session that does not exist yet has nothing to refuse");
+        refuse_a_spawned_session(&manager, Some(parent))
+            .await
+            .expect("a root session is the ordinary case and must be admitted");
+
+        let error = refuse_a_spawned_session(&manager, Some(sub_agent))
+            .await
+            .expect_err("a session with a parent cannot be built as a plain agent");
+        assert!(
+            matches!(
+                error.downcast_ref::<crate::error::MekaError>(),
+                Some(crate::error::MekaError::SessionNotDrivable(_))
+            ),
+            "the refusal has to be the variant the HTTP layer answers 422 for: {error}"
+        );
+        // Both ids and the way through, because a client handed a sub-agent's id may not know what
+        // spawned it, and "no" without a remedy sends it looking for a bug in meka.
+        let text = error.to_string();
+        assert!(
+            text.contains(&sub_agent.to_string())
+                && text.contains(&parent.to_string())
+                && text.contains("agent_followup"),
+            "the refusal must name the sub-agent, its parent, and the door that can: {text}"
+        );
+    }
+
+    /// A sub-agent whose parent did not survive an import is still a sub-agent.
+    ///
+    /// `session export` on a sub-agent alone writes a `parent_id` pointing outside the archive, and
+    /// `import_sessions` resolves an unknown parent to `NULL` while copying `subagent_spec_json`
+    /// verbatim. Keying the refusal on the parent alone therefore left export-then-import as a
+    /// two-command promotion of a sub-agent into a drivable root session -- the same laundering
+    /// `fork_session` was fixed for, one door over, and reproducible with a real shell.
+    ///
+    /// The spec is the fact worth refusing on: a row holding the terms another session spawned it
+    /// under is a sub-agent's conversation whether or not the link survived.
+    #[tokio::test]
+    async fn spawn_terms_without_a_parent_are_still_a_sub_agent() {
+        let manager = crate::store::Store::for_test().await;
+        // Written through the real importer, because that is the only door that produces this
+        // shape: `plan_import` resolves a parent outside the archive to `None` and carries
+        // `subagent_spec_json` regardless.
+        let orphaned = uuid::Uuid::new_v4();
+        manager
+            .import_sessions(
+                vec![crate::store::ImportSessionRecord {
+                    new_id: orphaned,
+                    new_parent_id: None,
+                    created_at: "2026-08-31T00:00:00Z".to_string(),
+                    cwd: None,
+                    permission: crate::permission::Permission::Read,
+                    approvals: false,
+                    capabilities_json: None,
+                    additional_roots: Vec::new(),
+                    subagent_spec_json: Some("{\"tools\":[]}".to_string()),
+                    profile: "profile".to_string(),
+                    title: None,
+                    pinned_at: None,
+                    stats: Default::default(),
+                    events: Vec::new(),
+                    scratchpad_entries: Vec::new(),
+                }],
+                Vec::new(),
+            )
+            .await
+            .expect("the archive a lone sub-agent exports to");
+
+        let error = refuse_a_spawned_session(&manager, Some(orphaned))
+            .await
+            .expect_err("spawn terms with no parent are what an imported sub-agent looks like");
+        assert!(
+            matches!(
+                error.downcast_ref::<crate::error::MekaError>(),
+                Some(crate::error::MekaError::SessionNotDrivable(_))
+            ),
+            "the same refusal the parented case gets: {error}"
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains(&orphaned.to_string()) && !text.contains("agent_followup"),
+            "there is no parent to point at, so it must not name a door that is not there: {text}"
+        );
+    }
+
+    /// `/cd` reaches the row, which is what makes the recorded directory mean "where the session
+    /// is" rather than "where it was created". Nothing else covers this: the REPL loop that sends
+    /// the event needs a terminal, so a test cannot drive `/cd` itself.
+    #[tokio::test]
+    async fn a_cd_records_the_directory_on_the_session_row() {
+        let manager = crate::store::Store::for_test().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let moved = crate::workspace::canonical_for_test(temp.path());
+        let id = manager
+            .create_session(
+                Some(std::path::PathBuf::from("/somewhere/else")),
+                "p".to_string(),
+            )
+            .await
+            .expect("create");
+
+        record_session_cwd(&manager, Some(id), &moved).await;
+
+        let recorded = manager
+            .session_info(id)
+            .await
+            .expect("read the row")
+            .and_then(|info| info.cwd);
+        assert_eq!(
+            recorded,
+            Some(moved),
+            "the row must say where `/cd` moved the session",
+        );
+    }
+
+    /// Before the first turn there is no row to correct: the directory the creation snapshot reads
+    /// is the cell `/cd` has already written. So this is a no-op, and in particular it must not
+    /// reach for some other session's row -- a REPL sharing a store with a `meka serve` has plenty
+    /// to choose from.
+    #[tokio::test]
+    async fn a_cd_before_the_first_turn_writes_nobody_elses_row() {
+        let manager = crate::store::Store::for_test().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bystander = manager
+            .create_session(
+                Some(std::path::PathBuf::from("/its/own/place")),
+                "p".to_string(),
+            )
+            .await
+            .expect("create");
+
+        record_session_cwd(&manager, None, temp.path()).await;
+
+        let untouched = manager
+            .session_info(bystander)
+            .await
+            .expect("read the row")
+            .and_then(|info| info.cwd);
+        assert_eq!(
+            untouched,
+            Some(std::path::PathBuf::from("/its/own/place")),
+            "a `/cd` with no session of its own must leave every other row alone",
+        );
+    }
+
+    /// A resumed session opens where it was recorded. At `workspace` that directory is also the
+    /// writable boundary, so adopting the shell's would widen it behind the user's back.
+    #[test]
+    fn a_resume_prefers_the_recorded_directory_over_the_launch_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let recorded = temp.path().join("project");
+        let launch = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&recorded).expect("recorded dir");
+        std::fs::create_dir_all(&launch).expect("launch dir");
+
+        assert_eq!(
+            resume_working_directory(Some(recorded.clone()), &launch, None),
+            recorded,
+        );
+    }
+
+    /// The two cases that have to keep the run going: a row carrying no directory (an imported
+    /// archive may omit it) and one naming a directory that has since been removed.
+    #[test]
+    fn a_resume_falls_back_to_the_launch_directory_when_the_recording_cannot_serve() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let launch = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&launch).expect("launch dir");
+
+        assert_eq!(resume_working_directory(None, &launch, None), launch);
+        assert_eq!(
+            resume_working_directory(Some(temp.path().join("gone")), &launch, None),
+            launch,
+        );
+        // A file is not a directory to open in either, and `is_dir` is what separates them.
+        let file = temp.path().join("a-file");
+        std::fs::write(&file, b"x").expect("write file");
+        assert_eq!(resume_working_directory(Some(file), &launch, None), launch);
     }
 }

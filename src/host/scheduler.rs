@@ -18,13 +18,55 @@ use crate::{
     store::{Store, background::BackgroundTask},
 };
 
-/// Who started a turn the host did not receive over its own door, for the host's own accounting:
-/// `serve` names it on the session feed's `turn.started`.
+/// Who started a turn, for the host's own accounting: `serve` names it on the session feed's
+/// `turn.started`, and the hosts that run an out-of-band turn name it to their hooks.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TurnOrigin {
-    Schedule { job_id: String },
-    Background,
+pub(crate) enum TurnSource {
+    /// `POST /v1/sessions/{id}/turn`.
+    Client,
+    /// The inbox driver, on these items.
     Inbox { item_ids: Vec<uuid::Uuid> },
+    /// A scheduled job firing.
+    Schedule { job_id: String },
+    /// Finished background work delivered as a turn of its own.
+    Background,
+    /// `POST /v1/sessions/{id}/compact`: the checkpoint turn a compaction runs.
+    Compaction,
+}
+
+impl TurnSource {
+    /// The one spelling of this value: the `source` member of `turn.started`.
+    pub(crate) const fn name(&self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Inbox { .. } => "inbox",
+            Self::Schedule { .. } => "schedule",
+            Self::Background => "background",
+            Self::Compaction => "compaction",
+        }
+    }
+
+    /// Write `source` and what identifies it into a `turn.started` payload: the real one
+    /// `HttpFrontend::begin_turn` publishes and the one a feed synthesizes for a client that
+    /// attaches mid-turn, so both name the turn the same way.
+    pub(crate) fn describe(&self, data: &mut serde_json::Value) {
+        let Some(object) = data.as_object_mut() else {
+            return;
+        };
+        object.insert(
+            "source".into(),
+            serde_json::Value::String(self.name().to_string()),
+        );
+        match self {
+            Self::Inbox { item_ids } => {
+                object.insert("item_ids".into(), serde_json::json!(item_ids));
+            }
+            Self::Schedule { job_id } => {
+                object.insert("job_id".into(), serde_json::json!(job_id));
+            }
+            Self::Client | Self::Background | Self::Compaction => {}
+        }
+    }
 }
 
 /// First wait before a turn that failed on inbox items is tried again; doubles per attempt.
@@ -82,9 +124,10 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
         entry.admit_turn(None)
     }
 
-    /// What the host does with the session before a turn, under the conversation lock. ACP moves
-    /// the agent onto the profile the row records; an error here makes the fire unrunnable rather
-    /// than failed.
+    /// What the host does with the session before a turn, under the conversation lock. The two
+    /// servers move the agent onto the profile the row records, through
+    /// `crate::host::apply_recorded_profile`; an error here makes the fire unrunnable rather than
+    /// failed.
     async fn prepare(&self, _entry: &Self::Entry) -> anyhow::Result<()> {
         Ok(())
     }
@@ -108,7 +151,7 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
 
     /// An out-of-band turn is about to run under `turn_id`. `serve` opens it on the session feed;
     /// the others have no feed to open it on.
-    fn begin_turn(&self, _entry: &Self::Entry, _turn_id: uuid::Uuid, _origin: TurnOrigin) {}
+    fn begin_turn(&self, _entry: &Self::Entry, _turn_id: uuid::Uuid, _origin: TurnSource) {}
 
     /// An out-of-band turn has ended, before [`Self::finished`] announces it. `serve` records the
     /// terminal on the feed, closes the turn there, and posts the turn webhooks an inbox turn
@@ -117,7 +160,7 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
         &self,
         _entry: &Self::Entry,
         _turn_id: uuid::Uuid,
-        _origin: &TurnOrigin,
+        _origin: &TurnSource,
         _outcome: &Result<crate::agent::TurnOutcome, MekaError>,
     ) {
     }
@@ -221,8 +264,9 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
     if let Err(error) = hooks.prepare(&entry).await {
         tracing::warn!(
             "scheduled job {job_id} did not run: its session's profile did not resolve \
-             ({error}); move it with `meka -r <id> --profile <name>`"
+             ({error}); restore the profile in config.toml or move the session onto another"
         );
+        hooks.failed_before_running(job, &error);
         return FireOutcome::Unrunnable;
     }
     let cancellation = hooks.cancellation();
@@ -265,7 +309,7 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
     hooks.show_prompt(&entry, OutOfBandPrompt::Scheduled(&wakeup));
     let input = input.riding(riding);
 
-    let origin = TurnOrigin::Schedule {
+    let origin = TurnSource::Schedule {
         job_id: job.id.clone(),
     };
     hooks.begin_turn(&entry, turn_id, origin.clone());
@@ -278,8 +322,10 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
     let outcome = outcome.map(|_| ());
     // Before `finished`, not after: a fire the drain cut short is deferred and fires again on the
     // next start, so telling a webhook it failed announced one occurrence twice.
-    if hooks.shutting_down() {
-        tracing::info!("scheduled job {job_id} fired during shutdown; deferring the occurrence");
+    if deferred_by_the_drain(hooks.shutting_down(), &outcome) {
+        tracing::info!(
+            "scheduled job {job_id} was cut short by the shutdown; deferring the occurrence"
+        );
         return FireOutcome::Deferred;
     }
     hooks.finished(&entry, Some(job), &outcome).await;
@@ -288,6 +334,52 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
         Err(error) => tracing::warn!("scheduled job {job_id} failed: {error}"),
     }
     FireOutcome::Ran
+}
+
+/// Deliver finished background outcomes on every tick until `shutdown` fires or the sweep says
+/// it is done: the one poller both servers spawn, so the supervision is written once.
+///
+/// Supervised because this sweep runs a whole agent turn, so anything in the tool loop can
+/// panic, and losing the task would stop every background outcome from ever being delivered,
+/// silently, since nothing joins the handle. A task that finished would then sit stamped and
+/// unreported forever, which is exactly the promise `background.rs` opens by making.
+pub(crate) fn spawn_outcome_poller<H, K>(
+    hooks: H,
+    sessions: Sessions<K, H::Entry>,
+    poll_interval: std::time::Duration,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()>
+where
+    H: HostHooks + 'static,
+    K: Eq + std::hash::Hash + Clone + Send + Sync + 'static,
+    H::Entry: Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(poll_interval);
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
+            let sweep = std::panic::AssertUnwindSafe(deliver_ready_outcomes(&hooks, &sessions));
+            match futures::FutureExt::catch_unwind(sweep).await {
+                Ok(ControlFlow::Break(())) => return,
+                Ok(ControlFlow::Continue(())) => {}
+                Err(panic) => tracing::warn!(
+                    "background outcome sweep panicked ({panic}); continuing",
+                    panic = crate::error::panic_message(&*panic)
+                ),
+            }
+        }
+    })
+}
+
+/// Whether a fire's occurrence is handed back for the next start rather than completed: only when
+/// the drain cut the turn short. A turn that finished, or failed on its own, while the drain began
+/// is complete, its messages persisted; deferring it too makes a one-shot reminder deliver twice.
+fn deferred_by_the_drain(shutting_down: bool, outcome: &Result<(), MekaError>) -> bool {
+    shutting_down && matches!(outcome, Err(MekaError::Interrupted))
 }
 
 /// Deliver finished background work to every resident session that can take a turn for it.
@@ -391,14 +483,14 @@ where
             .cancel
             .publish_turn(cancellation.clone(), busy.admission, turn_id);
         let input = crate::agent::TurnInput::outcomes(ready);
-        hooks.begin_turn(&entry, turn_id, TurnOrigin::Background);
+        hooks.begin_turn(&entry, turn_id, TurnSource::Background);
         let outcome = entry
             .agent
             .run_turn(&mut conversation, input, cancellation)
             .await;
         entry.touch();
         hooks
-            .turn_closed(&entry, turn_id, &TurnOrigin::Background, &outcome)
+            .turn_closed(&entry, turn_id, &TurnSource::Background, &outcome)
             .await;
         let outcome = outcome.map(|_| ());
         hooks.finished(&entry, None, &outcome).await;
@@ -514,8 +606,14 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
         let now = chrono::Utc::now();
         let items = match inbox.take_pending(session_id, &[], now).await {
             Ok(items) => items,
+            // Put off like the arms above, or the sweeper asks again at once for as long as the
+            // read keeps failing.
             Err(error) => {
-                tracing::warn!("failed to read the inbox for session {session_id}: {error}");
+                tracing::warn!(
+                    "inbox items for session {session_id} wait {INBOX_RETRY_LONGEST_WAIT:?}: \
+                     failed to read the inbox: {error}"
+                );
+                defer_session_inbox(hooks, session_id, INBOX_RETRY_LONGEST_WAIT).await;
                 return InboxDrain::Done;
             }
         };
@@ -549,11 +647,14 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
         let item_ids: Vec<uuid::Uuid> = items.iter().map(|item| item.id).collect();
 
         entry.touch();
+        // Put off like the arms above, or the sweeper asks again at once: a session whose row
+        // names a profile this process cannot resolve stays that way until somebody moves it.
         if let Err(error) = hooks.prepare(&entry).await {
             tracing::warn!(
-                "inbox items for session {session_id} wait: the session's profile did not \
-                 resolve ({error})"
+                "inbox items for session {session_id} wait {INBOX_RETRY_LONGEST_WAIT:?}: the \
+                 session's profile did not resolve ({error})"
             );
+            defer_session_inbox(hooks, session_id, INBOX_RETRY_LONGEST_WAIT).await;
             return InboxDrain::Done;
         }
         let cancellation = hooks.cancellation();
@@ -582,7 +683,7 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
             );
         }
         let input = input.riding(riding);
-        let origin = TurnOrigin::Inbox {
+        let origin = TurnSource::Inbox {
             item_ids: item_ids.clone(),
         };
         hooks.begin_turn(&entry, turn_id, origin.clone());
@@ -668,6 +769,27 @@ pub(crate) async fn a_turn_can_carry_them(agent: &crate::agent::Agent) -> bool {
 }
 #[cfg(test)]
 mod tests {
+    /// A fire that completed before the drain reached it is complete: its reply is in the store,
+    /// and a deferred occurrence would deliver it again on the next start. Only the drain's own
+    /// interruption hands the occurrence back.
+    #[test]
+    fn only_a_fire_the_drain_cut_short_is_deferred() {
+        use super::deferred_by_the_drain;
+        assert!(deferred_by_the_drain(
+            true,
+            &Err(crate::error::MekaError::Interrupted)
+        ));
+        assert!(!deferred_by_the_drain(true, &Ok(())));
+        assert!(!deferred_by_the_drain(
+            true,
+            &Err(crate::error::MekaError::Provider("down".to_string()))
+        ));
+        assert!(!deferred_by_the_drain(
+            false,
+            &Err(crate::error::MekaError::Interrupted)
+        ));
+    }
+
     /// Asserted against the source, and weaker than a behavioral test: nothing in the suite drives
     /// background-outcome delivery through this driver, so this checks *order* rather than mere
     /// presence.

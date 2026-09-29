@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `turn.started` carries `source: "compaction"` for the checkpoint turn `POST /compact` runs.
+- `schedule.fired` carries `status: "not_run"` for a job whose session could not be opened.
+- `interleaved_thinking = false` on an `anthropic-messages` account withholds the beta header.
+
+### Changed
+
+- **Breaking:** `headers_helper` resolves beside `config.toml` or absolute, never on `PATH`.
+- **Breaking:** an unset or malformed `${VAR}` in an MCP server's `url` or `args` refuses it.
+- **Breaking:** `[serve]` values take `${VAR:-default}` and no longer take `$$` for a literal `$`.
+- **Breaking:** `GET /v1/sessions/{id}/stream` needs `sessions:w` to load an evicted session.
+- **Breaking:** `meka account whoami --format json` carries `auth.expires_at` as RFC 3339.
+- A session expires as a tree: a sub-agent is kept with a kept root and taken with an expired one.
+- Deleting a session locks its sub-agents too, and is refused while another process runs one.
+- `DELETE /v1/sessions/{id}` answers 409 while a scheduled or background turn holds the session.
+- Below `unrestricted`, `file_read` and `file_search` refuse a process's own `/proc` entries.
+- `file_read` and `file_search` reach a skill's bundled files in meka's own store at every level.
+- `session list -n 0` and `session search -n 0` show every session, as `history list -n 0` does.
+- `session import` refuses an archive whose timestamps are not RFC 3339.
+- `--format` ahead of a subcommand is refused rather than ignored.
+- A flag's help lists the values it takes, and `mcp add --auth` names them for an unknown kind.
+- Refusals by `mcp`, `schedule`, `background`, `memory` and `skill` no longer read as config errors.
+- `mcp add`, `remove`, `enable` and `disable` refuse a write that leaves `config.toml` unreadable.
+- `[background] max_tasks = 0` is refused at startup while `enabled = true`.
+- An MCP tool whose name sanitizes to one already taken is skipped, with a warning.
+- An unreadable scheduled job warns once per process and can still be canceled by its id.
+
+### Fixed
+
+- `POST /compact` runs on the session's recorded profile and finishes after the client hangs up.
+- A stopped turn no longer resets the context reading to zero; the last measurement stands.
+- `/rewind` forgets the files the model had read, as a compaction does, so a later edit re-reads.
+- A steer that landed during a tool round no longer counts as a turn in `agent_list` or `/history`.
+- A corrupt message row no longer hides its session from listings and resumes.
+- A large tool output spilled to the scratchpad no longer replaces an earlier entry under its name.
+- A tool that panics fails its call instead of leaving the session's next request rejected.
+- A `shell_execute` gate that times out kills its command instead of leaving it running.
+- A command admitted as sandboxed is refused, not run bare, when no backend can confine it.
+- Ctrl+C while a one-shot run waits for a background task stops the task and records it.
+- Subscription token refreshes no longer race each other into a login prompt, in one process or two.
+- An MCP call's reconnect is bounded and stops on Ctrl+C; a server still connecting says so.
+- MCP error text no longer quotes a URL's query; the HTTP MCP routes keep the reason in the log.
+- `mcp add` probes the server's URL with its `${VAR}` expanded, never with the literal.
+- An inbox item whose session's profile does not resolve waits; an unreadable item is withdrawn.
+- Inbox items delivered beside another process's write are no longer redelivered by a rewind.
+- A scheduled job that completed as `meka serve` shut down is not fired again on the next start.
+- A feed reader no longer holds `meka serve`'s shutdown to the drain timeout; DELETE ends its feed.
+- An invalid `?cursor=` on `GET /v1/sessions` answers 422 naming the cursor, not 500.
+- ACP notices for a failed scheduled or background turn carry only what a request would.
+- On Windows, a skill name with a drive prefix (`C:..`) is refused.
+- The pre-migration backup is synced to disk before the previous one is removed.
+
 ## [0.67.0] - 2026-09-28
 
 ### Changed

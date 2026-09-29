@@ -93,7 +93,11 @@ impl ProgressRegistry {
             tool_use_id,
             progress: params.progress,
             total: params.total,
-            message: params.message,
+            // Sanitized at ingress like a connector's stderr: the line below reaches the terminal
+            // at `-v` with whatever escapes the server put in it.
+            message: params
+                .message
+                .map(|message| crate::text::sanitize_to_line(&message, usize::MAX)),
         };
         let total = update
             .total

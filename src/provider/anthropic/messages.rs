@@ -28,6 +28,8 @@ pub(crate) struct AnthropicMessagesProvider {
     api_key: String,
     base_url: String,
     model: String,
+    /// See `AccountConfig::interleaved_thinking`.
+    interleaved_thinking: bool,
     thinking: ThinkingMode,
     thinking_budget_tokens: u64,
     /// The settled `output_config.effort` for the request body, resolved once at construction from
@@ -47,6 +49,7 @@ impl AnthropicMessagesProvider {
         let crate::provider::ProviderBuilder {
             model,
             base_url,
+            interleaved_thinking,
             thinking,
             thinking_budget_tokens,
             effort,
@@ -64,6 +67,7 @@ impl AnthropicMessagesProvider {
                     .unwrap_or(crate::provider::DEFAULT_ANTHROPIC_BASE_URL),
             ),
             model,
+            interleaved_thinking,
             thinking,
             thinking_budget_tokens,
             resolved_effort,
@@ -83,10 +87,10 @@ impl AnthropicMessagesProvider {
 
     fn compute_betas(&self, thinking: ThinkingOverride) -> Option<String> {
         let mut parts: Vec<&str> = Vec::new();
-        // Sent to whatever `base_url` names, on purpose: an endpoint that does not know the beta
-        // rejects the request, a visible failure, where omitting it would silently degrade
-        // thinking on every endpoint that does.
-        if self.effective_thinking(thinking).is_on() {
+        // Whether the endpoint takes the beta is the endpoint's fact, which this backend cannot
+        // know from `base_url`; the account states it, defaulting to the direct API's answer, so
+        // a gateway that refuses the header has a key rather than a `thinking = off`.
+        if self.interleaved_thinking && self.effective_thinking(thinking).is_on() {
             parts.push("interleaved-thinking-2025-05-14");
         }
         // No `context-1m-2025-08-07`: on the direct Messages API, 1M context is the *default* for
@@ -349,9 +353,7 @@ mod tests {
     /// header into a local and then hands [`crate::error::provider_transport_error`] a `None`
     /// retries a provider that just said "wait 60 seconds" on plain 1s/2s backoff. The classifier's
     /// own tests cannot catch that, because they supply the argument themselves; this one makes a
-    /// real site parse a real header. Asserting the message as well as the hint is what pins it to
-    /// the read site: a 429 whose body *did* arrive is also retryable and also carries the hint,
-    /// but says so in `provider_http_error`'s words.
+    /// real site parse a real header, and a body that stops short must not lose it on the way.
     #[tokio::test]
     async fn a_truncated_body_keeps_the_rate_limit_hint() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -424,9 +426,12 @@ mod tests {
                 retry_after,
                 ..
             } => {
+                // The status is classified ahead of the body on every path, and a body that
+                // stops short leaves the status to describe itself; the hint is what must
+                // survive.
                 assert!(
-                    message.starts_with("failed to read response"),
-                    "expected the read site rather than the status classifier: {message}"
+                    message.contains("429"),
+                    "expected the status classifier's words: {message}"
                 );
                 assert_eq!(retry_after, Some(std::time::Duration::from_secs(60)));
             }
@@ -453,6 +458,32 @@ mod tests {
         assert_eq!(trailing.base_url, "https://api.anthropic.com");
 
         assert_eq!(provider_for_test().base_url, "https://api.anthropic.com");
+    }
+
+    /// Whether the endpoint takes the beta is the account's to say: withheld, thinking stays on
+    /// and the header stays home; unset, the direct API's answer is sent.
+    #[test]
+    fn an_account_that_withholds_the_beta_sends_no_beta_header() {
+        let build = |interleaved_thinking: bool| {
+            AnthropicMessagesProvider::new(
+                "test-key".to_string(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::AnthropicMessages,
+                    crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                    "claude-opus-5-5".to_string(),
+                )
+                .thinking(crate::config::ThinkingMode::Adaptive, 0)
+                .interleaved_thinking(interleaved_thinking),
+            )
+            .expect("provider")
+        };
+        assert_eq!(build(false).compute_betas(ThinkingOverride::Inherit), None);
+        assert_eq!(
+            build(true)
+                .compute_betas(ThinkingOverride::Inherit)
+                .as_deref(),
+            Some("interleaved-thinking-2025-05-14")
+        );
     }
 
     #[test]

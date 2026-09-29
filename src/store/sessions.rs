@@ -111,6 +111,19 @@ pub(crate) struct SpawnTerms {
     /// that only exists when the answer is yes, rather than the answer itself.
     pub(crate) parent: Option<Uuid>,
 }
+impl SpawnTerms {
+    /// What `session_id` is, for the refusal a door builds by adding its own remedy: a sub-agent
+    /// of its parent, or one whose parent is not in this store. The one spelling, so five doors
+    /// cannot describe the same row five ways.
+    pub(crate) fn describe(&self, session_id: Uuid) -> String {
+        match self.parent {
+            Some(parent) => format!("session '{session_id}' is a sub-agent of '{parent}'"),
+            None => {
+                format!("session '{session_id}' is a sub-agent whose parent is not in this store")
+            }
+        }
+    }
+}
 /// "Is this row a sub-agent's conversation?", for a `WHERE` clause.
 ///
 /// The SQL half of [`Store::spawn_terms`]; see that function for why both columns are
@@ -278,63 +291,41 @@ pub(crate) enum SourceLock {
     /// This process holds the source: the REPL's own session, or one resident in `serve` or `acp`.
     HeldByCaller,
 }
-/// Sessions a scheduled job still depends on, as a `WHERE` fragment over `sessions`.
+/// What the retention sweep may take: a root session whose tree nobody pinned and no schedule
+/// speaks for, as a `WHERE` fragment over `sessions`.
 ///
-/// A session with a job ahead of it is *not* expired, whatever `updated_at` says. Only turns bump
-/// that column ([`ScheduleStore::claim_occurrence`] and [`ScheduleStore::complete_claim`] touch
-/// `scheduled_jobs` alone), so a gated watcher that evaluates every tick and rarely fires looks
-/// untouched for exactly as long as it is working. The cascade would then take the job with the
-/// session, and the sweep report `deleted 1 session(s)` without ever mentioning that a schedule
-/// went with it.
+/// A session expires as a tree. `parent_session_id` carries `ON DELETE CASCADE`, so deleting a
+/// root takes every sub-agent under it, and every other door that acts on a tree (the cascade of
+/// `session delete`, an export, `agent_delete`) treats root plus children as one unit; the sweep
+/// selects roots alone and lets the cascade do what the caller would read as one deletion. A
+/// sub-agent's `updated_at` moves only on its own turns, which run inside its root's, so the
+/// root's recency stands for the tree's: an old child under a kept root is kept, and a child
+/// under an expired root goes with it however it is dated.
 ///
-/// Sparing only the row that *owns* the job is not enough. `parent_session_id` carries
-/// `ON DELETE CASCADE`, so deleting a stale parent silently takes its sub-agent children, and a
-/// job created against a child (reachable over HTTP, whose only gate is that the session exists)
-/// goes with them. The recursive term walks parent links up from every job-owning session and
-/// spares that whole chain.
+/// A pin anywhere in the tree keeps it: a pin is the user saying keep this, and the cascade would
+/// take a pinned child with an expiring root. So does a job anywhere in it, whatever `updated_at`
+/// says: only turns bump that column ([`ScheduleStore::claim_occurrence`] and
+/// [`ScheduleStore::complete_claim`] touch `scheduled_jobs` alone), so a gated watcher that
+/// evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and
+/// a job created against a child (reachable over HTTP, whose only gate is that the session exists)
+/// would be cascaded away with the root.
 ///
 /// A constant because it is applied twice, in two statements, and the pair is only sound while
 /// they agree: see [`Store::delete_the_unattached_among`].
 ///
 /// [`ScheduleStore::claim_occurrence`]: crate::store::schedule::ScheduleStore::claim_occurrence
 /// [`ScheduleStore::complete_claim`]: crate::store::schedule::ScheduleStore::complete_claim
-pub(super) const NOT_SPOKEN_FOR_BY_A_SCHEDULE: &str = "id NOT IN (SELECT session_id FROM scheduled_jobs) \
+const EXPIRABLE: &str = "parent_session_id IS NULL \
      AND id NOT IN ( \
-         WITH RECURSIVE ancestors(id) AS ( \
-             SELECT parent_session_id FROM sessions \
-               WHERE parent_session_id IS NOT NULL \
-                 AND id IN (SELECT session_id FROM scheduled_jobs) \
-             UNION \
-             SELECT s.parent_session_id FROM sessions s \
-               JOIN ancestors a ON s.id = a.id \
-              WHERE s.parent_session_id IS NOT NULL \
+         WITH RECURSIVE tree(id, root) AS ( \
+             SELECT id, id FROM sessions WHERE parent_session_id IS NULL \
+             UNION ALL \
+             SELECT s.id, tree.root FROM sessions s JOIN tree ON s.parent_session_id = tree.id \
          ) \
-         SELECT id FROM ancestors \
+         SELECT root FROM tree \
+          WHERE id IN (SELECT id FROM sessions WHERE pinned_at IS NOT NULL) \
+             OR id IN (SELECT session_id FROM scheduled_jobs) \
      )";
-
-/// What the retention sweep may take: a session nobody pinned and no schedule speaks for.
-///
-/// A pin spares the whole parent chain, as a schedule does and for the same reason: a pinned
-/// sub-agent session is cascaded away with a root that expires, so sparing the row alone would
-/// not keep it. [`NOT_SPOKEN_FOR_BY_A_SCHEDULE`] with the pin ahead of it, built once because the
-/// sweep applies it in two statements that are only sound while they agree.
-static EXPIRABLE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    format!(
-        "pinned_at IS NULL \
-         AND id NOT IN ( \
-             WITH RECURSIVE kept(id) AS ( \
-                 SELECT parent_session_id FROM sessions \
-                   WHERE parent_session_id IS NOT NULL AND pinned_at IS NOT NULL \
-                 UNION \
-                 SELECT s.parent_session_id FROM sessions s \
-                   JOIN kept k ON s.id = k.id \
-                  WHERE s.parent_session_id IS NOT NULL \
-             ) \
-             SELECT id FROM kept \
-         ) \
-         AND {NOT_SPOKEN_FOR_BY_A_SCHEDULE}"
-    )
-});
 /// How many sessions a prefix scan fetches before it stops counting.
 ///
 /// A resolution needs at most two: one match resolves, and any second makes it ambiguous. The rest
@@ -381,8 +372,10 @@ static TITLE_ROW_WHERE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
         "session_id = s.id
          AND ((kind = 'user' AND {user_words})
               OR (kind = 'user_blocks'
+                  AND json_valid(messages.content)
                   AND EXISTS (SELECT 1 FROM json_each(messages.content)
-                              WHERE json_extract(json_each.value, '$.type') = 'text'
+                              WHERE json_extract(CASE WHEN json_each.type = 'object'
+                                                      THEN json_each.value END, '$.type') = 'text'
                                 AND {block_words})))",
         user_words = is_words("messages.content"),
         block_words = is_words("json_extract(json_each.value, '$.text')"),
@@ -447,6 +440,58 @@ pub(super) fn title_of_first_user_row(session: &str, kind: &str, content: String
     };
     Conversation::from_events(vec![Event::Append(message)]).title()
 }
+/// An event as the `messages` table takes it: its images taken out into blobs and its references
+/// read. Built on the caller's thread rather than the database's, since decoding and hashing the
+/// images is the expensive half and the one database thread serves every writer.
+/// [`Self::from_event`] is the only way to build one and [`insert_event`] the only door that
+/// writes one, so a row can carry image bytes inline only by bypassing both.
+pub(super) struct PreparedEvent {
+    event: crate::conversation::Event,
+    blobs: Vec<super::blobs::NewBlob>,
+    references: Vec<String>,
+}
+
+impl PreparedEvent {
+    pub(super) fn from_event(event: &crate::conversation::Event) -> Self {
+        let (event, blobs) = super::blobs::externalize_images(event);
+        let references = super::blobs::blob_references(&event);
+        Self {
+            event,
+            blobs,
+            references,
+        }
+    }
+
+    /// The blob hashes the row will reference, for a check ahead of the write.
+    pub(super) fn references(&self) -> &[String] {
+        &self.references
+    }
+
+    /// The blobs the event carried inline, for a writer that stores them ahead of its rows so a
+    /// check between the two sees them; the door then finds none left to store.
+    pub(super) fn take_blobs(&mut self) -> Vec<super::blobs::NewBlob> {
+        std::mem::take(&mut self.blobs)
+    }
+}
+
+/// The one door into `messages`: a prepared event becomes a row with its blobs stored and its
+/// references linked, in the caller's transaction. Every writer goes through here (a turn's save,
+/// the batch, a rewind, a withdrawal, an import); a fork copies rows that already came through it.
+pub(super) fn insert_event(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    prepared: &PreparedEvent,
+    created_at: &str,
+) -> rusqlite::Result<i64> {
+    let (kind, content) = encode_event_for_db(&prepared.event)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    super::blobs::insert_blobs(transaction, &prepared.blobs, created_at)?;
+    let message_id =
+        super::search::insert_message(transaction, session_id, &kind, &content, created_at)?;
+    super::blobs::link_message_blobs(transaction, message_id, &prepared.references)?;
+    Ok(message_id)
+}
+
 /// Encode an [`crate::conversation::Event`] into the `(kind, content)` columns of the `messages`
 /// table. `Event::Append` is stored under the message's role; `Event::CompactBoundary`,
 /// `Event::Repair` and `Event::Redact` write a JSON envelope under a kind of their own.
@@ -618,9 +663,9 @@ pub(super) fn decode_list_cursor(token: &str) -> Result<ListSessionsCursor> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(token)
-        .map_err(|error| MekaError::Database(format!("invalid list cursor: {error}")))?;
+        .map_err(|error| MekaError::Usage(format!("invalid list cursor: {error}")))?;
     serde_json::from_slice(&bytes)
-        .map_err(|error| MekaError::Database(format!("invalid list cursor: {error}")))
+        .map_err(|error| MekaError::Usage(format!("invalid list cursor: {error}")))
 }
 /// Encode an additional-root list for the `additional_roots_json` column. `None` for the empty case
 /// keeps "no extra roots" as NULL, so the column has one representation for one meaning rather than
@@ -640,8 +685,30 @@ pub(super) fn encode_additional_roots(roots: &[PathBuf]) -> Result<Option<String
 /// usable as a single-root session, and refusing to load it would be a far worse outcome than
 /// silently narrowing its search scope.
 pub(super) fn decode_additional_roots(json: Option<&str>) -> Vec<PathBuf> {
-    json.and_then(|raw| serde_json::from_str::<Vec<PathBuf>>(raw).ok())
-        .unwrap_or_default()
+    match json.map(serde_json::from_str::<Vec<PathBuf>>) {
+        Some(Ok(roots)) => roots,
+        // A column meka wrote is JSON; one that is not was hand-edited or damaged, and the
+        // session runs with no extra roots rather than not at all. Said, since a root that
+        // silently stopped applying is a fence a user believes is there.
+        Some(Err(error)) => {
+            tracing::warn!("ignoring an unreadable additional_roots column: {error}");
+            Vec::new()
+        }
+        None => Vec::new(),
+    }
+}
+
+/// A session id as a column holds it, or `None` with a warning for one that is not an id: every
+/// id meka writes parses, so a row that does not was hand-edited or damaged, and a reader that
+/// dropped it silently would list a tree short a member with nothing said.
+pub(super) fn session_id_in(raw: &str) -> Option<Uuid> {
+    match Uuid::parse_str(raw) {
+        Ok(id) => Some(id),
+        Err(error) => {
+            tracing::warn!("ignoring a session id that does not parse ('{raw}'): {error}");
+            None
+        }
+    }
 }
 impl Store {
     /// The key under which a sub-agent's spawn terms record the profile the spawn call chose. The
@@ -1106,7 +1173,7 @@ impl Store {
                     return None;
                 }
                 Some(SpawnTerms {
-                    parent: parent.as_deref().and_then(|id| Uuid::parse_str(id).ok()),
+                    parent: parent.as_deref().and_then(session_id_in),
                 })
             })
     }
@@ -1379,12 +1446,8 @@ impl Store {
         event: &crate::conversation::Event,
         inbox_items: &[Uuid],
     ) -> Result<()> {
-        let (event, blobs) = super::blobs::externalize_images(event);
-        let references = super::blobs::blob_references(&event);
-        let (kind, content) = encode_event_for_db(&event)
-            .map_err(|error| MekaError::Database(format!("failed to encode event: {error}")))?;
         let appended = inbox_items.iter().map(Uuid::to_string).collect();
-        self.save_row(session_id, kind, content, blobs, references, appended)
+        self.save_row(session_id, PreparedEvent::from_event(event), appended)
             .await
     }
 
@@ -1399,8 +1462,7 @@ impl Store {
         inbox_items: &[Uuid],
         not_before: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
-        let (kind, content) = encode_event_for_db(event)
-            .map_err(|error| MekaError::Database(format!("failed to encode event: {error}")))?;
+        let prepared = PreparedEvent::from_event(event);
         let ids: Vec<String> = inbox_items.iter().map(Uuid::to_string).collect();
         let not_before = not_before.to_rfc3339();
         let now = chrono::Utc::now().to_rfc3339();
@@ -1408,7 +1470,7 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let transaction = connection.transaction()?;
-                super::search::insert_message(&transaction, &session_id, &kind, &content, &now)?;
+                insert_event(&transaction, &session_id, &prepared, &now)?;
                 super::inbox::reset_pending_in(&transaction, &ids, &not_before)?;
                 transaction.execute(
                     "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
@@ -1449,32 +1511,16 @@ impl Store {
             return Ok(());
         }
         let appended: Vec<String> = inbox_items.iter().map(Uuid::to_string).collect();
-        // Encode all events upfront so a serialization failure aborts before any DB I/O.
-        let mut encoded: Vec<(String, String, Vec<String>)> = Vec::with_capacity(events.len());
-        let mut blobs = Vec::new();
-        for event in &events {
-            let (event, mut taken) = super::blobs::externalize_images(event);
-            blobs.append(&mut taken);
-            let references = super::blobs::blob_references(&event);
-            let (kind, content) = encode_event_for_db(&event)
-                .map_err(|error| MekaError::Database(format!("failed to encode event: {error}")))?;
-            encoded.push((kind, content, references));
-        }
         let now = chrono::Utc::now().to_rfc3339();
         let session_id_str = session_id.to_string();
+        let prepared: Vec<PreparedEvent> = events.iter().map(PreparedEvent::from_event).collect();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
+                // One transaction, so an event that fails to encode or to write rolls the batch
+                // back whole.
                 let transaction = connection.transaction()?;
-                super::blobs::insert_blobs(&transaction, &blobs, &now)?;
-                for (kind, content, references) in &encoded {
-                    let message_id = super::search::insert_message(
-                        &transaction,
-                        &session_id_str,
-                        kind,
-                        content,
-                        &now,
-                    )?;
-                    super::blobs::link_message_blobs(&transaction, message_id, references)?;
+                for prepared in &prepared {
+                    insert_event(&transaction, &session_id_str, prepared, &now)?;
                 }
                 super::inbox::stamp_appended(&transaction, &appended, &now)?;
                 transaction.execute(
@@ -1528,7 +1574,8 @@ impl Store {
             title: Option<String>,
             pinned_at: Option<String>,
             stats: crate::stats::SessionStatsSnapshot,
-            events: Vec<(String, String, String, Vec<String>)>,
+            /// `(created_at, the event as the door takes it)`.
+            events: Vec<(String, PreparedEvent)>,
             scratchpad_entries: Vec<(String, String)>,
         }
         let imported_at = chrono::Utc::now().to_rfc3339();
@@ -1549,16 +1596,14 @@ impl Store {
         let mut encoded = Vec::with_capacity(records.len());
         for record in records {
             let mut events = Vec::with_capacity(record.events.len());
-            for (at, event) in &record.events {
+            for (at, event) in record.events {
                 // An archive carries references, but one written by hand or by another tool may
-                // carry bytes; either way the row gets a reference and the bytes a blob.
-                let (event, mut taken) = super::blobs::externalize_images(event);
-                archive_blobs.append(&mut taken);
-                let references = super::blobs::blob_references(&event);
-                let (kind, content) = encode_event_for_db(&event).map_err(|error| {
-                    MekaError::Database(format!("failed to encode event: {error}"))
-                })?;
-                events.push((kind, content, at.clone(), references));
+                // carry bytes; either way the row gets a reference and the bytes a blob. The
+                // bytes join the archive's, stored ahead of the rows, so the check below sees
+                // them.
+                let mut prepared = PreparedEvent::from_event(&event);
+                archive_blobs.append(&mut prepared.take_blobs());
+                events.push((at, prepared));
             }
             encoded.push(EncodedSession {
                 id: record.new_id.to_string(),
@@ -1587,8 +1632,8 @@ impl Store {
             .collect();
         let mut unresolved: Vec<String> = Vec::new();
         for session in &encoded {
-            for (_, _, _, references) in &session.events {
-                for hash in references {
+            for (_, prepared) in &session.events {
+                for hash in prepared.references() {
                     if !carried.contains(hash.as_str()) && !unresolved.contains(hash) {
                         unresolved.push(hash.clone());
                     }
@@ -1656,24 +1701,19 @@ impl Store {
                         ],
                     )?;
                     {
-                        for (kind, content, created_at, references) in &session.events {
+                        for (created_at, prepared) in &session.events {
                             // Refused rather than linked to nothing: a reference the archive did
                             // not carry and the store does not hold would be an image no reader
                             // could ever show.
-                            if let Some(hash) = super::blobs::missing_blob(&transaction, references)? {
+                            if let Some(hash) =
+                                super::blobs::missing_blob(&transaction, prepared.references())?
+                            {
                                 return Err(rusqlite::Error::InvalidParameterName(format!(
                                     "the archive references image blob {hash}, which it does not \
                                      carry and this store does not hold"
                                 )));
                             }
-                            let message_id = super::search::insert_message(
-                                &transaction,
-                                &session.id,
-                                kind,
-                                content,
-                                created_at,
-                            )?;
-                            super::blobs::link_message_blobs(&transaction, message_id, references)?;
+                            insert_event(&transaction, &session.id, prepared, created_at)?;
                         }
                     }
                     {
@@ -1876,8 +1916,9 @@ impl Store {
             .map_err(|error| MekaError::Database(format!("failed to load session tree: {error}")))
     }
 
-    /// Persist a single plain row into the `messages` table, carrying no image. Tests call this
-    /// directly to populate fixtures; everything else goes through the event API.
+    /// Persist a single plain row into the `messages` table as written, bypassing the event
+    /// door: a fixture may need a kind no event encodes to. Tests only; everything else goes
+    /// through the event API.
     #[cfg(test)]
     pub(super) async fn save_message(
         &self,
@@ -1885,15 +1926,26 @@ impl Store {
         kind: &str,
         content: &str,
     ) -> Result<()> {
-        self.save_row(
-            session_id,
-            kind.to_string(),
-            content.to_string(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )
-        .await
+        let (kind, content) = (kind.to_string(), content.to_string());
+        let now = chrono::Utc::now().to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let transaction = connection.transaction()?;
+                super::search::insert_message(
+                    &transaction,
+                    &session_id.to_string(),
+                    &kind,
+                    &content,
+                    &now,
+                )?;
+                transaction.execute(
+                    "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![now, session_id.to_string()],
+                )?;
+                transaction.commit()
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to save message: {error}")))
     }
 
     /// The row half of [`Self::save_event`]: the message, the blobs it took its images out into,
@@ -1901,10 +1953,7 @@ impl Store {
     async fn save_row(
         &self,
         session_id: Uuid,
-        kind: String,
-        content: String,
-        blobs: Vec<super::blobs::NewBlob>,
-        references: Vec<String>,
+        prepared: PreparedEvent,
         appended_inbox_items: Vec<String>,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
@@ -1915,15 +1964,7 @@ impl Store {
                 // session's `updated_at` moving is ordered wrong in every listing and judged
                 // expired by the retention sweep despite the turn that wrote it.
                 let transaction = connection.transaction()?;
-                super::blobs::insert_blobs(&transaction, &blobs, &now)?;
-                let message_id = super::search::insert_message(
-                    &transaction,
-                    &session_id.to_string(),
-                    &kind,
-                    &content,
-                    &now,
-                )?;
-                super::blobs::link_message_blobs(&transaction, message_id, &references)?;
+                insert_event(&transaction, &session_id.to_string(), &prepared, &now)?;
                 super::inbox::stamp_appended(&transaction, &appended_inbox_items, &now)?;
                 transaction.execute(
                     "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
@@ -2066,14 +2107,13 @@ impl Store {
         session_id: Uuid,
         event: &crate::conversation::Event,
     ) -> Result<()> {
-        let (kind, content) = encode_event_for_db(event)
-            .map_err(|error| MekaError::Database(format!("failed to encode event: {error}")))?;
+        let prepared = PreparedEvent::from_event(event);
         let now = chrono::Utc::now().to_rfc3339();
         let session_id = session_id.to_string();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let transaction = connection.transaction()?;
-                super::search::insert_message(&transaction, &session_id, &kind, &content, &now)?;
+                insert_event(&transaction, &session_id, &prepared, &now)?;
                 super::inbox::reset_appended_in(&transaction, &session_id)?;
                 transaction.execute(
                     "UPDATE sessions SET context_tokens = NULL, updated_at = ?1 WHERE id = ?2",
@@ -2340,8 +2380,8 @@ impl Store {
     ///
     /// `cursor`, if `Some`, is a previous `next_cursor` value from this method; rows are returned
     /// strictly *after* the cursor in the listing's order. Returns `(rows, next_cursor)`;
-    /// `next_cursor` is `Some` iff there is at least one more row past `limit`. Invalid cursors
-    /// are rejected with [`MekaError::Database`].
+    /// `next_cursor` is `Some` iff there is at least one more row past `limit`. A cursor this
+    /// method did not issue is refused with [`MekaError::Usage`], the caller's to fix.
     pub(crate) async fn list_sessions(
         &self,
         limit: u32,
@@ -2413,8 +2453,11 @@ impl Store {
                 let mut statement = connection.prepare(&query)?;
 
                 // Fetch one extra row to detect whether a next page exists without a second COUNT
-                // query.
-                let fetch_limit: i64 = i64::from(limit).saturating_add(1);
+                // query. Zero is every row, with no page after it.
+                let fetch_limit: i64 = match limit {
+                    0 => -1,
+                    limit => i64::from(limit).saturating_add(1),
+                };
                 let mut params: Vec<(&str, &dyn rusqlite::ToSql)> = Vec::new();
                 params.push((":limit", &fetch_limit));
                 if let Some(ref cwd) = cwd_filter_string {
@@ -2494,7 +2537,7 @@ impl Store {
                         capabilities_json,
                         additional_roots: decode_additional_roots(additional_roots_json.as_deref()),
                         token_id,
-                        parent_id: parent_id.as_deref().and_then(|raw| Uuid::parse_str(raw).ok()),
+                        parent_id: parent_id.as_deref().and_then(session_id_in),
                         pinned_at,
                     });
                 }
@@ -2502,7 +2545,7 @@ impl Store {
             })
             .await
             .map(|mut rows| {
-                let next_cursor = if rows.len() > limit as usize {
+                let next_cursor = if limit > 0 && rows.len() > limit as usize {
                     rows.truncate(limit as usize);
                     rows.last().map(encode_list_cursor)
                 } else {
@@ -2609,7 +2652,7 @@ impl Store {
                             token_id,
                             parent_id: parent_id
                                 .as_deref()
-                                .and_then(|raw| Uuid::parse_str(raw).ok()),
+                                .and_then(session_id_in),
                             pinned_at,
                         }))
                     }
@@ -2708,11 +2751,9 @@ impl Store {
     /// next turn runs against the provider and *then* fails on a foreign-key violation, with the
     /// answer paid for and lost, and every later turn in that REPL fails the same way.
     ///
-    /// A locked *child* is not separately checked. The cascade would take one with its parent, but
-    /// children are sub-agent rows, and the only thing that locks one is `agent_followup`, for the
-    /// length of a sub-agent turn that runs inside its parent's turn. The parent is locked for as
-    /// long as that lasts, so a live child always has a live parent, and the parent's lock is what
-    /// spares the pair.
+    /// A root is locked with every sub-agent under it, since the cascade takes them: a child
+    /// spawned with `background: true` keeps its lock for as long as it runs, after its parent's
+    /// turn has ended and released the parent's.
     pub(crate) async fn delete_expired_sessions(
         &self,
         retention: std::time::Duration,
@@ -2740,13 +2781,8 @@ impl Store {
         let expired: Vec<Uuid> = self
             .connection
             .call(move |connection| -> rusqlite::Result<_> {
-                // FK CASCADE sweeps messages, scratchpad entries, and any sub-agent child sessions
-                // of the expired parents.
-                //
-                // A pinned session is never expired: a pin is the user saying keep this. Nor is a
-                // session with a scheduled job still ahead of it, whatever `updated_at` says;
-                // `NOT_SPOKEN_FOR_BY_A_SCHEDULE` says why the whole parent chain of a job-owning
-                // session is spared.
+                // Roots alone, with `EXPIRABLE` saying why; the cascade takes each root's
+                // sub-agents, and their messages, scratchpad entries and blobs with them.
                 //
                 // Selected rather than deleted outright, because which of these rows may go is not
                 // a question the database can answer: it depends on which of them another process
@@ -2754,9 +2790,8 @@ impl Store {
                 // inside the delete, so splitting one statement into two does not open a window
                 // where a job created in between is cascaded away by a decision taken before it
                 // existed.
-                let expirable = EXPIRABLE.as_str();
                 let mut statement = connection.prepare(&format!(
-                    "SELECT id FROM sessions WHERE updated_at < ?1 AND {expirable}"
+                    "SELECT id FROM sessions WHERE updated_at < ?1 AND {EXPIRABLE}"
                 ))?;
                 let ids = statement
                     .query_map(rusqlite::params![cutoff_str], |row| row.get::<_, String>(0))?
@@ -2768,15 +2803,11 @@ impl Store {
                 MekaError::Database(format!("failed to list expired sessions: {error}"))
             })?
             .into_iter()
-            .filter_map(|id| Uuid::parse_str(&id).ok())
+            .filter_map(|id| session_id_in(&id))
             .collect();
 
-        self.delete_the_unattached_among(
-            &expired,
-            EXPIRABLE.as_str(),
-            Some(cutoff_for_delete.as_str()),
-        )
-        .await
+        self.delete_the_unattached_among(&expired, EXPIRABLE, Some(cutoff_for_delete.as_str()))
+            .await
     }
 
     /// Delete every one of `candidates` whose lock this process can take, and report what it left.
@@ -2797,6 +2828,10 @@ impl Store {
     /// sessions would otherwise hold ten thousand at once and hit the process limit, turning a
     /// housekeeping pass into a hard failure. The chunk is the unit of both locking and deleting,
     /// so no lock is held longer than its own statement.
+    ///
+    /// Every candidate is locked as a tree, root and sub-agents, since its deletion cascades to
+    /// them: a sub-agent another process is running keeps its root, and is reported as left open.
+    /// The callers hand in roots, so no tree is locked twice.
     pub(super) async fn delete_the_unattached_among(
         &self,
         candidates: &[Uuid],
@@ -2806,71 +2841,89 @@ impl Store {
         // the select and the delete has a fresh `updated_at`, and the stale list still names it.
         updated_before: Option<&str>,
     ) -> Result<SessionSweep> {
-        /// Sessions locked and deleted per statement. Well under SQLite's parameter ceiling
-        /// (32,766) and well under any sane descriptor limit.
+        /// Locks held and sessions deleted per statement. Counted in locks rather than candidates,
+        /// since a root locked as a tree holds one per member: well under SQLite's parameter
+        /// ceiling (32,766), and under the usual descriptor limit of 1024 with room for the store's
+        /// own. A tree larger than this is one batch on its own.
         const CHUNK: usize = 100;
 
         let mut sweep = SessionSweep::default();
-        for chunk in candidates.chunks(CHUNK) {
-            let mut held = Vec::with_capacity(chunk.len());
-            for id in chunk {
-                match self.lock_session(*id) {
-                    Ok(lock) => held.push((*id, lock)),
-                    // Not "someone has it" but "we could not ask", which is the same answer here:
-                    // a session this process cannot establish a claim on is one it must not
-                    // delete. Counted as attached so the caller still reports incomplete coverage.
-                    Err(_) => sweep.attached_elsewhere += 1,
+        let mut held: Vec<(Uuid, Vec<FileLock>)> = Vec::new();
+        let mut held_locks = 0;
+        let mut candidates = candidates.iter().peekable();
+        while let Some(id) = candidates.next() {
+            match self.lock_tree(*id).await {
+                Ok(locks) => {
+                    held_locks += locks.len();
+                    held.push((*id, locks));
                 }
+                // Not "someone has it" but "we could not ask", which is the same answer here:
+                // a session this process cannot establish a claim on is one it must not
+                // delete. Counted as attached so the caller still reports incomplete coverage.
+                Err(_) => sweep.attached_elsewhere += 1,
             }
-            if held.is_empty() {
+            if held.is_empty() || (held_locks < CHUNK && candidates.peek().is_some()) {
                 continue;
             }
-            let ids: Vec<String> = held.iter().map(|(id, _)| id.to_string()).collect();
-            let updated_before = updated_before.map(str::to_string);
-            let deleted = self
-                .connection
-                .call(move |connection| -> rusqlite::Result<_> {
-                    let placeholders = vec!["?"; ids.len()].join(",");
-                    let cutoff_clause = match &updated_before {
-                        Some(_) => format!(" AND updated_at < ?{}", ids.len() + 1),
-                        None => String::new(),
-                    };
-                    let parameters: Vec<String> = ids
-                        .iter()
-                        .cloned()
-                        .chain(updated_before.iter().cloned())
-                        .collect();
-                    let transaction = connection.transaction()?;
-                    let deleted = transaction.execute(
-                        &format!(
-                            "DELETE FROM sessions WHERE id IN ({}){}{}",
-                            placeholders,
-                            match still_eligible {
-                                "" => String::new(),
-                                predicate => format!(" AND {predicate}"),
-                            },
-                            cutoff_clause
-                        ),
-                        rusqlite::params_from_iter(parameters.iter()),
-                    )?;
-                    super::blobs::sweep_unreferenced_blobs(&transaction)?;
-                    transaction.commit()?;
-                    Ok(deleted)
-                })
-                .await
-                .map_err(|error| {
-                    MekaError::Database(format!("failed to delete sessions: {error}"))
-                })?;
-            sweep.deleted += deleted as u64;
-            // Before the sweep below, not after: `prune_orphan_lock_files` refuses to unlink a
-            // file whose lock it cannot take, and this process is holding every one of these.
-            drop(held);
+            let batch = std::mem::take(&mut held);
+            held_locks = 0;
+            sweep.deleted += self
+                .delete_held_batch(batch, still_eligible, updated_before)
+                .await?;
         }
         if sweep.deleted > 0 {
             self.optimize_search_index().await?;
         }
         self.prune_orphan_lock_files().await;
         Ok(sweep)
+    }
+
+    /// Delete the sessions of `held`, whose locks this process holds, in one statement narrowed
+    /// by `still_eligible` and `updated_before`; how many went. The locks are released here,
+    /// ahead of the lock-file sweep that refuses to unlink a file it cannot lock.
+    async fn delete_held_batch(
+        &self,
+        held: Vec<(Uuid, Vec<FileLock>)>,
+        still_eligible: &str,
+        updated_before: Option<&str>,
+    ) -> Result<u64> {
+        let ids: Vec<String> = held.iter().map(|(id, _)| id.to_string()).collect();
+        let updated_before = updated_before.map(str::to_string);
+        let still_eligible = still_eligible.to_string();
+        let deleted = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let placeholders = vec!["?"; ids.len()].join(",");
+                let cutoff_clause = match &updated_before {
+                    Some(_) => format!(" AND updated_at < ?{}", ids.len() + 1),
+                    None => String::new(),
+                };
+                let parameters: Vec<String> = ids
+                    .iter()
+                    .cloned()
+                    .chain(updated_before.iter().cloned())
+                    .collect();
+                let transaction = connection.transaction()?;
+                let deleted = transaction.execute(
+                    &format!(
+                        "DELETE FROM sessions WHERE id IN ({}){}{}",
+                        placeholders,
+                        match still_eligible.as_str() {
+                            "" => String::new(),
+                            predicate => format!(" AND {predicate}"),
+                        },
+                        cutoff_clause
+                    ),
+                    rusqlite::params_from_iter(parameters.iter()),
+                )?;
+                super::blobs::sweep_unreferenced_blobs(&transaction)?;
+                transaction.commit()?;
+                Ok(deleted)
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to delete sessions: {error}")))?;
+        drop(held);
+        Ok(deleted as u64)
     }
 
     /// Move what a host may move on a session's row, in one statement, bumping `updated_at`.
@@ -3065,20 +3118,33 @@ impl Store {
     }
 
     /// Delete a session, refusing with [`MekaError::SessionLocked`] if another meka process has it
-    /// open. The door for a caller acting on a session it does not hold: `meka session delete`.
+    /// or a sub-agent under it open. The door for a caller acting on a session it does not hold:
+    /// `meka session delete`, and the servers' deletes of a session they have not loaded.
     ///
     /// Without it, `meka session delete <id>` against a live REPL exits 0 having said nothing at
     /// all (the count goes through `tracing::info!`, invisible at the default level) while the row
     /// and its messages cascade away underneath a conversation that carries on until its next turn
-    /// fails on a foreign-key violation.
+    /// fails on a foreign-key violation. The sub-agents are locked too, since the cascade takes
+    /// them: one spawned with `background: true` may be running after its parent's turn ended.
     pub(crate) async fn delete_session_unless_attached(&self, session_id: Uuid) -> Result<bool> {
-        let lock = self.lock_session(session_id)?;
+        let held = self.lock_tree(session_id).await?;
         let deleted = self.delete_session_row(session_id).await?;
-        // Released before the sweep: it will not unlink a file it cannot lock, and that file is
-        // this one.
-        drop(lock);
+        // Released before the sweep: it will not unlink a file it cannot lock, and these are the
+        // files.
+        drop(held);
         self.prune_orphan_lock_files().await;
         Ok(deleted)
+    }
+
+    /// The locks on a session and every sub-agent under it, root first, or the
+    /// [`MekaError::SessionLocked`] of the first one another process holds. Nothing is held when
+    /// the refusal comes back.
+    async fn lock_tree(&self, root: Uuid) -> Result<Vec<FileLock>> {
+        let mut held = Vec::new();
+        for row in self.load_session_tree(root).await? {
+            held.push(self.lock_session(row.id)?);
+        }
+        Ok(held)
     }
 
     /// Delete a session and every sub-agent under it, refusing with [`MekaError::SessionLocked`]
@@ -3088,10 +3154,7 @@ impl Store {
     /// it. Every id is locked before the one statement runs, root first, so the refusal names the
     /// session that is busy and nothing is deleted ahead of it.
     pub(crate) async fn delete_session_tree_unless_attached(&self, root: Uuid) -> Result<bool> {
-        let mut held = Vec::new();
-        for row in self.load_session_tree(root).await? {
-            held.push(self.lock_session(row.id)?);
-        }
+        let held = self.lock_tree(root).await?;
         let deleted = self.delete_session_row(root).await?;
         // Released before the sweep, for the reason `delete_session_unless_attached` gives.
         drop(held);
@@ -3100,11 +3163,15 @@ impl Store {
     }
 
     /// Delete every session no other meka process has open, and report what was left behind.
+    ///
+    /// Roots alone, each locked and deleted with its sub-agents: the cascade takes them anyway,
+    /// and a child listed on its own would be counted as left open and then taken with its root.
     pub(crate) async fn delete_all_sessions(&self) -> Result<SessionSweep> {
         let ids: Vec<Uuid> = self
             .connection
             .call(move |connection| -> rusqlite::Result<_> {
-                let mut statement = connection.prepare("SELECT id FROM sessions")?;
+                let mut statement = connection
+                    .prepare("SELECT id FROM sessions WHERE parent_session_id IS NULL")?;
                 let ids = statement
                     .query_map([], |row| row.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<String>>>()?;
@@ -3113,7 +3180,7 @@ impl Store {
             .await
             .map_err(|error| MekaError::Database(format!("failed to list sessions: {error}")))?
             .into_iter()
-            .filter_map(|id| Uuid::parse_str(&id).ok())
+            .filter_map(|id| session_id_in(&id))
             .collect();
         // No further condition: `--all` means every session nobody else has open, schedules
         // included. Sparing a job-owning session here would make the command quietly not mean what
@@ -3367,6 +3434,202 @@ mod tests {
              not counted twice"
         );
         assert!(!store.session_exists(child).await.expect("exists"));
+    }
+
+    /// A rewind and a withdrawal take the one door into `messages`, so an image inside the repair
+    /// they write rests in a blob like an image a turn saved, and the row carries its reference.
+    #[tokio::test]
+    async fn a_rewind_externalizes_images_like_a_save() {
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "words").await;
+        let with_image = crate::conversation::Message::user_with_images("look", vec![
+            crate::image::ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: "QUJD".to_string(),
+            },
+        ]);
+        store
+            .save_rewind(id, &crate::conversation::Event::Repair {
+                replaced_count: 0,
+                messages: vec![with_image.clone()],
+            })
+            .await
+            .expect("save the rewind");
+        store
+            .save_event_resetting_inbox(
+                id,
+                &crate::conversation::Event::Repair {
+                    replaced_count: 0,
+                    messages: vec![with_image],
+                },
+                &[],
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("save the withdrawal");
+        assert_eq!(
+            store.blob_count().await.expect("count"),
+            1,
+            "one image, stored once, referenced by both rows"
+        );
+        let events = store.load_events(id).await.expect("load");
+        let inline = events.iter().any(|event| {
+            let crate::conversation::Event::Repair { messages, .. } = event else {
+                return false;
+            };
+            messages.iter().any(|message| {
+                message.content.iter().any(|block| {
+                    matches!(block, crate::conversation::ContentBlock::Image {
+                        source: crate::image::ImageSource::Base64 { .. }
+                    })
+                })
+            })
+        });
+        assert!(!inline, "no row carries the bytes inline: {events:?}");
+    }
+
+    /// `-n 0` is every session, with no page after it, as it is on every listing that takes a
+    /// count.
+    #[tokio::test]
+    async fn a_zero_limit_lists_every_session_with_no_next_page() {
+        let store = Store::for_test().await;
+        for words in ["one", "two", "three"] {
+            plain_session(&store, words).await;
+        }
+        let (rows, next) = store
+            .list_sessions(0, false, None, None)
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(next, None);
+        let (rows, next) = store
+            .list_sessions(2, false, None, None)
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 2);
+        assert!(next.is_some(), "a bounded page still says there is more");
+    }
+
+    /// The SQL title rule skips a `user_blocks` row it cannot read as the decoder skips it, so
+    /// a corrupt row hides neither the listing nor the resume that reads the row through it: one
+    /// that is not JSON, and one that is JSON but not an array of blocks, whose bare string
+    /// element `json_extract` would refuse as malformed for the whole listing.
+    #[tokio::test]
+    async fn a_corrupt_user_blocks_row_hides_nothing() {
+        let store = Store::for_test().await;
+        let id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        let session = id.to_string();
+        // Ahead of the words, so the title rule meets them before it finds the words.
+        store
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                for content in ["{not json", "[\"hello\"]"] {
+                    connection.execute(
+                        "INSERT INTO messages (session_id, kind, content, created_at) \
+                         VALUES (?1, 'user_blocks', ?2, ?3)",
+                        rusqlite::params![session, content, chrono::Utc::now().to_rfc3339()],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("insert the corrupt rows");
+        store
+            .save_message(id, "user", "the words")
+            .await
+            .expect("seed");
+        let (rows, _) = store
+            .list_sessions(10, false, None, None)
+            .await
+            .expect("the listing survives the row");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "the words");
+        assert_eq!(row(&store, id).await.title, "the words");
+    }
+
+    /// A session expires as a tree: an old sub-agent under a kept root stays, since every other
+    /// door treats the two as one unit, and a root that expires takes its sub-agents however they
+    /// are dated.
+    #[tokio::test]
+    async fn the_retention_sweep_takes_a_root_and_its_sub_agents_together() {
+        let store = Store::for_test().await;
+        let kept_root = plain_session(&store, "pinned root").await;
+        let old_child = plain_session(&store, "an old sub-agent under it").await;
+        store.mark_spawned_for_test(old_child, kept_root).await;
+        let expired_root = plain_session(&store, "expired root").await;
+        let fresh_child = plain_session(&store, "a sub-agent dated after the cutoff").await;
+        store.mark_spawned_for_test(fresh_child, expired_root).await;
+        let old = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
+        for id in [kept_root, old_child, expired_root] {
+            store
+                .set_session_updated_at_for_test(id, &old)
+                .await
+                .expect("backdate");
+        }
+        store
+            .update_session(kept_root, SessionPatch {
+                pinned: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("pin");
+
+        let sweep = store
+            .delete_expired_sessions(std::time::Duration::from_secs(30 * 86_400))
+            .await
+            .expect("sweep");
+        assert_eq!(
+            sweep.deleted, 1,
+            "one root; its sub-agent went by the cascade"
+        );
+        assert!(store.session_exists(kept_root).await.expect("exists"));
+        assert!(
+            store.session_exists(old_child).await.expect("exists"),
+            "an old sub-agent under a kept root is kept with it"
+        );
+        assert!(!store.session_exists(expired_root).await.expect("exists"));
+        assert!(
+            !store.session_exists(fresh_child).await.expect("exists"),
+            "a sub-agent goes with its root whatever its own date"
+        );
+    }
+
+    /// The sweep locks a root as a tree: a sub-agent another process is running keeps its root,
+    /// since the cascade would take the child from under that process, and the sweep reports the
+    /// root as left open rather than deleted.
+    #[tokio::test]
+    async fn the_retention_sweep_spares_a_root_whose_sub_agent_another_process_holds() {
+        let store = Store::for_test().await;
+        let root = plain_session(&store, "an old root").await;
+        let child = plain_session(&store, "a sub-agent somebody is running").await;
+        store.mark_spawned_for_test(child, root).await;
+        let old = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
+        for id in [root, child] {
+            store
+                .set_session_updated_at_for_test(id, &old)
+                .await
+                .expect("backdate");
+        }
+        let held = store.lock_session(child).expect("hold the sub-agent");
+
+        let sweep = store
+            .delete_expired_sessions(std::time::Duration::from_secs(30 * 86_400))
+            .await
+            .expect("sweep");
+        assert_eq!(
+            sweep.deleted, 0,
+            "the root is not taken from under its child"
+        );
+        assert_eq!(
+            sweep.attached_elsewhere, 1,
+            "and it is reported as left open"
+        );
+        assert!(store.session_exists(root).await.expect("exists"));
+        assert!(store.session_exists(child).await.expect("exists"));
+        drop(held);
     }
 
     /// The copy names the same conversation, so it keeps the title; it is a new session, so it
@@ -5842,7 +6105,7 @@ mod tests {
             .expect("create the job");
 
         let sweep = store
-            .delete_the_unattached_among(&[scheduled, ordinary], NOT_SPOKEN_FOR_BY_A_SCHEDULE, None)
+            .delete_the_unattached_among(&[scheduled, ordinary], EXPIRABLE, None)
             .await
             .expect("sweep");
 

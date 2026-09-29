@@ -26,11 +26,7 @@ use crate::image::ImageSource;
 /// [`Conversation::ends_on_a_turn_opening`], which asks whether a turn produced anything at all:
 /// two callers that must agree on where a turn begins.
 fn opens_turn(message: &Message) -> bool {
-    message.role == Role::User
-        && !message
-            .content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+    message.opens_turn()
 }
 
 /// One entry in the underlying event log of a [`Conversation`]. Persisted as a single row in the
@@ -953,6 +949,18 @@ pub(crate) enum ContentBlock {
     },
 }
 impl ContentBlock {
+    /// A thinking block when it carries replayable state: visible text or something opaque (a
+    /// signature, sealed reasoning). Under `redact-thinking` or display updates the text is empty
+    /// but the signature must survive to continue the chain; an empty unsigned block is nothing
+    /// to replay. One rule for the streamed fold and the whole-reply parser, so a resumed
+    /// transcript never differs from the live turn by a block one of them kept.
+    pub(crate) fn replayable_thinking(
+        thinking: String,
+        opaque: Option<OpaqueReasoning>,
+    ) -> Option<Self> {
+        (!thinking.is_empty() || opaque.is_some()).then_some(Self::Thinking { thinking, opaque })
+    }
+
     /// The block as one searchable string, labeled by what it is where it is not plain text, or
     /// `None` for a block that holds no words: an image, and the context block meka writes ahead
     /// of a turn. The one definition of a block's text for search, read by the
@@ -1002,6 +1010,19 @@ pub(crate) struct Message {
     pub(crate) content: Vec<ContentBlock>,
 }
 impl Message {
+    /// Whether this message opens a turn: a user message carrying no tool result. The other user
+    /// message, the envelope of results a tool round answers with, continues the turn the model
+    /// is still working on. The one spelling of the rule: a rewind counts turns by it, a
+    /// compaction splits on it, an export and a wire encoder shape the message by it, and a
+    /// worker listing counts by it.
+    pub(crate) fn opens_turn(&self) -> bool {
+        self.role == Role::User
+            && !self
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+    }
+
     /// A user message carrying only `text`.
     pub(crate) fn user(text: impl Into<String>) -> Self {
         Self {
@@ -1296,11 +1317,7 @@ pub(crate) fn write_message_markdown(
     match message.role {
         crate::conversation::Role::User => {
             // A `User` message is either a turn or a tool-results envelope; the blocks say which.
-            let has_tool_results = message
-                .content
-                .iter()
-                .any(|block| matches!(block, crate::conversation::ContentBlock::ToolResult { .. }));
-            if has_tool_results {
+            if !message.opens_turn() {
                 for block in &message.content {
                     if let crate::conversation::ContentBlock::ToolResult {
                         content, is_error, ..
@@ -2600,5 +2617,137 @@ mod tests {
             refusal.contains("keep, withdraw"),
             "the refusal lists what would have been accepted: {refusal}"
         );
+    }
+
+    fn user_msg(text: &str) -> crate::conversation::Message {
+        crate::conversation::Message::user(text)
+    }
+
+    fn assistant_text(text: &str) -> crate::conversation::Message {
+        crate::conversation::Message::assistant_text(text)
+    }
+
+    fn assistant_tool_use(id: &str, name: &str) -> crate::conversation::Message {
+        crate::conversation::Message {
+            role: crate::conversation::Role::Assistant,
+            content: vec![crate::conversation::ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input: serde_json::json!({}),
+            }],
+        }
+    }
+
+    fn tool_result(tool_use_id: &str) -> crate::conversation::Message {
+        crate::conversation::Message {
+            role: crate::conversation::Role::User,
+            content: vec![crate::conversation::ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: vec![crate::conversation::ToolResultContent::Text {
+                    text: "ok".to_string(),
+                }],
+                is_error: false,
+            }],
+        }
+    }
+
+    fn build_log(messages: Vec<crate::conversation::Message>) -> crate::conversation::Conversation {
+        crate::conversation::Conversation::from_vec(messages)
+    }
+
+    #[test]
+    fn validate_valid_chain() {
+        let mut log = build_log(vec![
+            user_msg("hello"),
+            assistant_tool_use("c1", "file_read"),
+            tool_result("c1"),
+            assistant_text("done"),
+        ]);
+        let dropped = log.sanitize_orphans();
+        assert!(dropped.is_empty());
+        assert_eq!(log.len(), 4);
+    }
+
+    #[test]
+    fn validate_orphaned_tool_use_dropped() {
+        let mut log = build_log(vec![
+            user_msg("hello"),
+            assistant_tool_use("c1", "file_read"),
+            // Missing tool_result for c1
+            assistant_text("done"),
+        ]);
+        let dropped = log.sanitize_orphans();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(log.len(), 2);
+        let view = log.as_slice();
+        assert_eq!(view[0].role, crate::conversation::Role::User);
+        assert_eq!(view[1].role, crate::conversation::Role::Assistant);
+        assert_eq!(view[1].text_content(), "done");
+    }
+
+    #[test]
+    fn validate_orphaned_at_end() {
+        let mut log = build_log(vec![
+            user_msg("hello"),
+            assistant_tool_use("c1", "file_read"),
+        ]);
+        log.sanitize_orphans();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.as_slice()[0].text_content(), "hello");
+    }
+
+    #[test]
+    fn validate_mismatched_ids() {
+        let mut log = build_log(vec![
+            user_msg("hello"),
+            assistant_tool_use("c1", "file_read"),
+            tool_result("c2"), // Wrong ID
+        ]);
+        log.sanitize_orphans();
+        // The assistant message is dropped because c1 has no matching result.
+        assert_eq!(log.len(), 2);
+    }
+
+    #[test]
+    fn validate_text_only_preserved() {
+        let mut log = build_log(vec![
+            user_msg("hello"),
+            assistant_text("hi"),
+            user_msg("bye"),
+        ]);
+        log.sanitize_orphans();
+        assert_eq!(log.len(), 3);
+    }
+
+    #[test]
+    fn validate_multiple_chains() {
+        let mut log = build_log(vec![
+            user_msg("start"),
+            assistant_tool_use("c1", "file_read"),
+            tool_result("c1"),
+            assistant_tool_use("c2", "file_write"),
+            // Missing tool_result for c2
+            assistant_text("done"),
+        ]);
+        log.sanitize_orphans();
+        // c2 should be dropped, rest preserved.
+        assert_eq!(log.len(), 4);
+        assert_eq!(log.as_slice()[3].text_content(), "done");
+    }
+
+    #[test]
+    fn export_without_compaction_renders_plain_turns() {
+        let mut log = crate::conversation::Conversation::new();
+        log.append(user_msg("hello"));
+        log.append(assistant_text("hi there"));
+        let markdown = crate::conversation::format_session_as_markdown(
+            uuid::Uuid::nil(),
+            log.events(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(markdown.contains("## User") && markdown.contains("hello"));
+        assert!(markdown.contains("## Assistant") && markdown.contains("hi there"));
+        // No compaction happened, so no boundary marker.
+        assert!(!markdown.contains("Session compaction"));
     }
 }

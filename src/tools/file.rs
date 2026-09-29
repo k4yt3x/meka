@@ -5404,7 +5404,7 @@ mod tests {
         std::fs::create_dir(&work).expect("work");
 
         let cwd = crate::workspace::SharedCwd::new(work);
-        resolve_write_target(
+        let (target, _lock) = resolve_write_target(
             "file_write",
             &cwd,
             &crate::workspace::WriteScope::unconfined(),
@@ -5412,6 +5412,11 @@ mod tests {
         )
         .await
         .expect("unrestricted must not confine");
+        assert_eq!(
+            target,
+            base.join("out.txt"),
+            "the write lands where it was aimed, outside the working directory"
+        );
     }
 
     /// A path past `MAX_PATH` still resolves, writes and reads back after the verbatim prefix is

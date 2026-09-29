@@ -174,47 +174,64 @@ impl BackgroundTasks {
     /// Callers should bound this: canceling asks, and a task that does not answer must not hold
     /// the terminal.
     pub(crate) async fn wait_all(&self) {
-        let joins: Vec<tokio::task::JoinHandle<()>> = {
-            let mut guard = self.inner.lock().await;
-            let ids: Vec<String> = guard.keys().cloned().collect();
-            let joins: Vec<tokio::task::JoinHandle<()>> = ids
-                .into_iter()
-                .filter_map(|id| guard.remove(&id).and_then(|handle| handle.join))
-                .collect();
-            drop(guard);
-            joins
-        };
-        for join in joins {
+        let joins = self.take_joins(|_| true).await;
+        for (id, join) in joins {
             if let Err(error) = join.await {
                 tracing::warn!("background task ended abnormally: {error}");
             }
+            self.forget(&id).await;
         }
+    }
+
+    /// The join handles of the tasks `wanted` selects, leaving their entries registered: a wait
+    /// that is cut short must leave `cancel_all` something to reach, and the joined entries are
+    /// removed once each join has returned.
+    async fn take_joins(
+        &self,
+        wanted: impl Fn(&TaskHandle) -> bool,
+    ) -> Vec<(String, tokio::task::JoinHandle<()>)> {
+        let mut guard = self.inner.lock().await;
+        let ids: Vec<String> = guard
+            .iter()
+            .filter(|(_, handle)| wanted(handle))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let joins = ids
+            .into_iter()
+            .filter_map(|id| {
+                guard
+                    .get_mut(&id)
+                    .and_then(|handle| handle.join.take())
+                    .map(|join| (id, join))
+            })
+            .collect();
+        drop(guard);
+        joins
     }
 
     /// Wait for this session's tasks to finish, for a host with nowhere to deliver an outcome
     /// later. `--oneshot` is the case: the process exits with the turn, so a background call there
     /// has to degrade into a slow synchronous one rather than a promise nothing will keep.
+    ///
+    /// The handles stay registered while the wait runs, each task removing its own on the way
+    /// out: a wait that takes them out first leaves a Ctrl+C during it with nothing for
+    /// `cancel_all` to reach, and the work runs on untracked.
     pub(crate) async fn wait_for_session(&self, session_id: Uuid) {
-        let joins: Vec<tokio::task::JoinHandle<()>> = {
-            let mut guard = self.inner.lock().await;
-            let ids: Vec<String> = guard
-                .iter()
-                .filter(|(_, handle)| handle.session_id == session_id)
-                .map(|(id, _)| id.clone())
-                .collect();
-            let joins: Vec<tokio::task::JoinHandle<()>> = ids
-                .into_iter()
-                .filter_map(|id| guard.remove(&id).and_then(|handle| handle.join))
-                .collect();
-            drop(guard);
-            joins
-        };
-        for join in joins {
+        let joins = self
+            .take_joins(|handle| handle.session_id == session_id)
+            .await;
+        for (id, join) in joins {
             // A panicking task has already written its own `failed` outcome via the dispatch
             // wrapper, so there is nothing to report here beyond not hanging on it.
             if let Err(error) = join.await {
                 tracing::warn!("background task ended abnormally: {error}");
             }
+            self.forget(&id).await;
+        }
+        // A wait that was cut short took the handles with it, so a second wait, after a cancel,
+        // has none to join; the entry every task removes on its way out is what it waits on.
+        while self.running_count(session_id).await > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 }

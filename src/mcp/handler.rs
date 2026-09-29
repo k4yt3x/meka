@@ -398,8 +398,9 @@ impl McpTool {
         }
         params.meta = Some(meta);
 
-        // Same error surface as an actually-closed transport. The upstream retry logic already
-        // handles `TransportClosed` by attempting a reconnect.
+        // `call` has already refused a server that is not connected in the state's own words; a
+        // state that changed between there and here is a transport that closed, which is what
+        // the retry in `call` reconnects.
         let peer: Peer<RoleClient> = self
             .entry
             .require_connected()
@@ -483,6 +484,12 @@ impl McpTool {
 
         let is_timeout = |error: &ServiceError| matches!(error, ServiceError::Cancelled { reason: Some(reason) } if reason.starts_with("timed out"));
 
+        // Refused in the state's own words when the server is not connected: a server still
+        // connecting, disabled or refused is not a closed transport, and the reconnect the retry
+        // below makes for one is a no-op for these that would then report "transport closed" for
+        // a server somebody shut down.
+        self.entry.require_connected().await?;
+
         // First attempt. On TransportClosed, reconnect and retry once.
         let result = match self.call_tool_once(params.clone(), context).await {
             Ok(result) => result,
@@ -495,11 +502,11 @@ impl McpTool {
                 return Err(MekaError::McpToolExecution {
                     server_name: self.entry.server_name().to_string(),
                     tool_name: self.remote_tool_name.clone(),
-                    message: error.to_string(),
+                    message: crate::text::redact_urls(&error.to_string()),
                 });
             }
             Err(ServiceError::TransportClosed) => {
-                self.entry.reconnect().await?;
+                self.entry.reconnect(&context.cancellation).await?;
                 match self.call_tool_once(params, context).await {
                     Ok(result) => result,
                     Err(ServiceError::Cancelled { reason })
@@ -511,7 +518,7 @@ impl McpTool {
                         return Err(MekaError::McpToolExecution {
                             server_name: self.entry.server_name().to_string(),
                             tool_name: self.remote_tool_name.clone(),
-                            message: error.to_string(),
+                            message: crate::text::redact_urls(&error.to_string()),
                         });
                     }
                 }
@@ -529,7 +536,7 @@ impl McpTool {
                 return Err(MekaError::McpToolExecution {
                     server_name: self.entry.server_name().to_string(),
                     tool_name: self.remote_tool_name.clone(),
-                    message: error.to_string(),
+                    message: crate::text::redact_urls(&error.to_string()),
                 });
             }
         };

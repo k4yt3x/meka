@@ -6498,6 +6498,338 @@ fn compact_replaces_the_window_with_a_summary() {
     );
 }
 
+/// A turn runs on the profile its row names, or not at all: the row is the billing record, and
+/// the guard reads it on this door as on ACP's, so a row moved under a resident session (a
+/// hand-edit, since every other writer is refused by the lock) cannot bill a profile that is gone.
+#[test]
+fn an_http_turn_refuses_a_profile_the_row_no_longer_names() {
+    let harness = ServeTestHarness::spawn("", mock_turns(2));
+    let id = session_with_one_turn(&harness);
+
+    let connection = rusqlite::Connection::open(harness.install.data_dir().join("meka.db"))
+        .expect("open the store");
+    let moved = connection
+        .execute("UPDATE sessions SET profile = 'retired' WHERE id = ?1", [
+            &id,
+        ])
+        .expect("repin the session");
+    assert_eq!(moved, 1, "the repin matched no row");
+    drop(connection);
+
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "again"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        response.status(),
+        422,
+        "{}",
+        response.text().unwrap_or_default()
+    );
+    let body: serde_json::Value = response.json().expect("parse");
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("retired")),
+        "the refusal names the profile the row names: {body}"
+    );
+}
+
+/// A feed reader is told the session is gone by the feed ending, rather than left on a channel
+/// nothing will publish to again.
+#[test]
+fn deleting_a_session_ends_its_feed() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let id = create_session_id(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(8));
+    let deleted = harness
+        .request(reqwest::Method::DELETE, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send");
+    assert!(deleted.status().is_success(), "{}", deleted.status());
+    let started = Instant::now();
+    let body = read_feed_until(feed, |_| false);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the feed must end when the session is deleted, not on the client's timeout: {body}"
+    );
+}
+
+/// A reader attached to a session's feed does not hold the drain: the feed ends with the process,
+/// so axum's graceful shutdown finds no connection to wait for and the process exits clean rather
+/// than through the drain timeout and `exit(1)`, which is what a bridge attached across a restart
+/// would make every restart look like.
+#[cfg(unix)]
+#[test]
+fn a_shutdown_with_a_feed_reader_attached_exits_clean() {
+    let mut harness =
+        ServeTestHarness::spawn("shutdown_drain_timeout = \"5s\"\n", mock_simple_turn());
+    let id = create_session_id(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let reader = std::thread::spawn(move || read_feed_until(feed, |_| false));
+
+    let signaled = Instant::now();
+    let kill_status = Command::new("kill")
+        .arg("-TERM")
+        .arg(harness.child.id().to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill_status.success(), "kill should succeed");
+    let status = harness.child.wait().expect("wait for exit");
+    let elapsed = signaled.elapsed();
+    assert!(
+        status.success(),
+        "a drain with only a feed reader attached exits 0; got {status:?} after {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "the reader must not hold the drain to its timeout: {elapsed:?}"
+    );
+    reader.join().expect("the reader's stream ended");
+}
+
+/// A cursor this server did not issue is the caller's to fix, answered as such rather than as a
+/// fault in the server.
+#[test]
+fn a_cursor_the_server_did_not_issue_is_refused_as_the_callers() {
+    let harness = ServeTestHarness::spawn("", mock_turns(1));
+    let _id = session_with_one_turn(&harness);
+    let response = harness
+        .request(reqwest::Method::GET, "/v1/sessions?cursor=not-a-cursor")
+        .send()
+        .expect("send");
+    assert_eq!(
+        response.status(),
+        422,
+        "{}",
+        response.text().unwrap_or_default()
+    );
+    let body: serde_json::Value = response.json().expect("parse");
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("cursor")),
+        "the refusal names the cursor: {body}"
+    );
+}
+
+/// An inbox item on a session whose row names a profile this process cannot resolve is put off,
+/// not asked about again at once: the driver wakes itself while due items remain, so leaving
+/// them due after the refusal would have it refuse in a loop, warning each time, for as long as
+/// the row stays that way.
+#[test]
+fn an_item_on_a_session_whose_profile_does_not_resolve_waits_instead_of_spinning() {
+    let harness =
+        ServeTestHarness::spawn("\n[schedule]\npoll_interval = \"500ms\"\n", mock_turns(2));
+    let id = session_with_one_turn(&harness);
+
+    let store = rusqlite::Connection::open(harness.install.data_dir().join("meka.db"))
+        .expect("open the store");
+    let moved = store
+        .execute("UPDATE sessions SET profile = 'retired' WHERE id = ?1", [
+            &id,
+        ])
+        .expect("repin the session");
+    assert_eq!(moved, 1, "the repin matched no row");
+
+    let accepted = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .json(&serde_json::json!({"message": "later", "class": "followup"}))
+        .send()
+        .expect("send");
+    assert_eq!(accepted.status(), 202);
+
+    std::thread::sleep(Duration::from_secs(3));
+    let (attempts, not_before): (i64, Option<String>) = store
+        .query_row(
+            "SELECT attempts, not_before FROM inbox_items WHERE session_id = ?1",
+            [&id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read the item");
+    assert_eq!(
+        attempts, 1,
+        "one pass found the profile unresolvable and put the item off once; zero means it was \
+         left due and asked about at once, more means the driver spun"
+    );
+    assert!(
+        not_before.is_some(),
+        "the item carries the time it will be asked about again"
+    );
+}
+
+/// A background task that finishes while nothing is running is delivered as a turn of its own,
+/// and the feed shows it as one: `turn.started` with `source: "background"` and a terminal.
+#[test]
+fn a_finished_task_is_delivered_as_its_own_turn_on_the_feed() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "shell_execute" },
+            { "type": "tool_use_end", "input": {"command": "sleep 1", "background": true} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "started" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "DELIVERED_MARKER" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn(
+        "\n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"200ms\"\n",
+        script,
+    );
+    let id = start_streaming_session(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "run it"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        response.status(),
+        200,
+        "{}",
+        response.text().unwrap_or_default()
+    );
+
+    let body = read_feed_until(feed, |text| {
+        text.rfind("\"source\":\"background\"")
+            .is_some_and(|at| text[at..].contains("event: turn.finished"))
+    });
+    let at = body
+        .find("\"source\":\"background\"")
+        .expect("the delivery opened a turn of its own");
+    let from = body[..at]
+        .rfind("event: turn.started")
+        .expect("the source rides a turn.started");
+    let delivery = &body[from..];
+    let started = sse_event_data(delivery, "turn.started").expect("turn.started");
+    let finished = sse_event_data(delivery, "turn.finished").expect("turn.finished");
+    assert_eq!(
+        finished["turn_id"], started["turn_id"],
+        "the terminal closes the delivery turn: {body}"
+    );
+    assert!(
+        delivery.contains("DELIVERED_MARKER"),
+        "the delivery turn carried the model's reply: {body}"
+    );
+}
+
+/// The checkpoint turn a compaction runs is a turn on the feed like every other: a subscriber sees
+/// `turn.started` with `source: "compaction"` and the terminal that closes it, so its tool calls
+/// and notices arrive under a turn rather than between two.
+#[test]
+fn compact_runs_as_a_turn_on_the_feed() {
+    let harness =
+        ServeTestHarness::spawn("\n[session]\ncompact_checkpoint = false\n", mock_turns(3));
+    let id = session_with_one_turn(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/compact"))
+        .send()
+        .expect("send");
+    assert_eq!(
+        response.status(),
+        200,
+        "compact failed: {}",
+        response.text().unwrap_or_default()
+    );
+
+    // The ring replays the first turn ahead of this one, so the compaction's own `turn.started`
+    // is the anchor, and the terminal after it is the one that must close it.
+    let body = read_feed_until(feed, |text| {
+        text.rfind("\"source\":\"compaction\"")
+            .is_some_and(|at| text[at..].contains("event: turn.finished"))
+    });
+    let at = body
+        .find("\"source\":\"compaction\"")
+        .expect("the compaction opened a turn");
+    let from = body[..at]
+        .rfind("event: turn.started")
+        .expect("the source rides a turn.started");
+    let compaction = &body[from..];
+    let started = sse_event_data(compaction, "turn.started").expect("turn.started");
+    assert_eq!(started["source"], "compaction", "{body}");
+    let finished = sse_event_data(compaction, "turn.finished").expect("turn.finished");
+    assert_eq!(
+        finished["turn_id"], started["turn_id"],
+        "the terminal closes the turn that opened: {body}"
+    );
+    assert!(
+        sse_event_data(compaction, "context.compacted").is_some(),
+        "the compaction itself is on the feed, inside its turn: {body}"
+    );
+}
+
+/// A compaction outlives the request that asked for it, the way a client's turn does: axum drops
+/// the handler's future when the client hangs up, and a compaction dropped after its
+/// `turn.started` would leave the feed's turn open with no terminal and the conversation without
+/// its boundary. The client here gives up in half a second on a summarizer that takes longer; the
+/// feed still shows the turn end, and the store still holds the summary.
+#[test]
+fn a_compaction_finishes_and_closes_its_turn_after_the_client_hangs_up() {
+    let script = serde_json::json!([
+        [
+            { "type": "text", "text": "reply 0" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "sleep", "ms": 2500 },
+            { "type": "text", "text": "the summary" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("\n[session]\ncompact_checkpoint = false\n", script);
+    let id = session_with_one_turn(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+
+    let hung_up = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/compact"))
+        .timeout(Duration::from_millis(500))
+        .send();
+    assert!(
+        hung_up.is_err(),
+        "the client must give up ahead of the summarizer: {hung_up:?}"
+    );
+
+    // Bounded by the clock rather than by the feed alone: a compaction dropped with the request
+    // leaves the turn open, and the keep-alives would hold this read forever.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let body = read_feed_until(feed, |text| {
+        Instant::now() > deadline
+            || text
+                .rfind("\"source\":\"compaction\"")
+                .is_some_and(|at| text[at..].contains("event: turn.finished"))
+    });
+    let at = body
+        .find("\"source\":\"compaction\"")
+        .expect("the compaction opened a turn");
+    let compaction = &body[at..];
+    assert!(
+        sse_event_data(compaction, "turn.finished").is_some(),
+        "the turn closed after the client left: {body}"
+    );
+    assert!(
+        sse_event_data(compaction, "context.compacted").is_some(),
+        "the compaction ran to its end after the client left: {body}"
+    );
+    let messages = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send")
+        .text()
+        .expect("body");
+    assert!(
+        messages.contains("the summary"),
+        "the boundary the client never waited for is in the store: {messages}"
+    );
+}
+
 /// An empty body means "compact with no guidance". Requiring `{}` would make every client send a
 /// payload to say nothing.
 #[test]
@@ -9969,6 +10301,57 @@ fn reattach_on_an_unknown_session_is_404() {
     assert_eq!(body["type"], "https://meka.run/errors/session-not-found");
 }
 
+/// `GET /stream` on a session this process has not loaded revives it, which takes the session's
+/// cross-process lock and pins it in memory for as long as the stream stays open. That is a
+/// driver's act: a token that may only read attaches to a resident session and is told when it is
+/// not one, rather than holding every session it can list against `meka -r`.
+#[test]
+fn a_read_only_token_does_not_revive_a_session_by_streaming_it() {
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "idle_timeout = \"1s\"\ngc_scan_interval = \"1s\"\n\n[[serve.tokens]]\ntoken = \
+         \"sk_test_read\"\nscopes = [\"sessions:r\"]\n",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+    );
+    let id = create_session_id(&harness);
+    harness.wait_until_evicted(&id);
+
+    let reader = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let refused = reader
+        .get(format!("{}/v1/sessions/{id}/stream", harness.base_url))
+        .header("Authorization", "Bearer sk_test_read")
+        .send()
+        .expect("send");
+    let status = refused.status();
+    let body: serde_json::Value = refused.json().expect("problem detail");
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        body["type"]
+            .as_str()
+            .is_some_and(|kind| kind.ends_with("/session-not-loaded")),
+        "{body}"
+    );
+    // The refusal loaded nothing: the session is still evicted.
+    let context: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/context"))
+        .send()
+        .expect("probe")
+        .json()
+        .expect("parse");
+    assert!(
+        context["message_count"].is_null(),
+        "a read token must not have loaded the session: {context}"
+    );
+    // A token that may drive the session gets its feed back.
+    let stream = open_feed(&harness, &id, None, Duration::from_secs(5));
+    assert_eq!(stream.status(), 200);
+}
+
 #[test]
 fn reattach_requires_sessions_read_scope() {
     let harness =
@@ -11095,6 +11478,60 @@ fn task_webhook_payload_omits_the_command_line() {
         }
         Err(_) => panic!("a task.finished delivery must arrive"),
     }
+}
+
+/// A scheduled fire whose session names a profile this process cannot resolve is reported as
+/// `not_run`, as a fire whose session could not be opened is: a subscriber sent looking for a
+/// fault in a turn would find no turn, and the fire is tried again when its lease expires.
+#[test]
+fn a_fire_on_a_session_whose_profile_does_not_resolve_is_reported_as_not_run() {
+    let (port, rx) = spawn_webhook_listener();
+    let config = format!(
+        "\n[schedule]\npoll_interval = \"1s\"\n\n[[serve.webhooks]]\nurl = \
+         \"http://127.0.0.1:{port}/hook\"\nsecret = \"s\"\nevents = [\"schedule.fired\"]\n"
+    );
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "schedule_create" },
+            { "type": "tool_use_end", "input": {
+                "prompt": "NEVER_DELIVERED",
+                "at": "2s"
+            }},
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "scheduled it" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "a reply the fire must never reach" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn(&config, script);
+    let id = create_session_id(&harness);
+    let scheduled = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "remind me in two seconds"}))
+        .send()
+        .expect("send");
+    assert_eq!(scheduled.status(), 200);
+
+    let store = rusqlite::Connection::open(harness.install.data_dir().join("meka.db"))
+        .expect("open the store");
+    let moved = store
+        .execute("UPDATE sessions SET profile = 'retired' WHERE id = ?1", [
+            &id,
+        ])
+        .expect("repin the session");
+    assert_eq!(moved, 1, "the repin matched no row");
+
+    let delivery = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the fire is reported");
+    assert_eq!(delivery.event, "schedule.fired");
+    let payload: serde_json::Value = serde_json::from_str(&delivery.body).expect("json body");
+    assert_eq!(payload["status"], "not_run", "{}", delivery.body);
 }
 
 /// An endpoint that subscribed to something else must not be called at all, or the `events` list

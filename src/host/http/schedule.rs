@@ -159,35 +159,14 @@ pub(crate) fn spawn_background_poller(state: ServerState) -> tokio::task::JoinHa
         "background tasks enabled: max_tasks={max_tasks}, poll_interval={poll_interval:?}",
         max_tasks = config.max_tasks
     );
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(poll_interval);
-        ticker.tick().await;
-        loop {
-            tokio::select! {
-                _ = state.shutdown.cancelled() => return,
-                _ = ticker.tick() => {}
-            }
-            // Supervised for the same reason the scheduler is: this sweep runs a whole agent turn,
-            // so anything in the tool loop can panic, and losing the task would stop every
-            // background outcome from ever being delivered -- silently, since nothing joins this
-            // handle. A task that finished would then sit `delivered_at`-stamped and unreported
-            // forever, which is exactly the promise `background.rs` opens by making.
-            let hooks = HttpHooks {
-                state: state.clone(),
-            };
-            let sweep = std::panic::AssertUnwindSafe(
-                crate::host::scheduler::deliver_ready_outcomes(&hooks, &state.sessions),
-            );
-            match futures::FutureExt::catch_unwind(sweep).await {
-                Ok(std::ops::ControlFlow::Break(())) => return,
-                Ok(std::ops::ControlFlow::Continue(())) => {}
-                Err(panic) => tracing::warn!(
-                    "background outcome sweep panicked ({panic}); continuing",
-                    panic = crate::error::panic_message(&*panic)
-                ),
-            }
-        }
-    })
+    let sessions = state.sessions.clone();
+    let shutdown = state.shutdown.clone();
+    crate::host::scheduler::spawn_outcome_poller(
+        HttpHooks { state },
+        sessions,
+        poll_interval,
+        shutdown,
+    )
 }
 
 /// `meka serve` around an out-of-band turn: a session another process holds is deferred, webhooks
@@ -232,6 +211,10 @@ impl crate::scheduler::ResidentPermissions for HttpHooks {
 #[async_trait::async_trait]
 impl crate::host::scheduler::HostHooks for HttpHooks {
     type Entry = crate::host::http::state::SessionEntry;
+
+    async fn prepare(&self, entry: &Self::Entry) -> anyhow::Result<()> {
+        crate::host::apply_recorded_profile(&self.state.shared, &entry.agent, entry.id).await
+    }
 
     async fn resident(&self, session_id: uuid::Uuid) -> anyhow::Result<Option<Self::Entry>> {
         match reattach::ensure_session_loaded(&self.state, session_id).await {
@@ -284,19 +267,8 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         &self,
         entry: &Self::Entry,
         turn_id: uuid::Uuid,
-        origin: crate::host::scheduler::TurnOrigin,
+        source: crate::host::scheduler::TurnSource,
     ) {
-        let source = match origin {
-            crate::host::scheduler::TurnOrigin::Schedule { job_id } => {
-                crate::host::http::http_frontend::TurnSource::Schedule { job_id }
-            }
-            crate::host::scheduler::TurnOrigin::Background => {
-                crate::host::http::http_frontend::TurnSource::Background
-            }
-            crate::host::scheduler::TurnOrigin::Inbox { item_ids } => {
-                crate::host::http::http_frontend::TurnSource::Inbox { item_ids }
-            }
-        };
         let (_feed, _ids) = entry.frontend.begin_turn(
             turn_id,
             source,
@@ -314,7 +286,7 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         &self,
         entry: &Self::Entry,
         turn_id: uuid::Uuid,
-        origin: &crate::host::scheduler::TurnOrigin,
+        origin: &crate::host::scheduler::TurnSource,
         outcome: &Result<crate::agent::TurnOutcome, crate::error::MekaError>,
     ) {
         use crate::host::http::handlers::turn::{
@@ -329,7 +301,7 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
             CancelReason::Client
         };
         let (event_type, data) = terminal_event_parts(
-            Ok(outcome),
+            Ok(outcome.as_ref()),
             cancel_reason,
             usage_from(&recorder),
             turn_id,
@@ -339,7 +311,7 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         );
         entry.frontend.record_terminal(event_type, data);
         entry.frontend.end_turn();
-        if matches!(origin, crate::host::scheduler::TurnOrigin::Inbox { .. }) {
+        if matches!(origin, crate::host::scheduler::TurnSource::Inbox { .. }) {
             notify_turn_end(&self.state.webhooks, event_type, turn_id, entry.id);
         }
     }
@@ -407,7 +379,10 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
     }
 
     fn failed_before_running(&self, job: &crate::schedule::ScheduledJob, _error: &anyhow::Error) {
-        self.notify(job, "failed");
+        // Not `failed`: that is a turn that ran, and a subscriber sent looking for a fault in one
+        // would find no turn. The session could not be opened, and the lease expires and is
+        // claimed again, so this may repeat until the attempts run out.
+        self.notify(job, "not_run");
     }
 
     fn background_enabled(&self) -> bool {

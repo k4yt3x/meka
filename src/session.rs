@@ -205,13 +205,7 @@ impl SessionCells {
     /// again: the conversation's estimate plus the fixed overhead the last round stamped, so the
     /// figure stands in for the measurement it replaces. The estimate alone reads as the summary
     /// and nothing else, a few percent right after a compaction that left the window a third full.
-    /// In memory alone: the row's own figure is the rewrite's to decide.
-    pub(crate) fn seed_context_estimate(&self, messages: &[crate::conversation::Message]) {
-        self.record_context_tokens(self.estimate_context_tokens(messages));
-    }
-
-    /// The figure [`Self::seed_context_estimate`] publishes; a compaction records it on the row as
-    /// well, through the agent, where a rewind leaves the row forgetting.
+    /// Every rewrite records it through the agent, on the row as well.
     pub(crate) fn estimate_context_tokens(&self, messages: &[crate::conversation::Message]) -> u64 {
         // An emptied conversation reads as turn zero: nothing has been sent, so nothing is in
         // context, and the overhead becomes real with the first request, which measures it.
@@ -356,7 +350,7 @@ impl SessionCells {
     }
 }
 
-/// Per-turn configuration knobs for `Agent`. Constructed once by `main` from the
+/// Per-turn configuration knobs for `Agent`. Constructed once by the host's assembly from the
 /// [`crate::config::ResolvedConfig`] and held immutably for the agent's lifetime; mid-session
 /// permission cycling and tool loading are handled by shared state (see
 /// [`crate::permission::SharedPermission`] and `ToolRegistry`) rather than by mutating fields here.

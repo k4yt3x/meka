@@ -184,10 +184,17 @@ pub(crate) async fn mcp_tools(
         .list_advertised_tools(&name)
         .await
         // A connection or `list_tools` failure is upstream, not the caller's: 502, the same
-        // classification `MekaError::Provider` gets.
+        // classification `MekaError::Provider` gets. The reason stays in the log: a connector's
+        // reason has carried a spawn command line and a URL with its key, which are for the
+        // operator's terminal, and `internals.md` promises an MCP refusal names the server only.
         .map_err(|error| {
-            ProblemDetail::new(ErrorKind::Provider, StatusCode::BAD_GATEWAY, error.to_string())
-                .with("server", name.clone())
+            tracing::warn!("failed to list the tools of MCP server '{name}': {error}");
+            ProblemDetail::new(
+                ErrorKind::Provider,
+                StatusCode::BAD_GATEWAY,
+                format!("MCP server '{name}' could not list its tools; the reason is in the meka log"),
+            )
+            .with("server", name.clone())
         })?;
     Ok(Json(McpToolsResponse {
         server: name,
@@ -280,7 +287,17 @@ pub(crate) async fn mcp_reconnect(
             } else {
                 (ErrorKind::Provider, StatusCode::BAD_GATEWAY)
             };
-            ProblemDetail::new(kind, status, error.to_string()).with("server", name.clone())
+            // The reason stays in the log, for the reason `mcp_tools` gives.
+            tracing::warn!("failed to reconnect MCP server '{name}' via HTTP: {error}");
+            ProblemDetail::new(
+                kind,
+                status,
+                format!(
+                    "MCP server '{name}' did not reconnect; it is {}; the reason is in the meka log",
+                    state_before.label()
+                ),
+            )
+            .with("server", name.clone())
         })?;
     tracing::info!(
         "reconnected MCP server '{name}' via HTTP: {state}",

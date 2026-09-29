@@ -186,6 +186,14 @@ pub(crate) enum MekaError {
 
 pub(crate) type Result<T> = std::result::Result<T, MekaError>;
 
+impl MekaError {
+    /// A file or process failure with its context, for a door that could not read, write or run
+    /// what it was asked to: neither the caller's fault nor `config.toml`'s.
+    pub(crate) fn io(message: impl Into<String>) -> Self {
+        Self::Io(std::io::Error::other(message.into()))
+    }
+}
+
 /// The most of an upstream's response a host will repeat to a caller, in bytes.
 ///
 /// Not a redaction measure: a length bound keeps the *start*, which is where an identifier sits in

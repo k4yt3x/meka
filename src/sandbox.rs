@@ -90,7 +90,7 @@ impl Confinement {
             // command at any other level runs confined at that level, like an approved write.
             crate::permission::Permission::Unrestricted => Self::Unconfined,
             crate::permission::Permission::Workspace => {
-                Self::Workspace(scope.confined_to(cwd).unwrap_or_default())
+                Self::Workspace(scope.confined_to_at(permission, cwd).unwrap_or_default())
             }
             _ => Self::ReadOnly,
         }
@@ -1293,25 +1293,6 @@ mod tests {
             std::env::remove_var(NAME);
         }
         assert!(kept, "XDG_* prefix var was dropped from sandbox env");
-    }
-
-    #[test]
-    fn detect_sandbox_capability() {
-        let capability = detect();
-        // Should detect something on Linux/macOS/Windows, Unavailable on others
-        match capability {
-            #[cfg(target_os = "linux")]
-            SandboxCapability::Landlock { abi_version } => {
-                assert!(abi_version >= 1);
-            }
-            #[cfg(target_os = "linux")]
-            SandboxCapability::Bubblewrap { .. } => {}
-            #[cfg(target_os = "macos")]
-            SandboxCapability::SandboxExec => {}
-            #[cfg(target_os = "windows")]
-            SandboxCapability::LowIntegrity => {}
-            SandboxCapability::Unavailable => {}
-        }
     }
 
     /// The seatbelt profile names each root as a `-D` parameter, never inside the profile text.

@@ -75,16 +75,23 @@ pub(super) async fn try_local_command(
     match name.as_str() {
         "status" => Some(build_status_text(agent, conversation_len, permission, shared).await),
         "mcp" => Some(build_mcp_list_text(shared).await),
-        "usage" => Some(build_usage_text(agent).await),
+        "usage" => Some(build_usage_text(agent, shared.relay_provider_errors()).await),
         _ => None,
     }
 }
 /// Plain-text `/usage` output for ACP clients, reusing the shared `render::format_account_usage`.
-pub(super) async fn build_usage_text(agent: &crate::agent::Agent) -> String {
+/// A failure is worded by `acp_error_for`, the one mapping for what this wire may carry.
+pub(super) async fn build_usage_text(
+    agent: &crate::agent::Agent,
+    relay_provider_errors: bool,
+) -> String {
     match agent.fetch_usage().await {
         Ok(Some(usage)) => crate::render::format_account_usage(&usage),
         Ok(None) => "Account usage is not available for this backend.".to_string(),
-        Err(error) => format!("failed to fetch usage: {error}"),
+        Err(error) => format!(
+            "failed to fetch usage: {}",
+            super::acp_error_text(&error, relay_provider_errors)
+        ),
     }
 }
 /// Plain-text `/status` output: the block the REPL prints, from [`crate::host::format_status`],
@@ -116,8 +123,10 @@ pub(super) async fn build_mcp_list_text(shared: &crate::host::SharedDeps) -> Str
     for name in names {
         let status = match manager.server_entry(&name) {
             Some(entry) => match entry.state().await {
-                crate::mcp::ServerState::Failed { error, .. } => {
-                    format!("failed: {}", error.lines().next().unwrap_or("").trim())
+                // The name travels and the reason does not: a connector's reason has carried a
+                // spawn command line, which is for the terminal `meka acp` runs in.
+                crate::mcp::ServerState::Failed { .. } => {
+                    "failed; the reason is in the meka log".to_string()
                 }
                 other => other.label().to_string(),
             },
@@ -385,17 +394,20 @@ pub(super) async fn run_prompt_turn(
         }
     };
 
-    // Under the lock and before the first round, so a switch made while the previous turn held this
-    // mutex takes effect on this one. Refused rather than run on the old profile: the client asked
-    // for a specific account, and answering from another one silently is the failure the whole
-    // per-session binding exists to prevent.
-    if let Err(error) = apply_recorded_profile(&state, &entry.agent, entry.id).await {
+    // Under the lock and before the first round, so a switch made while the previous turn held
+    // this mutex takes effect on this one. Refused rather than run on the old profile: the client
+    // asked for a specific account, and answering from another one silently is the failure the
+    // whole per-session binding exists to prevent.
+    if let Err(error) =
+        crate::host::apply_recorded_profile(&state.shared, &entry.agent, entry.id).await
+    {
         return responder.respond_with_error(build_failure_error(
             "cannot run this turn on the profile this session is recorded against",
             &error,
             state.shared.relay_provider_errors(),
         ));
     }
+
     // Once the binding is applied, so the question is asked of the profile this turn runs on: a
     // `session/set_config_option` switch reaches the agent on the line above and nowhere earlier,
     // and a session moved onto a text-only profile must refuse the attachment even on a connection
@@ -516,6 +528,9 @@ pub(super) async fn run_prompt_turn(
     // `MekaError::Interrupted` path.
     let cancel_probe = cancellation.clone();
     let result = agent.run_turn(messages, input, cancellation).await;
+    // On both sides of the turn, as every other turn path touches: the idle sweep measures from
+    // the last touch, and a long turn touched at its start alone would read as idle at its end.
+    entry.touch();
 
     let stop_reason = match result {
         Ok(crate::agent::TurnOutcome::EndTurn) => StopReason::EndTurn,

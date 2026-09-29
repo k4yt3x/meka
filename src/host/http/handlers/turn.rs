@@ -353,6 +353,18 @@ pub(crate) async fn submit_turn(
         .try_lock_owned()
         .map_err(|_| turn_in_flight_conflict(session_id, "run a turn"))?;
 
+    // Under the lock and before the first round, the way ACP's prompt door does it: the turn runs
+    // on the profile the row names, or not at all.
+    if let Err(error) =
+        crate::host::apply_recorded_profile(&state.shared, &entry.agent, session_id).await
+    {
+        return Err(crate::host::http::reattach::agent_build_problem(
+            session_id,
+            "cannot run this turn on the profile this session is recorded against",
+            error,
+        ));
+    }
+
     // Asked again of the entry admitted, not only of the one the decode was judged against: the
     // session may have been evicted and moved onto a text-only profile in between, and the
     // images would otherwise reach a model the row says cannot take them. Ahead of the outcome
@@ -685,12 +697,12 @@ fn cached_response_into_axum(entry: crate::host::http::idempotency::CachedRespon
 /// RAII guard that clears the per-session `StreamSink` on drop so both normal completion
 /// and panics reset the cell. Without this, a panic leaves a zero-subscriber sink that
 /// causes subsequent blocking turns to 500 via `client_disconnected()`.
-struct StreamGuard {
+pub(super) struct StreamGuard {
     frontend: Arc<crate::host::http::http_frontend::HttpFrontend>,
 }
 
 impl StreamGuard {
-    fn new(frontend: Arc<crate::host::http::http_frontend::HttpFrontend>) -> Self {
+    pub(super) fn new(frontend: Arc<crate::host::http::http_frontend::HttpFrontend>) -> Self {
         Self { frontend }
     }
 }
@@ -774,7 +786,7 @@ async fn run_blocking_turn(
             CancelReason::Client
         };
         let (event_type, data) = terminal_event_parts(
-            Ok(&outcome),
+            Ok(outcome.as_ref()),
             cancel_reason,
             usage_from(&recorder),
             turn_id,
@@ -905,7 +917,7 @@ fn run_streaming_turn(
             CancelReason::Client
         };
         let (event_type, data) = terminal_event_parts(
-            Ok(&outcome),
+            Ok(outcome.as_ref()),
             cancel_reason,
             usage_from(&recorder),
             turn_id,
@@ -1080,7 +1092,10 @@ impl CancelReason {
 /// half-composed tool call look like output and neither reaches the conversation. `None` is a turn
 /// that never began, or one whose record died with its task, and is omitted rather than guessed.
 pub(crate) fn terminal_event_parts(
-    turn_result: std::result::Result<&crate::error::Result<TurnOutcome>, tokio::task::JoinError>,
+    turn_result: std::result::Result<
+        std::result::Result<&TurnOutcome, &crate::error::MekaError>,
+        tokio::task::JoinError,
+    >,
     cancel_reason: CancelReason,
     usage: UsageView,
     turn_id: Uuid,
@@ -1539,6 +1554,266 @@ pub(crate) struct CancelRequest {
     pub(crate) turn_id: Option<Uuid>,
 }
 
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub(crate) struct StreamQuery {
+    /// Last event id the client received, for clients that cannot set a `Last-Event-ID` header
+    /// (browser `EventSource` sets it automatically; `fetch`-based clients often cannot).
+    /// The header wins when both are present.
+    #[serde(default)]
+    pub(crate) last_event_id: Option<u64>,
+    /// Attend the session: show `permission_required` events and answer them. While an attending
+    /// reader is connected, a gated call on any turn parks for an answer instead of being refused
+    /// without asking. Needs `sessions:w`, the scope that answers.
+    #[serde(default)]
+    pub(crate) attend: bool,
+}
+
+/// `GET /v1/sessions/{id}/stream`: rejoin the current turn's SSE stream.
+///
+/// Replays the events after `Last-Event-ID` from a bounded per-turn ring, then follows the live
+/// stream. When the turn has already ended, the backlog plus its terminal event are delivered and
+/// the connection closes, so a client that dropped at the last moment still learns the outcome.
+///
+/// Two limits worth stating plainly. The ring holds `[serve] stream_replay_events` events, so a
+/// client that was away longer than that gets a `notice` saying its replay has a hole rather than a
+/// transcript that silently skips. And only the most recent turn is retained: reconnecting after a
+/// *newer* turn has started returns that turn's stream, which the `turn_id` on the re-issued
+/// `turn.started` identifies.
+#[utoipa::path(
+    get,
+    path = "/v1/sessions/{id}/stream",
+    tag = "turn",
+    params(
+        ("id" = Uuid, Path, description = "Session UUID"),
+        ("Last-Event-ID" = Option<String>, Header, description = "Resume after this event id"),
+        StreamQuery,
+    ),
+    responses(
+        (status = 200, description = "SSE stream (text/event-stream)"),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 404, description = "Session not found", body = ProblemDetail),
+        (status = 409, description = "Another meka process holds the session (`/errors/session-locked`), or the token may only read and the session is not loaded (`/errors/session-not-loaded`)", body = ProblemDetail),
+        (status = 422, description = "The id names a sub-agent's session (`/errors/session-not-drivable`)", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["sessions:r"]))
+)]
+pub(crate) async fn stream_turn(
+    State(state): State<ServerState>,
+    scoped: scope::Scoped<scope::SessionsRead>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<StreamQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, ProblemDetail> {
+    // Attending is answering, so it takes the scope answering takes; refused before the session
+    // is loaded, so a token that may not attend loads nothing by asking.
+    if query.attend {
+        scope::require(&scoped.principal, "sessions:w")?;
+    }
+    // Loaded for a token that may drive the session, looked up for one that may only read it.
+    // Reviving takes the session's cross-process file lock and pins it in memory for as long as
+    // the stream stays open, since the GC never evicts a session with a subscriber; a read token
+    // that could do that to every session it lists would hold them all against `meka -r`. A
+    // driver gets its feed back after an eviction, which is what a bridge reconnecting wants
+    // rather than a 404 that tells it to run a turn it has no message for; a reader watches a
+    // session somebody else is driving.
+    let entry = if scoped.principal.has_scope("sessions:w") {
+        ensure_session_loaded(&state, id).await?
+    } else {
+        let resident = state.sessions.read().await.get(&id).cloned();
+        match resident {
+            Some(entry) => entry,
+            None => {
+                crate::host::http::reattach::require_session_exists(&state, id).await?;
+                return Err(ProblemDetail::new(
+                    ErrorKind::SessionNotLoaded,
+                    StatusCode::CONFLICT,
+                    "session is not loaded; a token with `sessions:w` loads it by attaching or by \
+                     submitting a turn",
+                )
+                .with("session_id", id.to_string()));
+            }
+        }
+    };
+
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .or(query.last_event_id);
+
+    let Some(attachment) = entry.frontend.attach_stream(last_event_id, query.attend) else {
+        return Err(no_stream_to_join(id));
+    };
+
+    let session_id = id;
+    let stream = build_reattach_stream(
+        session_id,
+        attachment,
+        Arc::clone(&entry.frontend),
+        state.shutdown.clone(),
+    );
+    let sse = Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(20))
+            .text("keep-alive"),
+    );
+    let mut response = sse.into_response();
+    response.headers_mut().insert(
+        "X-Accel-Buffering",
+        axum::http::HeaderValue::from_static("no"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache, no-transform"),
+    );
+    Ok(response)
+}
+
+fn no_stream_to_join(id: Uuid) -> ProblemDetail {
+    ProblemDetail::new(
+        ErrorKind::NotFound,
+        StatusCode::NOT_FOUND,
+        "no event feed on this session; it is installed when the session is loaded",
+    )
+    .with("session_id", id.to_string())
+}
+
+/// Backlog, then the feed, live: this stream does not end with a turn.
+///
+/// A client that named a `Last-Event-ID` gets what it missed first. A turn in flight is announced
+/// so the client can tell "my stream resumed" from "I am now watching something else"; with no
+/// turn in flight, the most recent turn's terminal is handed over when the ring no longer holds
+/// it, so a client that reconnects late still learns the outcome. Then the feed carries every
+/// later turn, whoever starts it, until the client hangs up or the session leaves this process.
+fn build_reattach_stream(
+    session_id: Uuid,
+    attachment: crate::host::http::feed::StreamAttachment,
+    frontend: Arc<crate::host::http::http_frontend::HttpFrontend>,
+    shutdown: CancellationToken,
+) -> impl Stream<Item = Result<Event, Infallible>> + Send {
+    async_stream::stream! {
+        // Held for the life of the response: the client attends until it hangs up.
+        let _attendance = attachment.attendance;
+        yield Ok::<_, Infallible>(Event::default().retry(std::time::Duration::from_secs(3)));
+
+        if let Some(turn_id) = attachment.turn_id {
+            let mut data = serde_json::json!({
+                "turn_id": turn_id,
+                "session_id": session_id,
+                "resumed": true,
+            });
+            if let Some(source) = &attachment.turn_source {
+                source.describe(&mut data);
+            }
+            yield Ok(Event::default()
+                .event("turn.started")
+                .json_data(data)
+                .unwrap_or_else(|_| Event::default().comment("resumed turn.started serialize-failed")));
+        }
+
+        if attachment.gap {
+            // Said out loud rather than papered over. A transcript with a silent hole in it is
+            // worse than one the client knows is incomplete, because only the second can be
+            // repaired by reading `GET /messages`.
+            yield Ok(Event::default()
+                .event("notice")
+                .json_data(serde_json::json!({
+                    "level": "warn",
+                    "text": "the replay does not reach your Last-Event-ID, so events were \
+                             dropped; read `GET /v1/sessions/{id}/messages` for the full transcript",
+                }))
+                .unwrap_or_else(|_| Event::default().comment("gap-notice serialize-failed")));
+        }
+
+        // The terminal is in the backlog too when the turn has ended, since `record_terminal`
+        // pushes it into the ring. Track it so the fallback below does not send it twice.
+        let mut sent_terminal = false;
+        for event in attachment.backlog {
+            sent_terminal |= event.event_type.is_terminal();
+            yield Ok(event.into_axum());
+        }
+
+        // Filtered by the resume position like every other replayed event. A client whose last id
+        // *is* the terminal has already seen the turn end, and re-sending it would break the one
+        // promise resumption makes -- that nothing at or before your position comes back -- on the
+        // single event a client is most likely to act on twice.
+        if !sent_terminal
+            && let Some(terminal) = attachment.terminal.filter(|terminal| {
+                attachment
+                    .resume_from
+                    .is_none_or(|last| terminal.id.is_some_and(|id| id > last))
+            })
+        {
+            yield Ok(terminal.into_axum());
+        }
+
+        let mut receiver = attachment.receiver;
+        loop {
+            // The feed outlives every turn, and this response holds the frontend that owns it, so
+            // nothing closes the channel from the sending side while the session is resident: the
+            // process ending is watched here, or a bridge attached across a restart would hold
+            // axum's graceful shutdown to the drain timeout and the process would leave through
+            // `exit(1)`. A session leaving the process closes the feed and ends this from the
+            // other side.
+            let received = tokio::select! {
+                received = receiver.recv() => received,
+                _ = shutdown.cancelled() => break,
+            };
+            match received {
+                Ok(event) => {
+                    sent_terminal |= event.event_type.is_terminal();
+                    yield Ok(event.into_axum());
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!("feed SSE consumer lagged, skipped {skipped} events");
+                    // Unlike the primary stream's lag branch, this does not cancel the turn: the
+                    // original consumer may still be reading it perfectly well, and a turn the
+                    // session runs for itself has nobody to cancel it for.
+                    yield Ok(Event::default()
+                        .event("notice")
+                        .json_data(serde_json::json!({
+                            "level": "warn",
+                            "text": format!(
+                                "Fell behind; {} event(s) were dropped from this replay.",
+                                skipped
+                            ),
+                        }))
+                        .unwrap_or_else(|_| Event::default().comment("lag serialize-failed")));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+
+        // The feed closed under a turn this client was following, which happens when the session
+        // leaves the process. Its outcome, if the task recorded one, or an honest failure.
+        if let Some(turn_id) = attachment.turn_id
+            && !sent_terminal
+        {
+            match frontend.recorded_terminal(turn_id) {
+                Some(terminal) => yield Ok(terminal.into_axum()),
+                None => {
+                    yield Ok(Event::default()
+                        .event("turn.failed")
+                        .json_data(serde_json::json!({
+                            "turn_id": turn_id.to_string(),
+                            "session_id": session_id.to_string(),
+                            "error": {
+                                "type": crate::host::http::errors::ErrorKind::StreamDetached.type_uri(),
+                                "title": crate::host::http::errors::ErrorKind::StreamDetached.title(),
+                                "status": 500,
+                                "detail": "the turn's stream closed without recording an outcome; \
+                                           read `GET /v1/sessions/{id}/messages` for what completed",
+                            },
+                        }))
+                        .unwrap_or_else(|_| Event::default().comment("detached serialize-failed")));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1885,228 +2160,5 @@ mod tests {
             .await
             .expect_err("should reject");
         assert_eq!(problem.status, 422);
-    }
-}
-
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-pub(crate) struct StreamQuery {
-    /// Last event id the client received, for clients that cannot set a `Last-Event-ID` header
-    /// (browser `EventSource` sets it automatically; `fetch`-based clients often cannot).
-    /// The header wins when both are present.
-    #[serde(default)]
-    pub(crate) last_event_id: Option<u64>,
-    /// Attend the session: show `permission_required` events and answer them. While an attending
-    /// reader is connected, a gated call on any turn parks for an answer instead of being refused
-    /// without asking. Needs `sessions:w`, the scope that answers.
-    #[serde(default)]
-    pub(crate) attend: bool,
-}
-
-/// `GET /v1/sessions/{id}/stream`: rejoin the current turn's SSE stream.
-///
-/// Replays the events after `Last-Event-ID` from a bounded per-turn ring, then follows the live
-/// stream. When the turn has already ended, the backlog plus its terminal event are delivered and
-/// the connection closes, so a client that dropped at the last moment still learns the outcome.
-///
-/// Two limits worth stating plainly. The ring holds `[serve] stream_replay_events` events, so a
-/// client that was away longer than that gets a `notice` saying its replay has a hole rather than a
-/// transcript that silently skips. And only the most recent turn is retained: reconnecting after a
-/// *newer* turn has started returns that turn's stream, which the `turn_id` on the re-issued
-/// `turn.started` identifies.
-#[utoipa::path(
-    get,
-    path = "/v1/sessions/{id}/stream",
-    tag = "turn",
-    params(
-        ("id" = Uuid, Path, description = "Session UUID"),
-        ("Last-Event-ID" = Option<String>, Header, description = "Resume after this event id"),
-        StreamQuery,
-    ),
-    responses(
-        (status = 200, description = "SSE stream (text/event-stream)"),
-        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
-        (status = 403, description = "Insufficient scope", body = ProblemDetail),
-        (status = 404, description = "Session not found", body = ProblemDetail),
-        (status = 409, description = "Another meka process holds the session (`/errors/session-locked`)", body = ProblemDetail),
-        (status = 422, description = "The id names a sub-agent's session (`/errors/session-not-drivable`)", body = ProblemDetail),
-        (status = 500, description = "Internal server error", body = ProblemDetail),
-    ),
-    security(("bearerAuth" = ["sessions:r"]))
-)]
-pub(crate) async fn stream_turn(
-    State(state): State<ServerState>,
-    scoped: scope::Scoped<scope::SessionsRead>,
-    Path(id): Path<Uuid>,
-    Query(query): Query<StreamQuery>,
-    headers: axum::http::HeaderMap,
-) -> Result<axum::response::Response, ProblemDetail> {
-    // Attending is answering, so it takes the scope answering takes; refused before the session
-    // is loaded, so a token that may not attend loads nothing by asking.
-    if query.attend {
-        scope::require(&scoped.principal, "sessions:w")?;
-    }
-    // Loaded rather than looked up: a subscriber may arrive before any turn, and a bridge that
-    // reconnects to an evicted session wants its feed back, not a 404 that tells it to run a
-    // turn it has no message for.
-    let entry = ensure_session_loaded(&state, id).await?;
-
-    let last_event_id = headers
-        .get("last-event-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .or(query.last_event_id);
-
-    let Some(attachment) = entry.frontend.attach_stream(last_event_id, query.attend) else {
-        return Err(no_stream_to_join(id));
-    };
-
-    let session_id = id;
-    let stream = build_reattach_stream(session_id, attachment, Arc::clone(&entry.frontend));
-    let sse = Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(std::time::Duration::from_secs(20))
-            .text("keep-alive"),
-    );
-    let mut response = sse.into_response();
-    response.headers_mut().insert(
-        "X-Accel-Buffering",
-        axum::http::HeaderValue::from_static("no"),
-    );
-    response.headers_mut().insert(
-        axum::http::header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-cache, no-transform"),
-    );
-    Ok(response)
-}
-
-fn no_stream_to_join(id: Uuid) -> ProblemDetail {
-    ProblemDetail::new(
-        ErrorKind::NotFound,
-        StatusCode::NOT_FOUND,
-        "no event feed on this session; it is installed when the session is loaded",
-    )
-    .with("session_id", id.to_string())
-}
-
-/// Backlog, then the feed, live: this stream does not end with a turn.
-///
-/// A client that named a `Last-Event-ID` gets what it missed first. A turn in flight is announced
-/// so the client can tell "my stream resumed" from "I am now watching something else"; with no
-/// turn in flight, the most recent turn's terminal is handed over when the ring no longer holds
-/// it, so a client that reconnects late still learns the outcome. Then the feed carries every
-/// later turn, whoever starts it, until the client hangs up or the session leaves this process.
-fn build_reattach_stream(
-    session_id: Uuid,
-    attachment: crate::host::http::http_frontend::StreamAttachment,
-    frontend: Arc<crate::host::http::http_frontend::HttpFrontend>,
-) -> impl Stream<Item = Result<Event, Infallible>> + Send {
-    async_stream::stream! {
-        // Held for the life of the response: the client attends until it hangs up.
-        let _attendance = attachment.attendance;
-        yield Ok::<_, Infallible>(Event::default().retry(std::time::Duration::from_secs(3)));
-
-        if let Some(turn_id) = attachment.turn_id {
-            let mut data = serde_json::json!({
-                "turn_id": turn_id,
-                "session_id": session_id,
-                "resumed": true,
-            });
-            if let Some(source) = &attachment.turn_source {
-                source.describe(&mut data);
-            }
-            yield Ok(Event::default()
-                .event("turn.started")
-                .json_data(data)
-                .unwrap_or_else(|_| Event::default().comment("resumed turn.started serialize-failed")));
-        }
-
-        if attachment.gap {
-            // Said out loud rather than papered over. A transcript with a silent hole in it is
-            // worse than one the client knows is incomplete, because only the second can be
-            // repaired by reading `GET /messages`.
-            yield Ok(Event::default()
-                .event("notice")
-                .json_data(serde_json::json!({
-                    "level": "warn",
-                    "text": "the replay does not reach your Last-Event-ID, so events were \
-                             dropped; read `GET /v1/sessions/{id}/messages` for the full transcript",
-                }))
-                .unwrap_or_else(|_| Event::default().comment("gap-notice serialize-failed")));
-        }
-
-        // The terminal is in the backlog too when the turn has ended, since `record_terminal`
-        // pushes it into the ring. Track it so the fallback below does not send it twice.
-        let mut sent_terminal = false;
-        for event in attachment.backlog {
-            sent_terminal |= event.event_type.is_terminal();
-            yield Ok(event.into_axum());
-        }
-
-        // Filtered by the resume position like every other replayed event. A client whose last id
-        // *is* the terminal has already seen the turn end, and re-sending it would break the one
-        // promise resumption makes -- that nothing at or before your position comes back -- on the
-        // single event a client is most likely to act on twice.
-        if !sent_terminal
-            && let Some(terminal) = attachment.terminal.filter(|terminal| {
-                attachment
-                    .resume_from
-                    .is_none_or(|last| terminal.id.is_some_and(|id| id > last))
-            })
-        {
-            yield Ok(terminal.into_axum());
-        }
-
-        let mut receiver = attachment.receiver;
-        loop {
-            match receiver.recv().await {
-                Ok(event) => {
-                    sent_terminal |= event.event_type.is_terminal();
-                    yield Ok(event.into_axum());
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!("feed SSE consumer lagged, skipped {skipped} events");
-                    // Unlike the primary stream's lag branch, this does not cancel the turn: the
-                    // original consumer may still be reading it perfectly well, and a turn the
-                    // session runs for itself has nobody to cancel it for.
-                    yield Ok(Event::default()
-                        .event("notice")
-                        .json_data(serde_json::json!({
-                            "level": "warn",
-                            "text": format!(
-                                "Fell behind; {} event(s) were dropped from this replay.",
-                                skipped
-                            ),
-                        }))
-                        .unwrap_or_else(|_| Event::default().comment("lag serialize-failed")));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-
-        // The feed closed under a turn this client was following, which happens when the session
-        // leaves the process. Its outcome, if the task recorded one, or an honest failure.
-        if let Some(turn_id) = attachment.turn_id
-            && !sent_terminal
-        {
-            match frontend.recorded_terminal(turn_id) {
-                Some(terminal) => yield Ok(terminal.into_axum()),
-                None => {
-                    yield Ok(Event::default()
-                        .event("turn.failed")
-                        .json_data(serde_json::json!({
-                            "turn_id": turn_id.to_string(),
-                            "session_id": session_id.to_string(),
-                            "error": {
-                                "type": crate::host::http::errors::ErrorKind::StreamDetached.type_uri(),
-                                "title": crate::host::http::errors::ErrorKind::StreamDetached.title(),
-                                "status": 500,
-                                "detail": "the turn's stream closed without recording an outcome; \
-                                           read `GET /v1/sessions/{id}/messages` for what completed",
-                            },
-                        }))
-                        .unwrap_or_else(|_| Event::default().comment("detached serialize-failed")));
-                }
-            }
-        }
     }
 }

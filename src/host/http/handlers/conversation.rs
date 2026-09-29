@@ -90,6 +90,10 @@ pub(crate) struct CompactResponse {
     ),
     security(("bearerAuth" = ["sessions:w"]))
 )]
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "the conversation guard is the compaction's exclusivity and moves into its task whole"
+)]
 pub(crate) async fn compact(
     State(state): State<ServerState>,
     _scoped: scope::Scoped<scope::SessionsWrite>,
@@ -111,26 +115,19 @@ pub(crate) async fn compact(
     // is dropped would let a concurrent DELETE remove the row and the map entry first, leaving
     // this to run a multi-minute checkpoint against a session that no longer exists and to persist
     // a boundary event for it.
-    let (entry, in_flight) = {
-        let map = state.sessions.read().await;
-        match map.get(&id).cloned() {
-            Some(entry) => {
+    let (entry, in_flight) = loop {
+        {
+            let map = state.sessions.read().await;
+            if let Some(entry) = map.get(&id).cloned() {
                 let guard = entry
                     .claim_idle()
                     .ok_or_else(|| turn_in_flight_conflict(id, "compact the conversation"))?;
-                (entry, guard)
-            }
-            // Not resident: `ensure_session_loaded` below re-attaches it, and a session that is
-            // not in the map cannot be racing a turn, so there is nothing to guard against yet.
-            None => {
-                drop(map);
-                let entry = ensure_session_loaded(&state, id).await?;
-                let guard = entry
-                    .claim_idle()
-                    .ok_or_else(|| turn_in_flight_conflict(id, "compact the conversation"))?;
-                (entry, guard)
+                break (entry, guard);
             }
         }
+        // Not resident: re-attach it, then claim it on the next pass, under the lock like the
+        // resident arm, so a DELETE landing between the two finds it claimed.
+        ensure_session_loaded(&state, id).await?;
     };
 
     // `try_lock`, not `lock().await`. The CAS above catches a turn that started first, but a turn
@@ -139,10 +136,18 @@ pub(crate) async fn compact(
     // succeeded instead of the one the caller meant. Out-of-band turns (the scheduler,
     // background-outcome delivery) take the mutex before marking themselves busy, so this is the
     // check that catches one in that window.
-    let mut conversation = entry
-        .conversation
-        .try_lock()
+    let mut conversation = std::sync::Arc::clone(&entry.conversation)
+        .try_lock_owned()
         .map_err(|_| turn_in_flight_conflict(id, "compact the conversation"))?;
+    // Under the lock and before the checkpoint's first round, as on every turn door: the
+    // checkpoint and the summarizer bill the profile the row names, or do not run.
+    if let Err(error) = crate::host::apply_recorded_profile(&state.shared, &entry.agent, id).await {
+        return Err(crate::host::http::reattach::agent_build_problem(
+            id,
+            "cannot compact on the profile this session is recorded against",
+            error,
+        ));
+    }
     let messages_before = conversation.len();
     let request = CompactRequest {
         // `Manual` and not `Requested`: the origin distinguishes who asked, and an API caller is
@@ -164,29 +169,95 @@ pub(crate) async fn compact(
     // Publishing it keeps `POST /cancel` and the shutdown drain working: both fire whatever token
     // is in this cell, which is now this compaction's.
     let cancellation = CancellationToken::new();
-    let _published = entry
+    let turn_id = Uuid::new_v4();
+    let published = entry
         .cancel
-        .publish(cancellation.clone(), in_flight.admission);
-    let outcome = entry
-        .agent
-        .compact_session(&mut conversation, request, cancellation)
-        .await
-        .map_err(|error| {
-            ProblemDetail::for_error(&error, state.config.relay_provider_errors)
-                .with("session_id", id.to_string())
-        })?;
-    let messages_after = conversation.len();
-    drop(conversation);
-    // The checkpoint turn emits provider notices and the `Compacted` event into the session's
-    // recorder, and nothing here consumes them. Every other path that runs a turn outside a
-    // request drains for the same reason (`schedule::run_prompt_in_session`): left alone they
-    // accumulate across repeated compactions and then surface in whichever turn drains next.
-    let _checkpoint_events = entry.frontend.drain();
-    // Same reason every turn path touches: this both advances the `updated_at` clients poll for
-    // change detection, which the boundary write already moved on the DB row, and resets the GC
-    // idle timer. Without it a session compacted just shy of `idle_timeout` is evicted on the next
-    // scan, throwing away the context gauge `compact_session` has just re-seeded.
-    entry.touch();
+        .publish_turn(cancellation.clone(), in_flight.admission, turn_id);
+    // On the feed like every other turn that runs on the session: the checkpoint's tool calls
+    // and notices arrive under a `turn.started` a subscriber can attribute, `POST /cancel` can
+    // name the turn, and a terminal closes it. Unattended, like a scheduled fire.
+    let (_feed, _ids) = entry.frontend.begin_turn(
+        turn_id,
+        crate::host::scheduler::TurnSource::Compaction,
+        false,
+        state.config.stream_reattach_grace,
+        state.config.stream_replay_events,
+    );
+    // Spawned for the reason a client's turn is (see `run_blocking_turn`): axum drops the
+    // handler's future when the client hangs up, and a checkpoint runs for minutes against
+    // client timeouts of seconds. Dropped after `begin_turn`, the compaction would leave the
+    // feed's turn open with no terminal: `GET /stream` would announce a resumed turn that never
+    // ends and withhold the previous turn's terminal until another turn started. The terminal is
+    // recorded and the turn closed before the conversation is released, so a turn winning the
+    // lock next finds nothing of this one in the recorder or on the feed.
+    let join = tokio::spawn({
+        let state = state.clone();
+        let entry = entry.clone();
+        async move {
+            let _in_flight = in_flight;
+            let _published = published;
+            // Closes the feed's turn on a panic too, as it does for a client's turn.
+            let stream_guard = crate::host::http::handlers::turn::StreamGuard::new(
+                std::sync::Arc::clone(&entry.frontend),
+            );
+            let outcome = entry
+                .agent
+                .compact_session(&mut conversation, request, cancellation)
+                .await;
+            let messages_after = conversation.len();
+            // The checkpoint turn emits provider notices and the `Compacted` event into the
+            // session's recorder; its usage rides the terminal, and the rest is dropped, as every
+            // other path that runs a turn outside a request drops it: left alone the events
+            // accumulate across repeated compactions and surface in whichever turn drains next.
+            let recorder = entry.frontend.drain();
+            {
+                use crate::host::http::handlers::turn::{
+                    CancelReason, terminal_event_parts, usage_from,
+                };
+                let compacted = crate::agent::TurnOutcome::EndTurn;
+                let cancel_reason = if state.shutdown.is_cancelled() {
+                    CancelReason::ServerShutdown
+                } else {
+                    CancelReason::Client
+                };
+                let (event_type, data) = terminal_event_parts(
+                    Ok(outcome.as_ref().map(|_| &compacted)),
+                    cancel_reason,
+                    usage_from(&recorder),
+                    turn_id,
+                    id,
+                    state.config.relay_provider_errors,
+                    None,
+                );
+                entry.frontend.record_terminal(event_type, data);
+            }
+            drop(stream_guard);
+            drop(conversation);
+            // Same reason every turn path touches: this both advances the `updated_at` clients
+            // poll for change detection, which the boundary write already moved on the DB row,
+            // and resets the GC idle timer. Without it a session compacted just shy of
+            // `idle_timeout` is evicted on the next scan, throwing away the context gauge
+            // `compact_session` has just re-seeded.
+            entry.touch();
+            (outcome, messages_after)
+        }
+    });
+    let (outcome, messages_after) = match join.await {
+        Ok(result) => result,
+        Err(panic) => {
+            tracing::error!("compaction task panicked: {panic:?}");
+            return Err(ProblemDetail::new(
+                crate::host::http::errors::ErrorKind::Internal,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "compaction task panicked",
+            )
+            .with("session_id", id.to_string()));
+        }
+    };
+    let outcome = outcome.map_err(|error| {
+        ProblemDetail::for_error(&error, state.config.relay_provider_errors)
+            .with("session_id", id.to_string())
+    })?;
 
     tracing::info!(
         "compacted session {id} via HTTP: {messages_before} -> {messages_after} messages"
@@ -457,34 +528,28 @@ pub(crate) async fn rewind(
 
     // Acquired under the sessions read-lock, for the reason `compact` gives: DELETE's `in_flight`
     // re-check has to see this operation, or the rewind lands on a session that no longer exists.
-    let (entry, _in_flight) = {
-        let map = state.sessions.read().await;
-        match map.get(&id).cloned() {
-            Some(entry) => {
+    let (entry, _in_flight) = loop {
+        {
+            let map = state.sessions.read().await;
+            if let Some(entry) = map.get(&id).cloned() {
                 let guard = entry
                     .claim_idle()
                     .ok_or_else(|| turn_in_flight_conflict(id, "rewind the conversation"))?;
-                (entry, guard)
-            }
-            // Not resident: rewound straight on the store, without reviving anything. A rewind is
-            // an edit to the event log, not a turn, so an agent built here would be needed only to
-            // hold the result, and a session with no runtime has nothing to hold. This is also what
-            // makes the endpoint symmetrical with `meka session rewind`, which has always been a
-            // store-only operation and therefore always worked on a sub-agent.
-            None => {
-                drop(map);
-                if let Some(response) = rewind_dormant_session(&state, id, body.turns).await? {
-                    return Ok(response);
-                }
-                // It became resident while we looked; fall through so the rewind lands in the
-                // live conversation rather than under it.
-                let entry = ensure_session_loaded(&state, id).await?;
-                let guard = entry
-                    .claim_idle()
-                    .ok_or_else(|| turn_in_flight_conflict(id, "rewind the conversation"))?;
-                (entry, guard)
+                break (entry, guard);
             }
         }
+        // Not resident: rewound straight on the store, without reviving anything. A rewind is
+        // an edit to the event log, not a turn, so an agent built here would be needed only to
+        // hold the result, and a session with no runtime has nothing to hold. This is also what
+        // makes the endpoint symmetrical with `meka session rewind`, which has always been a
+        // store-only operation and therefore always worked on a sub-agent.
+        if let Some(response) = rewind_dormant_session(&state, id, body.turns).await? {
+            return Ok(response);
+        }
+        // It became resident while we looked; re-attach and claim it on the next pass, under the
+        // lock like the resident arm, so the rewind lands in the live conversation rather than
+        // under it and a DELETE finds it claimed.
+        ensure_session_loaded(&state, id).await?;
     };
 
     // `try_lock` for the same reason as `compact`; see the note there. Rewind is the sharper case:
@@ -520,19 +585,11 @@ pub(crate) async fn rewind(
                 .with("session_id", id.to_string()),
         );
     }
-    // The conversation was rewritten under the agent, which indexes two markers by message
-    // position. Left stale, `last_accepted_len` makes the degrade-and-retry repair compute an
-    // empty suspect window and silently stop firing for the rest of the session, and
-    // `last_rendered_world` makes `run_turn` believe it already announced a tool or MCP server
-    // whose announcement the rewind just deleted. `compact_session` clears both inline; this is
-    // the other path that rewrites the log, and the REPL's `/rewind` has always called this.
-    entry.agent.reset_conversation_markers().await;
-    // The gauge described turns that are gone; an estimate of what is left stands in until the
-    // next measurement, or the next turn's check reads the dropped turns as still there.
+    // The conversation was rewritten under the agent; the one reset every rewrite door calls.
     entry
         .agent
-        .cells()
-        .seed_context_estimate(conversation.as_slice());
+        .reset_conversation_markers(conversation.as_slice())
+        .await;
     drop(conversation);
     // See the note in `compact`. `save_event` has already moved `updated_at` on the row, so
     // without this the resident entry reports an older timestamp than `meka session list` does for

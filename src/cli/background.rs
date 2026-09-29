@@ -91,7 +91,7 @@ pub(crate) async fn show(
         .resolve_background_task(session, id_prefix)
         .await?
     else {
-        return Err(MekaError::Config(format!(
+        return Err(MekaError::Usage(format!(
             "no background task matching '{id_prefix}'"
         )));
     };
@@ -187,12 +187,12 @@ pub(crate) async fn cancel(
         .resolve_background_task(session, id_prefix)
         .await?
     else {
-        return Err(MekaError::Config(format!(
+        return Err(MekaError::Usage(format!(
             "no background task matching '{id_prefix}'"
         )));
     };
     if task.status.is_terminal() {
-        return Err(MekaError::Config(format!(
+        return Err(MekaError::Usage(format!(
             "task {} already {}",
             task.short_id(),
             task.status.name()

@@ -72,6 +72,17 @@ pub(super) fn back_up_before_migrating(
     }
     // For platforms where the mode above is a no-op, and against a umask that somehow widened it.
     restrict_permissions(&staging, 0o600);
+    // `VACUUM INTO` writes through the page cache and syncs nothing, and the rename below is what
+    // makes the older copy prunable: a power loss between the two would leave the documented name
+    // on a copy the disk never finished, with the one good copy already gone. The file first, then
+    // the directory entry the rename made.
+    if let Err(error) = sync_file(&staging) {
+        remove_partial_backup(&staging);
+        return Err(MekaError::Database(format!(
+            "failed to sync the pre-migration backup at '{}': {error}. Nothing has been changed",
+            staging.display()
+        )));
+    }
     std::fs::rename(&staging, &target).map_err(|error| {
         remove_partial_backup(&staging);
         MekaError::Database(format!(
@@ -80,7 +91,35 @@ pub(super) fn back_up_before_migrating(
             target = target.display(),
         ))
     })?;
+    if let Some(directory) = target.parent()
+        && let Err(error) = sync_directory(directory)
+    {
+        return Err(MekaError::Database(format!(
+            "failed to sync the directory of the pre-migration backup '{}': {error}. Nothing has \
+             been changed",
+            target.display()
+        )));
+    }
     Ok(Some(target))
+}
+
+/// Flush `path`'s bytes to the disk.
+fn sync_file(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+/// Flush the directory entries of `directory` to the disk, which is what makes a rename durable.
+/// Windows has no directory sync and does not need one for a `MoveFileEx`.
+fn sync_directory(directory: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(directory)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        Ok(())
+    }
 }
 /// Remove the copies an earlier migration left, now that a fresher one is in place.
 ///

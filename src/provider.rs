@@ -146,8 +146,9 @@ const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// is found by the keepalives instead (reqwest's TCP defaults and [`HTTP2_KEEPALIVE_INTERVAL`]); a
 /// stream that carries nothing is bounded by [`STREAM_IDLE_TIMEOUT`] at the SSE layer, the one
 /// place silence means something; and a stop drops a pending request in
-/// `crate::oauth::send_with_one_refresh` and its body in `crate::error::read_whole_reply`, the one
-/// place every request a turn makes is sent and the one place every whole reply is read.
+/// `crate::oauth::send_with_one_refresh` and its body in `crate::error::read_whole_reply`, where
+/// every request a turn or an account call makes is sent and its whole reply read. A token
+/// exchange, a revocation and an MCP auth probe run their own bounded requests outside a turn.
 pub(crate) fn build_http_client(
     backend: &str,
     configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
@@ -517,10 +518,13 @@ struct ToolCallAccumulator {
 }
 
 /// The response if it succeeded, else the classified HTTP error carrying whatever body could be
-/// read. Every driver refuses a non-success status the same way, before it starts reading events.
+/// read. Every driver refuses a non-success status the same way: the stream loop before it starts
+/// reading events, and each whole-reply path, a completion's or an auxiliary call's, before it
+/// reads the body as an answer.
 pub(crate) async fn succeeded(
     response: reqwest::Response,
     what: &str,
+    request: crate::error::ProviderRequest,
     cancellation: &CancellationToken,
 ) -> Result<reqwest::Response> {
     let status = response.status();
@@ -545,7 +549,7 @@ pub(crate) async fn succeeded(
         status,
         &response_text,
         retry_after,
-        crate::error::ProviderRequest::Completion,
+        request,
     ))
 }
 
@@ -568,17 +572,17 @@ pub(crate) fn finalize_tool_arguments(
     })
 }
 
-/// [`finalize_tool_arguments`] as the streaming drivers emit it: the call's end, or its rejection.
+/// [`finalize_tool_arguments`] as the streaming drivers emit it: the call's end, or its refusal.
 pub(crate) fn tool_use_event(id: String, name: String, raw: &str) -> StreamEvent {
     match finalize_tool_arguments(&name, raw) {
         Ok(input) => StreamEvent::ToolUseEnd { input },
-        Err(reason) => StreamEvent::ToolCallRejected { id, name, reason },
+        Err(reason) => StreamEvent::ToolCallRefused { id, name, reason },
     }
 }
 
-/// A rejected call as a content block: the reason rides under [`INVALID_TOOL_ARGS_MARKER`] so the
+/// A refused call as a content block: the reason rides under [`INVALID_TOOL_ARGS_MARKER`] so the
 /// dispatch loop refuses it and the model is told why.
-pub(crate) fn rejected_tool_use(id: String, name: String, reason: String) -> ContentBlock {
+pub(crate) fn refused_tool_use(id: String, name: String, reason: String) -> ContentBlock {
     ContentBlock::ToolUse {
         id,
         name,
@@ -643,15 +647,9 @@ impl MessageAccumulator {
             StreamEvent::TextDelta(text) => self.text.push_str(&text),
             StreamEvent::ThinkingDelta(text) => self.thinking.push_str(&text),
             StreamEvent::ThinkingComplete { opaque } => {
-                // Kept whenever it carries replayable state: visible text and/or something opaque.
-                // Under `redact-thinking` or display updates the text is empty but the signature
-                // must survive to continue the reasoning chain on the next turn,
-                // and under the Responses API the sealed reasoning is the whole of
-                // what can be replayed.
                 let thinking = std::mem::take(&mut self.thinking);
-                if !thinking.is_empty() || opaque.is_some() {
-                    self.content
-                        .push(ContentBlock::Thinking { thinking, opaque });
+                if let Some(block) = ContentBlock::replayable_thinking(thinking, opaque) {
+                    self.content.push(block);
                 }
             }
             StreamEvent::RedactedThinking { data } => {
@@ -670,10 +668,10 @@ impl MessageAccumulator {
                 name: std::mem::take(&mut self.tool_name),
                 input,
             }),
-            StreamEvent::ToolCallRejected { id, name, reason } => {
+            StreamEvent::ToolCallRefused { id, name, reason } => {
                 // A malformed call keeps the assistant message's shape valid for the round trip;
                 // the marker is what `resolve_and_execute_tool` refuses to run.
-                self.content.push(rejected_tool_use(id, name, reason));
+                self.content.push(refused_tool_use(id, name, reason));
                 self.tool_id.clear();
                 self.tool_name.clear();
             }
@@ -878,7 +876,12 @@ mod tests {
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            succeeded(response, "test", &cancellation),
+            succeeded(
+                response,
+                "test",
+                crate::error::ProviderRequest::Completion,
+                &cancellation,
+            ),
         )
         .await
         .expect("the stop must end the read, not the test's own deadline");
@@ -1638,7 +1641,7 @@ mod tests {
     }
 
     /// Regression test for the "silent `{}` fallback" bug: a tool call with unparseable JSON
-    /// arguments must be rejected via [`StreamEvent::ToolCallRejected`] rather than replayed with
+    /// arguments must be refused via [`StreamEvent::ToolCallRefused`] rather than replayed with
     /// an empty input object (which would run the tool on whatever defaults it happens to
     /// tolerate).
     #[tokio::test]
@@ -1662,12 +1665,12 @@ mod tests {
 
         let second = receiver.try_recv().expect("follow-up event");
         match second {
-            StreamEvent::ToolCallRejected { id, name, reason } => {
+            StreamEvent::ToolCallRefused { id, name, reason } => {
                 assert_eq!(id, "call-1");
                 assert_eq!(name, "file_read");
                 assert!(reason.starts_with("invalid JSON arguments"));
             }
-            other => panic!("expected ToolCallRejected, got {other:?}"),
+            other => panic!("expected ToolCallRefused, got {other:?}"),
         }
 
         assert!(
@@ -2015,26 +2018,5 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as i64 + 86_400_000)
             .unwrap_or(0)
-    }
-
-    #[test]
-    fn auth_credential_api_key_header() {
-        let credential = AuthCredential::ApiKey("my-key".to_string());
-        let (name, value) = credential.auth_header();
-        assert_eq!(name, "x-api-key");
-        assert_eq!(value, "my-key");
-    }
-
-    #[test]
-    fn auth_credential_oauth_header() {
-        let credential = AuthCredential::OAuthToken {
-            access_token: "my-token".to_string(),
-            refresh_token: None,
-            expires_at: None,
-            account_id: None,
-        };
-        let (name, value) = credential.auth_header();
-        assert_eq!(name, "Authorization");
-        assert_eq!(value, "Bearer my-token");
     }
 }

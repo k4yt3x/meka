@@ -1099,6 +1099,19 @@ fn format_without_oneshot_is_refused() {
     assert!(stderr.contains("`--format` needs `--oneshot`"), "{stderr}");
 }
 
+/// The root `--format` is refused ahead of every subcommand too: a script that wrote it ahead of
+/// `profile list` meant the subcommand's own flag, and a plain table with exit 0 would hide that.
+#[test]
+fn format_ahead_of_a_subcommand_is_refused() {
+    let install = Install::new();
+    write_provider_config(&install, "mock", &["mock"]);
+    let output = run_scripted(&install, &["--format", "json", "profile", "list"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("`--format` needs `--oneshot`"), "{stderr}");
+    assert!(output.stdout.is_empty(), "nothing was listed");
+}
+
 /// Ctrl+C ends a one-shot run with 130, as it ends every other host, not with 0 over a partial
 /// answer, and what streamed before the press is kept. The press waits for a notice the script
 /// raises right after its first text, which the console prints to stderr as it arrives; the
@@ -1197,6 +1210,76 @@ fn an_interrupted_json_oneshot_run_still_reports() {
     let report: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|error| panic!("one object on stdout ({error}): {stdout:?}"));
     assert_eq!(report["stop_reason"], "interrupted");
+}
+
+/// Ctrl+C while a one-shot run waits for a background task stops the task: the wait keeps the
+/// handles registered, the release on the way out cancels them, and the run waits for the cancel
+/// to land before leaving. Without them the command runs on untracked, its row saying `running`
+/// until a later open sweeps it.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_wait_stops_the_background_task_it_was_waiting_for() {
+    fn a_process_lists(needle: &str) -> bool {
+        let listing = std::process::Command::new("ps")
+            .args(["-eo", "args"])
+            .output()
+            .expect("ps runs");
+        String::from_utf8_lossy(&listing.stdout).contains(needle)
+    }
+    let install = Install::new();
+    let config_dir = install.config_dir();
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "default_profile = \"mock\"\n\n[accounts.mock]\nbackend = \"anthropic-messages\"\n\n\
+         [profiles.mock]\naccount = \"mock\"\nmodel = \"claude-sonnet-4-5\"\n\n[permissions]\n\
+         default = \"unrestricted\"\nenabled = [\"read\", \"unrestricted\"]\n\n[background]\n\
+         enabled = true\n",
+    )
+    .expect("write config.toml");
+    install.write_script(
+        r#"[
+          [{"type":"tool_use_start","id":"call-1","name":"shell_execute"},
+           {"type":"tool_use_end","input":{"command":"sleep 27.1828","background":true}},
+           {"type":"message_end","stop_reason":"tool_use"}],
+          [{"type":"text","text":"started"},{"type":"message_end","stop_reason":"end_turn"}]
+        ]"#,
+    );
+    let child = install
+        .meka(&["--oneshot", "-p", "run it"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn meka");
+    // The press waits for the command to be running, which is when the run is waiting on it.
+    support::wait_until(
+        "the detached command",
+        std::time::Duration::from_secs(20),
+        || a_process_lists("sleep 27.1828"),
+    );
+    // SAFETY: `child.id()` is a live process this test spawned and still owns.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+    let output = child.wait_with_output().expect("wait for meka");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("stopping 1 background task"),
+        "the release names what it stopped: {stderr}"
+    );
+    support::wait_until(
+        "the command's end",
+        std::time::Duration::from_secs(5),
+        || !a_process_lists("sleep 27.1828"),
+    );
+    let status: String = store(&install)
+        .query_row("SELECT status FROM background_tasks", [], |row| row.get(0))
+        .expect("the one task row");
+    assert_ne!(
+        status, "running",
+        "the task was stopped before the process left, not abandoned: {stderr}"
+    );
 }
 
 /// A script whose answer starts at once, says so on stderr, and then holds for longer than any

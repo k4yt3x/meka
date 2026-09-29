@@ -74,7 +74,10 @@ A hardcoded fact about an external system expires, and nothing in the build noti
 A guess is tolerable when its wrong answer is a *rejected request* and it fails toward omission. A
 guess that fails toward *sending* survives only where the endpoint cannot vary, so never introduce one
 on a backend reachable via a user-supplied `base_url`. A value verified against a captured wire is a
-fact about the protocol rather than a prediction; pin it deliberately and cite the capture.
+fact about the protocol rather than a prediction; pin it deliberately and cite the capture. A
+capture pins a fact about the endpoint captured: on a backend whose endpoint varies, the captured
+value is the default of a user-owned key, never a bare pin (`interleaved_thinking` on an
+`anthropic-messages` account is the pattern).
 
 ## Compatibility
 

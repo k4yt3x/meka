@@ -6203,6 +6203,74 @@ fn acp_reports_a_failed_scheduled_turn_as_a_warn_notice() {
     );
 }
 
+/// The notice for a failed fire says what a request would have been told, and no more: with
+/// `relay_provider_errors` off, the upstream's own words stay in the log, on this door as on the
+/// prompt door. A notice that formats the error itself carries the whole provider body.
+#[test]
+fn acp_withholds_a_failed_fires_upstream_text_when_relaying_is_off() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "call_sched", "name": "schedule_create" },
+            { "type": "tool_use_end", "input": {
+                "prompt": "ACP_FIRE_PROMPT",
+                "at": "2s"
+            }},
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "scheduled" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "fail", "message": "ACP_PROVIDER_DOWN" }
+        ]
+    ]);
+    let config = format!("{ACP_SCHEDULE_CONFIG}\n[serve]\nrelay_provider_errors = false\n");
+    let mut harness = AcpTestHarness::builder()
+        .config(&config)
+        .script(script)
+        .window(Duration::from_secs(45))
+        .build();
+
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "remind me in two seconds");
+    let (_updates, _response) = harness.collect_updates(&session_id, id);
+
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut chunks: Vec<String> = Vec::new();
+    loop {
+        chunks.extend(
+            harness
+                .drain_unsolicited_updates(&session_id)
+                .iter()
+                .map(|update| &update["params"]["update"])
+                .filter(|update| update["sessionUpdate"] == "agent_message_chunk")
+                .filter_map(|update| update["content"]["text"].as_str())
+                .map(str::to_string),
+        );
+        if chunks.iter().any(|chunk| chunk.starts_with("[meka warn]")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the failed fire was never reported to the editor; chunks were:\n{chunks:#?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let notice = chunks
+        .iter()
+        .find(|chunk| chunk.starts_with("[meka warn]"))
+        .expect("checked by the loop");
+    assert!(
+        notice.contains("scheduled job") && notice.contains("failed"),
+        "the notice must still say which turn failed: {notice}"
+    );
+    assert!(
+        !notice.contains("ACP_PROVIDER_DOWN"),
+        "the upstream's words stay in the log when relaying is off: {notice}"
+    );
+}
+
 /// A compaction is the one thing that changes what the model can see without the editor doing
 /// anything, and the automatic ones fire with nobody asking. It is said as a `[meka]` chunk so a
 /// user whose next reply forgets the morning has been told why.

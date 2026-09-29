@@ -76,23 +76,15 @@ pub(super) fn spawn_background_poller(
     }
     let poll_interval = state.shared.config.schedule.poll_interval;
     tracing::info!("background tasks enabled for ACP: open sessions only");
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(poll_interval);
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            let hooks = AcpHooks {
-                state: Arc::clone(&state),
-            };
-            let sweep = std::panic::AssertUnwindSafe(
-                crate::host::scheduler::deliver_ready_outcomes(&hooks, &state.sessions),
-            );
-            if let Err(panic) = futures::FutureExt::catch_unwind(sweep).await {
-                let panic = crate::error::panic_message(&*panic);
-                tracing::warn!("background outcome delivery panicked ({panic}); continuing");
-            }
-        }
-    })
+    let sessions = state.sessions.clone();
+    // A token nothing fires: the handle is aborted with the connection, which is what ends this
+    // poller.
+    crate::host::scheduler::spawn_outcome_poller(
+        AcpHooks { state },
+        sessions,
+        poll_interval,
+        tokio_util::sync::CancellationToken::new(),
+    )
 }
 
 /// Build the `session/update` that shows a job's prompt as the user turn that triggered the reply.
@@ -152,7 +144,7 @@ impl crate::host::scheduler::HostHooks for AcpHooks {
     }
 
     async fn prepare(&self, entry: &Self::Entry) -> anyhow::Result<()> {
-        super::apply_recorded_profile(&self.state, &entry.agent, entry.id).await
+        crate::host::apply_recorded_profile(&self.state.shared, &entry.agent, entry.id).await
     }
 
     fn show_prompt(
@@ -189,7 +181,12 @@ impl crate::host::scheduler::HostHooks for AcpHooks {
             Err(crate::error::MekaError::Interrupted) => {
                 crate::frontend::Notice::info(format!("{what} was interrupted"))
             }
-            Err(error) => crate::frontend::Notice::warn(format!("{what} failed: {error}")),
+            // The words the request door would have given the editor: a provider's body or a
+            // store path travels only as `acp_error_for` allows, on this wire as on that one.
+            Err(error) => crate::frontend::Notice::warn(format!(
+                "{what} failed: {}",
+                super::acp_error_text(error, self.state.shared.relay_provider_errors())
+            )),
         };
         entry
             .frontend

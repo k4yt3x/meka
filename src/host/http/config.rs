@@ -298,8 +298,8 @@ impl std::fmt::Debug for ResolvedServeToken {
 /// (inline plaintext) or file-backed.
 #[derive(Debug, Clone)]
 pub(crate) enum TokenSource {
-    /// Literal value in `token = "..."` with no `${ENV}` markers, discouraged outside
-    /// development.
+    /// A value the file states, written plainly or as the default a `${ENV:-default}` fell to;
+    /// discouraged outside development.
     Inline,
     /// `token = "${ENV_VAR}"` substituted at config-load time.
     EnvVar,

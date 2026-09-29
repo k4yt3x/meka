@@ -124,14 +124,11 @@ impl crate::schedule::GateTools for GateToolset {
         //
         // Requiring the tool to exist first is what keeps this from failing open: the map alone
         // would admit a probe that matches nothing, if a stale entry happened to give it `read`.
-        Some(
-            self.core
-                .builtin_filter
-                .permission_overrides
-                .get(name)
-                .copied()
-                .unwrap_or(hardcoded),
-        )
+        Some(crate::tools::effective_permission(
+            &self.core.builtin_filter.permission_overrides,
+            name,
+            hardcoded,
+        ))
     }
 
     fn is_still_connecting(&self, name: &str) -> bool {

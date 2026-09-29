@@ -394,4 +394,105 @@ mod tests {
             "publishing a turn starts the count over, whatever the wait before it counted"
         );
     }
+
+    /// A host that leaves through one of its early `?` paths still flushes what it had streamed and
+    /// still settles the row.
+    ///
+    /// Both halves of what the guard is for, and the second is the one with a screen behind it:
+    /// `repl_handle.await?` fires when the REPL thread panicked, which can be mid-wake with the
+    /// prompt it broke out of still drawn.
+    ///
+    /// Only the mechanism is pinned here. Reaching those paths for real needs a failing provider
+    /// registry or a panicking REPL thread behind a terminal, and an assertion the guard's absence
+    /// cannot fail is not coverage.
+    #[test]
+    fn the_last_episode_closes_however_the_host_leaves() {
+        let console = std::sync::Arc::new(std::sync::Mutex::new(crate::console::Console::new(
+            crate::console::Spacing {
+                newline_before_prompt: true,
+                newline_after_prompt: true,
+            },
+            crate::config::RenderMode::Raw,
+        )));
+        with_console(&console, |console| {
+            console.open_episode(
+                crate::console::RowState::Empty,
+                crate::console::Neighbor::Shell,
+            )
+        });
+        {
+            let _last_episode = LastEpisode(std::sync::Arc::clone(&console));
+            with_console(&console, |console| {
+                console.text_delta("half an answer");
+                // The drawing API cannot reach a parked prompt without a terminal. A wake that
+                // streamed would have settled the row first, so this pairs a parked prompt with an
+                // open block to exercise both halves of the close at once rather than to reproduce
+                // one state the REPL reaches.
+                console.force_row(crate::console::RowState::PromptParked);
+            });
+            assert!(
+                with_console(&console, |console| console.has_open_text()),
+                "the block has to be open, or the guard has nothing to close"
+            );
+        }
+        assert!(
+            !with_console(&console, |console| console.has_open_text()),
+            "leaving the host's scope closes it, whether or not the host reached its own close"
+        );
+        assert_eq!(
+            with_console(&console, |console| console.row()),
+            crate::console::RowState::Empty,
+            "and the stale prompt goes with it, rather than sitting under the shell's"
+        );
+    }
+
+    /// The Ctrl+C ladder, which nothing else can reach.
+    ///
+    /// `install_interrupt_handler` is a spawned listener on `tokio::signal::ctrl_c()` ending in
+    /// `std::process::exit(130)`, so no test drives it; the four mutants that survived the sweep
+    /// all lived in these two decisions. Both are behavior: collapsing the second press into the
+    /// third makes Ctrl+C Ctrl+C kill the process instead of the background tasks, which is the
+    /// unrecoverable outcome the ladder exists to put one more keystroke in front of.
+    #[test]
+    fn the_interrupt_ladder_escalates_one_press_at_a_time() {
+        assert_eq!(
+            escalation_for(1),
+            Escalation::CancelTurn,
+            "the first press is the shell's contract: the foreground job, and nothing else"
+        );
+        assert_eq!(
+            escalation_for(2),
+            Escalation::CancelBackgroundTasks,
+            "the second stops the background work, and is the rung whose absence would make the \
+             second press fatal"
+        );
+        for press in [3, 4, 99] {
+            assert_eq!(
+                escalation_for(press),
+                Escalation::Leave,
+                "press {press} is past the ladder and leaves"
+            );
+        }
+        // Zero is unreachable -- the counter is incremented before this is asked -- so what matters
+        // is that it does not land on a rung, not which one it picks.
+        assert_eq!(escalation_for(0), Escalation::Leave);
+    }
+
+    /// Nothing is announced when nothing was stopped, and the plural agrees with the count.
+    #[test]
+    fn the_background_cancellation_notice_counts_what_it_stopped() {
+        assert_eq!(
+            background_cancellation_notice(0),
+            None,
+            "a second press with nothing running must not claim to have stopped anything"
+        );
+        assert_eq!(
+            background_cancellation_notice(1).as_deref(),
+            Some("stopping 1 background task")
+        );
+        assert_eq!(
+            background_cancellation_notice(4).as_deref(),
+            Some("stopping 4 background tasks")
+        );
+    }
 }

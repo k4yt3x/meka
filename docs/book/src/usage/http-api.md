@@ -535,7 +535,7 @@ Every resident session has one event feed. Everything a turn emits goes on it, w
 
 | Event | Payload | When |
 |-------|---------|------|
-| `turn.started` | `turn_id`, `session_id`, `started_at`, `source` (`"client"`, `"inbox"` with `item_ids`, `"schedule"` with `job_id`, or `"background"`) | Turn begins |
+| `turn.started` | `turn_id`, `session_id`, `started_at`, `source` (`"client"`, `"inbox"` with `item_ids`, `"schedule"` with `job_id`, `"background"`, or `"compaction"` for the checkpoint turn `POST /compact` runs) | Turn begins |
 | `turn.finished` | `turn_id`, `session_id`, `stop_reason`, `usage`, optional `refusal_text` | Turn completed successfully |
 | `turn.failed` | `turn_id`, `session_id`, `error` (Problem Detail shape), `message_withdrawn` when the turn began | Turn failed mid-stream |
 | `turn.canceled` | `turn_id`, `session_id`, `reason` (`"client"`, `"server_shutdown"`, or `"sse_lag"` when the only consumer fell behind and the turn was stopped for it), `message_withdrawn` when the turn began | Turn was canceled |
@@ -612,7 +612,7 @@ Turn events are broadcast, so a re-attached client or a second consumer counts a
 
 ### The session feed
 
-`GET /v1/sessions/{id}/stream` is the session's feed: every event of every turn, across turns, for as long as the connection is held. It is how a client sees the turns nobody asked for over HTTP, a scheduled job firing at three in the morning or a background task reporting back, and it is where a client that submits through the [inbox](#the-inbox) learns what became of its items. Subscribe once, and file events by the `turn_id` they carry. Loading the session is part of opening the feed, so a bridge can subscribe before it has anything to submit, and a reconnect to an evicted session gets its feed back rather than a 404.
+`GET /v1/sessions/{id}/stream` is the session's feed: every event of every turn, across turns, for as long as the connection is held. It is how a client sees the turns nobody asked for over HTTP, a scheduled job firing at three in the morning or a background task reporting back, and it is where a client that submits through the [inbox](#the-inbox) learns what became of its items. Subscribe once, and file events by the `turn_id` they carry. Loading the session is part of opening the feed, so a bridge can subscribe before it has anything to submit, and a reconnect to an evicted session gets its feed back rather than a 404. That loading takes `sessions:w`, the scope that drives a session: a revived session is held in memory and under its cross-process lock for as long as the stream stays open, so a token with `sessions:r` alone attaches to a session this process has loaded and is answered `409` (`/errors/session-not-loaded`) otherwise.
 
 Send the last id you received as a `Last-Event-ID` header (browser `EventSource` does this automatically) or as a `?last_event_id=` query parameter, and the server replays what you missed before following the live feed.
 
@@ -674,7 +674,7 @@ Every delivery carries `delivery_id`, `event`, `timestamp`, and event-specific i
 }
 ```
 
-A `schedule.fired` `status` is `completed`, `failed`, or `canceled` when the turn was stopped before it finished, as happens when the server drains during it.
+A `schedule.fired` `status` is `completed`, `failed`, `canceled` when the turn was stopped before it finished, as happens when the server drains during it, or `not_run` when the job's session could not be opened for it (its profile left `config.toml`, or the session is gone); a `not_run` fire is tried again when its lease expires, so the status may repeat until the attempts run out.
 
 **Payloads never carry message content.** A webhook URL is a string in a config file: it can be mistyped, it can outlive whatever owned it, and anything that learns it can reach it. So a delivery tells you *what happened to which session*, and you fetch the conversation with your own bearer token over the API you already authenticate against. A compromised endpoint learns that a session was active, not what was said in it.
 
@@ -1206,7 +1206,7 @@ Key points:
 | GET | `/v1/sessions/{id}/inbox` | `sessions:r` | Inbox items the model has not been shown |
 | DELETE | `/v1/sessions/{id}/inbox/{item_id}` | `sessions:w` | Withdraw an item still waiting |
 | POST | `/v1/sessions/{id}/responses/{request_id}` | `sessions:w` | Resolve permission prompt |
-| GET | `/v1/sessions/{id}/stream` | `sessions:r` | The session's event feed, across turns; `?attend=true` (needs `sessions:w`) to be asked to approve gated calls |
+| GET | `/v1/sessions/{id}/stream` | `sessions:r` | The session's event feed, across turns; `sessions:w` to load a session this process has not, and `?attend=true` (needs `sessions:w`) to be asked to approve gated calls |
 | POST | `/v1/sessions/{id}/compact` | `sessions:w` | Summarize the conversation now |
 | GET | `/v1/sessions/{id}/context` | `sessions:r` | Context occupancy and cumulative usage |
 | POST | `/v1/sessions/{id}/rewind` | `sessions:w` | Drop trailing turns |
@@ -1259,7 +1259,7 @@ A `schedule:*`-only token can still plant ordinary prompt-only jobs; it cannot r
 
 Canceling a background task records the cancellation and signals the running task, but only `meka serve` can signal work `meka serve` started. If the session is open in another process (a `meka -r` REPL, say), the row is marked `canceled` and the command keeps running there until it ends on its own; its result is then discarded, because the row is no longer `running`.
 
-`POST /v1/mcp/{name}/reconnect` answers 200 with where the server now stands, which is not the same as "it worked": **read `state`, not the status code**. An attempt that ran and failed is a 200 carrying `state: "failed"`, not a 502. A server the startup sweep is still connecting comes back as `state: "pending"` with no attempt made, so a dashboard polling `GET /v1/mcp` during startup does not mistake "still coming up" for "down". The two non-200s are narrow: 422 when the server is `disabled` in config, and 502 when an already-connected server's transport could not be re-established within `[mcp] connect_timeout`.
+`POST /v1/mcp/{name}/reconnect` answers 200 with where the server now stands, which is not the same as "it worked": **read `state`, not the status code**. An attempt that ran and failed is a 200 carrying `state: "failed"`, not a 502. A server the startup sweep is still connecting comes back as `state: "pending"` with no attempt made, so a dashboard polling `GET /v1/mcp` during startup does not mistake "still coming up" for "down". The two non-200s are narrow: 422 when the server is `disabled` in config, and 502 when an already-connected server's transport could not be re-established within `[mcp] connect_timeout`. Neither carries the reason, which is in the meka log: a connector's reason has quoted a spawn command line and a URL with its key.
 
 MCP OAuth login and logout are deliberately absent: the flow prints a URL for a person to open in a browser and waits for the callback, which does not belong on a service-to-service surface. Use `meka mcp login` on the host. `/v1/profiles` is read-only for the same reason profile selection has no environment tier: an ambient value must never silently rebind which account a named profile bills.
 

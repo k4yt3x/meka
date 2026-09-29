@@ -341,7 +341,7 @@ fn rename_profile_under_lock(name: &str, new_name: &str) -> anyhow::Result<()> {
 /// `account` is absent. Moving a profile to another account moves every session on it to another
 /// credential and possibly another backend, silently, which is the one thing this command must not
 /// be able to do; a new profile on that account is one command away.
-const SETTABLE_PROFILE_KEYS: &[&str] = &[
+pub(super) const SETTABLE_PROFILE_KEYS: &[&str] = &[
     "model",
     "context_window",
     "max_output_tokens",
@@ -400,29 +400,27 @@ fn parse_profile_value(name: &str, key: &str, value: &str) -> anyhow::Result<tom
                 .map_err(anyhow::Error::msg)?;
             Ok(toml_edit::Value::from(mode.name()))
         }
-        other => anyhow::bail!(
-            "'{}' is not a profile setting (settable: {}).{}",
-            other,
-            SETTABLE_PROFILE_KEYS.join(", "),
-            unsettable_key_hint(other)
-        ),
+        other => Err(unsettable_key_refusal(other)),
     }
 }
 
-/// Why a key the user may reasonably reach for still cannot be written here.
-///
-/// An empty string for anything else, so the refusal above reads the same either way. Worth saying
-/// rather than leaving to the list: a user who typed `account` did not typo, and "settable: model,
-/// effort, ..." alone would read as though meka had simply forgotten it.
-fn unsettable_key_hint(key: &str) -> String {
+/// The refusal for a key `profile set` cannot write: one sentence, with the remedy where there
+/// is one. The one spelling for the check ahead of parsing and the parser's own fall-through.
+fn unsettable_key_refusal(key: &str) -> anyhow::Error {
     match key {
-        "account" => " Changing `account` would move every session on this profile onto another \
-             credential; add a profile on that account instead."
-            .to_string(),
+        // A user who typed it did not typo, and "settable: model, effort, ..." alone would read
+        // as though meka had forgotten it rather than declined it.
+        "account" => anyhow::anyhow!(
+            "`account` names the credential every session on the profile bills; add a profile on \
+             the other account instead"
+        ),
         "backend" | "base_url" | "oauth_token_url" | "client_id" | "device_id" => {
-            format!(" `{key}` is an account setting, under `[accounts.<name>]`.")
+            anyhow::anyhow!("`{key}` is set on the account, under `[accounts.<name>]`")
         }
-        _ => String::new(),
+        _ => anyhow::anyhow!(
+            "'{key}' is not a profile setting (settable: {})",
+            SETTABLE_PROFILE_KEYS.join(", ")
+        ),
     }
 }
 
@@ -541,12 +539,7 @@ fn ensure_settable_key(key: &str) -> anyhow::Result<()> {
     if SETTABLE_PROFILE_KEYS.contains(&key) {
         return Ok(());
     }
-    anyhow::bail!(
-        "'{}' is not a profile setting (settable: {}).{}",
-        key,
-        SETTABLE_PROFILE_KEYS.join(", "),
-        unsettable_key_hint(key)
-    )
+    Err(unsettable_key_refusal(key))
 }
 
 /// `meka profile set <name> <key> <value>`, or `--unset` to drop the key.
@@ -2044,14 +2037,21 @@ account = "work"
     /// Every settable key parses its own value type, and refuses what it cannot mean.
     #[test]
     fn each_profile_key_parses_the_way_its_add_flag_does() {
-        assert!(parse_profile_value("work", "model", "claude-opus-5-5").is_ok());
-        assert!(parse_profile_value("work", "context_window", "200000").is_ok());
+        let parsed = |key: &str, value: &str| parse_profile_value("work", key, value).expect(key);
+        assert_eq!(
+            parsed("model", "claude-opus-5-5").as_str(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(
+            parsed("context_window", "200000").as_integer(),
+            Some(200_000)
+        );
         assert!(parse_profile_value("work", "context_window", "lots").is_err());
-        assert!(parse_profile_value("work", "vision", "false").is_ok());
+        assert_eq!(parsed("vision", "false").as_bool(), Some(false));
         assert!(parse_profile_value("work", "vision", "no").is_err());
-        assert!(parse_profile_value("work", "thinking", "budgeted").is_ok());
+        assert_eq!(parsed("thinking", "budgeted").as_str(), Some("budgeted"));
         assert!(parse_profile_value("work", "thinking", "sideways").is_err());
-        assert!(parse_profile_value("work", "thinking_budget", "2048").is_ok());
+        assert_eq!(parsed("thinking_budget", "2048").as_integer(), Some(2048));
 
         // Every key in the advertised list has an arm. A key listed but unhandled would fall to the
         // catch-all and be refused as unknown, which reads as meka having forgotten its own field.

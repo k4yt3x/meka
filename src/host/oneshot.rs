@@ -345,7 +345,10 @@ pub(crate) async fn run_oneshot(
     // Waiting here degrades a background call into a slow synchronous one, which is a worse deal
     // than the agent asked for but an honest one; exiting instead would leave a promise nothing can
     // keep, and kill the work halfway through besides.
+    // Not after a Ctrl+C: the press that cut the turn short means the run is over, and the tasks
+    // are stopped by the release below rather than waited on for another press.
     if config.background.enabled
+        && !interrupted
         && let Some(id) = session_id
     {
         let outstanding = agent.background_tasks().running_count(id).await;
@@ -403,10 +406,35 @@ pub(crate) async fn run_oneshot(
         });
     }
 
-    // Same pairing the REPL does: this path attached the registry to the manager when the agent was
-    // built, so it detaches it here rather than leaving the cycle for the process teardown.
-    if let Some(manager) = &mcp_manager {
-        crate::tools::mcp_adapter::detach_session_registry(manager, agent.tool_registry()).await;
+    // The release the REPL makes on its way out, on every exit here too: without it a Ctrl+C
+    // during the wait above leaves the tasks it was waiting on running untracked, with their rows
+    // saying `running` until a later open sweeps them. It also detaches the registry this path
+    // attached to the manager when the agent was built, rather than leaving the cycle for the
+    // process teardown.
+    let stopped = crate::host::release_agent(&agent, &cancel, mcp_manager.as_ref()).await;
+    if stopped > 0 {
+        with_console(&console, |console| {
+            console.annotation(&format!(
+                "stopping {} background task{}",
+                stopped,
+                if stopped == 1 { "" } else { "s" }
+            ))
+        });
+        // Waited for, not just signaled, for the reason the REPL gives: the process leaves
+        // through `exit` right after this, which polls no task again, so a cancel alone would
+        // kill nothing. Bounded, since canceling only asks.
+        if let Some(id) = session_id
+            && tokio::time::timeout(
+                crate::host::terminal::BACKGROUND_EXIT_GRACE,
+                agent.background_tasks().wait_for_session(id),
+            )
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "background tasks did not stop in time; their rows are swept on the next open"
+            );
+        }
     }
     drop(agent);
 

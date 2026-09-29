@@ -119,16 +119,13 @@ async fn refuse_subagent_session(
     else {
         return Ok(None);
     };
-    let detail = match terms.parent {
-        Some(parent) => format!(
-            "session '{session_id}' is a sub-agent of '{parent}'; answer its prompts at \
-             `POST /v1/sessions/{parent}/responses/{{request_id}}`"
-        ),
-        None => format!(
-            "session '{session_id}' is a sub-agent whose parent is not in this store, so it has no \
-             prompt of its own to answer"
-        ),
+    let remedy = match terms.parent {
+        Some(parent) => {
+            format!("; answer its prompts at `POST /v1/sessions/{parent}/responses/{{request_id}}`")
+        }
+        None => ", so it has no prompt of its own to answer".to_string(),
     };
+    let detail = format!("{}{remedy}", terms.describe(session_id));
     Ok(Some(
         ProblemDetail::new(
             ErrorKind::SessionNotDrivable,

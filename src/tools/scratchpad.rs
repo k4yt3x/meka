@@ -177,13 +177,16 @@ pub(crate) async fn persist_oversized_results(
                     }
 
                     counter += 1;
-                    // Unique for the life of the session, not just within this call: `counter`
-                    // restarts at zero on every invocation (this runs once per assistant message)
-                    // and `save_scratchpad_entry` is `INSERT OR REPLACE` keyed on `(session,
-                    // name)`, so a name built from the counter alone would let a later turn's
-                    // spill silently replace an earlier one under the handle the model still
-                    // holds. The `tool_use_id` is provider-generated and unique per call.
-                    let name = format!("{}_{}_{}", base_name, short_call_id(tool_use_id), counter);
+                    // `counter` restarts at zero on every invocation (this runs once per
+                    // assistant message) and `save_scratchpad_entry` is `INSERT OR REPLACE`
+                    // keyed on `(session, name)`, so a name that repeats replaces an earlier
+                    // spill under the handle the model still holds. The call id disambiguates
+                    // where the provider mints one per call, and the store is asked where it does
+                    // not: an OpenAI-compatible server may number calls from zero every turn, or
+                    // send none.
+                    let wanted =
+                        format!("{}_{}_{}", base_name, short_call_id(tool_use_id), counter);
+                    let name = free_scratchpad_name(store, session_id, wanted).await?;
 
                     store.save_scratchpad_entry(session_id, &name, text).await?;
 
@@ -193,6 +196,31 @@ pub(crate) async fn persist_oversized_results(
         }
     }
     Ok(())
+}
+
+/// `wanted`, or the first `wanted_<n>` the session holds no entry under.
+async fn free_scratchpad_name(
+    store: &Store,
+    session_id: Uuid,
+    wanted: String,
+) -> crate::error::Result<String> {
+    let mut name = wanted.clone();
+    let mut attempt = 1;
+    while store
+        .load_scratchpad_entry(session_id, &name)
+        .await?
+        .is_some()
+    {
+        attempt += 1;
+        name = format!("{wanted}_{attempt}");
+    }
+    Ok(name)
+}
+
+/// The `Created` column: an RFC 3339 stamp's date and time without its offset. Cut by characters,
+/// since an imported archive may carry a stamp meka did not write.
+fn created_at_column(created_at: &str) -> String {
+    created_at.chars().take(19).collect()
 }
 
 /// A short, name-safe slice of a provider tool-call id, for disambiguating scratchpad entries.
@@ -743,7 +771,7 @@ impl Tool for ScratchpadListTool {
                 vec![
                     entry.name.clone(),
                     format_size(entry.size),
-                    entry.created_at[..19.min(entry.created_at.len())].to_string(),
+                    created_at_column(&entry.created_at),
                     origin.to_string(),
                 ]
             })
@@ -1590,6 +1618,81 @@ mod tests {
             .await
             .expect("load");
         assert_eq!(loaded, Some(large_text));
+    }
+
+    /// The column is cut by characters: an imported archive's stamp may put a multi-byte
+    /// character where meka's own stamps never have one, and a byte slice there panicked the
+    /// listing and the turn with it.
+    #[test]
+    fn the_created_column_is_cut_by_characters() {
+        assert_eq!(
+            created_at_column("2026-09-29T10:00:00+00:00"),
+            "2026-09-29T10:00:00"
+        );
+        let cut = created_at_column("2026-09-29T10:00:0é and more");
+        assert_eq!(cut.chars().count(), 19);
+        assert!(cut.ends_with('é'));
+    }
+
+    /// A spill takes a name the store does not hold: the provider owns the call id, and one that
+    /// numbers calls from zero every turn, or sends none, gives a later turn's spill the name of an
+    /// earlier one, which `INSERT OR REPLACE` then silently replaces under the handle the model
+    /// still holds.
+    #[tokio::test]
+    async fn a_spill_never_replaces_an_entry_the_model_still_holds() {
+        let manager = Store::for_test().await;
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        let taken = format!("shell_execute_{}_1", short_call_id("call-1"));
+        manager
+            .save_scratchpad_entry(session_id, &taken, "an earlier turn's output")
+            .await
+            .expect("the earlier spill");
+
+        let large_text = "y".repeat(MAX_INLINE_RESULT_BYTES + 1000);
+        let assistant_msg =
+            make_assistant_message(vec![("call-1", "shell_execute", serde_json::json!({}))]);
+        let mut results = vec![ContentBlock::ToolResult {
+            tool_use_id: "call-1".to_string(),
+            content: vec![ToolResultContent::Text {
+                text: large_text.clone(),
+            }],
+            is_error: false,
+        }];
+        persist_oversized_results(
+            &manager,
+            session_id,
+            &assistant_msg,
+            &mut results,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("persist");
+
+        assert_eq!(
+            manager
+                .load_scratchpad_entry(session_id, &taken)
+                .await
+                .expect("load"),
+            Some("an earlier turn's output".to_string()),
+            "the handle the model holds still reads what it read"
+        );
+        let renamed = format!("{taken}_2");
+        assert_eq!(
+            manager
+                .load_scratchpad_entry(session_id, &renamed)
+                .await
+                .expect("load"),
+            Some(large_text),
+            "the new spill took the next free name"
+        );
+        let text = ContentBlock::tool_result_text_content(match &results[0] {
+            ContentBlock::ToolResult { content, .. } => content,
+            other => panic!("{other:?}"),
+        });
+        assert!(text.contains(&format!("name=\"{renamed}\"")), "{text}");
     }
 
     /// The read tool's reply is what the dispatcher records as sized, and the spill pass must then

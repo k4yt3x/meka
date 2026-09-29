@@ -52,6 +52,7 @@ pub(crate) async fn run(
             base_url,
             oauth_token_url,
             client_id,
+            interleaved_thinking,
             api_key_stdin,
         } => {
             run_add(
@@ -62,6 +63,7 @@ pub(crate) async fn run(
                     oauth_token_url: oauth_token_url.clone(),
                     client_id: client_id.clone(),
                 },
+                *interleaved_thinking,
                 *api_key_stdin,
                 token_store,
             )
@@ -93,6 +95,7 @@ async fn run_add(
     backend_flag: Option<&str>,
     base_url_flag: Option<String>,
     settings_flags: OAuthSettings,
+    interleaved_thinking: Option<bool>,
     api_key_stdin: bool,
     token_store: &TokenStore,
 ) -> anyhow::Result<()> {
@@ -132,6 +135,11 @@ async fn run_add(
         Some(value) => validate_backend(value)?,
         None => prompt_backend()?,
     };
+    // Refused rather than written and ignored, the way a key the backend never reads is warned
+    // about when hand-written: a flag that does nothing on this backend is a mistake to name.
+    if interleaved_thinking.is_some() && !backend.reads_account_key("interleaved_thinking") {
+        anyhow::bail!("`--interleaved-thinking` is read by `anthropic-messages` alone; drop it");
+    }
 
     let base_url = match base_url_flag {
         Some(url) => Some(url),
@@ -179,7 +187,13 @@ async fn run_add(
     // The account before the secret, so the half that lands first is the visible half: a failed
     // config write then leaves an account with no credential, which the next run refuses by name,
     // rather than a credential no account names, which only `account list` reports.
-    write_account(name, backend, base_url.as_deref(), &settings)?;
+    write_account(
+        name,
+        backend,
+        base_url.as_deref(),
+        &settings,
+        interleaved_thinking,
+    )?;
     token_store
         .save_account_credential(name, &credential)
         .await?;
@@ -271,18 +285,25 @@ async fn run_remove(name: &str, token_store: &TokenStore) -> anyhow::Result<()> 
     // reentrancy in a thread-local depth counter, so a guard held across an await on a
     // multi-threaded runtime can resume on a worker where the depth reads zero, and a nested
     // acquisition then self-deadlocks on the file lock this process already holds.
-    let has_account = {
+    let configured = {
         let (_lock, _path, document) = open_document()?;
         // Ahead of every write. A profile that names this account cannot run without it, and
         // every session on that profile would refuse to resume; refusing here names what to move
         // first rather than cascading a deletion the user did not ask for.
         refuse_a_referenced_account(&document, name)?;
         table_names(&document, "accounts")
-            .iter()
-            .any(|account| account == name)
     };
+    let has_account = configured.iter().any(|account| account == name);
     if !has_account && !has_credential {
-        anyhow::bail!("no account or stored credential named '{name}'");
+        // Configured accounts and accounts with a stored credential alike: this door removes
+        // either, so either is a name it knows.
+        let mut known = configured;
+        for account in token_store.list_credential_accounts().await? {
+            if !known.contains(&account) {
+                known.push(account);
+            }
+        }
+        anyhow::bail!(crate::text::unknown_name("account", name, known.iter()));
     }
 
     // Delete the credential first; the config write can still fail, but the secret should go
@@ -714,27 +735,36 @@ async fn acquire_credential(
 /// separate `lock_config_file()` call would be a step someone eventually forgets.
 ///
 /// Shared with `profile.rs`, which edits the same file under the same lock.
-pub(super) fn open_document() -> anyhow::Result<(
+pub(super) fn open_document() -> crate::error::Result<(
     config::ConfigFileLock,
     std::path::PathBuf,
     toml_edit::DocumentMut,
 )> {
-    let lock = config::lock_config_file()?;
+    let lock = config::lock_config_file()
+        .map_err(|error| crate::error::MekaError::io(format!("failed to lock config: {error}")))?;
     let path = crate::paths::config_file_path()
-        .ok_or_else(|| anyhow::anyhow!("failed to determine the config directory"))?;
+        .ok_or_else(|| crate::error::MekaError::io("failed to determine the config directory"))?;
     // Only a genuinely absent file starts from empty. Treating *any* read failure as "" turns
     // "I couldn't read your config" into "your config is blank", and the caller writes that blank
     // document straight back over the real file: one non-UTF-8 byte or a mode-000 file, and
     // `account remove` truncates config.toml to nothing, accounts and MCP servers included. The
-    // `meka mcp` editors already tolerate `NotFound` only; this matches them.
+    // one opener for every editor of the raw document, `meka mcp`'s included.
     let contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => {
-            anyhow::bail!("failed to read config at {}: {}", path.display(), error);
+            return Err(crate::error::MekaError::io(format!(
+                "failed to read config at {}: {}",
+                path.display(),
+                error
+            )));
         }
     };
-    let document = contents.parse::<toml_edit::DocumentMut>()?;
+    let document = contents
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| {
+            crate::error::MekaError::Config(format!("failed to parse config: {error}"))
+        })?;
     Ok((lock, path, document))
 }
 
@@ -809,6 +839,7 @@ fn upsert_account_document(
     backend: config::Backend,
     base_url: Option<&str>,
     settings: &OAuthSettings,
+    interleaved_thinking: Option<bool>,
 ) -> anyhow::Result<()> {
     let mut account = toml_edit::Table::new();
     // Written in [`config::AccountConfig`]'s canonical order. An unset setting is left out rather
@@ -823,6 +854,12 @@ fn upsert_account_document(
     }
     if let Some(client_id) = settings.client_id.as_deref() {
         account.insert("client_id", toml_edit::value(client_id));
+    }
+    if let Some(interleaved_thinking) = interleaved_thinking {
+        account.insert(
+            "interleaved_thinking",
+            toml_edit::value(interleaved_thinking),
+        );
     }
     // Redundant here, since the inserts above already run in order, and deliberately kept: it is
     // the one line that makes "every writer leaves the canonical order" true of this writer too.
@@ -846,6 +883,7 @@ fn write_account(
     backend: config::Backend,
     base_url: Option<&str>,
     settings: &OAuthSettings,
+    interleaved_thinking: Option<bool>,
 ) -> anyhow::Result<()> {
     // `_lock` is held to the end of the function, so the read above and the write below are one
     // critical section.
@@ -864,7 +902,14 @@ fn write_account(
         );
     }
     let before = document.to_string();
-    upsert_account_document(&mut document, name, backend, base_url, settings)?;
+    upsert_account_document(
+        &mut document,
+        name,
+        backend,
+        base_url,
+        settings,
+        interleaved_thinking,
+    )?;
     let after = document.to_string();
     reparse_after_edit(&before, &after)?;
     crate::fs::write_file_atomic(&path, &after)?;
@@ -1561,8 +1606,9 @@ fn extract_jwt_expiration_millis(jwt: &str) -> Option<i64> {
 #[derive(serde::Serialize)]
 struct AuthStatus {
     valid: bool,
-    /// Token expiry as Unix seconds (`None` for API keys / no expiry).
-    expires_at: Option<i64>,
+    /// Token expiry as RFC 3339, the form every wire carries a time in (`None` for API keys and
+    /// for a token with no expiry).
+    expires_at: Option<String>,
     /// Seconds until expiry (negative if already expired).
     expires_in_seconds: Option<i64>,
 }
@@ -1572,9 +1618,11 @@ impl AuthStatus {
         match credential {
             AuthCredential::OAuthToken { expires_at, .. } => {
                 // `expires_at` is stored as epoch milliseconds.
-                let expires_at = expires_at.map(|millis| millis / 1000);
                 let expires_in_seconds =
-                    expires_at.map(|secs| secs - chrono::Utc::now().timestamp());
+                    expires_at.map(|millis| millis / 1000 - chrono::Utc::now().timestamp());
+                let expires_at = expires_at
+                    .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                    .map(|expiry| expiry.to_rfc3339());
                 AuthStatus {
                     valid: expires_in_seconds.is_none_or(|remaining| remaining > 0),
                     expires_at,
@@ -1987,6 +2035,35 @@ mod tests {
         assert_eq!(orphans, vec!["archive".to_string()]);
     }
 
+    /// `--interleaved-thinking` is `anthropic-messages`'s key; on any other backend it would be
+    /// written and never read, so the door refuses it in the words the hand-written warning uses.
+    #[tokio::test]
+    async fn add_refuses_the_interleaved_thinking_flag_on_a_backend_that_never_reads_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.toml"), "").expect("write config");
+        let store = crate::store::Store::for_test().await.token_store();
+
+        // SAFETY: as in the sibling tests.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = run_add(
+            "home",
+            Some("openai-responses"),
+            None,
+            OAuthSettings::default(),
+            Some(false),
+            true,
+            &store,
+        )
+        .await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+        let error = result
+            .expect_err("refused ahead of the key prompt")
+            .to_string();
+        assert!(error.contains("`--interleaved-thinking`"), "{error}");
+        assert!(error.contains("anthropic-messages"), "{error}");
+    }
+
     /// The sibling of `login_refuses_a_piped_key_for_a_browser_backend`, and asserted together
     /// because the two commands taking the same flag must answer it the same way. `add` knows the
     /// backend too: `--api-key-stdin` requires `--backend`, so the refusal can come before the
@@ -2005,6 +2082,7 @@ mod tests {
             Some("claude-subscription"),
             None,
             OAuthSettings::default(),
+            None,
             true,
             &store,
         )
@@ -2038,6 +2116,7 @@ mod tests {
             Some("chatgpt-subscription"),
             Some("https://chatgpt.com/backend-api".to_string()),
             OAuthSettings::default(),
+            None,
             false,
             &store,
         )
@@ -2453,7 +2532,10 @@ mod tests {
             Ok(()) => panic!("removing a name that exists nowhere must fail"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains("no account or stored credential"), "{error}");
+        assert!(
+            error.contains("no account named 'typo'") && error.contains("work"),
+            "the one unknown-name sentence, naming what is known: {error}"
+        );
         // The untouched account is still there: a failed remove must not rewrite anything.
         let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
         assert!(contents.contains("[accounts.work]"), "{contents}");
@@ -2469,6 +2551,7 @@ mod tests {
             config::Backend::AnthropicMessages,
             None,
             &OAuthSettings::default(),
+            None,
         )
         .expect("upsert");
         let rendered = bare.to_string();
@@ -2486,6 +2569,7 @@ mod tests {
                 oauth_token_url: Some("https://auth.invalid/token".to_string()),
                 client_id: Some("my-client".to_string()),
             },
+            None,
         )
         .expect("upsert");
         // Read back through the real parser, so a key written under the wrong name or type is
@@ -2535,6 +2619,7 @@ mod tests {
             config::Backend::OpenAiResponses,
             None,
             &OAuthSettings::default(),
+            None,
         )
         .expect_err("an inline `accounts` must be refused, not overwritten");
         assert!(
@@ -2617,7 +2702,10 @@ mod tests {
 
     #[test]
     fn a_backend_name_parses_only_when_meka_has_it() {
-        assert!(validate_backend("claude-subscription").is_ok());
+        assert_eq!(
+            validate_backend("claude-subscription").expect("a backend meka has"),
+            config::Backend::ClaudeSubscription
+        );
         assert!(validate_backend("bogus").is_err());
     }
 

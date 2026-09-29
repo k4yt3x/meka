@@ -524,16 +524,13 @@ fn refuse_subagent_session(
     spawned: Option<crate::store::SpawnTerms>,
 ) -> Option<ProblemDetail> {
     let terms = spawned?;
-    let detail = match terms.parent {
-        Some(parent) => format!(
-            "session '{id}' is a sub-agent of '{parent}', which runs it only while waiting on it; \
-             schedule the job on '{parent}'"
-        ),
-        None => format!(
-            "session '{id}' is a sub-agent whose parent is not in this store, so nothing here can \
-             fire a job on it"
-        ),
+    let remedy = match terms.parent {
+        Some(parent) => {
+            format!(", which runs it only while waiting on it; schedule the job on '{parent}'")
+        }
+        None => ", so nothing here can fire a job on it".to_string(),
     };
+    let detail = format!("{}{remedy}", terms.describe(id));
     Some(
         ProblemDetail::new(
             ErrorKind::SessionNotDrivable,

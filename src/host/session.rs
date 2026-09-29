@@ -511,6 +511,41 @@ where
     K: Eq + std::hash::Hash + Clone,
     E: std::ops::Deref<Target = ResidentSession> + Clone,
 {
+    /// Cancel every session's in-flight turn, for a host that is shutting down.
+    ///
+    /// Through the cell, not the live token alone: a turn admitted but not yet published has no
+    /// token, and only the cell's epoch bump reaches it. Firing the live tokens alone leaves such a
+    /// turn to run whole during the drain and then be abandoned.
+    pub(crate) async fn cancel_every_turn(&self) {
+        let sessions = self.0.read().await;
+        for entry in sessions.values() {
+            entry.cancel.cancel();
+        }
+    }
+
+    /// Resolve once no session counts a turn in flight, and `also_busy` says nothing else is.
+    ///
+    /// Canceling a turn is not the same as waiting for one: the token stops the agent at its next
+    /// check, and what follows is the commit of the partial assistant message, the tool result the
+    /// round already produced, and the frontend teardown. That tail is what a drain exists to
+    /// protect, and it is measured in database round-trips, not instants. The per-session count
+    /// covers what claims the session, a compaction or a rewind included; `also_busy` is for a
+    /// host with a process-wide count as well, which reaches a turn whose session was evicted.
+    pub(crate) async fn wait_for_turns_to_unwind(&self, also_busy: impl Fn() -> bool) {
+        loop {
+            let idle = !also_busy() && {
+                let sessions = self.0.read().await;
+                sessions
+                    .values()
+                    .all(|entry| entry.in_flight.load(std::sync::atomic::Ordering::Acquire) == 0)
+            };
+            if idle {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self(Arc::new(tokio::sync::RwLock::new(
             std::collections::HashMap::new(),

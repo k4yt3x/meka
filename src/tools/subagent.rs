@@ -1072,8 +1072,8 @@ impl Tool for AgentListTool {
         for row in rows.iter().filter(|row| row.parent_id == Some(session_id)) {
             // Tool results are persisted as user-role messages too (`Agent::run_turn` wraps them in
             // one), so counting every user message would report a single task that took four tool
-            // rounds as five turns. A real turn is a user message that carries something other than
-            // tool results.
+            // rounds as five turns. A turn is a user message that opens one, by
+            // `Message::opens_turn`: a steer that rides a round's results is part of that round.
             let turns = self
                 .tool_builder_params
                 .materials
@@ -1084,15 +1084,7 @@ impl Tool for AgentListTool {
                     events
                         .iter()
                         .filter(|event| match event {
-                            crate::conversation::Event::Append(message) => {
-                                message.role == crate::conversation::Role::User
-                                    && !message.content.iter().all(|block| {
-                                        matches!(
-                                            block,
-                                            crate::conversation::ContentBlock::ToolResult { .. }
-                                        )
-                                    })
-                            }
+                            crate::conversation::Event::Append(message) => message.opens_turn(),
                             _ => false,
                         })
                         .count()
@@ -4316,7 +4308,8 @@ mod tests {
     }
 
     /// `turns` counts tasks, not messages. `Agent::run_turn` persists tool results as user-role
-    /// messages, so a single task that took three tool rounds must still read as one turn.
+    /// messages, so a single task that took three tool rounds must still read as one turn, and a
+    /// steer that landed beside one round's results is part of that round rather than a turn.
     #[tokio::test]
     async fn agent_list_turns_excludes_tool_result_messages() {
         use crate::conversation::{ContentBlock, Event, Message, Role, ToolResultContent};
@@ -4349,12 +4342,27 @@ mod tests {
                 is_error: false,
             }],
         });
+        let steered = Event::Append(Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "u2".to_string(),
+                    content: vec![ToolResultContent::Text {
+                        text: "ok".to_string(),
+                    }],
+                    is_error: false,
+                },
+                ContentBlock::Text {
+                    text: "and hurry".to_string(),
+                },
+            ],
+        });
         for event in [
             Event::Append(Message::user("the one and only task")),
             Event::Append(Message::assistant_text("working")),
-            tool_result.clone(),
-            Event::Append(Message::assistant_text("still working")),
             tool_result,
+            Event::Append(Message::assistant_text("still working")),
+            steered,
             Event::Append(Message::assistant_text("done")),
         ] {
             store.save_event(child, &event).await.expect("save");
@@ -5279,8 +5287,8 @@ mod tests {
     }
 
     /// The registered tool's schema, not just the free function behind it: the tool derives its
-    /// choices from the session materials on every call, so what the model is offered follows the
-    /// switch and the configured names with nothing cached in between.
+    /// choices from the session materials, so what the model is offered follows the switch and
+    /// the configured names.
     #[tokio::test]
     async fn the_registered_tool_offers_profiles_only_while_the_choice_is_open() {
         let store = store_for_test().await;

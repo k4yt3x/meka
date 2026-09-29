@@ -119,7 +119,7 @@ pub(crate) enum ToolAction {
 pub(crate) enum SessionAction {
     /// List past sessions
     List {
-        /// Maximum number of sessions to show
+        /// Maximum number of sessions to show (0 = all)
         #[arg(short = 'n', long, default_value = "20")]
         limit: u32,
         /// Include sub-agent sessions in the listing
@@ -221,7 +221,7 @@ pub(crate) enum SessionAction {
     Search {
         /// Words to search for
         query: String,
-        /// Maximum number of sessions to show
+        /// Maximum number of sessions to show (0 = all)
         #[arg(short = 'n', long, default_value = "20")]
         limit: u32,
         /// Include sub-agent sessions
@@ -315,9 +315,11 @@ pub(crate) enum AccountAction {
     Add {
         /// Account name
         name: String,
-        /// Backend: anthropic-messages, chatgpt-subscription, claude-subscription,
-        /// openai-chat-completions, openai-responses
-        #[arg(long, value_name = "BACKEND")]
+        #[arg(
+            long,
+            value_name = "BACKEND",
+            help = listed("Backend", crate::config::Backend::ALL.iter().map(|backend| backend.name()), "")
+        )]
         backend: Option<String>,
         /// API base URL; any endpoint serving the backend's protocol
         #[arg(long = "base-url", value_name = "URL")]
@@ -328,6 +330,14 @@ pub(crate) enum AccountAction {
         /// OAuth client id override (subscription backends only)
         #[arg(long = "client-id", value_name = "ID")]
         client_id: Option<String>,
+        /// Send the interleaved-thinking beta when thinking is on (anthropic-messages only;
+        /// default: true)
+        #[arg(
+            long = "interleaved-thinking",
+            hide_possible_values = true,
+            value_name = "BOOL"
+        )]
+        interleaved_thinking: Option<bool>,
         /// Read the API key from stdin (API-key backends only); needs `--backend`
         #[arg(long = "api-key-stdin")]
         api_key_stdin: bool,
@@ -418,7 +428,7 @@ pub(crate) enum ProfileAction {
         /// Model name
         #[arg(long)]
         model: Option<String>,
-        /// Context window in tokens (default: 1000000)
+        /// Context window in tokens (default: `[session].context_window`, else 1000000)
         #[arg(long = "context-window", value_name = "TOKENS")]
         context_window: Option<u64>,
         /// Per-request output token cap; unset leaves the backend's default
@@ -430,9 +440,17 @@ pub(crate) enum ProfileAction {
         /// Accept image input (default: true)
         #[arg(long, hide_possible_values = true, value_name = "BOOL")]
         vision: Option<bool>,
-        /// Thinking mode: adaptive, budgeted, off (Anthropic Messages backends only; default:
-        /// adaptive)
-        #[arg(long, value_enum, hide_possible_values = true, value_name = "MODE")]
+        #[arg(
+            long,
+            value_enum,
+            hide_possible_values = true,
+            value_name = "MODE",
+            help = listed(
+                "Thinking mode",
+                crate::config::ThinkingMode::ALL.iter().map(|mode| mode.name()),
+                " (Anthropic Messages backends only; default: adaptive)"
+            )
+        )]
         thinking: Option<crate::config::ThinkingMode>,
         /// Token budget when thinking = budgeted (default: `[thinking].budget`, then 16000)
         #[arg(long = "thinking-budget", value_name = "TOKENS")]
@@ -441,13 +459,16 @@ pub(crate) enum ProfileAction {
         /// default to 30 MiB)
         #[arg(long = "max-request-bytes", value_name = "BYTES")]
         max_request_bytes: Option<u64>,
-        /// Thinking display: updates, summarized, redacted (claude-subscription only; default:
-        /// updates)
         #[arg(
             long = "thinking-display",
             value_enum,
             hide_possible_values = true,
-            value_name = "DISPLAY"
+            value_name = "DISPLAY",
+            help = listed(
+                "Thinking display",
+                crate::config::ThinkingDisplay::ALL.iter().map(|display| display.name()),
+                " (claude-subscription only; default: updates)"
+            )
         )]
         thinking_display: Option<crate::config::ThinkingDisplay>,
     },
@@ -458,10 +479,7 @@ pub(crate) enum ProfileAction {
         format: OutputFormat,
     },
     /// Change one setting on a profile
-    ///
-    /// Keys: model, context_window, max_output_tokens, effort, vision, thinking, thinking_budget,
-    /// max_request_bytes, thinking_display. `account` is not settable; add a profile on the other
-    /// account instead.
+    #[command(long_about = profile_set_about())]
     Set {
         /// Profile name
         name: String,
@@ -523,7 +541,7 @@ pub(crate) enum SkillAction {
         #[arg(long, default_value = "plain")]
         format: OutputFormat,
     },
-    /// Scaffold a new skill at `~/.config/meka/skills/<name>/SKILL.md`
+    /// Scaffold a new skill at `skills/<name>/SKILL.md` beside config.toml
     Add {
         /// Unique skill name (lowercase letters, digits, hyphens)
         name: String,
@@ -807,8 +825,14 @@ pub(crate) enum McpAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
 
-        /// Force transport (stdio or http); auto-detected otherwise
-        #[arg(long)]
+        #[arg(
+            long,
+            help = listed(
+                "Force the transport",
+                crate::config::McpTransport::ALL.iter().map(|transport| transport.name()),
+                "; auto-detected otherwise"
+            )
+        )]
         transport: Option<crate::config::McpTransport>,
 
         /// Environment variable for a stdio server (repeatable)
@@ -819,8 +843,10 @@ pub(crate) enum McpAction {
         #[arg(long = "header", value_name = "KEY=VALUE")]
         header: Vec<String>,
 
-        /// Authentication: oauth, client_credentials, client_credentials_jwt
-        #[arg(long)]
+        #[arg(
+            long,
+            help = listed("Authentication", McpAuthKind::ALL.iter().map(|kind| kind.name()), "")
+        )]
         auth: Option<McpAuthKind>,
 
         /// Read a static bearer token from stdin (excludes `--auth`)
@@ -855,8 +881,15 @@ pub(crate) enum McpAction {
         #[arg(long, value_name = "PORT")]
         redirect_port: Option<u16>,
 
-        /// Permission: none, read, workspace, unrestricted (default: read)
-        #[arg(long, value_name = "LEVEL")]
+        #[arg(
+            long,
+            value_name = "LEVEL",
+            help = listed(
+                "Permission",
+                Permission::ALL.iter().map(|level| level.name()),
+                " (default: read)"
+            )
+        )]
         permission: Option<String>,
 
         /// Raw tool name to allow (repeatable; restricts which register)
@@ -946,9 +979,34 @@ impl std::str::FromStr for McpAuthKind {
             .copied()
             .find(|kind| kind.name() == value)
             .ok_or_else(|| {
-                crate::text::unknown_name("auth", value, Self::ALL.iter().map(|kind| kind.name()))
+                format!(
+                    "'{value}' is not an auth kind. Supported: {}",
+                    Self::ALL
+                        .iter()
+                        .map(|kind| kind.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             })
     }
+}
+
+/// A help line listing a vocabulary from the table that defines it, so `-h` cannot fall behind a
+/// value added to an `ALL`.
+fn listed(lead: &str, names: impl IntoIterator<Item = &'static str>, tail: &str) -> String {
+    format!(
+        "{lead}: {}{tail}",
+        names.into_iter().collect::<Vec<_>>().join(", ")
+    )
+}
+
+/// The long help of `profile set`: the settable keys, from the table `profile set` refuses by.
+fn profile_set_about() -> String {
+    format!(
+        "Change one setting on a profile\n\nKeys: {}. `account` is not settable; add a profile on the \
+         other account instead.",
+        profile::SETTABLE_PROFILE_KEYS.join(", ")
+    )
 }
 
 #[derive(Parser, Debug)]
@@ -969,8 +1027,15 @@ pub(crate) struct Cli {
     #[arg(short = 'r', long = "resume", value_name = "SESSION")]
     pub(crate) resume: Option<String>,
 
-    /// Initial permission level (none, read, workspace, unrestricted)
-    #[arg(long = "permission", value_name = "LEVEL")]
+    #[arg(
+        long = "permission",
+        value_name = "LEVEL",
+        help = listed(
+            "Initial permission level",
+            Permission::ALL.iter().map(|level| level.name()),
+            ""
+        )
+    )]
     pub(crate) permission: Option<Permission>,
 
     /// Extra directory writable at `workspace` permission (repeatable)
@@ -989,16 +1054,30 @@ pub(crate) struct Cli {
     #[arg(long = "profile", value_name = "NAME")]
     pub(crate) profile: Option<String>,
 
-    /// Linux sandbox backend: landlock, bubblewrap or bubblewrap-landlock
-    #[arg(long = "sandbox-backend", value_name = "BACKEND")]
+    #[arg(
+        long = "sandbox-backend",
+        value_name = "BACKEND",
+        help = listed(
+            "Linux sandbox backend",
+            crate::config::SandboxBackend::ALL.iter().map(|backend| backend.name()),
+            ""
+        )
+    )]
     pub(crate) sandbox_backend: Option<crate::config::SandboxBackend>,
 
     /// Disable streaming for this run (see `[display] stream`)
     #[arg(long = "no-stream")]
     pub(crate) no_stream: bool,
 
-    /// Markdown render mode: termimad (default), syntect, or raw
-    #[arg(long = "render-mode", value_name = "RENDERER")]
+    #[arg(
+        long = "render-mode",
+        value_name = "RENDERER",
+        help = listed(
+            "Markdown render mode",
+            crate::config::RenderMode::ALL.iter().map(|mode| mode.name()),
+            " (default: termimad)"
+        )
+    )]
     pub(crate) render_mode: Option<crate::config::RenderMode>,
 
     /// Standing instructions for this run, replacing the discovered ones

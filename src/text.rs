@@ -929,6 +929,43 @@ pub(crate) fn bearer(token: &str) -> String {
     format!("Bearer {token}")
 }
 
+/// `text` with every URL in it stripped of its userinfo, query and fragment, so an error that
+/// quotes the request's URL cannot carry a key that rode in it. reqwest's transport errors end in
+/// `for url (<the url>)`, and an MCP server's `url` may name its key in the query string, which
+/// `config.toml` expands there on purpose. A URL that does not parse is left as written.
+pub(crate) fn redact_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = [rest.find("http://"), rest.find("https://")]
+        .into_iter()
+        .flatten()
+        .min()
+    {
+        out.push_str(&rest[..start]);
+        let candidate = &rest[start..];
+        let end = candidate
+            .find(|character: char| character.is_whitespace() || "()[]<>'\"".contains(character))
+            .unwrap_or(candidate.len());
+        let raw = candidate[..end].trim_end_matches(['.', ',', ';']);
+        match url::Url::parse(raw) {
+            Ok(mut parsed) if parsed.has_host() => {
+                parsed.set_query(None);
+                parsed.set_fragment(None);
+                // Neither can fail on a URL with a host.
+                if parsed.set_username("").is_ok() && parsed.set_password(None).is_ok() {
+                    out.push_str(parsed.as_str());
+                } else {
+                    out.push_str(raw);
+                }
+            }
+            _ => out.push_str(raw),
+        }
+        rest = &candidate[raw.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1202,5 +1239,23 @@ mod tests {
         assert_eq!(id_prefix_for_matching("4D71EECA"), "4d71eeca");
         assert_eq!(id_prefix_for_matching("4D"), "4d");
         assert_eq!(id_prefix_for_matching("4d71eeca-ab"), "4d71eeca-ab");
+    }
+
+    /// A URL quoted by an error loses what a key rides in and keeps what names the endpoint; text
+    /// around it, and a URL that is not one, are left as written.
+    #[test]
+    fn a_url_in_error_text_loses_its_userinfo_query_and_fragment() {
+        assert_eq!(
+            super::redact_urls(
+                "error sending request for url (https://u:p@api.example.test/mcp?apiKey=SECRET#f)"
+            ),
+            "error sending request for url (https://api.example.test/mcp)"
+        );
+        assert_eq!(
+            super::redact_urls("two: http://a.test/x?k=1, and https://b.test:8443/y?k=2."),
+            "two: http://a.test/x, and https://b.test:8443/y."
+        );
+        assert_eq!(super::redact_urls("no url here"), "no url here");
+        assert_eq!(super::redact_urls("https://"), "https://");
     }
 }

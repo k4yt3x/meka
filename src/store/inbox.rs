@@ -408,7 +408,12 @@ impl InboxStore {
         let ids: Vec<String> = self
             .connection
             .call(move |connection| -> rusqlite::Result<Vec<String>> {
-                let transaction = connection.transaction()?;
+                // `IMMEDIATE`, as every read-then-write transaction in the store is: a deferred
+                // one that read while another process wrote cannot upgrade, and SQLite answers
+                // that with `SQLITE_BUSY` at once, past the busy timeout, so a REPL beside
+                // `serve` leaves the items appended and a rewind then delivers them again.
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let ids = {
                     let mut statement = transaction.prepare(
                         "SELECT id FROM inbox_items WHERE session_id = ?1 \
@@ -583,9 +588,13 @@ impl InboxStore {
         let ids: Vec<String> = self
             .connection
             .call(move |connection| -> rusqlite::Result<Vec<String>> {
+                // `spawned_session_sql`, not the parent link alone: an imported sub-agent whose
+                // parent did not come with it has no parent link and is still not a session a
+                // driver may run, and offering it every tick reaches the refusal at re-attach.
+                let spawned = super::sessions::spawned_session_sql("");
                 let mut statement = connection.prepare(&format!(
                     "SELECT DISTINCT session_id FROM inbox_items WHERE {PENDING} \
-                     AND session_id IN (SELECT id FROM sessions WHERE parent_session_id IS NULL) \
+                     AND session_id IN (SELECT id FROM sessions WHERE NOT {spawned}) \
                      ORDER BY session_id"
                 ))?;
                 // `?1` is unused by `PENDING`, which binds `?2`; a placeholder is still counted.
@@ -629,13 +638,43 @@ impl InboxStore {
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to read inbox items: {error}")))?;
-        rows.into_iter()
-            .map(|row| {
-                row.decode().map_err(|reason| {
-                    MekaError::Database(format!("unreadable inbox row: {reason}"))
-                })
+        let mut items = Vec::with_capacity(rows.len());
+        let mut unreadable = Vec::new();
+        for row in rows {
+            let id = row.id.clone();
+            match row.decode() {
+                Ok(item) => items.push(item),
+                Err(reason) => unreadable.push((id, reason)),
+            }
+        }
+        // Quarantined rather than failing the read: one row this build cannot decode (a hand
+        // edit, damage) would otherwise fail every read of the session's inbox, and the driver,
+        // which re-wakes on the pending count, would ask again at once for as long as the row
+        // stood. Withdrawn with the reason, so it leaves the count and a listing says why.
+        for (id, reason) in unreadable {
+            tracing::warn!("withdrawing unreadable inbox item {id}: {reason}");
+            self.quarantine(id, format!("unreadable: {reason}")).await;
+        }
+        Ok(items)
+    }
+
+    /// Withdraw a row by its raw id, which [`Self::withdraw`] cannot take when the id itself is
+    /// what does not read. A failure is logged: the read that found the row goes on either way.
+    async fn quarantine(&self, id: String, failure: String) {
+        let withdrawn_at = Utc::now().to_rfc3339();
+        let outcome = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<usize> {
+                connection.execute(
+                    "UPDATE inbox_items SET withdrawn_at = ?2, failure = ?3 \
+                     WHERE id = ?1 AND withdrawn_at IS NULL",
+                    rusqlite::params![id, withdrawn_at, failure],
+                )
             })
-            .collect()
+            .await;
+        if let Err(error) = outcome {
+            tracing::warn!("failed to withdraw an unreadable inbox item: {error}");
+        }
     }
 }
 
@@ -741,6 +780,118 @@ impl InboxRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One row this build cannot decode is quarantined, not the whole read: withdrawn with the
+    /// reason, so it leaves the pending count the driver re-wakes on, while the session's other
+    /// items still read and drain.
+    #[tokio::test]
+    async fn an_unreadable_inbox_row_is_withdrawn_and_the_rest_still_read() {
+        let store = crate::store::Store::for_test().await;
+        let session = store
+            .create_session(None, "p".to_string())
+            .await
+            .expect("create");
+        store
+            .inbox_store()
+            .enqueue(item(session, InboxClass::Followup, "hello"))
+            .await
+            .expect("enqueue");
+        let bad_id = Uuid::new_v4().to_string();
+        let bad_for_insert = bad_id.clone();
+        let session_text = session.to_string();
+        store
+            .connection
+            .call(move |connection| -> rusqlite::Result<()> {
+                connection.execute(
+                    "INSERT INTO inbox_items (id, session_id, class, source, body, created_at) \
+                     VALUES (?1, ?2, 'bogus', 'test', 'unreadable', ?3)",
+                    rusqlite::params![bad_for_insert, session_text, Utc::now().to_rfc3339()],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("a row no build decodes");
+
+        let items = store
+            .inbox_store()
+            .take_pending(session, &[], Utc::now())
+            .await
+            .expect("the read survives the row");
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].body, "hello");
+
+        let (withdrawn_at, failure): (Option<String>, Option<String>) = store
+            .connection
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT withdrawn_at, failure FROM inbox_items WHERE id = ?1",
+                    [bad_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .await
+            .expect("the row");
+        assert!(
+            withdrawn_at.is_some(),
+            "the row is out of the pending count"
+        );
+        assert!(
+            failure
+                .as_deref()
+                .is_some_and(|why| why.starts_with("unreadable")),
+            "{failure:?}"
+        );
+    }
+
+    /// The delivery mark takes the write lock up front. A deferred transaction that read while
+    /// another process wrote cannot upgrade, and SQLite answers that with `SQLITE_BUSY` at once,
+    /// past the busy timeout; a REPL beside `serve` then leaves the items appended, and a rewind
+    /// delivers them again. A second connection stands in for the other process, writing and
+    /// committing while the mark would sit between its read and its write.
+    #[tokio::test]
+    async fn mark_delivered_waits_for_a_writer_beside_it_instead_of_failing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("meka.db");
+        let store = crate::store::Store::open(Some(&path), &Default::default())
+            .await
+            .expect("open");
+        let session = store
+            .create_session(None, "p".to_string())
+            .await
+            .expect("create");
+        let now = Utc::now().to_rfc3339();
+        let other = rusqlite::Connection::open(&path).expect("second connection");
+        other
+            .execute(
+                "INSERT INTO inbox_items (id, session_id, class, source, body, created_at, \
+                 appended_at) VALUES (?1, ?2, 'followup', 'test', 'hello', ?3, ?3)",
+                rusqlite::params![Uuid::new_v4().to_string(), session.to_string(), now],
+            )
+            .expect("an appended item");
+        let writer = std::thread::spawn({
+            let session = session.to_string();
+            move || {
+                other.execute_batch("BEGIN IMMEDIATE").expect("begin");
+                other
+                    .execute(
+                        "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                        rusqlite::params!["2026-01-01T00:00:00Z", session],
+                    )
+                    .expect("write");
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                other.execute_batch("COMMIT").expect("commit");
+            }
+        });
+        // The writer holds the lock by now, and commits while the mark is waiting on it.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let delivered = store
+            .inbox_store()
+            .mark_delivered(session)
+            .await
+            .expect("the mark waits for the writer rather than failing on a stale snapshot");
+        assert_eq!(delivered.len(), 1);
+        writer.join().expect("the writer committed");
+    }
 
     async fn store_with_session() -> (Store, Uuid) {
         let store = Store::for_test().await;

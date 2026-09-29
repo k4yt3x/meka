@@ -128,10 +128,9 @@ impl Write for RelayWriter {
                     // full queue falls through to stderr below.
                     match printer.sender().try_send(trimmed.to_string()) {
                         Ok(()) => return Ok(buffer.len()),
-                        Err(error) if error.is_disconnected() => {
-                            tracing::trace!("the editor has gone; a relayed line was dropped");
-                            return Ok(buffer.len());
-                        }
+                        // The editor has gone and the line with it. Not logged: an event raised
+                        // inside tracing's own writer is dropped by its re-entrancy guard.
+                        Err(error) if error.is_disconnected() => return Ok(buffer.len()),
                         Err(_full) => {}
                     }
                 }
@@ -297,14 +296,21 @@ mod tests {
         );
     }
 
-    /// With no console installed (every non-interactive command) nothing changes.
+    /// With no console installed (every non-interactive command) nothing changes: the whole line
+    /// reaches stderr, none of it swallowed by a printer that is not there.
     #[test]
     fn a_host_with_no_console_still_writes_to_stderr() {
         let relay = Relay::new();
         relay.set_at_prompt(false);
-        relay
+        let line = b"WARN config.toml could not be read\n";
+        let written = relay
             .make_writer()
-            .write_all(b"WARN config.toml could not be read\n")
+            .write(line)
             .expect("plain stderr is the fallback for `meka mcp list` and friends");
+        assert_eq!(
+            written,
+            line.len(),
+            "nothing is dropped on the way to stderr"
+        );
     }
 }

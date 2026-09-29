@@ -892,6 +892,7 @@ pub(super) fn should_retry_provider_error(
 /// refusing to send would leave a `/compact` the user just pressed Ctrl+C on with the window as
 /// full as before. `an_interrupt_ends_the_checkpoint_and_falls_back` pins it.
 pub(super) async fn complete_with_retry(
+    what: &str,
     provider: &Arc<dyn Provider>,
     request: CompletionRequest<'_>,
     cancellation: &CancellationToken,
@@ -911,8 +912,11 @@ pub(super) async fn complete_with_retry(
                 else {
                     return Err(error);
                 };
+                let ceiling = crate::provider::retry::MAX_PROVIDER_RETRIES;
                 tracing::warn!(
-                    "compaction's provider call failed ({error}); retrying in {delay:?}"
+                    "{what} failed transiently (attempt {}/{ceiling}), retrying in {delay:?}: \
+                     {error}",
+                    retries + 1
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}

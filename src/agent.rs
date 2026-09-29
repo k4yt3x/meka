@@ -1,6 +1,6 @@
 //! Per-turn agent loop: streams provider output, dispatches tool calls, and persists the resulting
-//! messages to the session store. Also handles mid-conversation auto-compaction when the
-//! input-token budget is exceeded.
+//! messages to the session store. Compaction runs from here too, when the context ceiling is
+//! crossed, when the model asks or when the user does.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -37,11 +37,11 @@ use crate::session::{AgentOptions, SessionCells};
 /// and tool-result message to the session store.
 ///
 /// `Agent` is held across turns *and* across providers: [`Self::set_provider`] moves a live one, so
-/// a switch keeps the conversation, the session lock and the background-task registry. `/provider`,
+/// a switch keeps the conversation, the session lock and the background-task registry. `/profile`,
 /// `PATCH /v1/sessions/{id}` and ACP's `session/set_config_option` all land there.
 pub(crate) struct Agent {
     /// The live state of the session this agent drives, shared by handle with every tool and with
-    /// the host: permission, working directory, the published provider profile, the gauges, the
+    /// the host: permission, working directory, the published profile, the gauges, the
     /// frontend. The agent reads and writes through the cells rather than copies of them, so a
     /// change made anywhere reaches everywhere.
     cells: SessionCells,
@@ -174,11 +174,13 @@ impl Agent {
         options: AgentOptions,
         role: AgentRole,
     ) -> Self {
-        // Off for a worker whatever the configuration says: a worker's session ends with the one
-        // turn that spawned it, so a task outliving that turn would have no conversation left to
-        // report into.
+        // The registry's switch is the one definition of whether background is on: it is what
+        // offers `background` to the model, so the ceiling refusing a call the model was told
+        // about cannot disagree with it. Zero for a worker whatever the configuration says: a
+        // worker's session ends with the one turn that spawned it, so a task outliving that turn
+        // would have no conversation left to report into.
         let background_max_tasks = match role {
-            AgentRole::Root if materials.background.enabled => materials.background.max_tasks,
+            AgentRole::Root if tool_registry.background_enabled() => materials.background.max_tasks,
             _ => 0,
         };
         Self {
@@ -409,10 +411,11 @@ impl Agent {
         })
     }
 
-    /// Whether this agent detaches tool calls and carries their outcomes: `[background] enabled`,
-    /// with a ceiling above zero. Off for a sub-agent and for every host that never enabled it.
+    /// Whether this agent detaches tool calls and carries their outcomes: the registry's switch,
+    /// which is also what offers `background` to the model. Off for a worker and for every host
+    /// that never enabled it.
     pub(crate) fn background_enabled(&self) -> bool {
-        self.background_max_tasks > 0
+        self.tool_registry.background_enabled()
     }
 
     /// Snapshot of the per-session counters used by `/status`. Called from the REPL on demand.
@@ -505,11 +508,28 @@ impl Agent {
     /// server whose announcement the rewind just deleted, so it never mentions it again.
     ///
     /// Compaction replaces the world snapshot with the live context it restores into the summary.
-    pub(crate) async fn reset_conversation_markers(&self) {
+    ///
+    /// The read tracker and the schema advisories go with them: each records something the model
+    /// was shown in a conversation that no longer exists, and left standing, a `file_edit` after
+    /// the rewrite trusts a read the model no longer holds, and a model that repeats a mistake
+    /// after a boundary gets no hint for the rest of the session. The gauge is seeded with an
+    /// estimate of what is left, on the row as well, so `/status` and the next turn's ceiling
+    /// check read the conversation as it is rather than as it was, until the provider measures.
+    ///
+    /// The one reset every door that rewrites the log calls: compaction, and a rewind on every
+    /// host. A door that resets its own subset leaves the rest stale.
+    pub(crate) async fn reset_conversation_markers(
+        &self,
+        messages: &[crate::conversation::Message],
+    ) {
         self.last_accepted_len
             .store(LAST_ACCEPTED_UNKNOWN, std::sync::atomic::Ordering::Relaxed);
         *self.last_rendered_world.write().await = None;
         *crate::sync::lock(&self.context_compacted) = None;
+        self.tool_registry.clear_read_tracker().await;
+        crate::sync::lock(&self.schema_advisories_sent).clear();
+        self.record_context_tokens(self.cells.estimate_context_tokens(messages))
+            .await;
     }
 
     /// The compaction the next request is the first to follow, if any; see

@@ -651,10 +651,12 @@ pub(super) fn parse_non_streaming_response(
                         .get("signature")
                         .and_then(|s| s.as_str())
                         .map(|s| s.to_string());
-                    content_blocks.push(ContentBlock::Thinking {
-                        thinking: thinking.to_string(),
-                        opaque: signature.map(|signature| OpaqueReasoning::Signed { signature }),
-                    });
+                    if let Some(block) = ContentBlock::replayable_thinking(
+                        thinking.to_string(),
+                        signature.map(|signature| OpaqueReasoning::Signed { signature }),
+                    ) {
+                        content_blocks.push(block);
+                    }
                 }
             }
             "redacted_thinking" => {
@@ -791,19 +793,17 @@ pub(super) async fn complete<B: ClaudeBackend>(
     )
     .await?;
 
-    let status = response.status();
     let retry_after = crate::error::parse_retry_after(response.headers());
     backend.remember_request_id(&attribution, response.headers());
+    let response = crate::provider::succeeded(
+        response,
+        "completion",
+        crate::error::ProviderRequest::Completion,
+        &cancellation,
+    )
+    .await?;
     let response_text =
         crate::error::read_whole_reply(response, retry_after, &cancellation).await?;
-    if !status.is_success() {
-        return Err(crate::error::provider_http_error(
-            status,
-            &response_text,
-            retry_after,
-            crate::error::ProviderRequest::Completion,
-        ));
-    }
 
     let response_json: serde_json::Value = serde_json::from_str(&response_text)
         .map_err(|error| MekaError::Provider(format!("invalid JSON response: {error}")))?;
@@ -1686,7 +1686,7 @@ mod tests {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                StreamEvent::ToolCallRejected { name, .. } if name == "file_write"
+                StreamEvent::ToolCallRefused { name, .. } if name == "file_write"
             )),
             "the call must be rejected: {events:?}",
         );
@@ -1905,6 +1905,30 @@ mod tests {
         assert_eq!(blocks[1]["source"]["type"], "base64");
         assert_eq!(blocks[1]["source"]["media_type"], "image/png");
         assert_eq!(blocks[1]["source"]["data"], "QUJD");
+    }
+
+    /// The whole-reply parser keeps a thinking block by the rule the streamed fold keeps one: an
+    /// empty unsigned block is nothing to replay, and a `--no-stream` transcript that carried one
+    /// would differ from the live turn's.
+    #[test]
+    fn an_empty_unsigned_thinking_block_is_dropped_by_the_whole_reply_parser_too() {
+        let response = serde_json::json!({
+            "content": [
+                { "type": "thinking", "thinking": "" },
+                { "type": "thinking", "thinking": "", "signature": "sig" },
+                { "type": "text", "text": "done" },
+            ],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 1, "output_tokens": 1 },
+        });
+        let (message, ..) = parse_non_streaming_response(&response).unwrap();
+        assert_eq!(message.content.len(), 2, "{:?}", message.content);
+        assert!(matches!(
+            &message.content[0],
+            ContentBlock::Thinking { thinking, opaque: Some(OpaqueReasoning::Signed { signature }) }
+                if thinking.is_empty() && signature == "sig"
+        ));
+        assert!(matches!(&message.content[1], ContentBlock::Text { text } if text == "done"));
     }
 
     #[test]

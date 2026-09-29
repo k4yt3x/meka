@@ -23,7 +23,7 @@ use crate::{
 };
 
 /// First delay after a failed initial connect. Doubles per attempt up to [`MAX_RETRY_BACKOFF`].
-const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+pub(super) const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Ceiling on the retry delay. A server that is down for a long time is polled every five minutes
 /// rather than abandoned, because the alternative is a meka that stays broken until someone
@@ -127,7 +127,7 @@ pub(super) async fn run_connector(
 /// builds a throwaway manager per invocation, and it is reachable from the REPL's `/mcp reconnect`
 /// in a process that keeps running; a strong reference there would leave a task respawning a
 /// failing server every five minutes for a manager nobody is using.
-async fn retry_until_connected(
+pub(super) async fn retry_until_connected(
     entry: Arc<ServerEntry>,
     manager: std::sync::Weak<McpClientManager>,
     mcp_default_permission: Option<Permission>,
@@ -191,12 +191,21 @@ fn is_repeat_failure(state: &ServerState, cause: &str) -> bool {
 }
 
 /// Record a failed connect on `entry`, announcing it only when it tells the user something new.
+/// The one door a failure is recorded by: the connector's, and the give-up of
+/// `ServerEntry::reconnect`.
 ///
 /// A server that is down stays down, and [`retry_until_connected`] keeps trying every five minutes
 /// for the life of the process. Logged at `warn!` on every attempt, a missing binary or an
 /// unreachable endpoint prints forever, on top of an idle REPL prompt. The first failure, and any
 /// *change* of cause, is worth saying; a repeat of the same one is not.
-async fn record_connect_failure(entry: &Arc<ServerEntry>, server_name: &str, cause: String) {
+pub(super) async fn record_connect_failure(
+    entry: &Arc<ServerEntry>,
+    server_name: &str,
+    cause: String,
+) {
+    // The cause reaches the log at the default level, the model as the reason the server is
+    // unavailable, and every session's history through the tool results that quote it.
+    let cause = crate::text::redact_urls(&cause);
     let repeat = {
         let state = entry.state.read().await;
         is_repeat_failure(&state, &cause)
@@ -350,6 +359,24 @@ async fn discover_and_register_tools(
     Ok(registered_count)
 }
 
+/// The raw name that already took `namespaced` on this server, or `None` after recording `raw`
+/// as the one that takes it now. Sanitizing folds every character outside the tool-name alphabet
+/// to `_`, so `files.read` and `files_read` arrive at one name; kept both, the second is
+/// uncallable and, eager-loaded, every request carries the name twice and is rejected.
+fn first_under_the_name(
+    taken: &mut std::collections::HashMap<String, String>,
+    namespaced: &str,
+    raw: &str,
+) -> Option<String> {
+    match taken.get(namespaced) {
+        Some(earlier) => Some(earlier.clone()),
+        None => {
+            taken.insert(namespaced.to_string(), raw.to_string());
+            None
+        }
+    }
+}
+
 /// One server's [`McpTool`]s from a fresh `tools/list`.
 ///
 /// The one door for every listing: the connector's first, the refresh a `tools/list_changed`
@@ -372,6 +399,7 @@ pub(super) async fn build_mcp_tools(
     warn_on_stale_tool_config(&server_name, server_config, &advertised);
 
     let mut adapters = Vec::new();
+    let mut taken: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for tool in tools {
         let raw_tool_name = tool.name.as_ref().to_string();
         if !tool_is_allowed(server_config, &raw_tool_name) {
@@ -380,6 +408,13 @@ pub(super) async fn build_mcp_tools(
 
         let sanitized_tool_name = crate::mcp::sanitize::normalize_server_name(&raw_tool_name);
         let namespaced_name = format!("mcp__{server_name}__{sanitized_tool_name}");
+        if let Some(earlier) = first_under_the_name(&mut taken, &namespaced_name, &raw_tool_name) {
+            tracing::warn!(
+                "MCP server '{server_name}' tool '{raw_tool_name}' sanitizes to '{namespaced_name}', \
+                 the name '{earlier}' already took; it is not registered"
+            );
+            continue;
+        }
 
         let raw_description = tool
             .description
@@ -742,6 +777,46 @@ mod tests {
         assert!(!is_repeat_failure(&ServerState::Disabled, "anything"));
     }
 
+    /// The key a server's `url` carries in its query string does not survive into the state the
+    /// model, the log and every session's history read the cause from.
+    #[tokio::test]
+    async fn record_connect_failure_strips_the_url_s_query() {
+        let entry = bare_entry("api");
+        record_connect_failure(
+            &entry,
+            "api",
+            "error sending request for url (https://api.example.test/mcp?apiKey=SECRET)"
+                .to_string(),
+        )
+        .await;
+        match &*entry.state.read().await {
+            ServerState::Failed { error, .. } => {
+                assert!(!error.contains("SECRET"), "{error}");
+                assert!(error.contains("https://api.example.test/mcp"), "{error}");
+            }
+            other => panic!("expected Failed, got {}", other.label()),
+        }
+    }
+
+    /// Two remote names that sanitize to one namespaced name register once, and the second is
+    /// named with the first, so the operator can rename or disable one of them.
+    #[test]
+    fn a_second_tool_under_a_taken_name_names_the_first() {
+        let mut taken = std::collections::HashMap::new();
+        assert_eq!(
+            first_under_the_name(&mut taken, "mcp__srv__files_read", "files.read"),
+            None
+        );
+        assert_eq!(
+            first_under_the_name(&mut taken, "mcp__srv__files_read", "files_read"),
+            Some("files.read".to_string())
+        );
+        assert_eq!(
+            first_under_the_name(&mut taken, "mcp__srv__files_write", "files_write"),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn record_connect_failure_stores_the_bare_cause() {
         let entry = bare_entry("ida");
@@ -769,6 +844,7 @@ mod tests {
             refused: None,
             instructions: std::sync::RwLock::new(None),
             request_timeout: std::sync::OnceLock::new(),
+            background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         })
     }
@@ -797,6 +873,7 @@ mod tests {
             refused: None,
             instructions: std::sync::RwLock::new(None),
             request_timeout: std::sync::OnceLock::new(),
+            background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         });
         let manager = McpClientManager::prepare(&[], None, None, McpClientContext::new())
@@ -855,6 +932,7 @@ mod tests {
             refused: Some(reason.to_string()),
             instructions: std::sync::RwLock::new(None),
             request_timeout: std::sync::OnceLock::new(),
+            background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         });
         let manager = McpClientManager::prepare(&[], None, None, McpClientContext::new())
@@ -902,6 +980,7 @@ mod tests {
             refused: None,
             instructions: std::sync::RwLock::new(None),
             request_timeout: OnceLock::new(),
+            background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         });
 
@@ -954,6 +1033,7 @@ mod tests {
             refused: None,
             instructions: std::sync::RwLock::new(None),
             request_timeout: OnceLock::new(),
+            background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         });
         let manager = McpClientManager::prepare(&[], None, None, McpClientContext::new())

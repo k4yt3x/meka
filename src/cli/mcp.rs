@@ -10,8 +10,14 @@ use crate::{
     view::{McpServerDetail, McpServerView, McpToolView, McpToolsResponse},
 };
 
+/// `config.toml` holds something this command cannot work with.
 fn config_err(message: impl Into<String>) -> MekaError {
     MekaError::Config(message.into())
+}
+
+/// The command was asked for something it cannot do as asked.
+fn usage_err(message: impl Into<String>) -> MekaError {
+    MekaError::Usage(message.into())
 }
 
 /// `/mcp list` in the REPL: the configured servers with their transport and target.
@@ -189,7 +195,7 @@ fn require_server<'a>(servers: &'a [McpServerConfig], name: &str) -> Result<&'a 
         .iter()
         .find(|server| server.name == name)
         .ok_or_else(|| {
-            config_err(crate::text::unknown_name(
+            usage_err(crate::text::unknown_name(
                 "MCP server",
                 name,
                 servers.iter().map(|server| server.name.as_str()),
@@ -357,6 +363,49 @@ pub(crate) async fn run_get(
     Ok(())
 }
 
+/// The document as it will be written, refused ahead of the write when it would not parse back:
+/// the same check `account` and `profile` make, so no editor of the raw document can leave a
+/// `config.toml` meka cannot read.
+fn reparsed_edit(before: &str, document: &toml_edit::DocumentMut) -> Result<String> {
+    let after = document.to_string();
+    super::account::reparse_after_edit(before, &after)
+        .map_err(|error| MekaError::Config(error.to_string()))?;
+    Ok(after)
+}
+
+/// Connect `config` on its own, wait for the connector to settle, and say whether it ended
+/// connected; the manager comes back for what the caller reads off it. The one probe `mcp tools`,
+/// `mcp reconnect` and a login share, so the three cannot time out or count differently.
+async fn connect_alone(
+    config: &McpServerConfig,
+    mcp_default: Option<crate::permission::Permission>,
+    token_store: &TokenStore,
+    context: Arc<McpClientContext>,
+) -> Result<(Arc<McpClientManager>, bool)> {
+    let manager = McpClientManager::prepare(
+        std::slice::from_ref(config),
+        mcp_default,
+        Some(token_store.clone()),
+        context,
+    )
+    .await?;
+    manager.start_connector(crate::mcp::McpRuntimeConfig {
+        connect_timeout: std::time::Duration::from_secs(30),
+        stdio_concurrency: 1,
+        http_concurrency: 1,
+    });
+    manager.await_settled().await;
+    let connected = if let Some(entry) = manager.server_entry(&config.name) {
+        matches!(
+            &*entry.state.read().await,
+            crate::mcp::ServerState::Connected { .. }
+        )
+    } else {
+        false
+    };
+    Ok((manager, connected))
+}
+
 /// Run `meka mcp tools <name>`: connect to the server, list every advertised tool, resolve
 /// permissions, and print a column-aligned table. A tool that `allowed_tools` or `disabled_tools`
 /// filters out is still shown, marked `disabled`, so users can edit their config without leaving
@@ -371,33 +420,13 @@ pub(crate) async fn run_tools(
     let config = require_server(servers, name)?.clone();
 
     let context = McpClientContext::new();
-    let manager = McpClientManager::prepare(
-        std::slice::from_ref(&config),
-        mcp_default,
-        Some(token_store.clone()),
-        Arc::clone(&context),
-    )
-    .await?;
-    manager.start_connector(crate::mcp::McpRuntimeConfig {
-        connect_timeout: std::time::Duration::from_secs(30),
-        stdio_concurrency: 1,
-        http_concurrency: 1,
-    });
-    manager.await_settled().await;
-
-    let connected = if let Some(entry) = manager.server_entry(&config.name) {
-        matches!(
-            &*entry.state.read().await,
-            crate::mcp::ServerState::Connected { .. }
-        )
-    } else {
-        false
-    };
+    let (manager, connected) =
+        connect_alone(&config, mcp_default, token_store, Arc::clone(&context)).await?;
     if !connected {
-        return Err(config_err(format!(
-            "failed to connect to '{}'; see logs above",
-            config.name
-        )));
+        return Err(MekaError::McpConnection {
+            server_name: config.name.clone(),
+            message: "failed to connect; see logs above".to_string(),
+        });
     }
 
     let tools = manager.list_advertised_tools(&config.name).await?;
@@ -486,38 +515,18 @@ pub(crate) async fn run_reconnect(
     let context = McpClientContext::new();
     // No `[mcp].default_permission`: this is a smoke test with no `ResolvedConfig` in scope, and
     // the per-tool resolution falls through to its strict default.
-    let manager = McpClientManager::prepare(
-        std::slice::from_ref(&config),
-        None,
-        Some(token_store.clone()),
-        Arc::clone(&context),
-    )
-    .await?;
-    manager.start_connector(crate::mcp::McpRuntimeConfig {
-        connect_timeout: std::time::Duration::from_secs(30),
-        stdio_concurrency: 1,
-        http_concurrency: 1,
-    });
-    manager.await_settled().await;
-
-    let connected = if let Some(entry) = manager.server_entry(&config.name) {
-        matches!(
-            &*entry.state.read().await,
-            crate::mcp::ServerState::Connected { .. }
-        )
-    } else {
-        false
-    };
+    let (manager, connected) =
+        connect_alone(&config, None, token_store, Arc::clone(&context)).await?;
 
     if connected {
         tracing::info!("connected to '{name}'", name = config.name);
         manager.shutdown_arc().await;
         Ok(())
     } else {
-        Err(config_err(format!(
-            "failed to connect to '{}'; see logs above",
-            config.name
-        )))
+        Err(MekaError::McpConnection {
+            server_name: config.name.clone(),
+            message: "failed to connect; see logs above".to_string(),
+        })
     }
 }
 
@@ -590,7 +599,7 @@ pub(crate) async fn run_store_secret(
     // Checked against config rather than accepted for any name, so a typo leaves a stranded
     // credential under a server that will never exist rather than silently doing nothing useful.
     if server.transport != McpTransport::Http {
-        return Err(config_err(format!(
+        return Err(usage_err(format!(
             "server '{name}' is stdio and has no HTTP credential; its secrets go in `env`"
         )));
     }
@@ -599,19 +608,19 @@ pub(crate) async fn run_store_secret(
     // other door onto the same state and a rule enforced at one of two doors is not enforced.
     match (kind, &server.auth) {
         (McpCredentialKind::Bearer, Some(_)) => {
-            return Err(config_err(format!(
+            return Err(usage_err(format!(
                 "server '{name}' authenticates through its `[auth]` block, which a stored bearer \
                  would override; drop the block first"
             )));
         }
         (McpCredentialKind::ClientSecret, None) => {
-            return Err(config_err(format!(
+            return Err(usage_err(format!(
                 "server '{name}' has no `[auth]` block to present a client secret; add one with \
                  `type = \"oauth\"` or `\"client_credentials\"` first"
             )));
         }
         (McpCredentialKind::ClientSecret, Some(McpAuthConfig::ClientCredentialsJwt { .. })) => {
-            return Err(config_err(format!(
+            return Err(usage_err(format!(
                 "server '{name}' authenticates with a signed JWT, not a client secret; the key it \
                  signs with is `signing_key_path`"
             )));
@@ -633,28 +642,7 @@ async fn run_login_flow(config: &McpServerConfig, token_store: &TokenStore) -> R
     // client is given a way to ask them.
     context.set_login_prompt(std::sync::Arc::new(TerminalLogin));
     // No `[mcp].default_permission`, for the reason `run_reconnect` gives.
-    let manager = McpClientManager::prepare(
-        std::slice::from_ref(config),
-        None,
-        Some(token_store.clone()),
-        context,
-    )
-    .await?;
-    manager.start_connector(crate::mcp::McpRuntimeConfig {
-        connect_timeout: std::time::Duration::from_secs(30),
-        stdio_concurrency: 1,
-        http_concurrency: 1,
-    });
-    manager.await_settled().await;
-
-    let connected = if let Some(entry) = manager.server_entry(&config.name) {
-        matches!(
-            &*entry.state.read().await,
-            crate::mcp::ServerState::Connected { .. }
-        )
-    } else {
-        false
-    };
+    let (manager, connected) = connect_alone(config, None, token_store, context).await?;
     manager.shutdown_arc().await;
     Ok(connected)
 }
@@ -727,7 +715,7 @@ pub(crate) async fn run_login(
         .await?
         .is_some()
     {
-        return Err(config_err(format!(
+        return Err(usage_err(format!(
             "server '{name}' has a stored bearer, which would override the login; drop it first \
              with `meka mcp logout {name}`"
         )));
@@ -748,7 +736,7 @@ pub(crate) async fn run_login(
                 (assumed, true)
             }
             McpTransport::Stdio => {
-                return Err(config_err(format!(
+                return Err(usage_err(format!(
                     "server '{name}' is stdio; there is nothing to log in to"
                 )));
             }
@@ -786,10 +774,10 @@ pub(crate) async fn run_login(
         }
     };
     if !connected {
-        return Err(config_err(format!(
-            "OAuth flow did not complete for '{}'",
-            config.name
-        )));
+        return Err(MekaError::McpAuth {
+            server_name: config.name.clone(),
+            message: "the OAuth flow did not complete".to_string(),
+        });
     }
 
     if needs_persist && let Err(error) = persist_auth_block_for(name) {
@@ -809,15 +797,8 @@ pub(crate) async fn run_login(
 fn persist_auth_block_for(name: &str) -> Result<()> {
     // Held to the end of the function, so this read and the write below cannot interleave with
     // another editor's, `device_id::persist` on an ordinary launch included.
-    let _config_lock = crate::config::lock_config_file()
-        .map_err(|error| config_err(format!("failed to lock config: {error}")))?;
-    let path = crate::paths::config_file_path()
-        .ok_or_else(|| config_err("failed to determine the config directory"))?;
-    let existing = std::fs::read_to_string(&path)
-        .map_err(|error| config_err(format!("failed to read config: {error}")))?;
-    let mut document = existing
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|error| config_err(format!("failed to parse config: {error}")))?;
+    let (_config_lock, path, mut document) = super::account::open_document()?;
+    let before = document.to_string();
 
     let mutated = {
         let servers = document
@@ -850,8 +831,8 @@ fn persist_auth_block_for(name: &str) -> Result<()> {
     };
 
     if mutated {
-        crate::fs::write_file_atomic(&path, &document.to_string())
-            .map_err(|error| config_err(format!("failed to write config: {error}")))?;
+        crate::fs::write_file_atomic(&path, &reparsed_edit(&before, &document)?)
+            .map_err(|error| MekaError::io(format!("failed to write config: {error}")))?;
     }
     Ok(())
 }
@@ -941,13 +922,13 @@ pub(crate) async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<(
 
     let normalized = normalize_server_name(&args.name);
     if normalized != args.name {
-        return Err(config_err(format!(
+        return Err(usage_err(format!(
             "server name '{}' has invalid characters; '{}' would be accepted",
             args.name, normalized
         )));
     }
     if is_reserved_server_name(&args.name) {
-        return Err(config_err(format!(
+        return Err(usage_err(format!(
             "server name '{}' is reserved",
             args.name
         )));
@@ -957,27 +938,8 @@ pub(crate) async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<(
     // Held across this read and the write below, so the two cannot interleave with another
     // editor's (`device_id::persist` on an ordinary launch included), and released the moment the
     // write lands; see the `drop` below.
-    let config_lock = crate::config::lock_config_file()
-        .map_err(|error| config_err(format!("failed to lock config: {error}")))?;
-    let path = crate::paths::config_file_path()
-        .ok_or_else(|| config_err("failed to determine the config directory"))?;
-
-    // Only a missing file starts from empty: treating any read failure as empty would overwrite a
-    // file meka merely lacked permission to read.
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(config_err(format!(
-                "failed to read existing config at {}: {}",
-                path.display(),
-                error
-            )));
-        }
-    };
-    let mut document = existing
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|error| config_err(format!("failed to parse existing config: {error}")))?;
+    let (config_lock, path, mut document) = super::account::open_document()?;
+    let before = document.to_string();
 
     let servers_array = document
         .entry("mcp")
@@ -997,7 +959,7 @@ pub(crate) async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<(
             .and_then(|v| v.as_str())
             .is_some_and(|n| n == resolved.name)
         {
-            return Err(config_err(format!(
+            return Err(usage_err(format!(
                 "server '{}' already exists in config.toml",
                 resolved.name
             )));
@@ -1013,7 +975,7 @@ pub(crate) async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<(
     // After the duplicate check so the message can say the entry is gone, and before the write so
     // the refusal needs no rollback.
     if token_store.has_mcp_credentials(&resolved.name).await? {
-        return Err(config_err(format!(
+        return Err(usage_err(format!(
             "'{0}' has a stored credential left over from a removed server; clear it first with \
              `meka mcp remove {0}`",
             resolved.name
@@ -1023,8 +985,8 @@ pub(crate) async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<(
     let table = build_server_table(&resolved);
     servers_array.push(table);
 
-    crate::fs::write_file_atomic(&path, &document.to_string())
-        .map_err(|error| config_err(format!("failed to write config: {error}")))?;
+    crate::fs::write_file_atomic(&path, &reparsed_edit(&before, &document)?)
+        .map_err(|error| MekaError::io(format!("failed to write config: {error}")))?;
     tracing::info!(
         "added '{name}' to {path}",
         name = resolved.name,
@@ -1136,7 +1098,21 @@ async fn probe_then_login(resolved: &ResolvedAddArgs, token_store: &TokenStore) 
     };
 
     let wants_oauth_already = matches!(resolved.auth, Some(McpAuthConfig::OAuth { .. }));
-    let should_login = match probe_and_announce(&resolved.name, url).await {
+    // Expanded as the connector expands it, or the probe would send a literal `${KEY}` to the
+    // host: the one door the server's own rule does not reach. Skipped rather than refused when
+    // this shell cannot supply a name, since the server's own runs may, and the entry is written.
+    let expansion = crate::config::expand_env_vars(url, |name| std::env::var(name).ok());
+    let probe = if expansion.missing.is_empty() && expansion.malformed.is_empty() {
+        probe_and_announce(&resolved.name, &expansion.text).await
+    } else {
+        tracing::warn!(
+            "skipping the auth probe of '{}': its URL names {:?}, which this shell does not supply",
+            resolved.name,
+            [expansion.missing, expansion.malformed].concat()
+        );
+        ProbeOutcome::Inconclusive
+    };
+    let should_login = match probe {
         // Probe says unauthenticated access works, and the user didn't explicitly ask for OAuth →
         // nothing to log in to.
         ProbeOutcome::Open => wants_oauth_already,
@@ -1255,7 +1231,7 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
         .map(|level| {
             level
                 .parse::<crate::permission::Permission>()
-                .map_err(|error| config_err(format!("`--permission`: {error}")))
+                .map_err(|error| usage_err(format!("`--permission`: {error}")))
         })
         .transpose()?;
 
@@ -1267,21 +1243,21 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
         let mut map = std::collections::HashMap::with_capacity(tool_permission.len());
         for entry in &tool_permission {
             let (tool, level) = entry.split_once('=').ok_or_else(|| {
-                config_err(format!(
+                usage_err(format!(
                     "`--tool-permission` takes TOOL=LEVEL, got '{entry}'"
                 ))
             })?;
             let tool = tool.trim();
             let level = level.trim();
             if tool.is_empty() {
-                return Err(config_err(format!(
+                return Err(usage_err(format!(
                     "`--tool-permission` entry '{entry}' has an empty tool name"
                 )));
             }
             let level = level
                 .parse::<crate::permission::Permission>()
                 .map_err(|error| {
-                    config_err(format!("`--tool-permission` entry '{entry}': {error}"))
+                    usage_err(format!("`--tool-permission` entry '{entry}': {error}"))
                 })?;
             map.insert(tool.to_string(), level);
         }
@@ -1311,7 +1287,7 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
         || redirect_port.is_some();
 
     if auth_token.is_some() && auth.is_some() {
-        return Err(config_err(
+        return Err(usage_err(
             "`--auth-token-stdin` cannot be combined with `--auth`",
         ));
     }
@@ -1319,13 +1295,13 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
     match transport {
         McpTransport::Stdio => {
             let command = location.ok_or_else(|| {
-                config_err("stdio transport needs an executable as the positional argument")
+                usage_err("stdio transport needs an executable as the positional argument")
             })?;
             if !header.is_empty() {
-                return Err(config_err("`--header` is HTTP-only"));
+                return Err(usage_err("`--header` is HTTP-only"));
             }
             if auth_token.is_some() || auth.is_some() || auth_flags_present {
-                return Err(config_err("auth flags are HTTP-only"));
+                return Err(usage_err("auth flags are HTTP-only"));
             }
 
             let env = parse_kv_pairs("--env", &env)?;
@@ -1353,13 +1329,13 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
         }
         McpTransport::Http => {
             let url = location.ok_or_else(|| {
-                config_err("http transport needs a URL as the positional argument")
+                usage_err("http transport needs a URL as the positional argument")
             })?;
             if !tail.is_empty() {
-                return Err(config_err("http transport takes no trailing arguments"));
+                return Err(usage_err("http transport takes no trailing arguments"));
             }
             if !env.is_empty() {
-                return Err(config_err("`--env` is stdio-only"));
+                return Err(usage_err("`--env` is stdio-only"));
             }
 
             let headers = parse_kv_pairs("--header", &header)?;
@@ -1432,13 +1408,13 @@ fn resolve_auth_config(
     match auth {
         None => {
             if auth_flags_present && auth_token.is_none() {
-                return Err(config_err("OAuth-family flags need `--auth`"));
+                return Err(usage_err("OAuth-family flags need `--auth`"));
             }
             Ok(None)
         }
         Some(McpAuthKind::OAuth) => {
             if signing_key.is_some() || signing_algorithm.is_some() {
-                return Err(config_err(
+                return Err(usage_err(
                     "`--signing-key` and `--signing-algorithm` need `--auth client_credentials_jwt`",
                 ));
             }
@@ -1450,19 +1426,19 @@ fn resolve_auth_config(
         }
         Some(McpAuthKind::ClientCredentials) => {
             let client_id = client_id
-                .ok_or_else(|| config_err("`--auth client_credentials` needs `--client-id`"))?;
+                .ok_or_else(|| usage_err("`--auth client_credentials` needs `--client-id`"))?;
             if client_secret.is_none() {
-                return Err(config_err(
+                return Err(usage_err(
                     "`--auth client_credentials` needs `--client-secret-stdin`",
                 ));
             }
             if signing_key.is_some() || signing_algorithm.is_some() {
-                return Err(config_err(
+                return Err(usage_err(
                     "`--signing-key` and `--signing-algorithm` need `--auth client_credentials_jwt`",
                 ));
             }
             if redirect_port.is_some() {
-                return Err(config_err("`--redirect-port` needs `--auth oauth`"));
+                return Err(usage_err("`--redirect-port` needs `--auth oauth`"));
             }
             Ok(Some(McpAuthConfig::ClientCredentials {
                 client_id,
@@ -1472,17 +1448,17 @@ fn resolve_auth_config(
         }
         Some(McpAuthKind::ClientCredentialsJwt) => {
             let client_id = client_id
-                .ok_or_else(|| config_err("`--auth client_credentials_jwt` needs `--client-id`"))?;
+                .ok_or_else(|| usage_err("`--auth client_credentials_jwt` needs `--client-id`"))?;
             let signing_key_path = signing_key.ok_or_else(|| {
-                config_err("`--auth client_credentials_jwt` needs `--signing-key`")
+                usage_err("`--auth client_credentials_jwt` needs `--signing-key`")
             })?;
             if client_secret.is_some() {
-                return Err(config_err(
+                return Err(usage_err(
                     "`--auth client_credentials_jwt` signs a JWT and takes no `--client-secret-stdin`",
                 ));
             }
             if redirect_port.is_some() {
-                return Err(config_err("`--redirect-port` needs `--auth oauth`"));
+                return Err(usage_err("`--redirect-port` needs `--auth oauth`"));
             }
             Ok(Some(McpAuthConfig::ClientCredentialsJwt {
                 client_id,
@@ -1502,9 +1478,9 @@ fn parse_kv_pairs(flag: &str, pairs: &[String]) -> Result<Vec<(String, String)>>
     for entry in pairs {
         let (k, v) = entry
             .split_once('=')
-            .ok_or_else(|| config_err(format!("`{flag}` takes KEY=VALUE, got '{entry}'")))?;
+            .ok_or_else(|| usage_err(format!("`{flag}` takes KEY=VALUE, got '{entry}'")))?;
         if k.is_empty() {
-            return Err(config_err(format!(
+            return Err(usage_err(format!(
                 "`{flag}` entry '{entry}' has an empty key"
             )));
         }
@@ -1753,15 +1729,8 @@ enum Purged {
 async fn purge_server(name: &str, token_store: &TokenStore) -> Result<Purged> {
     // Held to the end of the function, so this read and the write below cannot interleave with
     // another editor's, `device_id::persist` on an ordinary launch included.
-    let _config_lock = crate::config::lock_config_file()
-        .map_err(|error| config_err(format!("failed to lock config: {error}")))?;
-    let path = crate::paths::config_file_path()
-        .ok_or_else(|| config_err("failed to determine the config directory"))?;
-    let existing = std::fs::read_to_string(&path)
-        .map_err(|error| config_err(format!("failed to read config: {error}")))?;
-    let mut document = existing
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|error| config_err(format!("failed to parse config: {error}")))?;
+    let (_config_lock, path, mut document) = super::account::open_document()?;
+    let before = document.to_string();
 
     let removed_from_config = document
         .get_mut("mcp")
@@ -1776,7 +1745,7 @@ async fn purge_server(name: &str, token_store: &TokenStore) -> Result<Purged> {
 
     if !removed_from_config {
         if !token_store.has_mcp_credentials(name).await? {
-            return Err(config_err(crate::text::unknown_name(
+            return Err(usage_err(crate::text::unknown_name(
                 "MCP server",
                 name,
                 server_names(&document),
@@ -1786,8 +1755,8 @@ async fn purge_server(name: &str, token_store: &TokenStore) -> Result<Purged> {
         return Ok(Purged::CredentialsOnly);
     }
 
-    crate::fs::write_file_atomic(&path, &document.to_string())
-        .map_err(|error| config_err(format!("failed to write config: {error}")))?;
+    crate::fs::write_file_atomic(&path, &reparsed_edit(&before, &document)?)
+        .map_err(|error| MekaError::io(format!("failed to write config: {error}")))?;
 
     clear_server_state(name, token_store).await?;
     Ok(Purged::Server(path))
@@ -1847,18 +1816,11 @@ pub(crate) async fn run_remove(name: &str, token_store: &TokenStore) -> Result<(
 fn set_server_disabled(name: &str, disabled: bool) -> Result<std::path::PathBuf> {
     // Held to the end of the function, so this read and the write below cannot interleave with
     // another editor's, `device_id::persist` on an ordinary launch included.
-    let _config_lock = crate::config::lock_config_file()
-        .map_err(|error| config_err(format!("failed to lock config: {error}")))?;
-    let path = crate::paths::config_file_path()
-        .ok_or_else(|| config_err("failed to determine the config directory"))?;
-    let existing = std::fs::read_to_string(&path)
-        .map_err(|error| config_err(format!("failed to read config: {error}")))?;
-    let mut document = existing
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|error| config_err(format!("failed to parse config: {error}")))?;
+    let (_config_lock, path, mut document) = super::account::open_document()?;
+    let before = document.to_string();
 
     let known = server_names(&document);
-    let unknown = || config_err(crate::text::unknown_name("MCP server", name, known.iter()));
+    let unknown = || usage_err(crate::text::unknown_name("MCP server", name, known.iter()));
     let servers = document
         .get_mut("mcp")
         .and_then(|m| m.as_table_mut())
@@ -1879,8 +1841,8 @@ fn set_server_disabled(name: &str, disabled: bool) -> Result<std::path::PathBuf>
         entry.remove("disabled");
     }
 
-    crate::fs::write_file_atomic(&path, &document.to_string())
-        .map_err(|error| config_err(format!("failed to write config: {error}")))?;
+    crate::fs::write_file_atomic(&path, &reparsed_edit(&before, &document)?)
+        .map_err(|error| MekaError::io(format!("failed to write config: {error}")))?;
     Ok(path)
 }
 
@@ -1916,7 +1878,8 @@ pub(crate) async fn run_mcp_subcommand(
             | crate::cli::McpAction::Enable { .. }
             | crate::cli::McpAction::Disable { .. }
     ) {
-        config.warn_if_config_unreadable();
+        // The raw-document editors run on a file meka cannot parse, since they are how it gets
+        // repaired; `main` has already noted the failure once.
     } else {
         config.require_readable_config()?;
     }

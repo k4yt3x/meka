@@ -183,6 +183,20 @@ fn acp_error_for(error: &MekaError, relay_provider_errors: bool) -> agent_client
     }
 }
 
+/// The words of a [`MekaError`] a notice may carry: what [`acp_error_for`] would have given a
+/// request, read back out of the error it builds, since the ACP helpers keep the sentence in
+/// `data` and leave `message` to JSON-RPC's own "Internal error". One accessor, so a notice and a
+/// response never say different things about one failure.
+fn acp_error_text(error: &MekaError, relay_provider_errors: bool) -> String {
+    let error = acp_error_for(error, relay_provider_errors);
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.as_str())
+        .map(str::to_string)
+        .unwrap_or(error.message)
+}
+
 /// [`acp_error_for`] for a builder or a door that answers in `anyhow`: a [`MekaError`] inside is
 /// mapped as itself, and anything else is an `InternalError` naming neither, since an `anyhow`
 /// chain from a builder ends in whatever the provider registry or the store said. `context` goes to

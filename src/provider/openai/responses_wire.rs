@@ -1446,7 +1446,7 @@ mod tests {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                StreamEvent::ToolCallRejected { name, .. } if name == "file_write"
+                StreamEvent::ToolCallRefused { name, .. } if name == "file_write"
             )),
             "the call must be rejected: {events:?}",
         );

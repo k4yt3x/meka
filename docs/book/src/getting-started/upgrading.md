@@ -10,6 +10,72 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.67 to 0.68
+
+**`headers_helper` is a path beside `config.toml`, or absolute.** A relative name is resolved
+against the directory `config.toml` is in and nowhere else; it is no longer tried against the
+working directory `meka` was launched from, and a bare name is no longer searched on `PATH`. A
+helper that lived beside the config keeps working; one that relied on the launch directory or on
+`PATH` needs its path written out.
+
+**An MCP server whose `url` or `args` name an unset `${VAR}` is refused.** The literal used to be
+sent to the other side; a key in a query string or a token on a command line is a credential, so
+these fields now fail closed as `env` and `headers` always did. Set the variable, or give it a
+default with `${VAR:-default}`. A reference the grammar does not accept (an unclosed `${`, an empty
+name, a default that opens another reference) is refused the same way in every field that reaches
+the other side. To hand a child shell a variable it expands itself, write it without braces
+(`args = ["-c", "srv --token $MY_TOKEN"]`); meka leaves that alone.
+
+**`[serve]` values take `${VAR:-default}` and no longer take `$$`.** The one `${VAR}` grammar
+serves every field of `config.toml`; `$$` in a `[serve]` value is now two dollar signs, and
+`$${VAR}` is a `$` followed by the expansion.
+
+**`meka mcp add`, `remove`, `enable` and `disable` refuse to write a `config.toml` that would not
+read back**, as `account` and `profile` always have. A file broken elsewhere is fixed by hand
+first; an entry whose own keys broke the file is still removable.
+
+**`[background] max_tasks = 0` is refused at startup while `enabled = true`.** It offered
+`background` to the model and refused every call; set it to 1 or more, or turn the switch off.
+
+**A session expires as a tree.** The retention sweep and `meka session delete --older-than-days`
+judge a root by its own age and take its sub-agents with it, and keep every sub-agent of a root
+that is pinned or owns a scheduled job. Before, an old sub-agent under a kept root was deleted on
+its own and `agent_followup` on it then failed. Every delete now locks the session with its
+sub-agents: `meka session delete <id>`, `--all` and the servers' deletes refuse while another
+process is running a sub-agent under it, where they took the sub-agent from under that process.
+
+**`GET /v1/sessions/{id}/stream` loads an evicted session only for `sessions:w`.** A token with
+`sessions:r` alone attaches to a session the server has loaded and is answered `409`
+(`/errors/session-not-loaded`) otherwise, where it used to revive the session and hold it, under
+its cross-process lock, for as long as the stream stayed open. A bridge that subscribes before it
+submits already holds `sessions:w`; a dashboard that only reads keeps reading resident sessions.
+
+**Below `unrestricted`, the in-process readers refuse a process's own `/proc` entries.**
+`file_read` and `file_search` refuse `/proc/<pid>`, `/proc/self` and `/proc/thread-self`, whose
+`environ`, `cmdline`, `fd` and `mem` carry what a process was given; the system-wide files
+(`/proc/meminfo`, `/proc/cpuinfo`, `/proc/mounts`) stay readable.
+
+**A skill's bundled files in meka's own store are readable at every level.** `file_read` and
+`file_search` reach `skills/` under the config directory below `unrestricted`, where they refused
+it; the rest of the directory stays private, and the shell sandbox still masks all of it, which the
+header a skill is served with now says.
+
+**`interleaved_thinking` on an account.** `anthropic-messages` still sends the
+`interleaved-thinking` beta whenever thinking is on; `[accounts.<name>] interleaved_thinking = false`,
+or `meka account add --interleaved-thinking false`, withholds it for an endpoint that refuses the
+header. Nothing changes for an account that does not set it.
+
+**Wire changes.** `schedule.fired` carries `status: "not_run"` for a job whose session could not
+be opened for it, where it said `"failed"`; `turn.started` carries `source: "compaction"` for the
+checkpoint turn `POST /compact` runs, with a `turn.finished` that closes it; `meka account whoami
+--format json` carries `auth.expires_at` as RFC 3339 rather than Unix seconds;
+`DELETE /v1/sessions/{id}` answers `409` while a scheduled or background turn is taking the
+session, as fork and `PATCH` do. A script that matched refusals from `meka mcp`, `schedule`,
+`background`, `memory` or `skill` on `configuration error:` will not match them any more: they
+print what happened, without that prefix. `meka session list -n 0` and `meka session search -n 0`
+show every session where they showed none, and `meka --format json <subcommand>` is refused where
+the flag was ignored.
+
 ## 0.66 to 0.67
 
 **Session archives are `format_version` 6.** Each session's `stats` carries a `turn_position`,

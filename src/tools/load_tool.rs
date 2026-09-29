@@ -24,7 +24,7 @@ use crate::{
     provider::ToolDefinition,
 };
 
-type ToolSet = Weak<RwLock<Vec<Arc<dyn Tool>>>>;
+type ToolSet = Weak<RwLock<super::registry::Registered>>;
 type DeferredSet = Weak<RwLock<HashSet<String>>>;
 
 /// Meta-tool that makes a deferred tool's schema visible for use. Held by the
@@ -50,14 +50,19 @@ impl LoadToolTool {
     /// The message for a name that resolved to nothing: the edit-distance hint when a registered
     /// name is close, else the keyword matches for the name, so a model that typed a bare word gets
     /// the tools that word finds rather than a dead end.
-    fn not_registered(&self, name: &str, tools: &Arc<RwLock<Vec<Arc<dyn Tool>>>>) -> String {
+    fn not_registered(
+        &self,
+        name: &str,
+        tools: &Arc<RwLock<super::registry::Registered>>,
+    ) -> String {
         let hint = self.near_miss_hint(name, tools);
         let mut message = format!(
             "Error: tool '{name}' is not registered.{hint} Check the names listed under `[Tool \
              discovery]` in the conversation context, or search with `{SEARCH_TOOL_NAME}`."
         );
         if hint.is_empty() {
-            let registered: Vec<Arc<dyn Tool>> = crate::sync::read(tools).iter().cloned().collect();
+            let registered: Vec<Arc<dyn Tool>> =
+                crate::sync::read(tools).tools().cloned().collect();
             let deferred = deferred_names(&self.deferred);
             if let Some(matches) = render_search(
                 &registered,
@@ -86,11 +91,11 @@ impl LoadToolTool {
     fn near_miss_hint(
         &self,
         name: &str,
-        tools: &std::sync::Arc<RwLock<Vec<Arc<dyn Tool>>>>,
+        tools: &std::sync::Arc<RwLock<super::registry::Registered>>,
     ) -> String {
         let registered: Vec<String> = crate::sync::read(tools)
-            .iter()
-            .map(|tool| tool.definition().name)
+            .names()
+            .map(str::to_string)
             .collect();
         crate::tools::did_you_mean_hint(name, registered.iter().map(String::as_str))
     }
@@ -149,10 +154,9 @@ impl Tool for LoadToolTool {
         let mut sections: Vec<String> = Vec::new();
         let mut resolved = 0usize;
         for name in &names {
-            let tool = {
-                let guard = crate::sync::read(&tools);
-                guard.iter().find(|t| t.definition().name == *name).cloned()
-            };
+            let tool = crate::sync::read(&tools)
+                .get(name)
+                .map(|entry| Arc::clone(&entry.tool));
 
             let Some(tool) = tool else {
                 sections.push(match self.unavailable_server_reason(name).await {
@@ -176,7 +180,11 @@ impl Tool for LoadToolTool {
             // the model into a refusal `tool_search` would have named.
             let status = callability(
                 name,
-                required_level(name, &*tool, &self.permission_overrides),
+                crate::tools::effective_permission(
+                    &self.permission_overrides,
+                    name,
+                    tool.required_permission(),
+                ),
                 tool.runs_outside_confinement(),
                 &self.permission,
             );
@@ -284,7 +292,7 @@ impl Tool for ToolSearchTool {
                 true,
             ));
         };
-        let registered: Vec<Arc<dyn Tool>> = crate::sync::read(&tools).iter().cloned().collect();
+        let registered: Vec<Arc<dyn Tool>> = crate::sync::read(&tools).tools().cloned().collect();
         let deferred = deferred_names(&self.deferred);
         Ok(
             match render_search(
@@ -307,19 +315,6 @@ fn deferred_names(deferred: &DeferredSet) -> HashSet<String> {
         .upgrade()
         .map(|set| crate::sync::read(&set).clone())
         .unwrap_or_default()
-}
-
-/// The level a call of `name` is judged against: the config's override when it names one, else
-/// the tool's own, exactly as the registry's catalog computes it.
-fn required_level(
-    name: &str,
-    tool: &dyn Tool,
-    overrides: &HashMap<String, Permission>,
-) -> Permission {
-    overrides
-        .get(name)
-        .copied()
-        .unwrap_or_else(|| tool.required_permission())
 }
 
 /// What the permission door says about a call of `name` now, in one clause: the decision is
@@ -481,7 +476,8 @@ fn render_search(
     let mut out = format!("Tools matching '{query}':\n");
     for found in &matches[..shown] {
         let name = &found.definition.name;
-        let required = required_level(name, &*found.tool, overrides);
+        let required =
+            crate::tools::effective_permission(overrides, name, found.tool.required_permission());
         let summary = crate::prompt::short_description(&found.definition.description);
         let status = callability(
             name,
@@ -639,7 +635,7 @@ mod tests {
         }
     }
 
-    type ToolStorage = Arc<RwLock<Vec<Arc<dyn Tool>>>>;
+    type ToolStorage = Arc<RwLock<crate::tools::Registered>>;
     type DeferredStorage = Arc<RwLock<HashSet<String>>>;
 
     /// Test fixture: holds the strong `Arc`s for `tools` and `deferred` so the `Weak`s inside
@@ -678,7 +674,11 @@ mod tests {
         deferred_names: &[&str],
         permission: SharedPermission,
     ) -> Fixture {
-        let tools: ToolStorage = Arc::new(RwLock::new(registered));
+        let mut list = crate::tools::Registered::default();
+        for tool in registered {
+            list.push(tool);
+        }
+        let tools: ToolStorage = Arc::new(RwLock::new(list));
         let deferred: DeferredStorage = Arc::new(RwLock::new(
             deferred_names.iter().map(|n| n.to_string()).collect(),
         ));

@@ -135,7 +135,7 @@ A skill file is content, and content does not get to widen what the agent may ru
 
 ### Referencing bundled files
 
-Refer to files bundled alongside `SKILL.md` by relative path (e.g. `scripts/helper.sh`). Every skill body is prefixed with a header naming the skill's directory (see [How the agent uses skills](#how-the-agent-uses-skills)), so relative paths resolve against the skill rather than against the session's working directory.
+Refer to files bundled alongside `SKILL.md` by relative path (e.g. `scripts/helper.sh`). Every skill body is prefixed with a header naming the skill's directory (see [How the agent uses skills](#how-the-agent-uses-skills)), so relative paths resolve against the skill rather than against the session's working directory. A skill in meka's own store sits under the config directory, which a shell command cannot see below `unrestricted`; `file_read` and `file_search` reach it at every level, and the header says so, so the agent reads a bundled script rather than running `cat` on it.
 
 The body is passed to the model verbatim; meka does not rewrite anything inside it. Keeping skills free of host-specific placeholders is what lets the same `SKILL.md` run under meka and other Agent Skills hosts unchanged.
 
@@ -345,7 +345,7 @@ Notes on how it behaves:
 
 ## Tips
 
-- Use short, unambiguous skill names (e.g. `setup-postgres`, not `pg`). The name is what the agent sees and calls, and the spec allows only lowercase alphanumerics and hyphens.
+- Use short, unambiguous skill names (e.g. `setup-postgres`, not `pg`). The name is what the agent sees and calls, and the spec allows only lowercase alphanumerics and hyphens. Every door that takes a name also requires it to be one directory name as the platform reads it: no separator, no drive prefix, no parent.
 - **Anything meka lists, meka can remove**, and so is almost anything it refuses to load. A name the spec forbids (`My_Skill`, `two words`, `not.a.skill`) is skipped with the reason named, and `meka skill remove` still takes it so you can clean up. The one exception is a name meka cannot [render](#required-frontmatter-fields), which no command can address; rename it in a shell. One Windows reserves, like `con`, loads normally: that is meka's own write-time rule, not the spec's.
 - Every write door applies the same rules. `meka skill add`, `skill_write` and `PUT /v1/skills/{name}` all refuse a name or a description the spec rejects, and refuse a skill whose `name` is missing or disagrees with its directory, so a skill meka authors passes `skills-ref validate`. `--from-file` copies your bytes verbatim, so it can still carry a key the spec does not define (that is how an imported skill keeps its `when_to_use`), but it must still declare the required `name`. Run `uvx skills-ref validate <dir>` when you want the reference's own verdict on a file.
 - Write `description` concisely, and fold the "use when..." trigger into it. It is sent to the model and consumes tokens.

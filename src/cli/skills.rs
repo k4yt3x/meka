@@ -140,7 +140,7 @@ pub(crate) fn run_get(
     roots: &[std::path::PathBuf],
     format: crate::cli::OutputFormat,
 ) -> Result<()> {
-    let skill = skills::require_skill(name, roots).map_err(MekaError::Config)?;
+    let skill = skills::require_skill(name, roots).map_err(MekaError::Usage)?;
     if format == crate::cli::OutputFormat::Json {
         crate::cli::write_json(&crate::view::InstalledSkillDetail::new(&skill, None))?;
         return Ok(());
@@ -217,10 +217,10 @@ pub(crate) async fn run_show(
     roots: &[std::path::PathBuf],
     format: crate::cli::OutputFormat,
 ) -> Result<()> {
-    let skill = skills::require_skill(name, roots).map_err(MekaError::Config)?;
+    let skill = skills::require_skill(name, roots).map_err(MekaError::Usage)?;
     let body = skills::load_skill_body(&skill)
         .await
-        .map_err(|error| MekaError::Config(format!("failed to load skill body: {error}")))?;
+        .map_err(|error| MekaError::io(format!("failed to load skill body: {error}")))?;
     if format == crate::cli::OutputFormat::Json {
         crate::cli::write_json(&crate::view::InstalledSkillDetail::new(&skill, Some(body)))?;
         return Ok(());
@@ -241,11 +241,11 @@ fn prepare_add(
     args: &AddArgs<'_>,
     roots: &[std::path::PathBuf],
 ) -> Result<(std::path::PathBuf, String)> {
-    skills::validate_skill_name(args.name).map_err(MekaError::Config)?;
+    skills::validate_skill_name(args.name).map_err(MekaError::Usage)?;
 
     // Resolved once and joined from, so there is one answer for a missing config directory.
     let native_root = crate::paths::skills_dir()
-        .ok_or_else(|| MekaError::Config("failed to determine the config directory".to_string()))?;
+        .ok_or_else(|| MekaError::io("failed to determine the config directory".to_string()))?;
     let dir = native_root.join(args.name);
 
     // The same refusal the agent tools and `PUT /v1/skills` apply, from the same function: a copy
@@ -256,11 +256,11 @@ fn prepare_add(
         args.name,
         &native_root,
     ) {
-        return Err(MekaError::Config(refusal.where_it_lives()));
+        return Err(MekaError::Usage(refusal.where_it_lives()));
     }
 
     if dir.exists() && !args.force {
-        return Err(MekaError::Config(format!(
+        return Err(MekaError::Usage(format!(
             "skill '{}' already exists at {}; pass `--force` to overwrite",
             args.name,
             dir.display()
@@ -278,19 +278,19 @@ fn prepare_add(
             .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
             .collect();
         crate::entry::check_case_collision(args.name, names.iter().map(String::as_str), "skill")
-            .map_err(MekaError::Config)?;
+            .map_err(MekaError::Usage)?;
     }
 
     // `remove_dir_all` does not follow a link, so a symlinked entry would lose the link and keep
     // whatever it pointed at. `delete_skill` and `write_skill` refuse this too, so `--force` cannot
     // quietly destroy an artifact the user planted deliberately.
-    crate::fs::reject_symlinked_path(&dir, "skill").map_err(MekaError::Config)?;
+    crate::fs::reject_symlinked_path(&dir, "skill").map_err(MekaError::Usage)?;
 
     let body = build_skill_body(args)?;
     let parsed =
         skills::parse_skill_definition(args.name, &native_root, &dir, &dir.join("SKILL.md"), &body)
             .map_err(|error| {
-                MekaError::Config(format!(
+                MekaError::Usage(format!(
                     "refusing to write a skill that would not parse back: {error}"
                 ))
             })?;
@@ -300,7 +300,7 @@ fn prepare_add(
     // door would author a skill the reference validator rejects the moment it exists, and that
     // `skill_write` and `PUT /v1/skills` would have refused. Measured raw, like the validator does.
     if parsed.conformance.description_chars > skills::MAX_DESCRIPTION_CHARS {
-        return Err(MekaError::Config(format!(
+        return Err(MekaError::Usage(format!(
             "description is {} characters; the Agent Skills spec allows at most {}",
             parsed.conformance.description_chars,
             skills::MAX_DESCRIPTION_CHARS
@@ -313,7 +313,7 @@ fn prepare_add(
     // Deliberately narrow: a key the spec does not define, such as a Claude Code `when_to_use`, is
     // preserved on purpose, and a missing required field is not that.
     if !parsed.conformance.declares_name {
-        return Err(MekaError::Config(format!(
+        return Err(MekaError::Usage(format!(
             "{} declares no `name`, which the Agent Skills spec requires; add `name: {}` to its \
              frontmatter",
             args.from_file
@@ -336,7 +336,7 @@ pub(crate) async fn run_add(args: AddArgs<'_>, roots: &[std::path::PathBuf]) -> 
     // bytes and writes them directly, so it inherited none of that function's guards.
     let native_root = roots.first().cloned().unwrap_or_else(|| dir.clone());
     let _store_lock = crate::fs::lock_store(&native_root)
-        .map_err(|error| MekaError::Config(format!("failed to lock the skill store: {error}")))?;
+        .map_err(|error| MekaError::io(format!("failed to lock the skill store: {error}")))?;
 
     let skill_md = dir.join("SKILL.md");
     // The replacement lands *first*, and the old bundled files are cleared afterwards.
@@ -350,7 +350,7 @@ pub(crate) async fn run_add(args: AddArgs<'_>, roots: &[std::path::PathBuf]) -> 
     // `write_file_atomic` creates the parents, so no separate `create_dir_all` is needed; and
     // because it publishes by rename, the directory never holds a partial `SKILL.md`.
     crate::fs::write_file_atomic(&skill_md, &body).map_err(|error| {
-        MekaError::Config(format!("failed to write {}: {}", skill_md.display(), error))
+        MekaError::io(format!("failed to write {}: {}", skill_md.display(), error))
     })?;
 
     // `--force` on a name that exists replaces the *skill*, bundled files included, which is what
@@ -403,9 +403,9 @@ pub(crate) async fn run_add(args: AddArgs<'_>, roots: &[std::path::PathBuf]) -> 
         // ordinary setting, and passing the whole string as a program name looks for a binary
         // literally called that.
         if let Some(mut command) = crate::entry::editor_command(&skill_md) {
-            let status = command.status().map_err(|error| {
-                MekaError::Config(format!("failed to launch your editor: {error}"))
-            })?;
+            let status = command
+                .status()
+                .map_err(|error| MekaError::io(format!("failed to launch your editor: {error}")))?;
             if !status.success() {
                 tracing::warn!("your editor exited with {status}");
             }
@@ -424,7 +424,7 @@ fn build_skill_body(args: &AddArgs<'_>) -> Result<String> {
         // frontmatter is refused rather than accepted and dropped. Silently ignoring `--priority`
         // here would leave the skill at the default with no indication the flag did nothing.
         if args.description.is_some() {
-            return Err(MekaError::Config(
+            return Err(MekaError::Usage(
                 "`--from-file` cannot be combined with `--description`".to_string(),
             ));
         }
@@ -433,22 +433,22 @@ fn build_skill_body(args: &AddArgs<'_>) -> Result<String> {
             ("--metadata", !args.metadata.is_empty()),
         ] {
             if given {
-                return Err(MekaError::Config(format!(
+                return Err(MekaError::Usage(format!(
                     "`--from-file` cannot be combined with `{flag}`; set the key in the file"
                 )));
             }
         }
         let content = std::fs::read_to_string(path).map_err(|error| {
-            MekaError::Config(format!("failed to read {}: {}", path.display(), error))
+            MekaError::io(format!("failed to read {}: {}", path.display(), error))
         })?;
         Ok(content)
     } else {
         let description = args.description.ok_or_else(|| {
-            MekaError::Config("`--description` is required without `--from-file`".to_string())
+            MekaError::Usage("`--description` is required without `--from-file`".to_string())
         })?;
         let priority = args.priority.unwrap_or(crate::entry::DEFAULT_PRIORITY);
         if priority > crate::entry::MAX_PRIORITY {
-            return Err(MekaError::Config(format!(
+            return Err(MekaError::Usage(format!(
                 "`--priority` must be between {} and {}",
                 crate::entry::MIN_PRIORITY,
                 crate::entry::MAX_PRIORITY
@@ -469,20 +469,20 @@ pub(crate) async fn run_remove(name: &str, roots: &[std::path::PathBuf]) -> Resu
     // Lookup rules, not write rules. A name the spec refuses is skipped rather than listed, but
     // the startup warning names it, and a remove that refused it would leave `rm -rf` as the only
     // way out.
-    skills::validate_addressable_name(name).map_err(MekaError::Config)?;
+    skills::validate_addressable_name(name).map_err(MekaError::Usage)?;
 
     let native_root = crate::paths::skills_dir()
-        .ok_or_else(|| MekaError::Config("failed to determine the config directory".to_string()))?;
+        .ok_or_else(|| MekaError::io("failed to determine the config directory".to_string()))?;
     // The same refusal every other delete door gives, from the same function. Without it this is
     // the one command that answers "not found" for a skill `meka skill list` just showed.
     if let Some(refusal) =
         skills::refuse_foreign_delete(&skills::discover_skills_in_roots(roots), name, &native_root)
     {
-        return Err(MekaError::Config(refusal.where_it_lives()));
+        return Err(MekaError::Usage(refusal.where_it_lives()));
     }
     let dir = native_root.join(name);
     if !dir.exists() {
-        return Err(MekaError::Config(format!(
+        return Err(MekaError::Usage(format!(
             "no skill named '{}' in {}",
             name,
             dir.display()
@@ -491,7 +491,7 @@ pub(crate) async fn run_remove(name: &str, roots: &[std::path::PathBuf]) -> Resu
     // The refusal `delete_skill` gives: `remove_dir_all` does not follow the link, so removing it
     // loses the link and keeps whatever it pointed at, and reporting that as a deleted skill is a
     // lie about what happened.
-    crate::fs::reject_symlinked_path(&dir, "skill").map_err(MekaError::Config)?;
+    crate::fs::reject_symlinked_path(&dir, "skill").map_err(MekaError::Usage)?;
     // The store lock, taken explicitly because this door does not go through `delete_skill`, the
     // way `run_add` takes it for not going through `write_skill`. Without it this could
     // `remove_dir_all` a skill directory while `skill_write` or `PUT /v1/skills` is composing and
@@ -503,8 +503,8 @@ pub(crate) async fn run_remove(name: &str, roots: &[std::path::PathBuf]) -> Resu
         std::fs::remove_dir_all(&target)
     })
     .await
-    .map_err(|error| MekaError::Config(format!("failed to run the removal: {error}")))?
-    .map_err(|error| MekaError::Config(format!("failed to remove {}: {}", dir.display(), error)))?;
+    .map_err(|error| MekaError::io(format!("failed to run the removal: {error}")))?
+    .map_err(|error| MekaError::io(format!("failed to remove {}: {}", dir.display(), error)))?;
     tracing::info!("removed skill '{name}'");
     Ok(())
 }
@@ -520,13 +520,13 @@ fn parse_metadata(pairs: &[String]) -> Result<BTreeMap<String, String>> {
     let mut metadata = BTreeMap::new();
     for pair in pairs {
         let Some((key, value)) = pair.split_once('=') else {
-            return Err(MekaError::Config(format!(
+            return Err(MekaError::Usage(format!(
                 "`--metadata` takes KEY=VALUE, got '{pair}'"
             )));
         };
         let key = key.trim();
         if key.is_empty() {
-            return Err(MekaError::Config(format!(
+            return Err(MekaError::Usage(format!(
                 "`--metadata` entry '{pair}' has an empty key"
             )));
         }
@@ -1209,7 +1209,7 @@ mod tests {
                 .expect_err("must fail")
         );
         assert_eq!(
-            absent, "configuration error: no skill named 'no-such-thing'",
+            absent, "no skill named 'no-such-thing'",
             "a name nobody wrote still reads as absent"
         );
     }

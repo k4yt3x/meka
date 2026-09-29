@@ -1,7 +1,7 @@
 //! What every OAuth-backed credential shares: expiry arithmetic, the refresh exchange and its
 //! cross-process lock, the rejection-and-retry policy, and the PKCE material a login mints.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngExt;
@@ -66,8 +66,10 @@ pub(crate) fn credential_was_rejected(status: reqwest::StatusCode) -> bool {
 /// subscription backends replace the token once and name the login remedy on the second refusal.
 #[async_trait::async_trait]
 pub(crate) trait RefreshesCredential {
-    /// Whether a rejected credential has been replaced for one more attempt.
-    async fn refresh_after_rejection(&self) -> bool {
+    /// Whether a rejected credential has been replaced for one more attempt. `sent_authorization`
+    /// is the `Authorization` header the refused request carried, so the backend records the
+    /// token that was refused rather than whatever is current when the refusal lands.
+    async fn refresh_after_rejection(&self, _sent_authorization: Option<&str>) -> bool {
         false
     }
     /// The error to return when the credential is rejected again.
@@ -106,18 +108,31 @@ where
 {
     let mut retried_after_rejection = false;
     loop {
-        let request_builder = build().await?;
+        // Built ahead of the send so the bearer this attempt carries is known to the rejection
+        // it may get: by the time a 401 lands, a sibling request may have refreshed the token,
+        // and the backend must record the one that was refused, not the replacement.
+        let (client, http_request) = build().await?.build_split();
+        let http_request = http_request.map_err(|error| transport_error(&error))?;
+        let sent_authorization = http_request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let sent = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
-            sent = request_builder.send() => sent,
+            sent = client.execute(http_request) => sent,
         };
         let response = sent.map_err(|error| transport_error(&error))?;
         let status = response.status();
         if !credential_was_rejected(status) {
             return Ok(response);
         }
-        if !retried_after_rejection && refresher.refresh_after_rejection().await {
+        if !retried_after_rejection
+            && refresher
+                .refresh_after_rejection(sent_authorization.as_deref())
+                .await
+        {
             retried_after_rejection = true;
             continue;
         }
@@ -209,13 +224,12 @@ pub(crate) fn row_is_at_least_as_new(memory: &AuthCredential, row: &AuthCredenti
         _ => true,
     }
 }
-/// How long to wait for another process to finish rotating a profile's credential before going
-/// ahead anyway.
-///
-/// Bounded rather than blocking, because a wedged holder must not wedge every other meka on the
-/// machine. Going ahead is safe: [`store_refreshed_credential`]'s compare-and-swap is what makes
-/// the outcome correct, and this only spares the wasted refresh in the common case.
-pub(crate) const CREDENTIAL_LOCK_WAIT: Duration = Duration::from_secs(10);
+/// How long to wait for another process's refresh of the same credential: past the refresh's own
+/// timeout and its write, so a slow holder is waited out rather than raced. Racing it posts the
+/// refresh token the holder is spending, which an issuer refuses as reused, and the refusal reads
+/// as a dead login while the holder has just stored a live one.
+pub(crate) const CREDENTIAL_LOCK_WAIT: Duration =
+    Duration::from_secs(REFRESH_TIMEOUT.as_secs() + 5);
 /// Wait, briefly, for exclusive use of a profile's credential across processes.
 ///
 /// `None` means the wait ran out or the lock could not be asked for at all. The caller proceeds
@@ -455,6 +469,350 @@ pub(crate) fn generate_state() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// What a subscription request authenticates with: the access token and, where the issuer names
+/// one, the account it belongs to.
+pub(crate) struct OAuthAccess {
+    pub(crate) access_token: String,
+    pub(crate) account_id: Option<String>,
+}
+
+/// The credential half of a subscription backend: the live token, the gate that serializes
+/// refreshes, the slot naming a token the backend refused, and the row the token is kept on. One
+/// machine for both subscription backends, which each supply the exchange that mints a
+/// replacement, so a rule about when a token is refreshed, re-read, adopted or stored is written
+/// once and a race closed here is closed for both.
+pub(crate) struct SubscriptionCredential {
+    /// What every request reads. Taken for the reads and writes themselves and never held across a
+    /// database or network await: with its write lock as the refresh gate, an endpoint that goes
+    /// silent would wedge every reader in the process, not just the task refreshing.
+    credential: tokio::sync::RwLock<AuthCredential>,
+    /// Serializes refreshes without blocking readers. Held across the database and network awaits
+    /// a refresh performs; `credential` is not.
+    refresh_gate: tokio::sync::Mutex<()>,
+    /// The access token a request got a 401 for, read by every [`Self::ensure_valid`] until a
+    /// refresh installs a replacement.
+    ///
+    /// A rejection is the backend saying the stored expiry is wrong: the token was revoked, or its
+    /// issuer shortened lifetimes. The expiry alone would keep presenting the dead token until it
+    /// passed, which can be hours or, for an expiry meka had to assume, a full lifetime. The
+    /// token's identity rather than a flag, because a flag was spent by whichever read came first:
+    /// two requests refused in the same window left one of them re-sending the dead bearer and
+    /// failing with the login remedy while the other's refresh succeeded beside it. Recorded only
+    /// when the bearer the refused request carried is still the current one: a refusal that lands
+    /// after its token was replaced is about a token that is gone, and writing it here would
+    /// rotate the replacement for a rejection nothing made of it, or erase a live refusal of the
+    /// replacement that another request just recorded.
+    rejected_access_token: std::sync::Mutex<Option<String>>,
+    token_store: Option<Arc<TokenStore>>,
+    /// The account the credential is stored under, so a refreshed token is written back to the
+    /// right `account_credentials` row and a refusal names the login that fixes it.
+    account: String,
+    /// The backend's name, for the refusal of a credential that is not an OAuth token.
+    backend: &'static str,
+}
+
+impl SubscriptionCredential {
+    pub(crate) fn new(
+        credential: AuthCredential,
+        token_store: Option<Arc<TokenStore>>,
+        account: String,
+        backend: &'static str,
+    ) -> Self {
+        Self {
+            credential: tokio::sync::RwLock::new(credential),
+            refresh_gate: tokio::sync::Mutex::new(()),
+            rejected_access_token: std::sync::Mutex::new(None),
+            token_store,
+            account,
+            backend,
+        }
+    }
+
+    /// The account the credential is stored under.
+    pub(crate) fn account(&self) -> &str {
+        &self.account
+    }
+
+    /// Record that the backend refused a bearer, so every read until a refresh replaces it
+    /// refreshes instead of trusting the stored expiry. `sent_authorization` is the
+    /// `Authorization` header the refused request carried, which names the token refused; a
+    /// bearer that is no longer current records nothing, for the reason
+    /// [`Self::rejected_access_token`] gives. Without it the current token is taken, which is
+    /// right only while no refresh has landed in between.
+    pub(crate) async fn note_rejected(&self, sent_authorization: Option<&str>) {
+        let current = match &*self.credential.read().await {
+            AuthCredential::OAuthToken { access_token, .. } => Some(access_token.clone()),
+            AuthCredential::ApiKey(_) => None,
+        };
+        let refused = match sent_authorization.and_then(|value| value.strip_prefix("Bearer ")) {
+            Some(sent) if current.as_deref() != Some(sent) => return,
+            Some(sent) => Some(sent.to_string()),
+            None => current,
+        };
+        *crate::sync::lock(&self.rejected_access_token) = refused;
+    }
+
+    /// The row's credential, installed and returned, when the row has moved past `observed_version`
+    /// to a live token other than the one this refresh set out from; `None` leaves the refusal
+    /// to stand.
+    async fn adopt_a_row_moved_past(
+        &self,
+        store: &TokenStore,
+        observed_version: Option<&str>,
+        entry_access_token: &str,
+    ) -> Option<OAuthAccess> {
+        let latest = match store.load_account_credential_versioned(&self.account).await {
+            Ok(Some(latest)) => latest,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(
+                    "failed to re-read the {} credential after a refused refresh: {error}",
+                    self.backend
+                );
+                return None;
+            }
+        };
+        if observed_version == Some(latest.version.as_str()) {
+            return None;
+        }
+        let AuthCredential::OAuthToken {
+            access_token,
+            expires_at,
+            refresh_token,
+            account_id,
+        } = &latest.credential
+        else {
+            return None;
+        };
+        if access_token == entry_access_token
+            || oauth_needs_refresh(*expires_at, refresh_token.is_some(), now_epoch_millis())
+        {
+            return None;
+        }
+        tracing::info!(
+            "adopting the {} credential another process refreshed",
+            self.backend
+        );
+        let access = OAuthAccess {
+            access_token: access_token.clone(),
+            account_id: account_id.clone(),
+        };
+        *self.credential.write().await = latest.credential;
+        crate::sync::lock(&self.rejected_access_token).take();
+        Some(access)
+    }
+
+    fn not_oauth(&self) -> MekaError {
+        MekaError::Provider(format!(
+            "{} requires an OAuth token, not an API key",
+            self.backend
+        ))
+    }
+
+    /// The access token to send, refreshed first when it is due or was refused.
+    ///
+    /// A stalled refresh blocks only another refresh, and the bounded HTTP timeout ends even
+    /// that. `refresh` is the backend's exchange: given the refresh token and the account id the
+    /// credential already names, it mints the replacement.
+    pub(crate) async fn ensure_valid<F, Fut>(&self, refresh: F) -> Result<OAuthAccess>
+    where
+        F: FnOnce(String, Option<String>) -> Fut,
+        Fut: Future<Output = Result<AuthCredential>>,
+    {
+        // Compared, not consumed: the rejection stands until a refresh replaces the token it
+        // names, so a second request carrying the same refused bearer refreshes too instead of
+        // finding a flag the first one spent.
+        let refused = crate::sync::lock(&self.rejected_access_token).clone();
+        let (rejected, entry_access_token) = {
+            let credential = self.credential.read().await;
+            let AuthCredential::OAuthToken {
+                access_token,
+                expires_at,
+                refresh_token,
+                account_id,
+            } = &*credential
+            else {
+                return Err(self.not_oauth());
+            };
+            let rejected = refused.as_deref() == Some(access_token.as_str());
+            if !rejected
+                && !oauth_needs_refresh(*expires_at, refresh_token.is_some(), now_epoch_millis())
+            {
+                return Ok(OAuthAccess {
+                    access_token: access_token.clone(),
+                    account_id: account_id.clone(),
+                });
+            }
+            let entry_access_token = access_token.clone();
+            drop(credential);
+            (rejected, entry_access_token)
+        };
+
+        // Token expired or refused: attempt refresh. Only refreshers queue here; readers are
+        // untouched.
+        let _refreshing = self.refresh_gate.lock().await;
+
+        // And the same thing one layer out. `refresh_gate` is a `tokio::sync::Mutex`, so it
+        // serializes the tasks in *this* process and says nothing about the meka in the next
+        // terminal, which is holding the same refresh token and is just as due. Bounded, and
+        // advisory: the compare-and-swap on the write is what makes the outcome correct whether or
+        // not this is held.
+        let _across_processes = match &self.token_store {
+            Some(store) => await_credential_lock(store, &self.account).await,
+            None => None,
+        };
+
+        // Re-read the latest credential from the store. Refresh tokens rotate on each successful
+        // refresh, and a sibling meka process may have rotated this one since startup; without
+        // the re-read a stale refresh token is posted and the issuer rejects it with
+        // `invalid_grant`.
+        //
+        // The store call is awaited with no credential lock held, and the result installed under a
+        // write lock that spans an assignment and nothing else.
+        //
+        // Installed only when it is at least as new as what memory holds. The row is behind in one
+        // case, a refresh in this process whose persist failed: adopting it would spend a refresh
+        // token the issuer has already retired while the live one sits here. The row's version is
+        // kept either way: the refresh below replaces the row on it, so a stale row catches up.
+        let mut observed_version = None;
+        if let Some(store) = &self.token_store {
+            match store.load_account_credential_versioned(&self.account).await {
+                Ok(Some(latest)) => {
+                    let crate::store::StoredCredential {
+                        credential: latest,
+                        version,
+                    } = latest;
+                    observed_version = Some(version);
+                    let mut credential = self.credential.write().await;
+                    if row_is_at_least_as_new(&credential, &latest) {
+                        *credential = latest;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to re-read the {} credential before refresh: {error}",
+                        self.backend
+                    );
+                }
+            }
+        }
+
+        // Double-check after the DB re-read: another task or process may have already rotated and
+        // persisted a new access token that is still valid.
+        let derived_from = {
+            let credential = self.credential.read().await;
+            if let AuthCredential::OAuthToken {
+                access_token,
+                expires_at,
+                refresh_token,
+                account_id,
+            } = &*credential
+            {
+                // After a rejection the expiry is not trusted, but a token that is not the refused
+                // one is: a sibling process may already have rotated past it.
+                let usable = if rejected {
+                    *access_token != entry_access_token
+                } else {
+                    !oauth_needs_refresh(*expires_at, refresh_token.is_some(), now_epoch_millis())
+                };
+                if usable {
+                    return Ok(OAuthAccess {
+                        access_token: access_token.clone(),
+                        account_id: account_id.clone(),
+                    });
+                }
+            }
+            credential.clone()
+        };
+        let (refresh_token, prior_account_id) = match &derived_from {
+            AuthCredential::OAuthToken {
+                refresh_token,
+                account_id,
+                ..
+            } => (refresh_token.clone(), account_id.clone()),
+            AuthCredential::ApiKey(_) => (None, None),
+        };
+
+        // With nothing to refresh with, a rejected or expired token has one remedy, which every
+        // exit from the refresh path names.
+        let Some(refresh_token) = refresh_token else {
+            return Err(with_login_remedy(
+                MekaError::Provider(
+                    "OAuth access token expired and no refresh token available".to_string(),
+                ),
+                &self.account,
+            ));
+        };
+
+        let refreshed = match refresh(refresh_token, prior_account_id).await {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                // The issuer refused the grant. A sibling process may have spent it first and
+                // stored what it got: adopted when the row has moved past what this refresh was
+                // derived from, so one refresh token spent twice costs a round trip, not the
+                // login.
+                if let Some(store) = &self.token_store
+                    && let Some(access) = self
+                        .adopt_a_row_moved_past(
+                            store,
+                            observed_version.as_deref(),
+                            &entry_access_token,
+                        )
+                        .await
+                {
+                    return Ok(access);
+                }
+                return Err(error);
+            }
+        };
+
+        // A refresh rotates the refresh token, so the one in the database is now dead, but only
+        // if the database still holds the one this was derived from. Where it does not, what comes
+        // back is the newer credential to use instead of this one.
+        let new_credential = match &self.token_store {
+            Some(store) => {
+                store_refreshed_credential(
+                    store,
+                    &self.account,
+                    observed_version.as_deref(),
+                    refreshed,
+                )
+                .await
+            }
+            None => refreshed,
+        };
+
+        // Re-checked, because `new_credential` need not be the one this refresh minted: a swap the
+        // row has moved past hands back what the row holds instead, and the check at the top of
+        // this function saw the credential as it was on entry.
+        //
+        // Unreachable as things stand (`store_refreshed_credential` adopts only a credential of
+        // the same kind this refresh was derived from, and that is an `OAuthToken` on every path
+        // that reaches here), and kept for what it costs if that stops being true: an API key in
+        // a bearer header on an endpoint that does not take one, which is the shape refused at
+        // the top of this function.
+        let AuthCredential::OAuthToken {
+            access_token,
+            account_id,
+            ..
+        } = &new_credential
+        else {
+            return Err(self.not_oauth());
+        };
+        let access = OAuthAccess {
+            access_token: access_token.clone(),
+            account_id: account_id.clone(),
+        };
+
+        *self.credential.write().await = new_credential;
+        // The refused token is gone, whatever the issuer minted; a rejection of the replacement is
+        // recorded afresh by the request that meets it.
+        crate::sync::lock(&self.rejected_access_token).take();
+        Ok(access)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +868,95 @@ mod tests {
             started.elapsed()
         );
         peer.abort();
+    }
+
+    /// The refresher is told the bearer the refused request carried, read off the request as
+    /// built rather than off the credential, which a sibling request may have refreshed by the
+    /// time the refusal lands; and the retry goes out on what the refresher installed.
+    #[tokio::test]
+    async fn the_refresher_is_told_the_bearer_the_refused_request_carried() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct Recording {
+            seen: std::sync::Mutex<Vec<Option<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl RefreshesCredential for Recording {
+            async fn refresh_after_rejection(&self, sent_authorization: Option<&str>) -> bool {
+                crate::sync::lock(&self.seen).push(sent_authorization.map(str::to_string));
+                true
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        // The refusal closes its connection, so the retry opens another and is the second accept.
+        let peer = tokio::spawn(async move {
+            let mut bearers = Vec::new();
+            for status in ["401 Unauthorized", "200 OK"] {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !head.ends_with(b"\r\n\r\n") {
+                    let read = socket.read(&mut chunk).await.expect("the request arrives");
+                    assert!(read > 0, "the client closed the connection");
+                    head.extend_from_slice(&chunk[..read]);
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                bearers.push(
+                    head.lines()
+                        .find_map(|line| line.strip_prefix("authorization: "))
+                        .map(str::to_string),
+                );
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("answer");
+            }
+            bearers
+        });
+
+        let recording = Recording {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let client = reqwest::Client::new();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let response = send_with_one_refresh(
+            &recording,
+            crate::error::ProviderRequest::Completion,
+            |error| MekaError::Provider(error.to_string()),
+            || async {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(client.get(format!("http://{address}/v1/messages")).header(
+                    reqwest::header::AUTHORIZATION,
+                    format!("Bearer token-{attempt}"),
+                ))
+            },
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("the retry succeeds");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            crate::sync::lock(&recording.seen).clone(),
+            vec![Some("Bearer token-0".to_string())],
+            "the refresher is told the bearer the refused request carried"
+        );
+        assert_eq!(
+            peer.await.expect("the peer saw both requests"),
+            vec![
+                Some("Bearer token-0".to_string()),
+                Some("Bearer token-1".to_string())
+            ],
+            "the retry carries what the refresher installed"
+        );
     }
 
     /// A credential the backend refuses for good has its reply read here, and that read is raced

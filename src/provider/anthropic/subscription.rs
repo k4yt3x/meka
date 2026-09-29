@@ -8,8 +8,6 @@
 
 mod attestation;
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -31,7 +29,7 @@ use crate::{
         ExtraUsage, Provider, StreamEvent, ThinkingOverride, ToolDefinition, UsageHistory,
         UsageWindow,
     },
-    store::{AuthCredential, TokenStore},
+    store::AuthCredential,
 };
 
 /// Claude Code system prompt prefix.
@@ -50,7 +48,6 @@ const CC_IDENTITY_NOTE: &str = "The identity line above is what this API require
                                 it does not describe this session. The harness is meka, whose \
                                 system prompt follows.";
 
-/// The `claude-subscription` backend: one profile's model and the OAuth credential it bills.
 /// The window at which a profile asks for the 1M-context beta.
 const CONTEXT_1M_TOKENS: u64 = 1_000_000;
 
@@ -72,20 +69,16 @@ impl WireThinkingDisplay {
     }
 }
 
+/// The `claude-subscription` backend: one profile's model and the OAuth credential it bills.
 pub(crate) struct ClaudeSubscriptionProvider {
     client: reqwest::Client,
-    credential: tokio::sync::RwLock<AuthCredential>,
-    /// Serializes refreshes without blocking readers. Held across the database and network awaits
-    /// a refresh performs; `credential` is not.
-    refresh_gate: tokio::sync::Mutex<()>,
+    /// The token, its refresh gate, the refused slot and the row, in the one machine both
+    /// subscription backends run.
+    credential: crate::oauth::SubscriptionCredential,
     base_url: String,
     model: String,
     client_id: String,
     oauth_token_url: String,
-    token_store: Option<Arc<TokenStore>>,
-    /// Account name this provider's credential is stored under, so refreshed tokens are written
-    /// back to the correct `account_credentials` row.
-    credential_key: String,
     session_id: String,
     device_id: String,
     /// The subscriber's account UUID, sent as `metadata.user_id.account_uuid` (matching Claude
@@ -94,17 +87,6 @@ pub(crate) struct ClaudeSubscriptionProvider {
     account_uuid: String,
     thinking: ThinkingMode,
     thinking_budget_tokens: u64,
-    /// The access token a request site got a 401 for, read by every `ensure_valid_credential`
-    /// until a refresh installs a replacement.
-    ///
-    /// A rejection is the backend saying the stored expiry is wrong: the token was revoked, or
-    /// its issuer shortened lifetimes. The expiry alone would keep presenting the dead token until
-    /// it passed, which can be hours or, for an expiry meka had to assume, a full lifetime. The
-    /// token's identity rather than a flag, because a flag was spent by whichever read came first:
-    /// two requests refused in the same window left one of them re-sending the dead bearer and
-    /// failing with the login remedy while the other's refresh succeeded beside it. A second
-    /// rejection of the replacement is the account, not the token.
-    rejected_access_token: std::sync::Mutex<Option<String>>,
     /// The settled `output_config.effort` for the request body, resolved once at construction: the
     /// profile's value if it set one, otherwise [`DEFAULT_EFFORT`]. `None` only where the model
     /// takes no effort at all, and then the `effort-2025-11-24` beta is withheld too: both read
@@ -162,8 +144,12 @@ impl ClaudeSubscriptionProvider {
         };
         Ok(Self {
             client: crate::provider::build_http_client("claude-subscription", |builder| builder)?,
-            credential: tokio::sync::RwLock::new(credential),
-            refresh_gate: tokio::sync::Mutex::new(()),
+            credential: crate::oauth::SubscriptionCredential::new(
+                credential,
+                token_store,
+                credential_key,
+                "claude-subscription",
+            ),
             base_url: super::shared::normalize_claude_base_url(
                 base_url
                     .as_deref()
@@ -175,14 +161,11 @@ impl ClaudeSubscriptionProvider {
             oauth_token_url: oauth_token_url.unwrap_or_else(|| {
                 crate::provider::DEFAULT_CLAUDE_SUBSCRIPTION_TOKEN_URL.to_string()
             }),
-            token_store,
-            credential_key,
             session_id: Uuid::new_v4().to_string(),
             device_id,
             account_uuid,
             thinking,
             thinking_budget_tokens,
-            rejected_access_token: std::sync::Mutex::new(None),
             resolved_effort,
             thinking_display,
             context_window,
@@ -344,215 +327,39 @@ impl ClaudeSubscriptionProvider {
         }
     }
 
-    /// Resolve a valid Authorization header, refreshing the OAuth token if it's within 5 minutes of
-    /// expiry.
-    ///
-    /// Concurrency contract (relevant under multi-session ACP where two sessions may call this in
-    /// parallel): `refresh_gate` serializes refreshers, and `credential` is held only across the
-    /// reads and writes themselves, never across an await on the network or the database. Two tasks
-    /// that both observe an expiring token queue on the gate; the loser re-checks after acquiring
-    /// it and finds the winner's fresh token. Exactly one refresh API call fires under
-    /// contention and both callers return a valid token.
-    ///
-    /// The gate is what makes that true. With the `credential` write lock as the gate instead,
-    /// every *reader* queues behind the refresh too, so a provider endpoint that accepts the
-    /// connection and then goes silent wedges every session in the process, not just the one
-    /// refreshing. A stalled refresh blocks only another refresh, and the bounded HTTP timeout
-    /// ends even that.
+    /// The `Authorization` header to send, refreshed first when the token is due or was refused;
+    /// see [`crate::oauth::SubscriptionCredential::ensure_valid`].
     async fn ensure_valid_credential(&self) -> Result<(&'static str, String)> {
-        // Compared, not consumed: the rejection stands until a refresh replaces the token it
-        // names, so a second request carrying the same refused bearer refreshes too instead of
-        // finding a flag the first one spent.
-        let refused = crate::sync::lock(&self.rejected_access_token).clone();
-        let (rejected, entry_access_token) = {
-            let credential = self.credential.read().await;
-            match &*credential {
-                AuthCredential::ApiKey(_) => {
-                    return Err(MekaError::Provider(
-                        "claude-subscription requires an OAuth token, not an API key".to_string(),
-                    ));
-                }
-                AuthCredential::OAuthToken {
-                    access_token,
-                    expires_at,
-                    refresh_token,
-                    ..
-                } => {
-                    let rejected = refused.as_deref() == Some(access_token.as_str());
-                    if !rejected
-                        && !crate::oauth::oauth_needs_refresh(
-                            *expires_at,
-                            refresh_token.is_some(),
-                            crate::oauth::now_epoch_millis(),
-                        )
-                    {
-                        return Ok(("Authorization", crate::text::bearer(access_token)));
-                    }
-                    (rejected, access_token.clone())
-                }
-            }
-        };
-
-        // Token expired: attempt refresh. Only refreshers queue here; readers are untouched.
-        let _refreshing = self.refresh_gate.lock().await;
-
-        // And the same thing one layer out. `refresh_gate` is a `tokio::sync::Mutex`, so it
-        // serializes the tasks in *this* process and says nothing about the meka in the next
-        // terminal, which is holding the same refresh token and is just as due. Bounded, and
-        // advisory: the compare-and-swap on the write is what makes the outcome correct whether or
-        // not this is held.
-        let _across_processes = match &self.token_store {
-            Some(store) => crate::oauth::await_credential_lock(store, &self.credential_key).await,
-            None => None,
-        };
-
-        // Re-read the latest credential from the store. Refresh tokens rotate on each successful
-        // refresh, and a sibling meka process may have rotated this one since startup; without
-        // the re-read a stale refresh token is posted and the issuer rejects it with
-        // `invalid_grant`.
-        //
-        // The store call is awaited with no credential lock held, and the result installed under a
-        // write lock that spans an assignment and nothing else.
-        //
-        // Installed only when it is at least as new as what memory holds. The row is behind in one
-        // case, a refresh in this process whose persist failed: adopting it would spend a refresh
-        // token the issuer has already retired while the live one sits here. The row's version is
-        // kept either way: the refresh below replaces the row on it, so a stale row catches up.
-        let mut observed_version = None;
-        if let Some(store) = &self.token_store {
-            match store
-                .load_account_credential_versioned(&self.credential_key)
-                .await
-            {
-                Ok(Some(latest)) => {
-                    let crate::store::StoredCredential {
-                        credential: latest,
-                        version,
-                    } = latest;
-                    observed_version = Some(version);
-                    let mut credential = self.credential.write().await;
-                    if crate::oauth::row_is_at_least_as_new(&credential, &latest) {
-                        *credential = latest;
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!("failed to re-read Claude OAuth token before refresh: {error}");
-                }
-            }
-        }
-
-        // Double-check after the DB re-read: another task or process may have already rotated and
-        // persisted a new access token that is still valid.
-        let derived_from = {
-            let credential = self.credential.read().await;
-            if let AuthCredential::OAuthToken {
-                access_token,
-                expires_at,
-                refresh_token,
-                ..
-            } = &*credential
-            {
-                // After a rejection the expiry is not trusted, but a token that is not the refused
-                // one is: a sibling process may already have rotated past it.
-                let usable = if rejected {
-                    *access_token != entry_access_token
-                } else {
-                    !crate::oauth::oauth_needs_refresh(
-                        *expires_at,
-                        refresh_token.is_some(),
-                        crate::oauth::now_epoch_millis(),
-                    )
-                };
-                if usable {
-                    return Ok(("Authorization", crate::text::bearer(access_token)));
-                }
-            }
-            credential.clone()
-        };
-        let (refresh_token, prior_account_id) = match &derived_from {
-            AuthCredential::OAuthToken {
-                refresh_token,
-                account_id,
-                ..
-            } => (refresh_token.clone(), account_id.clone()),
-            AuthCredential::ApiKey(_) => (None, None),
-        };
-
-        // With nothing to refresh with, a rejected or expired token has one remedy, which every
-        // exit from the refresh path names.
-        let Some(refresh_token) = refresh_token else {
-            return Err(crate::oauth::with_login_remedy(
-                MekaError::Provider(
-                    "OAuth access token expired and no refresh token available".to_string(),
-                ),
-                &self.credential_key,
-            ));
-        };
-
-        let refreshed = self
-            .refresh_oauth_token(&refresh_token, prior_account_id)
+        let access = self
+            .credential
+            .ensure_valid(|refresh_token, prior_account_id| async move {
+                self.refresh_oauth_token(&refresh_token, prior_account_id)
+                    .await
+            })
             .await?;
-
-        // A refresh rotates the refresh token, so the one in the database is now dead, but only
-        // if the database still holds the one this was derived from. Where it does not, what comes
-        // back is the newer credential to use instead of this one.
-        let new_credential = match &self.token_store {
-            Some(store) => {
-                crate::oauth::store_refreshed_credential(
-                    store,
-                    &self.credential_key,
-                    observed_version.as_deref(),
-                    refreshed,
-                )
-                .await
-            }
-            None => refreshed,
-        };
-
-        // Re-checked, because `new_credential` need not be the one this refresh minted: a swap the
-        // row has moved past hands back what the row holds instead, and the check at the top of
-        // this function saw the credential as it was on entry.
-        //
-        // Unreachable as things stand (`store_refreshed_credential` adopts only a credential of
-        // the same kind this refresh was derived from, and that is an `OAuthToken` on every path
-        // that reaches here), and kept for what it costs if that stops being true: `auth_header`
-        // would otherwise put an API key in an `x-api-key` header on a subscription endpoint that
-        // does not take one, which is the shape this backend refuses outright a hundred lines
-        // above. The Codex provider has the same guard.
-        let AuthCredential::OAuthToken { .. } = &new_credential else {
-            return Err(MekaError::Provider(
-                "claude-subscription requires an OAuth token, not an API key".to_string(),
-            ));
-        };
-
-        let (header_name, header_value) = new_credential.auth_header();
-        *self.credential.write().await = new_credential;
-        // The refused token is gone, whatever the issuer minted; a rejection of the replacement is
-        // recorded afresh by the request that meets it.
-        crate::sync::lock(&self.rejected_access_token).take();
-        Ok((header_name, header_value))
+        Ok(("Authorization", crate::text::bearer(&access.access_token)))
     }
 
-    /// Record that the backend refused the current access token, so every credential read until
-    /// it is replaced refreshes it instead of trusting the stored expiry.
-    async fn note_credential_rejected(&self) {
+    /// Record that the backend refused the bearer a request carried, so every credential read
+    /// until it is replaced refreshes it instead of trusting the stored expiry.
+    async fn note_credential_rejected(&self, sent_authorization: Option<&str>) {
         tracing::warn!(
             "claude-subscription rejected the access token; refreshing it and retrying once"
         );
-        let refused = match &*self.credential.read().await {
-            AuthCredential::OAuthToken { access_token, .. } => Some(access_token.clone()),
-            AuthCredential::ApiKey(_) => None,
-        };
-        *crate::sync::lock(&self.rejected_access_token) = refused;
+        self.credential.note_rejected(sent_authorization).await;
     }
 
     /// GET one of the OAuth account endpoints (usage, profile, history) as text.
     ///
     /// The three share everything but the path and the word in their error messages, and each
-    /// needs the same one retry after a 401 that a completion gets. `what` names the call in the
-    /// transport and read errors, which is how a user tells a usage probe from a profile read.
+    /// needs the same one retry after a 401 that a completion gets. `what` names the call in a
+    /// transport error and in a refused status, which is how a user tells a usage probe from a
+    /// profile read.
     async fn fetch_oauth_endpoint(&self, path: &str, what: &str) -> Result<String> {
+        // A token with no signal source: these calls answer a command, not a turn, and the
+        // process that asked ends with the command. Held for the whole reply so the body is read
+        // through the same door as every other.
+        let cancellation = tokio_util::sync::CancellationToken::new();
         let response = crate::oauth::send_with_one_refresh(
             self,
             crate::error::ProviderRequest::Auxiliary,
@@ -574,27 +381,18 @@ impl ClaudeSubscriptionProvider {
                     None,
                 ))
             },
-            &tokio_util::sync::CancellationToken::new(),
+            &cancellation,
         )
         .await?;
-        let status = response.status();
         let retry_after = crate::error::parse_retry_after(response.headers());
-        let text = response.text().await.map_err(|error| {
-            crate::error::provider_transport_error(
-                &format!("failed to read {what} response"),
-                &error,
-                retry_after,
-            )
-        })?;
-        if !status.is_success() {
-            return Err(crate::error::provider_http_error(
-                status,
-                &text,
-                retry_after,
-                crate::error::ProviderRequest::Auxiliary,
-            ));
-        }
-        Ok(text)
+        let response = crate::provider::succeeded(
+            response,
+            what,
+            crate::error::ProviderRequest::Auxiliary,
+            &cancellation,
+        )
+        .await?;
+        crate::error::read_whole_reply(response, retry_after, &cancellation).await
     }
 
     async fn refresh_oauth_token(
@@ -626,7 +424,7 @@ impl ClaudeSubscriptionProvider {
                 token_url: &self.oauth_token_url,
                 client_id: &self.client_id,
                 refresh_token,
-                account: &self.credential_key,
+                account: self.credential.account(),
                 context: "OAuth token refresh",
             })
             .await?;
@@ -815,14 +613,14 @@ impl ClaudeSubscriptionProvider {
 #[async_trait]
 impl crate::oauth::RefreshesCredential for ClaudeSubscriptionProvider {
     /// Sent once more after a 401, on a credential refreshed for the purpose; see
-    /// `rejected_access_token`. A second refusal gets the login remedy instead.
-    async fn refresh_after_rejection(&self) -> bool {
-        self.note_credential_rejected().await;
+    /// [`crate::oauth::SubscriptionCredential`]. A second refusal gets the login remedy instead.
+    async fn refresh_after_rejection(&self, sent_authorization: Option<&str>) -> bool {
+        self.note_credential_rejected(sent_authorization).await;
         true
     }
 
     fn with_login_remedy(&self, error: MekaError) -> MekaError {
-        crate::oauth::with_login_remedy(error, &self.credential_key)
+        crate::oauth::with_login_remedy(error, self.credential.account())
     }
 }
 
@@ -1159,6 +957,8 @@ impl OAuthProfileResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{attestation::CC_VERSION, shared::parse_non_streaming_response, *};
     use crate::{
         conversation::{ContentBlock, Role, ToolResultContent},

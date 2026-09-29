@@ -80,6 +80,14 @@ pub(crate) fn session_not_found(id: Uuid) -> ProblemDetail {
 
 /// Assert a session exists, without building anything.
 ///
+/// **Only a door that will run a turn may revive a dormant session**: `POST /turn`, `POST
+/// /compact`, `POST /rewind` on a resident session, and the inbox enqueue, whose driver runs one.
+/// Every other handler answers from the store through this function, a reader (`GET /messages`,
+/// exports, tasks, jobs) and a writer that edits rows alone (a title, a cancel, a response to a
+/// prompt) alike. Reviving costs the session's cross-process file lock for up to the idle
+/// timeout, and a handler that revived on the way to a 404 would hold a session hostage to
+/// answer a question about it.
+///
 /// The counterpart to [`ensure_session_loaded`] for read-only handlers. Reconstruction builds an
 /// `Agent`, a `ToolRegistry` and an MCP-attached registry, then pins the result in the session map
 /// until the GC scanner evicts it again; a handler that only reads rows out of SQLite (messages,
@@ -432,7 +440,7 @@ pub(crate) async fn ensure_session_loaded_holding(
     };
     new_entry.frontend.install_feed(
         id,
-        crate::host::http::http_frontend::FEED_BROADCAST_CAPACITY,
+        crate::host::http::feed::FEED_BROADCAST_CAPACITY,
         state.config.stream_replay_events,
         Some(state.webhooks.clone()),
     );

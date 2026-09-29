@@ -110,20 +110,28 @@ fn run_headers_helper(
         message,
     };
 
-    // A relative script that does not exist as-is is looked for beside `config.toml`.
+    // Absolute, or relative to the directory `config.toml` is in: never to the process's working
+    // directory, which would run a different helper per launch directory for one config, and
+    // never a bare name searched on `PATH`, which would run whatever the path holds under that
+    // name.
     let script_path = std::path::Path::new(script);
-    let resolved: std::path::PathBuf = if script_path.is_absolute() || script_path.exists() {
+    let resolved: std::path::PathBuf = if script_path.is_absolute() {
         script_path.to_path_buf()
-    } else if let Some(config_dir) = crate::paths::meka_config_dir() {
-        let candidate = config_dir.join(script);
-        if candidate.exists() {
-            candidate
-        } else {
-            script_path.to_path_buf()
-        }
     } else {
-        script_path.to_path_buf()
+        let Some(config_dir) = crate::paths::meka_config_dir() else {
+            return Err(connection_error(format!(
+                "`headers_helper` '{script}' is relative and no config directory resolves to \
+                 place it beside"
+            )));
+        };
+        config_dir.join(script)
     };
+    if !resolved.is_file() {
+        return Err(connection_error(format!(
+            "`headers_helper` '{script}' is not a file at {}",
+            resolved.display()
+        )));
+    }
 
     let mut command = std::process::Command::new(&resolved);
     command
@@ -320,6 +328,40 @@ mod tests {
             map.get("Location").map(String::as_str),
             Some("https://example.com/x")
         );
+    }
+
+    /// `headers_helper` is found beside `config.toml` or where an absolute path says, and a bare
+    /// name is not searched on `PATH`: a helper that runs whatever the launch directory or the
+    /// path holds under that name is a persistence primitive.
+    #[cfg(unix)]
+    #[test]
+    fn the_headers_helper_is_found_beside_the_config_and_nowhere_else() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("helper.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'X-Test: found\\n'\n").expect("write");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        // SAFETY: guarded above.
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let beside = run_headers_helper("s", "http://example.test", "helper.sh");
+        let absolute = run_headers_helper("s", "http://example.test", &script.to_string_lossy());
+        let bare = run_headers_helper("s", "http://example.test", "sh");
+        // SAFETY: guarded above.
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        for (how, headers) in [("beside the config", beside), ("absolute", absolute)] {
+            assert_eq!(
+                headers.expect(how).get("X-Test").map(String::as_str),
+                Some("found"),
+                "{how}"
+            );
+        }
+        let error = bare
+            .expect_err("a bare name is not searched on PATH")
+            .to_string();
+        assert!(error.contains("is not a file"), "{error}");
     }
 
     #[test]

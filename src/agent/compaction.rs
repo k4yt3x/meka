@@ -352,7 +352,7 @@ fn retained_section(entries: &[String]) -> String {
 /// opens a tool round, since its result is the next message and follows it into the tail.
 fn opens_a_boundary(message: &Message) -> bool {
     match message.role {
-        Role::User => !has_tool_results(&message.content),
+        Role::User => message.opens_turn(),
         Role::Assistant => message
             .content
             .iter()
@@ -366,9 +366,7 @@ fn opens_a_boundary(message: &Message) -> bool {
 /// it, and keeping it alone would orphan the pair the snap-back exists to protect.
 fn summarize_all_but_a_trailing_prompt(view: &[Message]) -> (Vec<Message>, Vec<Message>) {
     match view.split_last() {
-        Some((last, head))
-            if !head.is_empty() && last.role == Role::User && !has_tool_results(&last.content) =>
-        {
+        Some((last, head)) if !head.is_empty() && last.opens_turn() => {
             (head.to_vec(), vec![last.clone()])
         }
         _ => (view.to_vec(), Vec::new()),
@@ -454,7 +452,6 @@ impl Agent {
                 match self
                     .run_checkpoint_turn(
                         &request,
-                        Some(session_id),
                         messages.as_slice(),
                         cancellation.clone(),
                         &mut memories_written,
@@ -502,7 +499,7 @@ impl Agent {
             || messages
                 .as_slice()
                 .last()
-                .is_some_and(|last| last.role == Role::User && !has_tool_results(&last.content));
+                .is_some_and(|last| last.opens_turn());
 
         // Split into a head to summarize and a recent tail to keep verbatim, and copy the
         // messages received from the head alone: the tail is carried as it is, so a message there
@@ -680,38 +677,18 @@ impl Agent {
         // in-memory log doesn't grow unbounded across repeated compactions.
         messages.prune_compacted_events();
 
-        // Compaction rewrites the conversation, so a length recorded against the old one no longer
-        // identifies any particular message. Cleared here rather than at the call sites so
-        // `/compact` and both auto-compact paths are covered by construction.
-        self.last_accepted_len
-            .store(LAST_ACCEPTED_UNKNOWN, std::sync::atomic::Ordering::Relaxed);
-
-        // The model's view of which files it has read is reset by the summary; drop the
-        // read-tracker so `file_edit` re-reads rather than trusting a pre-compaction read (also
-        // bounds its growth).
-        //
-        // Since `context_compact` began draining mid-turn this also forgets reads the *current*
-        // turn made, so a `file_edit` after a compaction it asked for is refused until the file is
-        // read again. Kept deliberately: whether the read survived depends on where the kept tail
-        // was cut, and re-reading costs a call where trusting a read that fell out of the window
-        // costs a blind edit.
-        self.tool_registry.clear_read_tracker().await;
+        // The conversation was rewritten under the agent: every marker indexed by its old shape
+        // goes, here rather than at the call sites so `/compact` and both auto-compact paths are
+        // covered by construction. Since `context_compact` began draining mid-turn this also
+        // forgets reads the *current* turn made, so a `file_edit` after a compaction it asked for
+        // is refused until the file is read again. Kept deliberately: whether the read survived
+        // depends on where the kept tail was cut, and re-reading costs a call where trusting a
+        // read that fell out of the window costs a blind edit.
+        self.reset_conversation_markers(messages.as_slice()).await;
 
         // Publish only after persistence, so a failed compaction cannot suppress a later update
         // about facts it never delivered. The continuing loop already has the full picture.
         *self.last_rendered_world.write().await = Some(world);
-
-        // And the same for the schema advisories. Each one records "the model has already been
-        // shown how this tool's arguments go wrong", which was true of a conversation the summary
-        // has just replaced. Left standing, a model that repeats the mistake after a boundary gets
-        // no hint for the rest of the session.
-        crate::sync::lock(&self.schema_advisories_sent).clear();
-
-        // Seed the live context gauge with an estimate of the compacted working set so `/status`
-        // (and the prompt indicator) immediately reflect the smaller size; the next real turn
-        // overwrites it with the exact provider-reported total.
-        self.record_context_tokens(self.cells.estimate_context_tokens(messages.as_slice()))
-            .await;
 
         report_checkpoint_memories(&memories_written);
 
@@ -812,7 +789,6 @@ impl Agent {
     pub(super) async fn run_checkpoint_turn(
         &self,
         request: &CompactRequest,
-        session_id: Option<Uuid>,
         messages: &[Message],
         cancellation: CancellationToken,
         // Accumulated in the caller's buffer rather than returned, so a checkpoint that writes a
@@ -870,6 +846,7 @@ impl Agent {
                 return Ok(None);
             }
             let completed = match complete_with_retry(
+                "the checkpoint's provider call",
                 &self.provider(),
                 CompletionRequest::new(&system_prompt, &checkpoint_messages, &definitions)
                     .attributed(attribution.clone()),
@@ -927,84 +904,32 @@ impl Agent {
                     // are actions: `memory_write` overwrites an existing note in place, durably and
                     // instance-wide. Dispatching straight to `run_tool` would make the checkpoint
                     // the one place that silently ignores the level, and invisibly, since the loop
-                    // emits no tool-call indicators either. The door is `admit_tool_call`, the one
-                    // dispatch uses, so the approvals switch is honored here too. `context_replace`
-                    // is exempt, for the same reason it bypasses the permission filter in
-                    // `checkpoint_tools`: it performs no action, it hands the summary back to the
-                    // caller. Prompting for it would ask the user to approve the checkpoint's own
-                    // conclusion, and a denial would silently discard the summary and drop the
-                    // whole compaction to the fallback summarizer.
+                    // emits no tool-call indicators either. The doors are dispatch's own, through
+                    // `run_admitted_call`, so the approvals switch is honored here too; the level
+                    // is read there, at each call, since the checkpoint is up to eight round trips
+                    // long and a user who cycles the permission during it means the next call.
+                    // `context_replace` comes through its own door, for the reason it bypasses the
+                    // permission filter in `checkpoint_tools`.
                     Some(tool) => {
-                        let schema = tool.definition().parameters;
-                        // A checkpoint tool runs inline whatever the model asked; the detach flag
-                        // is stripped like everywhere else and not honored. Read here, at the
-                        // enforcement site, like `resolve_and_execute_tool` does: the checkpoint is
-                        // up to eight round trips long, and a user who cycles the permission during
-                        // it means the next call, not the last one. The set offered above was
-                        // filtered at the level the checkpoint began with; this is what stops a
-                        // call that set admitted from running after the level dropped.
-                        let required = self
-                            .tool_registry
-                            .required_permission_for(&name)
-                            .unwrap_or_else(|| tool.required_permission());
-                        let permission = self.cells.permission.get();
-                        let admission = if name == "context_replace" {
-                            crate::tools::Admission::Run
+                        let door = if name == "context_replace" {
+                            super::dispatch::CallDoor::CheckpointSubmission
                         } else {
-                            crate::tools::admit_tool_call(
-                                &name,
-                                required,
-                                permission,
-                                self.cells.permission.approvals(),
-                                tool.runs_outside_confinement(),
-                            )
+                            super::dispatch::CallDoor::Checkpoint
                         };
-                        match (
-                            crate::tools::admit_arguments(&name, &input, &schema),
-                            admission,
-                        ) {
-                            (Err(refusal), _) => refusal,
-                            (Ok(_), crate::tools::Admission::Refuse(refusal)) => *refusal,
-                            (Ok((input, _detach)), admission) => {
-                                let asked = matches!(admission, crate::tools::Admission::Ask);
-                                // As dispatch does: a refusal the level already decides is
-                                // returned instead of asked about, since approval could not
-                                // lift it.
-                                let settled = if asked {
-                                    match tool.refusal_at_level(permission, &input).await {
-                                        Some(refusal) => Some(refusal),
-                                        None => {
-                                            self.request_approval(
-                                                &name,
-                                                &input,
-                                                false,
-                                                &schema,
-                                                &cancellation,
-                                            )
-                                            .await
-                                        }
-                                    }
-                                } else {
-                                    None
-                                };
-                                if let Some(settled) = settled {
-                                    settled
-                                } else {
-                                    Self::run_tool(
-                                        tool.as_ref(),
-                                        &input,
-                                        crate::tools::ToolContext {
-                                            session_id,
-                                            tool_call_id: Some(tool_use_id.clone()),
-                                            prompt_id: attribution.prompt_id,
-                                            frontend: Arc::clone(&self.cells.frontend),
-                                            cancellation: cancellation.clone(),
-                                        },
-                                    )
-                                    .await
-                                }
-                            }
-                        }
+                        // No deferred tool is offered here, so nothing is loaded or blind.
+                        self.run_admitted_call(
+                            tool,
+                            super::dispatch::ResolvedCall {
+                                tool_call_id: &tool_use_id,
+                                name: &name,
+                                input: &input,
+                            },
+                            &[],
+                            &attribution,
+                            cancellation.clone(),
+                            door,
+                        )
+                        .await
                     }
                     // Names the constraint rather than reporting the tool as missing, which would
                     // read as "meka has no such tool" and invite the model to look for a synonym.
@@ -1107,6 +1032,7 @@ impl Agent {
             notices,
             ..
         } = complete_with_retry(
+            "the summarizer's provider call",
             &self.provider(),
             CompletionRequest::new(&system_prompt, &compact_messages, &[])
                 .attributed(self.compaction_attribution(request))
@@ -1247,6 +1173,7 @@ mod tests {
         let provider: Arc<dyn Provider> = mock.clone();
 
         let error = complete_with_retry(
+            "a test call",
             &provider,
             CompletionRequest::new("system", &[], &[]),
             &CancellationToken::new(),
@@ -1306,6 +1233,7 @@ mod tests {
         });
         let started = std::time::Instant::now();
         let error = complete_with_retry(
+            "a test call",
             &provider,
             CompletionRequest::new("system", &[], &[]),
             &cancellation,
@@ -1374,8 +1302,10 @@ mod tests {
         assert!(head.len() >= 4);
         assert!(!tail.is_empty() && tail.len() < messages.len());
         // The kept window starts on a clean user boundary.
-        assert_eq!(tail[0].role, Role::User);
-        assert!(!has_tool_results(&tail[0].content));
+        assert!(
+            tail[0].opens_turn(),
+            "the tail opens on a turn, never on a result envelope"
+        );
     }
 
     #[test]
@@ -1395,10 +1325,13 @@ mod tests {
         let (head, tail) = compute_compaction_split(&messages, 20);
         assert_eq!(head.len() + tail.len(), messages.len());
         assert!(opens_a_boundary(&tail[0]), "{:?}", tail[0]);
-        assert!(!has_tool_results(&tail[0].content));
+        assert!(
+            tail[0].role == Role::Assistant || tail[0].opens_turn(),
+            "the tail opens on a call or on a turn, never on a result envelope"
+        );
         if tail[0].role == Role::Assistant {
             assert!(
-                has_tool_results(&tail[1].content),
+                tail[1].role == Role::User && !tail[1].opens_turn(),
                 "a tail opened by a call carries the call's result next"
             );
         }
@@ -1428,7 +1361,7 @@ mod tests {
         let (head, tail) = compute_compaction_split(&messages, budget);
         assert_eq!(tail.len(), 4, "two rounds, each a call and its result");
         assert_eq!(tail[0].role, Role::Assistant);
-        assert!(has_tool_results(&tail[1].content));
+        assert!(tail[1].role == Role::User && !tail[1].opens_turn());
         assert_eq!(head.len(), messages.len() - 4);
         assert!(
             head.iter()

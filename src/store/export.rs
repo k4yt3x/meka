@@ -222,6 +222,17 @@ pub(crate) async fn build_session_export(
         blobs,
     })
 }
+/// The refusal for an archive stamp that is not RFC 3339, the one shape every row's stamp has.
+fn require_rfc3339(session: &str, what: &str, stamp: &str) -> crate::error::Result<()> {
+    chrono::DateTime::parse_from_rfc3339(stamp)
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::MekaError::Usage(format!(
+                "session '{session}' carries a `{what}` that is not RFC 3339 ('{stamp}'): {error}"
+            ))
+        })
+}
+
 /// Turn a deserialized [`SessionExport`] into the parents-first
 /// [`crate::store::ImportSessionRecord`] list to persist, plus the freshly-minted root session
 /// ID. Validates the format version, mints a new ID per session, and remaps parent links (a parent
@@ -253,6 +264,23 @@ pub(crate) fn plan_import(
                 "session export contains duplicate id '{}'",
                 session.id
             )));
+        }
+    }
+
+    // A stamp meka did not write is refused ahead of any row: every listing reads them back, and
+    // a column cut from one has to be cut from a shape it knows.
+    for session in &export.sessions {
+        for (what, stamp) in [
+            ("created_at", Some(&session.created_at)),
+            ("updated_at", Some(&session.updated_at)),
+            ("pinned_at", session.pinned_at.as_ref()),
+        ] {
+            if let Some(stamp) = stamp {
+                require_rfc3339(&session.id, what, stamp)?;
+            }
+        }
+        for event in &session.events {
+            require_rfc3339(&session.id, "an event's `at`", &event.at)?;
         }
     }
 
@@ -563,6 +591,28 @@ mod tests {
         );
     }
 
+    /// A stamp that is not RFC 3339 is refused ahead of any row: meka's own are, every listing
+    /// reads them back, and `scratchpad_list` cuts one for its column.
+    #[test]
+    fn an_archive_stamp_that_is_not_rfc_3339_is_refused() {
+        let profiles = configured(&["work"]);
+        let mut archive = archive_on("work");
+        archive.sessions[0].created_at = "yesterday".to_string();
+        let message = refusal(plan_import(
+            archive,
+            ImportProfiles {
+                selected: None,
+                default: Some("work"),
+                configured: Some(&profiles),
+            },
+            Some(crate::permission::Permission::Read),
+        ));
+        assert!(
+            message.contains("RFC 3339") && message.contains("created_at"),
+            "{message}"
+        );
+    }
+
     /// `--profile` is the explicit act that moves a session: every imported session takes it,
     /// whatever the archive recorded, and a flag naming nothing moves nothing.
     /// An archive's title goes through the acceptor every door uses: collapsed like a typed one,
@@ -651,5 +701,30 @@ mod tests {
             None,
         ));
         assert!(message.contains("--profile"), "{message}");
+    }
+
+    #[test]
+    fn parents_first_order_orders_parents_before_children() {
+        // Given out of order (child, root, middle), each node must land after its parent.
+        let nodes = vec![
+            ("c".to_string(), Some("b".to_string())),
+            ("a".to_string(), None),
+            ("b".to_string(), Some("a".to_string())),
+        ];
+        let order = crate::store::export::parents_first_order(&nodes).expect("order");
+        let position = |id: &str| order.iter().position(|&i| nodes[i].0 == id).unwrap();
+        assert!(position("a") < position("b"));
+        assert!(position("b") < position("c"));
+    }
+
+    #[test]
+    fn parents_first_order_treats_external_parent_as_root() {
+        // A parent absent from the set (e.g. the exported root was itself a sub-agent) is not an
+        // error; the node is ordered as a root.
+        let nodes = vec![("only".to_string(), Some("outside".to_string()))];
+        assert_eq!(
+            crate::store::export::parents_first_order(&nodes).expect("order"),
+            vec![0]
+        );
     }
 }

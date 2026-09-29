@@ -10,6 +10,7 @@
 pub(crate) mod auth;
 pub(crate) mod config;
 pub(crate) mod errors;
+pub(crate) mod feed;
 pub(crate) mod gc;
 pub(crate) mod handlers;
 pub(crate) mod http_frontend;
@@ -128,9 +129,9 @@ pub(crate) async fn run_serve(
         .into_future();
     let serve_handle = tokio::spawn(serve_future);
 
-    shutdown_signal().await;
+    crate::host::wait_for_shutdown_signal().await;
     state.shutdown.cancel();
-    drain_active_sessions(&state).await;
+    state.sessions.cancel_every_turn().await;
     if drain_tx.send(()).is_err() {
         tracing::trace!("the accept loop had already stopped");
     }
@@ -141,7 +142,15 @@ pub(crate) async fn run_serve(
     // request to wait for and returns while the work is still going; `handlers::turn` documents
     // what a turn dropped mid-flight costs.
     let drain_result = tokio::time::timeout(shutdown_drain_timeout, async {
-        let (join_result, ()) = tokio::join!(serve_handle, wait_for_turns_to_unwind(&state));
+        // The process-wide count reaches a turn whose session has since been evicted from the
+        // map; the per-session counts reach what claims a session, a compaction or a rewind.
+        let turns_unwound = state.sessions.wait_for_turns_to_unwind(|| {
+            state
+                .concurrent_turns
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0
+        });
+        let (join_result, ()) = tokio::join!(serve_handle, turns_unwound);
         join_result
     })
     .await;
@@ -181,50 +190,6 @@ pub(crate) async fn run_serve(
         }
     }
     Ok(())
-}
-
-/// Fire every session's cancellation token during a graceful drain.
-///
-/// The only thing that stops an in-flight turn on shutdown. The streaming handler does not watch
-/// `state.shutdown` in its own `select!`, which would be redundant with this. The turn task still
-/// reads the shutdown token, but only to label its terminal event `server_shutdown` rather than
-/// `client`.
-async fn drain_active_sessions(state: &ServerState) {
-    let sessions = state.sessions.read().await;
-    for entry in sessions.values() {
-        entry.cancel.cancel();
-    }
-}
-
-/// Resolve once every turn this process is running has finished unwinding.
-///
-/// Canceling a turn is not the same as waiting for one: the token stops the agent at its next
-/// check, and what follows is the commit of the partial assistant message, the tool result the
-/// round already produced, and the frontend teardown. That tail is what a drain exists to protect,
-/// and it is measured in database round-trips, not instants.
-///
-/// Both counters are consulted because neither covers everything. The process-wide one counts
-/// every turn, a client's or an autonomous one, including one whose session has since been
-/// evicted from the map. The per-session one counts what claims the session alone, a compaction
-/// or a rewind, which run on tasks the caller aborts as soon as this returns, so leaving them out
-/// would abandon precisely the unattended work nobody is watching.
-async fn wait_for_turns_to_unwind(state: &ServerState) {
-    loop {
-        let idle = state
-            .concurrent_turns
-            .load(std::sync::atomic::Ordering::Acquire)
-            == 0
-            && {
-                let sessions = state.sessions.read().await;
-                sessions
-                    .values()
-                    .all(|entry| entry.in_flight.load(std::sync::atomic::Ordering::Acquire) == 0)
-            };
-        if idle {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
 }
 
 fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -> Router {
@@ -550,36 +515,4 @@ async fn inject_problem_instance(
         }
     };
     axum::response::Response::from_parts(parts, rewritten)
-}
-
-/// Wait for SIGTERM / SIGINT, then return so `axum::serve(...).with_graceful_shutdown(...)`
-/// can begin draining. On Windows, only Ctrl+C is observed.
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut term =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(stream) => stream,
-                Err(error) => {
-                    tracing::warn!(
-                        "failed to install SIGTERM handler: {error}; relying on Ctrl+C only"
-                    );
-                    if let Err(error) = tokio::signal::ctrl_c().await {
-                        tracing::warn!("failed to listen for Ctrl+C: {error}");
-                    }
-                    return;
-                }
-            };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received, draining"),
-            _ = term.recv() => tracing::info!("SIGTERM received, draining"),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::warn!("failed to listen for Ctrl+C: {error}");
-        }
-        tracing::info!("Ctrl+C received, draining");
-    }
 }

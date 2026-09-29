@@ -14,9 +14,13 @@ use crate::{
     permission::{EnabledPermissions, Permission},
 };
 
+/// The `[mcp]` section: servers, transports and auth as `config.toml` states them.
+mod mcp;
 /// Accounts and profiles: the `backend` vocabulary, an account and a profile as written and a
 /// profile as resolved through its account, and which profile a run selects.
 mod profile;
+/// The `[serve]` section: the HTTP server's bind address, tokens, webhooks and limits.
+mod serve;
 
 #[cfg(test)]
 pub(crate) use profile::PROFILE_KEY_ORDER;
@@ -25,6 +29,8 @@ pub(crate) use profile::{
     default_profile_on_disk, require_model, require_profile, resolve_device_id, resolve_profile,
     select_profile, sort_account_keys, sort_profile_keys, validate_max_output_tokens,
 };
+
+pub(crate) use self::{mcp::*, serve::*};
 
 /// In-memory shape of `config.toml`. Each top-level `[section]` deserializes into its own
 /// sub-struct; missing sections fall back to `Default`. This is the raw deserialized form;
@@ -895,6 +901,7 @@ impl Backend {
             "client_id" | "oauth_token_url" => {
                 matches!(self, Self::ClaudeSubscription | Self::ChatGptSubscription)
             }
+            "interleaved_thinking" => matches!(self, Self::AnthropicMessages),
             _ => true,
         }
     }
@@ -919,6 +926,10 @@ fn warn_about_inert_profile_keys(
         let set = [
             ("client_id", account.client_id.is_some()),
             ("oauth_token_url", account.oauth_token_url.is_some()),
+            (
+                "interleaved_thinking",
+                account.interleaved_thinking.is_some(),
+            ),
         ];
         for (key, is_set) in set {
             if is_set && !backend.reads_account_key(key) {
@@ -1307,50 +1318,116 @@ where
     }
 }
 
-/// Replace `${VAR}` occurrences with the corresponding environment variable. `$$` is an escape
-/// for a literal `$`. Unknown variables return an error rather than expanding to empty; silent
-/// expansion to empty would produce a runtime auth-bypass-shaped configuration.
-///
-/// Returns the substituted string plus a boolean indicating whether at least one `${VAR}` expansion
-/// happened; callers use this to classify token provenance (`TokenSource::EnvVar` vs
-/// `TokenSource::Inline`) for the startup warning.
-pub(crate) fn substitute_env(input: &str) -> Result<(String, bool), String> {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut substituted = false;
-    while let Some(c) = chars.next() {
-        if c != '$' {
-            out.push(c);
+/// What expanding one string produced; see [`expand_env_vars`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Expansion {
+    pub(crate) text: String,
+    /// Names the lookup did not supply and no default covered, left literal in the text.
+    pub(crate) missing: Vec<String>,
+    /// References the grammar does not accept, as written: an unclosed `${`, an empty name, or a
+    /// default that opens another reference. Left literal too, and reported apart from a miss
+    /// because a caller cannot set a variable to satisfy one; in a field that reaches another
+    /// party the literal is a placeholder sent where a credential was meant.
+    pub(crate) malformed: Vec<String>,
+}
+
+/// Expand `${VAR}` / `${VAR:-default}` in `input`, consulting `lookup` (the process environment
+/// in production). The one grammar for every string `config.toml` expands, an MCP server's fields
+/// and `[serve]`'s tokens and URLs alike; what a caller does about a miss or a malformed reference
+/// is its own policy.
+pub(crate) fn expand_env_vars<F>(input: &str, mut lookup: F) -> Expansion
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut expansion = Expansion {
+        text: String::with_capacity(input.len()),
+        ..Expansion::default()
+    };
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Fast path: any byte that is not the start of a `${…}` opener is copied verbatim by
+        // reading the next UTF-8 scalar and pushing the whole codepoint. Byte-level `as char` would
+        // mangle multi-byte sequences (e.g. `café` → `cafÃ©`).
+        if bytes[i] != b'$' || i + 1 >= bytes.len() || bytes[i + 1] != b'{' {
+            // `i` is always on a char boundary: it advances by `ch.len_utf8()` or to the byte
+            // after an ASCII `}`.
+            let rest = &input[i..];
+            #[allow(
+                clippy::expect_used,
+                reason = "the `while i < bytes.len()` guard keeps `rest` non-empty"
+            )]
+            let ch = rest.chars().next().expect("non-empty slice");
+            expansion.text.push(ch);
+            i += ch.len_utf8();
             continue;
         }
-        match chars.peek() {
-            Some('$') => {
-                chars.next();
-                out.push('$');
-            }
-            Some('{') => {
-                chars.next();
-                let mut name = String::new();
-                let mut closed = false;
-                for inner in chars.by_ref() {
-                    if inner == '}' {
-                        closed = true;
-                        break;
+        // Find matching `}`.
+        let start = i + 2;
+        let Some(end_offset) = bytes[start..].iter().position(|&b| b == b'}') else {
+            // Unterminated `${`: emit verbatim and stop scanning.
+            expansion.malformed.push(input[i..].to_string());
+            expansion.text.push_str(&input[i..]);
+            break;
+        };
+        let end = start + end_offset;
+        let reference = &input[i..=end];
+        let body = &input[start..end];
+        // Split on `:-` (limit 2 so `:-` can appear inside the default).
+        let (var_name, default) = match body.split_once(":-") {
+            Some((name, def)) => (name.trim(), Some(def)),
+            None => (body.trim(), None),
+        };
+        // A reference the grammar has no reading of is left as written and reported: `${}`, and a
+        // default that opens another reference, which this scan would otherwise cut at the inner
+        // `}` and expand to the literal inner reference with nothing reported missing.
+        if var_name.is_empty() || default.is_some_and(|def| def.contains("${")) {
+            expansion.malformed.push(reference.to_string());
+            expansion.text.push_str(reference);
+        } else {
+            match lookup(var_name) {
+                Some(value) => expansion.text.push_str(&value),
+                None => match default {
+                    Some(def) => expansion.text.push_str(def),
+                    None => {
+                        expansion.missing.push(var_name.to_string());
+                        expansion.text.push_str(reference);
                     }
-                    name.push(inner);
-                }
-                if !closed {
-                    return Err("unclosed `${` in a substituted config value".into());
-                }
-                let value = std::env::var(&name)
-                    .map_err(|_| format!("env var `{name}` referenced in config is unset"))?;
-                out.push_str(&value);
-                substituted = true;
+                },
             }
-            _ => out.push('$'),
         }
+        i = end + 1;
     }
-    Ok((out, substituted))
+    expansion
+}
+
+/// [`expand_env_vars`] over the process environment for a `[serve]` value, where a name the
+/// environment does not supply, or a reference the grammar does not accept, is an error rather
+/// than a literal: a token or a webhook URL left reading `${VAR}` would be an auth-bypass-shaped
+/// configuration, and a value that is not there is a value the operator meant to keep out of the
+/// file.
+///
+/// Returns the expanded string plus whether at least one name was expanded; callers classify a
+/// token's provenance by it (`TokenSource::EnvVar` against `TokenSource::Inline`) for the startup
+/// warning.
+pub(crate) fn substitute_env(input: &str) -> Result<(String, bool), String> {
+    // Counted by what the environment supplied: a `${VAR:-default}` that fell to its default is
+    // a value written in the file, and the warning this feeds exists for exactly that.
+    let mut environment_supplied = false;
+    let expansion = expand_env_vars(input, |name| {
+        let value = std::env::var(name).ok();
+        environment_supplied |= value.is_some();
+        value
+    });
+    if let Some(reference) = expansion.malformed.first() {
+        return Err(format!(
+            "`{reference}` in a config value is not a `${{VAR}}` or `${{VAR:-default}}` reference"
+        ));
+    }
+    if let Some(name) = expansion.missing.first() {
+        return Err(format!("env var `{name}` referenced in config is unset"));
+    }
+    Ok((expansion.text, environment_supplied))
 }
 
 /// Default input style: bold, white-ish foreground, slate-blue background. Uses truecolor RGB (not
@@ -1565,11 +1642,10 @@ pub(crate) fn lock_config_file() -> std::io::Result<ConfigFileLock> {
 ///
 /// Commands that instead edit the raw document through `toml_edit` are unaffected by an unknown key
 /// and are how a broken config gets fixed from the CLI, so they run anyway: `meka mcp add` /
-/// `remove` / `enable` / `disable` note the failure via
-/// [`ResolvedConfig::warn_if_config_unreadable`], and `meka account remove` and `meka profile
-/// remove` never load the parsed config at all. Each re-reads the file itself, and each must fail
-/// on a *read* error rather than substitute an empty document, or the write-back truncates what it
-/// couldn't read.
+/// `remove` / `enable` / `disable` run on the unparsed file, which `main` has warned about once,
+/// and `meka account remove` and `meka profile remove` never load the parsed config at all. Each
+/// re-reads the file itself, and each must fail on a *read* error rather than substitute an empty
+/// document, or the write-back truncates what it couldn't read.
 pub(crate) fn load_config_file() -> (ConfigFile, Option<String>) {
     let Some(path) = config_file_path() else {
         return (ConfigFile::default(), None);
@@ -2107,16 +2183,6 @@ impl ResolvedConfig {
         crate::paths::skill_roots(&self.skills_extra_paths)
     }
 
-    /// Note an unreadable `config.toml` without failing, for the commands that edit the raw
-    /// document through `toml_edit` and so work fine on one meka can't parse. They are how the file
-    /// gets repaired from the CLI, so they must run; the warning is there because their view of the
-    /// config is empty and any message they print about it would otherwise mislead.
-    pub(crate) fn warn_if_config_unreadable(&self) {
-        if let Some(error) = &self.config_error {
-            tracing::warn!("ignoring config file: {error}");
-        }
-    }
-
     pub(crate) fn validate(&self) -> crate::error::Result<()> {
         // Profile-selection failure (none / ambiguous / unknown name) is reported first with its
         // specific guidance. Ahead of the provider check: with an unparsed config there are no
@@ -2134,6 +2200,15 @@ impl ResolvedConfig {
             return Err(crate::error::MekaError::Config(
                 "`[session].retention = \"0s\"` would delete every session on each startup; remove \
                  the key to keep sessions"
+                    .to_string(),
+            ));
+        }
+        // Zero with the switch on would offer `background` to the model and refuse every call it
+        // made; with the switch off the ceiling is inert and nobody is told about it.
+        if self.background.enabled && self.background.max_tasks == 0 {
+            return Err(crate::error::MekaError::Config(
+                "`[background].max_tasks = 0` would offer `background` and refuse every detached \
+                 call; set it to 1 or more, or set `enabled = false`"
                     .to_string(),
             ));
         }
@@ -2273,17 +2348,6 @@ impl ResolvedConfig {
         Ok(())
     }
 }
-
-/// The one lock serializing every test in this crate that mutates `MEKA_CONFIG_DIR` or
-/// `MEKA_DATA_DIR`.
-///
-/// The var is process-global and unit tests share a process, so a per-module lock only serializes a
-/// module against itself. Two of them are worse than none: with `cli/skills.rs` holding its own
-/// lock, a config test's `remove_var` could land mid-test and send `crate::cli::skills::run_add` at
-/// the developer's real `~/.config/meka`. A `tokio::sync::Mutex` because the skills tests are async
-/// and hold the guard across `.await`; the synchronous tests here take it with `blocking_lock`.
-#[cfg(test)]
-pub(crate) static CONFIG_DIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Built-in tool policy from `[tools]` in `config.toml`. Mirrors the three knobs
 /// [`crate::config::McpServerConfig`] exposes for MCP tools.
@@ -2603,7 +2667,7 @@ impl From<ThinkingDisplay> for String {
 /// `{:?}` on this struct (in a connect error, a `tracing::debug!`, a panic message) printed them.
 /// Names are kept: knowing that `Authorization` was set is the diagnostic; knowing its value is the
 /// leak.
-fn redact_map(
+pub(super) fn redact_map(
     map: &Option<std::collections::HashMap<String, String>>,
 ) -> Option<std::collections::BTreeMap<&str, String>> {
     map.as_ref().map(|entries| {
@@ -2614,414 +2678,17 @@ fn redact_map(
     })
 }
 
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct McpConfig {
-    /// Fallback permission for MCP tools when nothing more specific applies (no `tool_permissions`
-    /// override, no server-level `permission`, no `readOnlyHint` from the server). If this is also
-    /// unset the hardcoded fallback is `Unrestricted`, i.e. strict. Typed, like `[permissions]`,
-    /// so a level meka does not have is refused where the file is parsed.
-    pub(crate) default_permission: Option<Permission>,
-    pub(crate) servers: Option<Vec<McpServerConfig>>,
-    /// Default for each server's [`McpServerConfig::required`]. When true, every enabled server
-    /// gates the turn; when false (the default) only servers that opt in with `required = true`
-    /// do. A gated turn is refused outright rather than sent to the model.
-    ///
-    /// Defaults to false because whether a missing server should stop the turn is a property of
-    /// that server, not of the installation: one that is essential on a workstation may be
-    /// irrelevant inside a container that lacks its binary.
-    pub(crate) default_required: Option<bool>,
-    /// Per-turn cap on how long to wait for still-`Pending` MCP servers to settle before the
-    /// readiness gate decides. Default `"3s"`; `"0s"` skips the wait.
-    #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub(crate) grace: Option<std::time::Duration>,
-    /// Per-server wrap around connect + `initialize` + `list_tools`. A hung stdio spawn or slow
-    /// HTTPS handshake can't stall the whole fleet past this bound. Default `"30s"`; `"0s"` is
-    /// refused at startup.
-    #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub(crate) connect_timeout: Option<std::time::Duration>,
-    /// How many stdio servers the startup connector spawns at once. Default 3; `0` is refused at
-    /// startup.
-    pub(crate) stdio_concurrency: Option<usize>,
-    /// How many HTTP servers the startup connector connects at once. Default 20; `0` is refused
-    /// at startup.
-    pub(crate) http_concurrency: Option<usize>,
-}
-#[derive(Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct McpServerConfig {
-    pub(crate) name: String,
-    pub(crate) transport: McpTransport,
-    pub(crate) command: Option<String>,
-    pub(crate) args: Option<Vec<String>>,
-    pub(crate) env: Option<std::collections::HashMap<String, String>>,
-    pub(crate) url: Option<String>,
-    pub(crate) headers: Option<std::collections::HashMap<String, String>>,
-    /// Optional path to an executable that, when run, prints dynamic HTTP headers to stdout in
-    /// `Name: Value\n` form. Merged over [`Self::headers`] (dynamic wins). Useful for SSO flows
-    /// where bearer tokens rotate. The script is spawned with `MEKA_MCP_SERVER_NAME` and
-    /// `MEKA_MCP_SERVER_URL` in its environment so one helper can drive multiple servers. Non-zero
-    /// exit fails the connect.
-    pub(crate) headers_helper: Option<String>,
-    pub(crate) auth: Option<McpAuthConfig>,
-    /// Server-wide permission override. Typed, like `[permissions]`, so a level meka does not have
-    /// is refused where the file is parsed rather than when the server connects.
-    pub(crate) permission: Option<Permission>,
-    /// Optional allow-list of raw tool names (the server-advertised form, not the
-    /// `mcp__<server>__<tool>` namespaced form). When set and non-empty, only these tools from
-    /// this server are registered.
-    pub(crate) allowed_tools: Option<Vec<String>>,
-    /// Optional block-list of raw tool names. Applied after [`Self::allowed_tools`]. Tools listed
-    /// here are never registered.
-    pub(crate) disabled_tools: Option<Vec<String>>,
-    /// Raw tool names (server-advertised, not the `mcp__<server>__<tool>` namespaced form) that
-    /// should ship eager-loaded instead of deferred. Saves a `tool_load` round-trip and keeps the
-    /// schema in the cacheable tools-array prefix. Names that don't match an advertised tool
-    /// surface as a `warn!` via [`crate::mcp::warn_on_stale_tool_config`].
-    pub(crate) eager_load_tools: Option<Vec<String>>,
-    /// Optional per-tool permission overrides keyed by raw tool name. Beats the server-level
-    /// `permission` and the server's `readOnlyHint` annotation when resolving a tool's required
-    /// permission at registration time. Typed for the same reason [`Self::permission`] is.
-    pub(crate) tool_permissions: Option<std::collections::HashMap<String, Permission>>,
-    /// Whether this server's `readOnlyHint` annotation may classify a tool as `read`. Defaults to
-    /// true, so a server that says a tool only reads is believed.
-    ///
-    /// The hint is asserted by the server, not verified by meka, and MCP tools execute in the
-    /// server's own process with no sandbox. A server that advertises `readOnlyHint: true` for a
-    /// tool that in fact writes therefore gets to write while meka sits at `read`. That is the
-    /// reason this knob exists: setting it to `false` makes the hint advisory for display only, so
-    /// the tool falls through to the strict `Unrestricted` fallback, and nothing from this server
-    /// is reachable at `read` without an explicit [`Self::tool_permissions`] or
-    /// [`Self::permission`] entry.
-    ///
-    /// A refused hint deliberately skips `[mcp].default_permission` on the way. That is a global
-    /// convenience and this is a per-server audit decision, so the per-server one wins, the same
-    /// direction the two overrides above already run. Falling through to it meant that with
-    /// `default_permission = "read"` the knob changed nothing at all: the tool landed back on
-    /// `Read` and dispatched unapproved at `--permission read`, which is precisely the outcome
-    /// setting it to `false` was meant to prevent.
-    ///
-    /// Defaulting to true keeps existing configurations working and keeps the `read` level useful
-    /// with well-behaved servers; the trade is that the `read` level's filesystem guarantee covers
-    /// meka's built-in tools plus whichever MCP servers the user has chosen to trust.
-    pub(crate) trust_read_only_hint: Option<bool>,
-    /// When true, this server is skipped at startup: no process is spawned, no HTTP connect
-    /// attempt is made. Lets users mute a flaky or in-development server without removing the
-    /// entry. Unset means false.
-    pub(crate) disabled: Option<bool>,
-    /// Whether a turn may proceed while this server is unavailable. `None` inherits
-    /// [`McpConfig::default_required`] (false by default), so a server is optional unless it says
-    /// otherwise.
-    ///
-    /// The other half of the availability pair with [`Self::disabled`]: `disabled` says "don't
-    /// even try", `required` says "if trying failed, stop the turn". Resolved once in
-    /// [`crate::config::ResolvedConfig::resolve`], so every later consumer reads a plain `bool`.
-    pub(crate) required: Option<bool>,
-}
-
-#[cfg(test)]
-impl McpServerConfig {
-    /// A bare HTTP server entry with nothing configured but its name.
-    pub(crate) fn for_test(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            transport: McpTransport::Http,
-            command: None,
-            args: None,
-            env: None,
-            url: Some("https://example".to_string()),
-            headers: None,
-            headers_helper: None,
-            auth: None,
-            permission: None,
-            allowed_tools: None,
-            disabled_tools: None,
-            eager_load_tools: None,
-            tool_permissions: None,
-            trust_read_only_hint: None,
-            disabled: None,
-            required: None,
-        }
-    }
-}
-/// How an MCP server is reached. One spelling, [`Self::name`], on `transport` in the file and on
-/// `meka mcp add --transport`.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(try_from = "String", into = "String")]
-pub(crate) enum McpTransport {
-    Stdio,
-    Http,
-}
-impl McpTransport {
-    /// Every transport, in the order the names sort.
-    pub(crate) const ALL: [McpTransport; 2] = [Self::Http, Self::Stdio];
-
-    /// The one spelling `transport` takes.
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Stdio => "stdio",
-            Self::Http => "http",
-        }
-    }
-
-    /// The names, joined for a refusal that lists what would have been accepted.
-    pub(crate) fn supported() -> String {
-        Self::ALL
-            .iter()
-            .map(|transport| transport.name())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
-impl std::fmt::Display for McpTransport {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
-    }
-}
-impl std::str::FromStr for McpTransport {
-    type Err = String;
-
-    /// Refuses with the names that would have been accepted.
-    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|transport| transport.name() == value)
-            .ok_or_else(|| {
-                format!(
-                    "'{value}' is not a transport. Supported: {}",
-                    Self::supported()
-                )
-            })
-    }
-}
-impl TryFrom<String> for McpTransport {
-    type Error = String;
-
-    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
-        value.parse()
-    }
-}
-impl From<McpTransport> for String {
-    fn from(transport: McpTransport) -> Self {
-        transport.name().to_string()
-    }
-}
-/// How an HTTP MCP server authenticates. The secret itself is never here: it lives in
-/// `mcp_credentials`, keyed by server name, exactly as an account's key lives in
-/// `account_credentials`. This block says *which* flow to run and with what public parameters.
+/// The one lock serializing every test in this crate that mutates `MEKA_CONFIG_DIR` or
+/// `MEKA_DATA_DIR`.
 ///
-/// `deny_unknown_fields` so a key this does not model is refused rather than silently dropped,
-/// which is the same strictness [`McpServerConfig`] already has. A secret quietly ignored is worse
-/// than one refused: the connect fails later, somewhere else, for a reason that names nothing.
-#[derive(Debug, Deserialize, Clone)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum McpAuthConfig {
-    ClientCredentials {
-        client_id: String,
-        scopes: Option<Vec<String>>,
-        resource: Option<String>,
-    },
-    ClientCredentialsJwt {
-        client_id: String,
-        signing_key_path: String,
-        signing_algorithm: Option<String>,
-        scopes: Option<Vec<String>>,
-        resource: Option<String>,
-    },
-    #[serde(rename = "oauth")]
-    OAuth {
-        client_id: Option<String>,
-        scopes: Option<Vec<String>>,
-        redirect_port: Option<u16>,
-    },
-}
-impl std::fmt::Debug for McpServerConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("McpServerConfig")
-            .field("name", &self.name)
-            .field("transport", &self.transport)
-            .field("command", &self.command)
-            .field("args", &self.args)
-            .field("env", &redact_map(&self.env))
-            .field("url", &self.url)
-            .field("headers", &redact_map(&self.headers))
-            .field("headers_helper", &self.headers_helper)
-            .field("auth", &self.auth)
-            .field("permission", &self.permission)
-            .field("allowed_tools", &self.allowed_tools)
-            .field("disabled_tools", &self.disabled_tools)
-            .field("eager_load_tools", &self.eager_load_tools)
-            .field("tool_permissions", &self.tool_permissions)
-            .field("trust_read_only_hint", &self.trust_read_only_hint)
-            .field("disabled", &self.disabled)
-            .field("required", &self.required)
-            .finish()
-    }
-}
+/// The var is process-global and unit tests share a process, so a per-module lock only serializes a
+/// module against itself. Two of them are worse than none: with `cli/skills.rs` holding its own
+/// lock, a config test's `remove_var` could land mid-test and send `crate::cli::skills::run_add` at
+/// the developer's real `~/.config/meka`. A `tokio::sync::Mutex` because the skills tests are async
+/// and hold the guard across `.await`; the synchronous tests here take it with `blocking_lock`.
+#[cfg(test)]
+pub(crate) static CONFIG_DIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// `[serve]` table: HTTP server config for `meka serve`. All fields optional with sensible
-/// defaults, but at least one `[[serve.tokens]]` entry is required; the server refuses to start
-/// without one.
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ServeConfig {
-    /// Listen address. Default `127.0.0.1:8080`: bind to loopback so a fresh deploy isn't
-    /// accidentally world-reachable. Operators front with a reverse proxy (nginx, caddy) for
-    /// TLS termination and put a public address there.
-    pub(crate) bind: Option<String>,
-    /// Browser origins allowed to call the API cross-origin. Omitted or empty (the default) means
-    /// no CORS headers at all; `["*"]` allows any origin; otherwise each entry is one exact
-    /// origin, `scheme://host[:port]`, normalized at startup.
-    ///
-    /// Safe to relax because the API authenticates with a bearer header the page sets itself and
-    /// never with a cookie, so a page that lacks the token gets a 401 from any origin, and a page
-    /// that holds it can use it from anywhere regardless. The allowlist guards only what needs no
-    /// token: the health probes, the opt-in OpenAPI document and the body of a 401.
-    pub(crate) cors_allowed_origins: Option<Vec<String>>,
-    /// Idle-timeout for session eviction. Sessions with no turn activity for this long are dropped
-    /// from the in-memory map by the GC scanner. Accepts humantime strings like `"24h"`, `"30m"`,
-    /// `"86400s"`. Default `"24h"`.
-    #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub(crate) idle_timeout: Option<std::time::Duration>,
-    /// How often the GC scanner sweeps the session map. Accepts humantime strings like `"5m"`,
-    /// `"300s"`. Default `"5m"`.
-    #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub(crate) gc_scan_interval: Option<std::time::Duration>,
-    /// When true, GC also deletes the SQLite row for idle sessions; default false (keep the row so
-    /// a future request with the same session ID can re-attach, mirroring ACP's `session/load`).
-    pub(crate) delete_on_idle: Option<bool>,
-    /// On SIGTERM / SIGINT, wait at most this long for in-flight turns to finish before forcibly
-    /// aborting. Accepts humantime strings like `"30s"`, `"1m"`. Default `"30s"`.
-    #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub(crate) shutdown_drain_timeout: Option<std::time::Duration>,
-    /// Process-wide cap on concurrent in-flight turns across all sessions. None = unbounded
-    /// (default). Returns 429 with `concurrency-limit` when exceeded.
-    pub(crate) max_concurrent_turns: Option<usize>,
-    /// Request body size limit (bytes). Default 10 MiB.
-    pub(crate) max_body_bytes: Option<usize>,
-    /// Whether a 502 carries the failing provider call's error text, as a `provider_response`
-    /// extension member. Default `true`. `detail` is meka's own sentence and is identical either
-    /// way.
-    ///
-    /// On, because the upstream's error type is the actionable part of a failed turn and "consult
-    /// the server log" is no answer to anyone running against a meka they do not operate. `meka
-    /// acp` honors this key too: the same policy decides what a failed turn's `error.data`
-    /// carries.
-    ///
-    /// **What it can expose.** Usually the upstream's response body, which can name the
-    /// *operator's* provider account and its rate-limit posture. Not always, though: the member
-    /// carries the failing call's error message, and for some failures that is meka's own sentence
-    /// about the call rather than anything the provider sent.
-    ///
-    /// **Who can read it.** `sessions:r`, not just `sessions:w`. Submitting a turn takes the write
-    /// scope, but the failure also rides the terminal `turn.failed` event, and `GET
-    /// /v1/sessions/{id}/stream` replays that to any reader.
-    ///
-    /// Turn it off where read-only tokens go to people who may watch a session but are not
-    /// entitled to the account behind it. `/errors/mcp-unavailable` is not covered either way: it
-    /// reports server names only, and that reason is meka's own subprocess text.
-    pub(crate) relay_provider_errors: Option<bool>,
-    /// Whether to serve the Swagger UI and the OpenAPI document at `/v1/docs` and
-    /// `/v1/openapi.json`. Default `false`.
-    ///
-    /// Off by default because they are unauthenticated (as are the two health probes, which
-    /// publish nothing) and what they publish is the shape of every endpoint the deployment
-    /// exposes. That is useful while building a client and pure reconnaissance value once the
-    /// deployment is real. Turn it on deliberately, on a deployment where anyone who can reach the
-    /// port is entitled to the map.
-    pub(crate) docs: Option<bool>,
-    /// How many SSE events per turn to retain so a client reconnecting with `Last-Event-ID` can
-    /// replay what it missed. Default 256, matching the live broadcast channel's capacity.
-    ///
-    /// Raising it buys a longer reconnect window at the cost of holding more per-session memory
-    /// during a turn; `0` switches replay off, so a reconnect gets only what happens from then on.
-    pub(crate) stream_replay_events: Option<usize>,
-    /// How long a streaming turn keeps running after its SSE consumer disconnects, waiting for a
-    /// reconnect. Accepts humantime strings like `"30s"`. Default `"30s"`.
-    ///
-    /// `"0s"` cancels the turn the moment the stream drops. That spends fewer provider tokens on
-    /// abandoned work, and makes re-attach useful only for turns that already finished.
-    #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub(crate) stream_reattach_grace: Option<std::time::Duration>,
-    /// Bearer tokens configured for this deployment. An empty list is refused at startup: `meka
-    /// serve` exits rather than binding a port nothing can authenticate against.
-    pub(crate) tokens: Option<Vec<ServeTokenConfig>>,
-    /// Outbound webhook endpoints. Empty (the default) means meka never makes an outbound request.
-    pub(crate) webhooks: Option<Vec<WebhookConfig>>,
-}
-/// One entry in `[[serve.webhooks]]`.
-#[derive(Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct WebhookConfig {
-    /// Where to POST. `http://` is accepted for loopback development but logged as a warning:
-    /// deliveries are signed, not encrypted, so anything on the path can read them.
-    pub(crate) url: String,
-    /// Shared secret for the `X-Meka-Signature` HMAC. Supports `${ENV_VAR}` substitution.
-    /// Mutually exclusive with `secret_file`.
-    pub(crate) secret: Option<String>,
-    /// Path to a file whose contents (trimmed) are the secret. chmod 0600 recommended.
-    pub(crate) secret_file: Option<std::path::PathBuf>,
-    /// Which events to deliver. Required and non-empty: an endpoint subscribed to nothing is
-    /// almost certainly a mistake, and silently never firing is the worst way to find out.
-    pub(crate) events: Vec<String>,
-    /// Per-attempt request timeout. Accepts humantime strings like `"10s"`. Default `"10s"`.
-    #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub(crate) timeout: Option<std::time::Duration>,
-    /// Retries after the first attempt, with exponential backoff. Default 3.
-    pub(crate) max_retries: Option<u32>,
-}
-// Manual `Debug` so a secret cannot reach a log through the *raw* struct either. Nothing prints
-// this today, but the derived one would have been the single unredacted path in the webhook chain,
-// and that is exactly the kind of thing a later `dbg!` finds.
-impl std::fmt::Debug for WebhookConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WebhookConfig")
-            .field("url", &self.url)
-            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
-            .field("secret_file", &self.secret_file)
-            .field("events", &self.events)
-            .field("timeout", &self.timeout)
-            .field("max_retries", &self.max_retries)
-            .finish()
-    }
-}
-/// One entry in `[serve.tokens]`. Tokens identify callers; scopes gate what they can do. See the
-/// Auth section of the HTTP API docs for the full scope catalog.
-#[derive(Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ServeTokenConfig {
-    /// Inline token value. Supports `${ENV_VAR}` substitution at config-load time. Mutually
-    /// exclusive with `token_file`.
-    pub(crate) token: Option<String>,
-    /// Path to a file whose contents (trimmed) are the token. chmod 0600 recommended.
-    pub(crate) token_file: Option<std::path::PathBuf>,
-    /// Free-form description, surfaced in startup logs. Operators use it to remember which caller
-    /// a token belongs to (e.g. "telegram bridge", "ci debug").
-    pub(crate) description: Option<String>,
-    /// Scopes granted to this token. See the HTTP API docs for the catalog.
-    pub(crate) scopes: Vec<String>,
-}
-// Manual `Debug` for the same reason as [`WebhookConfig`]'s, and more urgently: `ServeConfig` and
-// `ResolvedConfig` both derive `Debug` and `ResolvedConfig` owns the whole `[serve]` table, so the
-// derived impl made every bearer token reachable from a single `{:?}` on the config. Redacting only
-// `ResolvedServeToken` left that path open, because the raw form survives resolution.
-impl std::fmt::Debug for ServeTokenConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServeTokenConfig")
-            .field(
-                "token",
-                &self
-                    .token
-                    .as_ref()
-                    .map(|token| format_args!("[REDACTED len={}]", token.len()).to_string()),
-            )
-            .field("token_file", &self.token_file)
-            .field("description", &self.description)
-            .field("scopes", &self.scopes)
-            .finish()
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4259,6 +3926,53 @@ model = "m"
         }
     }
 
+    /// An account states whether its endpoint takes the interleaved-thinking beta; unset is the
+    /// direct API's answer, and the resolved profile carries it to the backend.
+    #[test]
+    fn an_account_s_interleaved_thinking_reaches_the_resolved_profile() {
+        let usable = "default_profile = \"p\"\n\n[profiles.p]\naccount = \"p\"\nmodel = \"m\"\n\n";
+        for (written, resolved_to) in [
+            ("", true),
+            ("interleaved_thinking = false\n", false),
+            ("interleaved_thinking = true\n", true),
+        ] {
+            let resolved = resolve_with_config(&format!(
+                "{usable}[accounts.p]\nbackend = \"anthropic-messages\"\n{written}"
+            ));
+            let settings = profile::resolve_profile(
+                &resolved.profiles["p"],
+                &resolved.accounts["p"],
+                None,
+                None,
+                String::new(),
+            )
+            .expect("resolves");
+            assert_eq!(settings.interleaved_thinking, resolved_to, "{written:?}");
+        }
+    }
+
+    /// `[background] max_tasks = 0` with the switch on would offer `background` to the model and
+    /// refuse every call it made, so it is refused at startup like every other zero that means
+    /// nothing; with the switch off the ceiling is inert and the file is left alone.
+    #[test]
+    fn a_zero_background_ceiling_is_refused_while_the_switch_is_on() {
+        let usable = "default_profile = \"p\"\n\n[accounts.p]\nbackend = \
+                      \"openai-chat-completions\"\n\n[profiles.p]\naccount = \"p\"\nmodel = \
+                      \"m\"\n\n";
+        let resolved = resolve_with_config(&format!(
+            "{usable}[background]\nenabled = true\nmax_tasks = 0\n"
+        ));
+        let error = resolved
+            .validate()
+            .expect_err("zero is refused")
+            .to_string();
+        assert!(error.contains("`[background].max_tasks = 0`"), "{error}");
+        let resolved = resolve_with_config(&format!(
+            "{usable}[background]\nenabled = false\nmax_tasks = 0\n"
+        ));
+        resolved.validate().expect("inert while the switch is off");
+    }
+
     #[test]
     fn a_zero_retention_is_refused() {
         // Needs a usable provider: `validate` reports a missing one first, and rightly so - it
@@ -4920,6 +4634,40 @@ file_read = "unrestricted"
             resolved.expect("ok").expect("some").text,
             "from the named path"
         );
+    }
+
+    /// The provenance a `[serve]` token reports is whether the environment supplied it: a
+    /// `${VAR:-default}` that fell to its default is a value written in the file, which is what the
+    /// inline-token warning exists to name.
+    #[test]
+    fn a_serve_value_is_env_sourced_only_when_the_environment_supplied_it() {
+        let (expanded, from_environment) =
+            substitute_env("${CARGO_MANIFEST_DIR}").expect("cargo sets it for every test");
+        assert!(!expanded.is_empty() && from_environment);
+        let (expanded, from_environment) =
+            substitute_env("${MEKA_TEST_UNSET_SERVE_TOKEN:-written-in-the-file}")
+                .expect("a default covers the miss");
+        assert_eq!(expanded, "written-in-the-file");
+        assert!(
+            !from_environment,
+            "the default is the file's, not the environment's"
+        );
+        assert!(substitute_env("${MEKA_TEST_UNSET_SERVE_TOKEN}").is_err());
+    }
+
+    /// A reference the grammar has no reading of is refused, never written into a token: an
+    /// unclosed `${`, an empty name, and a default that opens another reference all read as a
+    /// literal to a grammar that stops at the first `}`, and a bearer token that is a literal
+    /// placeholder is a guessable credential.
+    #[test]
+    fn a_malformed_reference_in_a_serve_value_is_refused() {
+        for value in ["${MEKA_TOKEN", "${}", "${MEKA_TOKEN:-${MEKA_FALLBACK}}"] {
+            let error = substitute_env(value).expect_err(value);
+            assert!(
+                error.contains("is not a `${VAR}` or `${VAR:-default}` reference"),
+                "{value}: {error}"
+            );
+        }
     }
 
     /// No reading of "both set" means both, so resolving one silently would hide the mistake until

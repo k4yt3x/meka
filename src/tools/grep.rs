@@ -106,7 +106,7 @@ impl Tool for SearchContentsTool {
         // One budget for the whole call, not one per root: `WalkBudget::new` stamps its deadline at
         // construction, so a per-root budget would silently multiply the ceiling by the root count.
         let budget = WalkBudget::new(cancellation.clone());
-        let private = crate::workspace::private_directories_hidden_at(self.site.permission.get());
+        let fence = crate::workspace::ReadFence::at(self.site.permission.get());
         let search = tokio::task::spawn_blocking(move || {
             search_with_grep(
                 &pattern,
@@ -114,7 +114,7 @@ impl Tool for SearchContentsTool {
                 file_glob.as_deref(),
                 max_results,
                 &budget,
-                &private,
+                &fence,
             )
         });
 
@@ -145,7 +145,7 @@ fn search_with_grep(
     budget: &WalkBudget,
     // meka's own directories at this permission, which a named root may not be inside and the
     // walk steps around; see `crate::workspace::private_read_refusal`.
-    private: &[std::path::PathBuf],
+    fence: &crate::workspace::ReadFence,
 ) -> Result<String> {
     use grep_regex::RegexMatcherBuilder;
 
@@ -207,7 +207,7 @@ fn search_with_grep(
 
         // A root the caller named is refused outright rather than stepped around: pointing `path`
         // at the store is the question, and a silent empty answer would read as "nothing there".
-        if crate::workspace::resolves_into_private(path, private) {
+        if fence.hides(path) {
             return Err(MekaError::ToolExecution {
                 tool_name: "file_search".to_string(),
                 message: format!(
@@ -238,7 +238,7 @@ fn search_with_grep(
                 glob_pattern: &glob_pattern,
                 max_results,
                 budget,
-                private,
+                fence,
             };
             if walk_directory(path, &scope, &mut results, &mut unreadable)? {
                 timed_out = true;
@@ -355,7 +355,7 @@ struct SearchScope<'a> {
     budget: &'a WalkBudget,
     /// meka's own directories at this permission, which the walk steps around; see
     /// `crate::workspace::private_read_refusal`.
-    private: &'a [std::path::PathBuf],
+    fence: &'a crate::workspace::ReadFence,
 }
 
 /// Walk `directory`, searching every file that passes the scope's glob. Returns whether the walk
@@ -376,7 +376,7 @@ fn walk_directory(
         glob_pattern,
         max_results,
         budget,
-        private,
+        fence,
     } = *scope;
     // Iterative traversal via an explicit work-stack: a recursive walk would overflow the call
     // stack on a pathologically deep directory tree.
@@ -386,7 +386,7 @@ fn walk_directory(
         // Stepped around, like the dot-directories below: a root above meka's directories is a
         // legitimate workspace, and what lies inside them is not this walk's to read. Resolved
         // per directory, since the root itself need not be canonical.
-        if crate::workspace::resolves_into_private(&dir, private) {
+        if fence.hides(&dir) {
             continue;
         }
         // Checked here as well as per entry: a run of directories that all fail `read_dir` (a tree
@@ -444,8 +444,7 @@ fn walk_directory(
                 // A symlink is the one way a file under a permitted directory resolves into
                 // meka's own; a regular file cannot, since the walk never descends a symlinked
                 // directory and every directory it does enter was judged above.
-                if file_type.is_symlink() && crate::workspace::resolves_into_private(&path, private)
-                {
+                if file_type.is_symlink() && fence.hides(&path) {
                     continue;
                 }
                 search_file(matcher, &path, results, max_results, unreadable)?;
@@ -928,7 +927,7 @@ mod tests {
             None,
             MAX_INLINE_MATCHES,
             &budget,
-            &[],
+            &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
         )
         .expect("search should return, not error");
 
@@ -967,7 +966,7 @@ mod tests {
             None,
             MAX_INLINE_MATCHES,
             &budget,
-            &[],
+            &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
         )
         .expect("search should return, not error");
 
@@ -993,7 +992,7 @@ mod tests {
             None,
             MAX_INLINE_MATCHES,
             &budget,
-            &[],
+            &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
         )
         .expect("an expired budget must not be reported as a missing path");
         assert!(output.contains("still running"), "got: {output}");
@@ -1014,7 +1013,7 @@ mod tests {
             None,
             MAX_INLINE_MATCHES,
             &budget,
-            &[],
+            &crate::workspace::ReadFence::at(crate::permission::Permission::Unrestricted),
         )
         .expect("search should return, not error");
 

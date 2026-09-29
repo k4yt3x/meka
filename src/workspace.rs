@@ -273,17 +273,46 @@ pub(crate) fn private_read_refusal(
     permission: crate::permission::Permission,
     target: &Path,
 ) -> Option<String> {
-    private_read_refusal_with(permission, target, &private_directories())
+    private_read_refusal_with(
+        permission,
+        target,
+        &private_directories(),
+        &readable_within_private(),
+    )
 }
 
-/// [`private_read_refusal`] with the private directories taken as a parameter, for the tests.
+/// The part of the private directories that stays readable below `unrestricted`: meka's own
+/// skills store. A skill's bundled files are what its body tells the model to read, and the
+/// store sits under the config directory only because that is where meka keeps what the user
+/// authored; nothing secret lives there. The shell sandbox still masks it, so the header a skill
+/// is served with says to read them with `file_read`.
+fn readable_within_private() -> Vec<PathBuf> {
+    private_directories_among(crate::paths::skills_dir())
+}
+
+/// [`private_read_refusal`] with the private and readable directories taken as parameters, for
+/// the tests.
 fn private_read_refusal_with(
     permission: crate::permission::Permission,
     target: &Path,
     private: &[PathBuf],
+    readable: &[PathBuf],
 ) -> Option<String> {
     if permission == crate::permission::Permission::Unrestricted {
         return None;
+    }
+    if readable
+        .iter()
+        .any(|directory| target.starts_with(directory))
+    {
+        return None;
+    }
+    if is_process_proc_entry(target) {
+        return Some(format!(
+            "'{}' is a process's `/proc` entry, which only `unrestricted` reads: `environ`, \
+             `cmdline`, `fd` and `mem` carry what the process was given.",
+            target.display()
+        ));
     }
     let directory = private
         .iter()
@@ -295,27 +324,78 @@ fn private_read_refusal_with(
     ))
 }
 
-/// The private directories a walk at `permission` has to step around: none at `unrestricted`, so
-/// the walk resolves nothing.
-pub(crate) fn private_directories_hidden_at(
-    permission: crate::permission::Permission,
-) -> Vec<PathBuf> {
-    if permission == crate::permission::Permission::Unrestricted {
-        Vec::new()
-    } else {
-        private_directories()
-    }
-}
-
-/// Whether `path`, resolved through any symlinks, lies inside one of `private`. A path that cannot
-/// be resolved is not inside anything meka owns, and an empty list costs no resolution at all.
-pub(crate) fn resolves_into_private(path: &Path, private: &[PathBuf]) -> bool {
-    if private.is_empty() {
+/// Whether `target` lies under a process's own directory in `/proc`: `/proc/<pid>`, or `self` and
+/// `thread-self`, which canonicalization has usually already turned into a pid.
+///
+/// The system-wide files (`meminfo`, `cpuinfo`, `mounts`, `net/*`) stay readable: they carry no
+/// secret, and at `read` the shell is closed, so `file_read` is the only door to them. Every entry
+/// that does carry one is per process: `environ` holds what a process was given, which for an MCP
+/// server meka spawned is its credential and for meka itself every `${VAR}` `config.toml` names;
+/// `cmdline`, `fd`, `maps` and `mem` (readable for a child under the default ptrace scope) hold
+/// the rest. The sandboxed shell already sees no other process; this is the same line for the
+/// in-process readers.
+fn is_process_proc_entry(target: &Path) -> bool {
+    use std::path::Component;
+    let mut components = target.components();
+    if components.next() != Some(Component::RootDir) {
         return false;
     }
-    std::fs::canonicalize(path)
-        .map(strip_verbatim)
-        .is_ok_and(|real| private.iter().any(|directory| real.starts_with(directory)))
+    if components.next() != Some(Component::Normal("proc".as_ref())) {
+        return false;
+    }
+    let Some(Component::Normal(process)) = components.next() else {
+        return false;
+    };
+    process.to_str().is_some_and(|name| {
+        name == "self" || name == "thread-self" || name.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+/// What a walk below `unrestricted` steps around, and the part of it that stays readable: none of
+/// either at `unrestricted`, so a walk resolves nothing.
+pub(crate) struct ReadFence {
+    private: Vec<PathBuf>,
+    readable: Vec<PathBuf>,
+}
+
+impl ReadFence {
+    /// The fence at `permission`.
+    pub(crate) fn at(permission: crate::permission::Permission) -> Self {
+        if permission == crate::permission::Permission::Unrestricted {
+            return Self {
+                private: Vec::new(),
+                readable: Vec::new(),
+            };
+        }
+        Self {
+            private: private_directories(),
+            readable: readable_within_private(),
+        }
+    }
+
+    /// Whether `path`, resolved through any symlinks, lies inside a private directory and outside
+    /// the readable part of it, or is a process's own `/proc` entry. A path that cannot be
+    /// resolved is not inside anything meka owns, and an empty fence costs no resolution at all.
+    pub(crate) fn hides(&self, path: &Path) -> bool {
+        if self.private.is_empty() {
+            return false;
+        }
+        std::fs::canonicalize(path)
+            .map(strip_verbatim)
+            .is_ok_and(|real| {
+                if self
+                    .readable
+                    .iter()
+                    .any(|directory| real.starts_with(directory))
+                {
+                    return false;
+                }
+                self.private
+                    .iter()
+                    .any(|directory| real.starts_with(directory))
+                    || is_process_proc_entry(&real)
+            })
+    }
 }
 
 /// [`is_system_root`] with meka's private directories taken as a parameter, so it can be tested
@@ -717,19 +797,15 @@ impl WriteScope {
         self.locks.lock_path(canonical).await
     }
 
-    /// The roots a write must land under right now, or `None` when this level imposes no boundary.
+    /// The roots a write must land under at `level`, or `None` when that level imposes no
+    /// boundary.
     ///
     /// Only `unrestricted` disclaims a boundary, by definition; an approved call runs at its own
     /// level and reaches no further. Every other level, `none` and `read` included, is confined
     /// here: a level that should never reach a write door must fail closed if one is ever wired to
-    /// it.
-    pub(crate) fn confined_to(&self, cwd: &SharedCwd) -> Option<Vec<PathBuf>> {
-        self.confined_to_at(self.permission.get(), cwd)
-    }
-
-    /// [`Self::confined_to`] at a level the caller has already read, for a door that has judged the
-    /// call at that level and must not re-read the handle to find a different one.
-    fn confined_to_at(
+    /// it. The level is the caller's, read once at its enforcement site, never re-read off the
+    /// handle here: a door that judged the call at one level must not confine it at another.
+    pub(crate) fn confined_to_at(
         &self,
         level: crate::permission::Permission,
         cwd: &SharedCwd,
@@ -1192,22 +1268,94 @@ mod tests {
         let private = vec![PathBuf::from("/home/someone/.local/share/meka")];
         let store = Path::new("/home/someone/.local/share/meka/meka.db");
         for permission in [Permission::Read, Permission::Workspace, Permission::None] {
-            let refusal = private_read_refusal_with(permission, store, &private)
+            let refusal = private_read_refusal_with(permission, store, &private, &[])
                 .unwrap_or_else(|| panic!("{permission:?} must refuse the store"));
             assert!(refusal.contains("meka's own directory"), "{refusal}");
         }
         assert!(
-            private_read_refusal_with(Permission::Unrestricted, store, &private).is_none(),
+            private_read_refusal_with(Permission::Unrestricted, store, &private, &[]).is_none(),
             "unrestricted reads it, as it writes it"
         );
         assert!(
             private_read_refusal_with(
                 Permission::Read,
                 Path::new("/home/someone/.local/share/other"),
-                &private
+                &private,
+                &[]
             )
             .is_none()
         );
+    }
+
+    /// The skills store stays readable inside the private config directory: a skill's bundled
+    /// files are what its body tells the model to read. The config file beside it does not.
+    #[test]
+    fn the_skills_store_is_readable_inside_the_private_config_directory() {
+        use crate::permission::Permission;
+        let config = PathBuf::from("/home/someone/.config/meka");
+        let private = vec![config.clone()];
+        let readable = vec![config.join("skills")];
+        assert!(
+            private_read_refusal_with(
+                Permission::Read,
+                &config.join("skills/deploy/scripts/helper.sh"),
+                &private,
+                &readable
+            )
+            .is_none(),
+            "a bundled file is the model's to read"
+        );
+        assert!(
+            private_read_refusal_with(
+                Permission::Read,
+                &config.join("config.toml"),
+                &private,
+                &readable
+            )
+            .is_some(),
+            "the file beside the store stays private"
+        );
+    }
+
+    /// A process's own `/proc` directory is refused below `unrestricted` by the same rule that
+    /// refuses meka's directories, whether named by pid, `self` or `thread-self`; the system-wide
+    /// files beside them are not, since they carry no secret and are the one way to read them at
+    /// `read`.
+    #[test]
+    fn a_process_s_proc_entries_are_not_readable_below_unrestricted() {
+        use crate::permission::Permission;
+        let private = vec![PathBuf::from("/home/someone/.local/share/meka")];
+        for entry in [
+            "/proc/1234/environ",
+            "/proc/1234/mem",
+            "/proc/self/environ",
+            "/proc/thread-self/cmdline",
+            "/proc/42/fd/3",
+        ] {
+            let refusal =
+                private_read_refusal_with(Permission::Read, Path::new(entry), &private, &[])
+                    .unwrap_or_else(|| panic!("{entry} must be refused"));
+            assert!(refusal.contains("`/proc` entry"), "{refusal}");
+            assert!(
+                private_read_refusal_with(Permission::Unrestricted, Path::new(entry), &private, &[
+                ])
+                .is_none(),
+                "unrestricted reads {entry}"
+            );
+        }
+        for system_wide in [
+            "/proc/meminfo",
+            "/proc/cpuinfo",
+            "/proc/net/tcp",
+            "/proc/mounts",
+        ] {
+            assert!(
+                private_read_refusal_with(Permission::Read, Path::new(system_wide), &private, &[])
+                    .is_none(),
+                "{system_wide} carries no secret and stays readable"
+            );
+        }
+        assert!(!is_process_proc_entry(Path::new("/procfs/1234/environ")));
     }
 
     /// The in-process write door refuses meka's own directories even when a workspace root
@@ -1558,7 +1706,7 @@ mod tests {
         let scope = WriteScope::deny_all();
 
         assert_eq!(
-            scope.confined_to(&cwd),
+            scope.confined_to_at(crate::permission::Permission::Workspace, &cwd),
             Some(Vec::new()),
             "the closed fallback must name no writable root at all"
         );
@@ -1597,7 +1745,7 @@ mod tests {
             match level {
                 crate::permission::Permission::Unrestricted => {
                     assert_eq!(
-                        scope.confined_to(&cwd),
+                        scope.confined_to_at(level, &cwd),
                         None,
                         "{level} disclaims a boundary: a write reaches anywhere"
                     );
@@ -1607,7 +1755,7 @@ mod tests {
                 }
                 _ => {
                     assert_eq!(
-                        scope.confined_to(&cwd),
+                        scope.confined_to_at(level, &cwd),
                         Some(vec![base.clone()]),
                         "{level} must be confined to the working directory"
                     );
