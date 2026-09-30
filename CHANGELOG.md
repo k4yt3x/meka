@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.68.1] - 2026-09-30
+
+### Changed
+
+- The Windows sandbox no longer warns that it cannot hide meka's store; see the shell page.
+- A warning printed between two prompts takes a row of its own and spends neither `[display]` blank.
+- Reasoning shown with `show_content` resumes behind a second `Thinking...` after a warning cuts in.
+
 ## [0.68.0] - 2026-09-29
 
 ### Added
@@ -2501,7 +2509,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.68.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.68.1...HEAD
+[0.68.1]: https://github.com/k4yt3x/meka/compare/0.68.0...0.68.1
 [0.68.0]: https://github.com/k4yt3x/meka/compare/0.67.0...0.68.0
 [0.67.0]: https://github.com/k4yt3x/meka/compare/0.66.0...0.67.0
 [0.66.0]: https://github.com/k4yt3x/meka/compare/0.65.0...0.66.0

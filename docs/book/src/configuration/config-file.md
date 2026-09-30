@@ -1246,7 +1246,7 @@ Default: `16000`
 
 Whether to show the whole text of a thinking block. When `false`, a block carrying readable reasoning is previewed as a single dimmed line, flattened across line breaks and cut to fit [`display.max_width`](#displaymax_width), and the history replayed on resume (`resume_show_recent`) omits it entirely. Emphasis on that line is styling rather than text, so a summary's `**Bold header**` reads as a bold header there too.
 
-When `true`, the block streams to stderr as it arrives, behind the same dimmed `Thinking... ` label, with every line after the first indented by two spaces. There is no height limit: asking to see the reasoning is asking to see all of it. On a model that streams its whole chain of thought this is the difference between a token counter and the text. The label takes the live `Thinking... (N tokens)` indicator's place as soon as reasoning starts to arrive, and the text follows as it settles: a paragraph at a time under `termimad`, a line at a time under `raw` and `syntect`, the same way the answer does.
+When `true`, the block streams to stderr as it arrives, behind the same dimmed `Thinking... ` label, with every line after the first indented by two spaces. There is no height limit: asking to see the reasoning is asking to see all of it. On a model that streams its whole chain of thought this is the difference between a token counter and the text. The label takes the live `Thinking... (N tokens)` indicator's place as soon as reasoning starts to arrive, and the text follows as it settles: a paragraph at a time under `termimad`, a line at a time under `raw` and `syntect`, the same way the answer does. A warning logged while the block streams takes a row of its own, and the block resumes below it behind a second `Thinking... ` label.
 
 Formatting follows [`display.render_mode`](#displayrender_mode), with one difference: reasoning is painted entirely in dark gray, so emphasis carries as bold or italic rather than as color. That is what keeps a thinking block readable as a footnote rather than as the reply. Under `termimad` the markdown is rendered, so a reasoning summary's `**Bold header**` arrives as a bold header instead of as asterisks; under `raw` and `syntect` the source is shown as written, which for reasoning means those two produce the same output. Fenced code keeps its fences and is not syntax-highlighted, for the same reason.
 
@@ -1515,7 +1515,9 @@ Both apply to **anything printed between two prompts**, not only agent responses
 unit, whatever filled it: a turn, a slash command's output (`/task`, `/memory`, `/help`, …), an
 error, a scheduled job waking the shell to run several turns at once, or any combination. It is
 bracketed once, by whichever of those printed first and last, never once per turn inside it, and
-never twice because two things both thought they owned the spacing.
+never twice because two things both thought they owned the spacing. Log lines are the one
+exception: a warning (or, under `-v`, anything else `tracing` prints) takes a row of its own and
+spends neither blank, so a warning at startup is followed straight by the first prompt.
 
 Both space output away from *meka's* prompt, so neither applies at the edges of a run, where the
 prompt is your shell's. Whatever meka prints before drawing its first prompt sits directly under the

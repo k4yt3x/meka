@@ -149,11 +149,11 @@ impl Write for RelayWriter {
 }
 
 impl RelayWriter {
-    /// Tell the console that output it cannot see is about to land on the current row.
+    /// Tell the console that a log line is about to land on the current row.
     ///
     /// Off-prompt is when the row may not be free: a turn draws the thinking indicator as a
-    /// [`crate::console::RowState::Transient`] line, and a `warn!` printed onto it is wiped by the
-    /// next `Settle::Erase`.
+    /// [`crate::console::RowState::Transient`] line, and a `warn!` printed onto it is written
+    /// behind the indicator's text and left there when the indicator redraws below.
     ///
     /// `try_lock`, never `lock`: [`Console`] methods log through `render::report_lost_output`, so a
     /// thread already inside one re-enters here holding the lock, and a blocking acquire would
@@ -171,9 +171,9 @@ impl RelayWriter {
             return;
         };
         match console.try_lock() {
-            Ok(mut console) => console.announce_foreign_output(),
+            Ok(mut console) => console.announce_log_line(),
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                poisoned.into_inner().announce_foreign_output()
+                poisoned.into_inner().announce_log_line()
             }
             Err(std::sync::TryLockError::WouldBlock) => {}
         }
@@ -225,11 +225,12 @@ mod tests {
             .expect("the third line blocked on a queue nobody drains");
     }
 
-    /// An off-prompt log line settles the row instead of landing on it.
+    /// An off-prompt log line settles the row instead of landing on it, and counts for nothing
+    /// else.
     ///
-    /// This is the wiring, not the state machine: `step` already knows that foreign output erases a
-    /// transient row. The row is the thinking indicator's, and the line that lands on it is the
-    /// retry path's `warn!`, which fires at default verbosity.
+    /// This is the wiring, not the state machine: `step` already knows that a log line erases a
+    /// transient row and spends no bracket. The row is the thinking indicator's, and the line that
+    /// lands on it is the retry path's `warn!`, which fires at default verbosity.
     ///
     /// `force_row` because the drawing API cannot reach `Transient` without a terminal:
     /// `thinking_indicator` returns early on `!live_indicator_supported()`.
@@ -262,8 +263,9 @@ mod tests {
              `Settle::Erase` takes the line with it"
         );
         assert!(
-            console.has_printed(),
-            "and the episode has to know it printed, or its closing blank is skipped"
+            !console.has_printed(),
+            "and the episode must not count it, or a warning at startup earns the first prompt a \
+             blank above it"
         );
     }
 

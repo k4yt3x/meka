@@ -113,7 +113,8 @@ fn resolve_output_width(configured: Option<usize>, measured: Option<usize>) -> u
 /// What the next byte written owes the block it belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Owes {
-    /// Nothing has been written yet, so the label is still due.
+    /// The label is due: nothing has been written yet, or a foreign line has interrupted the block
+    /// since.
     Opening,
     /// A row ended, so the next row starts with the indent.
     Continuation,
@@ -319,7 +320,7 @@ impl StreamingRenderer {
     /// not model. A mid-turn `tracing` line would then be appended to the model's last row instead
     /// of settling it first, and a piped answer would end without a newline. The one row left open
     /// on purpose is the label's, spent ahead of its text by [`Self::open_lead`]; the console ends
-    /// it through [`Self::end_open_row`] before any other writer prints.
+    /// it through [`Self::interrupt`] before any other writer prints.
     fn write(&mut self, text: &str) -> io::Result<()> {
         if text.is_empty() {
             return Ok(());
@@ -353,19 +354,30 @@ impl StreamingRenderer {
     /// Close the block: drop the blank rows held behind it, and end the row if one is still open.
     fn settle_last_row(&mut self) -> io::Result<()> {
         self.held_blank_rows = 0;
-        self.end_open_row()
-    }
-
-    /// End the row if one is open, for another writer about to take the terminal mid-block.
-    ///
-    /// Goes through the lead, so the block resumes below the foreign line behind its indent
-    /// rather than at column zero. The held blank rows stay held: they separate this block's text
-    /// from its own continuation, which the foreign line does not change.
-    pub(crate) fn end_open_row(&mut self) -> io::Result<()> {
         if !std::mem::take(&mut self.row_open) {
             return Ok(());
         }
         self.write_through("\n")
+    }
+
+    /// Make way for another writer about to take the terminal mid-block.
+    ///
+    /// A labeled block resumes below the foreign line the way it began, behind its label, rather
+    /// than as an indented paragraph under a line that is not its own. The row is ended through the
+    /// lead so the resumption starts a row, and the blank rows held behind the last paragraph are
+    /// dropped: the foreign line now separates that paragraph from what resumes, and a blank
+    /// released ahead of the resumed text would land between the label and its text. The answer
+    /// wears no label and keeps its held blanks, so its next paragraph is spaced as it would have
+    /// been: the foreign line is invisible to its layout.
+    pub(crate) fn interrupt(&mut self) -> io::Result<()> {
+        if std::mem::take(&mut self.row_open) {
+            self.write_through("\n")?;
+        }
+        if let Some((_, owes)) = self.lead.as_mut() {
+            *owes = Owes::Opening;
+            self.held_blank_rows = 0;
+        }
+        Ok(())
     }
 
     /// Whether the last write left the cursor mid-row, for the console's tests.
@@ -374,7 +386,8 @@ impl StreamingRenderer {
         self.row_open
     }
 
-    /// Write the lead's label ahead of its text, at the first delta of the block.
+    /// Write the lead's label ahead of its text, at the first delta of the block and at the first
+    /// after an interruption; a no-op whenever the label is not owed.
     ///
     /// Every mode holds text back until it settles (a line, a paragraph, a whole table), so
     /// nothing else can mark the phase while the first of it is still arriving. On the REPL the
@@ -483,9 +496,9 @@ impl StreamingRenderer {
                 return Ok(());
             }
             self.started = true;
-            self.open_lead()?;
             trimmed
         };
+        self.open_lead()?;
 
         self.buffer.push_str(delta);
 
@@ -2329,8 +2342,7 @@ mod tests {
     }
 
     /// The label goes out with the first delta, ahead of the text every mode holds back, so the
-    /// row the indicator gives up is never blank. A row another writer ends mid-hold is continued
-    /// below behind the indent, with the held text intact.
+    /// row the indicator gives up is never blank.
     #[test]
     fn the_label_is_spent_on_the_first_delta_not_the_first_settled_row() {
         for mode in [RenderMode::Raw, RenderMode::Termimad] {
@@ -2344,15 +2356,71 @@ mod tests {
                 "{mode:?}: the label waits for the paragraph"
             );
             renderer
-                .end_open_row()
-                .expect("a captured write cannot fail");
-            renderer
                 .push_delta(" rest\n\n")
                 .expect("a captured write cannot fail");
             renderer.finish().expect("a captured write cannot fail");
             assert_eq!(
                 strip_ansi_escapes(renderer.captured()),
-                "Thinking... \n  partial rest\n",
+                "Thinking... partial rest\n",
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// A block another writer interrupts resumes behind its label, whether the interruption found
+    /// the label's row open with the first paragraph still held, or fell between two paragraphs.
+    /// The label goes out at the next delta, as it does at the first, and the blank held behind
+    /// the paragraph before the interruption is not released in front of it. The answer, which
+    /// wears no label, keeps that blank: its paragraphs stay spaced as if nothing had cut in.
+    #[test]
+    fn an_interrupted_block_resumes_behind_its_label() {
+        for mode in [RenderMode::Raw, RenderMode::Termimad] {
+            let mut renderer = super::StreamingRenderer::new(mode).capturing(TEST_WIDTH);
+            renderer
+                .push_delta("one\n\n")
+                .expect("a captured write cannot fail");
+            renderer.interrupt().expect("a captured write cannot fail");
+            renderer
+                .push_delta("two\n\n")
+                .expect("a captured write cannot fail");
+            renderer.finish().expect("a captured write cannot fail");
+            assert_eq!(
+                strip_ansi_escapes(renderer.captured()),
+                "one\n\ntwo\n",
+                "{mode:?}: the answer keeps its paragraph gap across the interruption"
+            );
+        }
+        for mode in [RenderMode::Raw, RenderMode::Termimad] {
+            let mut renderer = super::StreamingRenderer::for_thinking(mode).capturing(TEST_WIDTH);
+            renderer
+                .push_delta("partial")
+                .expect("a captured write cannot fail");
+            renderer.interrupt().expect("a captured write cannot fail");
+            renderer
+                .push_delta(" rest\n\n")
+                .expect("a captured write cannot fail");
+            assert_eq!(
+                strip_ansi_escapes(renderer.captured()),
+                "Thinking... \nThinking... partial rest\n",
+                "{mode:?}: the held text resumes behind a second label"
+            );
+
+            renderer.interrupt().expect("a captured write cannot fail");
+            renderer
+                .push_delta("two")
+                .expect("a captured write cannot fail");
+            assert_eq!(
+                strip_ansi_escapes(renderer.captured()),
+                "Thinking... \nThinking... partial rest\nThinking... ",
+                "{mode:?}: the label goes out at the first delta after the interruption"
+            );
+            renderer
+                .push_delta("\n\n")
+                .expect("a captured write cannot fail");
+            renderer.finish().expect("a captured write cannot fail");
+            assert_eq!(
+                strip_ansi_escapes(renderer.captured()),
+                "Thinking... \nThinking... partial rest\nThinking... two\n",
                 "{mode:?}"
             );
         }

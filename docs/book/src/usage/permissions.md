@@ -123,9 +123,10 @@ rules only add access, so meka hides them there by never covering them: reading 
 per sibling along the path to each, which keeps their names and sizes visible and their bytes
 not, and a workspace root above them is split the same way, at the cost that a new file under
 such a root can land only in one of its subdirectories. The Windows token cannot express the
-denial at all: under it a command at `read` can still read the store, and a workspace root
-containing it can write it, which Windows says at startup. Only `unrestricted` writes there on
-the other backends.
+denial at all: under it a command at `read` can still read the config directory and the store,
+account credentials included, and a workspace root containing them can write them; see
+[Shell](../tools/shell.md#macos-and-windows). Only `unrestricted` writes there on the other
+backends.
 
 Windows works differently enough to be worth stating. meka mints a deterministic capability SID per
 workspace root, adds an inheritable write ACE for it on that root, and runs the shell under a

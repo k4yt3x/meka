@@ -102,6 +102,11 @@ pub(crate) enum Action {
     /// Output that `Console` cannot see is about to print: a slash command answering through one of
     /// the `cli` modules, or a child process meka handed the terminal to.
     AnnounceForeign,
+    /// A `tracing` line is about to print. It takes a row of its own, because the row it would land
+    /// on may be a status line about to be erased or a parked prompt, and spends neither blank: a
+    /// log is not the episode's output, so a warning at startup does not earn the first prompt a
+    /// blank above it, and one right after a typed line does not take the blank owed to the answer.
+    AnnounceLog,
     Block(BlockKind),
     /// An in-place status line is about to be drawn.
     OpenTransient,
@@ -239,6 +244,16 @@ pub(crate) fn step(state: State, spacing: Spacing, action: Action) -> (Emit, Sta
                 next,
             )
         }
+        Action::AnnounceLog => {
+            let settle = settle_row(&mut next);
+            (
+                Emit {
+                    settle,
+                    ..Emit::NOTHING
+                },
+                next,
+            )
+        }
         Action::Block(kind) => {
             let (settle, after_prompt_blank) = open_output(&mut next, spacing);
             let separator_blank = match kind {
@@ -313,13 +328,19 @@ pub(crate) fn step(state: State, spacing: Spacing, action: Action) -> (Emit, Sta
 /// Settle the row and spend the opening blank, which is what every writer of real output does
 /// first.
 fn open_output(next: &mut State, spacing: Spacing) -> (Settle, bool) {
+    let settle = settle_row(next);
+    (settle, spend_pending(next, spacing))
+}
+
+/// Settle the row so the next thing printed starts at column zero of a row of its own.
+fn settle_row(next: &mut State) -> Settle {
     let settle = match next.row {
         RowState::Empty => Settle::Nothing,
         RowState::Transient => Settle::Erase,
         RowState::PromptParked => Settle::Terminate,
     };
     next.row = RowState::Empty;
-    (settle, spend_pending(next, spacing))
+    settle
 }
 
 fn spend_pending(next: &mut State, spacing: Spacing) -> bool {
@@ -433,11 +454,11 @@ impl Console {
         // its cursor may sit mid-row. `step` does not model that row, and does not need to: it is
         // ended here, ahead of every action, so nothing that prints can land on it. Ended by the
         // renderer rather than with a newline of this module's own, because the block resumes
-        // below with its indent only if its lead saw the row end.
+        // below behind its label only if its lead saw the interruption.
         let ended = self
             .stream
             .as_mut()
-            .map(|open| (open.kind, open.renderer.end_open_row()));
+            .map(|open| (open.kind, open.renderer.interrupt()));
         if let Some((kind, Err(error))) = ended {
             self.lost_output(lost_output_of(kind), error);
         }
@@ -486,6 +507,14 @@ impl Console {
     /// the confirmation.
     pub(crate) fn announce_foreign_output(&mut self) {
         self.act(Action::AnnounceForeign);
+    }
+
+    /// Declare that a `tracing` line is about to print.
+    ///
+    /// Called by the relay for every line it writes to stderr off-prompt. See
+    /// [`Action::AnnounceLog`] for what a log line does and does not spend.
+    pub(crate) fn announce_log_line(&mut self) {
+        self.act(Action::AnnounceLog);
     }
 
     pub(crate) fn error(&mut self, error: &dyn std::fmt::Display) {
@@ -818,7 +847,7 @@ mod tests {
     /// A log line arriving while a thinking block holds its first paragraph lands under the label
     /// rather than on its row, and the block stays open to continue below it.
     #[test]
-    fn a_foreign_write_ends_the_row_a_streaming_block_left_open() {
+    fn a_log_line_ends_the_row_a_streaming_block_left_open() {
         let mut console = Console::new(NEITHER, RenderMode::Raw);
         console.open_episode(RowState::Empty, Neighbor::Prompt);
         console.thinking_delta("partial");
@@ -826,7 +855,7 @@ mod tests {
             console.has_open_row(),
             "the label leaves the cursor mid-row"
         );
-        console.announce_foreign_output();
+        console.announce_log_line();
         assert!(
             !console.has_open_row(),
             "the row is ended before the foreign line"
@@ -1074,6 +1103,67 @@ mod tests {
         assert!(
             !parting_word[3].before_prompt_blank,
             "and cannot be bracketed a second time by it",
+        );
+    }
+
+    /// A log line takes a row of its own and spends no bracket. The row, because what it lands on
+    /// may be a status line about to be erased or a parked prompt; no bracket, because a log is
+    /// not the episode's output: counted, a warning at startup earns the first prompt a blank
+    /// above it, and one right after a typed line takes the blank owed to the answer.
+    #[test]
+    fn a_log_line_settles_its_row_and_spends_no_bracket() {
+        let at_startup = run(BOTH, &[
+            Action::OpenEpisode(RowState::Empty, Neighbor::Shell),
+            Action::AnnounceLog,
+            Action::CloseEpisode(Neighbor::Prompt),
+        ]);
+        assert_eq!(
+            total_blanks(&at_startup),
+            0,
+            "a warning under the shell's command line is followed straight by the first prompt",
+        );
+
+        let before_the_answer = run(BOTH, &[
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
+            Action::AnnounceLog,
+            Action::Block(BlockKind::Text),
+            Action::CloseEpisode(Neighbor::Prompt),
+        ]);
+        assert!(
+            !before_the_answer[1].after_prompt_blank,
+            "the log line sits under the typed line",
+        );
+        assert!(
+            before_the_answer[2].after_prompt_blank,
+            "and the answer keeps the blank the typed line owes it",
+        );
+        assert!(before_the_answer[3].before_prompt_blank);
+
+        let over_a_status_line = run(BOTH, &[
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
+            Action::OpenTransient,
+            Action::AnnounceLog,
+        ]);
+        assert_eq!(
+            over_a_status_line[2].settle,
+            Settle::Erase,
+            "the indicator is replaced, not written over",
+        );
+
+        let after_a_wake = run(BOTH, &[
+            Action::OpenEpisode(RowState::PromptParked, Neighbor::Prompt),
+            Action::AnnounceLog,
+            Action::CloseEpisode(Neighbor::Prompt),
+        ]);
+        assert_eq!(
+            after_a_wake[1].settle,
+            Settle::Terminate,
+            "the parked prompt is moved past",
+        );
+        assert_eq!(
+            total_blanks(&after_a_wake),
+            0,
+            "and a wake that only logged leaves no gap before the prompt is redrawn",
         );
     }
 

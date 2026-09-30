@@ -372,11 +372,11 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
     // boundary Windows offers cannot hide meka's own store from a command at `read` the way the
     // bubblewrap and seatbelt masks do; and a workspace root's inheritable ACE grants writes to
     // everything under it, meka's directories included, with no way to subtract them afterwards.
-    // Named at startup because nothing else would: the command succeeds, and the credential it
-    // read leaves over the open network.
+    // A signpost under `-v` rather than a warning: no setting changes it, so a warning at every
+    // launch would be noise with no remedy, and the shell and permissions pages state it.
     #[cfg(windows)]
     if context == WarnContext::Startup {
-        tracing::warn!("the Windows sandbox cannot hide meka's config and credential store");
+        tracing::info!("the Windows sandbox cannot hide meka's config and credential store");
     }
 
     #[cfg(target_os = "linux")]
