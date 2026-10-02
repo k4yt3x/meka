@@ -162,8 +162,10 @@ assumption is the entire return, and it is lost the moment a second place tolera
 
 Run after editing: `cargo +nightly fmt` and `cargo sort -w`.
 
-CI denies warnings on clippy and rustdoc, so the bare commands can pass locally and fail CI.
-Reproduce the exact gate before declaring done:
+CI denies warnings on clippy and rustdoc, so the bare commands can pass locally and fail CI, and
+it runs them on the current stable, which may be newer than yours: a deprecation lands there first.
+Reproduce the exact gate, on the stable `gh run view` reports when yours is older, before declaring
+done:
 
 ```
 cargo +nightly fmt --check

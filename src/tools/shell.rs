@@ -971,7 +971,7 @@ impl OutputBudget {
         use std::sync::atomic::Ordering;
         let before = self
             .remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                 Some(remaining.saturating_sub(bytes))
             })
             .unwrap_or(0);
