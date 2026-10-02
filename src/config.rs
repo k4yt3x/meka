@@ -660,6 +660,10 @@ pub(crate) const DEFAULT_MCP_CONNECT_TIMEOUT: std::time::Duration =
 pub(crate) const DEFAULT_MCP_STDIO_CONCURRENCY: usize = 3;
 /// `[mcp].http_concurrency` when unset: a connect is a request, not a process.
 pub(crate) const DEFAULT_MCP_HTTP_CONCURRENCY: usize = 20;
+/// Cap on one remote tool call when `MEKA_MCP_TOOL_TIMEOUT` is unset: long enough for a database
+/// index rebuild, short enough that a hung server is not invisible.
+pub(crate) const DEFAULT_MCP_TOOL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(600);
 
 /// Default extended-thinking token budget.
 pub(crate) const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 16_000;
@@ -1130,9 +1134,6 @@ pub(crate) struct RunRequest {
     /// CLI-flag override for `[serve].bind` (`meka serve --bind ...`). Wins over the config file
     /// when set.
     pub(crate) serve_bind_override: Option<String>,
-    /// `--instructions` verbatim; the host resolves it against the persistent tiers at startup
-    /// through [`crate::instructions::resolve`].
-    pub(crate) instructions: Option<String>,
 }
 
 /// One configured profile as a listing shows it: its name, the account it bills, that account's
@@ -1260,6 +1261,9 @@ pub(crate) struct ResolvedConfig {
     /// entry stays relative because each session resolves it against its own working directory
     /// when it opens; see [`InstructionsConfig::files`]. Empty unless configured.
     pub(crate) instruction_files: Vec<std::path::PathBuf>,
+    /// Which tier the standing instructions come from; see [`StandingInstructions::select`]. The
+    /// text is read where a run needs it, by [`crate::instructions::resolve`].
+    pub(crate) standing_instructions: StandingInstructions,
     /// Whether the `skill_read` / `skill_search` tools are registered and the `[Skills]` index
     /// rendered. Defaults to `true`; see [`SkillsConfig`].
     pub(crate) skills_enabled: bool,
@@ -1292,6 +1296,8 @@ pub(crate) struct ResolvedConfig {
     pub(crate) mcp_grace: std::time::Duration,
     /// Per-server connect+initialize timeout.
     pub(crate) mcp_connect_timeout: std::time::Duration,
+    /// Cap on one remote tool call: `MEKA_MCP_TOOL_TIMEOUT`, else [`DEFAULT_MCP_TOOL_TIMEOUT`].
+    pub(crate) mcp_tool_timeout: std::time::Duration,
     /// How many stdio servers the startup connector spawns at once.
     pub(crate) mcp_stdio_concurrency: usize,
     /// How many HTTP servers the startup connector connects at once.
@@ -1302,6 +1308,12 @@ pub(crate) struct ResolvedConfig {
     pub(crate) serve: Option<ServeConfig>,
     /// What this invocation asked for, as distinct from how meka is configured.
     pub(crate) request: RunRequest,
+    /// The scripted provider a test harness asked for with `MEKA_MOCK_PROVIDER=1`.
+    #[cfg(any(debug_assertions, feature = "mock-provider"))]
+    pub(crate) mock_provider: Option<MockProviderRequest>,
+    /// Where an HTTP turn waits for a test's signal ahead of admission: `MEKA_MOCK_TURN_HOLD`.
+    #[cfg(any(debug_assertions, feature = "mock-provider"))]
+    pub(crate) mock_turn_hold: Option<PathBuf>,
 }
 
 /// Deserialize an optional humantime duration string (e.g. `"24h"`, `"5m"`, `"30s"`).
@@ -1784,6 +1796,96 @@ fn resolve_permission(
     (requested.unwrap_or(resolved_default), enabled, requested)
 }
 
+/// Which tier the standing instructions come from, as [`Self::select`] decides it.
+///
+/// A choice of source rather than the text: the text is files and environment, read once by
+/// [`crate::instructions::resolve`] at the point where a run that cannot load the guidance the user
+/// named must not start, and `meka instructions show` reads the persistent tiers the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StandingInstructions {
+    /// `--instructions`, verbatim.
+    Flag(String),
+    /// `MEKA_INSTRUCTIONS`, verbatim.
+    Inline(String),
+    /// `MEKA_INSTRUCTIONS_FILE`: a file, or a directory of files.
+    File(PathBuf),
+    /// The conventional path under the config directory.
+    Conventional,
+    /// `MEKA_INSTRUCTIONS` and `MEKA_INSTRUCTIONS_FILE` both set. Refused where the text is read
+    /// rather than resolved to one of them: there is no reading under which someone meant both, so
+    /// picking one would hide the mistake.
+    Conflict,
+}
+
+impl StandingInstructions {
+    /// `--instructions`, else `MEKA_INSTRUCTIONS`, else `MEKA_INSTRUCTIONS_FILE`, else the
+    /// conventional path: the one statement of the precedence, read by
+    /// [`ResolvedConfig::resolve`] and by `meka instructions show`, which asks with no flag.
+    ///
+    /// Inline and file are two transports for one setting, and the string channels (argv,
+    /// environment) cannot always point at a file: the `mekabox` wrapper mounts the host config
+    /// directory read-only and overrides the instructions for the container with one `-e`.
+    pub(crate) fn select(flag: Option<&str>) -> Self {
+        if let Some(text) = flag {
+            return Self::Flag(text.to_string());
+        }
+        match (
+            std::env::var("MEKA_INSTRUCTIONS").ok(),
+            std::env::var_os("MEKA_INSTRUCTIONS_FILE"),
+        ) {
+            (Some(_), Some(_)) => Self::Conflict,
+            (Some(text), None) => Self::Inline(text),
+            (None, Some(path)) => Self::File(PathBuf::from(path)),
+            (None, None) => Self::Conventional,
+        }
+    }
+}
+
+/// What `MEKA_MOCK_PROVIDER=1` asks for: the scripted provider in place of every profile's, playing
+/// the rounds `MEKA_MOCK_PROVIDER_SCRIPT` names, or none.
+#[cfg(any(debug_assertions, feature = "mock-provider"))]
+#[derive(Debug)]
+pub(crate) struct MockProviderRequest {
+    pub(crate) script: Option<PathBuf>,
+}
+
+/// The request `MEKA_MOCK_PROVIDER=1` makes, or `None` when it is not set to that.
+#[cfg(any(debug_assertions, feature = "mock-provider"))]
+fn mock_provider_override() -> Option<MockProviderRequest> {
+    (std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1")).then(|| MockProviderRequest {
+        script: std::env::var_os("MEKA_MOCK_PROVIDER_SCRIPT").map(PathBuf::from),
+    })
+}
+
+/// `MEKA_MCP_TOOL_TIMEOUT` as a duration, with the same tolerance as [`sandbox_backend_override`]:
+/// a value meka cannot use is warned about and ignored.
+fn mcp_tool_timeout_override() -> Option<std::time::Duration> {
+    parse_mcp_tool_timeout(&std::env::var("MEKA_MCP_TOOL_TIMEOUT").ok()?)
+}
+
+/// Parse a `MEKA_MCP_TOOL_TIMEOUT` value (trimmed). Empty yields `None`; a bare number has no unit
+/// and either guess is invisible when wrong, and a zero would time out every call before it is
+/// sent, so both yield `None` with a warning rather than a timeout nobody asked for.
+fn parse_mcp_tool_timeout(value: &str) -> Option<std::time::Duration> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match humantime_serde::re::humantime::parse_duration(trimmed) {
+        Ok(timeout) if !timeout.is_zero() => Some(timeout),
+        Ok(_) => {
+            tracing::warn!(
+                "ignoring MEKA_MCP_TOOL_TIMEOUT='{trimmed}': a zero timeout fails every call"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!("ignoring MEKA_MCP_TOOL_TIMEOUT='{trimmed}': {error}");
+            None
+        }
+    }
+}
+
 /// `MEKA_SANDBOX_BACKEND` overrides `[shell].sandbox_backend` for non-interactive / containerized
 /// runs (the `mekabox` wrapper sets it to pin Landlock and silence the auto-resolve warning when
 /// it mounts the host config read-only). Takes the one spelling the file takes; an unrecognized
@@ -1911,6 +2013,7 @@ impl ResolvedConfig {
                 .as_deref()
                 .unwrap_or_default(),
         );
+        let standing_instructions = StandingInstructions::select(overrides.instructions.as_deref());
         let file_skills = config_file.skills.unwrap_or_default();
         let skills_enabled = file_skills.enabled.unwrap_or(true);
         let skills_agent_managed = file_skills.agent_managed.unwrap_or(false);
@@ -1941,6 +2044,7 @@ impl ResolvedConfig {
         let mcp_connect_timeout = file_mcp
             .connect_timeout
             .unwrap_or(DEFAULT_MCP_CONNECT_TIMEOUT);
+        let mcp_tool_timeout = mcp_tool_timeout_override().unwrap_or(DEFAULT_MCP_TOOL_TIMEOUT);
         let mcp_stdio_concurrency = file_mcp
             .stdio_concurrency
             .unwrap_or(DEFAULT_MCP_STDIO_CONCURRENCY);
@@ -2128,6 +2232,7 @@ impl ResolvedConfig {
             mcp_default_permission,
             profile_summaries,
             instruction_files,
+            standing_instructions,
             skills_enabled,
             skills_agent_managed,
             skills_extra_paths,
@@ -2145,6 +2250,7 @@ impl ResolvedConfig {
                 .unwrap_or_else(default_input_style),
             mcp_grace,
             mcp_connect_timeout,
+            mcp_tool_timeout,
             mcp_stdio_concurrency,
             mcp_http_concurrency,
             serve: config_file.serve,
@@ -2160,8 +2266,11 @@ impl ResolvedConfig {
                 oneshot: overrides.oneshot,
                 output_format: overrides.output_format,
                 serve_bind_override: None,
-                instructions: overrides.instructions,
             },
+            #[cfg(any(debug_assertions, feature = "mock-provider"))]
+            mock_provider: mock_provider_override(),
+            #[cfg(any(debug_assertions, feature = "mock-provider"))]
+            mock_turn_hold: std::env::var_os("MEKA_MOCK_TURN_HOLD").map(PathBuf::from),
         }
     }
 
@@ -4603,7 +4712,7 @@ file_read = "unrestricted"
 
         // SAFETY: `CONFIG_DIR_ENV_LOCK` serializes this with every other env-var test.
         unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
-        let resolved = resolve_instructions(None);
+        let resolved = resolve_instructions(&StandingInstructions::select(None));
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
 
         let found = resolved.expect("ok").expect("some");
@@ -4627,7 +4736,7 @@ file_read = "unrestricted"
 
         // SAFETY: guarded above.
         unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
-        let resolved = resolve_instructions(None);
+        let resolved = resolve_instructions(&StandingInstructions::select(None));
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
 
         assert_eq!(
@@ -4650,7 +4759,7 @@ file_read = "unrestricted"
             std::env::set_var("MEKA_CONFIG_DIR", dir.path());
             std::env::set_var("MEKA_INSTRUCTIONS", "FROM THE ENV");
         }
-        let resolved = resolve_instructions(None);
+        let resolved = resolve_instructions(&StandingInstructions::select(None));
         unsafe {
             std::env::remove_var("MEKA_CONFIG_DIR");
             std::env::remove_var("MEKA_INSTRUCTIONS");
@@ -4670,13 +4779,91 @@ file_read = "unrestricted"
 
         // SAFETY: guarded above.
         unsafe { std::env::set_var("MEKA_INSTRUCTIONS_FILE", &path) };
-        let resolved = resolve_instructions(None);
+        let resolved = resolve_instructions(&StandingInstructions::select(None));
         unsafe { std::env::remove_var("MEKA_INSTRUCTIONS_FILE") };
 
         assert_eq!(
             resolved.expect("ok").expect("some").text,
             "from the named path"
         );
+    }
+
+    /// The tiers in order, each beating the next: the flag, the inline variable, the file variable,
+    /// the conventional path; and both variables at once resolve to a refusal rather than to
+    /// either.
+    #[test]
+    fn the_instructions_tiers_are_taken_in_order() {
+        let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
+        // SAFETY: guarded above.
+        unsafe {
+            std::env::remove_var("MEKA_INSTRUCTIONS");
+            std::env::remove_var("MEKA_INSTRUCTIONS_FILE");
+        }
+        assert_eq!(
+            StandingInstructions::select(None),
+            StandingInstructions::Conventional
+        );
+        unsafe { std::env::set_var("MEKA_INSTRUCTIONS_FILE", "/somewhere.md") };
+        assert_eq!(
+            StandingInstructions::select(None),
+            StandingInstructions::File(PathBuf::from("/somewhere.md"))
+        );
+        unsafe { std::env::set_var("MEKA_INSTRUCTIONS", "inline") };
+        assert_eq!(
+            StandingInstructions::select(None),
+            StandingInstructions::Conflict
+        );
+        unsafe { std::env::remove_var("MEKA_INSTRUCTIONS_FILE") };
+        assert_eq!(
+            StandingInstructions::select(None),
+            StandingInstructions::Inline("inline".to_string())
+        );
+        assert_eq!(
+            StandingInstructions::select(Some("flag")),
+            StandingInstructions::Flag("flag".to_string())
+        );
+        unsafe { std::env::remove_var("MEKA_INSTRUCTIONS") };
+    }
+
+    /// The variable takes a duration string; a bare number and a zero both fall to the default
+    /// rather than to a timeout nobody asked for.
+    #[test]
+    fn the_tool_timeout_variable_takes_a_duration_and_nothing_else() {
+        assert_eq!(
+            parse_mcp_tool_timeout("90s"),
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_mcp_tool_timeout(" 2m "),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(parse_mcp_tool_timeout(""), None);
+        assert_eq!(parse_mcp_tool_timeout("600000"), None);
+        assert_eq!(parse_mcp_tool_timeout("0s"), None);
+        assert_eq!(parse_mcp_tool_timeout("soon"), None);
+    }
+
+    /// The variable is read once, into the resolved config, and the default stands when it is
+    /// unset.
+    #[test]
+    fn the_tool_timeout_variable_reaches_the_resolved_config() {
+        use clap::Parser;
+        let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        // SAFETY: guarded above.
+        unsafe {
+            std::env::set_var("MEKA_CONFIG_DIR", dir.path());
+            std::env::set_var("MEKA_MCP_TOOL_TIMEOUT", "90s");
+        }
+        let overridden = ResolvedConfig::resolve(crate::cli::Cli::parse_from(["meka"]).overrides());
+        unsafe { std::env::remove_var("MEKA_MCP_TOOL_TIMEOUT") };
+        let unset = ResolvedConfig::resolve(crate::cli::Cli::parse_from(["meka"]).overrides());
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+        assert_eq!(
+            overridden.mcp_tool_timeout,
+            std::time::Duration::from_secs(90)
+        );
+        assert_eq!(unset.mcp_tool_timeout, DEFAULT_MCP_TOOL_TIMEOUT);
     }
 
     /// The provenance a `[serve]` token reports is whether the environment supplied it: a
@@ -4723,7 +4910,7 @@ file_read = "unrestricted"
             std::env::set_var("MEKA_INSTRUCTIONS", "inline");
             std::env::set_var("MEKA_INSTRUCTIONS_FILE", "/nonexistent.md");
         }
-        let resolved = resolve_instructions(None);
+        let resolved = resolve_instructions(&StandingInstructions::select(None));
         unsafe {
             std::env::remove_var("MEKA_INSTRUCTIONS");
             std::env::remove_var("MEKA_INSTRUCTIONS_FILE");
@@ -4739,8 +4926,9 @@ file_read = "unrestricted"
         let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
         // SAFETY: guarded above.
         unsafe { std::env::set_var("MEKA_INSTRUCTIONS", "from the env") };
-        let resolved = resolve_instructions(Some("  from the flag  "));
-        let blank = resolve_instructions(Some("   \n\t "));
+        let resolved =
+            resolve_instructions(&StandingInstructions::select(Some("  from the flag  ")));
+        let blank = resolve_instructions(&StandingInstructions::select(Some("   \n\t ")));
         unsafe { std::env::remove_var("MEKA_INSTRUCTIONS") };
 
         assert_eq!(resolved.expect("ok").expect("some").text, "from the flag");
@@ -4815,7 +5003,8 @@ thinking = "budgeted"
             std::env::set_var("MEKA_INSTRUCTIONS", "FROM ENV VAR");
         }
 
-        let resolved = resolve_instructions(None).expect("instructions resolve");
+        let resolved = resolve_instructions(&StandingInstructions::select(None))
+            .expect("instructions resolve");
 
         // SAFETY: same as above, the `CONFIG_DIR_ENV_LOCK` guard is held for the full
         // set→read→clear cycle.

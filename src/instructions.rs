@@ -312,47 +312,34 @@ pub(crate) fn warn_if_large(instructions: &Instructions) {
 /// [`resolve`] over the persistent tiers only, for `meka instructions show`: a per-run
 /// `--instructions` is not part of what a standalone query is asking about.
 pub(crate) fn resolve_for_display() -> crate::error::Result<Option<Instructions>> {
-    resolve(None)
+    resolve(&crate::config::StandingInstructions::select(None))
 }
 
-/// Resolve the user's standing instructions across the tiers that can carry them, most specific
-/// first: `--instructions`, then `MEKA_INSTRUCTIONS`, then `MEKA_INSTRUCTIONS_FILE`, then the
-/// conventional path under the config directory.
+/// Read the standing instructions from the tier [`crate::config::StandingInstructions::select`]
+/// chose.
 ///
-/// Inline and file are two transports for one setting, and the string channels (argv, environment)
-/// cannot always point at a file: the `mekabox` wrapper mounts the host config directory read-only
-/// and overrides the instructions for the container with one `-e`.
-///
-/// Setting both environment variables is refused rather than silently resolved: there is no reading
-/// under which someone meant both, so picking one would hide the mistake.
-pub(crate) fn resolve(flag: Option<&str>) -> crate::error::Result<Option<Instructions>> {
-    if let Some(text) = flag {
+/// A flag or an inline value that is blank is no instructions at all rather than a fall-through to
+/// the next tier: the user said "none", and the conventional file is not what they meant.
+pub(crate) fn resolve(
+    selection: &crate::config::StandingInstructions,
+) -> crate::error::Result<Option<Instructions>> {
+    use crate::config::StandingInstructions;
+    let inline = |text: &str, source: InstructionsSource| {
         let text = text.trim();
-        return Ok((!text.is_empty()).then(|| Instructions {
+        (!text.is_empty()).then(|| Instructions {
             text: text.to_string(),
-            source: InstructionsSource::Flag,
-        }));
-    }
-
-    let inline = std::env::var("MEKA_INSTRUCTIONS").ok();
-    let from_file = std::env::var("MEKA_INSTRUCTIONS_FILE").ok();
-    if inline.is_some() && from_file.is_some() {
-        return Err(crate::error::MekaError::Config(
+            source,
+        })
+    };
+    match selection {
+        StandingInstructions::Flag(text) => Ok(inline(text, InstructionsSource::Flag)),
+        StandingInstructions::Inline(text) => Ok(inline(text, InstructionsSource::Env)),
+        StandingInstructions::File(path) => read_explicit(path).map(Some),
+        StandingInstructions::Conventional => Ok(discover()),
+        StandingInstructions::Conflict => Err(crate::error::MekaError::Config(
             "`MEKA_INSTRUCTIONS` and `MEKA_INSTRUCTIONS_FILE` are both set; unset one".to_string(),
-        ));
+        )),
     }
-
-    if let Some(text) = inline {
-        let text = text.trim();
-        return Ok((!text.is_empty()).then(|| Instructions {
-            text: text.to_string(),
-            source: InstructionsSource::Env,
-        }));
-    }
-    if let Some(path) = from_file {
-        return read_explicit(Path::new(&path)).map(Some);
-    }
-    Ok(discover())
 }
 #[cfg(test)]
 mod tests {

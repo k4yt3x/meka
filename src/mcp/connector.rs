@@ -841,6 +841,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
             instructions: std::sync::RwLock::new(None),
             request_timeout: std::sync::OnceLock::new(),
@@ -870,15 +871,22 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
             instructions: std::sync::RwLock::new(None),
             request_timeout: std::sync::OnceLock::new(),
             background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         });
-        let manager = McpClientManager::prepare(&[], None, None, McpClientContext::new())
-            .await
-            .expect("empty manager");
+        let manager = McpClientManager::prepare(
+            &[],
+            None,
+            None,
+            McpClientContext::new(),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("empty manager");
         connect_one(
             Arc::clone(&entry),
             manager,
@@ -929,15 +937,22 @@ mod tests {
                 at: std::time::Instant::now(),
             }),
             reconnect_lock: Mutex::new(()),
+            tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: Some(reason.to_string()),
             instructions: std::sync::RwLock::new(None),
             request_timeout: std::sync::OnceLock::new(),
             background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         });
-        let manager = McpClientManager::prepare(&[], None, None, McpClientContext::new())
-            .await
-            .expect("empty manager");
+        let manager = McpClientManager::prepare(
+            &[],
+            None,
+            None,
+            McpClientContext::new(),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("empty manager");
 
         connect_one(
             Arc::clone(&entry),
@@ -977,6 +992,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
             instructions: std::sync::RwLock::new(None),
             request_timeout: OnceLock::new(),
@@ -987,9 +1003,15 @@ mod tests {
         // The test never reaches tool discovery (the connect itself times out), so the manager
         // isn't observed; build a minimal one just to satisfy the signature.
         let context = McpClientContext::new();
-        let manager = McpClientManager::prepare(&[], None, None, context)
-            .await
-            .expect("empty manager");
+        let manager = McpClientManager::prepare(
+            &[],
+            None,
+            None,
+            context,
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("empty manager");
         connect_one(
             Arc::clone(&entry),
             manager,
@@ -1030,15 +1052,22 @@ mod tests {
                 at: std::time::Instant::now(),
             }),
             reconnect_lock: Mutex::new(()),
+            tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
             instructions: std::sync::RwLock::new(None),
             request_timeout: OnceLock::new(),
             background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         });
-        let manager = McpClientManager::prepare(&[], None, None, McpClientContext::new())
-            .await
-            .expect("empty manager");
+        let manager = McpClientManager::prepare(
+            &[],
+            None,
+            None,
+            McpClientContext::new(),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("empty manager");
         (entry, manager)
     }
 

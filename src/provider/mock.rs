@@ -6,8 +6,9 @@
 //! `meka serve`, and the CLI entry point behind the REPL and `--oneshot`. That last one is what
 //! lets a test ask what two `meka` processes do to each other's sessions. A second variable,
 //! `MEKA_MOCK_PROVIDER_SCRIPT`, names the file holding the JSON-encoded script (see
-//! [`crate::provider::mock::load_script_from_env`]). Nothing here is reachable without them, and
-//! the whole module is compiled out of a release build.
+//! [`crate::provider::mock::load_script`]). Both are read by `ResolvedConfig::resolve`, like
+//! every other `MEKA_*` variable, and acted on by `host::build_shared_deps`. Nothing here is
+//! reachable without them, and the whole module is compiled out of a release build.
 //!
 //! The mock is intentionally minimal: text deltas, thinking deltas, tool-use lifecycle,
 //! `MessageEnd`, plus a synthetic `Fail` event that returns an error from [`Provider::stream`] so
@@ -620,24 +621,20 @@ impl Provider for MockProvider {
     }
 }
 
-/// Read the JSON script from the path named in `MEKA_MOCK_PROVIDER_SCRIPT`. Returns `Ok(None)`
-/// when the env var is unset; `Err` only on actual parse failure (so the meka startup path can
-/// choose to log+abort vs proceed).
-pub(crate) fn load_script_from_env() -> Result<Option<Vec<Vec<MockEvent>>>> {
-    let Ok(path) = std::env::var("MEKA_MOCK_PROVIDER_SCRIPT") else {
-        return Ok(None);
-    };
-    let body = std::fs::read_to_string(&path).map_err(|error| {
+/// The JSON-encoded script at `path`, which `MEKA_MOCK_PROVIDER_SCRIPT` named.
+pub(crate) fn load_script(path: &std::path::Path) -> Result<Vec<Vec<MockEvent>>> {
+    let body = std::fs::read_to_string(path).map_err(|error| {
         crate::error::MekaError::Config(format!(
-            "failed to read MEKA_MOCK_PROVIDER_SCRIPT='{path}': {error}",
+            "failed to read MEKA_MOCK_PROVIDER_SCRIPT='{}': {error}",
+            path.display()
         ))
     })?;
-    let rounds: Vec<Vec<MockEvent>> = serde_json::from_str(&body).map_err(|error| {
+    serde_json::from_str(&body).map_err(|error| {
         crate::error::MekaError::Config(format!(
-            "MEKA_MOCK_PROVIDER_SCRIPT='{path}' is not valid JSON: {error}",
+            "MEKA_MOCK_PROVIDER_SCRIPT='{}' is not valid JSON: {error}",
+            path.display()
         ))
-    })?;
-    Ok(Some(rounds))
+    })
 }
 
 /// Send the `StreamEvent::Error` that every real driver emits immediately before returning its own

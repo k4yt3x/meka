@@ -382,11 +382,14 @@ async fn connect_alone(
     token_store: &TokenStore,
     context: Arc<McpClientContext>,
 ) -> Result<(Arc<McpClientManager>, bool)> {
+    // None of the three probes calls a tool, so the per-call cap never applies and the default
+    // stands in rather than threading a `ResolvedConfig` these commands do not otherwise need.
     let manager = McpClientManager::prepare(
         std::slice::from_ref(config),
         mcp_default,
         Some(token_store.clone()),
         context,
+        crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
     )
     .await?;
     manager.start_connector(crate::mcp::McpRuntimeConfig {

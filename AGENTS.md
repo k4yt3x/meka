@@ -304,7 +304,10 @@ output; don't demote it to `info!`.
     `deny_unknown_fields` names the key and line; the upgrade guide carries the remedy.
 - **Environment variables are operational only**: `MEKA_CONFIG_DIR`, `MEKA_DATA_DIR`, permission,
   instructions, sandbox backend, render mode, MCP tool timeout, `RUST_LOG`. Precedence is CLI > env
-  > file, written as `cli.x.or_else(env).or(file)` in `ResolvedConfig::resolve`.
+  > file, written as `cli.x.or_else(env).or(file)` in `ResolvedConfig::resolve`, and every layer
+  below the hosts takes the result as a value. `tests/layering.rs` keeps every other file from
+  reading a `MEKA_*` variable (`ENVIRONMENT_READERS`); `MEKA_CONFIG_DIR` and `MEKA_DATA_DIR` are
+  `paths.rs`'s, because they locate the file `resolve` reads.
 - **Session and display tuning is config-only.** No env vars or flags for set-once preferences.
   Render mode is the one exception, because the program that launches meka, not the user, knows
   whether its output is a terminal.

@@ -331,7 +331,7 @@ pub(crate) async fn submit_turn(
     // lock. From admission on the lock does the rest: DELETE's write-lock blocks behind any
     // reader, so by the time it fires `in_flight > 0` and its re-check returns 409.
     #[cfg(any(debug_assertions, feature = "mock-provider"))]
-    hold_before_admission().await;
+    hold_before_admission(state.shared.config.mock_turn_hold.as_deref()).await;
     let (entry, turn_guard) = loop {
         {
             let map = state.sessions.read().await;
@@ -432,18 +432,17 @@ fn refuse_images_without_vision(images: usize, vision: bool) -> Result<(), Probl
 }
 
 /// A test's hand on the gap between a turn's validation and its admission. Only where the mock
-/// provider exists, and only when `MEKA_MOCK_TURN_HOLD` names a path: the handler marks that it
+/// provider exists, and only when `MEKA_MOCK_TURN_HOLD` named a path: the handler marks that it
 /// has reached the gap by creating that path with `.waiting` appended, then waits until the path
 /// itself exists. A test can then act on the session (delete it, let the idle sweep evict it)
 /// while a turn stands in exactly this window, which no amount of image decoding can guarantee in
 /// a build where decoding is fast. Bounded, so a test that never releases the hold fails on its
 /// own clock rather than hanging the server.
 #[cfg(any(debug_assertions, feature = "mock-provider"))]
-async fn hold_before_admission() {
-    let Ok(path) = std::env::var("MEKA_MOCK_TURN_HOLD") else {
+async fn hold_before_admission(hold: Option<&std::path::Path>) {
+    let Some(path) = hold else {
         return;
     };
-    let path = std::path::PathBuf::from(path);
     if let Err(error) = tokio::fs::write(path.with_extension("waiting"), b"").await {
         tracing::warn!("MEKA_MOCK_TURN_HOLD: failed to mark the hold: {error}");
     }

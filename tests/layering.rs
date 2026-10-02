@@ -460,6 +460,71 @@ fn production_code_names_the_temp_directory_only_where_the_ledger_says() {
     );
 }
 
+/// Files whose production code may read a `MEKA_*` environment variable, and why. The same kind
+/// of ledger as [`TEMP_DIRECTORY_USERS`]: an entry that stops being true fails the test too.
+const ENVIRONMENT_READERS: &[(&str, &str)] = &[
+    (
+        "src/config.rs",
+        "precedence, CLI over environment over file, is written once in `ResolvedConfig::resolve`",
+    ),
+    (
+        "src/paths.rs",
+        "`MEKA_CONFIG_DIR` and `MEKA_DATA_DIR` locate the config file itself, so they are read \
+         before it",
+    ),
+];
+
+/// A `MEKA_*` variable is read where [`ENVIRONMENT_READERS`] says and nowhere else, so the
+/// precedence the config module states cannot be contradicted by a reader three modules away, and
+/// every layer below the hosts takes its settings as values. Matched by the literal name, which is
+/// how every such read is spelled.
+#[test]
+fn production_code_reads_meka_variables_only_where_the_ledger_says() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    source_files(&root.join("src"), &mut files);
+    files.sort();
+
+    let allowed: BTreeSet<&str> = ENVIRONMENT_READERS.iter().map(|(file, _)| *file).collect();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut violations = Vec::new();
+
+    for path in &files {
+        let relative = path
+            .strip_prefix(root)
+            .expect("a path under the manifest directory")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source = fs::read_to_string(path).expect("read a source file");
+        let code = strip_test_code(&source)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if code.contains("var(\"MEKA_") || code.contains("var_os(\"MEKA_") {
+            if allowed.contains(relative.as_str()) {
+                seen.insert(relative);
+            } else {
+                violations.push(format!("{relative} reads a MEKA_ variable"));
+            }
+        }
+    }
+
+    for (file, _) in ENVIRONMENT_READERS {
+        if !seen.contains(*file) {
+            violations.push(format!(
+                "{file} no longer reads a MEKA_ variable; remove it from the ledger"
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "environment reads outside the ledger:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
 #[test]
 fn code_is_not_an_edge() {
     let source = "use crate::store::Store;\n#[cfg(test)]\nmod tests {\n    use crate::host::Sessions;\n    let close = \"\\n    }\\n\"; let open = '{'; // a brace: }\n    let raw = r#\"}\"#;\n}\n#[cfg(test)]\nuse crate::cli::Cli;\n#[cfg(test)]\n#[allow(dead_code)]\nfn helper() { crate::render::x(); }\nfn kept() { crate::agent::y(); }\n";

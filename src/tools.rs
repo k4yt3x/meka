@@ -1318,6 +1318,7 @@ mod tests {
             None,
             None,
             crate::mcp::McpClientContext::new(),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
         )
         .await
         .expect("prepare with one configured server");

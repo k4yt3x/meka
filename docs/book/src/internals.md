@@ -183,6 +183,7 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | What a delete locks | `Store::lock_tree`: the session and every sub-agent under it, since the cascade takes them | the sweep and `--all` (over roots, through `delete_the_unattached_among`), `session delete <id>`, `agent_delete`, the servers' deletes of a session they have not loaded |
 | What `${VAR}` means in `config.toml` | `config::expand_env_vars`, one grammar (`${VAR}`, `${VAR:-default}`; an unclosed `${`, an empty name or a nested default is reported as malformed and left as written); what a miss or a malformed reference costs is the caller's: `[serve]` refuses, an MCP server is refused when it sits in `args`, `env`, `url` or `headers`, and `mcp add` skips its probe | `[serve]` tokens and URLs, every MCP server field |
 | What a tool call's arguments are, and whether it detaches | `tools::admit_arguments` | dispatch, ahead of every tool |
+| Where a `MEKA_*` variable is read | `ResolvedConfig::resolve` in `config.rs`, with `paths.rs` for the two that locate the config file; `tests/layering.rs` keeps every other file out through its `ENVIRONMENT_READERS` ledger | every operational override: the permission level, the standing instructions, the sandbox backend, the render mode, the MCP tool timeout, and the debug-only mock switches |
 | The level a call must clear | `tools::effective_permission`: the `[tools.tool_permissions]` override, else the tool's own | dispatch, the gate, `tool_load`'s listing, the catalog |
 | What level a scheduled job runs at | `scheduler::live_permission`, reading the session row through `admit_recorded` | the fire door, the wake watcher, `meka schedule show` |
 | Whether a recorded level still applies | `EnabledPermissions::admit_recorded` | a resume on every host (`host/assembly.rs`, `host/http/reattach.rs`, `host/acp/session.rs`), the scheduler |
@@ -344,8 +345,9 @@ dependencies only it needs, so `--no-default-features` builds a meka without one
 is behind `cfg(feature = "serve")`. `mock-provider` compiles in `provider/mock.rs`, the scripted
 provider the test suites drive every host with; debug builds carry it regardless, and CI enables it
 so a release-profile build is testable too. A shipped artifact is built without it. At run time,
-`MEKA_MOCK_PROVIDER=1` selects that provider on every host (`provider/registry.rs`,
-`host/assembly.rs`) and `MEKA_MOCK_PROVIDER_SCRIPT` names the JSON script it plays back.
+`MEKA_MOCK_PROVIDER=1` selects that provider on every host and `MEKA_MOCK_PROVIDER_SCRIPT` names
+the JSON script it plays back; both are read by `ResolvedConfig::resolve`, like every other `MEKA_*`
+variable, and acted on by `host::build_shared_deps`.
 
 The integration crates are gated on the same fact: `tests/acp.rs` and `tests/cli.rs` carry
 `#![cfg(any(debug_assertions, feature = "mock-provider"))]`; `tests/serve.rs` and

@@ -894,9 +894,15 @@ mod tests {
             required: None,
         };
         let context = McpClientContext::new();
-        let manager = McpClientManager::prepare(&[server_config], None, None, context)
-            .await
-            .expect("prepare with one server should succeed");
+        let manager = McpClientManager::prepare(
+            &[server_config],
+            None,
+            None,
+            context,
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare with one server should succeed");
 
         let registry = ToolRegistry::new();
         register_all(&registry, manager);

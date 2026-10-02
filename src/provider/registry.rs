@@ -334,8 +334,8 @@ pub(crate) struct ProviderRegistry {
     pub(super) built: std::sync::Mutex<std::collections::HashMap<ProviderKey, CachedProvider>>,
     /// Debug-only: a scripted provider that stands in for every profile.
     ///
-    /// Set by the three hosts when `MEKA_MOCK_PROVIDER=1`. One override here covers every profile,
-    /// which is what a harness driving a session on any profile wants.
+    /// Set by `host::build_shared_deps` when the config asks for one. One override here covers
+    /// every profile, which is what a harness driving a session on any profile wants.
     #[cfg(any(debug_assertions, feature = "mock-provider"))]
     pub(super) scripted: std::sync::Mutex<Option<Arc<dyn Provider>>>,
 }
@@ -553,13 +553,6 @@ impl ProviderRegistry {
     }
 
     pub(super) async fn credential_for(&self, account: &str) -> Result<AuthCredential> {
-        // Debug-only: the scripted provider replaces whatever this returns, so a harness need not
-        // seed a credential it will never use. Reached only when `ProviderRegistry::build` was
-        // called before a host installed the script.
-        #[cfg(any(debug_assertions, feature = "mock-provider"))]
-        if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
-            return Ok(AuthCredential::ApiKey("mock-provider".to_string()));
-        }
         match self.token_store.load_account_credential(account).await? {
             Some(credential) => Ok(credential),
             None => Err(MekaError::Config(format!(

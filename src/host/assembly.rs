@@ -183,10 +183,13 @@ pub(crate) async fn build_shared_deps(
     // this process is. Installed rather than swapped into a rebuilt registry, so a harness driving
     // sessions on different profiles gets the script for all of them.
     #[cfg(any(debug_assertions, feature = "mock-provider"))]
-    if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
-        let rounds = crate::provider::mock::load_script_from_env()
-            .map_err(|error| anyhow::anyhow!("failed to load the mock provider script: {error}"))?
-            .unwrap_or_default();
+    if let Some(request) = &config.mock_provider {
+        let rounds = match &request.script {
+            Some(path) => crate::provider::mock::load_script(path).map_err(|error| {
+                anyhow::anyhow!("failed to load the mock provider script: {error}")
+            })?,
+            None => Vec::new(),
+        };
         tracing::info!("MEKA_MOCK_PROVIDER=1: using scripted mock provider");
         providers.install_scripted(Arc::new(crate::provider::mock::MockProvider::from_rounds(
             rounds,
@@ -241,9 +244,9 @@ pub(crate) async fn build_shared_deps(
             CoreMaterials::from_config(&config, builtin_filter.clone(), &sandbox),
         )));
 
-    // Resolved here rather than during configuration: the persistent tiers are files and
-    // environment, and a run that cannot load the guidance the user named must not start.
-    let instructions = crate::instructions::resolve(config.request.instructions.as_deref())?;
+    // Read here rather than during configuration: the tier is config's choice, the text is a
+    // file's, and a run that cannot load the guidance the user named must not start.
+    let instructions = crate::instructions::resolve(&config.standing_instructions)?;
     if let Some(found) = &instructions {
         crate::instructions::warn_if_large(found);
         tracing::info!("instructions loaded from {source}", source = found.source);

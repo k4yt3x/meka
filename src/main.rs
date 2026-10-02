@@ -448,6 +448,7 @@ async fn async_main(
             config.mcp_default_permission,
             Some(token_store.clone()),
             Arc::clone(&mcp_context),
+            config.mcp_tool_timeout,
         )
         .await?;
         mcp_context.set_manager(Arc::downgrade(&manager));

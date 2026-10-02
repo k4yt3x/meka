@@ -314,31 +314,6 @@ pub(crate) struct CallContext {
     pub(crate) cancellation: tokio_util::sync::CancellationToken,
 }
 
-/// `MEKA_MCP_TOOL_TIMEOUT` as a duration, or the default when unset.
-///
-/// A value that does not parse, or a zero, is warned about and ignored rather than silently
-/// defaulted: a bare number has no unit and either guess is invisible when wrong, and a zero would
-/// time out every call before it is sent.
-fn parse_tool_call_timeout(raw: Option<&str>) -> std::time::Duration {
-    const DEFAULT: std::time::Duration = std::time::Duration::from_secs(600);
-    let Some(raw) = raw else {
-        return DEFAULT;
-    };
-    match humantime_serde::re::humantime::parse_duration(raw.trim()) {
-        Ok(timeout) if !timeout.is_zero() => timeout,
-        Ok(_) => {
-            tracing::warn!(
-                "ignoring MEKA_MCP_TOOL_TIMEOUT='{raw}': a zero timeout fails every call"
-            );
-            DEFAULT
-        }
-        Err(error) => {
-            tracing::warn!("ignoring MEKA_MCP_TOOL_TIMEOUT='{raw}': {error}");
-            DEFAULT
-        }
-    }
-}
-
 impl McpTool {
     /// The remote name; see [`Self::remote_tool_name`].
     pub(crate) fn raw_name(&self) -> &str {
@@ -353,13 +328,6 @@ impl McpTool {
 
     pub(crate) fn server_name(&self) -> &str {
         self.entry.server_name()
-    }
-
-    /// Resolves a per-call tool-call timeout. Respects `MEKA_MCP_TOOL_TIMEOUT` (a humantime
-    /// string such as `"10m"`) when set, otherwise falls back to 600 seconds, long enough for a
-    /// database index rebuild but short enough that a hung server isn't invisible.
-    fn tool_call_timeout() -> std::time::Duration {
-        parse_tool_call_timeout(std::env::var("MEKA_MCP_TOOL_TIMEOUT").ok().as_deref())
     }
 
     async fn call_tool_once(
@@ -412,7 +380,7 @@ impl McpTool {
             .await?;
         let request_id = handle.id.clone();
 
-        let timeout = Self::tool_call_timeout();
+        let timeout = self.entry.tool_call_timeout;
         // Cap how long we wait on the best-effort cancellation notification so a hung transport
         // can't block Ctrl-C handling or shutdown.
         const CANCEL_NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -739,25 +707,6 @@ pub(crate) fn convert_tool_result_content(
 
 #[cfg(test)]
 mod tests {
-
-    /// The variable takes a duration string; a bare number and a zero both fall to the default
-    /// rather than to a timeout nobody asked for.
-    #[test]
-    fn the_tool_timeout_variable_takes_a_duration_and_nothing_else() {
-        let default = std::time::Duration::from_secs(600);
-        assert_eq!(parse_tool_call_timeout(None), default);
-        assert_eq!(
-            parse_tool_call_timeout(Some("90s")),
-            std::time::Duration::from_secs(90)
-        );
-        assert_eq!(
-            parse_tool_call_timeout(Some(" 2m ")),
-            std::time::Duration::from_secs(120)
-        );
-        assert_eq!(parse_tool_call_timeout(Some("600000")), default);
-        assert_eq!(parse_tool_call_timeout(Some("0s")), default);
-        assert_eq!(parse_tool_call_timeout(Some("soon")), default);
-    }
     use base64::Engine as _;
 
     use super::*;

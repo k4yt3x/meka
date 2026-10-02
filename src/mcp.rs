@@ -270,6 +270,9 @@ pub(crate) struct ServerEntry {
     pub(crate) client_context: Arc<McpClientContext>,
     pub(crate) state: RwLock<ServerState>,
     pub(crate) reconnect_lock: Mutex<()>,
+    /// Cap on one call to this server's tools: `ResolvedConfig::mcp_tool_timeout`, carried here
+    /// because the adapter that makes the call holds the entry and nothing of the process.
+    pub(crate) tool_call_timeout: std::time::Duration,
     /// Why this server's configuration may not be sent at all, when it may not: its `headers` or
     /// `env` name a variable the environment did not supply, so the request would carry the
     /// literal `${NAME}`. Read by every door that connects, because marking the entry `Failed`
@@ -641,6 +644,7 @@ impl McpClientManager {
         mcp_default_permission: Option<Permission>,
         token_store: Option<TokenStore>,
         client_context: Arc<McpClientContext>,
+        tool_call_timeout: std::time::Duration,
     ) -> Result<Arc<Self>> {
         let mut servers = HashMap::new();
         let mut pending: Vec<Arc<ServerEntry>> = Vec::new();
@@ -735,6 +739,7 @@ impl McpClientManager {
                 client_context: Arc::clone(&client_context),
                 state: RwLock::new(initial_state),
                 reconnect_lock: Mutex::new(()),
+                tool_call_timeout,
                 refused,
                 instructions: std::sync::RwLock::new(None),
                 request_timeout: OnceLock::new(),
@@ -2155,6 +2160,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
             instructions: std::sync::RwLock::new(None),
             request_timeout: OnceLock::new(),
@@ -2196,9 +2202,15 @@ mod tests {
         config.eager_load_tools = Some(vec!["search".to_string()]);
 
         let context = McpClientContext::new();
-        let manager = McpClientManager::prepare(&[config], None, None, Arc::clone(&context))
-            .await
-            .expect("prepare");
+        let manager = McpClientManager::prepare(
+            &[config],
+            None,
+            None,
+            Arc::clone(&context),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare");
         context.set_manager(Arc::downgrade(&manager));
         let entry = manager
             .servers
@@ -2274,9 +2286,15 @@ mod tests {
         ]);
 
         let context = McpClientContext::new();
-        let manager = McpClientManager::prepare(&[config], None, None, Arc::clone(&context))
-            .await
-            .expect("prepare");
+        let manager = McpClientManager::prepare(
+            &[config],
+            None,
+            None,
+            Arc::clone(&context),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare");
         context.set_manager(Arc::downgrade(&manager));
         let registry = crate::tools::ToolRegistry::new();
         crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
@@ -2375,6 +2393,7 @@ mod tests {
             None,
             None,
             McpClientContext::new(),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
         )
         .await
         .expect("prepare");
@@ -2408,6 +2427,7 @@ mod tests {
             None,
             None,
             McpClientContext::new(),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
         )
         .await
         .expect("prepare");
@@ -2450,6 +2470,7 @@ mod tests {
             None,
             None,
             McpClientContext::new(),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
         )
         .await
         .expect("prepare");
@@ -2493,6 +2514,7 @@ mod tests {
             None,
             None,
             McpClientContext::new(),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
         )
         .await
         .expect("prepare");
@@ -2526,6 +2548,7 @@ mod tests {
             None,
             None,
             McpClientContext::new(),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
         )
         .await
         .expect("prepare");
@@ -2552,10 +2575,15 @@ mod tests {
         let mut gating = McpServerConfig::for_test("bridge");
         gating.required = Some(true);
 
-        let manager =
-            McpClientManager::prepare(&[optional, gating], None, None, McpClientContext::new())
-                .await
-                .expect("prepare");
+        let manager = McpClientManager::prepare(
+            &[optional, gating],
+            None,
+            None,
+            McpClientContext::new(),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare");
 
         let not_ready = manager.enabled_not_connected().await;
         assert_eq!(not_ready.len(), 2);
@@ -2644,6 +2672,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            tool_call_timeout: crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
             refused: None,
             instructions: std::sync::RwLock::new(None),
             request_timeout: OnceLock::new(),
@@ -2763,14 +2792,42 @@ mod tests {
         );
     }
 
+    /// The per-call cap is the config's, carried on the entry the adapter holds: one that stopped
+    /// at `prepare` would leave every call on a default nobody set.
+    #[tokio::test]
+    async fn the_tool_call_timeout_reaches_the_server_entry() {
+        let manager = McpClientManager::prepare(
+            &[McpServerConfig::for_test("srv")],
+            None,
+            None,
+            McpClientContext::new(),
+            std::time::Duration::from_secs(7),
+        )
+        .await
+        .expect("prepare");
+        assert_eq!(
+            manager
+                .server_entry("srv")
+                .expect("entry")
+                .tool_call_timeout,
+            std::time::Duration::from_secs(7)
+        );
+    }
+
     #[tokio::test]
     async fn prepare_all_disabled_publishes_settled_immediately() {
         let mut config = McpServerConfig::for_test("off");
         config.disabled = Some(true);
         let context = McpClientContext::new();
-        let manager = McpClientManager::prepare(&[config], None, None, context)
-            .await
-            .expect("prepare should succeed with a disabled-only config");
+        let manager = McpClientManager::prepare(
+            &[config],
+            None,
+            None,
+            context,
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare should succeed with a disabled-only config");
         assert!(manager.all_ready(), "manager should be settled immediately");
         let not_ready = manager.enabled_not_connected().await;
         assert!(
@@ -2783,9 +2840,15 @@ mod tests {
     async fn prepare_pending_entries_not_ready_until_connector_runs() {
         let config = McpServerConfig::for_test("waiting");
         let context = McpClientContext::new();
-        let manager = McpClientManager::prepare(&[config], None, None, context)
-            .await
-            .expect("prepare should succeed");
+        let manager = McpClientManager::prepare(
+            &[config],
+            None,
+            None,
+            context,
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare should succeed");
         assert!(
             !manager.all_ready(),
             "pending server shouldn't be ready yet"
@@ -2798,9 +2861,15 @@ mod tests {
     #[tokio::test]
     async fn await_settled_returns_immediately_when_already_settled() {
         let context = McpClientContext::new();
-        let manager = McpClientManager::prepare(&[], None, None, context)
-            .await
-            .expect("prepare with no servers should succeed");
+        let manager = McpClientManager::prepare(
+            &[],
+            None,
+            None,
+            context,
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare with no servers should succeed");
         let res = tokio::time::timeout(
             std::time::Duration::from_millis(50),
             manager.await_settled(),
@@ -2822,9 +2891,15 @@ mod tests {
         config.url = None;
 
         let context = McpClientContext::new();
-        let manager = McpClientManager::prepare(&[config], None, None, context)
-            .await
-            .expect("prepare should succeed");
+        let manager = McpClientManager::prepare(
+            &[config],
+            None,
+            None,
+            context,
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare should succeed");
         assert!(!manager.all_ready());
 
         manager.start_connector(McpRuntimeConfig {
@@ -2862,9 +2937,15 @@ mod tests {
         config.disabled = Some(true);
 
         let context = McpClientContext::new();
-        let manager = McpClientManager::prepare(&[config], None, None, context)
-            .await
-            .expect("prepare should succeed for a disabled server");
+        let manager = McpClientManager::prepare(
+            &[config],
+            None,
+            None,
+            context,
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare should succeed for a disabled server");
 
         let registry = crate::tools::ToolRegistry::new();
         crate::tools::mcp_adapter::install_on_worker_registry(&manager, &registry).await;
@@ -2890,9 +2971,15 @@ mod tests {
     #[tokio::test]
     async fn install_tools_on_noop_without_servers() {
         let context = McpClientContext::new();
-        let manager = McpClientManager::prepare(&[], None, None, context)
-            .await
-            .expect("prepare with no servers should succeed");
+        let manager = McpClientManager::prepare(
+            &[],
+            None,
+            None,
+            context,
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare with no servers should succeed");
 
         let registry = crate::tools::ToolRegistry::new();
         crate::tools::mcp_adapter::install_on_worker_registry(&manager, &registry).await;
@@ -2931,9 +3018,15 @@ mod tests {
     #[tokio::test]
     async fn a_registry_attaching_after_discovery_still_learns_which_tools_are_deferred() {
         let context = McpClientContext::new();
-        let manager = McpClientManager::prepare(&[], None, None, context)
-            .await
-            .expect("prepare");
+        let manager = McpClientManager::prepare(
+            &[],
+            None,
+            None,
+            context,
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare");
 
         manager
             .update_server_tools("notion", ServerTools {
@@ -2975,9 +3068,15 @@ mod tests {
         // Empty config: we don't need real servers to exercise the snapshot/registry plumbing,
         // just the manager methods.
         let context = McpClientContext::new();
-        let manager = McpClientManager::prepare(&[], None, None, context)
-            .await
-            .expect("prepare");
+        let manager = McpClientManager::prepare(
+            &[],
+            None,
+            None,
+            context,
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare");
 
         let server_names: Vec<String> = (0..4).map(|index| format!("srv-{index}")).collect();
         let registry_count = 8;
@@ -3049,9 +3148,15 @@ mod tests {
             "name = \"tenant\"\ntransport = \"http\"\nurl = \"https://example.test/mcp\"\n[headers]\nAuthorization = \"Bearer ${MEKA_TEST_UNSET_SECRET_TOKEN}\"\n",
         )
         .expect("the fixture parses");
-        let manager = McpClientManager::prepare(&[config], None, None, McpClientContext::new())
-            .await
-            .expect("prepare");
+        let manager = McpClientManager::prepare(
+            &[config],
+            None,
+            None,
+            McpClientContext::new(),
+            crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+        )
+        .await
+        .expect("prepare");
         let entry = manager.server_entry("tenant").expect("entry");
         let state = entry.state().await;
         assert!(
