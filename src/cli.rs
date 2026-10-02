@@ -459,6 +459,13 @@ pub(crate) enum ProfileAction {
         /// default to 30 MiB)
         #[arg(long = "max-request-bytes", value_name = "BYTES")]
         max_request_bytes: Option<u64>,
+        /// Send the moving cache breakpoint (anthropic-messages only; default: true)
+        #[arg(
+            long = "cache-control",
+            hide_possible_values = true,
+            value_name = "BOOL"
+        )]
+        cache_control: Option<bool>,
         #[arg(
             long = "thinking-display",
             value_enum,

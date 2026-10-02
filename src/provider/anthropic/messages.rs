@@ -30,6 +30,8 @@ pub(crate) struct AnthropicMessagesProvider {
     model: String,
     /// See `AccountConfig::interleaved_thinking`.
     interleaved_thinking: bool,
+    /// See [`crate::config::ProfileConfig::cache_control`].
+    cache_control: bool,
     thinking: ThinkingMode,
     thinking_budget_tokens: u64,
     /// The settled `output_config.effort` for the request body, resolved once at construction from
@@ -50,6 +52,7 @@ impl AnthropicMessagesProvider {
             model,
             base_url,
             interleaved_thinking,
+            cache_control,
             thinking,
             thinking_budget_tokens,
             effort,
@@ -68,6 +71,7 @@ impl AnthropicMessagesProvider {
             ),
             model,
             interleaved_thinking,
+            cache_control,
             thinking,
             thinking_budget_tokens,
             resolved_effort,
@@ -114,9 +118,13 @@ impl AnthropicMessagesProvider {
         thinking: ThinkingOverride,
     ) -> serde_json::Value {
         // The API's own TTL. The one-hour breakpoint needs a beta this backend does not send, and
-        // this endpoint is whatever `base_url` names.
-        let claude_messages =
-            convert_messages_to_claude_content(messages, super::shared::CacheBreakpoint::Ephemeral);
+        // this endpoint is whatever `base_url` names. Whether a breakpoint goes out at all is the
+        // profile's to say: a gateway may turn it into a paid cache of the whole prompt per turn.
+        let claude_messages = convert_messages_to_claude_content(
+            messages,
+            self.cache_control
+                .then_some(super::shared::CacheBreakpoint::Ephemeral),
+        );
 
         let mut body = serde_json::Map::new();
         body.insert("model".to_string(), serde_json::json!(self.model));
@@ -673,6 +681,60 @@ mod tests {
         assert!(
             body.get("system").is_none(),
             "anthropic-messages should omit `system` when the prompt is empty"
+        );
+    }
+
+    /// Whether the breakpoint goes out is the profile's to say: withheld, no block anywhere in the
+    /// body carries one, so a gateway that would turn it into a paid cache of the whole prompt has
+    /// nothing to turn; unset, the direct API's answer is sent.
+    #[test]
+    fn a_profile_that_withholds_the_breakpoint_sends_no_cache_control() {
+        fn mentions_cache_control(value: &serde_json::Value) -> bool {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.contains_key("cache_control") || map.values().any(mentions_cache_control)
+                }
+                serde_json::Value::Array(items) => items.iter().any(mentions_cache_control),
+                _ => false,
+            }
+        }
+        let build = |cache_control: bool| {
+            AnthropicMessagesProvider::new(
+                "test-key".to_string(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::AnthropicMessages,
+                    crate::store::AuthCredential::ApiKey("test-key".to_string()),
+                    "google/gemini-3.8-flash".to_string(),
+                )
+                .cache_control(cache_control),
+            )
+            .expect("provider")
+        };
+        let messages = vec![
+            Message::user("first"),
+            Message::assistant_text("reply"),
+            Message::user("second"),
+        ];
+        let body = |cache_control: bool| {
+            build(cache_control).build_request_body(
+                "be terse",
+                &messages,
+                &[],
+                true,
+                ThinkingOverride::Inherit,
+            )
+        };
+
+        let withheld = body(false);
+        assert!(
+            !mentions_cache_control(&withheld),
+            "a profile that withholds the breakpoint sends none: {withheld}"
+        );
+        let sent = body(true);
+        assert_eq!(
+            sent["messages"][2]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "the default is the direct API's moving breakpoint: {sent}"
         );
     }
 }

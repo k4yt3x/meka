@@ -29,6 +29,7 @@ pub(crate) async fn run(
             thinking,
             thinking_budget,
             max_request_bytes,
+            cache_control,
             thinking_display,
         } => run_add(name, account.as_deref(), model.clone(), ProfileTuning {
             context_window: *context_window,
@@ -38,6 +39,7 @@ pub(crate) async fn run(
             thinking: *thinking,
             thinking_budget: *thinking_budget,
             max_request_bytes: *max_request_bytes,
+            cache_control: *cache_control,
             thinking_display: *thinking_display,
         }),
         ProfileAction::List { format } => run_list(*format),
@@ -75,6 +77,7 @@ struct ProfileTuning {
     thinking: Option<config::ThinkingMode>,
     thinking_budget: Option<u64>,
     max_request_bytes: Option<u64>,
+    cache_control: Option<bool>,
     thinking_display: Option<crate::config::ThinkingDisplay>,
 }
 
@@ -350,6 +353,7 @@ pub(super) const SETTABLE_PROFILE_KEYS: &[&str] = &[
     "thinking",
     "thinking_budget",
     "max_request_bytes",
+    "cache_control",
     "thinking_display",
 ];
 
@@ -388,6 +392,7 @@ fn parse_profile_value(name: &str, key: &str, value: &str) -> anyhow::Result<tom
         "vision" => boolean("vision"),
         "thinking_budget" => integer("thinking_budget"),
         "max_request_bytes" => integer("max_request_bytes"),
+        "cache_control" => boolean("cache_control"),
         "thinking_display" => {
             let display = value
                 .parse::<crate::config::ThinkingDisplay>()
@@ -763,6 +768,9 @@ fn upsert_profile_document(
             toml_edit::value(toml_integer("max_request_bytes", bytes)?),
         );
     }
+    if let Some(cache_control) = tuning.cache_control {
+        profile.insert("cache_control", toml_edit::value(cache_control));
+    }
     if let Some(display) = tuning.thinking_display {
         profile.insert("thinking_display", toml_edit::value(display.name()));
     }
@@ -977,6 +985,9 @@ fn resolve_tuning(
     if !backend.reads_profile_key("thinking_display") && flags.thinking_display.take().is_some() {
         dropped.push("--thinking-display");
     }
+    if !backend.reads_profile_key("cache_control") && flags.cache_control.take().is_some() {
+        dropped.push("--cache-control");
+    }
     if !dropped.is_empty() {
         tracing::warn!(
             "ignoring {dropped}: a '{backend}' account never sends the field",
@@ -1069,6 +1080,7 @@ fn resolve_tuning(
         max_output_tokens: flags.max_output_tokens,
         thinking_display: flags.thinking_display,
         max_request_bytes: flags.max_request_bytes,
+        cache_control: flags.cache_control,
     })
 }
 
@@ -1538,6 +1550,31 @@ mod tests {
         );
     }
 
+    /// `--cache-control` is dropped on every backend but `anthropic-messages`: the OpenAI wires
+    /// have no breakpoint to withhold, and `claude-subscription` pins its own to the captured
+    /// wire.
+    #[test]
+    fn a_cache_control_flag_aimed_at_a_backend_that_never_reads_it_is_dropped() {
+        let flags = || ProfileTuning {
+            cache_control: Some(false),
+            thinking: Some(config::ThinkingMode::Off),
+            context_window: Some(1_024),
+            effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        for (backend, kept) in [
+            (config::Backend::AnthropicMessages, Some(false)),
+            (config::Backend::ClaudeSubscription, None),
+            (config::Backend::OpenAiChatCompletions, None),
+            (config::Backend::OpenAiResponses, None),
+            (config::Backend::ChatGptSubscription, None),
+        ] {
+            // Every prompted setting is pinned, so this returns before any prompt: no stdin.
+            let tuning = resolve_tuning(flags(), backend, "work", None, None).expect("resolve");
+            assert_eq!(tuning.cache_control, kept, "{backend}");
+        }
+    }
+
     /// The defaults line names what is still unset, and nothing else.
     ///
     /// It is the only thing that tells a user these settings exist: meka never infers them, so
@@ -1988,6 +2025,16 @@ model = "m"
         // when stated on the others.
         refuse_an_inert_key(&document, "oai", "max_request_bytes")
             .expect("a Responses profile may state its endpoint's ceiling");
+        // The breakpoint is `anthropic-messages`'s alone: the OpenAI wires have no such field.
+        refuse_an_inert_key(&document, "work", "cache_control")
+            .expect("a Messages profile may withhold the breakpoint");
+        let message = refuse_an_inert_key(&document, "oai", "cache_control")
+            .expect_err("a Responses profile has no breakpoint to withhold")
+            .to_string();
+        assert!(
+            message.contains("cache_control") && message.contains("openai-responses"),
+            "the refusal names the key and the backend: {message}"
+        );
     }
 
     /// `--unset` removes the key rather than writing an empty value.
@@ -2059,7 +2106,7 @@ account = "work"
             let sample = match *key {
                 "context_window" | "max_output_tokens" | "thinking_budget"
                 | "max_request_bytes" => "1000",
-                "vision" => "true",
+                "vision" | "cache_control" => "true",
                 "thinking_display" => "updates",
                 "thinking" => "adaptive",
                 _ => "value",
@@ -2164,6 +2211,7 @@ account = "work"
             "max_output_tokens",
             "thinking_display",
             "max_request_bytes",
+            "cache_control",
         ] {
             assert!(!rendered.contains(key), "{key} written unasked: {rendered}");
         }
@@ -2186,6 +2234,7 @@ account = "work"
                 max_output_tokens: Some(32_000),
                 thinking_display: Some(crate::config::ThinkingDisplay::Summarized),
                 max_request_bytes: Some(8_388_608),
+                cache_control: Some(false),
                 ..Default::default()
             },
         )
@@ -2204,6 +2253,7 @@ account = "work"
             Some(crate::config::ThinkingDisplay::Summarized)
         );
         assert_eq!(profile.max_request_bytes, Some(8_388_608));
+        assert_eq!(profile.cache_control, Some(false));
     }
 
     /// The advanced prompt covers exactly the three settings it has always covered.

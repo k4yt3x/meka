@@ -107,6 +107,13 @@ pub(crate) struct ProfileConfig {
     /// Anthropic's endpoint caps at 32 MiB and the Anthropic backends default to 30 MiB, but an
     /// `anthropic-messages` account reaches whatever `base_url` names, whose cap is its own fact.
     pub(crate) max_request_bytes: Option<u64>,
+    /// `anthropic-messages` only: whether the request carries the moving `cache_control`
+    /// breakpoint. Defaults to `true`, which is what Anthropic's own API needs to cache the prefix
+    /// incrementally. What an endpoint does with the breakpoint is the endpoint's fact, which meka
+    /// cannot know from `base_url`, and it varies by model on a gateway: one that turns it into a
+    /// full explicit cache of the prompt bills a write on every turn, and such a profile sets it
+    /// `false` to leave the endpoint's own implicit caching to work.
+    pub(crate) cache_control: Option<bool>,
     /// `claude-subscription` only: how the model's thinking is presented, one of Claude Code's
     /// three display modes. Defaults to `updates`, Claude Code's own default.
     pub(crate) thinking_display: Option<crate::config::ThinkingDisplay>,
@@ -135,6 +142,7 @@ pub(crate) const PROFILE_KEY_ORDER: &[&str] = &[
     "thinking",
     "thinking_budget",
     "max_request_bytes",
+    "cache_control",
     "thinking_display",
 ];
 /// Put one table's keys into `order`.
@@ -211,6 +219,8 @@ pub(crate) struct ProfileSettings {
     pub(crate) thinking_display: crate::config::ThinkingDisplay,
     /// See [`ProfileConfig::max_request_bytes`]; `None` leaves the backend's default.
     pub(crate) max_request_bytes: Option<usize>,
+    /// See [`ProfileConfig::cache_control`]; resolved to the default here.
+    pub(crate) cache_control: bool,
 }
 /// The selected profile's name, read straight off disk without resolving anything else.
 ///
@@ -310,6 +320,7 @@ pub(crate) fn resolve_profile(
         max_request_bytes: profile
             .max_request_bytes
             .and_then(|bytes| usize::try_from(bytes).ok()),
+        cache_control: profile.cache_control.unwrap_or(true),
         // Pure passthrough for every backend: whatever the profile sets goes to the provider
         // verbatim (the provider trims and lowercases it). Unset means the field is omitted and
         // the provider applies its own default. An invalid value is the user's to own.
@@ -923,6 +934,7 @@ mod tests {
             "thinking = \"budgeted\"\n",
             "thinking_budget = 32000\n",
             "max_request_bytes = 8388608\n",
+            "cache_control = false\n",
             "thinking_display = \"redacted\"\n",
         );
 

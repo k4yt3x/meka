@@ -889,6 +889,9 @@ impl Backend {
         match key {
             "thinking_display" => matches!(self, Self::ClaudeSubscription),
             "thinking" | "thinking_budget" => self.takes_thinking(),
+            // Not `claude-subscription`: its breakpoint is pinned by the captured wire, and its
+            // endpoint cannot vary.
+            "cache_control" => matches!(self, Self::AnthropicMessages),
             _ => true,
         }
     }
@@ -950,6 +953,7 @@ fn warn_about_inert_profile_keys(
         let set = [
             ("thinking", profile.thinking.is_some()),
             ("thinking_budget", profile.thinking_budget.is_some()),
+            ("cache_control", profile.cache_control.is_some()),
             ("thinking_display", profile.thinking_display.is_some()),
         ];
         for (key, is_set) in set {
@@ -3948,6 +3952,45 @@ model = "m"
             )
             .expect("resolves");
             assert_eq!(settings.interleaved_thinking, resolved_to, "{written:?}");
+        }
+    }
+
+    /// A profile states whether its requests carry the moving cache breakpoint; unset is the
+    /// direct API's answer, and the resolved profile carries it to the backend.
+    #[test]
+    fn a_profile_s_cache_control_reaches_the_resolved_profile() {
+        let account = "[accounts.p]\nbackend = \"anthropic-messages\"\n\n";
+        for (written, resolved_to) in [
+            ("", true),
+            ("cache_control = false\n", false),
+            ("cache_control = true\n", true),
+        ] {
+            let resolved = resolve_with_config(&format!(
+                "default_profile = \"p\"\n\n{account}[profiles.p]\naccount = \"p\"\nmodel = \
+                 \"m\"\n{written}"
+            ));
+            let settings = profile::resolve_profile(
+                &resolved.profiles["p"],
+                &resolved.accounts["p"],
+                None,
+                None,
+                String::new(),
+            )
+            .expect("resolves");
+            assert_eq!(settings.cache_control, resolved_to, "{written:?}");
+        }
+    }
+
+    /// The breakpoint key is `anthropic-messages`'s alone, which is what the two CLI write doors
+    /// and the load-time check all ask.
+    #[test]
+    fn only_the_messages_backend_reads_the_cache_control_key() {
+        for backend in Backend::ALL {
+            assert_eq!(
+                backend.reads_profile_key("cache_control"),
+                matches!(backend, Backend::AnthropicMessages),
+                "{backend}"
+            );
         }
     }
 

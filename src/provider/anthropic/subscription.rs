@@ -487,7 +487,7 @@ impl ClaudeSubscriptionProvider {
         } else {
             super::shared::CacheBreakpoint::OneHour
         };
-        let claude_messages = convert_messages_to_claude_content(messages, breakpoint);
+        let claude_messages = convert_messages_to_claude_content(messages, Some(breakpoint));
 
         let metadata_user_id = serde_json::json!({
             "device_id": self.device_id,

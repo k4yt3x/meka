@@ -172,7 +172,9 @@ its documentation shows.
 Whether the endpoint takes the `interleaved-thinking` beta header, which `anthropic-messages`
 sends whenever thinking is on. Unset is `true`, which is what Anthropic's own API needs to think
 between tool calls; an endpoint that refuses the header sets it `false`. The other backends never
-read it, and `meka account add --interleaved-thinking` refuses it for them.
+read it, and `meka account add --interleaved-thinking` refuses it for them. The other switch an
+endpoint decides, the cache breakpoint, is a profile field, because its answer varies by model on
+a gateway; see [`cache_control`](#cache_control).
 
 ```toml
 [accounts.gateway]
@@ -347,6 +349,30 @@ account           = "gateway"
 max_request_bytes = 8388608
 ```
 
+### `cache_control`
+
+`anthropic-messages` only. Whether each request carries the moving `cache_control` breakpoint on
+the last block it sends. Unset is `true`, which is what Anthropic's own API needs to cache the
+prompt incrementally: the breakpoint moves with the conversation, and each turn is billed a write
+for the new suffix alone. What an endpoint does with the breakpoint is the endpoint's fact, and on
+a gateway it varies by model, which is why this sits on the profile rather than beside
+[`interleaved_thinking`](#interleaved_thinking) on the account. OpenRouter turns it into Gemini
+explicit caching, which bills a write of the whole prompt on every turn the breakpoint moves, so a
+Gemini profile there pays more with the breakpoint than without it. The symptom in the usage is a
+cache write equal to the cache read on every turn with no live input, and a `/status` gauge at
+twice the real occupancy, since the two tiers are counted as separate tokens. Such a profile sets
+`false`, which sends no breakpoint at all and leaves the endpoint's own implicit caching to work; a
+Claude model on the same account keeps the default. The other backends never read it:
+`claude-subscription` pins its own breakpoint and the OpenAI wires have none, so `meka profile add
+--cache-control` is dropped for them and `meka profile set` refuses it.
+
+```toml
+[profiles.gemini]
+account       = "openrouter"
+model         = "google/gemini-3.8-flash"
+cache_control = false
+```
+
 ### `thinking_display`
 
 `claude-subscription` only. How the model's thinking is presented, one of Claude Code's three
@@ -405,7 +431,7 @@ login.
 
 | Command | Action |
 |---|---|
-| `meka profile add <name> [--account A] [--model M] [...]` | Add a profile. Prompts for the account and model when not flagged (a sole account is offered as the default; the model prompt offers `claude-opus-5-5` on a Claude account and `gpt-6-astra` on an OpenAI one), then offers an optional advanced step covering thinking, context window and effort, plus the thinking budget if you answer `budgeted`. Every other [profile field](#profile-fields) has a flag writing the key of the same name: `--context-window`, `--max-output-tokens`, `--effort`, `--vision`, `--thinking`, `--thinking-budget`, `--max-request-bytes` and `--thinking-display <DISPLAY>`, so one non-interactive command can create a profile of any shape. An unflagged setting is left out of the profile so its documented default applies. Does not touch `default_profile`. |
+| `meka profile add <name> [--account A] [--model M] [...]` | Add a profile. Prompts for the account and model when not flagged (a sole account is offered as the default; the model prompt offers `claude-opus-5-5` on a Claude account and `gpt-6-astra` on an OpenAI one), then offers an optional advanced step covering thinking, context window and effort, plus the thinking budget if you answer `budgeted`. Every other [profile field](#profile-fields) has a flag writing the key of the same name: `--context-window`, `--max-output-tokens`, `--effort`, `--vision`, `--thinking`, `--thinking-budget`, `--max-request-bytes`, `--cache-control` and `--thinking-display <DISPLAY>`, so one non-interactive command can create a profile of any shape. An unflagged setting is left out of the profile so its documented default applies. Does not touch `default_profile`. |
 | `meka profile list` | List configured profiles with account, backend, model and the default marker; `--format json` prints the same as one document. Names any profile whose account is not configured. |
 | `meka profile set <name> <key> <value>` | Change one setting on an existing profile, in place. `--unset` in place of the value removes the key instead. See [Changing one setting](#changing-one-setting). |
 | `meka profile use <name>` | Set `default_profile` to this profile. |
@@ -435,7 +461,7 @@ as writing an empty value: an absent key follows whatever the documented default
 which is what an unstated setting has always meant. `model` is the one key with no default to fall
 back to, so `--unset model` and an empty `model` are both refused.
 
-Nine keys are settable, each named after the [profile field](#profile-fields) it writes:
+Ten keys are settable, each named after the [profile field](#profile-fields) it writes:
 
 | Key | Value |
 |---|---|
@@ -447,6 +473,7 @@ Nine keys are settable, each named after the [profile field](#profile-fields) it
 | `thinking` | `adaptive`, `budgeted`, or `off` |
 | `thinking_budget` | A whole number of tokens |
 | `max_request_bytes` | A whole number of bytes |
+| `cache_control` | `true` or `false` |
 | `thinking_display` | `updates`, `summarized` or `redacted` |
 
 A token count must be whole and at most 9223372036854775807, the largest integer TOML can represent;

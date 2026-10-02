@@ -73,7 +73,9 @@ meka account add local --backend anthropic-messages --base-url http://127.0.0.1:
 meka profile add local --account local --model 'hf.co/bartowski/Qwen3.8-27B-GGUF:Q8_0'
 ```
 
-Nothing in the request is tuned to Claude unless you ask for it. `effort` is omitted when unset, so a backend with no reasoning tiers is never handed one, and `thinking` is whatever the profile says rather than something inferred from the model name: set `budgeted` if your endpoint only implements the older encoding, or `off` if it implements neither.
+Nothing in the request is tuned to Claude unless you ask for it, with one exception. `effort` is omitted when unset, so a backend with no reasoning tiers is never handed one, and `thinking` is whatever the profile says rather than something inferred from the model name: set `budgeted` if your endpoint only implements the older encoding, or `off` if it implements neither.
+
+The exception is the prompt-cache breakpoint, which goes out by default because Anthropic's own API caches nothing without it. An endpoint that ignores it loses nothing, but a gateway may turn it into a paid cache of the whole prompt on every turn (OpenRouter does for Gemini), and a profile on such a model sets [`cache_control = false`](../configuration/config-file.md#cache_control) to send none and leave the endpoint's own implicit caching to work.
 
 The one setting worth stating is the context window. meka never probes for it, so an unset profile budgets against the 1M default; on a smaller model that means compaction only fires once the backend itself rejects the request:
 
@@ -95,6 +97,8 @@ thinking = "budgeted"   # only if the endpoint rejects the adaptive form
 - `anthropic-beta: interleaved-thinking-2025-05-14`, whenever thinking is on (the default) and the account does not set `interleaved_thinking = false`
 
 **System prompt:** Sent as a top-level `system` string.
+
+**Prompt caching:** one `cache_control: {"type": "ephemeral"}` breakpoint on the last block of the last message, moved forward each request, unless the profile sets `cache_control = false`.
 
 **Tool format:** Tools are defined with `input_schema`:
 

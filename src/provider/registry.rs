@@ -14,6 +14,8 @@ pub(crate) struct ProviderBuilder {
     pub(super) oauth_token_url: Option<String>,
     /// See `AccountConfig::interleaved_thinking`; read by `anthropic-messages` alone.
     pub(super) interleaved_thinking: bool,
+    /// See `ProfileConfig::cache_control`; read by `anthropic-messages` alone.
+    pub(super) cache_control: bool,
     pub(super) token_store: Option<Arc<TokenStore>>,
     /// Account name the credential is stored under; OAuth providers use it to write refreshed
     /// tokens back to the right `account_credentials` row. Required by both subscription backends;
@@ -42,6 +44,7 @@ impl ProviderBuilder {
             client_id: None,
             oauth_token_url: None,
             interleaved_thinking: true,
+            cache_control: true,
             token_store: None,
             credential_key: None,
             thinking: ThinkingMode::Off,
@@ -79,6 +82,12 @@ impl ProviderBuilder {
     /// Whether the endpoint takes the `interleaved-thinking` beta; `anthropic-messages` alone.
     pub(crate) fn interleaved_thinking(mut self, value: bool) -> Self {
         self.interleaved_thinking = value;
+        self
+    }
+
+    /// Whether the moving cache breakpoint goes out; `anthropic-messages` alone.
+    pub(crate) fn cache_control(mut self, value: bool) -> Self {
+        self.cache_control = value;
         self
     }
 
@@ -502,6 +511,7 @@ impl ProviderRegistry {
         let provider = ProviderBuilder::new(settings.backend, credential, model)
             .base_url(settings.base_url.clone())
             .interleaved_thinking(settings.interleaved_thinking)
+            .cache_control(settings.cache_control)
             .client_id(settings.client_id.clone())
             .credential_key(Some(settings.account.clone()))
             .oauth_token_url(settings.oauth_token_url.clone())

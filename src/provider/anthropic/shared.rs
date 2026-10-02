@@ -409,11 +409,11 @@ fn no_message_content() -> serde_json::Value {
     })
 }
 
-/// The conversation as the `messages` array of a Claude request, with the cache breakpoint on its
-/// last block.
+/// The conversation as the `messages` array of a Claude request, with the cache breakpoint, when
+/// the profile sends one, on its last block.
 pub(super) fn convert_messages_to_claude_content(
     messages: &[Message],
-    breakpoint: CacheBreakpoint,
+    breakpoint: Option<CacheBreakpoint>,
 ) -> Vec<serde_json::Value> {
     let mut claude_messages: Vec<serde_json::Value> = messages
         .iter()
@@ -538,7 +538,8 @@ pub(super) fn convert_messages_to_claude_content(
     // After the strip, not before it: attached to the last block first, the breakpoint would go
     // out on a trailing thinking block and leave with it, so a conversation ending on one would
     // carry no breakpoint at all and re-bill its whole prefix at the write tier.
-    if let Some(last) = claude_messages.last_mut()
+    if let Some(breakpoint) = breakpoint
+        && let Some(last) = claude_messages.last_mut()
         && let Some(content) = last.get_mut("content").and_then(|c| c.as_array_mut())
         && let Some(block) = content.last_mut().and_then(|b| b.as_object_mut())
     {
@@ -1507,7 +1508,8 @@ mod tests {
                 },
             ],
         };
-        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::Ephemeral);
+        let converted =
+            convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::Ephemeral));
         let content = converted[0]["content"].as_array().expect("content array");
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["type"], "tool_result");
@@ -1538,7 +1540,8 @@ mod tests {
                 },
             ],
         };
-        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::Ephemeral);
+        let converted =
+            convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::Ephemeral));
         let content = converted[0]["content"].as_array().expect("content");
         assert_eq!(
             content.len(),
@@ -1556,7 +1559,8 @@ mod tests {
     #[test]
     fn the_context_block_precedes_the_words() {
         let message = Message::user_turn("[Permission context]", "hello", Vec::new());
-        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::Ephemeral);
+        let converted =
+            convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::Ephemeral));
         let content = converted[0]["content"].as_array().expect("content");
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "[Permission context]");
@@ -1585,7 +1589,8 @@ mod tests {
                 },
             ],
         };
-        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::Ephemeral);
+        let converted =
+            convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::Ephemeral));
         let content = converted[0]["content"].as_array().expect("content");
         assert_eq!(content[0]["type"], "text");
         assert_eq!(
@@ -1898,7 +1903,8 @@ mod tests {
                 data: "QUJD".to_string(),
             },
         ]);
-        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::OneHour);
+        let converted =
+            convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::OneHour));
         let blocks = converted[0]["content"].as_array().expect("content array");
         assert_eq!(blocks[0]["type"], "text");
         assert_eq!(blocks[1]["type"], "image");
@@ -1961,7 +1967,8 @@ mod tests {
                 },
             ],
         };
-        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::OneHour);
+        let converted =
+            convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::OneHour));
         let block = &converted[0]["content"].as_array().unwrap()[0];
         assert_eq!(block["type"], "redacted_thinking");
         assert_eq!(block["data"], "ENCRYPTED_OPAQUE_BLOB");
@@ -1993,7 +2000,8 @@ mod tests {
                 },
             ],
         };
-        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::OneHour);
+        let converted =
+            convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::OneHour));
         let content = converted[0]["content"].as_array().expect("content");
 
         assert_eq!(content.len(), 1, "{content:?}");
@@ -2024,7 +2032,8 @@ mod tests {
                 },
             ],
         };
-        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::OneHour);
+        let converted =
+            convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::OneHour));
         let content = converted[0]["content"].as_array().expect("content");
 
         assert_eq!(content.len(), 1, "{content:?}");
@@ -2055,7 +2064,8 @@ mod tests {
                 },
             ],
         };
-        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::OneHour);
+        let converted =
+            convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::OneHour));
         let content = converted[0]["content"].as_array().expect("content");
 
         assert_eq!(content.len(), 1, "{content:?}");
@@ -2083,7 +2093,8 @@ mod tests {
             crate::conversation::Message::user("next"),
             crate::conversation::Message::assistant_text("later"),
         ];
-        let converted = convert_messages_to_claude_content(&messages, CacheBreakpoint::OneHour);
+        let converted =
+            convert_messages_to_claude_content(&messages, Some(CacheBreakpoint::OneHour));
         let content = converted[0]["content"].as_array().expect("content");
 
         assert_eq!(content.len(), 1, "{content:?}");
@@ -2107,7 +2118,8 @@ mod tests {
                 },
             ],
         };
-        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::OneHour);
+        let converted =
+            convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::OneHour));
         let block = &converted[0]["content"].as_array().unwrap()[0];
         assert_eq!(block["type"], "thinking");
         assert_eq!(block["thinking"], "");

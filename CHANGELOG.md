@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `cache_control = false` on an `anthropic-messages` profile withholds the moving cache breakpoint.
+
 ## [0.68.1] - 2026-09-30
 
 ### Changed
