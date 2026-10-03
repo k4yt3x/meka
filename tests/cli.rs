@@ -1216,6 +1216,10 @@ fn an_interrupted_json_oneshot_run_still_reports() {
 /// handles registered, the release on the way out cancels them, and the run waits for the cancel
 /// to land before leaving. Without them the command runs on untracked, its row saying `running`
 /// until a later open sweeps it.
+///
+/// The press is sent once the JSON report is on stdout, which the run writes after the turn and
+/// ahead of the wait: that is the window a press has to survive, and a press sent while the turn
+/// still runs would be answered by the turn's own cancellation instead.
 #[cfg(unix)]
 #[test]
 fn an_interrupted_wait_stops_the_background_task_it_was_waiting_for() {
@@ -1245,23 +1249,35 @@ fn an_interrupted_wait_stops_the_background_task_it_was_waiting_for() {
           [{"type":"text","text":"started"},{"type":"message_end","stop_reason":"end_turn"}]
         ]"#,
     );
-    let child = install
-        .meka(&["--oneshot", "-p", "run it"])
+    let mut child = install
+        .meka(&["--oneshot", "--format", "json", "-p", "run it"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn meka");
-    // The press waits for the command to be running, which is when the run is waiting on it.
+    // The command is running by the time the report is out, since the turn that started it is
+    // over; checked ahead of the read so the press follows the report with nothing in between.
     support::wait_until(
         "the detached command",
         std::time::Duration::from_secs(20),
         || a_process_lists("sleep 27.1828"),
     );
+    let mut report = String::new();
+    {
+        use std::io::BufRead;
+        std::io::BufReader::new(child.stdout.take().expect("stdout is piped"))
+            .read_line(&mut report)
+            .expect("the report line");
+    }
     // SAFETY: `child.id()` is a live process this test spawned and still owns.
     unsafe {
         libc::kill(child.id() as libc::pid_t, libc::SIGINT);
     }
+    assert!(
+        report.contains("\"stop_reason\":\"end_turn\""),
+        "the turn ended before the wait: {report}"
+    );
     let output = child.wait_with_output().expect("wait for meka");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Provider and login requests no longer follow redirects, so a credential stays at its endpoint.
+- A Ctrl+C as a one-shot run turns to wait for its background tasks is answered, not dropped.
 
 ## [0.68.1] - 2026-09-30
 

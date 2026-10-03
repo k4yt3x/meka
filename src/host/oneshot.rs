@@ -289,6 +289,13 @@ pub(crate) async fn run_oneshot(
     // Admitted before the outcome claim below, which can wait on the MCP servers: a Ctrl+C in
     // that window has to reach the turn rather than be lost to an epoch sampled after it.
     let admission = cancel.admit();
+    // The wait for background tasks below listens for a press through this, registered here
+    // rather than at the wait: `notify_waiters` reaches only a waiter already registered, so a
+    // press landing after the turn's token is gone and before the wait polls would otherwise be
+    // dropped, and the run would sit out the task the press was meant to leave.
+    let pressed = INTERRUPT_RELAY.pressed.notified();
+    tokio::pin!(pressed);
+    pressed.as_mut().enable();
 
     // A resume inherits whatever the last process left undelivered, and this turn is the only one
     // this run has. Joined to the prompt rather than appended as its own message, for the reason
@@ -363,7 +370,7 @@ pub(crate) async fn run_oneshot(
             let tasks = agent.background_tasks();
             tokio::select! {
                 _ = tasks.wait_for_session(id) => {}
-                _ = INTERRUPT_RELAY.pressed.notified() => {
+                _ = &mut pressed => {
                     with_console(&console, |console| {
                         console.annotation("stopped waiting for background tasks")
                     });
