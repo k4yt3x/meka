@@ -213,6 +213,7 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | How long a host waits for an approval answer | `APPROVAL_TIMEOUT` in `frontend.rs` (30 minutes) | the ACP and HTTP frontends; the REPL has a human and no timeout |
 | How a notice serializes | `NoticeView` | SSE `notice`, the blocking response, the one-shot JSON report |
 | Whether an upstream's own words may reach a caller | `host::relay_provider_errors`, bounded by `error::bounded_upstream_body` | `ProblemDetail::for_error`'s `provider_response`, `acp_error_for`'s `data` |
+| How much of a reply is read | `error::MAX_REPLY_BYTES`, through `error::read_whole_reply` for a whole reply and `provider::sse::drive` for one streamed event; a redirect is refused ahead of either by `provider::succeeded`, since `provider::build_http_client` follows none | every provider reply, the token exchange included |
 | Whether a skill's name resolves outside meka's own store | `skills::refuse_foreign_write` / `refuse_foreign_delete`, both on `foreign_location` | `skill_write`, `skill_delete`, `meka skill add`/`remove`, `PUT`/`DELETE /v1/skills/{name}`; the `ForeignSkill` it hands back renders with the path for a local reader and without it on the wire |
 | Whether an older meka wrote the store | `store/migrations.rs` alone | nothing else may know |
 

@@ -445,6 +445,11 @@ edge is by design, `tools/subagent` reaching up to `agent`, because a sub-agent 
 module fails the test until it is placed. Put new code where its callers already are: a type
 read by `store` and `host` belongs in `store` or below, never in `host`.
 
+meka ships as one crate. The provider layer serves meka's own wires and is not a library: the
+Messages driver and the Claude subscription driver share one wire module, and the harness reads
+`config.toml` and the store. A library crate would need a contract a party outside this repository
+holds and pins, and none does; a program that wants meka drives it over the HTTP API.
+
 ## Documentation
 
 Update the mdBook docs under `docs/book/src/` for any user-facing change, and the upgrade guide for

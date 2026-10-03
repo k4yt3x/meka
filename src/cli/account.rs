@@ -1179,7 +1179,10 @@ async fn exchange_claude_code(
     state: &str,
     token_url: &str,
 ) -> anyhow::Result<AuthCredential> {
-    let client = reqwest::Client::new();
+    // The provider client, so the grant goes to `token_url` and nowhere a redirect points, and
+    // the reply is read under the same bound as every other.
+    let client = crate::provider::build_http_client("claude-subscription", |builder| builder)?;
+    let never = tokio_util::sync::CancellationToken::new();
     let response = client
         .post(token_url)
         .json(&serde_json::json!({
@@ -1195,7 +1198,9 @@ async fn exchange_claude_code(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = crate::error::read_whole_reply(response, None, &never)
+            .await
+            .unwrap_or_default();
         anyhow::bail!(
             "token exchange failed ({}): {}",
             status,
@@ -1203,7 +1208,8 @@ async fn exchange_claude_code(
         );
     }
 
-    let token: TokenResponse = response.json().await?;
+    let body = crate::error::read_whole_reply(response, None, &never).await?;
+    let token: TokenResponse = serde_json::from_str(&body)?;
     let expires_at = token.expires_in.map(|seconds| {
         let now_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1543,7 +1549,9 @@ async fn exchange_codex_code(
         encode(code_verifier),
     );
 
-    let client = reqwest::Client::new();
+    // The provider client, for the reason `exchange_claude_code` gives.
+    let client = crate::provider::build_http_client("chatgpt-subscription", |builder| builder)?;
+    let never = tokio_util::sync::CancellationToken::new();
     let response = client
         .post(token_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -1553,7 +1561,9 @@ async fn exchange_codex_code(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = crate::error::read_whole_reply(response, None, &never)
+            .await
+            .unwrap_or_default();
         anyhow::bail!(
             "Codex token exchange failed ({}): {}",
             status,
@@ -1568,7 +1578,8 @@ async fn exchange_codex_code(
         refresh_token: Option<String>,
     }
 
-    let token: CodexTokenResponse = response.json().await?;
+    let body = crate::error::read_whole_reply(response, None, &never).await?;
+    let token: CodexTokenResponse = serde_json::from_str(&body)?;
     let account_id = token.id_token.as_deref().and_then(extract_codex_account_id);
     let expires_at = extract_jwt_expiration_millis(&token.access_token);
 
@@ -1731,7 +1742,7 @@ async fn run_introspection(
                     "Account usage is not available for account '{}'.",
                     settings.account
                 ));
-                return Err(crate::AlreadyReported.into());
+                return Err(crate::error::AlreadyReported.into());
             }
         },
         View::Whoami => {
@@ -1776,7 +1787,7 @@ async fn run_introspection(
             // first would hand back the code for "stdout went away", and a reader that hung up
             // turns that into success, which says the credential is fine when it is not.
             if !out.auth.valid {
-                return Err(crate::AlreadyReported.into());
+                return Err(crate::error::AlreadyReported.into());
             }
             written?;
         }
@@ -1799,7 +1810,7 @@ async fn run_introspection(
                     "Account history is not available for account '{}'.",
                     settings.account
                 ));
-                return Err(crate::AlreadyReported.into());
+                return Err(crate::error::AlreadyReported.into());
             }
         },
     }

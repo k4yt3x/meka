@@ -504,15 +504,18 @@ fn is_destructive(name: &str) -> bool {
     name.ends_with("_delete") || name.ends_with("_cancel") || name.ends_with("_remove")
 }
 
-/// Counts entries into [`edit_distance`], so a test can assert the *matrix* was skipped rather than
-/// that the candidate was visited.
-///
-/// The distinction is the whole point of the length band in [`did_you_mean_hint`] and it is not
-/// observable any other way: skipping costs work, not output, and a counter placed in the caller's
-/// iterator increments before the band is consulted.
 #[cfg(test)]
-pub(crate) static EDIT_DISTANCE_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// Counts entries into [`edit_distance`] on this thread, so a test can assert the *matrix* was
+    /// skipped rather than that the candidate was visited.
+    ///
+    /// The distinction is the whole point of the length band in [`did_you_mean_hint`] and it is
+    /// not observable any other way: skipping costs work, not output, and a counter placed in the
+    /// caller's iterator increments before the band is consulted. Per thread rather than
+    /// process-wide because the tests run in parallel and `memory_search` and `tool_search` reach
+    /// this function too, so a shared count would read another test's work.
+    pub(crate) static EDIT_DISTANCE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Edit distance in chars: `strsim`'s optimal string alignment, which is Levenshtein with a
 /// transposition counted as one edit, since the commonest typo (`Tokoy` for `Tokyo`) is one. Only
@@ -524,7 +527,7 @@ pub(crate) static EDIT_DISTANCE_CALLS: std::sync::atomic::AtomicUsize =
 /// query was probably misspelled rather than absent.
 pub(crate) fn edit_distance(left: &str, right: &str) -> usize {
     #[cfg(test)]
-    EDIT_DISTANCE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    EDIT_DISTANCE_CALLS.with(|calls| calls.set(calls.get() + 1));
     strsim::osa_distance(left, right)
 }
 
@@ -1136,17 +1139,15 @@ mod tests {
     /// flake on a loaded CI runner and a real regression look identical.
     #[test]
     fn a_pathological_name_does_not_run_a_distance_matrix_per_candidate() {
-        use std::sync::atomic::Ordering;
-
         let candidates: Vec<String> = (0..500).map(|index| format!("memory-{index}")).collect();
         let needle = "x".repeat(200_000);
 
         // Counted at the callee, not in the caller's iterator: every candidate is still visited
         // (the band is inside the loop), so counting visits answers identically whether or not the
         // band is there.
-        EDIT_DISTANCE_CALLS.store(0, Ordering::Relaxed);
+        EDIT_DISTANCE_CALLS.with(|calls| calls.set(0));
         let hint = did_you_mean_hint(&needle, candidates.iter().map(String::as_str));
-        let built = EDIT_DISTANCE_CALLS.load(Ordering::Relaxed);
+        let built = EDIT_DISTANCE_CALLS.with(std::cell::Cell::get);
 
         assert!(
             hint.is_empty(),
@@ -1163,14 +1164,14 @@ mod tests {
 
         // The control, so "no matrices" is not passing because the function stopped working: a name
         // one edit away is still suggested, and that path *does* build the matrix.
-        EDIT_DISTANCE_CALLS.store(0, Ordering::Relaxed);
+        EDIT_DISTANCE_CALLS.with(|calls| calls.set(0));
         let near = did_you_mean_hint("memory-1", candidates.iter().map(String::as_str));
         assert!(
             near.contains("memory-1"),
             "a near miss must still be suggested: {near}"
         );
         assert!(
-            EDIT_DISTANCE_CALLS.load(Ordering::Relaxed) > 0,
+            EDIT_DISTANCE_CALLS.with(std::cell::Cell::get) > 0,
             "a needle inside the band must reach the matrix, or the band is refusing everything"
         );
     }

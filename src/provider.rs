@@ -149,6 +149,11 @@ const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// `crate::oauth::send_with_one_refresh` and its body in `crate::error::read_whole_reply`, where
 /// every request a turn or an account call makes is sent and its whole reply read. A token
 /// exchange, a revocation and an MCP auth probe run their own bounded requests outside a turn.
+///
+/// And no redirects: a 3xx comes back as the status it is, for [`succeeded`] to refuse with the
+/// location it named. reqwest strips `Authorization` on a hop to another host and leaves
+/// `x-api-key` and `ChatGPT-Account-ID` in place, and `base_url` is the user's, so a followed
+/// redirect would carry the credential wherever the endpoint pointed.
 pub(crate) fn build_http_client(
     backend: &str,
     configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
@@ -157,7 +162,8 @@ pub(crate) fn build_http_client(
         reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .http2_keep_alive_interval(HTTP2_KEEPALIVE_INTERVAL)
-            .http2_keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT),
+            .http2_keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none()),
     )
     .build()
     .map_err(|error| MekaError::Provider(format!("failed to build {backend} HTTP client: {error}")))
@@ -531,6 +537,20 @@ pub(crate) async fn succeeded(
     if status.is_success() {
         return Ok(response);
     }
+    // Refused with where it pointed rather than classified by its status: the client follows no
+    // redirect (see `build_http_client`), so the location is the one fact that corrects
+    // `base_url`. Through the URL redaction, since a gateway may echo the request's query into it.
+    if status.is_redirection() {
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("nowhere");
+        return Err(MekaError::Provider(crate::text::redact_urls(&format!(
+            "the {what} endpoint redirected to '{location}' ({status}); set `base_url` to the \
+             endpoint itself"
+        ))));
+    }
     let retry_after = crate::error::parse_retry_after(response.headers());
     // Under the token, as every body read is: the client runs no clock on a reply, so a peer that
     // sends the status and withholds the body would otherwise hold a canceled turn for as long as
@@ -768,6 +788,61 @@ mod tests {
         assert!(
             !rendered.contains("read_timeout") && !rendered.contains("TotalTimeout"),
             "the client carries a timeout a reply could run out: {rendered}"
+        );
+    }
+
+    /// A redirect is an answer, not a hop: the client follows none, so an endpoint that pointed
+    /// elsewhere is refused with the location, and the key never left for the other host.
+    #[tokio::test]
+    async fn a_redirect_is_refused_with_its_location() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !head.ends_with(b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.expect("the request arrives");
+                assert!(read > 0, "the client closed the connection");
+                head.extend_from_slice(&chunk[..read]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 308 Permanent Redirect\r\nLocation: \
+                      https://elsewhere.invalid/v1/messages?key=secret\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .expect("answer");
+        });
+
+        let client = build_http_client("test", |builder| builder).expect("client");
+        let response = client
+            .post(format!("http://{address}/v1/messages"))
+            .header("x-api-key", "secret")
+            .send()
+            .await
+            .expect("the redirect comes back as a response");
+        let error = succeeded(
+            response,
+            "test",
+            crate::error::ProviderRequest::Completion,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("refused");
+        peer.await.expect("the peer finished");
+
+        let message = error.to_string();
+        assert!(matches!(error, MekaError::Provider(_)), "{message}");
+        assert!(message.contains("elsewhere.invalid"), "{message}");
+        assert!(message.contains("`base_url`"), "{message}");
+        assert!(
+            !message.contains("secret"),
+            "the query is redacted: {message}"
         );
     }
 

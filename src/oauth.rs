@@ -340,14 +340,20 @@ pub(crate) async fn exchange_refresh_token<T: serde::de::DeserializeOwned>(
 
     let status = response.status();
     let retry_after = crate::error::parse_retry_after(response.headers());
+    // Through the bounded reader like every other reply. The token nothing fires: the exchange is
+    // bounded by `REFRESH_TIMEOUT` rather than by a turn's stop, for the reason that constant
+    // gives.
+    let never = tokio_util::sync::CancellationToken::new();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_else(|error| {
-            tracing::warn!(
-                "failed to read the OAuth refresh error body for '{account}': {error}",
-                account = exchange.account
-            );
-            String::new()
-        });
+        let body = crate::error::read_whole_reply(response, retry_after, &never)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    "failed to read the OAuth refresh error body for '{account}': {error}",
+                    account = exchange.account
+                );
+                String::new()
+            });
         return Err(crate::error::oauth_refresh_error(
             &format!("{} failed", exchange.context),
             status,
@@ -357,18 +363,22 @@ pub(crate) async fn exchange_refresh_token<T: serde::de::DeserializeOwned>(
         ));
     }
 
-    response.json::<T>().await.map_err(|error| {
+    let unreadable = |detail: String| {
         crate::error::oauth_refresh_error(
             &format!(
                 "{context} failed to read the response",
                 context = exchange.context
             ),
             status,
-            &crate::error::format_reqwest_error(&error),
+            &detail,
             None,
             exchange.account,
         )
-    })
+    };
+    let body = crate::error::read_whole_reply(response, None, &never)
+        .await
+        .map_err(|error| unreadable(error.to_string()))?;
+    serde_json::from_str::<T>(&body).map_err(|error| unreadable(error.to_string()))
 }
 /// Persist a refreshed credential, and answer with the one that should actually be used.
 ///

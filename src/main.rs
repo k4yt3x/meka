@@ -68,23 +68,6 @@ use clap::Parser;
 
 use crate::{config::ResolvedConfig, store::Store};
 
-/// A failure whose message has already been printed in meka's own format.
-///
-/// Returning the error itself would print it twice, since `main`'s `anyhow::Result` prints whatever
-/// it is given; returning `Ok(())` tells every supervisor and wrapper script that a session meka
-/// refused to open was a successful run. This carries the exit status and nothing else, so the host
-/// keeps its own rendering (color, and the provider hint underneath) and still fails.
-#[derive(Debug)]
-pub(crate) struct AlreadyReported;
-
-impl std::fmt::Display for AlreadyReported {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("already reported")
-    }
-}
-
-impl std::error::Error for AlreadyReported {}
-
 fn main() -> anyhow::Result<()> {
     let mut cli = cli::Cli::parse();
     // `meka confine` is the inside of the Bubblewrap sandbox: bwrap execs meka so the Landlock
@@ -155,7 +138,9 @@ fn main() -> anyhow::Result<()> {
     // Same shape, one line further along: the host has printed this one already, so all that is
     // left of it is the status. Both arms sit below `release_process_grants` for that reason.
     if let Err(error) = &result
-        && error.downcast_ref::<AlreadyReported>().is_some()
+        && error
+            .downcast_ref::<crate::error::AlreadyReported>()
+            .is_some()
     {
         std::process::exit(1);
     }

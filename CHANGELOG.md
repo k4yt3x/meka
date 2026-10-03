@@ -7,9 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.69.0] - 2026-10-03
+
 ### Added
 
 - `cache_control = false` on an `anthropic-messages` profile withholds the moving cache breakpoint.
+
+### Changed
+
+- A provider reply, or one streamed event, larger than 64 MiB ends the request with an error.
+
+### Fixed
+
+- Provider and login requests no longer follow redirects, so a credential stays at its endpoint.
 
 ## [0.68.1] - 2026-09-30
 
@@ -2513,7 +2523,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.68.1...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.69.0...HEAD
+[0.69.0]: https://github.com/k4yt3x/meka/compare/0.68.1...0.69.0
 [0.68.1]: https://github.com/k4yt3x/meka/compare/0.68.0...0.68.1
 [0.68.0]: https://github.com/k4yt3x/meka/compare/0.67.0...0.68.0
 [0.67.0]: https://github.com/k4yt3x/meka/compare/0.66.0...0.67.0

@@ -22,9 +22,9 @@ use tokio_util::sync::CancellationToken;
 
 use self::terminal::*;
 use crate::{
-    AlreadyReported,
     agent::Agent,
     config::ResolvedConfig,
+    error::AlreadyReported,
     host::repl::editor::ReplEvent,
     permission::SharedPermission,
     session::{AgentOptions, CoreMaterials, SessionCells, SessionMaterials},

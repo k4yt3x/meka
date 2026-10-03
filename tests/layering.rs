@@ -304,14 +304,14 @@ fn top_level_entries(inner: &str) -> Vec<&str> {
     entries
 }
 
-/// The module an entry or path starts with: its first identifier, if it is one.
+/// The module an entry or path starts with: its first identifier, if it is one. An item defined
+/// at the crate root reads as a module too, and has no rank, so a path to one is reported rather
+/// than passed over.
 fn leading_module(text: &str) -> Option<String> {
     let module: String = text
         .trim_start()
         .chars()
-        .take_while(|character| {
-            character.is_ascii_lowercase() || character.is_ascii_digit() || *character == '_'
-        })
+        .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
         .collect();
     (!module.is_empty()).then_some(module)
 }
@@ -354,9 +354,8 @@ fn no_module_reaches_a_layer_above_or_beside_it() {
                 continue;
             }
             let Some(&target_rank) = ranks.get(edge.as_str()) else {
-                // `crate::sync_helper` style names that are not modules: a path into a
-                // re-exported item at the crate root. The root re-exports nothing today, so any
-                // unknown name is a module that was added without a rank.
+                // A module added without a rank, or an item defined at the root: `main` is rank
+                // 0, so nothing below it may name what it defines.
                 violations.push(format!("{relative} names crate::{edge}, which has no rank"));
                 continue;
             };
@@ -523,6 +522,17 @@ fn production_code_reads_meka_variables_only_where_the_ledger_says() {
         "environment reads outside the ledger:\n  {}",
         violations.join("\n  ")
     );
+}
+
+/// A path to an item at the crate root is an edge to a name with no rank, and is seen as one.
+#[test]
+fn a_root_item_is_an_edge() {
+    let edges = edges_of("fn f() -> crate::AlreadyReported { crate::error::x() }");
+    let expected: BTreeSet<String> = ["AlreadyReported", "error"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert_eq!(edges, expected);
 }
 
 #[test]

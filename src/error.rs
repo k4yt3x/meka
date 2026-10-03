@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use futures::StreamExt;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -186,6 +187,23 @@ pub(crate) enum MekaError {
 
 pub(crate) type Result<T> = std::result::Result<T, MekaError>;
 
+/// A failure whose message has already been printed in meka's own format.
+///
+/// Returning the error itself would print it twice, since `main`'s `anyhow::Result` prints whatever
+/// it is given; returning `Ok(())` tells every supervisor and wrapper script that a session meka
+/// refused to open was a successful run. This carries the exit status and nothing else, so the host
+/// keeps its own rendering (color, and the provider hint underneath) and still fails.
+#[derive(Debug)]
+pub(crate) struct AlreadyReported;
+
+impl std::fmt::Display for AlreadyReported {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("already reported")
+    }
+}
+
+impl std::error::Error for AlreadyReported {}
+
 impl MekaError {
     /// A file or process failure with its context, for a door that could not read, write or run
     /// what it was asked to: neither the caller's fault nor `config.toml`'s.
@@ -349,10 +367,10 @@ pub(crate) fn provider_http_error(
 /// `should_retry_provider_error` bounds it with [`crate::provider::retry::RETRY_BUDGET`], which is
 /// the layer that knows how long the sequence has been running. Classification cannot.
 ///
-/// Two exceptions, both properties of the request and its destination rather than of the network,
-/// so both fail identically however many times they are tried. `is_builder` means the request was
-/// never constructed and nothing was sent. `is_redirect` means reqwest followed real 3xx answers
-/// until its policy ran out, so the endpoint replied every time.
+/// One exception, a property of the request rather than of the network, so it fails identically
+/// however many times it is tried: `is_builder` means the request was never constructed and nothing
+/// was sent. A redirect is not one, because the provider clients follow none: a 3xx is an answer,
+/// refused by `crate::provider::succeeded` with the location it named.
 ///
 /// A timeout is not a third exception, tempting as it is: reqwest cannot tell a request that may
 /// still be generating from one that delivered nothing. `is_timeout` scans the source chain for any
@@ -368,7 +386,7 @@ pub(crate) fn provider_transport_error(
     retry_after: Option<Duration>,
 ) -> MekaError {
     let message = format!("{}: {}", context, format_reqwest_error(error));
-    if error.is_builder() || error.is_redirect() {
+    if error.is_builder() {
         MekaError::Provider(message)
     } else {
         MekaError::RetryableProvider {
@@ -380,25 +398,78 @@ pub(crate) fn provider_transport_error(
     }
 }
 
+/// The most of one reply, or of one streamed event, meka holds in memory; past it the request ends
+/// with an error. A whole completion runs to a megabyte or two at the largest output caps and a
+/// streamed event to a fraction of that, so nothing legitimate comes near. What it bounds is an
+/// endpoint reached through `base_url` answering with something else, which would otherwise be read
+/// to its end whatever its size.
+pub(crate) const MAX_REPLY_BYTES: usize = 64 * crate::text::MIB;
+
 /// Read a whole reply's body, or stop reading the moment the turn is canceled.
 ///
 /// The other half of the race in `crate::oauth::send_with_one_refresh`. A provider may answer the
 /// headers at once and spend the whole generation inside the body, which is exactly what a proxy
 /// that keeps the connection warm does, so a stop that only dropped the send would still wait out a
-/// reply already announced. Every whole-reply body is read here, a refused status's included; a
-/// stream's body is read by `crate::provider::sse::drive`, which races the token on every event.
+/// reply already announced. Every whole-reply body is read here, a refused status's and a token
+/// exchange's included; a stream's body is read by `crate::provider::sse::drive`, which races the
+/// token on every event and bounds each the same way.
 pub(crate) async fn read_whole_reply(
     response: reqwest::Response,
     retry_after: Option<Duration>,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<String> {
-    tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => Err(MekaError::Interrupted),
-        text = response.text() => text.map_err(|error| {
-            provider_transport_error("failed to read response", &error, retry_after)
-        }),
+    read_whole_reply_within(response, MAX_REPLY_BYTES, retry_after, cancellation).await
+}
+
+/// [`read_whole_reply`] under an explicit bound.
+///
+/// A declared length past the bound is refused before a byte of the body is read; a body of no
+/// declared length is refused the moment it passes it. Decoded as UTF-8 with replacement, which is
+/// what every API meka speaks sends and what a reply that is not JSON gets cut to anyway.
+async fn read_whole_reply_within(
+    response: reqwest::Response,
+    max_bytes: usize,
+    retry_after: Option<Duration>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<String> {
+    let refused = || {
+        MekaError::Provider(format!(
+            "refused a reply larger than {}",
+            crate::text::format_size(max_bytes)
+        ))
+    };
+    if response
+        .content_length()
+        .is_some_and(|declared| declared > max_bytes as u64)
+    {
+        return Err(refused());
     }
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
+            chunk = stream.next() => chunk,
+        };
+        match chunk {
+            None => break,
+            Some(Ok(bytes)) => {
+                if body.len().saturating_add(bytes.len()) > max_bytes {
+                    return Err(refused());
+                }
+                body.extend_from_slice(&bytes);
+            }
+            Some(Err(error)) => {
+                return Err(provider_transport_error(
+                    "failed to read response",
+                    &error,
+                    retry_after,
+                ));
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// A mid-stream error event, classified by the code the backend put on it. The codes each backend
@@ -1196,62 +1267,68 @@ mod tests {
         assert!(message.contains("meka account login personal"), "{message}");
     }
 
-    /// A route that loops is not retried either, for the same reason: it is a property of the
-    /// destination rather than of the network, so the next attempt loops identically.
-    ///
-    /// Served locally rather than mocked, because `is_redirect` is only reachable by exhausting
-    /// reqwest's redirect policy, and a hand-built error would be testing the test.
+    /// A reply over the bound ends with an error rather than growing memory: by its declared length
+    /// before a byte is read, and by what has arrived when the length is undeclared.
     #[tokio::test]
-    async fn a_redirect_loop_is_not_retried() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind an ephemeral port");
-        let address = listener.local_addr().expect("the bound address");
-        let server = tokio::spawn(async move {
+    async fn a_reply_over_the_bound_is_refused() {
+        async fn serve_once(raw: Vec<u8>) -> std::net::SocketAddr {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            while let Ok((mut socket, _)) = listener.accept().await {
-                let mut discard = [0u8; 1024];
-                if socket.read(&mut discard).await.is_err() {
-                    continue;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let address = listener.local_addr().expect("address");
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !head.ends_with(b"\r\n\r\n") {
+                    let read = socket.read(&mut chunk).await.expect("the request arrives");
+                    assert!(read > 0, "the client closed the connection");
+                    head.extend_from_slice(&chunk[..read]);
                 }
-                if socket
-                    .write_all(b"HTTP/1.1 302 Found\r\nLocation: /\r\nContent-Length: 0\r\n\r\n")
-                    .await
-                    .is_err()
-                {
-                    // reqwest gives up after its redirect cap and drops the connection, so the last
-                    // write fails. Nothing to do but stop serving this one and wait for the next
-                    // `accept`, which is what `break` does here.
-                    break;
-                }
-            }
-        });
-
-        // Not `probe_client`, whose 500ms connect timeout is there for the dead-port tests beside
-        // this one; here the server is local and the error under test is only reached by walking
-        // reqwest's whole redirect chain.
-        //
-        // Pooling is off because the server above answers one request per `accept()` and then drops
-        // the socket. A later hop that reuses a pooled connection therefore writes into a closed
-        // one and fails as a transport error, and the assertion below sees that instead of the
-        // redirect. Raising the connect timeout did not fix this: it was never a connect timeout.
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .pool_max_idle_per_host(0)
-            .build()
-            .expect("a client with no exotic configuration builds");
-        let error = client
-            .get(format!("http://{address}/"))
-            .send()
+                socket.write_all(&raw).await.expect("answer");
+            });
+            address
+        }
+        async fn read_within(address: std::net::SocketAddr, max_bytes: usize) -> Result<String> {
+            let response = reqwest::Client::new()
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .expect("the head arrives");
+            read_whole_reply_within(
+                response,
+                max_bytes,
+                None,
+                &tokio_util::sync::CancellationToken::new(),
+            )
             .await
-            .expect_err("a server that only ever redirects to itself");
-        server.abort();
+        }
 
-        assert!(error.is_redirect(), "{error}");
-        assert!(matches!(
-            provider_transport_error("HTTP request failed", &error, None),
-            MekaError::Provider(_)
-        ));
+        let declared =
+            serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n".to_vec()).await;
+        let error = read_within(declared, 1024)
+            .await
+            .expect_err("declared too large");
+        assert!(matches!(error, MekaError::Provider(_)), "{error}");
+        assert!(error.to_string().contains("1.0 KiB"), "{error}");
+
+        let mut oversized =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n800\r\n".to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', 2048));
+        oversized.extend_from_slice(b"\r\n0\r\n\r\n");
+        let undeclared = serve_once(oversized).await;
+        let error = read_within(undeclared, 1024)
+            .await
+            .expect_err("arrived too large");
+        assert!(matches!(error, MekaError::Provider(_)), "{error}");
+
+        let fits = serve_once(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+                .to_vec(),
+        )
+        .await;
+        assert_eq!(read_within(fits, 1024).await.expect("read"), "hello");
     }
 
     #[test]

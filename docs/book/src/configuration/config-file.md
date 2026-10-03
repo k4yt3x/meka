@@ -147,6 +147,10 @@ If not set, defaults to:
 
 Set it with `meka account add <name> --base-url <url>`, or edit the account table by hand.
 
+The URL is used as given. An endpoint that answers with a redirect is refused, naming the location
+it pointed to, rather than followed, so a credential never leaves the host you configured; set the
+final URL.
+
 **The two API families end their base URL in different places, and that is not meka's choice.** An
 OpenAI-compatible base includes the version segment, which is why every provider documents one
 ending in `/v1` and why meka appends only `/chat/completions`. A Claude base is the host *root*,
