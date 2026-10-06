@@ -13,7 +13,7 @@ mock-provider = []
 serve = ["dep:axum", "dep:tower-http", "dep:utoipa", "dep:utoipa-swagger-ui"]
 
 [dependencies]
-agent-client-protocol = { version = "2.0", features = ["unstable_elicitation", "unstable_end_turn_token_usage", "unstable_session_fork"] }
+agent-client-protocol = { version = "2.2", features = ["unstable_end_turn_token_usage", "unstable_session_fork"] }
 anyhow = "1"
 async-stream = "0.3"
 async-trait = "0.1"
@@ -21,9 +21,9 @@ axum = { version = "0.8", optional = true }
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "wrap_help"] }
-croner = "3"
+croner = "4"
 crossterm = "0.29"
-dirs = "6"
+dirs = "7"
 eventsource-stream = "0.2"
 fast_html2md = "0.0"
 futures = "0.3"
@@ -40,11 +40,11 @@ open = "5"
 percent-encoding = "2"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 rand = "0.10"
-reedline = { version = "0.50", features = ["external_printer"] }
+reedline = { version = "0.52", features = ["external_printer"] }
 regex = "1"
 reqwest = { version = "0.13", features = ["json", "query", "stream", "gzip", "deflate", "brotli", "cookies"] }
-rmcp = { version = "3.1", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth", "auth-client-credentials-jwt"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rmcp = { version = "3.5", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth", "auth-client-credentials-jwt"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_norway = "0.9.42"
@@ -55,7 +55,7 @@ syntect = { version = "5", default-features = false, features = ["default-syntax
 termimad = "0.35"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-tokio-rusqlite = "0.7"
+tokio-rusqlite = "0.8"
 tokio-util = { version = "0.7", features = ["compat"] }
 toml = "1.1"
 toml_edit = "0.25"
@@ -64,8 +64,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.2"
 url = "2"
-utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"], optional = true }
-utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"], optional = true }
+utoipa = { version = "6", features = ["axum_extras", "chrono", "uuid"], optional = true }
+utoipa-swagger-ui = { version = "10", features = ["axum", "vendored"], optional = true }
 uuid = { version = "1", features = ["v4", "serde"] }
 zune-core = "0.5"
 zune-jpeg = "0.5"

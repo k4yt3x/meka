@@ -3,9 +3,10 @@
 //! Without this layer, `tracing` writes directly to `std::io::stderr`, and a line written while
 //! reedline is in raw mode is overwritten by its next redraw of the prompt.
 //!
-//! [`Relay`] holds an optional [`reedline::ExternalPrinter`] (a crossbeam channel reedline drains
-//! every poll tick to print messages *above* the prompt without clobbering it). Tracing output goes
-//! through the printer when the REPL has registered one; otherwise it falls back to plain stderr so
+//! [`Relay`] holds the sending half of an optional [`reedline::ExternalPrinter`], a bounded channel
+//! reedline drains every poll tick to print messages *above* the prompt without clobbering it.
+//! Tracing output goes through the printer when the REPL has registered one; otherwise it falls
+//! back to plain stderr so
 //! the non-interactive paths (`meka session export`, `meka session list`, etc.) and the pre-REPL
 //! startup window still see logs.
 //!
@@ -20,10 +21,10 @@ use std::{
     sync::{
         Arc, LazyLock, Mutex, RwLock, Weak,
         atomic::{AtomicBool, Ordering},
+        mpsc::{SyncSender, TrySendError},
     },
 };
 
-use reedline::ExternalPrinter;
 use tracing_subscriber::fmt::MakeWriter;
 
 use crate::console::Console;
@@ -33,11 +34,13 @@ use crate::console::Console;
 /// output.
 pub(crate) static RELAY: LazyLock<Relay> = LazyLock::new(Relay::new);
 
-/// Routes log output through reedline's [`ExternalPrinter`] when the interactive REPL has installed
-/// one; falls back to stderr otherwise.
+/// Routes log output through reedline's [`reedline::ExternalPrinter`] when the interactive REPL
+/// has installed its sender; falls back to stderr otherwise.
 #[derive(Clone)]
 pub(crate) struct Relay {
-    printer: Arc<RwLock<Option<ExternalPrinter<String>>>>,
+    /// The sending half of the REPL's external printer. reedline keeps the printer itself, whose
+    /// receiving half cannot be shared between threads, so this is all a logging thread can hold.
+    sender: Arc<RwLock<Option<SyncSender<String>>>>,
     /// True only while reedline's `read_line()` owns the terminal. reedline drains the
     /// `ExternalPrinter` channel only inside that loop, so a line routed through it at any other
     /// time would sit until the next prompt is drawn; off-prompt the terminal is in cooked mode
@@ -55,7 +58,7 @@ pub(crate) struct Relay {
 impl Relay {
     fn new() -> Self {
         Self {
-            printer: Arc::new(RwLock::new(None)),
+            sender: Arc::new(RwLock::new(None)),
             at_prompt: Arc::new(AtomicBool::new(false)),
             console: Arc::new(RwLock::new(Weak::new())),
         }
@@ -69,11 +72,11 @@ impl Relay {
         *crate::sync::write(&self.console) = Arc::downgrade(console);
     }
 
-    /// Register an [`ExternalPrinter`] so subsequent log lines get printed above the live prompt
-    /// instead of racing reedline's redraw. Caller keeps a clone of the same printer to hand to
-    /// [`reedline::Reedline::with_external_printer`].
-    pub(crate) fn install(&self, printer: ExternalPrinter<String>) {
-        *crate::sync::write(&self.printer) = Some(printer);
+    /// Register the sending half of a [`reedline::ExternalPrinter`] so subsequent log lines get
+    /// printed above the live prompt instead of racing reedline's redraw. The printer itself goes
+    /// to [`reedline::Reedline::with_external_printer`], its only drainer.
+    pub(crate) fn install(&self, sender: SyncSender<String>) {
+        *crate::sync::write(&self.sender) = Some(sender);
     }
 
     /// Mark whether reedline's `read_line()` is currently active; the REPL sets this around each
@@ -87,22 +90,22 @@ impl<'a> MakeWriter<'a> for Relay {
     type Writer = RelayWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
-        let printer = self.printer.read().ok().and_then(|guard| guard.clone());
+        let sender = self.sender.read().ok().and_then(|guard| guard.clone());
         let console = self.console.read().ok().and_then(|guard| guard.upgrade());
         RelayWriter {
-            printer,
+            sender,
             at_prompt: Arc::clone(&self.at_prompt),
             console,
         }
     }
 }
 
-/// Per-write borrow handed back to the tracing formatter. Holds a clone of the printer (cheap: it's
-/// a pair of crossbeam channel handles) captured at the moment `make_writer` was called, so a
-/// printer install or clear racing with an in-flight write doesn't tear. `at_prompt` is read at
-/// write time so the routing reflects the live REPL state, not whatever it was at `make_writer`.
+/// Per-write borrow handed back to the tracing formatter. Holds a clone of the printer's sender
+/// captured at the moment `make_writer` was called, so an install racing with an in-flight write
+/// doesn't tear. `at_prompt` is read at write time so the routing reflects the live REPL state,
+/// not whatever it was at `make_writer`.
 pub(crate) struct RelayWriter {
-    printer: Option<ExternalPrinter<String>>,
+    sender: Option<SyncSender<String>>,
     at_prompt: Arc<AtomicBool>,
     console: Option<Arc<Mutex<Console>>>,
 }
@@ -112,7 +115,7 @@ impl Write for RelayWriter {
         // Only hand the line to the printer while the prompt is live: reedline drains that channel
         // only inside `read_line()`, so an off-prompt line would sit until the next prompt.
         if self.at_prompt.load(Ordering::Relaxed)
-            && let Some(printer) = &self.printer
+            && let Some(sender) = &self.sender
         {
             // The printer adds its own line break, so the newline tracing's formatter appends is
             // stripped, and an empty message (formatter buffering) would print as a blank line.
@@ -122,16 +125,16 @@ impl Write for RelayWriter {
                     if trimmed.is_empty() {
                         return Ok(buffer.len());
                     }
-                    // `try_send`, never `print`: the printer is a bounded channel reedline drains
-                    // once per poll, and `print` blocks when it is full, which hangs the REPL
+                    // `try_send`, never `send`: the printer is a bounded channel reedline drains
+                    // once per poll, and `send` blocks when it is full, which hangs the REPL
                     // thread for good when that thread, the only drainer, is the one logging. A
                     // full queue falls through to stderr below.
-                    match printer.sender().try_send(trimmed.to_string()) {
+                    match sender.try_send(trimmed.to_string()) {
                         Ok(()) => return Ok(buffer.len()),
                         // The editor has gone and the line with it. Not logged: an event raised
                         // inside tracing's own writer is dropped by its re-entrancy guard.
-                        Err(error) if error.is_disconnected() => return Ok(buffer.len()),
-                        Err(_full) => {}
+                        Err(TrySendError::Disconnected(_)) => return Ok(buffer.len()),
+                        Err(TrySendError::Full(_)) => {}
                     }
                 }
                 Err(_) => {
@@ -204,8 +207,8 @@ mod tests {
     #[test]
     fn a_full_printer_queue_does_not_block_a_log_line() {
         let relay = Relay::new();
-        let printer = ExternalPrinter::<String>::new(1);
-        relay.install(printer);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        relay.install(sender);
         relay.set_at_prompt(true);
         let (done, finished) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -223,6 +226,9 @@ mod tests {
         finished
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the third line blocked on a queue nobody drains");
+        // Held to here: once the receiver is gone the channel answers `Disconnected`, which never
+        // blocks either, and the test would pass without a full queue.
+        drop(receiver);
     }
 
     /// An off-prompt log line settles the row instead of landing on it, and counts for nothing

@@ -289,10 +289,12 @@ enabled = ["read", "unrestricted"]
         let transaction = connection.transaction().expect("begin");
         for job in jobs {
             let due = std::time::SystemTime::now() - job.overdue_by;
-            let seconds = due
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("after the epoch")
-                .as_secs();
+            let seconds = i64::try_from(
+                due.duration_since(std::time::UNIX_EPOCH)
+                    .expect("after the epoch")
+                    .as_secs(),
+            )
+            .expect("fits an i64");
             let due: String = transaction
                 .query_row(
                     "SELECT strftime('%Y-%m-%dT%H:%M:%S', ?1, 'unixepoch') || '+00:00'",

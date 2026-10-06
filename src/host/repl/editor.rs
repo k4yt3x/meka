@@ -716,7 +716,7 @@ pub(crate) fn run_repl(launch: ReplLaunch) {
     // fire while the REPL is starting) print above the live prompt instead of being overwritten by
     // reedline's redraw.
     let printer = ExternalPrinter::default();
-    RELAY.install(printer.clone());
+    RELAY.install(printer.sender());
 
     // Persistent, cross-session input history backed by the SQLite DB. On failure, degrade to
     // reedline's default in-memory history rather than taking down the REPL.

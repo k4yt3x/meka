@@ -123,8 +123,12 @@ impl Schedule {
         // model meaning "every 10 minutes" in the Quartz shape, would become every 10 seconds. The
         // `MIN_EVERY` floor that stops `every` firing on each poll tick does not apply to `cron`,
         // and the confirmation echoes the pattern back verbatim.
+        // A step after a bare number, `5/5` for `5-59/5`, stays accepted against croner's strict
+        // default: a stored spec must read back under the grammar that accepted it, and a
+        // migration could not rewrite one without parsing cron, which is code it may not call.
         let cron = croner::parser::CronParser::builder()
             .seconds(croner::parser::Seconds::Disallowed)
+            .sloppy_ranges(true)
             .build()
             .parse(input)
             .map_err(|error| format!("'{input}' is not a valid cron expression: {error}"))?;
@@ -490,6 +494,28 @@ mod tests {
         // A legitimate five-field row still round-trips.
         let stored = Schedule::from_stored("cron", "0 9 * * 1-5").expect("five fields still load");
         assert_eq!(stored.spec(), "0 9 * * 1-5");
+    }
+
+    /// `5/5` starts at minute 5 and steps from there, where croner's strict default refuses it. A
+    /// row written under the lenient grammar has to keep loading, and reading the `5` as `*` would
+    /// move the job onto a grid nobody asked for.
+    #[test]
+    fn a_step_after_a_bare_number_starts_the_range_there() {
+        use chrono::{TimeZone, Timelike};
+
+        let schedule = Schedule::from_stored("cron", "5/5 * * * *").expect("the lenient grammar");
+        // Anchored in local time, the clock cron reads, so the host's offset cannot move the
+        // minute.
+        let anchor = Local
+            .with_ymd_and_hms(2026, 1, 1, 12, 57, 0)
+            .single()
+            .expect("anchor")
+            .with_timezone(&Utc);
+        let next = schedule
+            .next_after(anchor)
+            .expect("has a next occurrence")
+            .with_timezone(&Local);
+        assert_eq!((next.hour(), next.minute()), (13, 5), "{next}");
     }
 
     #[test]

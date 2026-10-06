@@ -66,7 +66,7 @@ impl ClientHandler for MekaClientHandler {
     /// What the `initialize` request says about this client. Left to rmcp's default, it names the
     /// SDK as the client, floats the protocol version with the SDK's release, and declares no
     /// capabilities at all, so a server that checks before it elicits never does.
-    fn get_info(&self) -> rmcp::model::ClientInfo {
+    fn get_info(&self) -> rmcp::model::ClientConfig {
         use rmcp::model::{
             ClientCapabilities, ElicitationCapability, FormElicitationCapability, Implementation,
             ProtocolVersion, UrlElicitationCapability,
@@ -77,7 +77,7 @@ impl ClientHandler for MekaClientHandler {
                 .with_form(FormElicitationCapability::new())
                 .with_url(UrlElicitationCapability::new()),
         );
-        rmcp::model::ClientInfo::new(
+        rmcp::model::ClientConfig::new(
             capabilities,
             Implementation::new("meka", env!("CARGO_PKG_VERSION")),
         )

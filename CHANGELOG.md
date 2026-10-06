@@ -38,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A sub-agent its parent is running reports `turn_in_flight: true` on its record and in listings.
 - A parked approval prompt waits out `stream_reattach_grace` after its last attender leaves.
 - The store gains a table of turns; the migration runs on open behind the usual backup.
+- Upgrade `rusqlite` to 0.40 (SQLite 3.53.2) and `croner` to 4; the cron grammar is unchanged.
+- Upgrade `agent-client-protocol` to 2.2, `rmcp` to 3.5, reedline to 0.52 and `utoipa` to 6.
 
 ### Fixed
 

@@ -65,7 +65,7 @@ impl ScheduleStore {
                 let existing = transaction.query_row(
                     "SELECT count(*) FROM scheduled_jobs WHERE session_id = ?1",
                     rusqlite::params![session_id],
-                    |row| row.get::<_, u64>(0),
+                    |row| row.get::<_, i64>(0),
                 )?;
                 let existing = usize::try_from(existing).unwrap_or(usize::MAX);
                 if existing >= max_jobs {
