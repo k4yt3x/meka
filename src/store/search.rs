@@ -104,6 +104,7 @@ fn spoken_words_of_row(kind: &str, content: &str) -> String {
         kind: kind.to_string(),
         content: content.to_string(),
         created_at: String::new(),
+        turn_id: None,
     };
     match decode_event_from_row(&row) {
         Ok(Some(Event::Append(message))) => spoken_words(&message),
@@ -210,10 +211,15 @@ pub(super) fn insert_message(
     kind: &str,
     content: &str,
     created_at: &str,
+    turn_id: Option<&str>,
 ) -> rusqlite::Result<i64> {
+    // The writer names the turn: only the agent knows whether the turn open on the session is
+    // the one it is running or one a dead process left open, so the store is told rather than
+    // left to guess from the table.
     connection.execute(
-        "INSERT INTO messages (session_id, kind, content, created_at) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![session_id, kind, content, created_at],
+        "INSERT INTO messages (session_id, kind, content, created_at, turn_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![session_id, kind, content, created_at, turn_id],
     )?;
     let message_id = connection.last_insert_rowid();
     connection.execute(
@@ -608,7 +614,7 @@ mod tests {
             .expect("create");
         for line in lines {
             store
-                .save_event(id, &Event::Append(Message::user(*line)))
+                .save_event(id, &Event::Append(Message::user(*line)), None)
                 .await
                 .expect("save");
         }
@@ -691,6 +697,7 @@ mod tests {
                         is_error: false,
                     }],
                 }),
+                None,
             )
             .await
             .expect("save");
@@ -1026,11 +1033,15 @@ mod tests {
             .await
             .expect("create");
         store
-            .save_event(session, &Event::CompactBoundary {
-                summary: Message::assistant_text("the summary mentions pelicans"),
-                replaced_count: 0,
-                loaded_tools_snapshot: HashSet::new(),
-            })
+            .save_event(
+                session,
+                &Event::CompactBoundary {
+                    summary: Message::assistant_text("the summary mentions pelicans"),
+                    replaced_count: 0,
+                    loaded_tools_snapshot: HashSet::new(),
+                },
+                None,
+            )
             .await
             .expect("save");
         let found = store

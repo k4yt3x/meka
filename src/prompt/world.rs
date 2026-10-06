@@ -824,7 +824,10 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
                 line.push_str(&format!(" [{}]", entry.tags.join(", ")));
             }
             if let Some(body) = &entry.inline_body {
-                line.push_str(&format!("\n  {}", clip_chars(body, MEMORY_INLINE_ENTRY_MAX_CHARS).replace('\n', "\n  ")));
+                line.push_str(&format!(
+                    "\n  {}",
+                    clip_chars(body, MEMORY_INLINE_ENTRY_MAX_CHARS).replace('\n', "\n  ")
+                ));
             }
             (entry.name.clone(), line)
         })

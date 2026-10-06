@@ -434,16 +434,10 @@ pub(crate) async fn ensure_session_loaded_holding(
         token_id: summary.token_id.clone(),
         created_at: parsed_created_at,
         updated_at: Arc::new(RwLock::new(parsed_updated_at)),
-        last_turn_at_wall: Arc::new(RwLock::new(None)),
         capabilities,
         frontend: http_frontend,
     };
-    new_entry.frontend.install_feed(
-        id,
-        crate::host::http::feed::FEED_BROADCAST_CAPACITY,
-        state.config.stream_replay_events,
-        Some(state.webhooks.clone()),
-    );
+    new_entry.frontend.install_feed(id, &state.feed_wiring());
 
     // Re-checked before the write lock rather than under it: the map's lock is write-preferring,
     // and a store round trip held under the write guard queued every handler on this process

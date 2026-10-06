@@ -445,7 +445,7 @@ impl TurnRecovery {
     /// costs a 2xx.
     pub(super) async fn persist_vindicated_repair(&mut self, agent: &Agent, session_id: Uuid) {
         if let Some(event) = self.pending_repair.take()
-            && let Err(error) = agent.store.save_event(session_id, &event).await
+            && let Err(error) = agent.save_event(session_id, &event).await
         {
             tracing::warn!("failed to persist content repair: {error}");
         }
@@ -467,7 +467,6 @@ impl TurnRecovery {
         }
         let event = crate::conversation::Event::Append(prompt.clone());
         agent
-            .store
             .save_event_marking_inbox(session_id, &event, &self.inbox_ids)
             .await?;
         self.user_saved = true;
@@ -501,7 +500,6 @@ impl TurnRecovery {
         };
         let nudge_event = crate::conversation::Event::Append(nudge.clone());
         agent
-            .store
             .save_events_atomic(session_id, vec![assistant_event, nudge_event])
             .await?;
         messages.append(assistant_message.clone());
@@ -536,7 +534,6 @@ impl TurnRecovery {
         if self.user_saved {
             let withdrawal = messages.replace_tail(1, Vec::new());
             if let Err(error) = agent
-                .store
                 .save_event_resetting_inbox(session_id, &withdrawal, &self.inbox_ids, not_before)
                 .await
             {

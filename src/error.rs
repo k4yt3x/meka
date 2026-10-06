@@ -185,6 +185,434 @@ pub(crate) enum MekaError {
     McpTurnGated { servers: Vec<(String, String)> },
 }
 
+/// The catalog every surface reports a failure under: the `type` of an HTTP Problem Detail and
+/// the `error_type` a session's `last_turn` records. One vocabulary, so a client branches on the
+/// same name wherever it meets the failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ErrorKind {
+    Auth,
+    AuthScope,
+    SessionNotFound,
+    /// A named resource that is not a session: a skill, a memory, an MCP server, a background
+    /// task, a turn stream. Distinct from [`Self::SessionNotFound`] because `type` is the
+    /// machine-readable code a client switches on, and "your session is gone" and "that skill does
+    /// not exist" call for very different responses.
+    NotFound,
+    /// The token's scopes are sufficient, but the *session* sits at too low a permission for what
+    /// was asked.
+    ///
+    /// Distinct from [`Self::AuthScope`], which is the same 403 with the opposite remedy. A client
+    /// routing on `type` reads `auth-scope` as "get a better token" and will re-provision forever;
+    /// the fix here is `PATCH /v1/sessions/{id}` with a higher `permission`.
+    SessionPermission,
+    SessionLocked,
+    /// The session exists but is not resident in memory, and the endpoint needs live state.
+    ///
+    /// Distinct from [`Self::TurnInFlight`], which reads as "something is running, cancel it" and
+    /// sends a client into a `POST /cancel` loop that returns 204 forever because there is no turn.
+    /// The remedy here is the opposite: submit a turn, which loads the session.
+    SessionNotLoaded,
+    TurnInFlight,
+    TurnCanceled,
+    /// A re-attached stream ended with no recorded outcome, because the task that would have
+    /// recorded one died. Only ever carried inside a terminal `turn.failed` SSE event, never as an
+    /// HTTP response body, but cataloged here so the type URI has one definition rather than a
+    /// string literal at the emitting site.
+    StreamDetached,
+    /// The only SSE consumer fell behind the broadcast buffer, so the turn was stopped for it.
+    /// SSE-only, like [`Self::StreamDetached`]: it rides a terminal `turn.failed` and is never an
+    /// HTTP response body.
+    SseLag,
+    RequestNotFound,
+    Idempotency,
+    /// The inbox item's text is already in the conversation, so only a turn can answer it now and
+    /// there is nothing to take back.
+    InboxAppended,
+    /// The cancel named a turn that is not the one in flight. Distinct from a 204 for "no turn",
+    /// because the caller was aiming at something specific and it is gone; whatever runs now is
+    /// somebody else's.
+    TurnMismatch,
+    /// The named skill lives under a read-only root from `[skills] extra_paths`, so writing it
+    /// here would create a shadowing copy in meka's own store rather than change the file.
+    ///
+    /// Distinct from [`Self::InvalidBody`]: the request is well-formed and the remedy is to pick
+    /// another name or edit that file directly, not to fix the payload.
+    StoreReadOnly,
+    /// The id names a sub-agent's conversation, which only its parent can continue.
+    ///
+    /// Distinct from [`Self::InvalidBody`] for the reason [`Self::StoreReadOnly`] is: the request
+    /// parsed and validated, and no edit to it will ever be accepted. A client routing on `type`
+    /// reads `invalid-body` as "my payload is malformed" and rewrites the payload forever, when the
+    /// remedy is to stop addressing this id and call `agent_followup` from the parent instead.
+    ///
+    /// Not [`Self::SessionPermission`], which is about the level a session runs at and is raised
+    /// with `PATCH /v1/sessions/{id}`; no permission makes a sub-agent drivable from outside its
+    /// parent. Not [`Self::SessionNotFound`] either: the session exists and every read endpoint
+    /// still serves it.
+    SessionNotDrivable,
+    /// The id names a sub-agent this process is not running, so there is no feed to read; its
+    /// feed exists while its parent runs it.
+    ///
+    /// Its own type rather than [`Self::SessionNotLoaded`], whose remedy is to load the session
+    /// by submitting a turn: a sub-agent is never loaded that way, and a client acting on that
+    /// type would be refused with [`Self::SessionNotDrivable`] for its trouble. Not that one
+    /// either, since reading a sub-agent is allowed; only its feed is absent.
+    SubagentNotRunning,
+    InvalidBody,
+    /// `If-Match` named a conversation that has since changed: a rewind or a fork decided on a
+    /// view that is no longer the one the server holds. The remedy is to read `GET /messages`
+    /// again and decide again, which `revision` and `total` on the detail support.
+    PreconditionFailed,
+    /// The conversation meka assembled still exceeds the profile's `max_request_bytes` after every
+    /// older image was redacted, so meka refused to send it.
+    ///
+    /// meka's own refusal, which is why it is a 422 and not one of the 502s: nothing was sent and
+    /// no provider judged it, so there is no upstream response to relay and `detail` is the whole
+    /// answer. Distinct from [`Self::PayloadTooLarge`], which is `max_body_bytes` on the HTTP
+    /// request rather than the profile's ceiling on what meka may send, and from
+    /// [`Self::ContextOverflow`], which is the model's window and comes back from the provider.
+    ///
+    /// Resending the same turn will be refused identically; the remedy is in `detail`.
+    RequestTooLarge,
+    PayloadTooLarge,
+    ConcurrencyLimit,
+    /// An upstream call failed for a reason meka could not place in one of the classes below.
+    ///
+    /// **A catch-all, not a "permanent" bucket, and the difference is worth stating because the
+    /// obvious reading of the name is the wrong one.** It is the `else` arm of
+    /// [`provider_http_error`] plus every site that builds a bare [`MekaError::Provider`], so a
+    /// revoked credential lands here, and so do a 408, a 425, a 200 whose body was replaced by a
+    /// proxy's HTML, and any mid-stream error type outside the retryable allowlists. Several of
+    /// those are transient; meka simply did not recognize them as such.
+    ///
+    /// So it means "not classified as transient", which is weaker than "will fail again", and the
+    /// docs must not promise the stronger thing. [`Self::ProviderUnavailable`] is the positive
+    /// signal and this is its absence.
+    Provider,
+    /// The upstream failed in a way meka's own classifier had already labeled transient.
+    ///
+    /// A 502 like [`Self::Provider`], and a distinct `type` for the reason
+    /// [`Self::ContextOverflow`] is one: the remedies differ. This one is worth sending again after
+    /// a pause. Its absence is not the opposite claim, only the lack of this one; see
+    /// [`Self::Provider`].
+    ///
+    /// **A relayed `Retry-After` cannot be what separates this from [`Self::Provider`].** That
+    /// header is absent from most of this variant's own instances: a transport failure has no
+    /// response to carry one, a mid-stream `overloaded_error` has no headers to read, and
+    /// [`parse_retry_after`] reads only the delta-seconds form, so an upstream answering with an
+    /// HTTP date sends none meka can use. An overload would otherwise arrive byte-identical to a
+    /// dead credential, and a client would have to choose between retrying that credential
+    /// forever and dropping turns a second attempt would have completed.
+    ///
+    /// Claims a *class*, never an outcome, and says nothing about how many attempts meka made.
+    /// `should_retry_provider_error` declines to retry at all once any output has reached the
+    /// stream or the retry budget is spent, so this can arrive after three attempts or after none.
+    ProviderUnavailable,
+    /// The conversation no longer fits the model's context window, and meka could not compact it
+    /// down far enough (or `auto_compact` is off).
+    ///
+    /// A 502 like [`Self::Provider`], because the upstream is what refused the turn, but a distinct
+    /// `type` so a client can tell the two apart. They call for opposite responses: `provider` is
+    /// "the upstream is unwell, try the same request again", while this one will refuse the same
+    /// request forever. A client that cannot distinguish them retries an oversized conversation
+    /// until it gives up on wall-clock, which is the failure this variant exists to prevent. The
+    /// remedy is to shorten the conversation: `POST /v1/sessions/{id}/compact`, or `/rewind`, or a
+    /// smaller message.
+    ///
+    /// Not [`Self::PayloadTooLarge`], which is meka's own `max_body_bytes` on the HTTP request and
+    /// has nothing to do with the model's window; a request well under one limit routinely exceeds
+    /// the other.
+    ContextOverflow,
+    /// A server marked `[mcp.servers.<name>] required` was not connected when a turn asked for it,
+    /// so the turn was refused before anything reached the provider.
+    ///
+    /// A 503 rather than a 502: the dependency that is unwell is one meka manages rather than the
+    /// model provider, and the caller's request was never forwarded to anything. Distinct from
+    /// [`Self::Internal`], which reads as "meka broke" and sends an operator to the wrong log: meka
+    /// classified this one correctly, and the fault is in a subprocess or a remote MCP server.
+    McpUnavailable,
+    Internal,
+}
+
+impl ErrorKind {
+    /// Every entry of the catalog, for a reader that holds a `type` and wants the kind back.
+    pub(crate) const ALL: [Self; 28] = [
+        Self::Auth,
+        Self::AuthScope,
+        Self::SessionNotFound,
+        Self::NotFound,
+        Self::SessionPermission,
+        Self::SessionLocked,
+        Self::SessionNotLoaded,
+        Self::TurnInFlight,
+        Self::TurnCanceled,
+        Self::StreamDetached,
+        Self::SseLag,
+        Self::RequestNotFound,
+        Self::Idempotency,
+        Self::InboxAppended,
+        Self::TurnMismatch,
+        Self::StoreReadOnly,
+        Self::SessionNotDrivable,
+        Self::SubagentNotRunning,
+        Self::InvalidBody,
+        Self::PreconditionFailed,
+        Self::RequestTooLarge,
+        Self::PayloadTooLarge,
+        Self::ConcurrencyLimit,
+        Self::Provider,
+        Self::ProviderUnavailable,
+        Self::ContextOverflow,
+        Self::McpUnavailable,
+        Self::Internal,
+    ];
+
+    /// The kind a stored name denotes, for a row the store wrote with [`Self::name`].
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|kind| kind.name() == name)
+    }
+
+    /// The kind's one name, the slug its `type` URI ends in: what the store records, so a row
+    /// carries the fact and not one host's spelling of it.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::AuthScope => "auth-scope",
+            Self::SessionNotFound => "session-not-found",
+            Self::NotFound => "not-found",
+            Self::SessionPermission => "session-permission",
+            Self::SessionLocked => "session-locked",
+            Self::SessionNotLoaded => "session-not-loaded",
+            Self::TurnInFlight => "turn-in-flight",
+            Self::TurnCanceled => "turn-canceled",
+            Self::StreamDetached => "stream-detached",
+            Self::SseLag => "sse-lag",
+            Self::RequestNotFound => "request-not-found",
+            Self::Idempotency => "idempotency",
+            Self::InboxAppended => "inbox-appended",
+            Self::TurnMismatch => "turn-mismatch",
+            Self::StoreReadOnly => "store-read-only",
+            Self::SessionNotDrivable => "session-not-drivable",
+            Self::SubagentNotRunning => "subagent-not-running",
+            Self::InvalidBody => "invalid-body",
+            Self::PreconditionFailed => "precondition-failed",
+            Self::RequestTooLarge => "request-too-large",
+            Self::PayloadTooLarge => "payload-too-large",
+            Self::ConcurrencyLimit => "concurrency-limit",
+            Self::Provider => "provider",
+            Self::ProviderUnavailable => "provider-unavailable",
+            Self::ContextOverflow => "context-overflow",
+            Self::McpUnavailable => "mcp-unavailable",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// The `type` URI a Problem Detail carries: [`Self::name`] under meka's error namespace.
+    pub(crate) const fn type_uri(self) -> &'static str {
+        match self {
+            Self::Auth => "https://meka.run/errors/auth",
+            Self::AuthScope => "https://meka.run/errors/auth-scope",
+            Self::SessionNotFound => "https://meka.run/errors/session-not-found",
+            Self::NotFound => "https://meka.run/errors/not-found",
+            Self::SessionPermission => "https://meka.run/errors/session-permission",
+            Self::SessionLocked => "https://meka.run/errors/session-locked",
+            Self::SessionNotLoaded => "https://meka.run/errors/session-not-loaded",
+            Self::TurnInFlight => "https://meka.run/errors/turn-in-flight",
+            Self::TurnCanceled => "https://meka.run/errors/turn-canceled",
+            Self::StreamDetached => "https://meka.run/errors/stream-detached",
+            Self::SseLag => "https://meka.run/errors/sse-lag",
+            Self::RequestNotFound => "https://meka.run/errors/request-not-found",
+            Self::Idempotency => "https://meka.run/errors/idempotency",
+            Self::InboxAppended => "https://meka.run/errors/inbox-appended",
+            Self::TurnMismatch => "https://meka.run/errors/turn-mismatch",
+            Self::StoreReadOnly => "https://meka.run/errors/store-read-only",
+            Self::SessionNotDrivable => "https://meka.run/errors/session-not-drivable",
+            Self::SubagentNotRunning => "https://meka.run/errors/subagent-not-running",
+            Self::InvalidBody => "https://meka.run/errors/invalid-body",
+            Self::PreconditionFailed => "https://meka.run/errors/precondition-failed",
+            Self::RequestTooLarge => "https://meka.run/errors/request-too-large",
+            Self::PayloadTooLarge => "https://meka.run/errors/payload-too-large",
+            Self::ConcurrencyLimit => "https://meka.run/errors/concurrency-limit",
+            Self::Provider => "https://meka.run/errors/provider",
+            Self::ProviderUnavailable => "https://meka.run/errors/provider-unavailable",
+            Self::ContextOverflow => "https://meka.run/errors/context-overflow",
+            Self::McpUnavailable => "https://meka.run/errors/mcp-unavailable",
+            Self::Internal => "https://meka.run/errors/internal",
+        }
+    }
+
+    /// The fixed `title` a Problem Detail carries beside the `type`.
+    pub(crate) const fn title(self) -> &'static str {
+        match self {
+            Self::Auth => "Authentication failed",
+            Self::AuthScope => "Insufficient scope",
+            Self::SessionNotFound => "Session not found",
+            Self::NotFound => "Resource not found",
+            Self::SessionPermission => "Session permission too low",
+            Self::SessionLocked => "Session is locked by another process",
+            Self::SessionNotLoaded => "Session is not loaded",
+            Self::TurnInFlight => "Turn already in flight",
+            Self::TurnCanceled => "Turn canceled",
+            Self::StreamDetached => "Turn outcome unavailable",
+            Self::SseLag => "SSE consumer lagged",
+            Self::RequestNotFound => "Pending request not found",
+            Self::Idempotency => "Idempotency-Key conflict",
+            Self::InboxAppended => "Inbox item already appended",
+            Self::TurnMismatch => "Turn is not the one in flight",
+            Self::StoreReadOnly => "Skill is in a read-only root",
+            Self::SessionNotDrivable => "Session is a sub-agent's conversation",
+            Self::SubagentNotRunning => "Sub-agent is not running here",
+            Self::InvalidBody => "Invalid request body",
+            Self::PreconditionFailed => "Precondition failed",
+            Self::RequestTooLarge => "Request exceeds the profile's size ceiling",
+            Self::PayloadTooLarge => "Request body exceeds configured limit",
+            Self::ConcurrencyLimit => "Process-wide concurrency limit reached",
+            Self::Provider => "Provider call failed",
+            Self::ProviderUnavailable => "Provider temporarily unavailable",
+            Self::ContextOverflow => "Conversation exceeds the model's context window",
+            Self::McpUnavailable => "Required MCP server is not ready",
+            Self::Internal => "Internal server error",
+        }
+    }
+}
+
+/// The sentence for every failure that reaches a caller as a 500: the fault is the operator's to
+/// read about, so the sentence names the log and nothing else.
+pub(crate) const INTERNAL_SENTENCE: &str = "internal server error; consult server logs";
+
+/// The sentence for a transient upstream failure, the same whether or not the failure carried a
+/// `Retry-After` to relay. Named rather than written twice because a caller matching on `type`
+/// gets one answer and a human reading `detail` must not get two.
+const PROVIDER_UNAVAILABLE_SENTENCE: &str =
+    "the provider did not complete this turn; its response is in the server log";
+
+impl MekaError {
+    /// Where this error sits in the catalog. The one classification, so the HTTP surface and the
+    /// outcome a session's row records cannot disagree about what a failure was.
+    pub(crate) fn kind(&self) -> ErrorKind {
+        match self {
+            // The 422s whose remedy is the same: change what was sent. A `Config` refusal is
+            // about what the caller sent or how the installation is set up, in its own words.
+            Self::Config(_)
+            | Self::Usage(_)
+            | Self::EmptyPrompt
+            | Self::DisabledLevel { .. }
+            | Self::ProfileNotConfigured { .. } => ErrorKind::InvalidBody,
+            // Same status as the three above, different `type`, because the remedies do not
+            // overlap: meka's own ceiling, refused before anything was sent, and a permanent
+            // property of the id itself.
+            Self::RequestTooLarge(_) => ErrorKind::RequestTooLarge,
+            Self::SessionNotDrivable(_) => ErrorKind::SessionNotDrivable,
+            // Everything upstream the transient class did not claim: `provider_http_error`'s
+            // `else`, so a revoked credential lands here and so does a 408, a 425 and any
+            // mid-stream error type outside the retryable allowlists. `InvalidRequest` belongs
+            // here despite naming a 400: what the upstream called invalid is the conversation
+            // meka assembled, which the caller neither sent nor can fix by correcting its own
+            // payload, and sending it again unchanged gets the same 400 back.
+            Self::Provider(_) | Self::InvalidRequest(_) => ErrorKind::Provider,
+            // The transient class, recovered from the branch the retry classifier took rather
+            // than guessed at here. `StreamError` belongs with it because every producer is
+            // transport-shaped: an idle timeout, an `Err` from the SSE stream itself, a stream
+            // that ended before its terminal event. A malformed SSE payload is not one of them,
+            // being skipped with a warning, so nothing here resends into a body the provider
+            // would reject identically forever.
+            Self::StreamError(_) | Self::RetryableProvider { .. } => ErrorKind::ProviderUnavailable,
+            Self::ContextOverflow(_) => ErrorKind::ContextOverflow,
+            // A fully classified pre-flight refusal: answering "internal server error" would send
+            // an operator looking for a bug in meka instead of at the subprocess that did not
+            // start.
+            Self::McpTurnGated { .. } => ErrorKind::McpUnavailable,
+            Self::Interrupted => ErrorKind::TurnCanceled,
+            Self::SessionLocked(_) => ErrorKind::SessionLocked,
+            Self::SessionNotFound(_) => ErrorKind::SessionNotFound,
+            Self::TurnInFlight { .. } => ErrorKind::TurnInFlight,
+            // An installation fault is the operator's to fix and its sentence names their
+            // `ca_cert_file`, their proxy URL or their `base_url`; a caller can do nothing with
+            // any of it, and reading it as a 422 would have them rewriting a payload forever.
+            // The same 500 every server fault gets, with the text in the log where the person
+            // who wrote the file can read it.
+            Self::Installation(_)
+            | Self::Database(_)
+            | Self::Io(_)
+            | Self::ToolExecution { .. }
+            | Self::ToolRegistration { .. }
+            | Self::Internal(_)
+            | Self::McpConnection { .. }
+            | Self::McpToolExecution { .. }
+            | Self::McpAuth { .. } => ErrorKind::Internal,
+        }
+    }
+
+    /// What meka says about this error to a caller: what happened and, where there is exactly
+    /// one, the remedy. Never the upstream's own text, which [`Self::upstream_body`] carries for
+    /// the one surface configured to relay it, and never an installation fault's path, which is
+    /// the operator's to read in the log.
+    pub(crate) fn sentence(&self) -> String {
+        match self {
+            Self::Config(message)
+            | Self::Usage(message)
+            | Self::RequestTooLarge(message)
+            | Self::SessionNotDrivable(message) => message.clone(),
+            Self::EmptyPrompt
+            | Self::DisabledLevel { .. }
+            | Self::ProfileNotConfigured { .. }
+            | Self::SessionNotFound(_)
+            | Self::TurnInFlight { .. } => self.to_string(),
+            Self::Provider(_) | Self::InvalidRequest(_) => {
+                "the provider rejected or failed this turn; its response is in the server log"
+                    .to_string()
+            }
+            Self::StreamError(_) | Self::RetryableProvider { .. } => {
+                PROVIDER_UNAVAILABLE_SENTENCE.to_string()
+            }
+            Self::ContextOverflow(_) => {
+                "the conversation exceeds the model's context window; compact it before retrying"
+                    .to_string()
+            }
+            // The names travel and the reasons do not: a reason is the connector's own text and
+            // can carry a spawn failure complete with the command line and its path; the names
+            // are the operator's own configuration and the only part a caller can act on.
+            Self::McpTurnGated { servers } => format!(
+                "required MCP server(s) not ready: {}; each server's reason is in the server log",
+                servers
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::Interrupted => {
+                "turn was canceled (client cancel, shutdown, or disconnect)".to_string()
+            }
+            Self::SessionLocked(id) => format!("session {id} is locked by another process"),
+            Self::Installation(_)
+            | Self::Database(_)
+            | Self::Io(_)
+            | Self::ToolExecution { .. }
+            | Self::ToolRegistration { .. }
+            | Self::Internal(_)
+            | Self::McpConnection { .. }
+            | Self::McpToolExecution { .. }
+            | Self::McpAuth { .. } => INTERNAL_SENTENCE.to_string(),
+        }
+    }
+
+    /// The provider's own response text, when this error carries one. Every surface logs it;
+    /// only one configured to relay it shows it, since it can name the operator's account, its
+    /// rate-limit posture and, on one backend, a fragment of the request that triggered it. A
+    /// length bound on the relayed copy is not a redaction: it keeps the start of the body, where
+    /// every one of those identifiers lives.
+    pub(crate) fn upstream_body(&self) -> Option<&str> {
+        match self {
+            Self::Provider(message)
+            | Self::InvalidRequest(message)
+            | Self::StreamError(message)
+            | Self::RetryableProvider { message, .. }
+            | Self::ContextOverflow(message) => Some(message),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) type Result<T> = std::result::Result<T, MekaError>;
 
 /// A failure whose message has already been printed in meka's own format.
@@ -638,6 +1066,27 @@ pub(crate) fn format_reqwest_error(error: &reqwest::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The store records a kind by its name and the HTTP host spells the same kind as a URI, so
+    /// the two tables have to agree kind for kind: a name is its URI's last segment, every kind
+    /// reads back from its name, and no two kinds share one.
+    #[test]
+    fn every_kind_s_uri_is_its_name_under_the_one_namespace() {
+        let mut names = std::collections::HashSet::new();
+        for kind in super::ErrorKind::ALL {
+            assert_eq!(
+                kind.type_uri(),
+                format!("https://meka.run/errors/{}", kind.name()),
+                "{kind:?}"
+            );
+            assert_eq!(super::ErrorKind::from_name(kind.name()), Some(kind));
+            assert!(names.insert(kind.name()), "{kind:?} shares a name");
+        }
+        assert_eq!(
+            super::ErrorKind::from_name("https://meka.run/errors/provider"),
+            None
+        );
+    }
+
     use super::*;
 
     /// A missing profile is refused in the one "no such name" sentence, with what exists beside it.

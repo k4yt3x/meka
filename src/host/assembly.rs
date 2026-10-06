@@ -38,6 +38,9 @@ pub(crate) struct SharedDeps {
     pub(crate) user_instructions_source: Option<String>,
     /// Shared by every session this host builds, so two of them writing one file serialize.
     pub(crate) write_locks: crate::workspace::WriteLocks,
+    /// Shared by every session this host builds, so the host can say which sub-agents are in a
+    /// turn.
+    pub(crate) running_subagents: crate::session::RunningSubagents,
 }
 /// Whether a host may repeat an upstream's own response text to its caller: `[serve]
 /// relay_provider_errors`, on unless the operator turned it off.
@@ -284,6 +287,7 @@ pub(crate) async fn build_shared_deps(
         builtin_filter,
         agent_options,
         write_locks: crate::workspace::WriteLocks::default(),
+        running_subagents: crate::session::RunningSubagents::default(),
     })
 }
 /// Per-session agent assembly behind [`build_session_agent`]. Builds the tool registry (with the
@@ -882,6 +886,7 @@ impl SharedDeps {
         SessionMaterials {
             core: CoreMaterials {
                 write_locks: self.write_locks.clone(),
+                running_subagents: self.running_subagents.clone(),
                 ..CoreMaterials::from_config(
                     &self.config,
                     self.builtin_filter.clone(),
@@ -995,6 +1000,7 @@ mod tests {
                     title: None,
                     pinned_at: None,
                     stats: Default::default(),
+                    turns: Vec::new(),
                     events: Vec::new(),
                     scratchpad_entries: Vec::new(),
                 }],

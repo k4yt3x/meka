@@ -42,7 +42,6 @@ pub(crate) enum SseEventType {
     ToolCallExecuting,
     ToolCallCompleted,
     ToolCallOutputDelta,
-    SubAgentActivity,
     Progress,
     Notice,
     PermissionRequired,
@@ -54,6 +53,11 @@ pub(crate) enum SseEventType {
     InboxDelivered,
     InboxFailed,
     InboxWithdrawn,
+    ConversationRewound,
+    PermissionResolved,
+    SessionCreated,
+    SessionUpdated,
+    SessionDeleted,
 }
 
 impl SseEventType {
@@ -71,7 +75,7 @@ impl SseEventType {
     /// the deltas of a command that has since completed nor a hole where a chatty one pushed the
     /// events it needs out of the ring.
     pub(crate) const fn is_transient(self) -> bool {
-        matches!(self, Self::ToolCallOutputDelta | Self::SubAgentActivity)
+        matches!(self, Self::ToolCallOutputDelta)
     }
 }
 
@@ -84,7 +88,6 @@ impl SseEventType {
             Self::ToolCallExecuting => "tool_call.executing",
             Self::ToolCallCompleted => "tool_call.completed",
             Self::ToolCallOutputDelta => "tool_call.output_delta",
-            Self::SubAgentActivity => "subagent.activity",
             Self::Progress => "progress",
             Self::Notice => "notice",
             Self::PermissionRequired => "permission_required",
@@ -96,6 +99,11 @@ impl SseEventType {
             Self::InboxDelivered => "inbox.delivered",
             Self::InboxFailed => "inbox.failed",
             Self::InboxWithdrawn => "inbox.withdrawn",
+            Self::ConversationRewound => "conversation.rewound",
+            Self::PermissionResolved => "permission_resolved",
+            Self::SessionCreated => "session.created",
+            Self::SessionUpdated => "session.updated",
+            Self::SessionDeleted => "session.deleted",
         }
     }
 }
@@ -162,11 +170,14 @@ pub(crate) fn translate(
     capabilities: SessionCapabilities,
 ) -> Option<(SseEventType, serde_json::Value)> {
     let pair = match event {
-        FrontendEvent::TurnStarted => {
+        FrontendEvent::TurnStarted { .. } => {
             // The streaming handler emits a richer `turn.started` with extra fields;
             // suppress this bare form to avoid duplicate events.
             return None;
         }
+        // The HTTP host writes its own terminal from the turn's result; a sub-agent's feed is the
+        // one reader of this, and it is not built from `translate`.
+        FrontendEvent::TurnEnded { .. } => return None,
         FrontendEvent::TurnFinished => {
             // stop_reason is unknown here; the turn handler emits the real `turn.finished`
             // after run_turn returns. This event is used as an internal end-of-stream marker.
@@ -260,16 +271,9 @@ pub(crate) fn translate(
             SseEventType::ToolCallOutputDelta,
             serde_json::json!({ "id": id, "chunk": chunk }),
         ),
-        // The rolling block replaces the one before it for the same `id`, the parent's
-        // `agent_spawn` call. That is how its producer shapes it, because ACP replaces a call's
-        // content, and sending the block whole keeps one shape for both hosts.
-        FrontendEvent::SubAgentActivity {
-            tool_call_id,
-            summary,
-        } => (
-            SseEventType::SubAgentActivity,
-            serde_json::json!({ "id": tool_call_id, "summary": summary }),
-        ),
+        // A sub-agent's own feed carries its calls as they happen; the rolled-up block is the
+        // ACP host's, whose protocol replaces a call's content rather than streaming events.
+        FrontendEvent::SubAgentActivity { .. } => return None,
         // Not a rewrite of anything: each update is a fact about the call's progress the client
         // did not have, and an MCP call can be minutes long with `tool_call.completed` the only
         // other sign of life. Dropped by the blocking recorder, which has no live reader.
@@ -400,21 +404,15 @@ mod tests {
         assert_eq!(data["chunk"], "one\ntwo\n");
     }
 
-    /// A sub-agent's activity is filed under the parent's `agent_spawn` call, which is the only
-    /// call the client has been told about, and the block is sent whole.
+    /// A sub-agent's activity is not an event on the parent's feed: its tool calls stream on the
+    /// sub-agent's own feed, where each is a full `tool_call.executing` with its arguments.
     #[test]
     fn translate_sub_agent_activity() {
         let event = FrontendEvent::SubAgentActivity {
             tool_call_id: "tu_1".into(),
             summary: "file_read: notes.txt\nfile_search: todo".into(),
         };
-        let (event_type, data) =
-            translate(event, SessionCapabilities::default()).expect("translates");
-        assert_eq!(event_type, SseEventType::SubAgentActivity);
-        assert_eq!(event_type.as_str(), "subagent.activity");
-        assert!(event_type.is_transient());
-        assert_eq!(data["id"], "tu_1");
-        assert_eq!(data["summary"], "file_read: notes.txt\nfile_search: todo");
+        assert!(translate(event, SessionCapabilities::default()).is_none());
     }
 
     #[test]

@@ -246,6 +246,7 @@ mod tests {
             finished_at: Some(chrono::Utc::now()),
             announced_at: None,
             delivered_at: None,
+            subagent_id: None,
         };
 
         let rendered = show_lines(&task);
@@ -297,6 +298,7 @@ mod tests {
             finished_at: Some(chrono::Utc::now()),
             announced_at: None,
             delivered_at: None,
+            subagent_id: None,
         };
 
         let rendered = show_lines(&task);
@@ -338,6 +340,7 @@ mod tests {
             finished_at: None,
             announced_at: None,
             delivered_at: None,
+            subagent_id: None,
         };
         manager
             .background_store()
@@ -455,6 +458,7 @@ mod tests {
             finished_at: Some(chrono::Utc::now()),
             announced_at: None,
             delivered_at: None,
+            subagent_id: None,
         };
 
         let table = crate::text::format_table(&TASK_COLUMNS, &task_rows(&[task]));

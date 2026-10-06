@@ -104,6 +104,7 @@ pub(crate) async fn run_serve(
     let scheduler_handle = schedule::spawn(state.clone());
     let background_handle = schedule::spawn_background_poller(state.clone());
     let inbox_handle = inbox::spawn_inbox_driver(state.clone());
+    let announcer_handle = tokio::spawn(handlers::sessions::announce_subagent_runs(state.clone()));
     let pruner_handle = idempotency_cache.spawn_pruner();
 
     let router = build_router(state.clone(), auth, max_body_bytes);
@@ -158,6 +159,7 @@ pub(crate) async fn run_serve(
     scheduler_handle.abort();
     background_handle.abort();
     inbox_handle.abort();
+    announcer_handle.abort();
     pruner_handle.abort();
     // Close the MCP servers before the exit paths below: the drain-timeout arm of the match ends
     // in `std::process::exit(1)`, so anything after it is skipped exactly when a hung shutdown
@@ -232,20 +234,15 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
             "/v1/sessions/{id}/cancel",
             post(handlers::turn::cancel_turn),
         )
-        .route(
-            "/v1/sessions/{id}/stream",
-            get(handlers::turn::stream_turn),
-        )
+        .route("/v1/sessions/{id}/stream", get(handlers::turn::stream_turn))
+        .route("/v1/stream", get(handlers::turn::stream_server))
         .route(
             "/v1/sessions/{id}/responses/{request_id}",
             post(handlers::responses::respond),
         )
         // Conversation-shaping operations. `/v1/sessions/import` is a static segment, so matchit
         // prefers it over `/v1/sessions/{id}` regardless of registration order.
-        .route(
-            "/v1/sessions/import",
-            post(handlers::conversation::import),
-        )
+        .route("/v1/sessions/import", post(handlers::conversation::import))
         .route(
             "/v1/sessions/{id}/compact",
             post(handlers::conversation::compact),
@@ -262,21 +259,19 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
             "/v1/sessions/{id}/export",
             get(handlers::conversation::export),
         )
+        .route(
+            "/v1/sessions/{id}/turns",
+            get(handlers::conversation::turns),
+        )
         .route("/v1/sessions/{id}/tasks", get(handlers::jobs::list_tasks))
+        .route("/v1/tasks", get(handlers::jobs::list_all_tasks))
         .route(
             "/v1/sessions/{id}/tasks/{task_id}",
             delete(handlers::jobs::cancel_task),
         )
         .route("/v1/schedule", get(handlers::jobs::list_all))
         .route("/v1/schedule/{job_id}", delete(handlers::jobs::cancel))
-        .route(
-            "/v1/sessions/{id}/schedule",
-            get(handlers::jobs::list_for_session),
-        )
-        .route(
-            "/v1/sessions/{id}/schedule",
-            post(handlers::jobs::create),
-        )
+        .route("/v1/sessions/{id}/schedule", post(handlers::jobs::create))
         .route("/v1/sessions/{id}/tools", get(handlers::stores::list_tools))
         .route("/v1/info", get(handlers::info::info))
         .route("/v1/skills", get(handlers::info::skills))
@@ -377,10 +372,11 @@ fn cors_layer(origins: Option<&CorsOrigins>) -> Option<CorsLayer> {
             .allow_headers([
                 header::AUTHORIZATION,
                 header::CONTENT_TYPE,
+                header::IF_MATCH,
                 HeaderName::from_static("idempotency-key"),
                 HeaderName::from_static("last-event-id"),
             ])
-            .expose_headers([header::RETRY_AFTER, header::WWW_AUTHENTICATE]),
+            .expose_headers([header::ETAG, header::RETRY_AFTER, header::WWW_AUTHENTICATE]),
     )
 }
 

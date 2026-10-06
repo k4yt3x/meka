@@ -61,6 +61,10 @@ pub(crate) struct Agent {
     /// fresh or rewound conversation. Compaction publishes the snapshot restored into its saved
     /// summary, so the continuing loop has that picture already.
     last_rendered_world: tokio::sync::RwLock<Option<crate::prompt::WorldSnapshot>>,
+    /// The turn this agent is running, for as long as it runs it. Every row the agent writes
+    /// names it, and a row written between turns (the compaction checkpoint's) names none; the
+    /// store is told rather than left to find an open turn, which a dead process can leave behind.
+    current_turn: std::sync::Mutex<Option<uuid::Uuid>>,
     /// Shared skill cache. Re-checks the on-disk snapshot at the top of each turn and re-discovers
     /// when something changed, so adds / removes / frontmatter edits land without restart.
     /// Body-only edits take effect even sooner; `load_skill_body` re-reads from disk on every
@@ -192,6 +196,7 @@ impl Agent {
             store: materials.store.clone(),
             last_rendered_todo: tokio::sync::RwLock::new(None),
             last_rendered_world: tokio::sync::RwLock::new(None),
+            current_turn: std::sync::Mutex::new(None),
             skills: materials.skills.clone(),
             memories: materials.memories.clone(),
             compaction_generation: std::sync::atomic::AtomicU64::new(GENERATION_UNKNOWN),

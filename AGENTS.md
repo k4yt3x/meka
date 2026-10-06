@@ -164,6 +164,8 @@ Run after editing: `cargo +nightly fmt` and `cargo sort -w`.
 
 CI denies warnings on clippy and rustdoc, so the bare commands can pass locally and fail CI, and
 it runs them on the current stable, which may be newer than yours: a deprecation lands there first.
+It formats with the current nightly rustfmt, whose layout moves between nightlies, so run
+`rustup update nightly` before `fmt --check` when yours is more than a few weeks old.
 Reproduce the exact gate, on the stable `gh run view` reports when yours is older, before declaring
 done:
 

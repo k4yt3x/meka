@@ -35,11 +35,21 @@ pub(crate) struct SessionFeed {
     /// [`Attendance`]. Shared with the guards so a reader that hangs up is counted out without
     /// taking the feed lock.
     pub(super) attending: Arc<std::sync::atomic::AtomicUsize>,
+    /// When the last attending reader left, while none has come back; `None` while one attends
+    /// or when none ever has. A parked prompt is given up on only once this has stood for the
+    /// feed's reattach grace, so a reload or a suspended tab is not a departure.
+    pub(super) unattended_since: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// The most recent turn's terminal, keyed by its id.
     pub(super) terminal: Option<(uuid::Uuid, SseEvent)>,
     /// Where an `inbox.delivered` also goes. The agent emits the delivery as a frontend event,
     /// and this is the one place that event is seen with the session's identity beside it.
     pub(super) webhooks: Option<super::webhook::WebhookDispatcher>,
+    /// How long a reader that left is waited for before it counts as gone: the wiring's
+    /// `stream_reattach_grace`, held on the feed so a prompt parked between turns, by a detached
+    /// sub-agent say, is given the same window as one parked inside a turn.
+    pub(super) reattach_grace: Duration,
+    /// The server feed, where every event that changes this session's record goes as well.
+    pub(super) server: Option<SharedServerFeed>,
 }
 
 /// What the feed knows about the turn in flight.
@@ -61,6 +71,8 @@ impl SessionFeed {
         capacity: usize,
         replay_capacity: usize,
         webhooks: Option<super::webhook::WebhookDispatcher>,
+        server: Option<SharedServerFeed>,
+        reattach_grace: Duration,
     ) -> Self {
         let (sender, _receiver) = broadcast::channel::<SseEvent>(capacity);
         Self {
@@ -71,8 +83,11 @@ impl SessionFeed {
             replay_capacity,
             turn: None,
             attending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            unattended_since: Arc::new(std::sync::Mutex::new(None)),
             terminal: None,
             webhooks,
+            server,
+            reattach_grace,
         }
     }
 
@@ -127,6 +142,13 @@ impl SessionFeed {
                 event.data.clone(),
             );
         }
+        // The server feed never takes a session feed's lock, so taking it here under one cannot
+        // invert.
+        if ServerFeed::mirrors(event_type)
+            && let Some(server) = &self.server
+        {
+            crate::sync::lock(server).publish(event_type, event.data.clone());
+        }
         event
     }
 }
@@ -170,10 +192,116 @@ pub(crate) struct StreamAttachment {
 /// as its stream is. While one exists, a gated call on any turn parks as `permission_required`
 /// rather than being refused without asking; when the last one drops, a parked prompt is canceled
 /// the way a streaming client's disconnect cancels it.
-pub(crate) struct Attendance(pub(super) Arc<std::sync::atomic::AtomicUsize>);
+pub(crate) struct Attendance {
+    pub(super) attending: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) unattended_since: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+}
 
 impl Drop for Attendance {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        // The last one out starts the clock a parked prompt waits on.
+        if self
+            .attending
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            *crate::sync::lock(&self.unattended_since) = Some(std::time::Instant::now());
+        }
+    }
+}
+
+/// The listing's change feed: every event that changes a session record, across every session
+/// this process holds, so a client keeping a list of sessions needs one connection to keep it
+/// current and opens a session's own feed only for the one it is looking at. Carries exactly what
+/// a record is rendered from: a session's creation, change and deletion, the four turn lifecycle
+/// events without their deltas, and the parking and closing of a prompt, which move
+/// `approvals_pending`. Ids of its own, and a ring of its own for `Last-Event-ID`.
+pub(crate) struct ServerFeed {
+    ids: EventIdGenerator,
+    sender: broadcast::Sender<SseEvent>,
+    replay: std::collections::VecDeque<SseEvent>,
+    replay_capacity: usize,
+}
+
+/// The server feed as every session feed and every handler shares it.
+pub(crate) type SharedServerFeed = Arc<std::sync::Mutex<ServerFeed>>;
+
+/// What a client attaching to the server feed gets: the backlog it missed and a live
+/// subscription, taken together under one lock so nothing is emitted in the gap between them.
+pub(crate) struct ServerAttachment {
+    pub(crate) backlog: Vec<SseEvent>,
+    pub(crate) receiver: broadcast::Receiver<SseEvent>,
+    /// Whether the client's `Last-Event-ID` is older than the ring reaches.
+    pub(crate) gap: bool,
+}
+
+impl ServerFeed {
+    /// A feed with a broadcast channel of `capacity` and a replay ring of `replay_capacity`.
+    pub(crate) fn new(capacity: usize, replay_capacity: usize) -> Self {
+        let (sender, _receiver) = broadcast::channel::<SseEvent>(capacity);
+        Self {
+            ids: EventIdGenerator::default(),
+            sender,
+            replay: std::collections::VecDeque::with_capacity(replay_capacity.min(64)),
+            replay_capacity,
+        }
+    }
+
+    /// Which of a session feed's events the server feed carries too: the ones that change the
+    /// session's record.
+    pub(crate) const fn mirrors(event_type: SseEventType) -> bool {
+        matches!(
+            event_type,
+            SseEventType::TurnStarted
+                | SseEventType::TurnFinished
+                | SseEventType::TurnFailed
+                | SseEventType::TurnCanceled
+                | SseEventType::PermissionRequired
+                | SseEventType::PermissionResolved
+        )
+    }
+
+    /// Number, record and broadcast one event. `data` already names its session.
+    pub(crate) fn publish(&mut self, event_type: SseEventType, data: serde_json::Value) {
+        let event = SseEvent {
+            id: Some(self.ids.next()),
+            event_type,
+            data,
+        };
+        if self.replay_capacity > 0 {
+            while self.replay.len() >= self.replay_capacity {
+                self.replay.pop_front();
+            }
+            self.replay.push_back(event.clone());
+        }
+        if self.sender.send(event).is_err() {
+            tracing::trace!("no consumer is attached to the server feed; the event is recorded");
+        }
+    }
+
+    /// The backlog after `last_event_id` and a live subscription. An id at or above the high-water
+    /// mark was never issued here and is discarded rather than filtered against.
+    pub(crate) fn attach(&self, last_event_id: Option<u64>) -> ServerAttachment {
+        let stale = last_event_id.is_some_and(|last| last >= self.ids.peek());
+        let resume_from = if stale { None } else { last_event_id };
+        let backlog: Vec<SseEvent> = self
+            .replay
+            .iter()
+            .filter(|event| resume_from.is_none_or(|last| event.id.is_some_and(|id| id > last)))
+            .cloned()
+            .collect();
+        let gap = stale
+            || match (resume_from, self.replay.front()) {
+                (Some(last), Some(oldest)) => {
+                    oldest.id.is_some_and(|id| id > last.saturating_add(1))
+                }
+                (Some(_), None) => self.replay_capacity == 0,
+                _ => false,
+            };
+        ServerAttachment {
+            backlog,
+            receiver: self.sender.subscribe(),
+            gap,
+        }
     }
 }

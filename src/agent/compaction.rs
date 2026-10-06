@@ -660,11 +660,7 @@ impl Agent {
                 .iter()
                 .map(|message| crate::conversation::Event::Append(message.clone())),
         );
-        if let Err(error) = self
-            .store
-            .save_events_atomic(session_id, compaction_events)
-            .await
-        {
+        if let Err(error) = self.save_events_atomic(session_id, compaction_events).await {
             // Put the conversation back: the rewrite above already happened in memory, so without
             // this the caller is told the compaction failed while the model goes on reasoning from
             // a summary the database has never heard of. `POST /rewind` guards the same hazard

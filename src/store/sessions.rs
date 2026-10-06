@@ -1,6 +1,6 @@
 //! Sessions and their event logs: the `sessions` and `messages` tables.
 
-use super::*;
+use super::{turns::turn_from_row, *};
 use crate::permission::Permission;
 
 /// Raw row from the `messages` table, the on-disk shape of a single
@@ -12,6 +12,16 @@ pub(super) struct StoredMessage {
     pub(super) kind: String,
     pub(super) content: String,
     pub(super) created_at: String,
+    pub(super) turn_id: Option<String>,
+}
+
+/// When a stored event was written, and under which turn, for a reader of the whole log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EventStamp {
+    pub(crate) created_at: String,
+    /// The turn that added the row; `None` for a row no turn added, such as a compaction
+    /// boundary written between turns or a rewind's repair.
+    pub(crate) turn_id: Option<Uuid>,
 }
 /// Result of `Store::create_session_with_metadata`. Carries the canonical RFC 3339
 /// `created_at` so the caller's in-memory state shares one timestamp with the DB row; without
@@ -96,8 +106,11 @@ pub(crate) struct ImportSessionRecord {
     /// When the archived session was pinned, restored as it was written.
     pub(crate) pinned_at: Option<String>,
     pub(crate) stats: crate::stats::SessionStatsSnapshot,
-    /// `(created_at, event)` pairs in chronological order; timestamps are preserved verbatim.
-    pub(crate) events: Vec<(String, crate::conversation::Event)>,
+    /// The session's turns, under the ids the archive's events were remapped to.
+    pub(crate) turns: Vec<super::export::ExportedTurn>,
+    /// `(created_at, event, turn)` triples in chronological order; timestamps are preserved
+    /// verbatim and the turn is one of `turns` or none.
+    pub(crate) events: Vec<(String, crate::conversation::Event, Option<Uuid>)>,
     /// `(name, content)` scratchpad entries referenced by name from tool-call inputs.
     pub(crate) scratchpad_entries: Vec<(String, String)>,
 }
@@ -184,6 +197,8 @@ pub(crate) struct SessionSummary {
     /// When the session was pinned (RFC 3339), or `None` for one that is not. A listing puts the
     /// pinned sessions first, newest pin on top.
     pub(crate) pinned_at: Option<String>,
+    /// The latest turn, however it stands, or `None` for a session no turn has begun on.
+    pub(crate) last_turn: Option<super::turns::TurnRecord>,
 }
 /// What a sweep over many sessions did, so its caller can say what it left behind.
 ///
@@ -198,6 +213,24 @@ pub(crate) struct SessionSweep {
     /// because their lock could not be established either way.
     pub(crate) attached_elsewhere: u64,
 }
+/// What [`Store::list_sessions`] keeps. Every field narrows the listing, and none by default.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionFilter {
+    /// Sub-agent sessions too; the default lists only root conversations.
+    pub(crate) include_children: bool,
+    /// Only sessions in this working directory, in the canonical spelling every session records.
+    pub(crate) cwd: Option<PathBuf>,
+    /// Only one session's direct children. Names sub-agents by definition, so `include_children`
+    /// is moot beside it.
+    pub(crate) parent: Option<Uuid>,
+    /// Only sessions on this profile.
+    pub(crate) profile: Option<String>,
+    /// Only pinned sessions, or only unpinned ones.
+    pub(crate) pinned: Option<bool>,
+    /// Only sessions changed after this instant, by the `updated_at` the row records.
+    pub(crate) updated_since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// What a host may move on a session's row once it exists, for [`Store::update_session`]. `None`
 /// leaves that column alone.
 ///
@@ -475,19 +508,27 @@ impl PreparedEvent {
 }
 
 /// The one door into `messages`: a prepared event becomes a row with its blobs stored and its
-/// references linked, in the caller's transaction. Every writer goes through here (a turn's save,
-/// the batch, a rewind, a withdrawal, an import); a fork copies rows that already came through it.
+/// references linked, in the caller's transaction, naming the turn that writes it or none. Every
+/// writer goes through here (a turn's save, the batch, a rewind, a withdrawal, an import); a fork
+/// copies rows that already came through it.
 pub(super) fn insert_event(
     transaction: &rusqlite::Transaction<'_>,
     session_id: &str,
     prepared: &PreparedEvent,
     created_at: &str,
+    turn_id: Option<&str>,
 ) -> rusqlite::Result<i64> {
     let (kind, content) = encode_event_for_db(&prepared.event)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     super::blobs::insert_blobs(transaction, &prepared.blobs, created_at)?;
-    let message_id =
-        super::search::insert_message(transaction, session_id, &kind, &content, created_at)?;
+    let message_id = super::search::insert_message(
+        transaction,
+        session_id,
+        &kind,
+        &content,
+        created_at,
+        turn_id,
+    )?;
     super::blobs::link_message_blobs(transaction, message_id, &prepared.references)?;
     Ok(message_id)
 }
@@ -603,11 +644,17 @@ const VIEW_FLOOR_SQL: &str =
 
 /// Decode rows into `(created_at, event)` pairs in the order they were stored, skipping with a
 /// warning any row this build cannot read, so one bad row costs itself and not the session.
-fn decode_rows(stored: Vec<StoredMessage>) -> Vec<(String, crate::conversation::Event)> {
+fn decode_rows(stored: Vec<StoredMessage>) -> Vec<(EventStamp, crate::conversation::Event)> {
     let mut events = Vec::with_capacity(stored.len());
     for row in stored {
         match decode_event_from_row(&row) {
-            Ok(Some(event)) => events.push((row.created_at, event)),
+            Ok(Some(event)) => events.push((
+                EventStamp {
+                    created_at: row.created_at,
+                    turn_id: row.turn_id.as_deref().and_then(session_id_in),
+                },
+                event,
+            )),
             Ok(None) => {
                 tracing::warn!(
                     "dropping a session row with unknown kind '{kind}'",
@@ -1370,9 +1417,34 @@ impl Store {
                 // the source row's blob references under its own new id: a reference is what keeps
                 // an image from the sweep when the source is deleted, and what lets this fork read
                 // it over the API.
+                // The turns travel under fresh ids, since a turn belongs to one session, and each
+                // copied message keeps naming the turn that added it.
+                let mut turn_ids: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                {
+                    let source_turns: Vec<String> = transaction
+                        .prepare("SELECT id FROM turns WHERE session_id = ?1")?
+                        .query_map(rusqlite::params![source_id], |row| row.get(0))?
+                        .collect::<rusqlite::Result<_>>()?;
+                    for old in source_turns {
+                        let new = Uuid::new_v4().to_string();
+                        transaction.execute(
+                            "INSERT INTO turns (id, session_id, source, started_at, ended_at, \
+                             status, stop_reason, error_type, detail, input_tokens, \
+                             output_tokens, cache_creation_input_tokens, \
+                             cache_read_input_tokens)
+                             SELECT ?1, ?2, source, started_at, ended_at, status, stop_reason, \
+                             error_type, detail, input_tokens, output_tokens, \
+                             cache_creation_input_tokens, cache_read_input_tokens
+                             FROM turns WHERE id = ?3",
+                            rusqlite::params![new, new_id_string, old],
+                        )?;
+                        turn_ids.insert(old, new);
+                    }
+                }
                 {
                     let mut select = transaction.prepare(
-                        "SELECT id, kind, content, created_at FROM messages \
+                        "SELECT id, kind, content, created_at, turn_id FROM messages \
                          WHERE session_id = ?1 ORDER BY id ASC",
                     )?;
                     let mut link = transaction.prepare(
@@ -1385,16 +1457,20 @@ impl Store {
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
                         ))
                     })?;
                     for row in rows {
-                        let (source_message_id, kind, content, created_at) = row?;
+                        let (source_message_id, kind, content, created_at, turn_id) = row?;
                         let message_id = super::search::insert_message(
                             &transaction,
                             &new_id_string,
                             &kind,
                             &content,
                             &created_at,
+                            turn_id
+                                .and_then(|old| turn_ids.get(&old))
+                                .map(String::as_str),
                         )?;
                         link.execute(rusqlite::params![message_id, source_message_id])?;
                     }
@@ -1432,8 +1508,10 @@ impl Store {
         &self,
         session_id: Uuid,
         event: &crate::conversation::Event,
+        turn: Option<Uuid>,
     ) -> Result<()> {
-        self.save_event_marking_inbox(session_id, event, &[]).await
+        self.save_event_marking_inbox(session_id, event, &[], turn)
+            .await
     }
 
     /// [`Self::save_event`], stamping `inbox_items` as appended in the same transaction. The
@@ -1445,9 +1523,10 @@ impl Store {
         session_id: Uuid,
         event: &crate::conversation::Event,
         inbox_items: &[Uuid],
+        turn: Option<Uuid>,
     ) -> Result<()> {
         let appended = inbox_items.iter().map(Uuid::to_string).collect();
-        self.save_row(session_id, PreparedEvent::from_event(event), appended)
+        self.save_row(session_id, PreparedEvent::from_event(event), appended, turn)
             .await
     }
 
@@ -1461,16 +1540,18 @@ impl Store {
         event: &crate::conversation::Event,
         inbox_items: &[Uuid],
         not_before: chrono::DateTime<chrono::Utc>,
+        turn: Option<Uuid>,
     ) -> Result<()> {
         let prepared = PreparedEvent::from_event(event);
         let ids: Vec<String> = inbox_items.iter().map(Uuid::to_string).collect();
         let not_before = not_before.to_rfc3339();
         let now = chrono::Utc::now().to_rfc3339();
         let session_id = session_id.to_string();
+        let turn = turn.map(|turn| turn.to_string());
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let transaction = connection.transaction()?;
-                insert_event(&transaction, &session_id, &prepared, &now)?;
+                insert_event(&transaction, &session_id, &prepared, &now, turn.as_deref())?;
                 super::inbox::reset_pending_in(&transaction, &ids, &not_before)?;
                 transaction.execute(
                     "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
@@ -1494,8 +1575,9 @@ impl Store {
         &self,
         session_id: Uuid,
         events: Vec<crate::conversation::Event>,
+        turn: Option<Uuid>,
     ) -> Result<()> {
-        self.save_events_atomic_marking_inbox(session_id, events, &[])
+        self.save_events_atomic_marking_inbox(session_id, events, &[], turn)
             .await
     }
 
@@ -1506,6 +1588,7 @@ impl Store {
         session_id: Uuid,
         events: Vec<crate::conversation::Event>,
         inbox_items: &[Uuid],
+        turn: Option<Uuid>,
     ) -> Result<()> {
         if events.is_empty() {
             return Ok(());
@@ -1513,6 +1596,7 @@ impl Store {
         let appended: Vec<String> = inbox_items.iter().map(Uuid::to_string).collect();
         let now = chrono::Utc::now().to_rfc3339();
         let session_id_str = session_id.to_string();
+        let turn = turn.map(|turn| turn.to_string());
         let prepared: Vec<PreparedEvent> = events.iter().map(PreparedEvent::from_event).collect();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
@@ -1520,7 +1604,13 @@ impl Store {
                 // back whole.
                 let transaction = connection.transaction()?;
                 for prepared in &prepared {
-                    insert_event(&transaction, &session_id_str, prepared, &now)?;
+                    insert_event(
+                        &transaction,
+                        &session_id_str,
+                        prepared,
+                        &now,
+                        turn.as_deref(),
+                    )?;
                 }
                 super::inbox::stamp_appended(&transaction, &appended, &now)?;
                 transaction.execute(
@@ -1575,7 +1665,8 @@ impl Store {
             pinned_at: Option<String>,
             stats: crate::stats::SessionStatsSnapshot,
             /// `(created_at, the event as the door takes it)`.
-            events: Vec<(String, PreparedEvent)>,
+            turns: Vec<super::export::ExportedTurn>,
+            events: Vec<(String, PreparedEvent, Option<String>)>,
             scratchpad_entries: Vec<(String, String)>,
         }
         let imported_at = chrono::Utc::now().to_rfc3339();
@@ -1596,14 +1687,14 @@ impl Store {
         let mut encoded = Vec::with_capacity(records.len());
         for record in records {
             let mut events = Vec::with_capacity(record.events.len());
-            for (at, event) in record.events {
+            for (at, event, turn) in record.events {
                 // An archive carries references, but one written by hand or by another tool may
                 // carry bytes; either way the row gets a reference and the bytes a blob. The
                 // bytes join the archive's, stored ahead of the rows, so the check below sees
                 // them.
                 let mut prepared = PreparedEvent::from_event(&event);
                 archive_blobs.append(&mut prepared.take_blobs());
-                events.push((at, prepared));
+                events.push((at, prepared, turn.map(|turn| turn.to_string())));
             }
             encoded.push(EncodedSession {
                 id: record.new_id.to_string(),
@@ -1619,6 +1710,7 @@ impl Store {
                 title: record.title,
                 pinned_at: record.pinned_at,
                 stats: record.stats,
+                turns: record.turns,
                 events,
                 scratchpad_entries: record.scratchpad_entries,
             });
@@ -1632,7 +1724,7 @@ impl Store {
             .collect();
         let mut unresolved: Vec<String> = Vec::new();
         for session in &encoded {
-            for (_, prepared) in &session.events {
+            for (_, prepared, _) in &session.events {
                 for hash in prepared.references() {
                     if !carried.contains(hash.as_str()) && !unresolved.contains(hash) {
                         unresolved.push(hash.clone());
@@ -1700,8 +1792,11 @@ impl Store {
                             session.stats.turn_position.map(|position| position.turn_index as i64),
                         ],
                     )?;
+                    for turn in &session.turns {
+                        super::turns::insert_turn_row(&transaction, &session.id, turn)?;
+                    }
                     {
-                        for (created_at, prepared) in &session.events {
+                        for (created_at, prepared, turn_id) in &session.events {
                             // Refused rather than linked to nothing: a reference the archive did
                             // not carry and the store does not hold would be an image no reader
                             // could ever show.
@@ -1713,7 +1808,13 @@ impl Store {
                                      carry and this store does not hold"
                                 )));
                             }
-                            insert_event(&transaction, &session.id, prepared, created_at)?;
+                            insert_event(
+                                &transaction,
+                                &session.id,
+                                prepared,
+                                created_at,
+                                turn_id.as_deref(),
+                            )?;
                         }
                     }
                     {
@@ -1849,7 +1950,7 @@ impl Store {
     pub(crate) async fn load_events_with_timestamps(
         &self,
         session_id: Uuid,
-    ) -> Result<Vec<(String, crate::conversation::Event)>> {
+    ) -> Result<Vec<(EventStamp, crate::conversation::Event)>> {
         let stored = self.load_messages(session_id, RowRange::All).await?;
         Ok(decode_rows(stored))
     }
@@ -1937,6 +2038,7 @@ impl Store {
                     &kind,
                     &content,
                     &now,
+                    None,
                 )?;
                 transaction.execute(
                     "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
@@ -1955,16 +2057,23 @@ impl Store {
         session_id: Uuid,
         prepared: PreparedEvent,
         appended_inbox_items: Vec<String>,
+        turn: Option<Uuid>,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-
+        let turn = turn.map(|turn| turn.to_string());
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 // One transaction, like `save_events_atomic`: a message committed without its
                 // session's `updated_at` moving is ordered wrong in every listing and judged
                 // expired by the retention sweep despite the turn that wrote it.
                 let transaction = connection.transaction()?;
-                insert_event(&transaction, &session_id.to_string(), &prepared, &now)?;
+                insert_event(
+                    &transaction,
+                    &session_id.to_string(),
+                    &prepared,
+                    &now,
+                    turn.as_deref(),
+                )?;
                 super::inbox::stamp_appended(&transaction, &appended_inbox_items, &now)?;
                 transaction.execute(
                     "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
@@ -2113,7 +2222,8 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let transaction = connection.transaction()?;
-                insert_event(&transaction, &session_id, &prepared, &now)?;
+                // A rewind is written between turns, so its repair names none.
+                insert_event(&transaction, &session_id, &prepared, &now, None)?;
                 super::inbox::reset_appended_in(&transaction, &session_id)?;
                 transaction.execute(
                     "UPDATE sessions SET context_tokens = NULL, updated_at = ?1 WHERE id = ?2",
@@ -2164,8 +2274,8 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(&format!(
-                    "SELECT kind, content, created_at FROM messages WHERE session_id = ?1 {floor} \
-                     ORDER BY id ASC"
+                    "SELECT kind, content, created_at, turn_id FROM messages \
+                     WHERE session_id = ?1 {floor} ORDER BY id ASC"
                 ))?;
 
                 let messages = statement
@@ -2174,6 +2284,7 @@ impl Store {
                             kind: row.get(0)?,
                             content: row.get(1)?,
                             created_at: row.get(2)?,
+                            turn_id: row.get(3)?,
                         })
                     })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2205,6 +2316,29 @@ impl Store {
             .await
             .map(|count| count.max(0) as u64)
             .map_err(|error| MekaError::Database(format!("failed to count compactions: {error}")))
+    }
+
+    /// How many times the conversation has been rewritten rather than appended to: the
+    /// `revision` the materialized view reports, counted from the rows. A resident session's
+    /// in-memory log begins at its last compaction boundary, so replaying it would undercount;
+    /// the rows answer the same number for a resident session and a dormant one.
+    pub(crate) async fn count_rewrites(&self, session_id: Uuid) -> Result<u64> {
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND kind IN (?2, ?3, ?4)",
+                    rusqlite::params![
+                        session_id.to_string(),
+                        COMPACT_BOUNDARY_KIND,
+                        REPAIR_KIND,
+                        REDACT_KIND
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await
+            .map(|count| count.max(0) as u64)
+            .map_err(|error| MekaError::Database(format!("failed to count rewrites: {error}")))
     }
 
     /// The session `meka -c` resumes: the most recently touched one a host can actually drive.
@@ -2385,15 +2519,22 @@ impl Store {
     pub(crate) async fn list_sessions(
         &self,
         limit: u32,
-        include_children: bool,
-        cwd_filter: Option<&Path>,
         cursor: Option<&str>,
+        filter: &SessionFilter,
     ) -> Result<(Vec<SessionSummary>, Option<String>)> {
         let cursor_decoded = match cursor {
             Some(token) => Some(decode_list_cursor(token)?),
             None => None,
         };
-        let cwd_filter_string = cwd_filter.map(|path| path.display().to_string());
+        let include_children = filter.include_children;
+        let cwd_filter_string = filter.cwd.as_ref().map(|path| path.display().to_string());
+        let parent_string = filter.parent.map(|parent| parent.to_string());
+        let profile_filter = filter.profile.clone();
+        let pinned_filter = filter.pinned;
+        // Compared as text: every writer renders `updated_at` with `to_rfc3339`, whose fixed
+        // width and `+00:00` offset sort as the instants do, so this holds only while no writer
+        // renders the column another way.
+        let updated_since = filter.updated_since.map(|at| at.to_rfc3339());
 
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
@@ -2404,11 +2545,25 @@ impl Store {
                 // front of them.
                 let not_spawned = format!("NOT {}", spawned_session_sql("s."));
                 let mut clauses: Vec<&str> = Vec::new();
-                if !include_children {
+                // A parent names sub-agents, so the root-only clause gives way to it.
+                if parent_string.is_some() {
+                    clauses.push("s.parent_session_id = :parent");
+                } else if !include_children {
                     clauses.push(&not_spawned);
                 }
                 if cwd_filter_string.is_some() {
                     clauses.push("s.cwd = :cwd");
+                }
+                if profile_filter.is_some() {
+                    clauses.push("s.profile = :profile");
+                }
+                match pinned_filter {
+                    Some(true) => clauses.push("s.pinned_at IS NOT NULL"),
+                    Some(false) => clauses.push("s.pinned_at IS NULL"),
+                    None => {}
+                }
+                if updated_since.is_some() {
+                    clauses.push("s.updated_at > :updated_since");
                 }
                 if cursor_decoded.is_some() {
                     // Keyset on the listing's own order, strictly past the cursor row: the pinned
@@ -2428,6 +2583,8 @@ impl Store {
                     format!("WHERE {}", clauses.join(" AND "))
                 };
                 let title_row = TITLE_ROW_WHERE_SQL.as_str();
+                let (turn_columns, latest_turn_join) =
+                    (super::turns::TURN_COLUMNS, super::turns::LATEST_TURN_JOIN);
                 let query = format!(
                     "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id, s.profile, s.approvals,
                             s.title, s.pinned_at,
@@ -2442,8 +2599,10 @@ impl Store {
                                WHERE {title_row}
                                ORDER BY id ASC LIMIT 1),
                               ''
-                            ) AS title_kind
+                            ) AS title_kind,
+                            {turn_columns}
                      FROM sessions s
+                     {latest_turn_join}
                      {where_clause}
                      ORDER BY (s.pinned_at IS NOT NULL) DESC,
                               COALESCE(s.pinned_at, s.updated_at) DESC,
@@ -2462,6 +2621,15 @@ impl Store {
                 params.push((":limit", &fetch_limit));
                 if let Some(ref cwd) = cwd_filter_string {
                     params.push((":cwd", cwd));
+                }
+                if let Some(ref parent) = parent_string {
+                    params.push((":parent", parent));
+                }
+                if let Some(ref profile) = profile_filter {
+                    params.push((":profile", profile));
+                }
+                if let Some(ref since) = updated_since {
+                    params.push((":updated_since", since));
                 }
                 if let Some(cursor) = &cursor_decoded {
                     params.push((":cursor_pinned", &cursor.pinned));
@@ -2485,6 +2653,7 @@ impl Store {
                     let pinned_at: Option<String> = row.get(12)?;
                     let title_kind: String = row.get(14)?;
                     let title = effective_title(set_title, &id_str, &title_kind, row.get(13)?);
+                    let last_turn = turn_from_row(row, 15)?;
                     Ok((
                         id_str,
                         created_at,
@@ -2499,6 +2668,7 @@ impl Store {
                         approvals,
                         title,
                         pinned_at,
+                        last_turn,
                     ))
                 })?;
 
@@ -2518,6 +2688,7 @@ impl Store {
                         approvals,
                         title,
                         pinned_at,
+                        last_turn,
                     ) = row?;
                     let id = Uuid::parse_str(&id_str).map_err(|error| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
@@ -2539,6 +2710,7 @@ impl Store {
                         token_id,
                         parent_id: parent_id.as_deref().and_then(session_id_in),
                         pinned_at,
+                        last_turn,
                     });
                 }
                 Ok(summaries)
@@ -2563,6 +2735,8 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let title_row = TITLE_ROW_WHERE_SQL.as_str();
+                let (turn_columns, latest_turn_join) =
+                    (super::turns::TURN_COLUMNS, super::turns::LATEST_TURN_JOIN);
                 let mut statement = connection.prepare(&format!(
                     "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id, s.profile, s.approvals,
                             s.title, s.pinned_at,
@@ -2577,8 +2751,10 @@ impl Store {
                                WHERE {title_row}
                                ORDER BY id ASC LIMIT 1),
                               ''
-                            ) AS title_kind
+                            ) AS title_kind,
+                            {turn_columns}
                      FROM sessions s
+                     {latest_turn_join}
                      WHERE s.id = ?1",
                 ))?;
                 let mut rows = statement.query_map(rusqlite::params![id.to_string()], |row| {
@@ -2597,6 +2773,7 @@ impl Store {
                     let pinned_at: Option<String> = row.get(12)?;
                     let title_kind: String = row.get(14)?;
                     let title = effective_title(set_title, &id_str, &title_kind, row.get(13)?);
+                    let last_turn = turn_from_row(row, 15)?;
                     Ok((
                         id_str,
                         created_at,
@@ -2611,6 +2788,7 @@ impl Store {
                         approvals,
                         title,
                         pinned_at,
+                        last_turn,
                     ))
                 })?;
                 match rows.next() {
@@ -2629,6 +2807,7 @@ impl Store {
                             approvals,
                             title,
                             pinned_at,
+                            last_turn,
                         ) = row?;
                         let id = Uuid::parse_str(&id_str).map_err(|error| {
                             rusqlite::Error::InvalidParameterName(error.to_string())
@@ -2654,6 +2833,7 @@ impl Store {
                                 .as_deref()
                                 .and_then(session_id_in),
                             pinned_at,
+                            last_turn,
                         }))
                     }
                     None => Ok(None),
@@ -3191,7 +3371,10 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        super::turns::{TurnEnding, TurnStatus, TurnUsage},
+        *,
+    };
 
     async fn plain_session(store: &Store, words: &str) -> Uuid {
         let id = store
@@ -3210,6 +3393,361 @@ mod tests {
             .expect("the row exists")
     }
 
+    /// A turn is a row from the moment it begins, every message it adds names it, and the row
+    /// says how it ended once it has, from the listing and the summary alike. A row is named by
+    /// its writer, not by the table: a repair written between turns names none even while a turn
+    /// a dead process left open is still on the table. A failure is stored under its catalog type
+    /// and meka's sentence, never under the provider's text.
+    #[tokio::test]
+    async fn a_turn_is_a_row_its_messages_name() {
+        use crate::conversation::{Event, Message};
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "words").await;
+        assert_eq!(row(&store, id).await.last_turn, None);
+
+        let first = Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(id, first, "client", "2026-10-06T10:00:00+00:00")
+            .await
+            .expect("open");
+        store
+            .save_event(id, &Event::Append(Message::user("ask")), Some(first))
+            .await
+            .expect("save");
+        let open = row(&store, id).await.last_turn.expect("a turn has begun");
+        assert_eq!(open.id, first);
+        assert_eq!(open.source, "client");
+        assert_eq!(
+            (open.ended_at, open.status),
+            (None, None),
+            "begun, not ended"
+        );
+
+        let usage = TurnUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 4,
+        };
+        store
+            .turn_store()
+            .close_turn(first, &TurnEnding::succeeded("max_tokens", usage))
+            .await
+            .expect("close");
+        store
+            .save_event(id, &Event::Append(Message::user("after")), None)
+            .await
+            .expect("save");
+        let ended = row(&store, id).await.last_turn.expect("recorded");
+        assert_eq!(ended.status, Some(TurnStatus::Succeeded));
+        assert_eq!(ended.stop_reason.as_deref(), Some("max_tokens"));
+        assert_eq!(ended.usage, usage);
+        assert!(ended.ended_at.is_some());
+
+        let stamps: Vec<Option<Uuid>> = store
+            .load_events_with_timestamps(id)
+            .await
+            .expect("load")
+            .into_iter()
+            .map(|(stamp, _)| stamp.turn_id)
+            .collect();
+        assert_eq!(
+            stamps,
+            vec![None, Some(first), None],
+            "a row names the turn its writer named, and none otherwise"
+        );
+
+        let second = Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(id, second, "schedule", "2026-10-06T11:00:00+00:00")
+            .await
+            .expect("open");
+        // Written between turns while `second` is open and unended, as a rewind's repair is
+        // after a crash: it names none, since the writer is the one who knows.
+        store
+            .save_event(id, &Event::Append(Message::user("repair")), None)
+            .await
+            .expect("save");
+        let last = store
+            .load_events_with_timestamps(id)
+            .await
+            .expect("load")
+            .pop()
+            .expect("the repair");
+        assert_eq!(
+            last.0.turn_id, None,
+            "an open turn on the table does not claim a row its writer did not give it"
+        );
+        let upstream = "{\"error\":{\"account_uuid\":\"acct-0f3c\"}}".to_string();
+        store
+            .turn_store()
+            .close_turn(
+                second,
+                &TurnEnding::failed(&MekaError::Provider(upstream), TurnUsage::default()),
+            )
+            .await
+            .expect("close");
+        let (turns, next) = store
+            .turn_store()
+            .list_turns(id, 10, None)
+            .await
+            .expect("list");
+        assert_eq!(next, None);
+        let ids: Vec<Uuid> = turns.iter().map(|turn| turn.id).collect();
+        assert_eq!(ids, vec![second, first], "newest first");
+        let error = turns[0].error.as_ref().expect("a failure names its error");
+        assert_eq!(error.kind.type_uri(), "https://meka.run/errors/provider");
+        assert!(
+            !error.detail.contains("acct-0f3c"),
+            "the provider's text never reaches the row: {}",
+            error.detail
+        );
+        let (page, next) = store
+            .turn_store()
+            .list_turns(id, 1, None)
+            .await
+            .expect("list");
+        assert_eq!(page[0].id, second);
+        assert_eq!(next, Some(second), "more remain, from before this one");
+        let (page, next) = store
+            .turn_store()
+            .list_turns(id, 1, next)
+            .await
+            .expect("list");
+        assert_eq!((page[0].id, next), (first, None));
+
+        let (listed, _) = store
+            .list_sessions(10, None, &SessionFilter::default())
+            .await
+            .expect("list");
+        let listed = listed
+            .iter()
+            .find(|session| session.id == id)
+            .expect("listed");
+        assert_eq!(
+            listed.last_turn.as_ref().map(|turn| turn.id),
+            Some(second),
+            "the listing reads the same latest row"
+        );
+    }
+
+    /// A fork keeps the turns its copied messages name, under ids of its own, and a row that
+    /// named no turn still names none in the copy, even with the source's turn left open.
+    #[tokio::test]
+    async fn a_fork_copies_the_turns_its_messages_name() {
+        use crate::conversation::{Event, Message};
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "words").await;
+        let turn = Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(id, turn, "client", "2026-10-06T10:00:00+00:00")
+            .await
+            .expect("open");
+        store
+            .save_event(
+                id,
+                &Event::Append(Message::assistant_text("answer")),
+                Some(turn),
+            )
+            .await
+            .expect("save");
+        store
+            .save_event(id, &Event::Append(Message::user("repair")), None)
+            .await
+            .expect("save");
+
+        let (forked, _lock) = store
+            .fork_session_locked(id, ForkOverrides::default(), SourceLock::Probe)
+            .await
+            .expect("fork")
+            .expect("the source exists");
+        let copied = row(&store, forked.id)
+            .await
+            .last_turn
+            .expect("the copy has the turn");
+        assert_ne!(copied.id, turn, "under an id of its own");
+        assert_eq!(copied.status, None, "copied as it was: open");
+        let stamps: Vec<Option<Uuid>> = store
+            .load_events_with_timestamps(forked.id)
+            .await
+            .expect("load")
+            .into_iter()
+            .map(|(stamp, _)| stamp.turn_id)
+            .collect();
+        assert_eq!(stamps, vec![None, Some(copied.id), None]);
+    }
+
+    /// `revision` is defined by the replay, and the rows have to count the same number: a
+    /// resident session's log begins at its last boundary, so the rows are what it answers from.
+    #[tokio::test]
+    async fn the_rewrite_count_agrees_with_the_replays_revision() {
+        use crate::conversation::{Event, Message, RedactedImage, materialize_annotated};
+        let store = Store::for_test().await;
+        let id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        for event in [
+            Event::Append(Message::user("one")),
+            Event::Append(Message::assistant_text("two")),
+            Event::CompactBoundary {
+                summary: Message::user("summary"),
+                replaced_count: 2,
+                loaded_tools_snapshot: Default::default(),
+            },
+            Event::Append(Message::user("three")),
+            Event::Append(Message::assistant_text("four")),
+            Event::Repair {
+                replaced_count: 1,
+                messages: Vec::new(),
+            },
+            Event::Redact {
+                images: vec![RedactedImage {
+                    from_end: 1,
+                    block: 0,
+                    item: None,
+                }],
+            },
+        ] {
+            store.save_event(id, &event, None).await.expect("save");
+        }
+        let events = store.load_events_with_timestamps(id).await.expect("load");
+        let replayed = materialize_annotated(&events).revision;
+        assert_eq!(replayed, 3, "one of each rewriting kind");
+        assert_eq!(store.count_rewrites(id).await.expect("count"), replayed);
+    }
+
+    /// Every filter narrows the one listing, and they compose.
+    #[tokio::test]
+    async fn the_listing_filters_by_profile_pin_and_time() {
+        let store = Store::for_test().await;
+        let before = chrono::Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let work = plain_session(&store, "work").await;
+        let other = store
+            .create_session(None, "other-profile".to_string())
+            .await
+            .expect("create");
+        store
+            .update_session(work, SessionPatch {
+                pinned: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("pin");
+        let ids = |rows: Vec<SessionSummary>| rows.iter().map(|row| row.id).collect::<Vec<_>>();
+
+        let (rows, _) = store
+            .list_sessions(10, None, &SessionFilter {
+                profile: Some("other-profile".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("list");
+        assert_eq!(ids(rows), vec![other]);
+        let (rows, _) = store
+            .list_sessions(10, None, &SessionFilter {
+                pinned: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("list");
+        assert_eq!(ids(rows), vec![work]);
+        let (rows, _) = store
+            .list_sessions(10, None, &SessionFilter {
+                pinned: Some(false),
+                ..Default::default()
+            })
+            .await
+            .expect("list");
+        assert_eq!(ids(rows), vec![other]);
+        let (rows, _) = store
+            .list_sessions(10, None, &SessionFilter {
+                updated_since: Some(before),
+                ..Default::default()
+            })
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 2, "both were made after the mark");
+        let (rows, _) = store
+            .list_sessions(10, None, &SessionFilter {
+                updated_since: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                ..Default::default()
+            })
+            .await
+            .expect("list");
+        assert!(rows.is_empty(), "nothing has changed since the future");
+        let (rows, _) = store
+            .list_sessions(10, None, &SessionFilter {
+                pinned: Some(true),
+                profile: Some("other-profile".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("list");
+        assert!(rows.is_empty(), "the filters compose");
+    }
+
+    /// `parent` lists a session's direct children and nothing else, and names sub-agents by
+    /// definition, so the root-only default does not hide them.
+    #[tokio::test]
+    async fn the_listing_filters_by_parent() {
+        let store = Store::for_test().await;
+        let parent = plain_session(&store, "parent").await;
+        let other = plain_session(&store, "other").await;
+        let (child, _lock) = store
+            .create_child_session(
+                parent,
+                None,
+                Vec::new(),
+                None,
+                "read".to_string(),
+                "test-profile".to_string(),
+            )
+            .await
+            .expect("spawn");
+        let (grandchild, _lock) = store
+            .create_child_session(
+                child,
+                None,
+                Vec::new(),
+                None,
+                "read".to_string(),
+                "test-profile".to_string(),
+            )
+            .await
+            .expect("spawn");
+
+        let (children, _) = store
+            .list_sessions(10, None, &SessionFilter {
+                parent: Some(parent),
+                ..Default::default()
+            })
+            .await
+            .expect("list");
+        let ids: Vec<Uuid> = children.iter().map(|session| session.id).collect();
+        assert_eq!(ids, vec![child], "direct children only: {ids:?}");
+        let (none, _) = store
+            .list_sessions(10, None, &SessionFilter {
+                parent: Some(grandchild),
+                ..Default::default()
+            })
+            .await
+            .expect("list");
+        assert!(none.is_empty());
+        let (none, _) = store
+            .list_sessions(10, None, &SessionFilter {
+                parent: Some(other),
+                ..Default::default()
+            })
+            .await
+            .expect("list");
+        assert!(none.is_empty());
+    }
+
     /// A title someone set is the label every reader shows; cleared, the first words are again.
     #[tokio::test]
     async fn a_set_title_labels_the_session_and_an_empty_one_clears_it() {
@@ -3226,7 +3764,7 @@ mod tests {
             .expect("title");
         assert_eq!(row(&store, id).await.title, "Research notes");
         let (listed, _) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list");
         assert_eq!(
@@ -3351,7 +3889,7 @@ mod tests {
         let expected = vec![ids[1], ids[0], ids[3], ids[2]];
 
         let (listed, next) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list");
         assert_eq!(
@@ -3364,7 +3902,7 @@ mod tests {
         let mut cursor: Option<String> = None;
         loop {
             let (page, next) = store
-                .list_sessions(1, false, None, cursor.as_deref())
+                .list_sessions(1, cursor.as_deref(), &SessionFilter::default())
                 .await
                 .expect("page");
             paged.extend(page.iter().map(|row| row.id));
@@ -3464,6 +4002,7 @@ mod tests {
                 },
                 &[],
                 chrono::Utc::now(),
+                None,
             )
             .await
             .expect("save the withdrawal");
@@ -3497,13 +4036,13 @@ mod tests {
             plain_session(&store, words).await;
         }
         let (rows, next) = store
-            .list_sessions(0, false, None, None)
+            .list_sessions(0, None, &SessionFilter::default())
             .await
             .expect("list");
         assert_eq!(rows.len(), 3);
         assert_eq!(next, None);
         let (rows, next) = store
-            .list_sessions(2, false, None, None)
+            .list_sessions(2, None, &SessionFilter::default())
             .await
             .expect("list");
         assert_eq!(rows.len(), 2);
@@ -3542,7 +4081,7 @@ mod tests {
             .await
             .expect("seed");
         let (rows, _) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("the listing survives the row");
         assert_eq!(rows.len(), 1);
@@ -3673,6 +4212,7 @@ mod tests {
                     title: Some("From the archive".to_string()),
                     pinned_at: Some("2026-02-02T00:00:00+00:00".to_string()),
                     stats: Default::default(),
+                    turns: Vec::new(),
                     events: Vec::new(),
                     scratchpad_entries: Vec::new(),
                 }],
@@ -3810,7 +4350,10 @@ mod tests {
                 Event::Append(Message::user(format!("ask {turn}"))),
                 Event::Append(Message::assistant_text(format!("reply {turn}"))),
             ] {
-                store.save_event(id, &event).await.expect("save event");
+                store
+                    .save_event(id, &event, None)
+                    .await
+                    .expect("save event");
             }
         }
         store
@@ -4153,6 +4696,7 @@ mod tests {
                         data: "aGVsbG8=".to_string(),
                     },
                 ])),
+                None,
             )
             .await
             .expect("save");
@@ -4417,7 +4961,7 @@ mod tests {
         );
 
         let (listed, _) = store
-            .list_sessions(50, false, None, None)
+            .list_sessions(50, None, &SessionFilter::default())
             .await
             .expect("list");
         let ids: Vec<Uuid> = listed.iter().map(|row| row.id).collect();
@@ -4426,7 +4970,10 @@ mod tests {
             "the default listing is the drivable ones: {ids:?}"
         );
         let (with_children, _) = store
-            .list_sessions(50, true, None, None)
+            .list_sessions(50, None, &SessionFilter {
+                include_children: true,
+                ..Default::default()
+            })
             .await
             .expect("list");
         assert!(
@@ -4604,6 +5151,7 @@ mod tests {
                     title: None,
                     pinned_at: None,
                     stats: crate::stats::SessionStatsSnapshot::default(),
+                    turns: Vec::new(),
                     events: Vec::new(),
                     scratchpad_entries: Vec::new(),
                 }],
@@ -4857,7 +5405,7 @@ mod tests {
         // `session/list` reports the same set, since that is what a client rebuilds a workspace
         // from when picking a session out of its history.
         let (listed, _cursor) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list");
         let row = listed
@@ -4973,7 +5521,10 @@ mod tests {
             &boundary_event,
             &repair_event,
         ] {
-            store.save_event(sid, event).await.expect("save event");
+            store
+                .save_event(sid, event, None)
+                .await
+                .expect("save event");
         }
 
         let loaded = store.load_events(sid).await.expect("load events");
@@ -5049,11 +5600,11 @@ mod tests {
         let image_event = Event::Append(Message::user_with_images("look at this", vec![image]));
         let text_event = Event::Append(Message::user("plain text only"));
         store
-            .save_event(sid, &image_event)
+            .save_event(sid, &image_event, None)
             .await
             .expect("save image event");
         store
-            .save_event(sid, &text_event)
+            .save_event(sid, &text_event, None)
             .await
             .expect("save text event");
 
@@ -5164,7 +5715,10 @@ mod tests {
             Event::Append(Message::user("third")),
             Event::Append(Message::assistant_text("reply three")),
         ] {
-            store.save_event(sid, &event).await.expect("save event");
+            store
+                .save_event(sid, &event, None)
+                .await
+                .expect("save event");
         }
 
         let whole = store.load_events(sid).await.expect("load events");
@@ -5201,7 +5755,10 @@ mod tests {
             Event::Append(Message::user("only")),
             Event::Append(Message::assistant_text("reply")),
         ] {
-            store.save_event(plain, &event).await.expect("save event");
+            store
+                .save_event(plain, &event, None)
+                .await
+                .expect("save event");
         }
         assert_eq!(store.load_view_events(plain).await.expect("view").len(), 2);
     }
@@ -5242,7 +5799,10 @@ mod tests {
                 }],
             }),
         ] {
-            store.save_event(sid, &event).await.expect("save event");
+            store
+                .save_event(sid, &event, None)
+                .await
+                .expect("save event");
         }
         assert_eq!(store.blob_count().await.expect("count"), 1);
 
@@ -5862,7 +6422,7 @@ mod tests {
             "a probe against a held source must refuse with the source's id"
         );
         let (listed, _cursor) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list");
         assert_eq!(listed.len(), 1, "and no copy was written");
@@ -5983,6 +6543,7 @@ mod tests {
             title: None,
             pinned_at: None,
             stats: crate::stats::SessionStatsSnapshot::default(),
+            turns: Vec::new(),
             events: Vec::new(),
             scratchpad_entries: Vec::new(),
         };
@@ -6040,6 +6601,7 @@ mod tests {
                     title: None,
                     pinned_at: None,
                     stats: crate::stats::SessionStatsSnapshot::default(),
+                    turns: Vec::new(),
                     events: Vec::new(),
                     scratchpad_entries: Vec::new(),
                 }],
@@ -6546,12 +7108,16 @@ mod tests {
         let user_prompt = "find all Rust files under src/";
         let stored = mock_run_turn_user_message(crate::permission::Permission::Read, user_prompt);
         store
-            .save_event(session_id, &crate::conversation::Event::Append(stored))
+            .save_event(
+                session_id,
+                &crate::conversation::Event::Append(stored),
+                None,
+            )
             .await
             .expect("save_message");
 
         let (summaries, _next_cursor) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list_sessions");
         let summary = summaries
@@ -6597,12 +7163,16 @@ mod tests {
             let prompt = format!("ask at {label} level");
             let stored = mock_run_turn_user_message(*permission, &prompt);
             store
-                .save_event(session_id, &crate::conversation::Event::Append(stored))
+                .save_event(
+                    session_id,
+                    &crate::conversation::Event::Append(stored),
+                    None,
+                )
                 .await
                 .expect("save_message");
 
             let (summaries, _next_cursor) = store
-                .list_sessions(100, false, None, None)
+                .list_sessions(100, None, &SessionFilter::default())
                 .await
                 .expect("list_sessions");
             let summary = summaries
@@ -6629,12 +7199,16 @@ mod tests {
         let long_prompt = "a".repeat(150);
         let stored = mock_run_turn_user_message(crate::permission::Permission::Read, &long_prompt);
         store
-            .save_event(session_id, &crate::conversation::Event::Append(stored))
+            .save_event(
+                session_id,
+                &crate::conversation::Event::Append(stored),
+                None,
+            )
             .await
             .expect("save_message");
 
         let (summaries, _next_cursor) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list_sessions");
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
@@ -6668,7 +7242,11 @@ mod tests {
         {
             let stored = mock_run_turn_user_message(crate::permission::Permission::Read, prompt);
             store
-                .save_event(session_id, &crate::conversation::Event::Append(stored))
+                .save_event(
+                    session_id,
+                    &crate::conversation::Event::Append(stored),
+                    None,
+                )
                 .await
                 .expect("save_message");
             // Interleave an assistant reply: real sessions alternate.
@@ -6679,7 +7257,7 @@ mod tests {
         }
 
         let (summaries, _next_cursor) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list_sessions");
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
@@ -6701,12 +7279,16 @@ mod tests {
             "line one of the title\nline two joins it\n\n  line three too",
         );
         store
-            .save_event(session_id, &crate::conversation::Event::Append(stored))
+            .save_event(
+                session_id,
+                &crate::conversation::Event::Append(stored),
+                None,
+            )
             .await
             .expect("save_message");
 
         let (summaries, _next_cursor) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list_sessions");
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
@@ -6733,7 +7315,11 @@ mod tests {
             },
         ]);
         store
-            .save_event(session_id, &crate::conversation::Event::Append(image_only))
+            .save_event(
+                session_id,
+                &crate::conversation::Event::Append(image_only),
+                None,
+            )
             .await
             .expect("save the image-only turn");
         let words = mock_run_turn_user_message(
@@ -6741,12 +7327,12 @@ mod tests {
             "what is in this picture?",
         );
         store
-            .save_event(session_id, &crate::conversation::Event::Append(words))
+            .save_event(session_id, &crate::conversation::Event::Append(words), None)
             .await
             .expect("save the worded turn");
 
         let (summaries, _next_cursor) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list_sessions");
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
@@ -6801,11 +7387,14 @@ mod tests {
             )),
         ];
         for event in &events {
-            store.save_event(session_id, event).await.expect("save");
+            store
+                .save_event(session_id, event, None)
+                .await
+                .expect("save");
         }
 
         let (summaries, _next_cursor) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list_sessions");
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
@@ -6842,6 +7431,7 @@ mod tests {
             title: None,
             pinned_at: None,
             stats: Default::default(),
+            turns: Vec::new(),
             events: vec![(
                 "2026-08-31T00:00:00Z".to_string(),
                 crate::conversation::Event::Append(crate::conversation::Message::user_with_images(
@@ -6852,6 +7442,7 @@ mod tests {
                         size: 3,
                     }],
                 )),
+                None,
             )],
             scratchpad_entries: Vec::new(),
         };
@@ -6894,13 +7485,13 @@ mod tests {
         for (sid, prompt) in [(a, "alpha"), (b, "beta"), (c, "gamma")] {
             let stored = mock_run_turn_user_message(crate::permission::Permission::Read, prompt);
             store
-                .save_event(sid, &crate::conversation::Event::Append(stored))
+                .save_event(sid, &crate::conversation::Event::Append(stored), None)
                 .await
                 .expect("save_message");
         }
 
         let (summaries, _next_cursor) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list_sessions");
         let title_of = |id: uuid::Uuid| {
@@ -6926,7 +7517,7 @@ mod tests {
             .expect("create_session");
 
         let (summaries, _next_cursor) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list_sessions");
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
@@ -6952,7 +7543,7 @@ mod tests {
             .expect("save_message");
 
         let (summaries, _next_cursor) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list_sessions");
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
@@ -6979,7 +7570,7 @@ mod tests {
             .expect("save_message");
 
         let (summaries, _next_cursor) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list_sessions");
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
@@ -7085,7 +7676,10 @@ mod tests {
 
         // Cross-check the column via list_sessions(include_children=true).
         let (summaries, _next_cursor) = store
-            .list_sessions(100, true, None, None)
+            .list_sessions(100, None, &SessionFilter {
+                include_children: true,
+                ..Default::default()
+            })
             .await
             .expect("list_sessions");
         let ids: Vec<_> = summaries.iter().map(|s| s.id).collect();
@@ -7114,7 +7708,7 @@ mod tests {
             .0;
 
         let (default_view, _) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list");
         let ids: Vec<_> = default_view.iter().map(|s| s.id).collect();
@@ -7122,7 +7716,10 @@ mod tests {
         assert!(ids.contains(&parent), "parent should still be visible");
 
         let (full_view, _) = store
-            .list_sessions(10, true, None, None)
+            .list_sessions(10, None, &SessionFilter {
+                include_children: true,
+                ..Default::default()
+            })
             .await
             .expect("list");
         assert_eq!(full_view.len(), 2);
@@ -7170,7 +7767,10 @@ mod tests {
             .expect("create b");
 
         let (only_a, next) = store
-            .list_sessions(10, false, Some(&cwd_a), None)
+            .list_sessions(10, None, &SessionFilter {
+                cwd: Some(cwd_a.clone()),
+                ..Default::default()
+            })
             .await
             .expect("list filtered");
         assert_eq!(only_a.len(), 1);
@@ -7181,7 +7781,7 @@ mod tests {
         );
 
         let (all, _) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &SessionFilter::default())
             .await
             .expect("list unfiltered");
         assert_eq!(all.len(), 2, "unfiltered must include both sessions");
@@ -7203,7 +7803,10 @@ mod tests {
             .expect("create without cwd");
 
         let (filtered, _) = store
-            .list_sessions(10, false, Some(&cwd), None)
+            .list_sessions(10, None, &SessionFilter {
+                cwd: Some(cwd.clone()),
+                ..Default::default()
+            })
             .await
             .expect("list");
         assert_eq!(filtered.len(), 1);
@@ -7231,7 +7834,7 @@ mod tests {
         let mut cursor: Option<String> = None;
         loop {
             let (page, next) = store
-                .list_sessions(2, false, None, cursor.as_deref())
+                .list_sessions(2, cursor.as_deref(), &SessionFilter::default())
                 .await
                 .expect("list");
             for summary in &page {
@@ -7253,7 +7856,7 @@ mod tests {
     async fn list_sessions_invalid_cursor_returns_error() {
         let store = Store::for_test().await;
         let result = store
-            .list_sessions(10, false, None, Some("not_base64_at_all!!"))
+            .list_sessions(10, Some("not_base64_at_all!!"), &SessionFilter::default())
             .await;
         assert!(
             result.is_err(),

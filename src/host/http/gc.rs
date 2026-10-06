@@ -1,5 +1,5 @@
 //! Background session GC. Periodically scans the in-memory session map and evicts entries
-//! whose `last_turn_at` is older than the configured `idle_timeout`. Eviction drops the
+//! that have been idle longer than the configured `idle_timeout`. Eviction drops the
 //! `SessionEntry` (which in turn drops the `FileLock`, releasing the OS file lock) but
 //! leaves the SQLite row in place by default; a later request with the same session ID can
 //! re-attach (mirroring ACP's `session/load` semantics).
@@ -74,8 +74,15 @@ async fn evict_idle(state: &ServerState, idle_timeout: Duration, delete_on_idle:
 
     if delete_on_idle {
         for (id, _entry) in &evicted {
-            if let Err(error) = state.shared.store.delete_session(*id).await {
-                tracing::warn!("session GC: failed to delete row for {id}: {error}");
+            let tree =
+                crate::host::http::handlers::sessions::ids_a_deletion_removes(state, *id).await;
+            match state.shared.store.delete_session(*id).await {
+                Ok(_) => {
+                    crate::host::http::handlers::sessions::announce_deletion(state, &tree);
+                }
+                Err(error) => {
+                    tracing::warn!("session GC: failed to delete row for {id}: {error}");
+                }
             }
         }
     }

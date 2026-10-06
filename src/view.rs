@@ -29,8 +29,8 @@ use crate::{
 };
 
 /// A session's row: what `meka session list` prints and what `GET /v1/sessions/{id}` answers with,
-/// less the facts only the process holding the session can add (`last_turn_at`, `capabilities`,
-/// `turn_in_flight`), which the HTTP response flattens this under.
+/// less the facts only the process holding the session can add (`capabilities`, `turn_in_flight`,
+/// `inbox_pending`, `approvals_pending`), which the HTTP response flattens this under.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub(crate) struct SessionView {
@@ -64,6 +64,14 @@ pub(crate) struct SessionView {
     /// are listed first, newest pin on top.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) pinned_at: Option<String>,
+    /// The latest turn: who opened it and when, and once it has ended, how (`succeeded` with its
+    /// `stop_reason`, `failed` with its `error`, or `canceled`), when, and what it spent. Omitted
+    /// for a session no turn has begun on. A turn that began and shows no ending is either in
+    /// flight, which `turn_in_flight` says, or one the process died under. The record carries it
+    /// because a list of sessions is rendered from it, one row per session; the whole history of
+    /// turns is `GET /v1/sessions/{id}/turns`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_turn: Option<crate::store::turns::TurnRecord>,
 }
 
 impl From<&SessionSummary> for SessionView {
@@ -79,6 +87,7 @@ impl From<&SessionSummary> for SessionView {
             title: session.title.clone(),
             parent_id: session.parent_id,
             pinned_at: session.pinned_at.clone(),
+            last_turn: session.last_turn.clone(),
         }
     }
 }
@@ -120,6 +129,10 @@ pub(crate) struct ProfileView {
     pub(crate) backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) model: Option<String>,
+    /// Whether a session on this profile accepts image attachments, so a client can tell whether
+    /// attaching one is worth the base64 payload instead of discovering it from a 422. Per
+    /// profile, because `POST /turn` asks the session's own profile.
+    pub(crate) vision: bool,
     /// Whether this is the profile a session gets when it names none.
     ///
     /// Not "the profile the server is running": a server runs no profile of its own, and each
@@ -136,6 +149,7 @@ impl ProfileView {
             account: summary.account.clone(),
             backend: summary.backend.clone(),
             model: summary.model.clone(),
+            vision: summary.vision,
             active,
         }
     }
@@ -155,6 +169,7 @@ impl ProfileView {
                 .get(&profile.account)
                 .map(|account| account.backend.clone()),
             model: profile.model.clone(),
+            vision: profile.vision.unwrap_or(true),
             active,
         }
     }
@@ -398,6 +413,9 @@ pub(crate) struct MemoryDetail {
     /// Present on `GET /v1/memory/{name}` and `meka memory show`, absent from a listing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) body: Option<String>,
+    /// The line the words of a search were found on, present only on an entry a search found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) snippet: Option<String>,
 }
 
 impl MemoryDetail {
@@ -412,6 +430,7 @@ impl MemoryDetail {
             tags: memory.tags.clone(),
             read_count: memory.read_count,
             body,
+            snippet: None,
         }
     }
 }
@@ -625,6 +644,7 @@ mod tests {
             token_id: None,
             parent_id,
             pinned_at: None,
+            last_turn: None,
         }
     }
 
@@ -684,6 +704,7 @@ mod tests {
             account: "gone".to_string(),
             backend: None,
             model: None,
+            vision: true,
         };
         let from_summary =
             serde_json::to_value(ProfileView::from_summary(&summary, false)).expect("json");

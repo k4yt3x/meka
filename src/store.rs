@@ -34,6 +34,7 @@ pub(crate) mod schedule;
 mod scratchpad;
 mod search;
 mod sessions;
+pub(crate) mod turns;
 
 use std::{
     path::{Path, PathBuf},
@@ -56,8 +57,8 @@ pub(crate) use self::{
     scratchpad::{RenameOutcome, ScratchpadEntry},
     search::SessionMatch,
     sessions::{
-        ForkOverrides, ImportSessionRecord, SessionMetaRow, SessionPatch, SessionSummary,
-        SessionSweep, SourceLock, SpawnTerms, normalize_title,
+        ForkOverrides, ImportSessionRecord, SessionFilter, SessionMetaRow, SessionPatch,
+        SessionSummary, SessionSweep, SourceLock, SpawnTerms, normalize_title,
     },
 };
 use crate::error::{MekaError, Result};
@@ -442,6 +443,11 @@ impl Store {
     /// The background-tasks table, on this store's connection.
     pub(crate) fn background_store(&self) -> crate::store::background::BackgroundStore {
         crate::store::background::BackgroundStore::new(Arc::clone(&self.connection))
+    }
+
+    /// The turns table, on this store's connection.
+    pub(crate) fn turn_store(&self) -> crate::store::turns::TurnStore {
+        crate::store::turns::TurnStore::new(Arc::clone(&self.connection))
     }
 
     /// The inbox table, on this store's connection.

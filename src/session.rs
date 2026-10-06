@@ -1,7 +1,7 @@
 //! What a session is made of: the materials every agent and tool registry of the session is built
 //! from, and the live cells they all read through the same handles.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use uuid::Uuid;
 
@@ -20,6 +20,9 @@ pub(crate) struct CoreMaterials {
     pub(crate) builtin_filter: crate::config::BuiltinToolFilter,
     /// The per-path write locks every registry built from these materials takes.
     pub(crate) write_locks: crate::workspace::WriteLocks,
+    /// Shared by every session this process builds, so a host can tell which sub-agents are in a
+    /// turn.
+    pub(crate) running_subagents: RunningSubagents,
 }
 
 impl CoreMaterials {
@@ -36,6 +39,7 @@ impl CoreMaterials {
             backend_probe: sandbox.probe.clone(),
             builtin_filter,
             write_locks: crate::workspace::WriteLocks::default(),
+            running_subagents: RunningSubagents::default(),
         }
     }
 
@@ -52,6 +56,7 @@ impl CoreMaterials {
             },
             builtin_filter: crate::config::BuiltinToolFilter::default(),
             write_locks: crate::workspace::WriteLocks::default(),
+            running_subagents: RunningSubagents::default(),
         }
     }
 }
@@ -59,6 +64,98 @@ impl CoreMaterials {
 /// What a session is made of and never changes while it runs. Every agent built for the session,
 /// and every sub-agent spawned from it, shares these by handle; a sub-agent narrows what it may
 /// reach through its own registry and permission, never through a different set of materials.
+/// The sub-agents this process is running right now, by their session id. A sub-agent is never a
+/// resident session of any host: its parent runs it under the parent's runtime, and only the
+/// child's file lock knows it is busy, which a reader may not probe (a spawn that cannot take the
+/// lock runs the child unlocked and warns, so a probe could cost a child its lock). This is what
+/// lets a session record say a sub-agent is in a turn.
+#[derive(Clone)]
+pub(crate) struct RunningSubagents {
+    running: Arc<std::sync::Mutex<HashSet<Uuid>>>,
+    /// Every start and end of a run, for a host that announces sub-agents it never sees a
+    /// request for: a sub-agent is run by a tool, not by a handler.
+    changes: tokio::sync::broadcast::Sender<SubagentChange>,
+}
+
+/// What a run of a sub-agent is, as the registry announces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubagentRun {
+    /// A spawn: the child's row is new.
+    Spawned,
+    /// A follow-up on a child that exists.
+    Resumed,
+    /// The run is over, however it ended.
+    Ended,
+}
+
+/// One change to a sub-agent's run, as the registry announces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SubagentChange {
+    pub(crate) child: Uuid,
+    pub(crate) run: SubagentRun,
+}
+
+impl Default for RunningSubagents {
+    fn default() -> Self {
+        let (changes, _receiver) = tokio::sync::broadcast::channel(64);
+        Self {
+            running: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            changes,
+        }
+    }
+}
+
+impl RunningSubagents {
+    /// Mark `child` as running for as long as the guard lives: the whole of a spawn or a
+    /// follow-up, whether or not the child's lock was taken.
+    pub(crate) fn run(&self, child: Uuid, start: SubagentRun) -> RunningGuard {
+        crate::sync::lock(&self.running).insert(child);
+        self.announce(SubagentChange { child, run: start });
+        RunningGuard {
+            registry: self.clone(),
+            child,
+        }
+    }
+
+    /// Whether this process is running `id` as a sub-agent right now.
+    pub(crate) fn is_running(&self, id: Uuid) -> bool {
+        crate::sync::lock(&self.running).contains(&id)
+    }
+
+    /// Every sub-agent running now, for a listener that missed some changes.
+    pub(crate) fn running_ids(&self) -> Vec<Uuid> {
+        crate::sync::lock(&self.running).iter().copied().collect()
+    }
+
+    /// Every change from now on. A receiver that falls behind is told how many it missed.
+    pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SubagentChange> {
+        self.changes.subscribe()
+    }
+
+    fn announce(&self, change: SubagentChange) {
+        // No receiver is the ordinary case for every host but `meka serve`.
+        if self.changes.send(change).is_err() {
+            tracing::trace!("no host is listening for sub-agent runs");
+        }
+    }
+}
+
+/// Clears the child from the registry when the run that registered it ends, however it ends.
+pub(crate) struct RunningGuard {
+    registry: RunningSubagents,
+    child: Uuid,
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        crate::sync::lock(&self.registry.running).remove(&self.child);
+        self.registry.announce(SubagentChange {
+            child: self.child,
+            run: SubagentRun::Ended,
+        });
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SessionMaterials {
     pub(crate) core: CoreMaterials,
@@ -556,6 +653,19 @@ impl AgentOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sub-agent is running for exactly the life of the guard its run holds, however the run
+    /// ends, which is what makes the registry safe to read for a session record.
+    #[test]
+    fn a_sub_agent_is_running_for_exactly_the_life_of_its_guard() {
+        let registry = RunningSubagents::default();
+        let child = Uuid::new_v4();
+        assert!(!registry.is_running(child));
+        let guard = registry.run(child, SubagentRun::Spawned);
+        assert!(registry.is_running(child));
+        drop(guard);
+        assert!(!registry.is_running(child));
+    }
     use crate::{
         cli::session::delete_sessions,
         conversation::{self, format_session_as_markdown},
@@ -673,10 +783,41 @@ mod tests {
         ];
         for event in &root_events {
             manager
-                .save_event(root, event)
+                .save_event(root, event, None)
                 .await
                 .expect("save root event");
         }
+        // A turn the root ran, which two of its rows name, ended in a failure the row records by
+        // its kind: an archive carries the turn and an import keeps it under an id of its own.
+        let turn = uuid::Uuid::new_v4();
+        manager
+            .turn_store()
+            .open_turn(root, turn, "client", "2026-08-31T00:00:00+00:00")
+            .await
+            .expect("open");
+        for event in [
+            Event::Append(Message::user("asked in a turn")),
+            Event::Append(Message::assistant_text("answered in it")),
+        ] {
+            manager
+                .save_event(root, &event, Some(turn))
+                .await
+                .expect("save turn event");
+        }
+        manager
+            .turn_store()
+            .close_turn(
+                turn,
+                &crate::store::turns::TurnEnding::failed(
+                    &crate::error::MekaError::Provider("{\"error\":\"acct-9\"}".to_string()),
+                    crate::store::turns::TurnUsage {
+                        input_tokens: 7,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("close");
         manager
             .save_scratchpad_entry(root, "tool_1_output", "big output")
             .await
@@ -714,7 +855,10 @@ mod tests {
             Event::Append(Message::user("sub task")),
             Event::Append(Message::assistant_text("sub done")),
         ] {
-            manager.save_event(child, &event).await.expect("save child");
+            manager
+                .save_event(child, &event, None)
+                .await
+                .expect("save child");
         }
 
         // Export -> JSON -> back.
@@ -779,6 +923,37 @@ mod tests {
             child_new.permission,
             Some(crate::permission::Permission::Read),
             "a worker's row records the level it was spawned at"
+        );
+
+        // The turn came back as a row of its own, and the rows that named it name the copy.
+        let turns = manager
+            .turn_store()
+            .load_turns(root_new_id)
+            .await
+            .expect("turns");
+        assert_eq!(turns.len(), 1, "{turns:?}");
+        assert_ne!(turns[0].id, turn, "under an id of its own");
+        assert_eq!(
+            turns[0].status,
+            Some(crate::store::turns::TurnStatus::Failed)
+        );
+        assert_eq!(
+            turns[0].error.as_ref().map(|error| error.kind),
+            Some(crate::error::ErrorKind::Provider)
+        );
+        assert_eq!(turns[0].usage.input_tokens, 7);
+        let stamps: Vec<Option<uuid::Uuid>> = manager
+            .load_events_with_timestamps(root_new_id)
+            .await
+            .expect("stamps")
+            .into_iter()
+            .map(|(stamp, _)| stamp.turn_id)
+            .collect();
+        let named: Vec<bool> = stamps.iter().map(Option::is_some).collect();
+        assert_eq!(named, [false, false, false, false, false, true, true]);
+        assert!(
+            stamps.iter().flatten().all(|id| *id == turns[0].id),
+            "named the copied turn: {stamps:?}"
         );
 
         // The event log round-trips byte-for-byte against the untouched original.
@@ -1044,6 +1219,7 @@ mod tests {
                 "subagent_spec_json": null,
                 "profile": "",
                 "stats": crate::stats::SessionStatsSnapshot::default(),
+                "turns": [],
                 "events": [],
                 "scratchpad_entries": {},
             }],
@@ -1097,7 +1273,9 @@ mod tests {
                     "profile": "work",
                     "base_url_override": base_url,
                     "stats": crate::stats::SessionStatsSnapshot::default(),
-                    "events": [],
+                    "turns": [],
+                    "turns": [],
+                "events": [],
                     "scratchpad_entries": {},
                 }],
                 "blobs": [],
@@ -1160,6 +1338,7 @@ mod tests {
             title: None,
             pinned_at: None,
             stats: crate::stats::SessionStatsSnapshot::default(),
+            turns: Vec::new(),
             events: Vec::new(),
             scratchpad_entries: Vec::new(),
         }];

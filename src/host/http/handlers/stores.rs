@@ -11,7 +11,7 @@
 use axum::{
     Json,
     body::Bytes,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
@@ -334,12 +334,25 @@ fn memory_failure(error: crate::error::MekaError) -> ProblemDetail {
 }
 
 /// `GET /v1/memory`: the memory index, most important first.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub(crate) struct MemoryListQuery {
+    /// Words to search for. The memories the agent's own `memory_search` would find for them,
+    /// best first, each with the `snippet` it was found on; absent, the whole index.
+    #[serde(default)]
+    pub(crate) q: Option<String>,
+    /// How many a search answers with at most. Default 10, clamped to 1..25. Ignored without
+    /// `q`.
+    #[serde(default)]
+    pub(crate) limit: Option<u32>,
+}
+
 #[utoipa::path(
     get,
     path = "/v1/memory",
     tag = "memory",
+    params(MemoryListQuery),
     responses(
-        (status = 200, description = "Memory index", body = MemoryListResponse),
+        (status = 200, description = "Memory index, or the memories a search found", body = MemoryListResponse),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
@@ -349,19 +362,37 @@ fn memory_failure(error: crate::error::MekaError) -> ProblemDetail {
 pub(crate) async fn list_memories(
     State(state): State<ServerState>,
     _scoped: scope::Scoped<scope::MemoryRead>,
+    Query(query): Query<MemoryListQuery>,
 ) -> Result<Json<MemoryListResponse>, ProblemDetail> {
-    let index = state
-        .shared
-        .memories
-        .index()
+    let memories = &state.shared.memories;
+    let Some(words) = query.q.filter(|words| !words.trim().is_empty()) else {
+        let index = memories.index().await.map_err(memory_failure)?;
+        return Ok(Json(MemoryListResponse {
+            memories: index
+                .iter()
+                .map(|memory| MemoryDetail::new(memory, None))
+                .collect(),
+        }));
+    };
+    let limit = query.limit.unwrap_or(10).clamp(1, 25) as usize;
+    // The same ladder the agent climbs, so an operator and the model find the same memories for
+    // the same words. A query with no searchable words finds nothing, as the tool says.
+    let found = memories
+        .find(&[words], limit)
         .await
         .map_err(memory_failure)?;
-    Ok(Json(MemoryListResponse {
-        memories: index
-            .iter()
-            .map(|memory| MemoryDetail::new(memory, None))
-            .collect(),
-    }))
+    let mut listed = Vec::new();
+    for hit in found.map(|found| found.results.hits).unwrap_or_default() {
+        // The hit carries the words it was found on; the entry is the memory as the index lists
+        // it, read fresh so its tags and counts are the row's. A memory deleted between the two
+        // reads is left out rather than invented.
+        if let Some(memory) = memories.get(&hit.name).await.map_err(memory_failure)? {
+            let mut detail = MemoryDetail::new(&memory, None);
+            detail.snippet = Some(hit.snippet);
+            listed.push(detail);
+        }
+    }
+    Ok(Json(MemoryListResponse { memories: listed }))
 }
 
 /// `GET /v1/memory/{name}`: one memory, body included.

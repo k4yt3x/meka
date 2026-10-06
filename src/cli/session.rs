@@ -426,7 +426,10 @@ pub(crate) async fn list_sessions(
     format: cli::OutputFormat,
 ) -> anyhow::Result<()> {
     let (sessions, _next_cursor) = store
-        .list_sessions(limit, include_children, None, None)
+        .list_sessions(limit, None, &crate::store::SessionFilter {
+            include_children,
+            ..Default::default()
+        })
         .await?;
 
     if format == cli::OutputFormat::Json {
@@ -815,12 +818,13 @@ mod tests {
                     "hello\u{1b}[31m\nffffffff-0000-0000-0000-000000000000  2026-01-01 00:00:00  \
                      other  harmless",
                 )),
+                None,
             )
             .await
             .expect("seed a first message");
 
         let (sessions, _) = manager
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &crate::store::SessionFilter::default())
             .await
             .expect("list");
         let table = crate::text::format_table(
@@ -852,6 +856,7 @@ mod tests {
             .save_event(
                 pinned,
                 &conversation::Event::Append(crate::conversation::Message::user("kept words")),
+                None,
             )
             .await
             .expect("seed");
@@ -872,12 +877,13 @@ mod tests {
                 &conversation::Event::Append(crate::conversation::Message::user(
                     "plain words about herons",
                 )),
+                None,
             )
             .await
             .expect("seed");
 
         let (sessions, _) = store
-            .list_sessions(10, false, None, None)
+            .list_sessions(10, None, &crate::store::SessionFilter::default())
             .await
             .expect("list");
         let rows = session_rows(&sessions, &ids_of(&sessions));
@@ -919,12 +925,13 @@ mod tests {
                         &conversation::Event::Append(crate::conversation::Message::user(
                             "word ".repeat(40),
                         )),
+                        None,
                     )
                     .await
                     .expect("seed");
             }
             let (sessions, _) = manager
-                .list_sessions(10, false, None, None)
+                .list_sessions(10, None, &crate::store::SessionFilter::default())
                 .await
                 .expect("list");
             crate::text::format_table(
@@ -1030,7 +1037,10 @@ mod tests {
             "the parse error is the answer: {error}"
         );
         let (sessions, _) = store
-            .list_sessions(10, true, None, None)
+            .list_sessions(10, None, &crate::store::SessionFilter {
+                include_children: true,
+                ..Default::default()
+            })
             .await
             .expect("list");
         assert!(

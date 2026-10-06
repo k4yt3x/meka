@@ -45,6 +45,11 @@ pub(crate) struct ServerState {
     /// Sessions a driver task is draining right now, so a wake that arrives mid-drain does not
     /// start a second driver on the same session.
     pub(crate) inbox_draining: Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
+    /// The listing's change feed; see [`super::feed::ServerFeed`].
+    pub(crate) server_feed: super::feed::SharedServerFeed,
+    /// The feeds of the sub-agents this process is running; see
+    /// [`super::http_frontend::SubagentFeed`].
+    pub(crate) child_feeds: super::http_frontend::ChildFeeds,
 }
 
 /// One session `meka serve` holds open: the shared [`ResidentSession`] plus what only the HTTP
@@ -60,8 +65,6 @@ pub(crate) struct SessionEntry {
     pub(crate) token_id: Option<String>,
     pub(crate) created_at: chrono::DateTime<chrono::Utc>,
     pub(crate) updated_at: Arc<std::sync::RwLock<chrono::DateTime<chrono::Utc>>>,
-    /// Wall-clock twin of the resident's `last_activity`, for the API's `last_turn_at`.
-    pub(crate) last_turn_at_wall: Arc<std::sync::RwLock<Option<chrono::DateTime<chrono::Utc>>>>,
     pub(crate) capabilities: super::http_frontend::SessionCapabilities,
     pub(crate) frontend: Arc<HttpFrontend>,
 }
@@ -81,6 +84,7 @@ impl ServerState {
         idempotency: IdempotencyCache,
     ) -> Self {
         let config_webhooks = config.webhooks.clone();
+        let stream_replay_events = config.stream_replay_events;
         Self {
             shared,
             sessions: Sessions::new(),
@@ -92,18 +96,33 @@ impl ServerState {
             reconstruction_locks: super::reattach::ReconstructionLocks::default(),
             inbox_wake: Arc::new(tokio::sync::Notify::new()),
             inbox_draining: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            server_feed: Arc::new(std::sync::Mutex::new(super::feed::ServerFeed::new(
+                super::feed::FEED_BROADCAST_CAPACITY,
+                stream_replay_events,
+            ))),
+            child_feeds: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// What every session's feed is built with on this server.
+    pub(crate) fn feed_wiring(&self) -> super::http_frontend::FeedWiring {
+        super::http_frontend::FeedWiring {
+            capacity: super::feed::FEED_BROADCAST_CAPACITY,
+            replay_capacity: self.config.stream_replay_events,
+            reattach_grace: self.config.stream_reattach_grace,
+            webhooks: Some(self.webhooks.clone()),
+            server: Some(Arc::clone(&self.server_feed)),
+            children: Some(Arc::clone(&self.child_feeds)),
         }
     }
 }
 
 impl SessionEntry {
     /// Record activity on both clocks: the resident's, which the idle sweep reads, and the
-    /// wall-clock twins the API reports.
+    /// wall-clock `updated_at` the API reports.
     pub(crate) fn touch(&self) {
         self.resident.touch();
-        let now_wall = chrono::Utc::now();
-        *crate::sync::write(&self.last_turn_at_wall) = Some(now_wall);
-        *crate::sync::write(&self.updated_at) = now_wall;
+        *crate::sync::write(&self.updated_at) = chrono::Utc::now();
     }
 }
 

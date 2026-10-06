@@ -202,6 +202,17 @@ impl TurnOrigin {
             Self::TaskNotification => "task_notification",
         }
     }
+
+    /// The same fact in meka's own words, as a turn's row and the HTTP API's `turn.started`
+    /// name who opened a turn.
+    pub(crate) const fn source(self) -> &'static str {
+        match self {
+            Self::Human => "client",
+            Self::Scheduled => "schedule",
+            Self::Peer => "inbox",
+            Self::TaskNotification => "background",
+        }
+    }
 }
 
 /// What set a compaction going, in the words Claude Code's compaction headers use.

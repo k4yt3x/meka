@@ -793,6 +793,9 @@ pub(crate) struct ToolContext {
     pub(crate) frontend: Arc<dyn crate::frontend::Frontend>,
     /// Canceled when this call, or the turn carrying it, is stopped.
     pub(crate) cancellation: CancellationToken,
+    /// The background task this call runs as, when it was detached with `background: true`, so
+    /// a tool that starts something long-lived can record it on the task's row.
+    pub(crate) task_id: Option<String>,
 }
 
 impl ToolContext {
@@ -806,6 +809,7 @@ impl ToolContext {
             prompt_id: None,
             frontend: Arc::new(crate::frontend::SilentFrontend),
             cancellation,
+            task_id: None,
         }
     }
 }
@@ -1394,6 +1398,7 @@ mod tests {
                     backend_probe,
                     builtin_filter: filter,
                     write_locks: crate::workspace::WriteLocks::default(),
+                    running_subagents: Default::default(),
                 },
                 skills: crate::skills::SkillCache::for_root(None),
                 skills_agent_managed: skills_managed,

@@ -434,6 +434,7 @@ mod tests {
             finished_at: Some(Utc::now()),
             announced_at: None,
             delivered_at: None,
+            subagent_id: None,
         }
     }
 
@@ -782,6 +783,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             finished_at: Some(chrono::Utc::now()),
             delivered_at: None,
+            subagent_id: None,
         };
         let joined = render_outcomes_riding(std::slice::from_ref(&task));
 

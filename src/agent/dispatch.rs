@@ -323,6 +323,7 @@ impl Agent {
                 prompt_id: attribution.prompt_id,
                 frontend: Arc::clone(&self.cells.frontend),
                 cancellation,
+                task_id: None,
             })
             .await
         };
@@ -388,6 +389,7 @@ impl Agent {
                 primary_param,
                 input: approval_input(input, detach),
                 cancellation: cancellation.clone(),
+                subagent_id: None,
             })
             .await;
         match outcome {
@@ -473,6 +475,7 @@ impl Agent {
             finished_at: None,
             announced_at: None,
             delivered_at: None,
+            subagent_id: None,
         };
         // Claim a slot before anything else. Atomic against the sibling calls in this same
         // assistant message, which `execute_tool_calls` dispatches concurrently: a
@@ -531,6 +534,7 @@ impl Agent {
                     prompt_id,
                     frontend,
                     cancellation: scoped.clone(),
+                    task_id: Some(task_id.clone()),
                 };
                 let run = crate::frontend::scope_call_cancellation(scoped, async move {
                     Self::run_tool(&*tool, &input, context).await

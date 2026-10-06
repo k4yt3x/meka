@@ -24,6 +24,17 @@ pub(crate) enum TurnOutcome {
     /// render it instead of a generic "request failed."
     Refusal(String),
 }
+
+impl TurnOutcome {
+    /// The stop reason's wire word, the one every surface reports it by.
+    pub(crate) const fn stop_reason(&self) -> &'static str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::MaxTokens => "max_tokens",
+            Self::Refusal(_) => "refusal",
+        }
+    }
+}
 /// What a turn is asked. Either a prompt somebody typed (a user, a scheduled job, a spawning
 /// agent) or a batch of finished background work that earned a turn of its own, with the images
 /// attached, whether the prompt is withdrawn if the turn fails, and the outcomes riding ahead of
@@ -42,6 +53,9 @@ pub(crate) struct TurnInput {
     /// Where the prompt came from, as the billing header reports it. Each door sets its own; the
     /// scheduler restates a fired job's, since its words are typed by nobody.
     origin: crate::provider::TurnOrigin,
+    /// The id the turn's row and every event about it carry. Minted here, and replaced by a host
+    /// that announces the turn under an id of its own, so the feed and the rows agree.
+    turn_id: Uuid,
 }
 
 enum Prompt {
@@ -67,6 +81,7 @@ impl TurnInput {
             riding: Vec::new(),
             inbox: Vec::new(),
             origin: crate::provider::TurnOrigin::Human,
+            turn_id: Uuid::new_v4(),
         })
     }
 
@@ -83,6 +98,7 @@ impl TurnInput {
             riding: Vec::new(),
             inbox: items,
             origin: crate::provider::TurnOrigin::Peer,
+            turn_id: Uuid::new_v4(),
         })
     }
 
@@ -106,12 +122,19 @@ impl TurnInput {
             riding: Vec::new(),
             inbox: Vec::new(),
             origin: crate::provider::TurnOrigin::TaskNotification,
+            turn_id: Uuid::new_v4(),
         }
     }
 
     /// Where the prompt came from, when the door that admitted it is not the one that knows.
     pub(crate) fn originating(mut self, origin: crate::provider::TurnOrigin) -> Self {
         self.origin = origin;
+        self
+    }
+
+    /// Run the turn under the id a host has already announced it by.
+    pub(crate) fn identified(mut self, turn_id: Uuid) -> Self {
+        self.turn_id = turn_id;
         self
     }
 
@@ -401,6 +424,93 @@ struct TurnMaterials {
     images: Vec<ImageSource>,
     inbox: Vec<crate::store::inbox::InboxItem>,
     outcomes: Option<String>,
+    turn_id: Uuid,
+    /// Who opened the turn, in the API's words, for its row.
+    source: &'static str,
+}
+
+/// Clears the agent's current turn on every exit of the run that set it, so a row written after
+/// the turn, by a checkpoint or the next host door, names no turn that has ended.
+struct TurnScope<'a> {
+    agent: &'a Agent,
+}
+
+impl Drop for TurnScope<'_> {
+    fn drop(&mut self) {
+        *crate::sync::lock(&self.agent.current_turn) = None;
+    }
+}
+
+impl Agent {
+    /// The turn this agent is running, or none between turns.
+    fn current_turn(&self) -> Option<Uuid> {
+        *crate::sync::lock(&self.current_turn)
+    }
+
+    /// [`Store::save_event`] naming the turn this agent is running.
+    pub(super) async fn save_event(
+        &self,
+        session_id: Uuid,
+        event: &crate::conversation::Event,
+    ) -> Result<()> {
+        self.store
+            .save_event(session_id, event, self.current_turn())
+            .await
+    }
+
+    /// [`Store::save_event_marking_inbox`] naming the turn this agent is running.
+    pub(super) async fn save_event_marking_inbox(
+        &self,
+        session_id: Uuid,
+        event: &crate::conversation::Event,
+        inbox_items: &[Uuid],
+    ) -> Result<()> {
+        self.store
+            .save_event_marking_inbox(session_id, event, inbox_items, self.current_turn())
+            .await
+    }
+
+    /// [`Store::save_event_resetting_inbox`] naming the turn this agent is running.
+    pub(super) async fn save_event_resetting_inbox(
+        &self,
+        session_id: Uuid,
+        event: &crate::conversation::Event,
+        inbox_items: &[Uuid],
+        not_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        self.store
+            .save_event_resetting_inbox(
+                session_id,
+                event,
+                inbox_items,
+                not_before,
+                self.current_turn(),
+            )
+            .await
+    }
+
+    /// [`Store::save_events_atomic`] naming the turn this agent is running.
+    pub(super) async fn save_events_atomic(
+        &self,
+        session_id: Uuid,
+        events: Vec<crate::conversation::Event>,
+    ) -> Result<()> {
+        self.store
+            .save_events_atomic(session_id, events, self.current_turn())
+            .await
+    }
+
+    /// [`Store::save_events_atomic_marking_inbox`] naming the turn this agent is running.
+    pub(super) async fn save_events_atomic_marking_inbox(
+        &self,
+        session_id: Uuid,
+        events: Vec<crate::conversation::Event>,
+        inbox_items: &[Uuid],
+    ) -> Result<()> {
+        self.store
+            .save_events_atomic_marking_inbox(session_id, events, inbox_items, self.current_turn())
+            .await
+    }
 }
 
 /// A turn's opening as appended and persisted: the message, and what settling the turn needs to
@@ -421,6 +531,7 @@ struct TurnOpening {
 /// The state a turn's rounds share, so the loop and the phases it calls read one thing.
 struct TurnRun {
     session_id: Uuid,
+    turn_id: Uuid,
     cancellation: CancellationToken,
     attribution: crate::provider::Attribution,
     system_prompt: Arc<str>,
@@ -687,8 +798,11 @@ impl Agent {
             images,
             inbox,
             origin,
+            turn_id,
             ..
         } = input;
+        *crate::sync::lock(&self.current_turn) = Some(turn_id);
+        let _turn_scope = TurnScope { agent: self };
         // Gate on MCP readiness BEFORE touching session state / message history so a rejected turn
         // leaves no trace in the conversation.
         self.await_mcp_ready().await?;
@@ -701,7 +815,10 @@ impl Agent {
         let turn_position = self.open_turn_position(origin);
         let attribution = self.turn_attribution(origin, turn_position);
 
-        self.cells.frontend.emit(FrontendEvent::TurnStarted).await;
+        self.cells
+            .frontend
+            .emit(FrontendEvent::TurnStarted { turn_id })
+            .await;
 
         let mut compacted_before_the_loop =
             self.compact_before_the_loop(messages, &cancellation).await;
@@ -712,6 +829,13 @@ impl Agent {
                 images,
                 inbox,
                 outcomes,
+                turn_id,
+                // A worker's turns are opened by its parent, through a spawn or a follow-up.
+                source: if self.role.is_worker() {
+                    "parent"
+                } else {
+                    origin.source()
+                },
             })
             .await?;
         let system_prompt: Arc<str> = match &self.options.system_prompt_override {
@@ -724,6 +848,7 @@ impl Agent {
 
         let mut run = TurnRun {
             session_id,
+            turn_id,
             cancellation,
             attribution,
             system_prompt,
@@ -842,6 +967,8 @@ impl Agent {
             images,
             inbox,
             outcomes,
+            turn_id,
+            source,
         } = materials;
         // The snapshot rolls back with a withdrawn opening; compaction publishes its own snapshot
         // only after saving the replacement context.
@@ -922,8 +1049,23 @@ impl Agent {
         // provider round trip would lose it from disk. On a transient database failure the lazy
         // save path retries; `user_eagerly_saved` suppresses double-writes on the happy path.
         let user_event = crate::conversation::Event::Append(user_message.clone());
-        let user_eagerly_saved = match self
+        // The row every message of this turn names, written ahead of the prompt so the prompt is
+        // the first row to name it. Best-effort like the counters: a row that could not be
+        // written costs the turn its bookkeeping, not its run.
+        if let Err(error) = self
             .store
+            .turn_store()
+            .open_turn(
+                session_id,
+                turn_id,
+                source,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .await
+        {
+            tracing::warn!("failed to record the turn's opening: {error}");
+        }
+        let user_eagerly_saved = match self
             .save_event_marking_inbox(session_id, &user_event, &inbox_ids)
             .await
         {
@@ -1178,7 +1320,7 @@ impl Agent {
                 // Its own write rather than part of the round's, which the exits below never
                 // reach. A failed write leaves the view redacted in memory, so the turn goes on;
                 // the cost is one more redaction after a resume.
-                if let Err(error) = self.store.save_event(session_id, &redaction).await {
+                if let Err(error) = self.save_event(session_id, &redaction).await {
                     tracing::warn!("failed to persist the image redaction: {error}");
                 }
             }
@@ -1198,7 +1340,6 @@ impl Agent {
                 {
                     messages.append(partial.clone());
                     if let Err(error) = self
-                        .store
                         .save_events_atomic(session_id, vec![crate::conversation::Event::Append(
                             partial,
                         )])
@@ -1285,9 +1426,7 @@ impl Agent {
             if !has_tool_calls {
                 // No tool calls: the assistant message stands alone and ends the turn. Save it
                 // before returning so the persistent log includes it.
-                self.store
-                    .save_events_atomic(session_id, round_events)
-                    .await?;
+                self.save_events_atomic(session_id, round_events).await?;
                 return Ok(match stop_reason {
                     StopReason::MaxTokens => TurnOutcome::MaxTokens,
                     StopReason::Refusal(text) if !text.is_empty() => TurnOutcome::Refusal(text),
@@ -1636,8 +1775,7 @@ impl Agent {
         round_events.push(crate::conversation::Event::Append(result_message.clone()));
         let tool_calls = result_message.content.len();
         messages.append(result_message);
-        self.store
-            .save_events_atomic_marking_inbox(session_id, round_events, &steered)
+        self.save_events_atomic_marking_inbox(session_id, round_events, &steered)
             .await
             .map_err(|error| {
                 tracing::warn!(
@@ -1768,6 +1906,7 @@ impl Agent {
     ) {
         let TurnRun {
             session_id,
+            turn_id,
             cancellation,
             recovery,
             turn_usage,
@@ -1796,6 +1935,19 @@ impl Agent {
         {
             tracing::warn!("failed to persist session stats: {error}");
         }
+        // The turn's row closes beside the counters, so a reader that was not watching learns how
+        // it ended and what it spent. Closed for a sub-agent's turn as well: the counter write
+        // skips a sub-agent to keep the parent's totals off the child, and a turn is the child's
+        // own.
+        let usage = crate::store::turns::TurnUsage::from(&turn_usage);
+        let ending = match result {
+            Ok(outcome) => crate::store::turns::TurnEnding::succeeded(outcome.stop_reason(), usage),
+            Err(MekaError::Interrupted) => crate::store::turns::TurnEnding::canceled(usage),
+            Err(error) => crate::store::turns::TurnEnding::failed(error, usage),
+        };
+        if let Err(error) = self.store.turn_store().close_turn(turn_id, &ending).await {
+            tracing::warn!("failed to record the turn's ending: {error}");
+        }
         if result.is_ok() {
             // The usage event doubles as the completed turn's summary (the HTTP blocking response
             // carries it); a failed turn answers with its error, and `/status` reads the stats.
@@ -1805,6 +1957,11 @@ impl Agent {
                 .await;
             self.cells.frontend.emit(FrontendEvent::TurnFinished).await;
         }
+        // Last, since a feed built from it closes on it: nothing the turn says follows.
+        self.cells
+            .frontend
+            .emit(FrontendEvent::TurnEnded { turn_id, ending })
+            .await;
 
         match result {
             // A prompt its caller will produce again is withdrawn when the turn produced nothing
@@ -1830,7 +1987,6 @@ impl Agent {
             Err(MekaError::Interrupted) if !recovery.user_saved => {
                 let user_event = crate::conversation::Event::Append(opening.user_message.clone());
                 if let Err(error) = self
-                    .store
                     .save_event_marking_inbox(session_id, &user_event, &recovery.inbox_ids)
                     .await
                 {
@@ -1851,7 +2007,6 @@ impl Agent {
             {
                 let user_event = crate::conversation::Event::Append(opening.user_message.clone());
                 if let Err(error) = self
-                    .store
                     .save_event_marking_inbox(session_id, &user_event, &recovery.inbox_ids)
                     .await
                 {
@@ -1957,7 +2112,6 @@ impl Agent {
         }
         messages.append(partial.clone());
         if let Err(error) = self
-            .store
             .save_events_atomic(session_id, vec![crate::conversation::Event::Append(
                 partial,
             )])
@@ -2039,16 +2193,15 @@ impl Agent {
                     role: Role::User,
                     content: blocks,
                 };
-                self.store
-                    .save_events_atomic_marking_inbox(
-                        session_id,
-                        vec![
-                            Event::Append(partial.clone()),
-                            Event::Append(arrived.clone()),
-                        ],
-                        &ids,
-                    )
-                    .await?;
+                self.save_events_atomic_marking_inbox(
+                    session_id,
+                    vec![
+                        Event::Append(partial.clone()),
+                        Event::Append(arrived.clone()),
+                    ],
+                    &ids,
+                )
+                .await?;
                 messages.append(partial);
                 messages.append(arrived);
             }
@@ -2063,19 +2216,18 @@ impl Agent {
                     });
                 joined.content.extend(blocks);
                 let prompt_stood_alone = messages.events_len() == recovery.prompt_only_events;
-                self.store
-                    .save_events_atomic_marking_inbox(
-                        session_id,
-                        vec![
-                            Event::Repair {
-                                replaced_count: 1,
-                                messages: Vec::new(),
-                            },
-                            Event::Append(joined.clone()),
-                        ],
-                        &ids,
-                    )
-                    .await?;
+                self.save_events_atomic_marking_inbox(
+                    session_id,
+                    vec![
+                        Event::Repair {
+                            replaced_count: 1,
+                            messages: Vec::new(),
+                        },
+                        Event::Append(joined.clone()),
+                    ],
+                    &ids,
+                )
+                .await?;
                 messages.replace_tail(1, Vec::new());
                 messages.append(joined);
                 if prompt_stood_alone {
@@ -2090,13 +2242,12 @@ impl Agent {
                     role: Role::User,
                     content: blocks,
                 };
-                self.store
-                    .save_events_atomic_marking_inbox(
-                        session_id,
-                        vec![Event::Append(arrived.clone())],
-                        &ids,
-                    )
-                    .await?;
+                self.save_events_atomic_marking_inbox(
+                    session_id,
+                    vec![Event::Append(arrived.clone())],
+                    &ids,
+                )
+                .await?;
                 messages.append(arrived);
             }
         }
@@ -4648,7 +4799,7 @@ mod tests {
             Event::Append(Message::assistant_text("seen")),
         ] {
             store
-                .save_event(session_id, &event)
+                .save_event(session_id, &event, None)
                 .await
                 .expect("seed the conversation");
         }
@@ -5885,7 +6036,7 @@ mod tests {
             Event::Append(Message::assistant_text("seen")),
         ] {
             store
-                .save_event(session_id, &event)
+                .save_event(session_id, &event, None)
                 .await
                 .expect("seed the conversation");
         }

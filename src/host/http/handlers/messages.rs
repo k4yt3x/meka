@@ -7,7 +7,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -61,15 +61,19 @@ pub(crate) struct MessageView {
     /// been read back via `GET /v1/sessions/{id}/messages`, every row has a `created_at`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) created_at: Option<String>,
-    /// Virtual per-conversation turn correlator (`t_001`, `t_002`, …). Derived at query time
-    /// by grouping every user-role message into a new turn that includes the assistant +
-    /// tool-result messages that follow it. `None` on messages from the assembled-response
-    /// path (no turn boundary known yet).
-    ///
-    /// Note: these are dense sequential indexes (`t_0001`, not UUIDs). The UUID-shaped
-    /// `turn_id` on `POST /v1/sessions/{id}/turn` is a different identifier.
+    /// The turn that added this message: the id `turn.started` announced it under and
+    /// `GET /v1/sessions/{id}/turns` lists it by. Omitted on a row no turn added (a compaction
+    /// summary, a repair's replacement).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) turn_id: Option<String>,
+    pub(crate) turn_id: Option<Uuid>,
+    /// Dense positional turn label (`t_0001`, `t_0002`, …), derived at query time. A message
+    /// that opens a turn starts a new label, and the assistant and tool-result messages after it
+    /// share it; what opens a turn is `Message::opens_turn`, the one rule rewind counts by, so a
+    /// tool round's results never read as a turn of their own, and the labels from a chosen one
+    /// to the last are the `turns` a rewind to that point takes. `None` on messages from the
+    /// assembled-response path, which holds one turn and no view to count in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) turn_label: Option<String>,
     /// Present only on a message that *is* a compaction summary.
     ///
     /// Without this a client polling `/messages` watches history rewrite itself: a compaction
@@ -166,7 +170,7 @@ fn blob_hash(source: &crate::image::ImageSource) -> Option<String> {
         MessagesQuery,
     ),
     responses(
-        (status = 200, description = "Page of conversation messages", body = MessagesResponse),
+        (status = 200, description = "Page of conversation messages. The `ETag` header identifies the whole conversation's current state, for `If-Match` on `POST /rewind` and `POST /fork`", body = MessagesResponse),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
@@ -179,7 +183,7 @@ pub(crate) async fn list_messages(
     _scoped: scope::Scoped<scope::SessionsRead>,
     Path(id): Path<Uuid>,
     Query(query): Query<MessagesQuery>,
-) -> Result<Json<MessagesResponse>, ProblemDetail> {
+) -> Result<Response, ProblemDetail> {
     let events_with_ts = state
         .shared
         .store
@@ -207,7 +211,7 @@ pub(crate) async fn list_messages(
     // the wire as it does in the window; a second copy of the rules had already drifted from it.
     let crate::conversation::AnnotatedView {
         messages: materialized,
-        timestamps,
+        stamps,
         markers,
         revision,
     } = crate::conversation::materialize_annotated(&events_with_ts);
@@ -221,40 +225,93 @@ pub(crate) async fn list_messages(
     let turn_indexes = derive_turn_indexes(&materialized);
     let messages = materialized[offset..end]
         .iter()
-        .zip(timestamps[offset..end].iter())
+        .zip(stamps[offset..end].iter())
         .zip(turn_indexes[offset..end].iter())
         .zip(markers[offset..end].iter())
-        .map(|(((message, timestamp), turn_index), marker)| MessageView {
+        .map(|(((message, stamp), turn_label), marker)| MessageView {
             role: match message.role {
                 Role::User => "user".to_string(),
                 Role::Assistant => "assistant".to_string(),
             },
             content: message.content.iter().map(view_for_block).collect(),
-            created_at: Some(timestamp.clone()),
-            turn_id: Some(turn_index.clone()),
+            created_at: Some(stamp.created_at.clone()),
+            turn_id: stamp.turn_id,
+            turn_label: Some(turn_label.clone()),
             compaction: marker.as_ref().map(|marker| CompactionMarker {
                 replaced_count: marker.replaced_count,
                 generation: marker.generation,
             }),
         })
         .collect();
-    Ok(Json(MessagesResponse {
-        session_id: id,
-        messages,
-        total,
-        revision,
-    }))
+    Ok((
+        [(header::ETAG, conversation_etag(revision, total))],
+        Json(MessagesResponse {
+            session_id: id,
+            messages,
+            total,
+            revision,
+        }),
+    )
+        .into_response())
 }
 
-/// Group materialized messages into virtual turns. Every user-role message opens a new turn;
-/// subsequent assistant + tool-result messages belong to that turn. Returns a parallel `Vec`
-/// the same length as `messages` with `t_NNNN` indexes.
+/// The entity tag of a conversation's materialized view: its revision and its length, which
+/// together say whether a client's copy is still the server's. A rewrite moves the first and an
+/// append moves the second, and `revision` alone would let a turn that landed between a read and
+/// an edit go unnoticed.
+pub(crate) fn conversation_etag(revision: u64, total: usize) -> HeaderValue {
+    HeaderValue::from_str(&format!("\"{revision}-{total}\""))
+        .unwrap_or_else(|_| HeaderValue::from_static("\"\""))
+}
+
+/// The `If-Match` precondition on an edit of the conversation: refused with 412 when none of the
+/// tags the client sent is the view's current one, so an edit addressed at the view the client
+/// read never lands on one it has not seen. No header is no precondition. `*` matches any view,
+/// and a weak tag matches none, as RFC 9110 has it for a state-changing request.
+pub(crate) fn check_if_match(
+    headers: &HeaderMap,
+    revision: u64,
+    total: usize,
+    session_id: Uuid,
+) -> Result<(), ProblemDetail> {
+    let mut tags = headers
+        .get_all(header::IF_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .peekable();
+    if tags.peek().is_none() {
+        return Ok(());
+    }
+    let current = conversation_etag(revision, total);
+    let current = current.to_str().unwrap_or_default();
+    if tags.any(|tag| tag == "*" || tag == current) {
+        return Ok(());
+    }
+    Err(ProblemDetail::new(
+        ErrorKind::PreconditionFailed,
+        StatusCode::PRECONDITION_FAILED,
+        format!(
+            "the conversation has changed since it was read; read `GET /v1/sessions/{session_id}/messages` again and retry with its `ETag`"
+        ),
+    )
+    .with("session_id", session_id.to_string())
+    .with("revision", revision)
+    .with("total", total as u64))
+}
+
+/// Group materialized messages into virtual turns. A message that opens a turn starts a new
+/// label; the assistant and tool-result messages after it share it. Returns a parallel `Vec` the
+/// same length as `messages` with `t_NNNN` labels.
 fn derive_turn_indexes(messages: &[Message]) -> Vec<String> {
     let mut counter: u32 = 0;
-    let mut current = String::from("t_0001"); // placeholder for messages before the first user message
+    // A view that begins before its first opener (a tail a repair left standing) is labeled as
+    // the first turn rather than left blank.
+    let mut current = String::from("t_0001");
     let mut ids = Vec::with_capacity(messages.len());
     for message in messages {
-        if matches!(message.role, Role::User) {
+        if message.opens_turn() {
             counter = counter.saturating_add(1);
             current = format!("t_{counter:04}");
         }
@@ -287,20 +344,23 @@ fn view_for_block(block: &ContentBlock) -> ContentBlockView {
         } => ContentBlockView::ToolResult {
             tool_use_id: tool_use_id.clone(),
             is_error: *is_error,
-            content: content
-                .iter()
-                .map(|item| match item {
-                    ToolResultContent::Text { text } => {
-                        ToolResultContentView::Text { text: text.clone() }
-                    }
-                    ToolResultContent::Image { source } => ToolResultContentView::Image {
-                        media_type: source.media_type().to_string(),
-                        hash: blob_hash(source),
-                    },
-                })
-                .collect(),
+            content: tool_result_views(content),
         },
     }
+}
+
+/// A tool result's content as the wire shows it, with an image reduced to its type and hash.
+pub(crate) fn tool_result_views(content: &[ToolResultContent]) -> Vec<ToolResultContentView> {
+    content
+        .iter()
+        .map(|item| match item {
+            ToolResultContent::Text { text } => ToolResultContentView::Text { text: text.clone() },
+            ToolResultContent::Image { source } => ToolResultContentView::Image {
+                media_type: source.media_type().to_string(),
+                hash: blob_hash(source),
+            },
+        })
+        .collect()
 }
 
 /// `GET /v1/sessions/{id}/blobs/{hash}`: the bytes behind an image block, with their media type.
@@ -343,5 +403,72 @@ pub(crate) async fn get_blob(
             format!("session '{id}' has no image blob '{hash}'"),
         )
         .with("session_id", id.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_round() -> (Message, Message) {
+        let call = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "tu_1".to_string(),
+                name: "file_read".to_string(),
+                input: serde_json::json!({ "path": "a.txt" }),
+            }],
+        };
+        let result = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "tu_1".to_string(),
+                content: vec![ToolResultContent::Text {
+                    text: "contents".to_string(),
+                }],
+                is_error: false,
+            }],
+        };
+        (call, result)
+    }
+
+    /// A tool round answers with a user-role message, which continues the turn that asked
+    /// rather than opening one; a task that took one round is still one turn, as rewind counts.
+    #[test]
+    fn a_tool_result_shares_the_label_of_the_turn_that_asked_for_it() {
+        let (call, result) = tool_round();
+        let messages = vec![
+            Message::user("first"),
+            call,
+            result,
+            Message::assistant_text("done"),
+            Message::user("second"),
+        ];
+        assert_eq!(derive_turn_indexes(&messages), [
+            "t_0001", "t_0001", "t_0001", "t_0001", "t_0002"
+        ]);
+    }
+
+    /// No header is no precondition; the current tag passes; a tag from before an append is
+    /// refused with the current state, since `revision` alone would not have moved; a weak tag
+    /// never matches a state-changing request; `*` matches any view.
+    #[test]
+    fn the_precondition_accepts_the_current_tag_and_refuses_a_stale_one() {
+        let mut headers = HeaderMap::new();
+        assert!(check_if_match(&headers, 3, 42, Uuid::nil()).is_ok());
+
+        headers.insert(header::IF_MATCH, conversation_etag(3, 42));
+        assert!(check_if_match(&headers, 3, 42, Uuid::nil()).is_ok());
+        let stale = check_if_match(&headers, 3, 43, Uuid::nil()).expect_err("an append since");
+        assert_eq!(stale.status, 412);
+        assert_eq!(stale.type_uri, ErrorKind::PreconditionFailed.type_uri());
+        assert_eq!(stale.extensions["revision"], 3);
+        assert_eq!(stale.extensions["total"], 43);
+
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("W/\"3-42\""));
+        assert!(check_if_match(&headers, 3, 42, Uuid::nil()).is_err());
+
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("*"));
+        assert!(check_if_match(&headers, 9, 9, Uuid::nil()).is_ok());
     }
 }

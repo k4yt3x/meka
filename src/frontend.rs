@@ -54,6 +54,24 @@ pub(crate) trait Frontend: Send + Sync {
     /// deny semantics.
     async fn request_permission(&self, request: PermissionRequest) -> PermissionOutcome;
 
+    /// The frontend a sub-agent of this one runs under: its prompts and elicitations forwarded
+    /// here, its tool calls rolled into the `agent_spawn` call's activity, everything else
+    /// dropped. A host that can show a sub-agent's own events overrides this with a frontend that
+    /// also publishes them. `this` is the caller's own handle, since a trait object cannot hand
+    /// out an `Arc` to itself.
+    fn for_subagent(
+        &self,
+        this: Arc<dyn Frontend>,
+        child: Uuid,
+        tool_call_id: Option<String>,
+    ) -> Arc<dyn Frontend> {
+        Arc::new(PermissionForwardingFrontend::new(
+            this,
+            tool_call_id,
+            Some(child),
+        ))
+    }
+
     /// Delegate a file read to whatever filesystem the frontend owns (typically the ACP client's
     /// in-buffer view of the file).
     ///
@@ -336,10 +354,18 @@ impl std::error::Error for FrontendError {}
 pub(crate) enum FrontendEvent {
     /// A new session was created. Carries the session UUID.
     SessionStarted { id: Uuid },
-    /// The agent is about to start a turn. Carries no spacing duty: the `[display]` blanks bracket
-    /// the *episode* between two prompts, which is `crate::console`'s to own, and a turn is only
-    /// one of the things an episode may contain.
-    TurnStarted,
+    /// The agent is about to start a turn, under the id its row and every event about it carry.
+    /// Carries no spacing duty: the `[display]` blanks bracket the *episode* between two prompts,
+    /// which is `crate::console`'s to own, and a turn is only one of the things an episode may
+    /// contain.
+    TurnStarted { turn_id: Uuid },
+    /// The turn ended, however it ended, with what its row records. Emitted for every turn that
+    /// began, after `TurnFinished` on a turn that succeeded; a frontend that renders a turn's
+    /// terminal reads it here rather than inferring one.
+    TurnEnded {
+        turn_id: Uuid,
+        ending: crate::store::turns::TurnEnding,
+    },
     /// The agent finished a turn cleanly. The REPL closes any open streaming text block on this, as
     /// a block boundary; the closing blank belongs to the episode, not to the turn.
     TurnFinished,
@@ -550,6 +576,10 @@ pub(crate) struct PermissionRequest {
     /// round-trip against this so a `session/cancel` during an approval prompt resolves promptly
     /// instead of hanging until the client replies.
     pub(crate) cancellation: tokio_util::sync::CancellationToken,
+    /// The sub-agent whose call this is, when the request reaches a frontend through its
+    /// parent's. `None` for the session's own call. Set by the innermost forwarding adapter, so a
+    /// grandchild's prompt names the grandchild.
+    pub(crate) subagent_id: Option<uuid::Uuid>,
 }
 
 /// Outcome of a [`Frontend::request_permission`] call.
@@ -587,6 +617,9 @@ pub(crate) struct PermissionForwardingFrontend {
     /// Rolling record of what the sub-agent has done, oldest first, capped at
     /// [`Self::MAX_ACTIVITY_LINES`].
     activity: std::sync::Mutex<VecDeque<String>>,
+    /// The sub-agent's own session, stamped on each prompt it forwards so the parent's feed can
+    /// say which sub-agent is asking.
+    subagent_id: Option<uuid::Uuid>,
 }
 
 impl PermissionForwardingFrontend {
@@ -594,11 +627,16 @@ impl PermissionForwardingFrontend {
     /// update (ACP replaces content), so this bounds per-update payload as well as height.
     const MAX_ACTIVITY_LINES: usize = 20;
 
-    pub(crate) fn new(delegate: Arc<dyn Frontend>, tool_call_id: Option<String>) -> Self {
+    pub(crate) fn new(
+        delegate: Arc<dyn Frontend>,
+        tool_call_id: Option<String>,
+        subagent_id: Option<uuid::Uuid>,
+    ) -> Self {
         Self {
             delegate,
             tool_call_id,
             activity: std::sync::Mutex::new(VecDeque::new()),
+            subagent_id,
         }
     }
 
@@ -674,7 +712,12 @@ impl Frontend for PermissionForwardingFrontend {
         self.delegate.client_disconnected()
     }
 
-    async fn request_permission(&self, request: PermissionRequest) -> PermissionOutcome {
+    async fn request_permission(&self, mut request: PermissionRequest) -> PermissionOutcome {
+        // Left alone when already set: an outer adapter forwards a grandchild's prompt, and the
+        // grandchild is the one asking.
+        if request.subagent_id.is_none() {
+            request.subagent_id = self.subagent_id;
+        }
         self.delegate.request_permission(request).await
     }
 
@@ -926,7 +969,11 @@ mod tests {
     #[tokio::test]
     async fn silent_frontend_emit_is_no_op_and_does_not_panic() {
         let frontend = SilentFrontend;
-        frontend.emit(FrontendEvent::TurnStarted).await;
+        frontend
+            .emit(FrontendEvent::TurnStarted {
+                turn_id: Uuid::nil(),
+            })
+            .await;
         frontend
             .emit(FrontendEvent::AssistantTextDelta("hello".to_string()))
             .await;
@@ -942,6 +989,7 @@ mod tests {
                 primary_param: Some("/tmp/foo".to_string()),
                 input: serde_json::json!({"path": "/tmp/foo"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
+                subagent_id: None,
             })
             .await;
         assert_eq!(outcome, PermissionOutcome::Deny);
@@ -999,8 +1047,11 @@ mod tests {
     /// blank the parent's view of the sub-agent for the rest of the run.
     #[test]
     fn activity_is_still_recorded_after_the_lock_was_poisoned() {
-        let frontend =
-            PermissionForwardingFrontend::new(Arc::new(SilentFrontend), Some("call-1".to_string()));
+        let frontend = PermissionForwardingFrontend::new(
+            Arc::new(SilentFrontend),
+            Some("call-1".to_string()),
+            None,
+        );
         std::thread::scope(|scope| {
             let poisoner = scope.spawn(|| {
                 let _held = frontend.activity.lock().expect("not yet poisoned");
@@ -1019,14 +1070,18 @@ mod tests {
     #[tokio::test]
     async fn recording_frontend_records_events_in_order() {
         let frontend = RecordingFrontend::new();
-        frontend.emit(FrontendEvent::TurnStarted).await;
+        frontend
+            .emit(FrontendEvent::TurnStarted {
+                turn_id: Uuid::nil(),
+            })
+            .await;
         frontend
             .emit(FrontendEvent::AssistantTextDelta("hi".to_string()))
             .await;
         frontend.emit(FrontendEvent::TurnFinished).await;
         let events = frontend.events();
         assert_eq!(events.len(), 3);
-        assert!(matches!(events[0], FrontendEvent::TurnStarted));
+        assert!(matches!(events[0], FrontendEvent::TurnStarted { .. }));
         assert!(matches!(events[1], FrontendEvent::AssistantTextDelta(ref s) if s == "hi"));
         assert!(matches!(events[2], FrontendEvent::TurnFinished));
     }
@@ -1069,6 +1124,7 @@ mod tests {
                 primary_param: Some("rm -rf /".to_string()),
                 input: serde_json::json!({"command": "rm -rf /"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
+                subagent_id: None,
             })
             .await;
         assert_eq!(outcome, PermissionOutcome::Deny);
@@ -1080,9 +1136,13 @@ mod tests {
         // UI; the sub-agent's report flows back via the agent_spawn tool result instead.
         let recorder = Arc::new(RecordingFrontend::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
-        let forwarder = PermissionForwardingFrontend::new(delegate, None);
+        let forwarder = PermissionForwardingFrontend::new(delegate, None, None);
 
-        forwarder.emit(FrontendEvent::TurnStarted).await;
+        forwarder
+            .emit(FrontendEvent::TurnStarted {
+                turn_id: Uuid::nil(),
+            })
+            .await;
         forwarder
             .emit(FrontendEvent::AssistantTextDelta("ignored".into()))
             .await;
@@ -1097,7 +1157,8 @@ mod tests {
     async fn permission_forwarding_frontend_rolls_up_sub_agent_tool_calls() {
         let recorder = Arc::new(RecordingFrontend::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
-        let forwarder = PermissionForwardingFrontend::new(delegate, Some("toolu_parent".into()));
+        let forwarder =
+            PermissionForwardingFrontend::new(delegate, Some("toolu_parent".into()), None);
 
         for (name, summary) in [
             ("file_read", Some("/etc/hosts".to_string())),
@@ -1136,7 +1197,8 @@ mod tests {
     async fn permission_forwarding_frontend_caps_activity_lines() {
         let recorder = Arc::new(RecordingFrontend::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
-        let forwarder = PermissionForwardingFrontend::new(delegate, Some("toolu_parent".into()));
+        let forwarder =
+            PermissionForwardingFrontend::new(delegate, Some("toolu_parent".into()), None);
 
         let total = PermissionForwardingFrontend::MAX_ACTIVITY_LINES + 5;
         for i in 0..total {
@@ -1176,7 +1238,7 @@ mod tests {
         // rather than sent against a guessed id.
         let recorder = Arc::new(RecordingFrontend::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
-        let forwarder = PermissionForwardingFrontend::new(delegate, None);
+        let forwarder = PermissionForwardingFrontend::new(delegate, None, None);
 
         forwarder
             .emit(FrontendEvent::ToolCallStarted {
@@ -1197,7 +1259,8 @@ mod tests {
         // content would overwrite each other.
         let recorder = Arc::new(RecordingFrontend::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
-        let forwarder = PermissionForwardingFrontend::new(delegate, Some("toolu_parent".into()));
+        let forwarder =
+            PermissionForwardingFrontend::new(delegate, Some("toolu_parent".into()), None);
 
         forwarder
             .emit(FrontendEvent::SubAgentActivity {
@@ -1218,7 +1281,8 @@ mod tests {
     async fn permission_forwarding_frontend_drops_events_keyed_by_sub_agent_call_id() {
         let recorder = Arc::new(RecordingFrontend::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
-        let forwarder = PermissionForwardingFrontend::new(delegate, Some("toolu_parent".into()));
+        let forwarder =
+            PermissionForwardingFrontend::new(delegate, Some("toolu_parent".into()), None);
 
         forwarder
             .emit(FrontendEvent::ToolCallComposing {
@@ -1275,7 +1339,7 @@ mod tests {
     async fn permission_forwarding_frontend_forwards_notice() {
         let recorder = Arc::new(RecordingFrontend::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
-        let forwarder = PermissionForwardingFrontend::new(delegate, None);
+        let forwarder = PermissionForwardingFrontend::new(delegate, None, None);
         forwarder
             .emit(FrontendEvent::Notice(crate::frontend::Notice::info(
                 "redacted 2 images",
@@ -1296,13 +1360,14 @@ mod tests {
     async fn permission_forwarding_frontend_delegates_request_permission() {
         let delegate: Arc<dyn Frontend> =
             Arc::new(RecordingFrontend::with_permission(PermissionOutcome::Allow));
-        let forwarder = PermissionForwardingFrontend::new(delegate, None);
+        let forwarder = PermissionForwardingFrontend::new(delegate, None, None);
         let outcome = forwarder
             .request_permission(PermissionRequest {
                 tool_name: "file_write".into(),
                 primary_param: Some("/tmp/foo".into()),
                 input: serde_json::json!({"path": "/tmp/foo"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
+                subagent_id: None,
             })
             .await;
         assert_eq!(outcome, PermissionOutcome::Allow);
@@ -1383,7 +1448,7 @@ mod tests {
     async fn permission_forwarding_frontend_forwards_fs_read() {
         let recorder = Arc::new(DelegatingRecorder::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
-        let forwarder = PermissionForwardingFrontend::new(delegate, None);
+        let forwarder = PermissionForwardingFrontend::new(delegate, None, None);
         let outcome = forwarder
             .delegate_fs_read(Path::new("/tmp/sub.txt"), None, None)
             .await
@@ -1399,7 +1464,7 @@ mod tests {
     async fn permission_forwarding_frontend_forwards_fs_write() {
         let recorder = Arc::new(DelegatingRecorder::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
-        let forwarder = PermissionForwardingFrontend::new(delegate, None);
+        let forwarder = PermissionForwardingFrontend::new(delegate, None, None);
         forwarder
             .delegate_fs_write(Path::new("/tmp/sub.txt"), "hi from sub-agent")
             .await

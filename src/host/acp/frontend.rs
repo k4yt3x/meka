@@ -536,7 +536,7 @@ impl Frontend for AcpFrontend {
                 }
                 SessionUpdate::UsageUpdate(UsageUpdate::new(used, size))
             }
-            FrontendEvent::TurnStarted => {
+            FrontendEvent::TurnStarted { .. } => {
                 // Tool calls begin and end inside a turn, so anything still open here belongs to a
                 // previous one that never delivered its completion (a canceled turn, or a stream
                 // retried after announcing a tool call). Those entries would otherwise accumulate
@@ -552,6 +552,7 @@ impl Frontend for AcpFrontend {
             // than left to a catch-all so a variant added later has to be placed here on purpose.
             FrontendEvent::SessionStarted { .. }
             | FrontendEvent::TurnFinished
+            | FrontendEvent::TurnEnded { .. }
             | FrontendEvent::PromptWithdrawn
             | FrontendEvent::InboxDelivered { .. } => return,
         };

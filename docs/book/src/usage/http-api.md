@@ -48,7 +48,8 @@ curl -s -X POST http://localhost:8080/v1/sessions \
 curl -s -X POST http://localhost:8080/v1/sessions/550e8400-e29b-41d4-a716-446655440000/turn \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"message": "list the files in src/"}' | jq .final_text
+  -d '{"message": "list the files in src/"}' \
+  | jq -r '[.messages[] | select(.role == "assistant") | .content[] | select(.type == "text") | .text] | join("")'
 # → "Here are the files in src/: ..."
 ```
 
@@ -116,8 +117,15 @@ POST   /v1/sessions/{id}/fork Branch a copy off a session
 `GET /v1/sessions` is paginated. `limit` is how many to return (default 50, clamped to 1..200).
 Pinned sessions come first, newest pin on top, then the rest most recently updated first. When
 more remain, the response carries `next_cursor`; pass it back as `cursor` for the next page.
-`include_children=true` lists sub-agent sessions too, and `cwd=<path>` keeps only the sessions in
-that working directory, compared in the canonical spelling every session records.
+`include_children=true` lists sub-agent sessions too, `cwd=<path>` keeps only the sessions in
+that working directory, compared in the canonical spelling every session records, and
+`parent=<id>` lists one session's direct children: the sub-agents it spawned, which is what a
+tree view asks for per expanded node, and what an audit asks to learn what a session dispatched.
+`parent` names sub-agents by definition, so `include_children` is moot beside it; a session with
+none, or an id no session has, is an empty page. `profile=<name>` keeps the sessions on one
+profile, `pinned=true` or `pinned=false` the pinned or the unpinned ones, and
+`updated_since=<RFC 3339>` the ones whose `updated_at` is after that instant: a turn or a change
+to what the session runs as, never a title or a pin. The filters compose.
 
 When creating a session, specify the working directory and optionally a permission level, the
 approvals switch, a profile, and capabilities:
@@ -151,26 +159,47 @@ Create, get, list, fork and `PATCH` all answer with the same session record:
   "approvals": false,
   "profile": "work",
   "title": "list the files in src/",
-  "last_turn_at": "2026-05-26T13:47:01Z",
+  "last_turn": {
+    "id": "7f3b...", "source": "client", "started_at": "2026-05-26T13:46:40Z",
+    "ended_at": "2026-05-26T13:47:01Z", "status": "succeeded", "stop_reason": "end_turn",
+    "usage": {"input_tokens": 12340, "output_tokens": 567, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 8000}
+  },
   "capabilities": {"supports_reasoning_stream": false, "supports_permission_prompts": true},
-  "turn_in_flight": false
+  "turn_in_flight": false,
+  "approvals_pending": 0
 }
 ```
 
 `created_at` is when the row was made; `updated_at` moves on a turn and on any change to what the
 session runs as (`permission`, `approvals`, `cwd`, `profile`), a `PATCH` included, but not on a
-title or a pin; `last_turn_at` is the last successful turn, and `title` is the title a client set,
-else the first user message's words, whitespace collapsed and cut to 80 characters. A pinned
-session also carries `pinned_at`.
+title or a pin; `title` is the title a client set, else the first user message's words, whitespace
+collapsed and cut to 80 characters. A pinned session also carries `pinned_at`.
+
+`last_turn` is the session's latest turn, whatever host ran it: the same record [`GET
+/v1/sessions/{id}/turns`](#turns) lists, carried here because a list of sessions is rendered from
+it, one row per session. `id` is the turn's id, the one `turn.started` announced it under and every
+message it added names; `source` is who opened it (`client`, `inbox`, `schedule`, `background`, or
+`parent` for a sub-agent's turn); `started_at` is when. Once the turn has ended, `ended_at` says
+when and `status` how: `succeeded`, with its `stop_reason` (`end_turn`, `max_tokens` or `refusal`),
+`failed`, with an `error` carrying the same `type` and `detail` a Problem Detail would (never the
+provider's own text), or `canceled`; and `usage` is what every round of it spent. A turn that began
+and shows no `ended_at` is either in flight, which `turn_in_flight` says, or one the process died
+under. Whether a turn is running now is a live fact of the process that no row stores. Together they
+answer the one question a session list asks: running, waiting on a person (`approvals_pending` above
+zero), or stopped and how. A turn refused before it began, by a `4xx` or the `503` for a required
+MCP server, added nothing and leaves `last_turn` alone. The checkpoint turn `POST /compact` runs is
+announced on the feed under a `turn_id` of its own, for the events it emits, but is not a turn of
+the conversation: it has no row and no message names it.
 
 On every response and event this API sends, a field that has no value is omitted rather than sent
-as `null`. On a session that means `last_turn_at` until a turn has run (and always on a session
-this server has evicted), `cwd` when the row recorded none, `permission` when the session is not
-loaded and its row records no level, and `parent_id`, which only a sub-agent's session carries. The
-same rule gives a turn its `refusal_text` only on a refusal and a tool call its `display_summary`
-only when the tool has a label. It is also why `meka session show --format json` prints the same
-object for the same record: the row's fields are one shape shared by both surfaces, and
-`last_turn_at`, `capabilities` and `turn_in_flight` are what the server adds to it.
+as `null`. On a session that means `last_turn` until a turn has begun, `approvals_pending` on a
+session this server does not hold, `cwd` when the row recorded none, `permission` when the session
+is not loaded and its row records no level, and `parent_id`, which only a sub-agent's session
+carries. The same rule gives a turn its `refusal_text` only on a refusal and a tool call its
+`display_summary` only when the tool has a label. It is also why `meka session show --format json`
+prints the same object for the same record: the row's fields are one shape shared by both
+surfaces, and `capabilities`, `turn_in_flight` and `approvals_pending` are what the server adds to
+it.
 
 `profile` names a profile in the server's `config.toml`; `GET /v1/profiles` lists them, and a name
 that is not configured is a `422` whose `detail` reads `no profile named 'x' (configured: a, b)`.
@@ -248,7 +277,11 @@ process holds answers `409` `session-locked`. Either copy would have ended on a 
 answered.
 
 The body is optional and inherits everything by default. The only field is `cwd`, matching ACP's
-`session/fork`, which likewise carries a workspace but no permission or capability fields:
+`session/fork`, which likewise carries a workspace but no permission or capability fields. An
+`If-Match` header holding the `ETag` of `GET /v1/sessions/{id}/messages` makes the copy
+conditional on the source being as it was read; see [Detecting a rewritten
+history](#detecting-a-rewritten-history). Branching from a point is a fork under `If-Match`
+followed by a rewind of the copy, which nothing else can run a turn on in between:
 
 ```json
 { "cwd": "/home/user/other-project" }
@@ -272,6 +305,14 @@ and `PATCH /v1/sessions/{id}`. A sub-agent
 runs under the tools, permission ceiling and profile its spawn call set, which live in its
 spawn record and which only its parent can reconstruct, so the conversation is continued with the
 `agent_followup` tool from the parent rather than over HTTP.
+
+A sub-agent is never a session this server holds: its parent runs it under the parent's runtime.
+Its record still says when it is in a turn, because the parent's run registers it for exactly as
+long as it runs, so `turn_in_flight` on a sub-agent's record and in a listing is true while a
+spawn or a follow-up is running it; `last_turn` on its row says how its last run ended. While it
+runs, its id names its own event feed, which is read rather than attended; see
+[A sub-agent's feed](#a-sub-agents-feed). A prompt a sub-agent's call parks rides the parent's
+feed, with the sub-agent named, and the sub-agent's feed mirrors it; see [Approvals](#approvals).
 
 Two exceptions, both of which change a transcript without running anything on it. Teardown stays
 open: `DELETE /v1/sessions/{id}` discards a sub-agent and `DELETE /v1/sessions/{id}/tasks/{task_id}`
@@ -335,13 +376,19 @@ never see the response body. Read the reply from `GET /v1/sessions/{id}/messages
 client timeout shorter than your longest turn is safe, and why retrying on one duplicates work
 rather than recovering it.
 
+`turn_in_flight` answers for this process: a session it holds, and a sub-agent it is running under
+a parent. A session another process is running, a REPL open on it say, reads as idle, because only
+that session's file lock knows and a read never probes the lock. Once a turn has ended, however it
+ended, `last_turn` on the record says how.
+
 ### Turns
 
-A turn is one round-trip: you send a user message, the agent processes it (potentially calling tools in a loop), and returns a result. Turns are ephemeral: they're not stored as their own resource, but the messages they produce are persisted in the session's conversation history.
+A turn is one round-trip: you send a user message, the agent processes it (potentially calling tools in a loop), and returns a result. Every turn that began is a row: `GET /v1/sessions/{id}/turns` lists them, newest first, each with its `id`, `source`, when it began and ended, how it ended and what it spent, in the shape `last_turn` on the session record shows for the latest one. `limit` is how many at most (default 50, clamped to 1..200), and when more remain the response carries `next_before`, the id to pass back as `before` for the page of turns older than it. Every message a turn added names it in `turn_id`, which is also the id its `turn.started` announced.
 
 ```
 POST   /v1/sessions/{id}/turn     Submit a turn
 POST   /v1/sessions/{id}/cancel   Cancel an in-flight turn
+GET    /v1/sessions/{id}/turns    The turns that began, newest first
 ```
 
 **One turn at a time per session.** A second `POST /turn` while another is running returns `409 Conflict`. Across sessions, turns run fully concurrently. A client that would rather hand the message over and be told when the model read it uses the [inbox](#the-inbox) instead of waiting for the session to be free.
@@ -407,8 +454,8 @@ curl -s -X POST http://localhost:8080/v1/sessions/$SESSION_ID/turn \
 - **Requires vision.** Attaching an image to a session whose profile has `vision = false` returns
   `422`. The check is per session, from the profile that session recorded, so a session created with
   `profile` or moved by a `PATCH` follows that profile rather than the server default. `vision` on
-  [`GET /v1/info`](#discovery-endpoints) reports the process default profile's flag, which answers
-  for a session created without naming one.
+  each entry of [`GET /v1/profiles`](#discovery-endpoints) is the flag to read, for whichever
+  profile the session runs on.
 - **`media_type` is a hint.** If it doesn't name a supported format, the payload's magic bytes are
   used instead, so `application/octet-stream` still works for a real image.
 - **Formats.** PNG, JPEG, GIF, WebP, and BMP pass through; TIFF, ICO, HDR, EXR, TGA, PNM, QOI, DDS,
@@ -430,6 +477,23 @@ Two signals cover this:
 
 `total` alone is not enough: a shrinking `total` is indistinguishable from the server losing your conversation.
 
+Three more things make editing the history safe:
+
+- **`ETag` and `If-Match`.** `GET /messages` answers with an `ETag` built from `revision` and
+  `total`, which together identify the view you read: a rewrite moves the first and an append
+  moves the second, and `revision` alone would let a turn that landed between your read and your
+  edit go unnoticed. Send it back as `If-Match` on `POST /rewind` or `POST /fork`, and an edit
+  decided on a view that has since changed is refused with `412`
+  `/errors/precondition-failed`, whose `revision` and `total` are the current state; read again
+  and decide again. Without the header the call behaves as it always has. A rewind answers with
+  the conversation's new `ETag`, so the next edit needs no re-read.
+- **`conversation.rewound`** on the [session feed](#the-session-feed), with the new `revision`,
+  the new `total` and `turns_removed`, so every reader learns the view was rewritten, with the
+  tag its next edit needs. It is emitted outside any turn and carries no `turn_id`.
+- **`revision` on every terminal event.** A repair, a redaction or a withdrawal rewrites the view
+  inside a turn and has no event of its own; the terminal, where a client already decides what
+  to re-fetch, carries the revision as it stands when the turn ends.
+
 Note that neither `GET /context` nor `GET /v1/sessions/{id}/tools` will load an evicted session. Reading is not permitted to take the session's cross-process lock, which a write would hold for `idle_timeout`. `/context` answers from the store with the live counters omitted; `/tools` returns 409, since a catalog needs a loaded session.
 
 ### Messages
@@ -440,9 +504,16 @@ Read the conversation history for a session:
 GET /v1/sessions/{id}/messages?offset=0&limit=50
 ```
 
-Returns `messages` with role, content blocks, timestamps and turn correlation ids, beside `total`
-(the length of the whole conversation, not the page) and `revision`. `limit` defaults to 200 and is
-capped at 1000; `offset` defaults to 0.
+Returns `messages` with role, content blocks, timestamps and turn labels, beside `total` (the
+length of the whole conversation, not the page) and `revision`, under an `ETag` header that
+identifies the whole conversation's current state. `limit` defaults to 200 and is capped at 1000;
+`offset` defaults to 0. A message's `turn_id` is the id of the turn that added it, as
+`turn.started` announced it and `GET /v1/sessions/{id}/turns` lists it; it is omitted on a row no
+turn added (a compaction summary, a repair's replacement) and on one written before turns were
+recorded. `turn_label` is a dense positional label (`t_0001`, `t_0002`, …): a message that opens a
+turn, a user message carrying no tool result, starts a new label, and the assistant and
+tool-result messages after it share it, which is also how `POST /rewind` counts turns. The number
+of labels from a chosen one to the last is the `turns` a rewind to that point takes.
 
 A user message carries what the user typed as a `text` block. Ahead of it, when meka added one,
 sits a `turn_context` block: the permission and environment context, todo list, catalog changes,
@@ -474,7 +545,11 @@ memories the checkpoint turn wrote.
 |-------|------|---------|-------------|
 | `turns` | integer | `1` | How many trailing turns to drop. At least 1, and no more than the conversation holds, or the request is a `422` |
 
-The response carries `turns_removed`, `messages_before` and `messages_after`.
+An `If-Match` header holding the `ETag` of `GET /v1/sessions/{id}/messages` makes the rewind
+conditional on the conversation being as it was read, and a `412` says it is not; see [Detecting
+a rewritten history](#detecting-a-rewritten-history). The response carries `turns_removed`,
+`messages_before` and `messages_after`, under the conversation's new `ETag`, and the feed carries
+`conversation.rewound`.
 
 `GET /v1/sessions/{id}/export?format=` returns the transcript: `markdown` (the default) as
 `text/markdown`, or `json` as the archive `POST /v1/sessions/import` and `meka session import`
@@ -489,21 +564,24 @@ With `stream: false` (the default), the server holds the connection until the tu
   "turn_id": "t_01J...",
   "session_id": "s_01J...",
   "stop_reason": "end_turn",
-  "final_text": "Here are the files in src/: ...",
   "messages": [
     {
       "role": "assistant",
-      "content": [{"type": "text", "text": "..."}]
-    }
-  ],
-  "tool_calls": [
+      "content": [
+        {"type": "text", "text": "Let me look."},
+        {"type": "tool_use", "id": "tu_1", "name": "file_read", "input": {"path": "src/main.rs"}}
+      ]
+    },
     {
-      "id": "tu_1",
-      "name": "file_read",
-      "input": {"path": "src/main.rs"},
-      "display_summary": "src/main.rs",
-      "is_error": false,
-      "content": [{"type": "text", "text": "..."}]
+      "role": "user",
+      "content": [
+        {"type": "tool_result", "tool_use_id": "tu_1", "is_error": false,
+         "content": [{"type": "text", "text": "fn main() { ... }"}]}
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [{"type": "text", "text": "Here are the files in src/: ..."}]
     }
   ],
   "usage": {
@@ -518,9 +596,11 @@ With `stream: false` (the default), the server holds the connection until the tu
 
 Key fields:
 
-- **`final_text`**: concatenated assistant text. This is what most bots display to the user.
-- **`messages`**: structured message array for clients that want richer rendering.
-- **`tool_calls`**: every tool the agent called during the turn, with inputs and outputs.
+- **`messages`**: the messages this turn added to the conversation, in order and in the shape
+  `GET /v1/sessions/{id}/messages` reads them back: the assistant's messages with their text, their
+  thinking when the session streams reasoning, and their tool calls, and the tool-result messages
+  that answered those calls. The user's own message is not repeated. The reply a bot shows is the
+  text blocks of the assistant messages, joined.
 - **`stop_reason`**: `end_turn`, `max_tokens`, or `refusal`.
 - **`notices`**: provider advisories and warnings about approvals refused without asking.
 - **`refusal_text`**: present only when `stop_reason` is `"refusal"`.
@@ -535,12 +615,12 @@ Every resident session has one event feed. Everything a turn emits goes on it, w
 
 | Event | Payload | When |
 |-------|---------|------|
-| `turn.started` | `turn_id`, `session_id`, `started_at`, `source` (`"client"`, `"inbox"` with `item_ids`, `"schedule"` with `job_id`, `"background"`, or `"compaction"` for the checkpoint turn `POST /compact` runs) | Turn begins |
-| `turn.finished` | `turn_id`, `session_id`, `stop_reason`, `usage`, optional `refusal_text` | Turn completed successfully |
-| `turn.failed` | `turn_id`, `session_id`, `error` (Problem Detail shape), `message_withdrawn` when the turn began | Turn failed mid-stream |
-| `turn.canceled` | `turn_id`, `session_id`, `reason` (`"client"`, `"server_shutdown"`, or `"sse_lag"` when the only consumer fell behind and the turn was stopped for it), `message_withdrawn` when the turn began | Turn was canceled |
+| `turn.started` | `turn_id`, `session_id`, `started_at`, `source` (`"client"`, `"inbox"` with `item_ids`, `"schedule"` with `job_id`, `"background"`, `"compaction"` for the checkpoint turn `POST /compact` runs, or `"parent"` with `parent_id` and `tool_call_id` on a sub-agent's feed) | Turn begins |
+| `turn.finished` | `turn_id`, `session_id`, `stop_reason`, `usage`, `revision`, optional `refusal_text` | Turn completed successfully |
+| `turn.failed` | `turn_id`, `session_id`, `error` (Problem Detail shape), `revision`, `message_withdrawn` when the turn began | Turn failed mid-stream |
+| `turn.canceled` | `turn_id`, `session_id`, `reason` (`"client"`, `"server_shutdown"`, `"sse_lag"` when the only consumer fell behind and the turn was stopped for it, or `"parent"` on a sub-agent's feed, whose turn stops with its parent's), `revision`, `message_withdrawn` when the turn began | Turn was canceled |
 
-`turn.finished`, `turn.failed`, and `turn.canceled` are **terminal** for the turn: a `POST /turn` stream closes immediately after its own, and the feed carries on to the next turn. `turn.failed` and `turn.canceled` also carry `message_withdrawn` when the turn began, whether it took the message it was sent back out of the conversation; see [Resending a failed turn](#resending-a-failed-turn).
+`turn.finished`, `turn.failed`, and `turn.canceled` are **terminal** for the turn: a `POST /turn` stream closes immediately after its own, and the feed carries on to the next turn. `turn.failed` and `turn.canceled` also carry `message_withdrawn` when the turn began, whether it took the message it was sent back out of the conversation; see [Resending a failed turn](#resending-a-failed-turn). All three carry `revision`, the conversation's revision as the turn ends, omitted only when the store could not say, and on [a sub-agent's feed](#a-sub-agents-feed), whose transcript is not the one the precondition guards; see [Detecting a rewritten history](#detecting-a-rewritten-history).
 
 #### Inbox
 
@@ -570,11 +650,10 @@ Reasoning streams in chunks, one event per chunk, the way `assistant_text.delta`
 | `tool_call.completed` | `id`, `is_error`, `content` | Tool call finishes |
 | `progress` | `server_name`, `tool_name`, `tool_use_id`, `progress`, `total`, `message` | An MCP tool reported progress while running |
 | `tool_call.output_delta` | `id`, `chunk` | A running `shell_execute` produced output; append `chunk` to what you show for the call |
-| `subagent.activity` | `id`, `summary` | A sub-agent under the `agent_spawn` call `id` started a tool call; `summary` is its rolling activity block and replaces the previous one |
 
 `progress` relays an MCP server's `notifications/progress` for a call that is still running: `progress` is the server's counter, `total` its target when it gave one, `message` its text, and `tool_use_id` the `tool_call.executing` the update belongs to. The three optional fields are omitted when the server did not send them. Only MCP tools report progress; a built-in's next sign of life is its `tool_call.completed`, except `shell_execute`, whose output streams as `tool_call.output_delta`.
 
-`tool_call.output_delta` and `subagent.activity` are progress rather than history, and the feed treats them so: they carry no `id`, are never replayed after a reconnect, and never displace the events a `Last-Event-ID` resumption depends on. Command output is coalesced to about one event per 150 ms per call, whatever is left is flushed just ahead of the call's `tool_call.completed`, and that event still carries the whole output. The activity block holds the sub-agent's last 20 tool calls. A command run with `background: true` is not streamed: its call returns at once with a task id, and its output arrives with the task's outcome.
+`tool_call.output_delta` is progress rather than history, and the feed treats it so: it carries no `id`, is never replayed after a reconnect, and never displaces the events a `Last-Event-ID` resumption depends on. Command output is coalesced to about one event per 150 ms per call, whatever is left is flushed just ahead of the call's `tool_call.completed`, and that event still carries the whole output. A command run with `background: true` is not streamed: its call returns at once with a task id, and its output arrives with the task's outcome. What a sub-agent under an `agent_spawn` call is doing is not summarized on the parent's feed: it is [the sub-agent's own feed](#a-sub-agents-feed), every call in full.
 
 The arguments are written between `tool_call.composing` and `tool_call.executing` on the same `id`, which makes that interval the only thing on the stream that separates the agent *writing a message* from the agent doing anything else. Assistant text is usually narration around a call rather than the reply itself, and by `tool_call.executing` the arguments are already finished. A client drawing a typing indicator for a tool like an MCP `send_message` raises it on the first and drops it on the second. The payload is the id and the name because nothing else has streamed yet: which conversation a message is for is not known until `tool_call.executing`.
 
@@ -585,13 +664,15 @@ Three limits. The event exists only when meka streams from its provider, so a se
 | Event | Payload | When |
 |-------|---------|------|
 | `notice` | `level`, `text` | Provider advisories or warnings |
-| `permission_required` | `request_id`, `tool_name`, `input`, `expires_in_seconds` | Permission approval needed (approvals on, call above the level) |
+| `permission_required` | `request_id`, `tool_name`, `input`, `expires_in_seconds`, `expires_at`, `subagent_id` when a sub-agent asked | Permission approval needed (approvals on, call above the level) |
+| `permission_resolved` | `request_id`, `outcome` (`allow`, `deny`, `allow_always`, `deny_always`, `expired` or `canceled`) | The parked prompt closed, however it closed |
 
 #### Context
 
 | Event | Payload | When |
 |-------|---------|------|
 | `context.compacted` | `source`, `replaced_count`, `generation` | The conversation was summarized and the window replaced |
+| `conversation.rewound` | `revision`, `total`, `turns_removed` | `POST /rewind` removed turns; emitted outside any turn, so it carries no `turn_id` |
 
 `context.compacted` is the one event on this stream that is not additive. Everything else appends, so a client that misses one still holds a prefix of the truth; a compaction *removes* messages the client has already rendered. `source` is `checkpoint` or `summarizer` (they differ in fidelity, not just mechanism), `replaced_count` is how many messages the boundary removed from the view (the whole pre-compaction window, including the tail compaction re-appends verbatim), and `generation` counts compactions from 1.
 
@@ -634,7 +715,56 @@ Three limits, all deliberate:
 - **Only the most recent turn's terminal is retained** past the ring. Everything else a late client needs is in `GET /messages`.
 - **A turn opened by `POST /turn` with `stream: true` is not canceled immediately when its client disconnects.** It keeps running for `[serve] stream_reattach_grace` (default 30s) waiting for the client to come back; after that the agent loop stops, since nobody is listening. Set `"0s"` to restore the older behavior where a dropped stream cancels the turn at once. The rule is only for turns a streaming client opened: a turn the server started for a fire, an outcome or an inbox item runs for the session and is never stopped for want of a reader.
 
-A session with a live feed subscriber is not idle, so the [idle sweep](#idle-timeout-and-gc) leaves it resident. Opening the feed loads the session if it was not, exactly as submitting a turn does, so a `sessions:r` token can bring one into memory and keep it there, and the route answers `409` `session-locked` and `422` `session-not-drivable` where `POST /turn` would.
+A session with a live feed subscriber is not idle, so the [idle sweep](#idle-timeout-and-gc) leaves it resident. Opening the feed loads the session if it was not, exactly as submitting a turn does, so a `sessions:r` token can bring one into memory and keep it there, and the route answers `409` `session-locked` where `POST /turn` would. A sub-agent's id is the one id the route never loads: it is the sub-agent's own feed while its parent runs it, below.
+
+### A sub-agent's feed
+
+`GET /v1/sessions/{id}/stream` on the id of a sub-agent this process is running is that
+sub-agent's feed: the same events a session feed carries, every one of its tool calls in full,
+with its own ids, ring and `Last-Event-ID`. The feed exists for exactly as long as the parent's
+spawn or follow-up runs the sub-agent, the span its record reports `turn_in_flight`; a client
+that sees a sub-agent in flight, on a listing or from a `session.updated` on
+[the server feed](#the-server-feed), opens the feed with the same call it uses for any session.
+It opens with a `turn.started` whose `source` is `"parent"`, with the parent's `parent_id` and
+the `tool_call_id` of the `agent_spawn` or `agent_followup` call running it, and closes with the
+terminal, which carries no `revision`. A sub-agent's turn ends when its parent's does: a parent
+canceled by a client, or stopped with the server, ends the sub-agent's with `turn.canceled`
+and `reason: "parent"`.
+
+The feed is read, never attended: a prompt a sub-agent's call parks is on its parent's feed,
+where the one answerer is, and is answered on the parent's `responses` route. The sub-agent's
+feed mirrors the `permission_required` and the `permission_resolved`, with `subagent_id`, so a
+client watching the sub-agent sees it waiting and knows where to answer. `?attend=true` on a
+sub-agent's feed is refused with `422` `session-not-drivable`.
+
+Once the run ends the feed is gone, and the route answers `409` `subagent-not-running`, naming
+the parent whose run it belongs to. What the sub-agent did is in its history, `GET /messages` and
+`GET /turns` on its own id, and `last_turn` on its record says how the run ended. A sub-agent a
+different process runs, a REPL on the same store say, has no feed here: the same limit
+`turn_in_flight` has.
+
+### The server feed
+
+`GET /v1/stream` is the listing's change feed: one connection, across every session this
+process holds, carrying exactly the events that change a session record and nothing a session
+feed is for. A client keeping a list of sessions keeps it current from this and opens a session's
+own feed only for the one it is looking at. It needs `sessions:r`, numbers its events on its own,
+and replays from `Last-Event-ID` (or `?last_event_id=`) out of a ring of its own, with the same
+`notice` when the ring no longer reaches back far enough.
+
+| Event | Payload | When |
+|-------|---------|------|
+| `session.created` | the session record, as `GET /v1/sessions/{id}` answers | A session was created, forked, imported, or spawned as a sub-agent by this process |
+| `session.updated` | the session record | A `PATCH` changed it, or a sub-agent's run on it began or ended |
+| `session.deleted` | `id`, `session_id` | A `DELETE`, or the idle sweep with `delete_on_idle` |
+| `turn.started`, `turn.finished`, `turn.failed`, `turn.canceled` | as on the session feed | Every turn on every session this process holds, deltas left out; a sub-agent's run reaches this feed as the `session.updated` on its record |
+| `permission_required`, `permission_resolved` | as on the session feed | A prompt was parked or closed, which moves `approvals_pending` |
+
+A `session.updated` carries the whole record so a client replaces its row rather than patching
+it. The same `session.updated` goes to the session's own feed, so a client on one session also
+learns its title or profile moved under it. The feed sees this process's changes only: a session
+another process renamed or deleted, a REPL open on the same store say, is not announced, the
+same limit `turn_in_flight` has.
 
 ## Webhooks
 
@@ -732,7 +862,9 @@ Possible outcomes:
 | `allow_always` | Allow this and all future calls to this tool (session-scoped) |
 | `deny_always` | Deny this and all future calls to this tool (session-scoped) |
 
-`input` is every argument the call was made with, and a prompt should show it: `tool_name` alone asks you to approve a write without showing what is written. If no response arrives within 30 minutes the request is denied; `expires_in_seconds` on the event carries that figure, and it is the same backstop an ACP client's prompt gets. When the last client that could answer disconnects, the request is canceled at once rather than left to that timeout. An approved call still runs at the session's level: approval never widens reach, so an approved write at `read` lands only under the session's `cwd`.
+`input` is every argument the call was made with, and a prompt should show it: `tool_name` alone asks you to approve a write without showing what is written. If no response arrives within 30 minutes the request is denied; `expires_in_seconds` on the event carries that figure, counted from when the prompt was parked, and `expires_at` carries the deadline itself, which is the one to show when the event reached you from the replay ring minutes after it was parked. It is the same backstop an ACP client's prompt gets. When the last client that could answer disconnects, the prompt waits out [`[serve] stream_reattach_grace`](../configuration/config-file.md#servestream_reattach_grace), the window a streaming turn already gives its reader, and is canceled only if nobody is attending by then: a browser tab reloading or waking from suspension finds its prompt still parked, and a closed one costs the call after the window rather than at once. An approved call still runs at the session's level: approval never widens reach, so an approved write at `read` lands only under the session's `cwd`.
+
+However a prompt closes, answered by you or another client, expired, or canceled because the turn ended or nobody was left to answer, the feed says so with `permission_resolved`, carrying the `request_id` and the `outcome`, so a second client showing the same prompt can take it down rather than learn of it from a `404`. While a prompt is parked, the session record counts it in `approvals_pending`, on the listing too, which is how a list of sessions says which ones are waiting on a person; the prompts themselves are on the feed, which hands every one still parked to a client that joins. A call a sub-agent makes is asked through its parent's feed and answered on the parent's `responses` route; the event names the sub-agent in `subagent_id`.
 
 ### Approvals with blocking turns
 
@@ -801,9 +933,9 @@ Token comparison uses constant-time equality to prevent timing side-channel atta
 A web application served from another origin, a static site or a development server, calls the API directly from the browser once [`[serve].cors_allowed_origins`](../configuration/config-file.md#servecors_allowed_origins) lists its origin, or `*`. The reference page covers the setting; this is what the grant covers.
 
 - **Preflights need no token.** The browser's `OPTIONS` request is answered ahead of authentication and runs nothing: it loads no session, takes no lock and enqueues nothing. The real request that follows needs the same bearer token and scopes as ever.
-- **Request headers.** `Authorization`, `Content-Type`, `Idempotency-Key` and `Last-Event-ID` are granted by name, on top of the headers a browser may always send. `Authorization` has to be named because a wildcard grant never covers it.
+- **Request headers.** `Authorization`, `Content-Type`, `Idempotency-Key`, `If-Match` and `Last-Event-ID` are granted by name, on top of the headers a browser may always send. `Authorization` has to be named because a wildcard grant never covers it.
 - **Methods.** `GET`, `HEAD`, `POST`, `PUT`, `PATCH` and `DELETE`. A method a route does not implement is still a `405`.
-- **Response headers.** `Retry-After` and `WWW-Authenticate` are exposed to page script. Errors carry the grant like successes do, so a `401`, a `403`, a `413` or a `429` is a Problem Detail the page can read rather than an opaque failure.
+- **Response headers.** `ETag`, `Retry-After` and `WWW-Authenticate` are exposed to page script. Errors carry the grant like successes do, so a `401`, a `403`, a `413` or a `429` is a Problem Detail the page can read rather than an opaque failure.
 - **No cookies.** `Access-Control-Allow-Credentials` is never sent. Send the bearer header on every request and use `credentials: "omit"`.
 - **Streams.** The feed and a streaming turn are granted like any other response and are not buffered. A native `EventSource` cannot send a header, so read SSE with `fetch` and a streaming parser, and send `Last-Event-ID` yourself on a reconnect. Fetch an image or an export the same way and hand the bytes to an object URL.
 
@@ -842,12 +974,12 @@ Idempotency keys are **ignored for streaming responses**; streaming clients shou
 | `POST /cancel`, `DELETE /v1/sessions/{id}`, `DELETE /v1/sessions/{id}/tasks/{task_id}`, `DELETE /v1/sessions/{id}/inbox/{item_id}` | yes | already-done is the same state; a withdrawn item answers **404** on the retry |
 | `DELETE /v1/skills/{name}`, `/v1/memory/{name}`, `/v1/schedule/{job_id}` | yes, but | the resource is gone, so the retry answers **404**. Expected, not a failure; treat it as success if you are retrying blind |
 | `PUT /v1/skills/{name}`, `PUT /v1/memory/{name}` | yes | same body writes the same skill file or memory row |
-| `POST /compact` | mostly | a second compaction summarizes the summary; fidelity drops, nothing is lost |
-| `POST /rewind` | **no** | drops another turn. A client that retries on a connection error loses conversation |
+| `POST /compact` | mostly | a second compaction summarizes the summary; fidelity drops, nothing is lost. It takes no `If-Match`, since it addresses no position in the history and a stale view costs a retry nothing it cannot undo |
+| `POST /rewind` | with `If-Match` | drops another turn without it. Under the `ETag` the first attempt was decided on, a retry after the first went through is refused with `412` |
 | `POST /sessions/import` | **no** | creates a second copy of the tree under new ids |
 | `POST /sessions/{id}/schedule` | **no** | creates a second job |
 
-The three marked **no** are administrative operations meant to be driven deliberately. If your HTTP stack retries failed POSTs by default, exclude them, or check the outcome first: `POST /rewind` returns `messages_before` and `messages_after`, and `GET /messages` returns a `revision` that increments on every rewrite.
+The two marked **no** are administrative operations meant to be driven deliberately. If your HTTP stack retries failed POSTs by default, exclude them, or check the outcome first: `GET /messages` returns a `revision` that increments on every rewrite, and its `ETag` is what makes a rewind retry-safe.
 
 ## Error handling
 
@@ -893,10 +1025,12 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/turn-mismatch` | 409 | `POST /cancel` named a turn that is not the one in flight; the `turn_id` member names the one that is. Nothing was canceled |
 | `/errors/inbox-appended` | 409 | The inbox item is already in the conversation, so only a turn can answer it now; nothing to withdraw |
 | `/errors/store-read-only` | 409 | The skill lives under a `[skills] extra_paths` root; meka reads those but never writes to them, so writing here would shadow the file rather than change it |
-| `/errors/session-not-drivable` | 422 | The id names a sub-agent's conversation, which only its parent drives. Reading it is unaffected; the message names the parent and what to do there: `agent_followup` for a turn or a fork, `POST /v1/sessions/{parent}/responses/{request_id}` for an approval, and the parent itself for a scheduled job. **Do not retry with a corrected payload**: no body addressed at this id is accepted |
+| `/errors/subagent-not-running` | 409 | The id names a sub-agent this process is not running, so there is no feed to read; its feed exists while its parent runs it, and `last_turn` on its record says how its last run ended |
+| `/errors/session-not-drivable` | 422 | The id names a sub-agent's conversation, which only its parent drives. Reading it is unaffected; the message names the parent and what to do there: `agent_followup` for a turn or a fork, `POST /v1/sessions/{parent}/responses/{request_id}` for an approval, the parent itself for a scheduled job, and the parent's feed for a sub-agent's `attend`. **Do not retry with a corrected payload**: no body addressed at this id is accepted |
 | `/errors/request-not-found` | 404 | Unknown or expired `request_id` |
 | `/errors/idempotency` | 409/429 | Key conflict (body mismatch: 409; cache cap: 429) |
 | `/errors/invalid-body` | 400/422 | Request body validation failed (422), or a path/query parameter the router rejected (400) |
+| `/errors/precondition-failed` | 412 | `If-Match` on a rewind or a fork names a conversation that has since changed; `revision` and `total` carry the current state. Read `GET /messages` again and decide again |
 | `/errors/request-too-large` | 422 | meka refused to send the turn: the conversation is still over the profile's `max_request_bytes` after redacting older tool-result images. meka's own ceiling, so no provider judged it and no `provider_response` rides along; `detail` names the size, the limit and the remedy, `/compact`. **Do not retry unchanged**: `POST /compact` first |
 | `/errors/payload-too-large` | 413 | Body exceeds `max_body_bytes`, meka's limit on the HTTP request itself. Unrelated to `request-too-large`, which is about what meka may send onward |
 | `/errors/concurrency-limit` | 429 | Process-wide turn limit reached (`Retry-After` header included) |
@@ -954,8 +1088,8 @@ These endpoints help clients inspect the server's capabilities at runtime.
 |----------|------|-------------|
 | `GET /v1/health/live` | None | Liveness probe: 200 if the process is up |
 | `GET /v1/health/ready` | None | Readiness probe: 200 if the store is healthy, at least one profile is configured, and no `required` MCP server has failed. A failed *optional* server doesn't affect readiness, since it can't stop a turn either. Returns `status`, `session_db`, `profile_configured`, and `mcp_servers_healthy` (boolean, no server names). **`profile_configured` means a profile exists in `config.toml`, not that it has a usable credential**: a profile's credential is checked when a session first needs it, so a server can be ready and still answer 422 to `POST /v1/sessions`. |
-| `GET /v1/profiles` | Any read scope | Configured profiles, as `{"profiles": [...]}`. Each carries `name`, `account`, `backend` (omitted when the profile names an account that is not configured), `model` (omitted when the profile names none) and `active: true` on the one a session gets when it names none. Read-only; profiles come from `config.toml` |
-| `GET /v1/info` | Any read scope | Server version and permission surface, and `scopes`, the ones the calling token holds, so a client can show only the controls it may use. `vision` reports whether the *default* profile accepts [image attachments](#image-attachments); a session on another profile follows that one. Carries no profile or model: `GET /v1/profiles` reports both per profile and marks the default with `active` |
+| `GET /v1/profiles` | Any read scope | Configured profiles, as `{"profiles": [...]}`. Each carries `name`, `account`, `backend` (omitted when the profile names an account that is not configured), `model` (omitted when the profile names none), `vision`, whether a session on it accepts [image attachments](#image-attachments), and `active: true` on the one a session gets when it names none. Read-only; profiles come from `config.toml` |
+| `GET /v1/info` | Any read scope | Server version and permission surface, and `scopes`, the ones the calling token holds, so a client can show only the controls it may use. Carries no profile, model or capability of one: `GET /v1/profiles` reports those per profile and marks the default with `active` |
 | `GET /v1/skills` | Any read scope | Installed skills |
 | `GET /v1/mcp` | Any read scope | MCP server connection status |
 | `GET /v1/openapi.json` | None, and off unless `[serve].docs` is set | OpenAPI 3 spec |
@@ -1086,7 +1220,7 @@ async def follow(session_id: str):
 
 ### Web UI (TypeScript, streaming)
 
-A UI that renders the whole session subscribes to the feed once and files events by `turn_id`, so it also shows the turns it did not start: a scheduled fire, a background task reporting, a message the user typed while the agent was working and the agent answering it in place. The feed is read with `fetch` and an SSE parser rather than a native `EventSource`, which cannot send the bearer header; a UI served from another origin also needs [`cors_allowed_origins`](#browser-clients) to name it.
+A UI that renders the whole session subscribes to the feed once and files events by `turn_id`, so it also shows the turns it did not start: a scheduled fire, a background task reporting, a message the user typed while the agent was working and the agent answering it in place. A UI that also keeps a list of sessions holds [the server feed](#the-server-feed) beside it and replaces a row whenever a `session.*` event names it. The feed is read with `fetch` and an SSE parser rather than a native `EventSource`, which cannot send the bearer header; a UI served from another origin also needs [`cors_allowed_origins`](#browser-clients) to name it.
 
 ```typescript
 const feed = await fetch(`${MEKA_URL}/v1/sessions/${sessionId}/stream`, {
@@ -1131,7 +1265,8 @@ RESULT=$(curl -sf -X POST "$BASE/v1/sessions/$SESSION/turn" \
   -H "Content-Type: application/json" \
   -d '{"message": "summarize this project"}')
 
-echo "$RESULT" | jq .final_text
+# The reply: the text blocks of the assistant's messages, joined.
+echo "$RESULT" | jq -r '[.messages[] | select(.role == "assistant") | .content[] | select(.type == "text") | .text] | join("")'
 
 # Clean up
 curl -sf -X DELETE "$BASE/v1/sessions/$SESSION" \
@@ -1147,7 +1282,9 @@ An agent-initiated turn has no HTTP request to respond to, so its output is pers
 `POST /v1/sessions/{id}/schedule` plants a job on a session. Scheduling must be enabled on the
 server (`[schedule] enabled`), or the request is a `404` `not-found`: there is nowhere for the job
 to go, the same answer a disabled skill or memory store gives. Listing and canceling stay open, so
-jobs left from before the flag was flipped can still be cleared out.
+jobs left from before the flag was flipped can still be cleared out. `GET /v1/schedule` lists every
+job, and `GET /v1/schedule?session=<id>` one session's; `DELETE /v1/schedule/{job_id}` cancels by
+the full id.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -1197,8 +1334,8 @@ Key points:
 | GET | `/v1/sessions/{id}` | `sessions:r` | Get session |
 | PATCH | `/v1/sessions/{id}` | `sessions:w` | Update session |
 | DELETE | `/v1/sessions/{id}` | `sessions:w` | Delete session |
-| POST | `/v1/sessions/{id}/fork` | `sessions:w` | Fork session |
-| GET | `/v1/sessions/{id}/messages` | `sessions:r` | List messages |
+| POST | `/v1/sessions/{id}/fork` | `sessions:w` | Fork session; `If-Match` makes it conditional |
+| GET | `/v1/sessions/{id}/messages` | `sessions:r` | List messages, under the conversation's `ETag` |
 | GET | `/v1/sessions/{id}/blobs/{hash}` | `sessions:r` | Image bytes behind a content block |
 | POST | `/v1/sessions/{id}/turn` | `sessions:w` | Submit turn |
 | POST | `/v1/sessions/{id}/cancel` | `sessions:w` | Cancel turn (optionally one named `turn_id`) |
@@ -1206,23 +1343,25 @@ Key points:
 | GET | `/v1/sessions/{id}/inbox` | `sessions:r` | Inbox items the model has not been shown |
 | DELETE | `/v1/sessions/{id}/inbox/{item_id}` | `sessions:w` | Withdraw an item still waiting |
 | POST | `/v1/sessions/{id}/responses/{request_id}` | `sessions:w` | Resolve permission prompt |
-| GET | `/v1/sessions/{id}/stream` | `sessions:r` | The session's event feed, across turns; `sessions:w` to load a session this process has not, and `?attend=true` (needs `sessions:w`) to be asked to approve gated calls |
+| GET | `/v1/sessions/{id}/stream` | `sessions:r` | The session's event feed, across turns; `sessions:w` to load a session this process has not, and `?attend=true` (needs `sessions:w`) to be asked to approve gated calls. On a sub-agent's id, its own feed while its parent runs it, read-only |
+| GET | `/v1/stream` | `sessions:r` | The server feed: every change to a session record, across sessions |
 | POST | `/v1/sessions/{id}/compact` | `sessions:w` | Summarize the conversation now |
 | GET | `/v1/sessions/{id}/context` | `sessions:r` | Context occupancy and cumulative usage |
-| POST | `/v1/sessions/{id}/rewind` | `sessions:w` | Drop trailing turns |
-| GET | `/v1/sessions/{id}/export` | `sessions:r` | Full transcript (`?format=markdown\|md\|json`) |
+| POST | `/v1/sessions/{id}/rewind` | `sessions:w` | Drop trailing turns; `If-Match` makes it conditional |
+| GET | `/v1/sessions/{id}/export` | `sessions:r` | Full transcript (`?format=markdown\|json`) |
+| GET | `/v1/sessions/{id}/turns` | `sessions:r` | The turns that began, newest first, paginated by `before` |
 | POST | `/v1/sessions/import` | `sessions:w` | Recreate a session tree from an export |
 | GET | `/v1/sessions/{id}/tools` | `sessions:r` | Tool catalog for this session (409 if not loaded) |
 | GET | `/v1/sessions/{id}/tasks` | `sessions:r` | Background tasks |
-| DELETE | `/v1/sessions/{id}/tasks/{task_id}` | `sessions:w` | Cancel a background task |
-| GET | `/v1/schedule` | `schedule:r` | All scheduled jobs |
-| GET | `/v1/sessions/{id}/schedule` | `schedule:r` | Scheduled jobs for one session |
+| GET | `/v1/tasks` | `sessions:r` | Every session's background tasks, newest first; `?status=` keeps one status |
+| DELETE | `/v1/sessions/{id}/tasks/{task_id}` | `sessions:w` | Cancel a background task by its full id |
+| GET | `/v1/schedule` | `schedule:r` | Scheduled jobs, every session's or one session's with `?session=<id>` |
 | POST | `/v1/sessions/{id}/schedule` | `schedule:w` (+ `sessions:w` for a `gate`) | Create a scheduled job |
-| DELETE | `/v1/schedule/{job_id}` | `schedule:w` | Cancel a scheduled job |
+| DELETE | `/v1/schedule/{job_id}` | `schedule:w` | Cancel a scheduled job by its full id |
 | GET | `/v1/skills/{name}` | `skills:r` | One skill, with its body |
 | PUT | `/v1/skills/{name}` | `skills:w` | Create or update a skill |
 | DELETE | `/v1/skills/{name}` | `skills:w` | Delete a skill |
-| GET | `/v1/memory` | `memory:r` | Memory index |
+| GET | `/v1/memory` | `memory:r` | Memory index, or with `?q=<words>` the memories a search finds, best first |
 | GET | `/v1/memory/{name}` | `memory:r` | One memory, with its body |
 | PUT | `/v1/memory/{name}` | `memory:w` | Create or update a memory |
 | DELETE | `/v1/memory/{name}` | `memory:w` | Delete a memory |
@@ -1233,9 +1372,11 @@ Key points:
 | GET | `/v1/openapi.json` | None, and off unless `[serve].docs` is set | OpenAPI spec |
 | GET | `/v1/docs` | None, and off unless `[serve].docs` is set | Swagger UI |
 
-`GET /v1/sessions` is paginated by `limit` and `cursor` (see [Sessions](#sessions)), and takes `include_children=true` to list sub-agent sessions alongside root ones, and `cwd=<path>` to filter by working directory. A sub-agent's session record carries `parent_id`, which is what reconnects it to the session that dispatched it.
+`GET /v1/sessions` is paginated by `limit` and `cursor` (see [Sessions](#sessions)), and takes `include_children=true` to list sub-agent sessions alongside root ones, `cwd=<path>` to filter by working directory, and `parent=<id>` to list one session's direct children. A sub-agent's session record carries `parent_id`, which is what reconnects it to the session that dispatched it.
 
 A memory record carries both `updated_at` (when the row last changed) and `created_at` (when the memory was made, stamped once at creation), plus its `tags` and its `read_count`, how many times the agent has recalled it through `memory_read`. The two timestamps are deliberately separate: a description edit moves `updated_at` without the note saying anything new, and it is `created_at` that the model is shown as an age. `PUT /v1/memory/{name}` accepts `tags` with the same omit-to-keep rule as `body`: omit to leave an existing memory's labels alone, send `[]` to clear them.
+
+`GET /v1/memory?q=<words>` answers with the memories the agent's own `memory_search` would find for those words, best first and at most `limit` of them (default 10, clamped to 1..25), each carrying the `snippet` it was found on; the same ladder of exact, prefix and substring matching, so an operator and the model find the same memories for the same words. Without `q` it is the whole index.
 
 `GET /v1/memory/{name}` answers **404** for a name that is not stored, with no 422 case: a memory is a row, so there is no file to be present but unparseable. Reading through this endpoint deliberately does *not* increment the memory's read count: an operator is not the agent recalling anything, and the count feeds search ranking.
 
@@ -1255,7 +1396,9 @@ No job of any kind can be created on a session at `none`, gated or not: no tool 
 
 A `schedule:*`-only token can still plant ordinary prompt-only jobs; it cannot reach a gate at all. Scope a bridge accordingly, and note that `GET /v1/schedule` is server-wide, so `schedule:r` alone lists every session id in the store.
 
-`DELETE /v1/schedule/{job_id}` and `DELETE /v1/sessions/{id}/tasks/{task_id}` both accept a unique id prefix as well as the full id, matching `meka schedule cancel` and the `schedule_cancel` / `task_cancel` tools: the 8-character short form those surfaces print is enough. An id matching nothing is a 404 and one matching several is a 422, so a typo is never reported as a cancellation. A job that a scheduler sweep retired between the lookup and the delete is a 404 as well, for the same reason: 204 means this request canceled the job, not merely that it is gone.
+`DELETE /v1/schedule/{job_id}` and `DELETE /v1/sessions/{id}/tasks/{task_id}` take the full id, which is what a client of this API holds; the 8-character short form `meka schedule cancel` and the `schedule_cancel` / `task_cancel` tools accept is a terminal's ergonomic and matches nothing here. An id matching nothing is a 404, so a typo is never reported as a cancellation. A job that a scheduler sweep retired a moment before the delete is a 404 as well, for the same reason: 204 means this request canceled the job, not merely that it is gone.
+
+`GET /v1/tasks` lists every session's background tasks, newest first, and `?status=running` (or `completed`, `failed`, `canceled`, `interrupted`) keeps one status; a status that is none of those is a `422`. A task that is a backgrounded `agent_spawn` carries `subagent_id`, the session it runs, once the spawn has made one, so a dashboard connects the task to the sub-agent's record without parsing the task's label.
 
 Canceling a background task records the cancellation and signals the running task, but only `meka serve` can signal work `meka serve` started. If the session is open in another process (a `meka -r` REPL, say), the row is marked `canceled` and the command keeps running there until it ends on its own; its result is then discarded, because the row is no longer `running`.
 

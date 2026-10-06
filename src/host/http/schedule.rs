@@ -290,7 +290,8 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         outcome: &Result<crate::agent::TurnOutcome, crate::error::MekaError>,
     ) {
         use crate::host::http::handlers::turn::{
-            CancelReason, message_withdrawn, notify_turn_end, terminal_event_parts, usage_from,
+            CancelReason, message_withdrawn, notify_turn_end, revision_for_terminal,
+            terminal_event_parts, usage_from,
         };
         // Drained here rather than in `finished`, which runs after and finds it empty: the usage
         // and the withdrawal ride the terminal.
@@ -308,6 +309,7 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
             entry.id,
             self.state.config.relay_provider_errors,
             message_withdrawn(&recorder),
+            revision_for_terminal(&self.state.shared.store, entry.id).await,
         );
         entry.frontend.record_terminal(event_type, data);
         entry.frontend.end_turn();

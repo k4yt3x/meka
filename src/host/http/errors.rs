@@ -19,7 +19,7 @@ use serde::Serialize;
 use serde_json::Value;
 use utoipa::ToSchema;
 
-use crate::error::{MekaError, bounded_upstream_body};
+use crate::error::{INTERNAL_SENTENCE, MekaError, bounded_upstream_body};
 
 /// RFC 9457 Problem Details body. The five core members (`type`, `title`, `status`, `detail`,
 /// `instance`) are first-class; meka-specific extension members ride in `extensions` and get
@@ -108,7 +108,7 @@ impl ProblemDetail {
         Self::new(
             ErrorKind::Internal,
             StatusCode::INTERNAL_SERVER_ERROR,
-            "internal server error; consult server logs",
+            INTERNAL_SENTENCE,
         )
     }
 
@@ -136,209 +136,39 @@ impl ProblemDetail {
 /// stall. An hour is far past any real rate-limit window and far short of that.
 const RELAYED_RETRY_AFTER_CAP: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-/// Shared by the two [`ErrorKind::ProviderUnavailable`] arms, which differ only in whether there is
-/// a `Retry-After` to relay. Named rather than written twice because a caller matching on `type`
-/// gets one answer and a human reading `detail` must not get two.
-const PROVIDER_UNAVAILABLE_DETAIL: &str =
-    "the provider did not complete this turn; its response is in the server log";
+pub(crate) use crate::error::ErrorKind;
 
-/// Catalog of stable error types, matching the HTTP API docs table. Each variant maps to a
-/// `type` URI plus a fixed `title`. New variants land alongside new endpoints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ErrorKind {
-    Auth,
-    AuthScope,
-    SessionNotFound,
-    /// A named resource that is not a session: a skill, a memory, an MCP server, a background
-    /// task, a turn stream. Distinct from [`Self::SessionNotFound`] because `type` is the
-    /// machine-readable code a client switches on, and "your session is gone" and "that skill does
-    /// not exist" call for very different responses.
-    NotFound,
-    /// The token's scopes are sufficient, but the *session* sits at too low a permission for what
-    /// was asked.
-    ///
-    /// Distinct from [`Self::AuthScope`], which is the same 403 with the opposite remedy. A client
-    /// routing on `type` reads `auth-scope` as "get a better token" and will re-provision forever;
-    /// the fix here is `PATCH /v1/sessions/{id}` with a higher `permission`.
-    SessionPermission,
-    SessionLocked,
-    /// The session exists but is not resident in memory, and the endpoint needs live state.
-    ///
-    /// Distinct from [`Self::TurnInFlight`], which reads as "something is running, cancel it" and
-    /// sends a client into a `POST /cancel` loop that returns 204 forever because there is no turn.
-    /// The remedy here is the opposite: submit a turn, which loads the session.
-    SessionNotLoaded,
-    TurnInFlight,
-    TurnCanceled,
-    /// A re-attached stream ended with no recorded outcome, because the task that would have
-    /// recorded one died. Only ever carried inside a terminal `turn.failed` SSE event, never as an
-    /// HTTP response body, but cataloged here so the type URI has one definition rather than a
-    /// string literal at the emitting site.
-    StreamDetached,
-    /// The only SSE consumer fell behind the broadcast buffer, so the turn was stopped for it.
-    /// SSE-only, like [`Self::StreamDetached`]: it rides a terminal `turn.failed` and is never an
-    /// HTTP response body.
-    SseLag,
-    RequestNotFound,
-    Idempotency,
-    /// The inbox item's text is already in the conversation, so only a turn can answer it now and
-    /// there is nothing to take back.
-    InboxAppended,
-    /// The cancel named a turn that is not the one in flight. Distinct from a 204 for "no turn",
-    /// because the caller was aiming at something specific and it is gone; whatever runs now is
-    /// somebody else's.
-    TurnMismatch,
-    /// The named skill lives under a read-only root from `[skills] extra_paths`, so writing it
-    /// here would create a shadowing copy in meka's own store rather than change the file.
-    ///
-    /// Distinct from [`Self::InvalidBody`]: the request is well-formed and the remedy is to pick
-    /// another name or edit that file directly, not to fix the payload.
-    StoreReadOnly,
-    /// The id names a sub-agent's conversation, which only its parent can continue.
-    ///
-    /// Distinct from [`Self::InvalidBody`] for the reason [`Self::StoreReadOnly`] is: the request
-    /// parsed and validated, and no edit to it will ever be accepted. A client routing on `type`
-    /// reads `invalid-body` as "my payload is malformed" and rewrites the payload forever, when the
-    /// remedy is to stop addressing this id and call `agent_followup` from the parent instead.
-    ///
-    /// Not [`Self::SessionPermission`], which is about the level a session runs at and is raised
-    /// with `PATCH /v1/sessions/{id}`; no permission makes a sub-agent drivable from outside its
-    /// parent. Not [`Self::SessionNotFound`] either: the session exists and every read endpoint
-    /// still serves it.
-    SessionNotDrivable,
-    InvalidBody,
-    /// The conversation meka assembled still exceeds the profile's `max_request_bytes` after every
-    /// older image was redacted, so meka refused to send it.
-    ///
-    /// meka's own refusal, which is why it is a 422 and not one of the 502s: nothing was sent and
-    /// no provider judged it, so there is no upstream response to relay and `detail` is the whole
-    /// answer. Distinct from [`Self::PayloadTooLarge`], which is `max_body_bytes` on the HTTP
-    /// request rather than the profile's ceiling on what meka may send, and from
-    /// [`Self::ContextOverflow`], which is the model's window and comes back from the provider.
-    ///
-    /// Resending the same turn will be refused identically; the remedy is in `detail`.
-    RequestTooLarge,
-    PayloadTooLarge,
-    ConcurrencyLimit,
-    /// An upstream call failed for a reason meka could not place in one of the classes below.
-    ///
-    /// **A catch-all, not a "permanent" bucket, and the difference is worth stating because the
-    /// obvious reading of the name is the wrong one.** It is the `else` arm of
-    /// [`crate::error::provider_http_error`] plus every site that builds a bare
-    /// [`crate::error::MekaError::Provider`], so a revoked credential lands here, and so do a 408,
-    /// a 425, a 200 whose body was replaced by a proxy's HTML, and any mid-stream error type
-    /// outside the retryable allowlists. Several of those are transient; meka simply did not
-    /// recognize them as such.
-    ///
-    /// So it means "not classified as transient", which is weaker than "will fail again", and the
-    /// docs must not promise the stronger thing. [`Self::ProviderUnavailable`] is the positive
-    /// signal and this is its absence.
-    Provider,
-    /// The upstream failed in a way meka's own classifier had already labeled transient.
-    ///
-    /// A 502 like [`Self::Provider`], and a distinct `type` for the reason
-    /// [`Self::ContextOverflow`] is one: the remedies differ. This one is worth sending again after
-    /// a pause. Its absence is not the opposite claim, only the lack of this one; see
-    /// [`Self::Provider`].
-    ///
-    /// **A relayed `Retry-After` cannot be what separates this from [`Self::Provider`].** That
-    /// header is absent from most of this variant's own instances: a transport failure has no
-    /// response to carry one, a mid-stream `overloaded_error` has no headers to read, and
-    /// [`crate::error::parse_retry_after`] reads only the delta-seconds form, so an upstream
-    /// answering with an HTTP date sends none meka can use. An overload therefore arrived
-    /// byte-identical to a dead credential, and a client had to choose between retrying that
-    /// credential forever and dropping turns a second attempt would have completed.
-    ///
-    /// Claims a *class*, never an outcome, and says nothing about how many attempts meka made.
-    /// `should_retry_provider_error` declines to retry at all once any output has reached the
-    /// stream or the retry budget is spent, so this can arrive after three attempts or after none.
-    ProviderUnavailable,
-    /// The conversation no longer fits the model's context window, and meka could not compact it
-    /// down far enough (or `auto_compact` is off).
-    ///
-    /// A 502 like [`Self::Provider`], because the upstream is what refused the turn, but a distinct
-    /// `type` so a client can tell the two apart. They call for opposite responses: `provider` is
-    /// "the upstream is unwell, try the same request again", while this one will refuse the same
-    /// request forever. A client that cannot distinguish them retries an oversized conversation
-    /// until it gives up on wall-clock, which is the failure this variant exists to prevent. The
-    /// remedy is to shorten the conversation: `POST /v1/sessions/{id}/compact`, or `/rewind`, or a
-    /// smaller message.
-    ///
-    /// Not [`Self::PayloadTooLarge`], which is meka's own `max_body_bytes` on the HTTP request and
-    /// has nothing to do with the model's window; a request well under one limit routinely exceeds
-    /// the other.
-    ContextOverflow,
-    /// A server marked `[mcp.servers.<name>] required` was not connected when a turn asked for it,
-    /// so the turn was refused before anything reached the provider.
-    ///
-    /// A 503 rather than a 502: the dependency that is unwell is one meka manages rather than the
-    /// model provider, and the caller's request was never forwarded to anything. Distinct from
-    /// [`Self::Internal`], which reads as "meka broke" and sends an operator to the wrong log: meka
-    /// classified this one correctly, and the fault is in a subprocess or a remote MCP server.
-    McpUnavailable,
-    Internal,
-}
-
-impl ErrorKind {
-    pub(crate) const fn type_uri(self) -> &'static str {
-        match self {
-            Self::Auth => "https://meka.run/errors/auth",
-            Self::AuthScope => "https://meka.run/errors/auth-scope",
-            Self::SessionNotFound => "https://meka.run/errors/session-not-found",
-            Self::NotFound => "https://meka.run/errors/not-found",
-            Self::SessionPermission => "https://meka.run/errors/session-permission",
-            Self::SessionLocked => "https://meka.run/errors/session-locked",
-            Self::SessionNotLoaded => "https://meka.run/errors/session-not-loaded",
-            Self::TurnInFlight => "https://meka.run/errors/turn-in-flight",
-            Self::TurnCanceled => "https://meka.run/errors/turn-canceled",
-            Self::StreamDetached => "https://meka.run/errors/stream-detached",
-            Self::SseLag => "https://meka.run/errors/sse-lag",
-            Self::RequestNotFound => "https://meka.run/errors/request-not-found",
-            Self::Idempotency => "https://meka.run/errors/idempotency",
-            Self::InboxAppended => "https://meka.run/errors/inbox-appended",
-            Self::TurnMismatch => "https://meka.run/errors/turn-mismatch",
-            Self::StoreReadOnly => "https://meka.run/errors/store-read-only",
-            Self::SessionNotDrivable => "https://meka.run/errors/session-not-drivable",
-            Self::InvalidBody => "https://meka.run/errors/invalid-body",
-            Self::RequestTooLarge => "https://meka.run/errors/request-too-large",
-            Self::PayloadTooLarge => "https://meka.run/errors/payload-too-large",
-            Self::ConcurrencyLimit => "https://meka.run/errors/concurrency-limit",
-            Self::Provider => "https://meka.run/errors/provider",
-            Self::ProviderUnavailable => "https://meka.run/errors/provider-unavailable",
-            Self::ContextOverflow => "https://meka.run/errors/context-overflow",
-            Self::McpUnavailable => "https://meka.run/errors/mcp-unavailable",
-            Self::Internal => "https://meka.run/errors/internal",
+/// The status each catalog entry answers with where the kind alone decides it. Two vary by site
+/// and take their common one here: `Idempotency` is 429 at the cache cap, and `InvalidBody` is
+/// 400 for a path or query the router refused; those sites say so themselves.
+pub(crate) fn status_of(kind: ErrorKind) -> StatusCode {
+    match kind {
+        ErrorKind::Auth => StatusCode::UNAUTHORIZED,
+        ErrorKind::AuthScope | ErrorKind::SessionPermission => StatusCode::FORBIDDEN,
+        ErrorKind::SessionNotFound | ErrorKind::NotFound | ErrorKind::RequestNotFound => {
+            StatusCode::NOT_FOUND
         }
-    }
-
-    pub(crate) const fn title(self) -> &'static str {
-        match self {
-            Self::Auth => "Authentication failed",
-            Self::AuthScope => "Insufficient scope",
-            Self::SessionNotFound => "Session not found",
-            Self::NotFound => "Resource not found",
-            Self::SessionPermission => "Session permission too low",
-            Self::SessionLocked => "Session is locked by another process",
-            Self::SessionNotLoaded => "Session is not loaded",
-            Self::TurnInFlight => "Turn already in flight",
-            Self::TurnCanceled => "Turn canceled",
-            Self::StreamDetached => "Turn outcome unavailable",
-            Self::SseLag => "SSE consumer lagged",
-            Self::RequestNotFound => "Pending request not found",
-            Self::Idempotency => "Idempotency-Key conflict",
-            Self::InboxAppended => "Inbox item already appended",
-            Self::TurnMismatch => "Turn is not the one in flight",
-            Self::StoreReadOnly => "Skill is in a read-only root",
-            Self::SessionNotDrivable => "Session is a sub-agent's conversation",
-            Self::InvalidBody => "Invalid request body",
-            Self::RequestTooLarge => "Request exceeds the profile's size ceiling",
-            Self::PayloadTooLarge => "Request body exceeds configured limit",
-            Self::ConcurrencyLimit => "Process-wide concurrency limit reached",
-            Self::Provider => "Provider call failed",
-            Self::ProviderUnavailable => "Provider temporarily unavailable",
-            Self::ContextOverflow => "Conversation exceeds the model's context window",
-            Self::McpUnavailable => "Required MCP server is not ready",
-            Self::Internal => "Internal server error",
+        ErrorKind::SessionLocked
+        | ErrorKind::SessionNotLoaded
+        | ErrorKind::SubagentNotRunning
+        | ErrorKind::TurnInFlight
+        | ErrorKind::TurnCanceled
+        | ErrorKind::Idempotency
+        | ErrorKind::InboxAppended
+        | ErrorKind::TurnMismatch
+        | ErrorKind::StoreReadOnly => StatusCode::CONFLICT,
+        ErrorKind::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
+        ErrorKind::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        ErrorKind::InvalidBody | ErrorKind::SessionNotDrivable | ErrorKind::RequestTooLarge => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        ErrorKind::ConcurrencyLimit => StatusCode::TOO_MANY_REQUESTS,
+        ErrorKind::Provider | ErrorKind::ProviderUnavailable | ErrorKind::ContextOverflow => {
+            StatusCode::BAD_GATEWAY
+        }
+        ErrorKind::McpUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        ErrorKind::StreamDetached | ErrorKind::SseLag | ErrorKind::Internal => {
+            StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }
@@ -385,239 +215,58 @@ impl ProblemDetail {
     /// Deliberately not extended to [`MekaError::McpTurnGated`], whose reasons are meka's own
     /// subprocess text rather than a provider's response; see the key's own documentation.
     pub(crate) fn for_error(error: &MekaError, relay_provider_errors: bool) -> Self {
+        let kind = error.kind();
+        // Logged here, once, whatever the surface shows: the upstream's text goes to the log
+        // unconditionally, and a fault that reaches a caller as a 500 is the operator's to read
+        // about there.
+        match error {
+            MekaError::Provider(message)
+            | MekaError::InvalidRequest(message)
+            | MekaError::StreamError(message)
+            | MekaError::RetryableProvider { message, .. } => {
+                tracing::warn!("provider error: {message}");
+            }
+            MekaError::ContextOverflow(message) => tracing::warn!("context overflow: {message}"),
+            MekaError::McpTurnGated { .. } => tracing::warn!("mcp gate declined a turn: {error}"),
+            MekaError::Installation(message) => tracing::error!("installation error: {message}"),
+            other if kind == ErrorKind::Internal => {
+                tracing::error!("unhandled agent error mapped to 500: {other}");
+            }
+            _ => {}
+        }
+        let mut problem = Self::new(kind, status_of(kind), error.sentence());
         // An extension member rather than a replacement for `detail`, because the two carry
         // different things and neither substitutes for the other. `detail` is meka's own sentence
         // and for a context overflow it is the entire remedy ("compact it before retrying"), which
         // relaying by overwrite would have deleted in exchange for a JSON blob. A client wanting to
         // branch on the upstream's error type also wants one well-known field, not prose to parse.
-        //
-        // Closured rather than repeated per arm so the four cannot drift into disagreeing about
-        // what relaying means. Where `detail` does point at the server log -- three of the four
-        // arms; the overflow arm gives a remedy instead -- that stays true either way, since every
-        // arm logs the body unconditionally and saying so is not wrong just because the payload now
-        // carries it too.
-        let attach = |problem: ProblemDetail, message: &String| -> ProblemDetail {
-            if relay_provider_errors {
-                problem.with(
-                    "provider_response",
-                    Value::from(bounded_upstream_body(message)),
-                )
-            } else {
-                problem
-            }
-        };
+        if relay_provider_errors && let Some(body) = error.upstream_body() {
+            problem = problem.with(
+                "provider_response",
+                Value::from(bounded_upstream_body(body)),
+            );
+        }
         match error {
-            // Adjacent, and to the same shape [`crate::host::http::reattach::agent_build_problem`]
-            // gives them, because the two arrive the same way: a builder refusing something the
-            // caller can act on, in its own words. Every door that can raise `SessionNotDrivable`
-            // goes through that function, so these arms are the belt to its braces.
-            //
-            // Same status, different `type`, because the remedies do not overlap: a `Config`
-            // refusal is about what the caller sent or how the installation is set up, while
-            // [`ErrorKind::SessionNotDrivable`] is a permanent property of the id itself.
-            MekaError::Config(message) | MekaError::Usage(message) => ProblemDetail::new(
-                ErrorKind::InvalidBody,
-                StatusCode::UNPROCESSABLE_ENTITY,
-                message.clone(),
-            ),
-            // The other half of that split, and the reason `Config` can go back verbatim at all.
-            // An installation fault is the *operator's* to fix and its sentence names their
-            // `ca_cert_file`, their proxy URL or their `base_url`; a caller can do nothing with any
-            // of it, and reading it as a 422 would have them rewriting a payload forever. Sanitized
-            // to the same 500 every server fault gets, with the text in the log where the person
-            // who wrote the file can read it. `build_shared_deps` builds the web client at startup
-            // precisely so the common case never reaches a caller at all.
-            MekaError::Installation(message) => {
-                ProblemDetail::internal_sanitized("installation error", message)
-            }
-            // meka's own ceiling, refused before anything was sent. A 422 rather than one of the
-            // 502s below: no provider judged this request, so there is no upstream response to
-            // relay and `detail`, which names the size, the ceiling and the remedy, is the whole
-            // answer.
-            MekaError::RequestTooLarge(message) => ProblemDetail::new(
-                ErrorKind::RequestTooLarge,
-                StatusCode::UNPROCESSABLE_ENTITY,
-                message.clone(),
-            ),
-            MekaError::SessionNotDrivable(message) => ProblemDetail::new(
-                ErrorKind::SessionNotDrivable,
-                StatusCode::UNPROCESSABLE_ENTITY,
-                message.clone(),
-            ),
-            // Everything upstream that the arm below did not claim. Deliberately *not* described as
-            // permanent: this is `provider_http_error`'s `else`, so a revoked credential lands here
-            // and so does a 408, a 425, and any mid-stream error type outside the retryable
-            // allowlists. Some of those are transient and meka merely failed to recognize them.
-            // "Not classified as transient" is the whole claim, and `ErrorKind::Provider` carries
-            // the longer version of why the stronger one would be false.
-            //
-            // `InvalidRequest` belongs with it rather than with the arm below despite naming a 400.
-            // What the upstream called invalid is the conversation meka assembled, which the caller
-            // neither sent nor can fix by correcting its own payload, and sending it again
-            // unchanged gets the same 400 back.
-            //
-            // Logged always, and relayed when `[serve] relay_provider_errors` says so. That body
-            // can hold an account identifier, a rate-limit posture, and on one backend a fragment
-            // of the request that triggered it, which is why publishing it is the operator's call
-            // rather than this module's; `attach` above is where the answer is applied and
-            // `ServeConfig::relay_provider_errors` is where it is argued.
-            //
-            // A length bound is not a redaction: it keeps the *start* of the body, and every one
-            // of those identifiers lives at the start of a JSON error object. The bound on the
-            // relayed body is a size bound only.
-            MekaError::Provider(message) | MekaError::InvalidRequest(message) => {
-                tracing::warn!("provider error: {message}");
-                let problem = ProblemDetail::new(
-                    ErrorKind::Provider,
-                    StatusCode::BAD_GATEWAY,
-                    "the provider rejected or failed this turn; its response is in the server log",
-                );
-                attach(problem, message)
-            }
-            // The transient half, under its own type: failures meka's own classifier labeled
-            // retryable, so the answer is recovered from the branch it took rather than guessed at
-            // here. It says nothing about how many attempts followed. `should_retry_provider_error`
-            // declines to retry at all once any output has reached the frontend or the retry budget
-            // is spent, so one of these can arrive after three attempts or after none, and reading
-            // a count into the type would be inventing a guarantee.
-            //
-            // Split from the arm above because a client's sensible responses differ. A relayed
-            // `Retry-After` cannot be what separates them: it is missing from most instances of
-            // this very arm, since a transport failure never received a response to carry one, a
-            // mid-stream `overloaded` event has no headers, and `parse_retry_after` reads only
-            // delta-seconds.
-            //
-            // `StreamError` is here rather than above because every producer is transport-shaped:
-            // an idle timeout, an `Err` from the SSE stream itself, and a stream that ended before
-            // its terminal event. A malformed SSE payload is *not* one of them, being skipped with
-            // a `warn!` and a `continue`, so nothing in this arm resends into a body the provider
-            // will reject identically forever.
-            MekaError::StreamError(message) => {
-                tracing::warn!("provider error: {message}");
-                let problem = ProblemDetail::new(
-                    ErrorKind::ProviderUnavailable,
-                    StatusCode::BAD_GATEWAY,
-                    PROVIDER_UNAVAILABLE_DETAIL,
-                );
-                attach(problem, message)
-            }
-            // The `Retry-After`, when there is one, is worth relaying because it is fresh rather
-            // than spent. It is read from the headers of the *final* attempt, and the agent loop
-            // gives up rather than sleeping again, so nothing has elapsed against it by the time it
-            // arrives here. Dropping it leaves a client backing off blind against a server that was
-            // told the number. `StreamError` above has no equivalent, which is the only reason
-            // these two are separate arms rather than one.
-            //
-            // Clamped, because `parse_retry_after` relays whatever the header said and a broken or
-            // hostile upstream can say a year. `u32` seconds is also what `ProblemDetail` carries,
-            // so an unclamped `u64` would wrap rather than saturate.
             MekaError::RetryableProvider {
-                message,
-                retry_after,
+                retry_after: Some(delay),
                 ..
-            } => {
-                tracing::warn!("provider error: {message}");
-                let problem = attach(
-                    ProblemDetail::new(
-                        ErrorKind::ProviderUnavailable,
-                        StatusCode::BAD_GATEWAY,
-                        PROVIDER_UNAVAILABLE_DETAIL,
-                    ),
-                    message,
-                );
-                match retry_after {
-                    Some(delay) => problem.with_retry_after(
-                        u32::try_from(delay.min(&RELAYED_RETRY_AFTER_CAP).as_secs())
-                            .unwrap_or(u32::MAX),
-                    ),
-                    None => problem,
-                }
-            }
-            // The same 502 as its neighbors, and for the same reason: the upstream refused the
-            // turn. Its own `type` because the remedy is the opposite one. `provider` invites the
-            // client to send the same request again, which is right for a 529 and wrong here: the
-            // conversation is too long and will be too long next time.
-            //
-            // Not a 413. That status is spoken for by `max_body_bytes`, which is meka's own limit
-            // on the HTTP request rather than the model's window, so reusing it would make one
-            // status mean two unrelated things.
-            //
-            // Reaching here at all means the agent loop could not compact its way out:
-            // `auto_compact` is off, or its retries are spent, or there was only one message and
-            // nothing to drop.
-            MekaError::ContextOverflow(message) => {
-                tracing::warn!("context overflow: {message}");
-                let problem = ProblemDetail::new(
-                    ErrorKind::ContextOverflow,
-                    StatusCode::BAD_GATEWAY,
-                    "the conversation exceeds the model's context window; compact it before retrying",
-                );
-                attach(problem, message)
-            }
-            // A required MCP server being down is a clean, fully classified pre-flight refusal;
-            // answering "internal server error" sends an operator looking for a bug in meka instead
-            // of at the subprocess that did not start.
-            //
-            // The names travel and the reasons do not, which is the policy the provider arms above
-            // state. A reason here is the connector's own text and can carry a spawn failure
-            // complete with the command line and its path; the names are the operator's own
-            // configuration and the only part a caller can act on. `servers` rides as an extension
-            // so a client can branch on which one rather than parse the sentence.
+            // Worth relaying because it is fresh rather than spent: read from the headers of the
+            // final attempt, after which the agent loop gives up rather than sleeping again, so
+            // nothing has elapsed against it. Clamped, because `parse_retry_after` relays
+            // whatever the header said and a broken or hostile upstream can say a year; `u32`
+            // seconds is what `ProblemDetail` carries, so an unclamped `u64` would wrap rather
+            // than saturate.
+            } => problem.with_retry_after(
+                u32::try_from(delay.min(&RELAYED_RETRY_AFTER_CAP).as_secs()).unwrap_or(u32::MAX),
+            ),
             MekaError::McpTurnGated { servers } => {
-                tracing::warn!("mcp gate declined a turn: {error}");
                 let names: Vec<&str> = servers.iter().map(|(name, _)| name.as_str()).collect();
-                ProblemDetail::new(
-                    ErrorKind::McpUnavailable,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!(
-                        "required MCP server(s) not ready: {}; each server's reason is in the \
-                         server log",
-                        names.join(", ")
-                    ),
-                )
-                .with("servers", Value::from(names))
+                problem.with("servers", Value::from(names))
             }
-            MekaError::Interrupted => ProblemDetail::new(
-                ErrorKind::TurnCanceled,
-                StatusCode::CONFLICT,
-                "turn was canceled (client cancel, shutdown, or disconnect)",
-            ),
-            MekaError::SessionLocked(id) => ProblemDetail::new(
-                ErrorKind::SessionLocked,
-                StatusCode::CONFLICT,
-                format!("session {id} is locked by another process"),
-            )
-            .with("session_id", id.to_string()),
-            // The refusals every door raises by variant, each mapped here and nowhere else. The
-            // three 422s share `invalid-body` with `Config` because their remedy is the same:
-            // change what was sent. `TurnInFlight` carries no id, so the door that
-            // answers it attaches `session_id` itself.
-            MekaError::SessionNotFound(id) => ProblemDetail::new(
-                ErrorKind::SessionNotFound,
-                StatusCode::NOT_FOUND,
-                error.to_string(),
-            )
-            .with("session_id", id.to_string()),
-            MekaError::TurnInFlight { .. } => ProblemDetail::new(
-                ErrorKind::TurnInFlight,
-                StatusCode::CONFLICT,
-                error.to_string(),
-            ),
-            MekaError::EmptyPrompt
-            | MekaError::DisabledLevel { .. }
-            | MekaError::ProfileNotConfigured { .. } => ProblemDetail::new(
-                ErrorKind::InvalidBody,
-                StatusCode::UNPROCESSABLE_ENTITY,
-                error.to_string(),
-            ),
-            other => {
-                tracing::error!("unhandled agent error mapped to 500: {other}");
-                ProblemDetail::new(
-                    ErrorKind::Internal,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error; consult server logs",
-                )
+            MekaError::SessionLocked(id) | MekaError::SessionNotFound(id) => {
+                problem.with("session_id", id.to_string())
             }
+            _ => problem,
         }
     }
 }

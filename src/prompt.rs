@@ -3817,6 +3817,7 @@ mod tests {
             finished_at: None,
             announced_at: None,
             delivered_at: None,
+            subagent_id: None,
         }
     }
 

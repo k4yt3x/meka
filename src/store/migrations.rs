@@ -310,6 +310,18 @@ const MIGRATIONS: &[Migration] = &[
         name: "sessions_number_their_turns",
         step: Step::Rust(sessions_number_their_turns),
     },
+    // A turn is a row: when it began, who opened it, how it ended and what it spent, and every
+    // message row a turn adds names it. A row written before this step names no turn.
+    Migration {
+        name: "turns_are_rows",
+        step: Step::Rust(turns_are_rows),
+    },
+    // A backgrounded `agent_spawn` names the session it runs, so a client connects the task to
+    // the sub-agent without parsing the task's words.
+    Migration {
+        name: "background_tasks_name_their_subagent",
+        step: Step::Rust(background_tasks_name_their_subagent),
+    },
 ];
 
 /// The position of the last turn a session opened, beside the eight cumulative counters: `NULL`
@@ -332,6 +344,47 @@ fn sessions_number_their_turns(transaction: &rusqlite::Transaction<'_>) -> rusql
         transaction.execute_batch(
             "UPDATE sessions SET prompt_index = NULL, turn_index = NULL WHERE turns > 0",
         )?;
+    }
+    Ok(())
+}
+
+/// The turns table, and the column every message row names its turn in. Safe to replay: the
+/// table is created only if absent, and a column that exists is left alone.
+const TURNS_ARE_ROWS: &str = "
+    CREATE TABLE IF NOT EXISTS turns (
+        id                          TEXT PRIMARY KEY,
+        session_id                  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source                      TEXT NOT NULL,
+        started_at                  TEXT NOT NULL,
+        ended_at                    TEXT,
+        status                      TEXT,
+        stop_reason                 TEXT,
+        error_type                  TEXT,
+        detail                      TEXT,
+        input_tokens                INTEGER NOT NULL DEFAULT 0,
+        output_tokens               INTEGER NOT NULL DEFAULT 0,
+        cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_input_tokens     INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_turns_session_started_at ON turns(session_id, started_at);
+";
+
+fn turns_are_rows(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(TURNS_ARE_ROWS)?;
+    if !table_has_column(transaction, "messages", "turn_id")? {
+        transaction.execute_batch("ALTER TABLE messages ADD COLUMN turn_id TEXT")?;
+    }
+    Ok(())
+}
+
+/// The session a backgrounded spawn runs, on its task's row. Safe to replay: a column that exists
+/// is left alone.
+fn background_tasks_name_their_subagent(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    if !table_has_column(transaction, "background_tasks", "subagent_id")? {
+        transaction.execute_batch("ALTER TABLE background_tasks ADD COLUMN subagent_id TEXT")?;
     }
     Ok(())
 }
@@ -639,11 +692,12 @@ const HEAD_TABLES: &[&str] = &[
     "scheduled_jobs",
     "scratchpad_entries",
     "sessions",
+    "turns",
 ];
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 6_765_195_325_341_607_469;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 5_240_258_893_683_659_556;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -890,7 +944,9 @@ fn user_version(connection: &rusqlite::Connection) -> Result<u32> {
         // binary".
         .map(|version| version.max(0) as u32)
         .map_err(|error| {
-            MekaError::Database(format!("failed to read the store's schema version: {error}"))
+            MekaError::Database(format!(
+                "failed to read the store's schema version: {error}"
+            ))
         })
 }
 
@@ -2472,6 +2528,9 @@ const ARCHIVE_FORMAT_0_59: u64 = 3;
 const ARCHIVE_FORMAT_0_64: u64 = 4;
 /// The archive `format_version` 0.65 and 0.66 wrote, whose stats carry no turn position.
 const ARCHIVE_FORMAT_0_66: u64 = 5;
+/// The archive `format_version` 0.67 through 0.69 wrote, which carries no turns and names none on
+/// its events.
+const ARCHIVE_FORMAT_0_69: u64 = 6;
 
 /// Bring a session archive written by an older meka to the current shape, reporting whether it
 /// was one. `current` is the version this build writes, handed in as data the way a [`Context`]
@@ -2480,8 +2539,9 @@ const ARCHIVE_FORMAT_0_66: u64 = 5;
 ///
 /// 0.59's archive differs from 0.64's only in the tool names 0.60 changed: the events are walked
 /// by [`rename_tools_0_60`], and each session's spec on its own, since it rides the archive as a
-/// string. Both then take the fields 0.65 requires, by [`require_fields_0_65`], and every version
-/// before 0.67 takes the turn position 0.67 records, by [`number_turns_0_67`].
+/// string. Both then take the fields 0.65 requires, by [`require_fields_0_65`], every version
+/// before 0.67 takes the turn position 0.67 records, by [`number_turns_0_67`], and every version
+/// before 0.70 takes the turns 0.70 records, none, by [`record_turns_0_70`].
 pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u64) -> bool {
     match document
         .get("format_version")
@@ -2504,13 +2564,44 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
                 }
             }
         }
-        Some(ARCHIVE_FORMAT_0_64) | Some(ARCHIVE_FORMAT_0_66) => {}
+        Some(ARCHIVE_FORMAT_0_64) | Some(ARCHIVE_FORMAT_0_66) | Some(ARCHIVE_FORMAT_0_69) => {}
         _ => return false,
     }
     require_fields_0_65(document);
     number_turns_0_67(document);
+    record_turns_0_70(document);
     document["format_version"] = current.into();
     true
+}
+
+/// Give each session the turns 0.70 records, none, and each event the turn it names, none: an
+/// older archive carries no turn rows, so its messages name no turn, as rows written before the
+/// table existed do in a migrated store.
+fn record_turns_0_70(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        let Some(fields) = session.as_object_mut() else {
+            continue;
+        };
+        fields
+            .entry("turns")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let Some(events) = fields
+            .get_mut("events")
+            .and_then(|events| events.as_array_mut())
+        {
+            for event in events {
+                if let Some(event) = event.as_object_mut() {
+                    event.entry("turn_id").or_insert(serde_json::Value::Null);
+                }
+            }
+        }
+    }
 }
 
 /// The turn position 0.67 records on each session's stats, by the rule the store's own step
@@ -3262,6 +3353,11 @@ mod tests {
                 7730251297735454426_u64,
             ),
             ("sessions_number_their_turns", 14854401362647262172_u64),
+            ("turns_are_rows", 463447860238898326_u64),
+            (
+                "background_tasks_name_their_subagent",
+                17443559184355884232_u64,
+            ),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
         /// every column-zero function it calls, recursively. What a Rust step does is its body and
@@ -4128,7 +4224,8 @@ mod tests {
                 session("22222222-2222-4222-8222-222222222222", 0),
             ],
         });
-        assert!(bring_archive_forward(&mut document, 6));
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
         assert_eq!(
             document["sessions"][0]["stats"]["turn_position"],
             serde_json::Value::Null
@@ -4139,7 +4236,7 @@ mod tests {
         );
         let once = document.clone();
         document["format_version"] = 5.into();
-        assert!(bring_archive_forward(&mut document, 6));
+        assert!(bring_archive_forward(&mut document, current));
         assert_eq!(document, once, "a replay is a no-op");
         let export = crate::store::export::parse_session_export(once.to_string().as_bytes())
             .expect("a converted archive reads");
@@ -4148,6 +4245,63 @@ mod tests {
             export.sessions[1].stats.turn_position,
             Some(crate::stats::TurnPosition::default())
         );
+    }
+
+    /// A 0.67 to 0.69 archive carries no turns: each session takes an empty list and each event
+    /// names none, so the import writes the rows a migrated store of that age holds.
+    #[test]
+    fn a_format_6_archive_takes_the_turns_it_never_wrote() {
+        let mut document = serde_json::json!({
+            "format_version": 6,
+            "meka_version": "0.69.0",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "blobs": [],
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "cwd": null,
+                "permission": "read",
+                "capabilities_json": null,
+                "approvals": false,
+                "additional_roots": [],
+                "subagent_spec_json": null,
+                "profile": "work",
+                "stats": {
+                    "turns": 1,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "redactions": 0,
+                    "redacted_images": 0,
+                    "redacted_bytes": 0,
+                    "turn_position": null,
+                },
+                "events": [{
+                    "at": "2020-01-01T00:00:00Z",
+                    "event": {"Append": {"role": "user", "content": [{"type": "text", "text": "hi"}]}},
+                }],
+                "scratchpad_entries": {},
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        assert_eq!(document["sessions"][0]["turns"], serde_json::json!([]));
+        assert_eq!(
+            document["sessions"][0]["events"][0]["turn_id"],
+            serde_json::Value::Null
+        );
+        let once = document.clone();
+        document["format_version"] = 6.into();
+        assert!(bring_archive_forward(&mut document, current));
+        assert_eq!(document, once, "a replay is a no-op");
+        let export = crate::store::export::parse_session_export(once.to_string().as_bytes())
+            .expect("a converted archive reads");
+        assert!(export.sessions[0].turns.is_empty());
+        assert_eq!(export.sessions[0].events[0].turn_id, None);
     }
 
     fn plant_message_of_kind(

@@ -83,7 +83,7 @@ impl BackgroundStore {
     ) -> crate::error::Result<Vec<BackgroundTask>> {
         self.query_background_tasks(
             "SELECT id, session_id, tool, label, status, outcome, scratchpad_entry, \
-             started_at, finished_at, announced_at, delivered_at FROM background_tasks \
+             started_at, finished_at, announced_at, delivered_at, subagent_id FROM background_tasks \
              WHERE session_id = ?1 ORDER BY started_at DESC",
             vec![session_id.to_string()],
         )
@@ -98,7 +98,7 @@ impl BackgroundStore {
     ) -> crate::error::Result<Vec<BackgroundTask>> {
         self.query_background_tasks(
             "SELECT id, session_id, tool, label, status, outcome, scratchpad_entry, \
-             started_at, finished_at, announced_at, delivered_at FROM background_tasks \
+             started_at, finished_at, announced_at, delivered_at, subagent_id FROM background_tasks \
              WHERE session_id = ?1 AND status = 'running' ORDER BY started_at ASC",
             vec![session_id.to_string()],
         )
@@ -120,7 +120,7 @@ impl BackgroundStore {
     ) -> crate::error::Result<Vec<BackgroundTask>> {
         self.query_background_tasks(
             "SELECT id, session_id, tool, label, status, outcome, scratchpad_entry, \
-             started_at, finished_at, announced_at, delivered_at FROM background_tasks \
+             started_at, finished_at, announced_at, delivered_at, subagent_id FROM background_tasks \
              WHERE session_id = ?1 AND status != 'running' AND delivered_at IS NULL \
              ORDER BY finished_at ASC",
             vec![session_id.to_string()],
@@ -192,7 +192,7 @@ impl BackgroundStore {
     ) -> crate::error::Result<Vec<BackgroundTask>> {
         self.query_background_tasks(
             "SELECT id, session_id, tool, label, status, outcome, scratchpad_entry, \
-             started_at, finished_at, announced_at, delivered_at FROM background_tasks \
+             started_at, finished_at, announced_at, delivered_at, subagent_id FROM background_tasks \
              WHERE session_id = ?1 AND status != 'running' AND announced_at IS NULL \
              AND delivered_at IS NULL ORDER BY finished_at ASC",
             vec![session_id.to_string()],
@@ -270,6 +270,71 @@ impl BackgroundStore {
     /// [`crate::store::schedule::ScheduleStore::cancel_scheduled_job`] in behavior and in error
     /// variant, so the two `serve` endpoints answer the same HTTP status (422) for the same
     /// mistake.
+    /// One task of a session by its full id, or `None` when the session has no such task.
+    pub(crate) async fn background_task(
+        &self,
+        session_id: Uuid,
+        id: &str,
+    ) -> crate::error::Result<Option<BackgroundTask>> {
+        let tasks = self
+            .query_background_tasks(
+                "SELECT id, session_id, tool, label, status, outcome, scratchpad_entry, \
+                 started_at, finished_at, announced_at, delivered_at, subagent_id FROM background_tasks \
+                 WHERE session_id = ?1 AND id = ?2",
+                vec![session_id.to_string(), id.to_string()],
+            )
+            .await?;
+        Ok(tasks.into_iter().next())
+    }
+
+    /// Record the session a backgrounded spawn runs, on the task's row.
+    pub(crate) async fn record_task_subagent(
+        &self,
+        task_id: &str,
+        subagent_id: Uuid,
+    ) -> crate::error::Result<()> {
+        let task_id = task_id.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE background_tasks SET subagent_id = ?2 WHERE id = ?1",
+                    rusqlite::params![task_id, subagent_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to record the task's sub-agent: {error}"))
+            })
+    }
+
+    /// Every session's tasks, newest first, or only those in one `status`.
+    pub(crate) async fn list_all_background_tasks(
+        &self,
+        status: Option<TaskStatus>,
+    ) -> crate::error::Result<Vec<BackgroundTask>> {
+        match status {
+            Some(status) => {
+                self.query_background_tasks(
+                    "SELECT id, session_id, tool, label, status, outcome, scratchpad_entry, \
+                     started_at, finished_at, announced_at, delivered_at, subagent_id \
+                     FROM background_tasks WHERE status = ?1 ORDER BY started_at DESC",
+                    vec![status.name().to_string()],
+                )
+                .await
+            }
+            None => {
+                self.query_background_tasks(
+                    "SELECT id, session_id, tool, label, status, outcome, scratchpad_entry, \
+                     started_at, finished_at, announced_at, delivered_at, subagent_id \
+                     FROM background_tasks ORDER BY started_at DESC",
+                    Vec::new(),
+                )
+                .await
+            }
+        }
+    }
+
     pub(crate) async fn resolve_background_task(
         &self,
         session_id: Uuid,
@@ -320,6 +385,7 @@ impl BackgroundStore {
                             finished_at: row.get(8)?,
                             announced_at: row.get(9)?,
                             delivered_at: row.get(10)?,
+                            subagent_id: row.get(11)?,
                         })
                     })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -357,6 +423,7 @@ pub(crate) struct BackgroundTaskRow {
     pub(crate) finished_at: Option<String>,
     pub(crate) announced_at: Option<String>,
     pub(crate) delivered_at: Option<String>,
+    pub(crate) subagent_id: Option<String>,
 }
 impl BackgroundTaskRow {
     /// The row as a [`BackgroundTask`], or what about it did not parse.
@@ -384,6 +451,12 @@ impl BackgroundTaskRow {
             finished_at: parse_optional(self.finished_at)?,
             announced_at: parse_optional(self.announced_at)?,
             delivered_at: parse_optional(self.delivered_at)?,
+            subagent_id: self
+                .subagent_id
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()
+                .map_err(|error| format!("bad sub-agent id: {error}"))?,
         })
     }
 }
@@ -512,6 +585,8 @@ pub(crate) struct BackgroundTask {
     /// outcome could wait for a turn instead of causing one.
     pub(crate) announced_at: Option<DateTime<Utc>>,
     pub(crate) delivered_at: Option<DateTime<Utc>>,
+    /// The session a backgrounded `agent_spawn` runs, once it has made one.
+    pub(crate) subagent_id: Option<Uuid>,
 }
 impl BackgroundTask {
     /// Short id for display, matching the width `task_cancel` accepts. Same convention as
@@ -547,6 +622,7 @@ mod tests {
             finished_at: None,
             announced_at: None,
             delivered_at: None,
+            subagent_id: None,
         };
         store
             .background_store()
@@ -554,6 +630,68 @@ mod tests {
             .await
             .expect("start background task");
         task
+    }
+
+    /// A detached spawn names the session it runs on its task's row, and the server-wide listing
+    /// answers for every session, or for one status of task.
+    #[tokio::test]
+    async fn a_detached_spawn_names_its_sub_agent_on_the_task() {
+        let store = Store::for_test().await;
+        let session = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        let other = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        let spawn = task_fixture(&store, session, "agent_spawn: count the files").await;
+        let command = task_fixture(&store, other, "sleep 5").await;
+        store
+            .background_store()
+            .finish_background_task(
+                &command.id,
+                TaskStatus::Completed,
+                Some("done".to_string()),
+                None,
+            )
+            .await
+            .expect("finish");
+        let child = Uuid::new_v4();
+        store
+            .background_store()
+            .record_task_subagent(&spawn.id, child)
+            .await
+            .expect("record");
+
+        let all = store
+            .background_store()
+            .list_all_background_tasks(None)
+            .await
+            .expect("list");
+        let ids: Vec<&str> = all.iter().map(|task| task.id.as_str()).collect();
+        assert!(ids.contains(&spawn.id.as_str()) && ids.contains(&command.id.as_str()));
+        let spawned = all.iter().find(|task| task.id == spawn.id).expect("listed");
+        assert_eq!(spawned.subagent_id, Some(child));
+        assert_eq!(
+            all.iter()
+                .find(|task| task.id == command.id)
+                .expect("listed")
+                .subagent_id,
+            None
+        );
+        let running = store
+            .background_store()
+            .list_all_background_tasks(Some(TaskStatus::Running))
+            .await
+            .expect("list");
+        assert_eq!(
+            running
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![spawn.id.as_str()]
+        );
     }
 
     #[tokio::test]

@@ -1089,9 +1089,12 @@ mod tests {
             .id;
         let prompt = crate::conversation::Message::user_turn("", "hello", Vec::new());
         store
-            .save_event_marking_inbox(session_id, &crate::conversation::Event::Append(prompt), &[
-                carried,
-            ])
+            .save_event_marking_inbox(
+                session_id,
+                &crate::conversation::Event::Append(prompt),
+                &[carried],
+                None,
+            )
             .await
             .expect("save with stamp");
         let not_before = Utc::now() + chrono::Duration::seconds(30);
@@ -1104,6 +1107,7 @@ mod tests {
                 },
                 &[carried],
                 not_before,
+                None,
             )
             .await
             .expect("withdraw with reset");
@@ -1143,6 +1147,7 @@ mod tests {
                     Vec::new(),
                 )),
                 &[delivered],
+                None,
             )
             .await
             .expect("save");
@@ -1156,6 +1161,7 @@ mod tests {
                     Vec::new(),
                 )),
                 &[undelivered],
+                None,
             )
             .await
             .expect("save");
@@ -1212,6 +1218,7 @@ mod tests {
                     Vec::new(),
                 )),
                 &[appended],
+                None,
             )
             .await
             .expect("save with stamp");

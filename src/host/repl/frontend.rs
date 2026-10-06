@@ -103,11 +103,12 @@ pub(super) fn indicator_action(event: &FrontendEvent, renders_reasoning: bool) -
         FrontendEvent::ThinkingDelta(_) | FrontendEvent::ThinkingBlock { .. } => {
             IndicatorAction::Erase
         }
-        FrontendEvent::TurnStarted => IndicatorAction::Drop,
+        FrontendEvent::TurnStarted { .. } => IndicatorAction::Drop,
         // Everything else means the thinking phase is over and nothing further will describe it,
         // so the indicator is the only record that the model spent that time.
         FrontendEvent::SessionStarted { .. }
         | FrontendEvent::TurnFinished
+        | FrontendEvent::TurnEnded { .. }
         | FrontendEvent::AssistantTextDelta(_)
         | FrontendEvent::ThinkingEnded
         | FrontendEvent::ToolCallComposing { .. }
@@ -218,7 +219,10 @@ impl Frontend for ReplFrontend {
             // Neither is a spacing signal any more. The blanks belong to the episode, which is
             // longer than a turn and outlives one that fails: a turn is simply one of the things
             // that can happen inside it.
-            FrontendEvent::TurnStarted => {}
+            FrontendEvent::TurnStarted { .. } => {}
+            // The terminal is the host's to print from the turn's result; the ending here is for
+            // a frontend that has no result in hand.
+            FrontendEvent::TurnEnded { .. } => {}
             // Nothing to draw. A typed prompt is never withdrawn here, and a scheduled fire's
             // withdrawal is the schedule's own bookkeeping, not news for the person at the
             // keyboard.
@@ -504,6 +508,7 @@ mod tests {
                 primary_param: Some("/tmp/x".to_string()),
                 input: serde_json::json!({"path": "/tmp/x"}),
                 cancellation,
+                subagent_id: None,
             }),
         )
         .await
@@ -727,6 +732,7 @@ mod tests {
                 primary_param: Some("rm -rf /".to_string()),
                 input: serde_json::json!({"command": "rm -rf /"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
+                subagent_id: None,
             })
             .await;
         assert_eq!(outcome, PermissionOutcome::Deny);
@@ -742,6 +748,7 @@ mod tests {
             primary_param: Some("/tmp/x".to_string()),
             input: serde_json::json!({"path": "/tmp/x"}),
             cancellation: tokio_util::sync::CancellationToken::new(),
+            subagent_id: None,
         }
     }
 
@@ -883,7 +890,12 @@ mod tests {
                 },
                 IndicatorAction::Erase,
             ),
-            (E::TurnStarted, IndicatorAction::Drop),
+            (
+                E::TurnStarted {
+                    turn_id: uuid::Uuid::nil(),
+                },
+                IndicatorAction::Drop,
+            ),
             // The rest close the phase out: the indicator is the only record of it.
             (E::ThinkingEnded, IndicatorAction::Commit),
             (E::TurnFinished, IndicatorAction::Commit),

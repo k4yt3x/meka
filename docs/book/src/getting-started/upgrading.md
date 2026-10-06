@@ -10,6 +10,57 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.69 to 0.70
+
+The HTTP API changes shape in the places below. The store gains a table of turns and a column
+naming each message's turn; the migration runs on open and needs nothing from you.
+
+**A blocking turn's response carries the turn's messages, and `final_text` and `tool_calls` are
+gone.** `messages` now holds what the turn added to the conversation, in the shape
+`GET /v1/sessions/{id}/messages` reads it back: the assistant's messages with their text, thinking
+and tool calls, and the tool-result messages that answered them. The reply a bot shows is the text
+blocks of the assistant messages, joined; a tool call is a `tool_use` block and its result the
+`tool_result` block on the user-role message after it.
+
+**`last_turn_at` is gone from the session record; `last_turn` replaces it.** The old field named
+the last turn of any outcome, only while this server held the session. `last_turn` is the
+session's latest turn, recorded for every host's turns, and says how it ended: `status`,
+`ended_at`, and a `stop_reason` or an `error`. `GET /v1/sessions/{id}/turns` lists them all.
+
+**`turn_id` on a message is the turn's id; the positional label is `turn_label`.** A message's
+`turn_id` was a dense label (`t_0001`, …) derived from its position; it is now the id of the turn
+that added the message, the one `turn.started` announced and `GET /v1/sessions/{id}/turns` lists,
+and the label moved to `turn_label` unchanged. A client that groups by the label reads
+`turn_label`; one that joins the feed to the history reads `turn_id`.
+
+**`used_percent` is gone from `GET /v1/sessions/{id}/context`.** Divide `used` by `window`; both
+are present exactly when the percentage was.
+
+**`vision` left `GET /v1/info` for `GET /v1/profiles`.** Read it on the entry of the profile a
+session runs on; the entry marked `active` is the one a session gets when it names none.
+
+**`GET /v1/sessions/{id}/schedule` is gone.** List one session's jobs with
+`GET /v1/schedule?session=<id>`; creating a job keeps its route.
+
+**`DELETE /v1/schedule/{job_id}` and `DELETE /v1/sessions/{id}/tasks/{task_id}` take the full
+id.** A prefix matches nothing and answers 404. `meka schedule cancel` and the `task_cancel` tool
+keep taking the short form.
+
+**`subagent.activity` is gone from the HTTP feed.** A sub-agent's tool calls are no longer
+summarized under the parent's `agent_spawn` call; while the parent runs a sub-agent, the
+sub-agent's own id answers `GET /v1/sessions/{id}/stream` with its feed, every call in full. The
+`permission_required` a sub-agent's call parks still arrives on the parent's feed, now naming
+the sub-agent in `subagent_id`. ACP clients are unaffected.
+
+**`GET /v1/sessions/{id}/stream` on a sub-agent's id answers `409`, not `422`.** While the parent
+runs the sub-agent it is the sub-agent's own feed; otherwise it is `409` `subagent-not-running`,
+a type of its own, where 0.69 answered `422` `session-not-drivable`. A client that branched on
+the `422` to recognize a sub-agent reads `parent_id` on the record instead.
+
+**Session archives are `format_version` 7.** Each session carries its `turns`, and each event
+names the turn that added it in `turn_id`, so an import keeps a session's turns under ids of its
+own. An archive of version 3 through 6 still imports, with no turns and no turn named.
+
 ## 0.67 to 0.68
 
 **`headers_helper` is a path beside `config.toml`, or absolute.** A relative name is resolved

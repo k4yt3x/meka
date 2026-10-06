@@ -32,6 +32,11 @@ pub(crate) enum TurnSource {
     Background,
     /// `POST /v1/sessions/{id}/compact`: the checkpoint turn a compaction runs.
     Compaction,
+    /// A sub-agent's turn, opened by its parent's spawn or follow-up.
+    Parent {
+        parent_id: Option<uuid::Uuid>,
+        tool_call_id: Option<String>,
+    },
 }
 
 impl TurnSource {
@@ -43,6 +48,7 @@ impl TurnSource {
             Self::Schedule { .. } => "schedule",
             Self::Background => "background",
             Self::Compaction => "compaction",
+            Self::Parent { .. } => "parent",
         }
     }
 
@@ -63,6 +69,17 @@ impl TurnSource {
             }
             Self::Schedule { job_id } => {
                 object.insert("job_id".into(), serde_json::json!(job_id));
+            }
+            Self::Parent {
+                parent_id,
+                tool_call_id,
+            } => {
+                if let Some(parent_id) = parent_id {
+                    object.insert("parent_id".into(), serde_json::json!(parent_id));
+                }
+                if let Some(tool_call_id) = tool_call_id {
+                    object.insert("tool_call_id".into(), serde_json::json!(tool_call_id));
+                }
             }
             Self::Client | Self::Background | Self::Compaction => {}
         }
@@ -280,7 +297,8 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
     let input = match crate::agent::TurnInput::from_parts(wakeup.render_prompt(), Vec::new()) {
         Ok(input) => input
             .retaining(job.prompt_retention())
-            .originating(crate::provider::TurnOrigin::Scheduled),
+            .originating(crate::provider::TurnOrigin::Scheduled)
+            .identified(turn_id),
         Err(empty) => {
             tracing::warn!("scheduled job {job_id} rendered no prompt: {empty}");
             return FireOutcome::Unrunnable;
@@ -482,7 +500,7 @@ where
         let _published = entry
             .cancel
             .publish_turn(cancellation.clone(), busy.admission, turn_id);
-        let input = crate::agent::TurnInput::outcomes(ready);
+        let input = crate::agent::TurnInput::outcomes(ready).identified(turn_id);
         hooks.begin_turn(&entry, turn_id, TurnSource::Background);
         let outcome = entry
             .agent
@@ -662,7 +680,9 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
         let _published = entry
             .cancel
             .publish_turn(cancellation.clone(), busy.admission, turn_id);
-        let Ok(input) = crate::agent::TurnInput::inbox(items) else {
+        let Ok(input) =
+            crate::agent::TurnInput::inbox(items).map(|input| input.identified(turn_id))
+        else {
             // Unreachable while the door refuses an empty message; left due, the sweeper would
             // ask again at once.
             tracing::warn!("inbox items for session {session_id} carry no words; they wait");

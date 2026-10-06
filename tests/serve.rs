@@ -269,6 +269,19 @@ impl Drop for ServeTestHarness {
     }
 }
 
+/// The assistant's words in a blocking response: the text blocks of its assistant messages, joined.
+fn assistant_text(body: &serde_json::Value) -> String {
+    body["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|message| message["role"] == "assistant")
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .filter(|block| block["type"] == "text")
+        .filter_map(|block| block["text"].as_str())
+        .collect()
+}
+
 fn mock_simple_turn() -> serde_json::Value {
     serde_json::json!([
         [
@@ -397,7 +410,7 @@ fn create_and_list_session_round_trip() {
 }
 
 #[test]
-fn blocking_turn_returns_final_text_from_mock_provider() {
+fn blocking_turn_returns_the_assistants_text_from_mock_provider() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
@@ -416,7 +429,7 @@ fn blocking_turn_returns_final_text_from_mock_provider() {
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().expect("parse");
     assert_eq!(body["stop_reason"], "end_turn");
-    assert_eq!(body["final_text"], "hello from agent");
+    assert_eq!(assistant_text(&body), "hello from agent");
     assert_eq!(body["session_id"], id);
 }
 
@@ -544,10 +557,33 @@ fn fork_copies_the_conversation_into_a_new_session() {
             .json()
             .expect("parse")
     };
+    // The copy's turns are its own, so its messages name ids of their own; everything else is
+    // the source's exactly.
+    let without_turns = |session: &str| -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        let mut messages = messages_of(session)["messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let turns = messages
+            .iter_mut()
+            .map(|message| {
+                message
+                    .as_object_mut()
+                    .and_then(|message| message.remove("turn_id"))
+                    .unwrap_or(serde_json::Value::Null)
+            })
+            .collect();
+        (messages, turns)
+    };
+    let (fork_messages, fork_turns) = without_turns(&fork_id);
+    let (source_messages, source_turns) = without_turns(&id);
     assert_eq!(
-        messages_of(&fork_id)["messages"],
-        messages_of(&id)["messages"],
+        fork_messages, source_messages,
         "the fork starts from the source's exact conversation",
+    );
+    assert!(
+        fork_turns.iter().all(|turn| turn.is_string()) && fork_turns != source_turns,
+        "the copy's messages name turns of the copy's own: {fork_turns:?} vs {source_turns:?}"
     );
 
     // The fork is immediately usable, and using it leaves the source alone.
@@ -2158,7 +2194,7 @@ fn parallel_job_creates_respect_max_jobs() {
         "{statuses:?}"
     );
     let jobs: serde_json::Value = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/schedule"))
+        .request(reqwest::Method::GET, &format!("/v1/schedule?session={id}"))
         .send()
         .expect("send")
         .json()
@@ -2676,6 +2712,21 @@ fn mid_turn_permission_round_trips() {
                     payload["expires_in_seconds"], 1800,
                     "the approval timeout is the thirty minutes every host shares: {payload}"
                 );
+                assert!(
+                    payload["expires_at"].as_str().is_some(),
+                    "the deadline is absolute too, for a reader handed the event late: {payload}"
+                );
+                let record: serde_json::Value = respond_client
+                    .get(format!("{base_url}/v1/sessions/{id_for_stream}"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .send()
+                    .expect("get")
+                    .json()
+                    .expect("parse");
+                assert_eq!(
+                    record["approvals_pending"], 1,
+                    "the record counts the parked prompt: {record}"
+                );
                 let request_id = payload["request_id"]
                     .as_str()
                     .expect("request_id")
@@ -2713,6 +2764,9 @@ fn mid_turn_permission_round_trips() {
         saw_finished,
         "stream must reach `turn.finished` after the deny resolves; body was:\n{body}",
     );
+    let resolved = sse_event_data(&body, "permission_resolved")
+        .unwrap_or_else(|| panic!("the feed says how the prompt closed: {body}"));
+    assert_eq!(resolved["outcome"], "deny", "{resolved}");
 }
 
 /// Streaming turn that executes a scripted tool call emits both `tool_call.executing` and
@@ -2978,7 +3032,7 @@ fn a_session_reads_the_listed_files_from_the_directory_the_client_chose() {
     let status = response.status();
     let body: serde_json::Value = response.json().expect("parse");
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["final_text"], "in haiku");
+    assert_eq!(assistant_text(&body), "in haiku");
 }
 
 /// The whole point of inline image attachments: a client on another host has no filesystem in
@@ -2999,7 +3053,7 @@ fn blocking_turn_accepts_inline_image_attachment() {
         .expect("send");
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["final_text"], "hello from agent");
+    assert_eq!(assistant_text(&body), "hello from agent");
 }
 
 /// Where a held turn waits, under the install: the path the server's `MEKA_MOCK_TURN_HOLD` names.
@@ -3095,7 +3149,7 @@ fn a_session_evicted_while_its_turn_is_validated_is_reattached_and_run() {
 
     let (status, body) = turn.join().expect("turn thread");
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["final_text"], "hello from agent");
+    assert_eq!(assistant_text(&body), "hello from agent");
 }
 
 /// The images are judged against the profile the turn is admitted on, not only the one the decode
@@ -3578,20 +3632,6 @@ fn an_image_is_judged_against_the_profile_the_session_runs_on() {
 }
 
 #[test]
-fn info_reports_the_vision_capability() {
-    let harness = ServeTestHarness::spawn("", mock_simple_turn());
-    let response = harness
-        .request(reqwest::Method::GET, "/v1/info")
-        .send()
-        .expect("send");
-    assert_eq!(response.status(), 200);
-    let body: serde_json::Value = response.json().expect("parse");
-    assert_eq!(body["vision"], true);
-}
-
-/// A client shows only the controls its token allows, and the token is the one thing about the
-/// caller the server knows. Sorted, so two tokens configured in different orders read the same.
-#[test]
 fn info_reports_the_scopes_the_calling_token_holds() {
     let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
@@ -3867,7 +3907,7 @@ fn a_blocking_turn_retries_even_with_reasoning_enabled() {
         response.text().unwrap_or_default()
     );
     let body = response.json::<serde_json::Value>().expect("parse");
-    assert_eq!(body["final_text"], "answer");
+    assert_eq!(assistant_text(&body), "answer");
 }
 
 /// The retry survives a blocking turn that follows a streamed one on the same session.
@@ -5021,7 +5061,8 @@ fn a_reattached_session_compacts_on_the_measurement_its_row_recorded() {
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().expect("parse");
     assert_eq!(
-        body["final_text"], "fourth",
+        assistant_text(&body),
+        "fourth",
         "the re-attached turn must compact first, spending the summarizer's round: {body}"
     );
 }
@@ -5258,13 +5299,13 @@ fn idempotency_cache_does_not_persist_turn_in_flight_409() {
         third.status(),
     );
     let body: serde_json::Value = third.json().expect("parse");
-    assert_eq!(body["final_text"], "retry done");
+    assert_eq!(assistant_text(&body), "retry done");
 }
 
 /// Validate the blocking turn response shape (`tool_calls`, `usage`, `messages`) end-to-end.
 /// Script a tool call and assert the fields are populated with the shapes the spec documents.
 #[test]
-fn blocking_turn_response_carries_tool_calls_messages_and_usage() {
+fn blocking_turn_response_carries_the_turns_messages_and_usage() {
     let script = serde_json::json!([
         [
             { "type": "tool_use_start", "id": "tu_1", "name": "list_directory" },
@@ -5294,19 +5335,29 @@ fn blocking_turn_response_carries_tool_calls_messages_and_usage() {
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().expect("parse");
     assert_eq!(body["stop_reason"], "end_turn");
-    assert_eq!(body["final_text"], "done listing");
+    assert_eq!(assistant_text(&body), "done listing");
 
-    let tool_calls = body["tool_calls"].as_array().expect("tool_calls array");
+    let blocks: Vec<&serde_json::Value> = body["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .collect();
+    let call = blocks
+        .iter()
+        .find(|block| block["type"] == "tool_use")
+        .unwrap_or_else(|| panic!("the scripted call is a tool_use block: {body}"));
+    assert_eq!(call["id"], "tu_1");
+    assert_eq!(call["name"], "list_directory");
     assert!(
-        !tool_calls.is_empty(),
-        "tool_calls must include the scripted tool call",
+        call["input"].is_object(),
+        "tool_use input must be a JSON object"
     );
-    assert_eq!(tool_calls[0]["id"], "tu_1");
-    assert_eq!(tool_calls[0]["name"], "list_directory");
-    assert!(
-        tool_calls[0]["input"].is_object(),
-        "tool_call input must be a JSON object",
-    );
+    let result = blocks
+        .iter()
+        .find(|block| block["type"] == "tool_result")
+        .unwrap_or_else(|| panic!("its result is a tool_result block: {body}"));
+    assert_eq!(result["tool_use_id"], "tu_1");
 
     let usage = &body["usage"];
     assert!(
@@ -5382,10 +5433,9 @@ fn refusal_stop_reason_propagates_through_blocking_response() {
         body["stop_reason"], "refusal",
         "stop_reason must propagate the refusal terminal state",
     );
-    // `final_text` carries the assistant's pre-refusal text (the mock sent it as a normal text
-    // delta before the message_end:refusal). Clients surface both fields together when
-    // stop_reason is refusal.
-    assert_eq!(body["final_text"], "I can't help with that.");
+    // The assistant's pre-refusal text (the mock sent it as a normal text delta before the
+    // message_end:refusal) is in `messages`; clients show it beside `refusal_text`.
+    assert_eq!(assistant_text(&body), "I can't help with that.");
 }
 
 /// SSE event ids form a dense, monotonic 0-based sequence with no gaps.
@@ -5727,8 +5777,15 @@ fn blocking_turn_with_approvals_auto_denies_with_notice() {
         }),
         "the refusal must be announced as a warn notice; got {body}"
     );
+    let refused_result = body["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .find(|block| block["type"] == "tool_result")
+        .unwrap_or_else(|| panic!("the refused call has a result block: {body}"));
     assert_eq!(
-        body["tool_calls"][0]["is_error"], true,
+        refused_result["is_error"], true,
         "the refused call is reported as an error, not as having run"
     );
     assert!(
@@ -5808,6 +5865,10 @@ fn terminal_sse_events_carry_turn_id_and_session_id() {
     assert!(
         payload["turn_id"].is_string(),
         "turn.finished must include turn_id; payload: {payload}",
+    );
+    assert_eq!(
+        payload["revision"], 0,
+        "every terminal carries the conversation's revision: {payload}"
     );
 }
 
@@ -6011,15 +6072,15 @@ fn option_fields_are_absent_not_null_when_unset() {
         .as_str()
         .expect("id")
         .to_string();
-    // Before the first turn, last_turn_at should be absent (not serialized as null).
+    // Before the first turn, last_turn should be absent (not serialized as null).
     let pre_turn = harness
         .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
         .send()
         .expect("pre-turn get");
     let pre_turn_text = pre_turn.text().expect("text");
     assert!(
-        !pre_turn_text.contains("\"last_turn_at\""),
-        "last_turn_at must be absent before the first turn; body was:\n{pre_turn_text}",
+        !pre_turn_text.contains("\"last_turn\""),
+        "last_turn must be absent before the first turn; body was:\n{pre_turn_text}",
     );
 
     let response = harness
@@ -6034,8 +6095,7 @@ fn option_fields_are_absent_not_null_when_unset() {
         !body_text.contains("\"refusal_text\":null"),
         "refusal_text must be absent (not null) on non-refusal turns; body was:\n{body_text}",
     );
-    // tool_calls is an empty array for this turn, so display_summary won't appear at all
-    // here, but verify that the SessionResponse.cwd field on GET is a string, not null.
+    // Verify that the SessionResponse.cwd field on GET is a string, not null.
     let get = harness
         .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
         .send()
@@ -6048,9 +6108,15 @@ fn option_fields_are_absent_not_null_when_unset() {
         session["cwd"],
     );
     assert!(
-        session["last_turn_at"].is_string(),
-        "last_turn_at must be a timestamp string after a turn; got: {}",
-        session["last_turn_at"],
+        session["last_turn"]["ended_at"].is_string(),
+        "last_turn must carry when the turn ended; got: {}",
+        session["last_turn"],
+    );
+    assert!(
+        session["last_turn"].get("stop_reason").is_some()
+            && session["last_turn"].get("error").is_none(),
+        "a turn that succeeded names its stop reason and no error; got: {}",
+        session["last_turn"],
     );
 }
 
@@ -6428,10 +6494,6 @@ fn context_endpoint_omits_used_before_any_turn() {
     assert!(
         body.get("used").is_none(),
         "an unmeasured window must omit `used`, not report 0: {body}"
-    );
-    assert!(
-        body.get("used_percent").is_none(),
-        "occupancy cannot be computed without `used`: {body}"
     );
 }
 
@@ -7103,11 +7165,11 @@ fn import_rejects_a_malformed_envelope() {
     );
 }
 
-/// Every surface that prints a job id to a human prints the 8-character short form, so that is
-/// what gets pasted here. Canceling on it must work, and an id matching nothing must say so
-/// rather than answering 204 over a job that is still firing.
+/// A job is canceled by its full id, which is what a client of this API holds. An id matching
+/// nothing must say so rather than answering 204 over a job that is still firing, and the short
+/// form a terminal prints is no id here: that ergonomic is the CLI's.
 #[test]
-fn canceling_a_scheduled_job_takes_a_prefix_and_reports_a_miss() {
+fn canceling_a_scheduled_job_takes_its_full_id_and_reports_a_miss() {
     let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
         "sessions:w",
@@ -7154,15 +7216,20 @@ fn canceling_a_scheduled_job_takes_a_prefix_and_reports_a_miss() {
     assert_eq!(body["type"], "https://meka.run/errors/not-found");
 
     let short = &job_id[..8];
-    let cancel = harness
+    let prefix = harness
         .request(reqwest::Method::DELETE, &format!("/v1/schedule/{short}"))
         .send()
         .expect("send");
     assert_eq!(
-        cancel.status(),
-        204,
-        "the short form printed by `meka schedule list` must cancel"
+        prefix.status(),
+        404,
+        "a prefix is not an id on this API, so it matches nothing"
     );
+    let cancel = harness
+        .request(reqwest::Method::DELETE, &format!("/v1/schedule/{job_id}"))
+        .send()
+        .expect("send");
+    assert_eq!(cancel.status(), 204);
 
     let after: serde_json::Value = harness
         .request(reqwest::Method::GET, "/v1/schedule")
@@ -7391,7 +7458,7 @@ fn a_job_that_could_never_fire_is_refused_and_an_existing_one_is_reported() {
     let listed = harness
         .client
         .get(format!(
-            "{}/v1/sessions/{}/schedule",
+            "{}/v1/schedule?session={}",
             harness.base_url, session
         ))
         .header("Authorization", "Bearer sk_test_full")
@@ -7796,7 +7863,7 @@ fn scheduled_job_create_list_and_cancel_round_trip() {
     );
 
     let scoped: serde_json::Value = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/schedule"))
+        .request(reqwest::Method::GET, &format!("/v1/schedule?session={id}"))
         .send()
         .expect("send")
         .json()
@@ -7810,7 +7877,7 @@ fn scheduled_job_create_list_and_cancel_round_trip() {
     assert_eq!(cancel.status(), 204);
 
     let after: serde_json::Value = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/schedule"))
+        .request(reqwest::Method::GET, &format!("/v1/schedule?session={id}"))
         .send()
         .expect("send")
         .json()
@@ -9232,14 +9299,18 @@ fn a_detached_commands_output_is_not_streamed_after_its_turn() {
     );
 }
 
-/// What a sub-agent is doing shows on the parent's feed under the parent's `agent_spawn` call,
-/// the only call the client has been told about, as the rolling block ACP shows.
+/// A running sub-agent's id names its own feed: the same events a session's feed carries, each
+/// tool call in full, opened by a `turn.started` naming the parent and its `agent_spawn` call and
+/// closed by a terminal that carries no `revision`, since a worker's transcript is not the
+/// parent's. It is read, never attended, and it exists only while the parent runs the worker; the
+/// parent's own feed carries no rollup of it.
 #[test]
-fn a_sub_agents_tool_calls_show_as_activity_on_the_parents_feed() {
+fn a_running_sub_agents_feed_streams_its_tool_calls_and_its_terminal() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let notes = workspace.path().join("notes.txt");
     std::fs::write(&notes, "hello").expect("write notes");
-    // The parent's spawn, the worker's read and its reply, then the parent's closing text.
+    // The parent's spawn, the worker's read and its reply, then the parent's closing text. The
+    // worker's first round waits, so the test opens its feed while the turn is in flight.
     let script = serde_json::json!([
         [
             { "type": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
@@ -9247,6 +9318,7 @@ fn a_sub_agents_tool_calls_show_as_activity_on_the_parents_feed() {
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
+            { "type": "sleep", "ms": 1500 },
             { "type": "tool_use_start", "id": "tu_w", "name": "file_read" },
             { "type": "tool_use_end", "input": {"path": notes} },
             { "type": "message_end", "stop_reason": "tool_use" }
@@ -9266,46 +9338,236 @@ fn a_sub_agents_tool_calls_show_as_activity_on_the_parents_feed() {
         .json(&serde_json::json!({"cwd": workspace.path().to_string_lossy()}))
         .send()
         .expect("create");
-    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+    let parent = create.json::<serde_json::Value>().expect("parse")["id"]
         .as_str()
         .expect("id")
         .to_string();
-    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let parent_feed = open_feed(&harness, &parent, None, Duration::from_secs(30));
     let accepted = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{parent}/inbox"),
+        )
         .json(&serde_json::json!({"message": "delegate it", "class": "followup"}))
         .send()
         .expect("send");
     assert_eq!(accepted.status(), 202);
 
-    let body = read_feed_until(feed, |text| text.contains("event: turn.finished"));
-    let activity = sse_event_data(&body, "subagent.activity")
-        .unwrap_or_else(|| panic!("the worker's tool call shows on the parent's feed: {body}"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let worker = loop {
+        let children = children_of(&harness, &parent);
+        if let Some(child) = children
+            .iter()
+            .find(|child| child["turn_in_flight"] == true)
+        {
+            break child["id"].as_str().expect("id").to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the worker should have appeared as running: {children:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // The record says running, so the feed is there: no retry loop papers over a window between
+    // the two.
+    let attending = open_feed_with(
+        &harness,
+        &worker,
+        "?attend=true",
+        None,
+        Duration::from_secs(30),
+    );
     assert_eq!(
-        activity["id"], "tu_1",
-        "filed under the parent's call: {activity}"
+        attending.status(),
+        422,
+        "a worker's feed is read, not attended"
+    );
+    let problem: serde_json::Value = attending.json().expect("parse");
+    assert_eq!(
+        problem["type"].as_str(),
+        Some("https://meka.run/errors/session-not-drivable"),
+        "{problem}"
+    );
+    let feed = open_feed(&harness, &worker, None, Duration::from_secs(30));
+    assert_eq!(feed.status(), 200, "the worker's feed opens while it runs");
+    let body = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+
+    let started = sse_event_data(&body, "turn.started")
+        .unwrap_or_else(|| panic!("the worker's turn opens its feed: {body}"));
+    assert_eq!(started["source"], "parent", "{started}");
+    assert_eq!(started["parent_id"], parent, "{started}");
+    assert_eq!(started["tool_call_id"], "tu_1", "{started}");
+    assert_eq!(started["session_id"], worker, "{started}");
+    let call = sse_event_data(&body, "tool_call.executing")
+        .unwrap_or_else(|| panic!("the worker's tool call streams in full: {body}"));
+    assert_eq!(call["id"], "tu_w", "{call}");
+    assert_eq!(call["name"], "file_read", "{call}");
+    assert_eq!(
+        call["input"]["path"],
+        notes.to_string_lossy().as_ref(),
+        "{call}"
+    );
+    let finished = sse_event_data(&body, "turn.finished")
+        .unwrap_or_else(|| panic!("the worker's terminal closes its feed: {body}"));
+    assert_eq!(finished["session_id"], worker, "{finished}");
+    assert_eq!(finished["stop_reason"], "end_turn", "{finished}");
+    assert!(
+        finished.get("revision").is_none(),
+        "a worker's terminal names no revision, since its transcript is not the parent's: \
+         {finished}"
+    );
+
+    let parent_body = read_feed_until(parent_feed, |text| text.contains("event: turn.finished"));
+    assert!(
+        !parent_body.contains("event: subagent.activity"),
+        "the parent's feed carries no rollup of the worker: {parent_body}"
+    );
+    let gone = open_feed(&harness, &worker, None, Duration::from_secs(5));
+    assert_eq!(
+        gone.status(),
+        409,
+        "once the parent's run ends there is no worker feed to read"
+    );
+    let problem: serde_json::Value = gone.json().expect("parse");
+    assert_eq!(
+        problem["type"].as_str(),
+        Some("https://meka.run/errors/subagent-not-running"),
+        "{problem}"
     );
     assert!(
-        activity["summary"]
+        problem["detail"]
             .as_str()
-            .is_some_and(|summary| summary.contains("file_read")),
-        "{activity}"
-    );
-    let block = body
-        .split("\n\n")
-        .find(|block| block.contains("event: subagent.activity"))
-        .expect("the activity block");
-    assert!(
-        !block.lines().any(|line| line.starts_with("id:")),
-        "progress carries no id: {block}"
+            .is_some_and(|detail| detail.contains(&parent) && detail.contains("parent runs it")),
+        "the refusal says whose run the feed belongs to: {problem}"
     );
 }
 
-// --------------------------------------------------------------------------- The session inbox.
-// ---------------------------------------------------------------------------
+/// A worker's prompt parks on its parent's feed, where the one answerer is, and the worker's own
+/// feed mirrors the prompt and its resolution, so a reader of the worker sees why it is waiting
+/// and knows where to answer.
+#[test]
+fn a_sub_agents_feed_mirrors_the_prompt_parked_on_its_parent() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let path = workspace.path().join("by-the-worker.txt");
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
+            { "type": "tool_use_end", "input": {"prompt": "write the file"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "sleep", "ms": 1500 },
+            { "type": "tool_use_start", "id": "tu_w", "name": "file_write" },
+            { "type": "tool_use_end", "input": {"path": path, "content": "hi"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "worker done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "dispatched" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": workspace.path().to_string_lossy(),
+            "permission": "read",
+            "approvals": true,
+            "capabilities": {"supports_permission_prompts": false},
+        }))
+        .send()
+        .expect("create");
+    assert_eq!(create.status(), 201);
+    let parent = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let parent_feed = open_feed_with(
+        &harness,
+        &parent,
+        "?attend=true",
+        None,
+        Duration::from_secs(30),
+    );
+    let accepted = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{parent}/inbox"),
+        )
+        .json(&serde_json::json!({"message": "delegate it", "class": "followup"}))
+        .send()
+        .expect("send");
+    assert_eq!(accepted.status(), 202);
 
-/// The asynchronous door: an item on an idle session starts a turn of its own, and the feed says
-/// who started it and when the model read the item.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let worker = loop {
+        let children = children_of(&harness, &parent);
+        if let Some(child) = children
+            .iter()
+            .find(|child| child["turn_in_flight"] == true)
+        {
+            break child["id"].as_str().expect("id").to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the worker should have appeared as running: {children:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // A per-read timeout shorter than the keep-alive interval, so a mirror that never comes fails
+    // the test rather than holding it open on keep-alives.
+    let worker_feed = open_feed(&harness, &worker, None, Duration::from_secs(10));
+    assert_eq!(worker_feed.status(), 200);
+
+    let (until_prompt, parent_feed) = read_feed_until_open(parent_feed, |text| {
+        text.contains("event: permission_required") || text.contains("event: turn.finished")
+    });
+    let prompt = sse_event_data(&until_prompt, "permission_required").unwrap_or_else(|| {
+        panic!("the worker's prompt parks on the parent's feed: {until_prompt}")
+    });
+    assert_eq!(prompt["subagent_id"], worker, "{prompt}");
+    let request_id = prompt["request_id"].as_str().expect("request id");
+    let (mirrored, worker_feed) = read_feed_until_open(worker_feed, |text| {
+        text.contains("event: permission_required")
+    });
+    let mirror = sse_event_data(&mirrored, "permission_required")
+        .unwrap_or_else(|| panic!("the worker's feed mirrors the prompt: {mirrored}"));
+    assert_eq!(mirror["request_id"], request_id, "{mirror}");
+    assert_eq!(mirror["subagent_id"], worker, "{mirror}");
+
+    let answered = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{parent}/responses/{request_id}"),
+        )
+        .json(&serde_json::json!({"outcome": "allow"}))
+        .send()
+        .expect("send");
+    assert_eq!(answered.status(), 204, "answered where it is parked");
+    let rest = read_feed_until(worker_feed, |text| text.contains("event: turn.finished"));
+    let resolved = sse_event_data(&rest, "permission_resolved")
+        .unwrap_or_else(|| panic!("the worker's feed mirrors the resolution: {rest}"));
+    assert_eq!(resolved["request_id"], request_id, "{resolved}");
+    assert_eq!(resolved["outcome"], "allow", "{resolved}");
+    assert!(
+        sse_event_data(&rest, "tool_call.completed").is_some(),
+        "the approved call then runs on the worker's feed: {rest}"
+    );
+    let parent_rest = read_feed_until(parent_feed, |text| text.contains("event: turn.finished"));
+    assert!(
+        parent_rest.contains("event: permission_resolved"),
+        "and the parent's feed resolves the prompt it parked: {parent_rest}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the approved write landed"),
+        "hi"
+    );
+}
+
 #[test]
 fn an_inbox_item_on_an_idle_session_starts_a_turn_and_the_feed_reports_its_delivery() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
@@ -10772,11 +11034,11 @@ fn canceling_a_running_background_task_stops_it() {
     let cancel = harness
         .request(
             reqwest::Method::DELETE,
-            &format!("/v1/sessions/{}/tasks/{}", id, &task_id[..8]),
+            &format!("/v1/sessions/{id}/tasks/{task_id}"),
         )
         .send()
         .expect("send");
-    assert_eq!(cancel.status(), 204, "a prefix must resolve to the task");
+    assert_eq!(cancel.status(), 204, "the full id names the task");
 
     let after: serde_json::Value = harness
         .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/tasks"))
@@ -10871,7 +11133,7 @@ fn a_canceled_task_rides_on_the_next_turn_instead_of_causing_one() {
     let cancel = harness
         .request(
             reqwest::Method::DELETE,
-            &format!("/v1/sessions/{}/tasks/{}", id, &task_id[..8]),
+            &format!("/v1/sessions/{id}/tasks/{task_id}"),
         )
         .send()
         .expect("send");
@@ -11092,7 +11354,7 @@ fn a_fire_that_fails_keeps_the_outcome_riding_on_it() {
     let cancel = harness
         .request(
             reqwest::Method::DELETE,
-            &format!("/v1/sessions/{}/tasks/{}", id, &task_id[..8]),
+            &format!("/v1/sessions/{id}/tasks/{task_id}"),
         )
         .send()
         .expect("send");
@@ -11210,7 +11472,7 @@ fn a_scheduled_fire_announces_what_it_claims() {
     let cancel = harness
         .request(
             reqwest::Method::DELETE,
-            &format!("/v1/sessions/{}/tasks/{}", id, &task_id[..8]),
+            &format!("/v1/sessions/{id}/tasks/{task_id}"),
         )
         .send()
         .expect("send");
@@ -11284,7 +11546,7 @@ fn a_scheduled_fire_carries_a_cancellation_that_was_waiting() {
     let cancel = harness
         .request(
             reqwest::Method::DELETE,
-            &format!("/v1/sessions/{}/tasks/{}", id, &task_id[..8]),
+            &format!("/v1/sessions/{id}/tasks/{task_id}"),
         )
         .send()
         .expect("send");
@@ -11399,7 +11661,7 @@ fn a_canceled_task_is_announced_without_being_delivered() {
     let cancel = harness
         .request(
             reqwest::Method::DELETE,
-            &format!("/v1/sessions/{}/tasks/{}", id, &task_id[..8]),
+            &format!("/v1/sessions/{id}/tasks/{task_id}"),
         )
         .send()
         .expect("send");
@@ -15199,4 +15461,910 @@ fn a_read_shell_inherits_only_its_standard_descriptors() {
              handle, got {targets:?} with strays {stray:?}"
         );
     }
+}
+
+/// An edit decided on one reading of the conversation lands only on that reading: the tag
+/// `GET /messages` answers with is honored as `If-Match`, a stale one is refused with the current
+/// state, the edit answers with the new tag, and every feed reader is told the view was rewritten.
+#[test]
+fn a_rewind_is_refused_under_a_stale_tag_and_announced_under_a_fresh_one() {
+    let harness = ServeTestHarness::spawn("", mock_turns(4));
+    let id = session_with_one_turn(&harness);
+    let read = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send");
+    let tag = read
+        .headers()
+        .get("etag")
+        .expect("the view carries a tag")
+        .to_str()
+        .expect("ascii")
+        .to_string();
+    let view: serde_json::Value = read.json().expect("parse");
+    assert_eq!(
+        tag,
+        format!("\"{}-{}\"", view["revision"], view["total"]),
+        "the tag is the revision and the length together"
+    );
+
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+
+    let stale = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/rewind"))
+        .header("If-Match", "\"0-999\"")
+        .json(&serde_json::json!({"turns": 1}))
+        .send()
+        .expect("send");
+    assert_eq!(stale.status(), 412);
+    let problem: serde_json::Value = stale.json().expect("parse");
+    assert_eq!(
+        problem["type"],
+        "https://meka.run/errors/precondition-failed"
+    );
+    assert_eq!(problem["revision"], view["revision"], "{problem}");
+    assert_eq!(problem["total"], view["total"], "{problem}");
+    let unchanged: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        unchanged["total"], view["total"],
+        "a refused edit changes nothing"
+    );
+
+    let rewound = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/rewind"))
+        .header("If-Match", &tag)
+        .json(&serde_json::json!({"turns": 1}))
+        .send()
+        .expect("send");
+    assert_eq!(rewound.status(), 200, "{}", rewound.text().expect("text"));
+    let new_tag = rewound
+        .headers()
+        .get("etag")
+        .expect("the edit answers with the new tag")
+        .to_str()
+        .expect("ascii")
+        .to_string();
+    let outcome: serde_json::Value = rewound.json().expect("parse");
+    assert_eq!(new_tag, format!("\"1-{}\"", outcome["messages_after"]));
+    let after = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send");
+    assert_eq!(
+        after
+            .headers()
+            .get("etag")
+            .expect("tag")
+            .to_str()
+            .expect("ascii"),
+        new_tag,
+        "the tag the rewind answered with is the one a read now gives"
+    );
+
+    let body = read_feed_until(feed, |text| text.contains("event: conversation.rewound"));
+    let event = sse_event_data(&body, "conversation.rewound")
+        .unwrap_or_else(|| panic!("the feed says the view was rewritten: {body}"));
+    assert_eq!(event["revision"], 1, "{event}");
+    assert_eq!(event["turns_removed"], 1, "{event}");
+    assert_eq!(event["total"], outcome["messages_after"], "{event}");
+}
+
+/// What a client watching the feed learns from the terminal, a client reading the record learns
+/// from `last_turn`: nothing before a turn has ended, how it ended afterwards.
+#[test]
+fn the_record_says_how_the_last_turn_ended() {
+    let script = serde_json::json!([
+        [
+            { "type": "text", "text": "first" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "sleep", "ms": 2000 },
+            { "type": "text", "text": "never reaches anyone" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let record = |harness: &ServeTestHarness| -> serde_json::Value {
+        harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse")
+    };
+    let fresh = record(&harness);
+    assert!(
+        fresh.get("last_turn").is_none(),
+        "no turn has ended, so nothing is said: {fresh}"
+    );
+
+    let turn = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "hi"}))
+        .send()
+        .expect("send");
+    assert_eq!(turn.status(), 200);
+    let reply: serde_json::Value = turn.json().expect("parse");
+    let turn_id = reply["turn_id"].as_str().expect("turn id").to_string();
+    assert!(
+        reply["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .all(|message| message["turn_id"] == turn_id),
+        "the reply's messages name the turn that made them: {reply}"
+    );
+    let after = record(&harness);
+    assert_eq!(after["last_turn"]["id"], turn_id, "{after}");
+    assert_eq!(after["last_turn"]["source"], "client", "{after}");
+    assert!(after["last_turn"]["started_at"].is_string(), "{after}");
+    assert_eq!(after["last_turn"]["status"], "succeeded", "{after}");
+    assert_eq!(after["last_turn"]["stop_reason"], "end_turn", "{after}");
+    assert!(after["last_turn"]["ended_at"].is_string(), "{after}");
+    assert!(
+        after["last_turn"]["usage"]["input_tokens"].is_number(),
+        "{after}"
+    );
+    assert!(after["last_turn"].get("error").is_none(), "{after}");
+
+    let history: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let stamped: Vec<&serde_json::Value> = history["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|message| &message["turn_id"])
+        .collect();
+    assert!(
+        stamped.len() == 2 && stamped.iter().all(|stamp| **stamp == turn_id),
+        "the prompt and the reply both name the turn: {history}"
+    );
+    assert_eq!(history["messages"][0]["turn_label"], "t_0001", "{history}");
+
+    let listed: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/turns"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        listed["turns"].as_array().expect("turns").len(),
+        1,
+        "{listed}"
+    );
+    assert_eq!(listed["turns"][0]["id"], turn_id, "{listed}");
+    assert_eq!(listed["turns"][0]["status"], "succeeded", "{listed}");
+    assert!(listed.get("next_before").is_none(), "one page: {listed}");
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let id_for_turn = id.clone();
+    let turn_handle = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{base_url}/v1/sessions/{id_for_turn}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"message": "go"}))
+            .send()
+            .expect("turn send")
+    });
+    harness.wait_until_in_flight(&id);
+    let cancel = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/cancel"))
+        .send()
+        .expect("cancel send");
+    assert_eq!(cancel.status(), 204);
+    assert_eq!(turn_handle.join().expect("turn join").status(), 409);
+    let canceled = record(&harness);
+    assert_eq!(canceled["last_turn"]["status"], "canceled", "{canceled}");
+    assert_ne!(
+        canceled["last_turn"]["id"], turn_id,
+        "the latest turn, not the first"
+    );
+    assert!(
+        canceled["last_turn"].get("stop_reason").is_none(),
+        "{canceled}"
+    );
+    assert!(canceled["last_turn"].get("error").is_none(), "{canceled}");
+    let listed: serde_json::Value = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{id}/turns?limit=1"),
+        )
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        listed["turns"][0]["status"], "canceled",
+        "newest first: {listed}"
+    );
+    let older: serde_json::Value = harness
+        .request(
+            reqwest::Method::GET,
+            &format!(
+                "/v1/sessions/{id}/turns?limit=1&before={}",
+                listed["next_before"].as_str().expect("more remain")
+            ),
+        )
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(older["turns"][0]["id"], turn_id, "{older}");
+    assert!(older.get("next_before").is_none(), "{older}");
+}
+
+fn spawning_script() -> serde_json::Value {
+    serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
+            { "type": "tool_use_end", "input": {"prompt": "count the files"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "sleep", "ms": 1500 },
+            { "type": "text", "text": "worker done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "dispatched" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ])
+}
+
+fn children_of(harness: &ServeTestHarness, parent: &str) -> Vec<serde_json::Value> {
+    harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions?parent={parent}"),
+        )
+        .send()
+        .expect("send")
+        .json::<serde_json::Value>()
+        .expect("parse")["sessions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// `parent` lists a session's direct children and nothing else: what a tree view asks for per
+/// expanded node, and what an audit asks to learn what a session spawned.
+#[test]
+fn the_listing_filters_by_parent() {
+    let harness = ServeTestHarness::spawn("", spawning_script());
+    let parent = session_with_one_turn(&harness);
+    let children = children_of(&harness, &parent);
+    assert_eq!(children.len(), 1, "{children:?}");
+    assert_eq!(children[0]["parent_id"], parent, "{children:?}");
+    let worker = children[0]["id"].as_str().expect("id");
+    assert!(
+        children_of(&harness, worker).is_empty(),
+        "the worker spawned nothing"
+    );
+    assert!(
+        children_of(&harness, &uuid::Uuid::new_v4().to_string()).is_empty(),
+        "an id no session has is an empty page, as every listing filter answers"
+    );
+}
+
+/// A sub-agent is never a resident session, so only its parent's run can say it is busy; while
+/// the parent runs it, the record and the listing say so, and once the run ends they stop.
+#[test]
+fn a_running_sub_agent_reads_as_in_flight() {
+    let harness = ServeTestHarness::spawn("", spawning_script());
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("create");
+    let parent = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let parent_for_turn = parent.clone();
+    let turn_handle = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{base_url}/v1/sessions/{parent_for_turn}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"message": "delegate"}))
+            .send()
+            .expect("turn send")
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let worker = loop {
+        let children = children_of(&harness, &parent);
+        if let Some(child) = children
+            .iter()
+            .find(|child| child["turn_in_flight"] == true)
+        {
+            break child["id"].as_str().expect("id").to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the worker should have appeared as running: {children:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let record: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{worker}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(record["turn_in_flight"], true, "{record}");
+
+    assert_eq!(turn_handle.join().expect("turn join").status(), 200);
+    let record: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{worker}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(record["turn_in_flight"], false, "{record}");
+    assert_eq!(
+        record["last_turn"]["status"], "succeeded",
+        "the worker's own row records how its turn ended: {record}"
+    );
+}
+
+/// Whether a profile accepts an image is a fact about that profile, so it is reported per entry
+/// where the default is marked, and a session on another profile is judged by its own.
+#[test]
+fn profiles_report_whether_each_accepts_images() {
+    let harness = ServeTestHarness::spawn_with_prelude(
+        "default_profile = \"mock\"\n",
+        "\n[accounts.blind]\nbackend = \"anthropic-messages\"\n\n[profiles.blind]\naccount = \"blind\"\n\
+         model = \"model-without-eyes\"\nvision = false\n",
+        mock_simple_turn(),
+    );
+    let body: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/profiles")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let profiles = body["profiles"].as_array().expect("profiles");
+    let find = |name: &str| {
+        profiles
+            .iter()
+            .find(|profile| profile["name"] == name)
+            .unwrap_or_else(|| panic!("profile {name} is listed: {body}"))
+    };
+    assert_eq!(find("mock")["vision"], true, "{body}");
+    assert_eq!(find("mock")["active"], true, "{body}");
+    assert_eq!(find("blind")["vision"], false, "{body}");
+}
+
+/// A parked prompt waits out the reader's reattach grace, the window a streaming turn already
+/// gives its reader: an attending tab that reloads inside it finds its prompt still parked and
+/// answers it, where cancel-on-disconnect would have failed the call under it.
+#[test]
+fn a_parked_prompt_waits_for_its_attender_through_the_reattach_grace() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let path = workspace.path().join("attended.txt");
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "file_write" },
+            { "type": "tool_use_end", "input": {"path": path, "content": "hi"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "written" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("stream_reattach_grace = \"3s\"\n", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": workspace.path().to_string_lossy(),
+            "permission": "read",
+            "approvals": true,
+            "capabilities": {"supports_permission_prompts": false},
+        }))
+        .send()
+        .expect("create");
+    assert_eq!(create.status(), 201);
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let feed = open_feed_with(&harness, &id, "?attend=true", None, Duration::from_secs(30));
+    let accepted = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .json(&serde_json::json!({"message": "write it", "class": "followup"}))
+        .send()
+        .expect("send");
+    assert_eq!(accepted.status(), 202);
+    let (until_prompt, feed) = read_feed_until_open(feed, |text| {
+        text.contains("event: permission_required") || text.contains("event: turn.finished")
+    });
+    let prompt = sse_event_data(&until_prompt, "permission_required")
+        .unwrap_or_else(|| panic!("the attendee is asked: {until_prompt}"));
+    let request_id = prompt["request_id"]
+        .as_str()
+        .expect("request id")
+        .to_string();
+
+    // The tab goes away, for longer than the disconnect poll but inside the grace.
+    drop(feed);
+    std::thread::sleep(Duration::from_millis(1500));
+    let record: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        record["approvals_pending"], 1,
+        "the prompt is still parked inside the grace: {record}"
+    );
+
+    // Back inside the window, the replay hands the parked prompt over again.
+    let feed = open_feed_with(&harness, &id, "?attend=true", None, Duration::from_secs(30));
+    let answered = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{id}/responses/{request_id}"),
+        )
+        .json(&serde_json::json!({"outcome": "allow"}))
+        .send()
+        .expect("send");
+    assert_eq!(answered.status(), 204, "the prompt was still answerable");
+    let rest = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+    assert!(
+        rest.contains("event: permission_required"),
+        "the reconnecting reader was handed the parked prompt: {rest}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the approved write landed"),
+        "hi"
+    );
+}
+
+/// Every session's tasks in one listing, by status when asked, and a detached spawn names the
+/// session it runs so a client connects the task to the sub-agent without parsing its words.
+#[test]
+fn tasks_across_sessions_list_a_detached_spawn_with_its_sub_agent() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
+            { "type": "tool_use_end", "input": {"prompt": "count the files", "background": true} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "dispatched" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "sleep", "ms": 1500 },
+            { "type": "text", "text": "worker done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("\n[background]\nenabled = true\n", script);
+    let parent = session_with_one_turn(&harness);
+
+    let bogus = harness
+        .request(reqwest::Method::GET, "/v1/tasks?status=bogus")
+        .send()
+        .expect("send");
+    assert_eq!(bogus.status(), 422);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let task = loop {
+        let listed: serde_json::Value = harness
+            .request(reqwest::Method::GET, "/v1/tasks")
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        let found = listed["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .find(|task| task["tool"] == "agent_spawn" && task["subagent_id"].is_string())
+            .cloned();
+        if let Some(task) = found {
+            break task;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the spawn's task should name its sub-agent: {listed}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(task["session_id"], parent, "{task}");
+    let worker = task["subagent_id"].as_str().expect("id");
+    let record: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{worker}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        record["parent_id"], parent,
+        "the named session is the worker: {record}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let completed: serde_json::Value = harness
+            .request(reqwest::Method::GET, "/v1/tasks?status=completed")
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        if completed["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .any(|listed| listed["id"] == task["id"])
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the spawn finishes: {completed}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The listing's filters narrow it by profile, pin and change time, and they compose.
+#[test]
+fn the_listing_filters_by_profile_pin_and_time() {
+    let harness = ServeTestHarness::spawn_with_prelude(
+        "default_profile = \"mock\"\n",
+        "\n[accounts.other]\nbackend = \"anthropic-messages\"\n\n[profiles.other]\naccount = \
+         \"other\"\nmodel = \"m\"\n",
+        mock_simple_turn(),
+    );
+    let create = |profile: &str| -> String {
+        harness
+            .request(reqwest::Method::POST, "/v1/sessions")
+            .json(&serde_json::json!({
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "profile": profile,
+            }))
+            .send()
+            .expect("send")
+            .json::<serde_json::Value>()
+            .expect("parse")["id"]
+            .as_str()
+            .expect("id")
+            .to_string()
+    };
+    let mark = chrono::Utc::now();
+    std::thread::sleep(Duration::from_millis(5));
+    let on_mock = create("mock");
+    let on_other = create("other");
+    let pinned = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{on_mock}"))
+        .json(&serde_json::json!({"pinned": true}))
+        .send()
+        .expect("send");
+    assert_eq!(pinned.status(), 200);
+    let ids = |query: &str| -> Vec<String> {
+        harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions?{query}"))
+            .send()
+            .expect("send")
+            .json::<serde_json::Value>()
+            .expect("parse")["sessions"]
+            .as_array()
+            .expect("sessions")
+            .iter()
+            .map(|row| row["id"].as_str().expect("id").to_string())
+            .collect()
+    };
+    assert_eq!(ids("profile=other"), vec![on_other.clone()]);
+    assert_eq!(ids("pinned=true"), vec![on_mock.clone()]);
+    assert_eq!(ids("pinned=false"), vec![on_other.clone()]);
+    assert!(
+        ids("pinned=true&profile=other").is_empty(),
+        "the filters compose"
+    );
+    let since = ids(&format!("updated_since={}", urlencoded(&mark.to_rfc3339())));
+    assert!(
+        since.contains(&on_mock) && since.contains(&on_other),
+        "{since:?}"
+    );
+    let future = ids(&format!(
+        "updated_since={}",
+        urlencoded(&(chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339())
+    ));
+    assert!(
+        future.is_empty(),
+        "nothing changed since the future: {future:?}"
+    );
+}
+
+fn urlencoded(text: &str) -> String {
+    text.replace('+', "%2B").replace(':', "%3A")
+}
+
+/// `GET /v1/memory?q=` finds what the agent's own search would, with the line it was found on.
+#[test]
+fn memory_search_lists_what_the_agent_would_find() {
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "memory:r", "memory:w",
+    ]);
+    for (name, description) in [
+        (
+            "deploy-policy",
+            "Deploys go out on Tuesdays after the standup",
+        ),
+        ("coffee", "The kitchen machine takes beans, not pods"),
+    ] {
+        let written = harness
+            .request(reqwest::Method::PUT, &format!("/v1/memory/{name}"))
+            .json(&serde_json::json!({"description": description, "body": description}))
+            .send()
+            .expect("send");
+        assert!(
+            written.status().is_success(),
+            "{}",
+            written.text().expect("text")
+        );
+    }
+    let found: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/memory?q=deploys")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let memories = found["memories"].as_array().expect("memories");
+    assert_eq!(memories.len(), 1, "{found}");
+    assert_eq!(memories[0]["name"], "deploy-policy", "{found}");
+    assert!(
+        memories[0]["snippet"]
+            .as_str()
+            .is_some_and(|line| line.contains("Tuesdays")),
+        "the line it was found on rides along: {found}"
+    );
+    let nothing: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/memory?q=zzzz")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert!(
+        nothing["memories"].as_array().expect("memories").is_empty(),
+        "{nothing}"
+    );
+    let whole: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/memory")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        whole["memories"].as_array().expect("memories").len(),
+        2,
+        "{whole}"
+    );
+    assert!(
+        whole["memories"][0].get("snippet").is_none(),
+        "no search, no snippet: {whole}"
+    );
+}
+
+fn open_server_feed(
+    harness: &ServeTestHarness,
+    last_event_id: Option<u64>,
+) -> reqwest::blocking::Response {
+    // A per-read timeout shorter than the keep-alive interval, so a wait for an event that never
+    // comes fails the test rather than holding it open on keep-alives.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let mut request = client
+        .get(format!("{}/v1/stream", harness.base_url))
+        .header("Authorization", format!("Bearer {}", harness.token));
+    if let Some(last) = last_event_id {
+        request = request.header("Last-Event-ID", last.to_string());
+    }
+    request.send().expect("send")
+}
+
+/// The server feed is the listing's change feed: one connection learns of every session made,
+/// changed and deleted, and of every turn's start and end, each event naming its session with the
+/// whole record where a record is what changed; a session's own feed learns of its own changes.
+#[test]
+fn the_server_feed_carries_every_change_to_a_session_record() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let feed = open_server_feed(&harness, None);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let own = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let renamed = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"title": "Research notes"}))
+        .send()
+        .expect("send");
+    assert_eq!(renamed.status(), 200);
+    let turn = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "hi"}))
+        .send()
+        .expect("send");
+    assert_eq!(turn.status(), 200);
+    let rewound = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/rewind"))
+        .json(&serde_json::json!({"turns": 1}))
+        .send()
+        .expect("send");
+    assert_eq!(rewound.status(), 200);
+    let deleted = harness
+        .request(reqwest::Method::DELETE, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send");
+    assert_eq!(deleted.status(), 204);
+
+    let body = read_feed_until(feed, |text| text.contains("event: session.deleted"));
+    let names = sse_event_names(&body);
+    let finished_at = names
+        .iter()
+        .position(|name| name == "turn.finished")
+        .expect("the turn ended");
+    let deleted_at = names
+        .iter()
+        .position(|name| name == "session.deleted")
+        .expect("the session was deleted");
+    assert!(
+        names[finished_at..deleted_at]
+            .iter()
+            .any(|name| name == "session.updated"),
+        "a rewind moves the record, so the record is announced: {names:?}"
+    );
+    for expected in [
+        "session.created",
+        "session.updated",
+        "turn.started",
+        "turn.finished",
+        "session.deleted",
+    ] {
+        assert!(
+            names.iter().any(|name| name == expected),
+            "the server feed carries {expected}: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|name| name == "assistant_text.delta"),
+        "and no deltas, which are a session feed's: {names:?}"
+    );
+    let created = sse_event_data(&body, "session.created").expect("created");
+    assert_eq!(created["id"], id, "the whole record: {created}");
+    let updated = sse_event_data(&body, "session.updated").expect("updated");
+    assert_eq!(updated["title"], "Research notes", "{updated}");
+    let finished = sse_event_data(&body, "turn.finished").expect("finished");
+    assert_eq!(
+        finished["session_id"], id,
+        "every event names its session: {finished}"
+    );
+    let gone = sse_event_data(&body, "session.deleted").expect("deleted");
+    assert_eq!(gone["session_id"], id, "{gone}");
+    let ids = sse_event_ids(&body);
+    assert!(
+        ids.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "the server feed numbers its own events densely: {ids:?}"
+    );
+
+    let own_body = read_feed_until_open(own, |text| text.contains("event: session.updated")).0;
+    let own_update = sse_event_data(&own_body, "session.updated").expect("own feed");
+    assert_eq!(own_update["title"], "Research notes", "{own_update}");
+
+    // A late client resumes from where it was and gets the rest of the ring.
+    let first = ids[0];
+    let resumed = open_server_feed(&harness, Some(first));
+    let resumed_body = read_feed_until(resumed, |text| text.contains("event: session.deleted"));
+    let resumed_ids = sse_event_ids(&resumed_body);
+    assert_eq!(resumed_ids.first(), Some(&(first + 1)), "{resumed_ids:?}");
+}
+
+/// A sub-agent is run by a tool, not by a request, so the registry that answers its
+/// `turn_in_flight` is what announces it: created as it is spawned, updated as its run ends.
+#[test]
+fn the_server_feed_announces_a_sub_agents_run() {
+    let harness = ServeTestHarness::spawn("", spawning_script());
+    let feed = open_server_feed(&harness, None);
+    let parent = session_with_one_turn(&harness);
+    let (body, feed) = read_feed_until_open(feed, |text| {
+        text.contains("event: turn.finished") && text.contains("event: session.created")
+    });
+    let blocks: Vec<serde_json::Value> = body
+        .split("\n\n")
+        .filter(|block| {
+            block.contains("event: session.created") || block.contains("event: session.updated")
+        })
+        .filter_map(|block| {
+            block
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .and_then(|data| serde_json::from_str(data).ok())
+        })
+        .collect();
+    let spawned = blocks
+        .iter()
+        .find(|record| record["parent_id"] == parent)
+        .unwrap_or_else(|| panic!("the worker is announced under its parent: {body}"));
+    assert_eq!(
+        spawned["turn_in_flight"], true,
+        "announced as it starts: {spawned}"
+    );
+    let worker = spawned["id"].as_str().expect("id");
+    let ended = blocks
+        .iter()
+        .rev()
+        .find(|record| record["id"] == worker)
+        .expect("the worker's last announcement");
+    assert_eq!(
+        ended["turn_in_flight"], false,
+        "and again as its run ends: {ended}"
+    );
+    assert_eq!(ended["last_turn"]["status"], "succeeded", "{ended}");
+
+    // Deleting the parent takes the worker with it, and the feed says so for each row.
+    let deleted = harness
+        .request(reqwest::Method::DELETE, &format!("/v1/sessions/{parent}"))
+        .send()
+        .expect("send");
+    assert_eq!(deleted.status(), 204);
+    let rest = read_feed_until(feed, |text| {
+        text.matches("event: session.deleted").count() >= 2
+    });
+    let gone: Vec<String> = rest
+        .split("\n\n")
+        .filter(|block| block.contains("event: session.deleted"))
+        .filter_map(|block| {
+            block
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        })
+        .filter_map(|data| data["session_id"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        gone,
+        vec![worker.to_string(), parent.clone()],
+        "the worker's deletion is announced, ahead of its parent's: {rest}"
+    );
 }

@@ -375,7 +375,7 @@ Four surfaces report it, and each says only what it can establish:
 
   Both apply `[permissions].enabled` when reading a session's recorded level, so neither can report
   a job as able to fire that the host refuses.
-- **`GET /v1/schedule` and `GET /v1/sessions/{id}/schedule`** carry a `withheld` field with the same
+- **`GET /v1/schedule`**, with or without `?session=`, carries a `withheld` field with the same
   sentence, absent when the job can fire.
 
 Firing the reminder ungated instead would be the more forgiving-looking choice and the wrong one: it

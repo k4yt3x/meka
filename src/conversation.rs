@@ -606,9 +606,10 @@ fn redact_image(message: &mut Message, image: &RedactedImage) {
 
 /// The replayed log with, for each message, when it was written and whether it is a compaction
 /// summary. Three vectors of one length, which every arm of the replay maintains.
-pub(crate) struct AnnotatedView {
+pub(crate) struct AnnotatedView<Stamp> {
     pub(crate) messages: Vec<Message>,
-    pub(crate) timestamps: Vec<String>,
+    /// Each message's stamp: whatever the caller stored beside the event that placed it.
+    pub(crate) stamps: Vec<Stamp>,
     pub(crate) markers: Vec<Option<CompactionMarker>>,
     /// How many times the log was rewritten: every boundary and every repair.
     pub(crate) revision: u64,
@@ -617,23 +618,25 @@ pub(crate) struct AnnotatedView {
 /// What `GET /v1/sessions/{id}/messages` serves: the same view the model gets, by the same rules,
 /// with each message stamped from the row that produced it. A summary takes its boundary's time
 /// and a repair's replacements take the repair's, because that is when the content came to be.
-pub(crate) fn materialize_annotated(events: &[(String, Event)]) -> AnnotatedView {
+pub(crate) fn materialize_annotated<Stamp: Clone>(
+    events: &[(Stamp, Event)],
+) -> AnnotatedView<Stamp> {
     let (placed, revision) = replay(events.iter().map(|(_, event)| event));
     let mut messages = Vec::with_capacity(placed.len());
-    let mut timestamps = Vec::with_capacity(placed.len());
+    let mut stamps = Vec::with_capacity(placed.len());
     let mut markers = Vec::with_capacity(placed.len());
     for placed in placed {
         let index = match placed.source {
             Source::Append(index) | Source::Boundary(index) | Source::Repair(index) => index,
         };
-        timestamps.push(events[index].0.clone());
+        stamps.push(events[index].0.clone());
         markers.push(placed.marker);
         messages.push(placed.message);
     }
     repair_invalid_images(&mut messages);
     AnnotatedView {
         messages,
-        timestamps,
+        stamps,
         markers,
         revision,
     }

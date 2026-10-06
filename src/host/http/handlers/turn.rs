@@ -108,22 +108,16 @@ pub(crate) struct TurnResponse {
     pub(crate) turn_id: Uuid,
     pub(crate) session_id: Uuid,
     pub(crate) stop_reason: String,
-    /// Concatenated assistant text produced this turn. **Excludes** refusal explanation:
-    /// when the model refuses, the refusal text rides on the dedicated `refusal_text` field
-    /// instead. Clients that just want "what the user sees" should consume both:
-    /// `final_text` for the normal response, `refusal_text` when `stop_reason == "refusal"`.
-    pub(crate) final_text: String,
     /// Refusal explanation when `stop_reason == "refusal"`; `None` otherwise. Mirrors the
     /// `refusal_text` field on the streaming `turn.finished` SSE event, so blocking and
     /// streaming clients share the same shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) refusal_text: Option<String>,
-    /// Structured view of the assistant's message(s) produced this turn. Per the spec, this is
-    /// the "richer access" companion to `final_text`. Clients that want the text plus its
-    /// formatting context (text/thinking content blocks) consume this; clients that just want
-    /// a single string consume `final_text`. Tool calls live in their own `tool_calls` array.
+    /// The messages this turn added to the conversation, in order and in the shape
+    /// `GET /v1/sessions/{id}/messages` reads them back: the assistant's messages with their
+    /// text, their thinking when the session streams reasoning, and their tool calls, and the
+    /// tool-result messages that answered those calls. The user's own message is not repeated.
     pub(crate) messages: Vec<crate::host::http::handlers::messages::MessageView>,
-    pub(crate) tool_calls: Vec<ToolCallView>,
     pub(crate) usage: UsageView,
     pub(crate) notices: Vec<NoticeView>,
 }
@@ -134,27 +128,6 @@ pub(crate) struct UsageView {
     pub(crate) output_tokens: u64,
     pub(crate) cache_creation_input_tokens: u64,
     pub(crate) cache_read_input_tokens: u64,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct ToolCallView {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    #[schema(value_type = Object)]
-    pub(crate) input: serde_json::Value,
-    /// The one-line label a terminal shows for the call, when the tool has one. Omitted otherwise,
-    /// like every optional field on this API.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) display_summary: Option<String>,
-    pub(crate) is_error: bool,
-    pub(crate) content: Vec<ToolCallContentView>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ToolCallContentView {
-    Text { text: String },
-    Image { media_type: String },
 }
 
 #[utoipa::path(
@@ -753,6 +726,7 @@ async fn run_blocking_turn(
     // prior-turn) token is a no-op on an already-finished turn.
     let cancellation = CancellationToken::new();
     let turn_id = uuid::Uuid::new_v4();
+    let input = input.identified(turn_id);
     let published = entry
         .cancel
         .publish_turn(cancellation.clone(), turn_guard.admission, turn_id);
@@ -792,6 +766,7 @@ async fn run_blocking_turn(
             session_id,
             state.config.relay_provider_errors,
             message_withdrawn(&recorder),
+            revision_for_terminal(&state.shared.store, session_id).await,
         );
         entry.frontend.record_terminal(event_type, data);
 
@@ -867,6 +842,7 @@ fn run_streaming_turn(
     // Minted before the stream is installed so the ring is keyed by it from the first event; a
     // re-attaching client reads the id back to confirm it rejoined the turn it thought it had.
     let turn_id = uuid::Uuid::new_v4();
+    let input = input.identified(turn_id);
     // Publish after the lock succeeds, same rationale as `run_blocking_turn`, and before the
     // stream announces the id: a client that answers `turn.started` with a cancel naming it
     // must find the turn there to cancel.
@@ -885,6 +861,7 @@ fn run_streaming_turn(
     let cancel_for_task = cancellation.clone();
     let shutdown_for_task = state.shutdown.clone();
     let relay_for_task = state.config.relay_provider_errors;
+    let store_for_task = state.shared.store.clone();
     let webhooks_for_task = state.webhooks;
 
     // Spawn the turn so the SSE response can return immediately.
@@ -923,6 +900,7 @@ fn run_streaming_turn(
             session_id,
             relay_for_task,
             message_withdrawn(&recorder),
+            revision_for_terminal(&store_for_task, session_id).await,
         );
         notify_turn_end(&webhooks_for_task, event_type, turn_id, session_id);
         entry_for_task.frontend.record_terminal(event_type, data)
@@ -1090,6 +1068,10 @@ impl CancelReason {
 /// fact a client that resends needs, and the stream cannot be read for it, since thinking and a
 /// half-composed tool call look like output and neither reaches the conversation. `None` is a turn
 /// that never began, or one whose record died with its task, and is omitted rather than guessed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every fact a terminal carries is a parameter, so no emitter can leave one out"
+)]
 pub(crate) fn terminal_event_parts(
     turn_result: std::result::Result<
         std::result::Result<&TurnOutcome, &crate::error::MekaError>,
@@ -1101,8 +1083,9 @@ pub(crate) fn terminal_event_parts(
     session_id: Uuid,
     relay_provider_errors: bool,
     message_withdrawn: Option<bool>,
+    revision: Option<u64>,
 ) -> (crate::host::http::sse::SseEventType, serde_json::Value) {
-    match turn_result {
+    let (event_type, mut data) = match turn_result {
         Ok(Ok(outcome)) => finished_parts(outcome, usage, turn_id, session_id),
         Ok(Err(crate::error::MekaError::Interrupted)) => {
             // Every stop surfaces as `Interrupted` by the time the agent loop unwinds; who asked
@@ -1147,6 +1130,29 @@ pub(crate) fn terminal_event_parts(
                     "error": serde_json::to_value(problem).unwrap_or(serde_json::Value::Null),
                 }),
             )
+        }
+    };
+    // On every terminal, because a repair, a redaction or a withdrawal rewrites the view inside
+    // the turn and has no event of its own: the terminal is where a client decides what to
+    // re-read. Omitted, like every optional field, when the store could not say.
+    if let Some(revision) = revision {
+        data["revision"] = serde_json::Value::from(revision);
+    }
+    (event_type, data)
+}
+
+/// The conversation's revision for a terminal event, or `None` when the store could not say; a
+/// client then re-reads as it does for any event that lacks it. Never fails the turn: the terminal
+/// still has to be recorded.
+pub(crate) async fn revision_for_terminal(
+    store: &crate::store::Store,
+    session_id: Uuid,
+) -> Option<u64> {
+    match store.count_rewrites(session_id).await {
+        Ok(revision) => Some(revision),
+        Err(error) => {
+            tracing::warn!("failed to count rewrites for session {session_id}: {error}");
+            None
         }
     }
 }
@@ -1214,6 +1220,7 @@ fn panic_terminal(panic: tokio::task::JoinError, turn_id: Uuid, session_id: Uuid
             session_id,
             false,
             None,
+            None,
         );
     // Sent without an `id:` field. The generator lives on the task that just died, and id 0 is
     // already `turn.started`; reusing it would have a client store 0 as its resume position and
@@ -1244,21 +1251,13 @@ fn canceled_parts(
 
 /// Wire `stop_reason` string for a finished turn. Shared by the blocking (`assemble_response`)
 /// and streaming (`terminal_event_for_outcome`) paths so the two can't drift.
-fn stop_reason_str(outcome: &TurnOutcome) -> &'static str {
-    match outcome {
-        TurnOutcome::EndTurn => "end_turn",
-        TurnOutcome::MaxTokens => "max_tokens",
-        TurnOutcome::Refusal(_) => "refusal",
-    }
-}
-
 fn finished_parts(
     outcome: &TurnOutcome,
     usage: UsageView,
     turn_id: Uuid,
     session_id: Uuid,
 ) -> (crate::host::http::sse::SseEventType, serde_json::Value) {
-    let stop_reason = stop_reason_str(outcome);
+    let stop_reason = outcome.stop_reason();
     let mut data = serde_json::json!({
         "turn_id": turn_id.to_string(),
         "session_id": session_id.to_string(),
@@ -1315,12 +1314,113 @@ pub(crate) fn usage_from(recorder: &Recorder) -> UsageView {
 pub(crate) fn message_withdrawn(recorder: &Recorder) -> Option<bool> {
     recorder
         .iter()
-        .any(|event| matches!(event, FrontendEvent::TurnStarted))
+        .any(|event| matches!(event, FrontendEvent::TurnStarted { .. }))
         .then(|| {
             recorder
                 .iter()
                 .any(|event| matches!(event, FrontendEvent::PromptWithdrawn))
         })
+}
+
+/// The messages a turn adds to the conversation, built from the recorder in the order the agent
+/// emitted them. An assistant message gathers text, thinking and tool calls until a tool result
+/// arrives, which closes it and opens the user-role message that carries the round's results;
+/// the next assistant output closes that one in turn.
+struct TurnMessages {
+    turn_id: Uuid,
+    messages: Vec<crate::host::http::handlers::messages::MessageView>,
+    assistant: Vec<crate::host::http::handlers::messages::ContentBlockView>,
+    results: Vec<crate::host::http::handlers::messages::ContentBlockView>,
+}
+
+impl TurnMessages {
+    fn new(turn_id: Uuid) -> Self {
+        Self {
+            turn_id,
+            messages: Vec::new(),
+            assistant: Vec::new(),
+            results: Vec::new(),
+        }
+    }
+
+    fn text(&mut self, text: &str) {
+        use crate::host::http::handlers::messages::ContentBlockView;
+        self.close_results();
+        if let Some(ContentBlockView::Text { text: last }) = self.assistant.last_mut() {
+            last.push_str(text);
+        } else {
+            self.assistant.push(ContentBlockView::Text {
+                text: text.to_string(),
+            });
+        }
+    }
+
+    fn thinking(&mut self, thinking: String) {
+        self.close_results();
+        self.assistant
+            .push(crate::host::http::handlers::messages::ContentBlockView::Thinking { thinking });
+    }
+
+    fn tool_use(&mut self, id: String, name: String, input: serde_json::Value) {
+        self.close_results();
+        self.assistant.push(
+            crate::host::http::handlers::messages::ContentBlockView::ToolUse { id, name, input },
+        );
+    }
+
+    fn tool_result(&mut self, tool_use_id: String, is_error: bool, content: &[ToolResultContent]) {
+        self.close_assistant();
+        self.results.push(
+            crate::host::http::handlers::messages::ContentBlockView::ToolResult {
+                tool_use_id,
+                is_error,
+                content: crate::host::http::handlers::messages::tool_result_views(content),
+            },
+        );
+    }
+
+    fn close_assistant(&mut self) {
+        if !self.assistant.is_empty() {
+            let content = std::mem::take(&mut self.assistant);
+            self.messages
+                .push(turn_message(self.turn_id, "assistant", content));
+        }
+    }
+
+    fn close_results(&mut self) {
+        if !self.results.is_empty() {
+            let content = std::mem::take(&mut self.results);
+            self.messages
+                .push(turn_message(self.turn_id, "user", content));
+        }
+    }
+
+    fn finish(mut self) -> Vec<crate::host::http::handlers::messages::MessageView> {
+        self.close_assistant();
+        self.close_results();
+        self.messages
+    }
+}
+
+fn turn_message(
+    turn_id: Uuid,
+    role: &str,
+    content: Vec<crate::host::http::handlers::messages::ContentBlockView>,
+) -> crate::host::http::handlers::messages::MessageView {
+    crate::host::http::handlers::messages::MessageView {
+        role: role.to_string(),
+        content,
+        // Not available yet: the DB write may still be in progress.
+        created_at: None,
+        turn_id: Some(turn_id),
+        // Only this turn is in hand; the label counts in the view `GET /v1/sessions/{id}/messages`
+        // serves.
+        turn_label: None,
+        // The turn's own output, never a compaction summary. A compaction that fired during this
+        // turn is reported by the `context.compacted` SSE event and by the marker on the summary
+        // when the history is read back.
+        compaction: None,
+    }
 }
 
 fn assemble_response(
@@ -1330,64 +1430,30 @@ fn assemble_response(
     recorder: Recorder,
     capabilities: crate::host::http::http_frontend::SessionCapabilities,
 ) -> TurnResponse {
-    let stop_reason = stop_reason_str(&outcome).to_string();
+    let stop_reason = outcome.stop_reason().to_string();
 
-    let mut final_text = String::new();
-    let mut tool_calls_by_id: std::collections::HashMap<String, ToolCallView> =
-        std::collections::HashMap::new();
-    let mut tool_call_order: Vec<String> = Vec::new();
+    let mut messages = TurnMessages::new(turn_id);
     let mut usage = UsageView::default();
     let mut notices: Vec<NoticeView> = Vec::new();
-    let mut thinking_segments: Vec<String> = Vec::new();
 
     for event in recorder {
         match event {
-            FrontendEvent::AssistantTextDelta(text) => {
-                final_text.push_str(&text);
-            }
-            FrontendEvent::ThinkingBlock { content, .. }
-                if capabilities.supports_reasoning_stream =>
-            {
-                thinking_segments.push(content);
+            FrontendEvent::AssistantTextDelta(text) => messages.text(&text),
+            FrontendEvent::ThinkingBlock { content } if capabilities.supports_reasoning_stream => {
+                messages.thinking(content);
             }
             // The block above already carries this text whole. Accumulating the deltas as well
             // would report every segment twice.
             FrontendEvent::ThinkingDelta(_) => {}
             FrontendEvent::ToolCallStarted {
-                id,
-                name,
-                input,
-                display_summary,
-            } => {
-                tool_call_order.push(id.clone());
-                tool_calls_by_id.insert(id.clone(), ToolCallView {
-                    id,
-                    name,
-                    input,
-                    display_summary,
-                    is_error: false,
-                    content: Vec::new(),
-                });
-            }
+                id, name, input, ..
+            } => messages.tool_use(id, name, input),
             FrontendEvent::ToolCallCompleted {
                 id,
                 is_error,
                 content,
                 ..
-            } => {
-                if let Some(view) = tool_calls_by_id.get_mut(&id) {
-                    view.is_error = is_error;
-                    view.content = content
-                        .into_iter()
-                        .map(|item| match item {
-                            ToolResultContent::Text { text } => ToolCallContentView::Text { text },
-                            ToolResultContent::Image { source } => ToolCallContentView::Image {
-                                media_type: source.media_type().to_string(),
-                            },
-                        })
-                        .collect();
-                }
-            }
+            } => messages.tool_result(id, is_error, &content),
             FrontendEvent::TokenUsage(token_usage) => {
                 // Last-wins assignment: the agent emits exactly one `TokenUsage` per turn
                 // (accumulated total). If that ever changes, switch to `saturating_add`.
@@ -1412,67 +1478,17 @@ fn assemble_response(
         }
     }
 
-    // Mark orphan tool calls (started but never completed) as errors so clients can
-    // distinguish "tool returned nothing" from "interrupted mid-execution".
-    for view in tool_calls_by_id.values_mut() {
-        if !view.is_error && view.content.is_empty() {
-            view.is_error = true;
-            view.content = vec![ToolCallContentView::Text {
-                text: "tool execution interrupted before completion".to_string(),
-            }];
-        }
-    }
-
     let refusal_text = match &outcome {
         TurnOutcome::Refusal(text) if !text.is_empty() => Some(text.clone()),
         _ => None,
-    };
-
-    let tool_calls = tool_call_order
-        .into_iter()
-        .filter_map(|id| tool_calls_by_id.remove(&id))
-        .collect();
-
-    let mut content_blocks: Vec<crate::host::http::handlers::messages::ContentBlockView> =
-        Vec::new();
-    for segment in thinking_segments {
-        content_blocks.push(
-            crate::host::http::handlers::messages::ContentBlockView::Thinking { thinking: segment },
-        );
-    }
-    if !final_text.is_empty() {
-        content_blocks.push(
-            crate::host::http::handlers::messages::ContentBlockView::Text {
-                text: final_text.clone(),
-            },
-        );
-    }
-    let messages = if content_blocks.is_empty() {
-        Vec::new()
-    } else {
-        vec![crate::host::http::handlers::messages::MessageView {
-            role: "assistant".to_string(),
-            content: content_blocks,
-            // Not available yet: the DB write may still be in progress.
-            created_at: None,
-            // Only the current message is available; full history index lives on
-            // `GET /v1/sessions/{id}/messages`.
-            turn_id: None,
-            // This is the assistant's reply, never a compaction summary. A compaction that fired
-            // during this turn is reported by the `context.compacted` SSE event and by the marker
-            // on the summary when the history is read back.
-            compaction: None,
-        }]
     };
 
     TurnResponse {
         turn_id,
         session_id,
         stop_reason,
-        final_text,
         refusal_text,
-        messages,
-        tool_calls,
+        messages: messages.finish(),
         usage,
         notices,
     }
@@ -1578,6 +1594,10 @@ pub(crate) struct StreamQuery {
 /// transcript that silently skips. And only the most recent turn is retained: reconnecting after a
 /// *newer* turn has started returns that turn's stream, which the `turn_id` on the re-issued
 /// `turn.started` identifies.
+///
+/// A sub-agent's id names its own feed for as long as this process runs it: the same events a
+/// session's feed carries, read-only, with `turn.started` naming the parent and its `agent_spawn`
+/// call. Its prompts park on the parent's feed, so `attend` is refused here.
 #[utoipa::path(
     get,
     path = "/v1/sessions/{id}/stream",
@@ -1592,8 +1612,8 @@ pub(crate) struct StreamQuery {
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
-        (status = 409, description = "Another meka process holds the session (`/errors/session-locked`), or the token may only read and the session is not loaded (`/errors/session-not-loaded`)", body = ProblemDetail),
-        (status = 422, description = "The id names a sub-agent's session (`/errors/session-not-drivable`)", body = ProblemDetail),
+        (status = 409, description = "Another meka process holds the session (`/errors/session-locked`), the token may only read and the session is not loaded (`/errors/session-not-loaded`), or the id names a sub-agent this process is not running (`/errors/subagent-not-running`)", body = ProblemDetail),
+        (status = 422, description = "`attend` on a sub-agent's feed, which is read-only (`/errors/session-not-drivable`)", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["sessions:r"]))
@@ -1609,6 +1629,46 @@ pub(crate) async fn stream_turn(
     // is loaded, so a token that may not attend loads nothing by asking.
     if query.attend {
         scope::require(&scoped.principal, "sessions:w")?;
+    }
+    let last_event_id = last_event_id_of(&headers, query.last_event_id);
+    // A sub-agent's feed exists for as long as this process runs it, and is read rather than
+    // attended: its prompts are parked on its parent's feed, where the one answerer is.
+    let child = crate::sync::lock(&state.child_feeds).get(&id).cloned();
+    if let Some(feed) = child {
+        if query.attend {
+            return Err(ProblemDetail::new(
+                ErrorKind::SessionNotDrivable,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "session '{id}' is a sub-agent, whose prompts are answered on its parent's \
+                     feed; read this one without `attend`"
+                ),
+            )
+            .with("session_id", id.to_string()));
+        }
+        let Some(attachment) = feed.attach_stream(last_event_id, false) else {
+            return Err(no_stream_to_join(id));
+        };
+        let stream = build_reattach_stream(id, attachment, feed, state.shutdown.clone());
+        return Ok(sse_response(stream));
+    }
+    if let Some(terms) = state
+        .shared
+        .store
+        .spawn_terms(id)
+        .await
+        .map_err(|error| ProblemDetail::internal_sanitized("failed to read session", error))?
+    {
+        return Err(ProblemDetail::new(
+            ErrorKind::SubagentNotRunning,
+            StatusCode::CONFLICT,
+            format!(
+                "{}, which is not running in this process; its feed exists while its parent runs \
+                 it",
+                terms.describe(id)
+            ),
+        )
+        .with("session_id", id.to_string()));
     }
     // Loaded for a token that may drive the session, looked up for one that may only read it.
     // Reviving takes the session's cross-process file lock and pins it in memory for as long as
@@ -1636,23 +1696,33 @@ pub(crate) async fn stream_turn(
         }
     };
 
-    let last_event_id = headers
-        .get("last-event-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .or(query.last_event_id);
-
     let Some(attachment) = entry.frontend.attach_stream(last_event_id, query.attend) else {
         return Err(no_stream_to_join(id));
     };
-
-    let session_id = id;
     let stream = build_reattach_stream(
-        session_id,
+        id,
         attachment,
         Arc::clone(&entry.frontend),
         state.shutdown.clone(),
     );
+    Ok(sse_response(stream))
+}
+
+/// The id a client resumes from: the `Last-Event-ID` header, or the query parameter for a
+/// transport that cannot send one.
+fn last_event_id_of(headers: &HeaderMap, query: Option<u64>) -> Option<u64> {
+    headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .or(query)
+}
+
+/// An event stream as every feed answers with it: a keep-alive comment every twenty seconds and
+/// the headers that keep a proxy from buffering it.
+fn sse_response(
+    stream: impl Stream<Item = Result<Event, Infallible>> + Send + 'static,
+) -> Response {
     let sse = Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(std::time::Duration::from_secs(20))
@@ -1667,7 +1737,7 @@ pub(crate) async fn stream_turn(
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-cache, no-transform"),
     );
-    Ok(response)
+    response
 }
 
 fn no_stream_to_join(id: Uuid) -> ProblemDetail {
@@ -1686,6 +1756,83 @@ fn no_stream_to_join(id: Uuid) -> ProblemDetail {
 /// turn in flight, the most recent turn's terminal is handed over when the ring no longer holds
 /// it, so a client that reconnects late still learns the outcome. Then the feed carries every
 /// later turn, whoever starts it, until the client hangs up or the session leaves this process.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub(crate) struct ServerStreamQuery {
+    /// The last event id received, for a client whose transport cannot send the
+    /// `Last-Event-ID` header.
+    #[serde(default)]
+    pub(crate) last_event_id: Option<u64>,
+}
+
+/// `GET /v1/stream`: the server feed, the listing's change feed across every session this process
+/// holds; see [`crate::host::http::feed::ServerFeed`] for what it carries.
+#[utoipa::path(
+    get,
+    path = "/v1/stream",
+    tag = "sessions",
+    params(
+        ServerStreamQuery,
+        ("Last-Event-ID" = Option<u64>, Header, description = "Resume from this id; the ring replays what followed it"),
+    ),
+    responses(
+        (status = 200, description = "Server-sent events: `session.created`, `session.updated`, `session.deleted`, the four turn lifecycle events and the two permission events, each naming its session", content_type = "text/event-stream"),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["sessions:r"]))
+)]
+pub(crate) async fn stream_server(
+    State(state): State<ServerState>,
+    _scoped: scope::Scoped<scope::SessionsRead>,
+    Query(query): Query<ServerStreamQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, ProblemDetail> {
+    let last_event_id = last_event_id_of(&headers, query.last_event_id);
+    let attachment = crate::sync::lock(&state.server_feed).attach(last_event_id);
+    let shutdown = state.shutdown;
+    let stream = async_stream::stream! {
+        yield Ok::<_, Infallible>(Event::default().retry(std::time::Duration::from_secs(3)));
+        if attachment.gap {
+            yield Ok(Event::default()
+                .event("notice")
+                .json_data(serde_json::json!({
+                    "level": "warn",
+                    "text": "the replay does not reach your Last-Event-ID, so events were \
+                             dropped; read `GET /v1/sessions` for the current records",
+                }))
+                .unwrap_or_else(|_| Event::default().comment("gap-notice serialize-failed")));
+        }
+        for event in attachment.backlog {
+            yield Ok(event.into_axum());
+        }
+        let mut receiver = attachment.receiver;
+        loop {
+            let received = tokio::select! {
+                received = receiver.recv() => received,
+                _ = shutdown.cancelled() => break,
+            };
+            match received {
+                Ok(event) => yield Ok(event.into_axum()),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!("server feed SSE consumer lagged, skipped {skipped} events");
+                    yield Ok(Event::default()
+                        .event("notice")
+                        .json_data(serde_json::json!({
+                            "level": "warn",
+                            "text": format!(
+                                "Fell behind; {skipped} event(s) were dropped from this replay."
+                            ),
+                        }))
+                        .unwrap_or_else(|_| Event::default().comment("lag serialize-failed")));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Ok(sse_response(stream))
+}
+
 fn build_reattach_stream(
     session_id: Uuid,
     attachment: crate::host::http::feed::StreamAttachment,
@@ -1918,6 +2065,19 @@ mod tests {
         assert_eq!(data["session_id"], session_id.to_string());
     }
 
+    fn text_of(message: &crate::host::http::handlers::messages::MessageView) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                crate::host::http::handlers::messages::ContentBlockView::Text { text } => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn assemble_response_concatenates_text_deltas() {
         let recorder: Recorder = vec![
@@ -1931,48 +2091,20 @@ mod tests {
             recorder,
             crate::host::http::http_frontend::SessionCapabilities::default(),
         );
-        assert_eq!(response.final_text, "Hello world");
         assert_eq!(response.stop_reason, "end_turn");
-        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.messages.len(), 1);
+        assert_eq!(response.messages[0].role, "assistant");
+        assert_eq!(text_of(&response.messages[0]), "Hello world");
     }
 
-    /// A tool call without a label omits `display_summary` from the blocking response rather than
-    /// writing `null`, like every optional field on this API.
+    /// A tool round reads back as the history does: the call on the assistant's message, its
+    /// result on the user-role message after it, and the next reply on a message of its own, so a
+    /// client renders one shape for a turn it ran and for a turn it reads back.
     #[test]
-    fn assemble_response_omits_an_absent_display_summary() {
-        let recorder: Recorder = vec![
-            FrontendEvent::ToolCallStarted {
-                id: "tu_1".into(),
-                name: "todo_write".into(),
-                input: serde_json::json!({}),
-                display_summary: None,
-            },
-            FrontendEvent::ToolCallCompleted {
-                id: "tu_1".into(),
-                name: "todo_write".into(),
-                is_error: false,
-                content: vec![ToolResultContent::Text { text: "ok".into() }],
-                metadata: None,
-            },
-        ];
-        let response = assemble_response(
-            Uuid::nil(),
-            Uuid::nil(),
-            TurnOutcome::EndTurn,
-            recorder,
-            crate::host::http::http_frontend::SessionCapabilities::default(),
-        );
-        let document = serde_json::to_value(&response).expect("serializes");
-        assert!(
-            document["tool_calls"][0].get("display_summary").is_none(),
-            "an absent summary must be omitted, not null: {document}"
-        );
-    }
-
-    #[test]
-    fn assemble_response_pairs_tool_calls_with_completion() {
+    fn assemble_response_lays_a_tool_round_out_as_the_history_does() {
         let input = serde_json::json!({"path": "src/main.rs"});
         let recorder: Recorder = vec![
+            FrontendEvent::AssistantTextDelta("Reading.".into()),
             FrontendEvent::ToolCallStarted {
                 id: "tu_1".into(),
                 name: "file_read".into(),
@@ -1988,6 +2120,7 @@ mod tests {
                 }],
                 metadata: None,
             },
+            FrontendEvent::AssistantTextDelta("Done.".into()),
         ];
         let response = assemble_response(
             Uuid::nil(),
@@ -1996,16 +2129,23 @@ mod tests {
             recorder,
             crate::host::http::http_frontend::SessionCapabilities::default(),
         );
-        assert_eq!(response.tool_calls.len(), 1);
-        let call = &response.tool_calls[0];
-        assert_eq!(call.id, "tu_1");
-        assert_eq!(call.name, "file_read");
-        assert_eq!(call.input, input);
-        assert!(!call.is_error);
-        match &call.content[0] {
-            ToolCallContentView::Text { text } => assert_eq!(text, "fn main() {}"),
-            other => panic!("expected text content, got {other:?}"),
-        }
+        let document = serde_json::to_value(&response).expect("serializes");
+        let nil = Uuid::nil().to_string();
+        assert_eq!(
+            document["messages"],
+            serde_json::json!([
+                {"role": "assistant", "turn_id": nil, "content": [
+                    {"type": "text", "text": "Reading."},
+                    {"type": "tool_use", "id": "tu_1", "name": "file_read", "input": input},
+                ]},
+                {"role": "user", "turn_id": nil, "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_1", "is_error": false,
+                     "content": [{"type": "text", "text": "fn main() {}"}]},
+                ]},
+                {"role": "assistant", "turn_id": nil, "content": [{"type": "text", "text": "Done."}]},
+            ]),
+            "{document}"
+        );
     }
 
     #[test]
@@ -2024,7 +2164,7 @@ mod tests {
     }
 
     #[test]
-    fn assemble_response_separates_refusal_text_from_final_text() {
+    fn assemble_response_separates_refusal_text_from_the_reply() {
         let recorder: Recorder = vec![FrontendEvent::AssistantTextDelta(
             "I cannot help with that.".into(),
         )];
@@ -2036,7 +2176,7 @@ mod tests {
             crate::host::http::http_frontend::SessionCapabilities::default(),
         );
         assert_eq!(response.stop_reason, "refusal");
-        assert_eq!(response.final_text, "I cannot help with that.");
+        assert_eq!(text_of(&response.messages[0]), "I cannot help with that.");
         assert_eq!(response.refusal_text.as_deref(), Some("policy violation"));
     }
 
@@ -2051,7 +2191,7 @@ mod tests {
             crate::host::http::http_frontend::SessionCapabilities::default(),
         );
         assert_eq!(response.refusal_text, None);
-        assert_eq!(response.final_text, "hello");
+        assert_eq!(text_of(&response.messages[0]), "hello");
     }
 
     fn png_input() -> ImageInput {

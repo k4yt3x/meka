@@ -413,6 +413,117 @@ fn repair_a_desynced_index(connection: &rusqlite::Connection) -> rusqlite::Resul
 ///
 /// Splitting on anything non-alphanumeric already strips every operator character; quoting each
 /// token on the way back out is what stops a *word* like `or` or `near` being read as one.
+/// Which tier of the search ladder answered. Reported rather than kept internal: a prefix or a
+/// substring answer is a guess about what the caller meant, and a reader that cannot tell it
+/// from an exact hit reports the guess as a recalled fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchTier {
+    Exact,
+    Prefix,
+    Substring,
+}
+
+/// What a search for words found, for every reader of memories to render in its own way.
+#[derive(Debug)]
+pub(crate) struct Found {
+    pub(crate) tier: SearchTier,
+    pub(crate) results: SearchResults,
+    /// The terms the index could not split into words that were scanned for and found.
+    pub(crate) scanned: Vec<String>,
+    /// The terms scanned for and found nowhere.
+    pub(crate) missed: Vec<String>,
+    /// Whether the query also held words the index could split, beside the scanned terms.
+    pub(crate) beside_words: bool,
+    /// Every searchable word of the query, for a reader that tries spellings when nothing
+    /// matched.
+    pub(crate) words: Vec<String>,
+}
+
+/// The most hits a search answers with, and the window each half of a mixed-script query is
+/// asked for before the merge is cut to the limit.
+pub(crate) const MAX_SEARCH_LIMIT: usize = 25;
+
+impl MemoryStore {
+    /// The ladder every reader of memories climbs, so the agent's tool and the HTTP listing find
+    /// the same memories for the same words. Four tiers, tried in order: exact handles word
+    /// endings through the stemmer, prefix handles a truncation or a trailing typo, a trimmed
+    /// prefix handles a query that is the longer derived form, and a substring scan handles text
+    /// the tokenizer does not split into words at all. A term of a script written without spaces
+    /// takes the scan every time rather than as a last resort, so a query mixing scripts is
+    /// answered for both halves. `None` when `queries` hold no searchable words.
+    pub(crate) async fn find(&self, queries: &[String], limit: usize) -> Result<Option<Found>> {
+        let terms = Terms::parse(queries);
+        if terms.is_empty() {
+            return Ok(None);
+        }
+        let (indexable, unspaced) = terms.split_by_script();
+        // Alone, the tiers answer with `limit` hits. When the halves of a mixed query are merged,
+        // each side is asked for the widest window ever shown, so a memory past `limit` on words
+        // alone still meets its substring hit and rises; the cut to `limit` comes after.
+        let window = if unspaced.is_empty() {
+            limit
+        } else {
+            MAX_SEARCH_LIMIT
+        };
+        let mut tier = SearchTier::Exact;
+        let mut results = SearchResults::default();
+        if !indexable.is_empty() {
+            results = self.search(indexable.match_expression(), window).await?;
+            if results.hits.is_empty() {
+                tier = SearchTier::Prefix;
+                results = self
+                    .search(indexable.prefix_match_expression(), window)
+                    .await?;
+            }
+            // Still the prefix tier, in the other direction: longest prefix first, stopping at
+            // the first that answers, so the most specific query that can find anything does.
+            if results.hits.is_empty() {
+                for expression in indexable.trimmed_prefix_match_expressions() {
+                    results = self.search(expression, window).await?;
+                    if !results.hits.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+        // The scanned terms that found something and those that found nothing, named apart so a
+        // reader is never told a term matched when no memory holds it.
+        let mut scanned: Vec<String> = Vec::new();
+        let mut missed: Vec<String> = Vec::new();
+        if !indexable.is_empty() && results.hits.is_empty() {
+            // Every term takes the scan, the indexable ones included: the last resort for text
+            // the tokenizer joined into one token, an identifier or a path as much as a sentence
+            // of Chinese.
+            tier = SearchTier::Substring;
+            results = self.substring_search(terms.words(), limit).await?;
+        } else {
+            // One scan per term, so the result can say which terms it answered for. With no
+            // indexable half this is the whole answer rather than a fallback, so the tier stays
+            // the one whose preamble does not say the words matched nothing.
+            for term in &unspaced {
+                let found = self
+                    .substring_search(std::slice::from_ref(term), window)
+                    .await?;
+                if found.hits.is_empty() {
+                    missed.push(term.clone());
+                } else {
+                    scanned.push(term.clone());
+                    results = results.merge(found, window);
+                }
+            }
+            results.hits.truncate(limit);
+        }
+        Ok(Some(Found {
+            tier,
+            results,
+            scanned,
+            missed,
+            beside_words: !indexable.is_empty(),
+            words: terms.words().to_vec(),
+        }))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Terms(Vec<String>);
 

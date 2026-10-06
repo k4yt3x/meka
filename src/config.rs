@@ -1145,6 +1145,9 @@ pub(crate) struct ProfileSummary {
     pub(crate) account: String,
     pub(crate) backend: Option<String>,
     pub(crate) model: Option<String>,
+    /// Whether a session on this profile accepts image attachments: `[profiles.<name>].vision`,
+    /// on unless the profile says otherwise.
+    pub(crate) vision: bool,
 }
 
 /// Merged + validated runtime view of [`ConfigFile`], CLI flags, and env vars. This is what the
@@ -2070,6 +2073,7 @@ impl ResolvedConfig {
                     .get(&profile.account)
                     .map(|account| account.backend.clone()),
                 model: profile.model.clone(),
+                vision: profile.vision.unwrap_or(true),
             })
             .collect();
 

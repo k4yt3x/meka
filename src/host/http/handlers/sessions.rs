@@ -9,7 +9,7 @@ use axum::{
     Json,
     body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header},
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::{
     host::http::{
         errors::{ErrorKind, ProblemDetail},
+        handlers::messages::check_if_match,
         http_frontend::{HttpFrontend, SessionCapabilities},
         reattach::{
             agent_build_problem, ensure_session_loaded, require_session_exists, session_not_found,
@@ -165,11 +166,6 @@ pub(crate) struct SessionResponse {
     /// the process default answers for a bare row, and that answer is written to the cells.
     #[serde(flatten)]
     pub(crate) session: SessionView,
-    /// Wall-clock timestamp (RFC 3339) of the last successful turn on this session. Omitted when
-    /// the session has never run a turn (just-created or just-re-attached). Distinct from
-    /// `updated_at`, which advances on any session-level mutation (PATCH included).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) last_turn_at: Option<String>,
     /// Per-session capability flags declared at create time (or re-attach), echoed back so clients
     /// can confirm the settings their session actually ended up with.
     pub(crate) capabilities: SessionCapabilities,
@@ -181,12 +177,21 @@ pub(crate) struct SessionResponse {
     /// `JoinHandle` detaches rather than aborts, so the work completes and resubmitting would
     /// duplicate a reply the user is about to receive anyway.
     ///
-    /// Always `false` for a GC-evicted session, since eviction requires an idle session.
+    /// `false` for a GC-evicted session, since eviction requires an idle session, and `true` for
+    /// a sub-agent this process is running under its parent, which is never resident itself. A
+    /// session another process runs (a REPL open on it) reads as idle: only its file lock knows,
+    /// and a read may not probe it.
     pub(crate) turn_in_flight: bool,
     /// Inbox items waiting to be appended. Reported for a loaded session only, since it is what a
     /// client asks a session it is driving; a listing does not pay a query per row for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) inbox_pending: Option<u64>,
+    /// Approval prompts parked on this session, waiting for a person. Reported for a session this
+    /// process holds, on the listing too, since the count is a fact of the resident frontend and
+    /// costs no query; it is what lets a session list say "waiting on a person" without a feed
+    /// per row. The prompts themselves are on the feed, which replays every one still parked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) approvals_pending: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -207,6 +212,22 @@ pub(crate) struct ListSessionsQuery {
     /// every session records.
     #[serde(default)]
     pub(crate) cwd: Option<String>,
+    /// Only the sub-agents this session spawned, its direct children. A tree view expands one
+    /// node with one call and recurses for depth. Names sub-agents by definition, so
+    /// `include_children` is moot beside it; a session with none, or an id no session has, is an
+    /// empty page, as every listing filter answers.
+    #[serde(default)]
+    pub(crate) parent: Option<Uuid>,
+    /// Only the sessions on this profile.
+    #[serde(default)]
+    pub(crate) profile: Option<String>,
+    /// Only pinned sessions (`true`) or only unpinned ones (`false`).
+    #[serde(default)]
+    pub(crate) pinned: Option<bool>,
+    /// Only the sessions changed after this RFC 3339 instant, by the `updated_at` the record
+    /// shows: a turn or a change to what the session runs as, never a title or a pin.
+    #[serde(default)]
+    pub(crate) updated_since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -368,16 +389,12 @@ pub(crate) async fn create_session(
         token_id: Some(principal.token_id.clone()),
         created_at: created_at_wall,
         updated_at: Arc::new(RwLock::new(created_at_wall)),
-        last_turn_at_wall: Arc::new(RwLock::new(None)),
         capabilities,
         frontend: http_frontend,
     };
-    entry.frontend.install_feed(
-        session_uuid,
-        crate::host::http::feed::FEED_BROADCAST_CAPACITY,
-        state.config.stream_replay_events,
-        Some(state.webhooks.clone()),
-    );
+    entry
+        .frontend
+        .install_feed(session_uuid, &state.feed_wiring());
 
     state.sessions.write().await.insert(session_uuid, entry);
 
@@ -394,29 +411,35 @@ pub(crate) async fn create_session(
     rollback.disarm();
     // Use the canonical `created_at` from the DB insert so all three surfaces agree.
     let timestamp = created.created_at;
-    Ok((
-        StatusCode::CREATED,
-        Json(SessionResponse {
-            session: SessionView {
-                id: session_uuid,
-                created_at: timestamp.clone(),
-                updated_at: timestamp,
-                cwd: Some(cwd_path),
-                permission: Some(permission),
-                approvals,
-                profile,
-                title,
-                // A root by construction: `POST /v1/sessions` has no way to name a parent, and
-                // a sub-agent session is only ever minted by `agent_spawn` inside a turn.
-                parent_id: None,
-                pinned_at: None,
-            },
-            last_turn_at: None,
-            capabilities,
-            turn_in_flight: false,
-            inbox_pending: None,
-        }),
-    ))
+    let record = SessionResponse {
+        session: SessionView {
+            id: session_uuid,
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+            cwd: Some(cwd_path),
+            permission: Some(permission),
+            approvals,
+            profile,
+            title,
+            // A root by construction: `POST /v1/sessions` has no way to name a parent, and
+            // a sub-agent session is only ever minted by `agent_spawn` inside a turn.
+            parent_id: None,
+            pinned_at: None,
+            last_turn: None,
+        },
+        capabilities,
+        turn_in_flight: false,
+        inbox_pending: None,
+        // Just made: nothing can be parked on it yet.
+        approvals_pending: Some(0),
+    };
+    announce_session(
+        &state,
+        crate::host::http::sse::SseEventType::SessionCreated,
+        &record,
+        None,
+    );
+    Ok((StatusCode::CREATED, Json(record)))
 }
 
 /// Body for `POST /v1/sessions/{id}/fork`. Every field is optional; omitted means "inherit from
@@ -443,7 +466,10 @@ pub(crate) struct ForkSessionBody {
     post,
     path = "/v1/sessions/{id}/fork",
     tag = "sessions",
-    params(("id" = Uuid, Path, description = "Session UUID to fork")),
+    params(
+        ("id" = Uuid, Path, description = "Session UUID to fork"),
+        ("If-Match" = Option<String>, Header, description = "The `ETag` of `GET /v1/sessions/{id}/messages` the copy was decided on. The fork is refused with 412 when the source has changed since."),
+    ),
     request_body = Option<ForkSessionBody>,
     responses(
         (status = 201, description = "Forked session", body = SessionResponse),
@@ -451,6 +477,7 @@ pub(crate) struct ForkSessionBody {
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
         (status = 409, description = "A turn is in flight on the source; cancel first (`/errors/turn-in-flight`). Or another meka process holds the source (`/errors/session-locked`)", body = ProblemDetail),
+        (status = 412, description = "`If-Match` names a conversation that has since changed (`/errors/precondition-failed`); `revision` and `total` carry the current state", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid body, or the source is a sub-agent's conversation, whose copy is another sub-agent and so has no live session to hand back (`/errors/session-not-drivable`)", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
@@ -461,6 +488,7 @@ pub(crate) async fn fork_session(
     State(state): State<ServerState>,
     scope::Scoped { principal, .. }: scope::Scoped<scope::SessionsWrite>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     raw_body: Bytes,
 ) -> Result<(StatusCode, Json<SessionResponse>), ProblemDetail> {
     // An empty body is the common case (`inherit everything`), and axum hands it to us as zero
@@ -546,6 +574,34 @@ pub(crate) async fn fork_session(
             None => (None, None, crate::store::SourceLock::Probe),
         }
     };
+    // The precondition is checked against the view about to be copied: a resident source under
+    // the conversation mutex held above, a dormant one from its rows. Only when the client sent
+    // one, since a dormant source's length costs a read of its log.
+    if headers.contains_key(header::IF_MATCH) {
+        let revision = state
+            .shared
+            .store
+            .count_rewrites(id)
+            .await
+            .map_err(|error| {
+                ProblemDetail::internal_sanitized(
+                    "failed to count the conversation's rewrites",
+                    error,
+                )
+                .with("session_id", id.to_string())
+            })?;
+        let total = match &source_still {
+            Some(conversation) => conversation.len(),
+            None => {
+                let events = state.shared.store.load_events(id).await.map_err(|error| {
+                    ProblemDetail::internal_sanitized("failed to load session events", error)
+                        .with("session_id", id.to_string())
+                })?;
+                crate::conversation::Conversation::from_events(events).len()
+            }
+        };
+        check_if_match(&headers, revision, total, id)?;
+    }
     let (forked, copy_lock) = state
         .shared
         .store
@@ -629,30 +685,35 @@ pub(crate) async fn fork_session(
         token = principal.token_id,
     );
 
-    Ok((
-        StatusCode::CREATED,
-        Json(SessionResponse {
-            session: SessionView {
-                id: forked.id,
-                created_at: forked.created_at.clone(),
-                updated_at: forked.created_at,
-                cwd: Some(entry.cells().cwd.get()),
-                permission: Some(entry.cells().permission.get()),
-                approvals: entry.cells().permission.approvals(),
-                profile: forked_info.profile,
-                title: forked_info.title,
-                // Read back rather than assumed: forking a sub-agent session keeps it under the
-                // same parent, so the copy is a sibling of the original, not a new root, and a
-                // response that said otherwise would disagree with the store.
-                parent_id: forked_info.parent_id,
-                pinned_at: forked_info.pinned_at,
-            },
-            last_turn_at: None,
-            capabilities: entry.capabilities,
-            turn_in_flight: false,
-            inbox_pending: None,
-        }),
-    ))
+    let record = SessionResponse {
+        session: SessionView {
+            id: forked.id,
+            created_at: forked.created_at.clone(),
+            updated_at: forked.created_at,
+            cwd: Some(entry.cells().cwd.get()),
+            permission: Some(entry.cells().permission.get()),
+            approvals: entry.cells().permission.approvals(),
+            profile: forked_info.profile,
+            title: forked_info.title,
+            // Read back rather than assumed: forking a sub-agent session keeps it under the
+            // same parent, so the copy is a sibling of the original, not a new root, and a
+            // response that said otherwise would disagree with the store.
+            parent_id: forked_info.parent_id,
+            pinned_at: forked_info.pinned_at,
+            last_turn: forked_info.last_turn,
+        },
+        capabilities: entry.capabilities,
+        turn_in_flight: false,
+        inbox_pending: None,
+        approvals_pending: Some(entry.frontend.approvals_pending()),
+    };
+    announce_session(
+        &state,
+        crate::host::http::sse::SseEventType::SessionCreated,
+        &record,
+        None,
+    );
+    Ok((StatusCode::CREATED, Json(record)))
 }
 
 /// Delete a fork this handler could not put a session behind, so the caller is not left with a
@@ -700,19 +761,21 @@ pub(crate) async fn list_sessions(
     // At least one: a zero-row page came back with no cursor, which reads as "no sessions" to a
     // paging client on a store full of them.
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let cwd_filter = query
-        .cwd
-        .as_deref()
-        .map(|given| crate::workspace::cwd_filter(std::path::Path::new(given)));
+    let filter = crate::store::SessionFilter {
+        include_children: query.include_children.unwrap_or(false),
+        cwd: query
+            .cwd
+            .as_deref()
+            .map(|given| crate::workspace::cwd_filter(std::path::Path::new(given))),
+        parent: query.parent,
+        profile: query.profile,
+        pinned: query.pinned,
+        updated_since: query.updated_since,
+    };
     let (rows, next_cursor) = state
         .shared
         .store
-        .list_sessions(
-            limit,
-            query.include_children.unwrap_or(false),
-            cwd_filter.as_deref(),
-            query.cursor.as_deref(),
-        )
+        .list_sessions(limit, query.cursor.as_deref(), &filter)
         .await
         .map_err(|error| match error {
             // A cursor this server did not issue is the caller's to fix, in the store's words.
@@ -728,7 +791,13 @@ pub(crate) async fn list_sessions(
     let in_memory = state.sessions.read().await;
     let sessions = rows
         .iter()
-        .map(|row| listed_session(row, in_memory.get(&row.id)))
+        .map(|row| {
+            listed_session(
+                row,
+                in_memory.get(&row.id),
+                state.shared.running_subagents.is_running(row.id),
+            )
+        })
         .collect();
     drop(in_memory);
 
@@ -738,12 +807,132 @@ pub(crate) async fn list_sessions(
     }))
 }
 
+/// Put a session's record on the server feed, the listing's change feed, and on the session's own
+/// feed when it is resident, so a client holding either learns the record changed. The record is
+/// the whole of it, as `GET /v1/sessions/{id}` would answer, so a client replaces its row rather
+/// than patching it.
+pub(crate) fn announce_session(
+    state: &ServerState,
+    event_type: crate::host::http::sse::SseEventType,
+    record: &SessionResponse,
+    resident: Option<&SessionEntry>,
+) {
+    let data = match serde_json::to_value(record) {
+        Ok(data) => data,
+        Err(error) => {
+            tracing::warn!("failed to serialize a session record for the feed: {error}");
+            return;
+        }
+    };
+    if let Some(entry) = resident {
+        entry.frontend.push_sse(event_type, data.clone());
+    }
+    crate::sync::lock(&state.server_feed).publish(event_type, data);
+}
+
+/// Put a session's deletion on the server feed. A session's own feed ends instead, which is how
+/// its readers learn.
+pub(crate) fn announce_session_deleted(state: &ServerState, id: Uuid) {
+    crate::sync::lock(&state.server_feed).publish(
+        crate::host::http::sse::SseEventType::SessionDeleted,
+        serde_json::json!({ "id": id.to_string(), "session_id": id.to_string() }),
+    );
+}
+
+/// The ids a deletion of `id` removes: the session and every sub-agent under it, which the
+/// store's cascade takes with it. Read ahead of the delete, since afterwards nothing can say.
+pub(crate) async fn ids_a_deletion_removes(state: &ServerState, id: Uuid) -> Vec<Uuid> {
+    match state.shared.store.load_session_tree(id).await {
+        Ok(tree) => tree.into_iter().map(|meta| meta.id).collect(),
+        Err(error) => {
+            tracing::warn!("failed to read the sub-agents of {id} ahead of its deletion: {error}");
+            vec![id]
+        }
+    }
+}
+
+/// Announce a deletion for every row it removed, the sub-agents ahead of the session that spawned
+/// them.
+pub(crate) fn announce_deletion(state: &ServerState, removed: &[Uuid]) {
+    for id in removed.iter().rev() {
+        announce_session_deleted(state, *id);
+    }
+}
+
+/// Put a sub-agent's record on the server feed as its parent spawns, resumes and finishes it.
+/// No handler sees those: a sub-agent is run by a tool, not by a request, so the registry that
+/// answers `turn_in_flight` for it is what announces them.
+pub(crate) async fn announce_subagent_runs(state: ServerState) {
+    use crate::session::{SubagentChange, SubagentRun};
+    let mut changes = state.shared.running_subagents.subscribe();
+    // What this task has told the feed is running, so a lag is repaired by comparing it with the
+    // registry rather than left as a sub-agent the feed believes is still in flight.
+    let mut announced_running: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    loop {
+        let pending: Vec<SubagentChange> = match changes.recv().await {
+            Ok(change) => vec![change],
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                tracing::warn!(
+                    "the server feed missed {missed} sub-agent run change(s); re-syncing"
+                );
+                let running: std::collections::HashSet<Uuid> = state
+                    .shared
+                    .running_subagents
+                    .running_ids()
+                    .into_iter()
+                    .collect();
+                let ended = announced_running.difference(&running).copied();
+                let started = running.difference(&announced_running).copied();
+                ended
+                    .map(|child| SubagentChange {
+                        child,
+                        run: SubagentRun::Ended,
+                    })
+                    .chain(started.map(|child| SubagentChange {
+                        child,
+                        run: SubagentRun::Resumed,
+                    }))
+                    .collect()
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        };
+        for change in pending {
+            if change.run == SubagentRun::Ended {
+                announced_running.remove(&change.child);
+            } else {
+                announced_running.insert(change.child);
+            }
+            let summary = match state.shared.store.session_info(change.child).await {
+                Ok(Some(summary)) => summary,
+                // Gone already: deleted under its parent, which the delete announced.
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to read sub-agent {} for the feed: {error}",
+                        change.child
+                    );
+                    continue;
+                }
+            };
+            let record = listed_session(&summary, None, change.run != SubagentRun::Ended);
+            let event_type = match change.run {
+                SubagentRun::Spawned => crate::host::http::sse::SseEventType::SessionCreated,
+                SubagentRun::Resumed | SubagentRun::Ended => {
+                    crate::host::http::sse::SseEventType::SessionUpdated
+                }
+            };
+            announce_session(&state, event_type, &record, None);
+        }
+    }
+}
+
 /// A session as a listing answers for it: the row, under what this process knows when the
 /// session is resident. The row answers for an evicted session; a resident one is reported from
 /// its cells and clock, which are what its next turn runs against.
-fn listed_session(
+pub(crate) fn listed_session(
     row: &crate::store::SessionSummary,
     live: Option<&SessionEntry>,
+    running_as_subagent: bool,
 ) -> SessionResponse {
     let mut session = SessionView::from(row);
     if let Some(entry) = live {
@@ -754,25 +943,19 @@ fn listed_session(
             session.updated_at = updated_at.to_rfc3339();
         }
     }
-    let last_turn_at = live.and_then(|entry| {
-        entry
-            .last_turn_at_wall
-            .read()
-            .ok()
-            .and_then(|guard| guard.map(|ts| ts.to_rfc3339()))
-    });
     // Recover capabilities from the persisted JSON column for evicted rows.
     let capabilities = live
         .map(|entry| entry.capabilities)
         .unwrap_or_else(|| capabilities_from_row(row.capabilities_json.as_deref()));
-    let turn_in_flight =
-        live.is_some_and(|entry| entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0);
+    // A sub-agent is never resident; its parent's run is what makes it busy.
+    let turn_in_flight = running_as_subagent
+        || live.is_some_and(|entry| entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0);
     SessionResponse {
         session,
-        last_turn_at,
         capabilities,
         turn_in_flight,
         inbox_pending: None,
+        approvals_pending: live.map(|entry| entry.frontend.approvals_pending()),
     }
 }
 
@@ -841,7 +1024,11 @@ pub(crate) async fn search_sessions(
     let sessions = found
         .iter()
         .map(|found| SessionMatchResponse {
-            session: listed_session(&found.session, in_memory.get(&found.session.id)),
+            session: listed_session(
+                &found.session,
+                in_memory.get(&found.session.id),
+                state.shared.running_subagents.is_running(found.session.id),
+            ),
             excerpt: found.excerpt.clone(),
         })
         .collect();
@@ -889,11 +1076,6 @@ pub(crate) async fn get_session(
                     .with("session_id", id.to_string())
             })?
             .ok_or_else(|| session_not_found(id))?;
-        let last_turn_at = entry
-            .last_turn_at_wall
-            .read()
-            .ok()
-            .and_then(|guard| guard.map(|ts| ts.to_rfc3339()));
         let inbox_pending = state
             .shared
             .store
@@ -916,11 +1098,12 @@ pub(crate) async fn get_session(
                 title: info.title,
                 parent_id: info.parent_id,
                 pinned_at: info.pinned_at,
+                last_turn: info.last_turn,
             },
-            last_turn_at,
             capabilities: entry.capabilities,
             turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
             inbox_pending: Some(inbox_pending),
+            approvals_pending: Some(entry.frontend.approvals_pending()),
         }));
     }
     let summary = state
@@ -934,10 +1117,11 @@ pub(crate) async fn get_session(
     let capabilities = capabilities_from_row(summary.capabilities_json.as_deref());
     Ok(Json(SessionResponse {
         session: SessionView::from(&summary),
-        last_turn_at: None,
         capabilities,
-        turn_in_flight: false,
+        // A sub-agent is never resident; its parent's run is what makes it busy.
+        turn_in_flight: state.shared.running_subagents.is_running(id),
         inbox_pending: None,
+        approvals_pending: None,
     }))
 }
 
@@ -982,6 +1166,7 @@ async fn patch_dormant_session(
         return Ok(None);
     }
     require_session_exists(state, id).await?;
+    let before = dormant_record(state, id).await?;
     if let Some(profile) = profile {
         // `session-locked`, the same code `ensure_session_loaded` answers a cross-process conflict
         // with, and for the same reason: this is another process owning the session, not an
@@ -1011,19 +1196,17 @@ async fn patch_dormant_session(
         crate::config::require_profile(profile, &state.shared.config.profiles).map_err(
             |error| ProblemDetail::for_error(&error, state.config.relay_provider_errors),
         )?;
-        let resolved = crate::provider::resolved_profile(
-            &state.shared.providers,
-            profile.to_string(),
-        )
-        .await
-        // Discriminated, not a blanket 422; see the sibling site in `patch_session`.
-        .map_err(|error| {
-            agent_build_problem(
-                id,
-                &format!("failed to resolve profile '{profile}'"),
-                error,
-            )
-        })?;
+        let resolved =
+            crate::provider::resolved_profile(&state.shared.providers, profile.to_string())
+                .await
+                // Discriminated, not a blanket 422; see the sibling site in `patch_session`.
+                .map_err(|error| {
+                    agent_build_problem(
+                        id,
+                        &format!("failed to resolve profile '{profile}'"),
+                        error,
+                    )
+                })?;
 
         // Skipped when nothing changes, so a no-op PATCH does not advance `updated_at` that
         // clients watch for changes. Nothing to reconcile beyond the name: a dormant session has
@@ -1051,6 +1234,24 @@ async fn patch_dormant_session(
 
     // Re-read rather than patching the pre-write copy, so `updated_at` and `profile` are what the
     // store now holds.
+    let record = dormant_record(state, id).await?;
+    // A `PATCH` that moved nothing is not a change anyone needs to hear of; the row is the
+    // judge, since a profile already recorded is skipped while a title is always written.
+    let changed = serde_json::to_value(&record).ok() != serde_json::to_value(&before).ok();
+    if changed {
+        announce_session(
+            state,
+            crate::host::http::sse::SseEventType::SessionUpdated,
+            &record,
+            None,
+        );
+    }
+    Ok(Some(Json(record)))
+}
+
+/// A session's record as its row states it, for a session this process does not hold: not
+/// resident, and nothing can make it so while the reconstruction lock is held.
+async fn dormant_record(state: &ServerState, id: Uuid) -> Result<SessionResponse, ProblemDetail> {
     let summary = state
         .shared
         .store
@@ -1058,14 +1259,13 @@ async fn patch_dormant_session(
         .await
         .map_err(|error| ProblemDetail::internal_sanitized("failed to look up session", error))?
         .ok_or_else(|| session_not_found(id))?;
-    Ok(Some(Json(SessionResponse {
+    Ok(SessionResponse {
         session: SessionView::from(&summary),
-        last_turn_at: None,
         capabilities: capabilities_from_row(summary.capabilities_json.as_deref()),
-        // Not resident, and nothing could have made it so while the reconstruction lock was held.
         turn_in_flight: false,
         inbox_pending: None,
-    })))
+        approvals_pending: None,
+    })
 }
 
 /// PATCH /v1/sessions/{id}: update mutable session knobs (permission, approvals, cwd, profile) on
@@ -1220,26 +1420,21 @@ pub(crate) async fn patch_session(
                 |error| ProblemDetail::for_error(&error, state.config.relay_provider_errors),
             )?;
             // The profile as configured. A `PATCH` naming a profile moves the session to that
-            // bundle entire, which is the only thing naming a profile can mean.
+            // bundle entire, which is the only thing naming a profile can mean. Its failure is
+            // discriminated rather than a blanket 422: `resolved_profile` reaches the credential
+            // store, so a locked or unreadable store arrives as `MekaError::Database`, which
+            // `agent_build_problem` sanitizes into a 500 while a `Config` refusal goes back
+            // verbatim, since naming the profile is the whole point.
             Some(
-                crate::provider::resolved_profile(
-                    &state.shared.providers,
-                    name.to_string(),
-                )
-                .await
-                // Not a blanket 422: `resolved_profile` reaches `profile_credential_version` and
-                // `load_profile_credential`, so a locked or unreadable store arrives here as
-                // `MekaError::Database`, and formatting it into the body answered "your request is
-                // invalid" with an internal message attached. `agent_build_problem` is the
-                // discriminator the rest of this surface already uses -- `Config` verbatim, because
-                // naming the profile is the whole point, everything else sanitized into a 500.
-                .map_err(|error| {
-                    agent_build_problem(
-                        id,
-                        &format!("failed to resolve profile '{name}'"),
-                        error,
-                    )
-                })?,
+                crate::provider::resolved_profile(&state.shared.providers, name.to_string())
+                    .await
+                    .map_err(|error| {
+                        agent_build_problem(
+                            id,
+                            &format!("failed to resolve profile '{name}'"),
+                            error,
+                        )
+                    })?,
             )
         }
         None => None,
@@ -1333,7 +1528,7 @@ pub(crate) async fn patch_session(
     }
 
     // Bump `updated_at` only on the changes the row's own rule moves it for, so the live clock
-    // agrees with the row; leave `last_turn_at` alone so the GC scanner's idle timer tracks
+    // agrees with the row; leave the resident's clock alone so the GC scanner's idle timer tracks
     // profile activity, not metadata edits.
     if moves_updated_at && let Ok(mut guard) = entry.updated_at.write() {
         *guard = chrono::Utc::now();
@@ -1356,12 +1551,7 @@ pub(crate) async fn patch_session(
                 .with("session_id", id.to_string())
         })?
         .ok_or_else(|| session_not_found(id))?;
-    let last_turn_at = entry
-        .last_turn_at_wall
-        .read()
-        .ok()
-        .and_then(|guard| guard.map(|ts| ts.to_rfc3339()));
-    Ok(Json(SessionResponse {
+    let record = SessionResponse {
         session: SessionView {
             id: entry.id,
             created_at: entry.created_at.to_rfc3339(),
@@ -1373,12 +1563,23 @@ pub(crate) async fn patch_session(
             title: info.title,
             parent_id: info.parent_id,
             pinned_at: info.pinned_at,
+            last_turn: info.last_turn,
         },
-        last_turn_at,
         capabilities: entry.capabilities,
         turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
         inbox_pending: None,
-    }))
+        approvals_pending: Some(entry.frontend.approvals_pending()),
+    };
+    // A `PATCH` that moved nothing is not a change anyone needs to hear of.
+    if mutated {
+        announce_session(
+            &state,
+            crate::host::http::sse::SseEventType::SessionUpdated,
+            &record,
+            Some(&entry),
+        );
+    }
+    Ok(Json(record))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1503,6 +1704,7 @@ pub(crate) async fn delete_session(
     // own existence re-check could then insert an entry for a row this delete is about to remove.
     // The window is the few instructions between the two, and both sides funnel through the single
     // database connection, which orders the delete ahead of the re-check in practice.
+    let tree = ids_a_deletion_removes(&state, id).await;
     let removed = {
         let mut map = state.sessions.write().await;
         if let Some(entry) = map.get(&id)
@@ -1570,6 +1772,7 @@ pub(crate) async fn delete_session(
             );
         }
     }
+    announce_deletion(&state, &tree);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1594,7 +1797,7 @@ mod tests {
         crate::host::http::reattach::assert_dormant_fast_path_is_serialized(
             include_str!("sessions.rs"),
             "async fn patch_dormant_session(",
-            "session_info(id)",
+            "dormant_record(state, id)",
             "record_profile_switch(",
         );
     }

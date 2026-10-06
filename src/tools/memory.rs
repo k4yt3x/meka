@@ -489,7 +489,7 @@ impl Tool for MemoryReadTool {
 /// An entry here carries a description, an excerpt and often a whole short body, so ten of them is
 /// already a substantial read and a hundred would crowd out the turn that asked for them.
 const DEFAULT_SEARCH_LIMIT: usize = 10;
-const MAX_SEARCH_LIMIT: usize = 25;
+use crate::store::memory::MAX_SEARCH_LIMIT;
 
 /// A hit whose body is at most this long is shown in full instead of an excerpt.
 ///
@@ -532,6 +532,16 @@ enum Tier {
     Prefix,
     Substring,
     Fuzzy,
+}
+
+impl From<crate::store::memory::SearchTier> for Tier {
+    fn from(tier: crate::store::memory::SearchTier) -> Self {
+        match tier {
+            crate::store::memory::SearchTier::Exact => Self::Exact,
+            crate::store::memory::SearchTier::Prefix => Self::Prefix,
+            crate::store::memory::SearchTier::Substring => Self::Substring,
+        }
+    }
 }
 
 impl Tier {
@@ -697,81 +707,26 @@ impl Tool for MemorySearchTool {
         };
 
         let store = self.memories.as_ref();
-        let terms = Terms::parse(&queries);
-        if terms.is_empty() {
+        let Some(found) = store
+            .find(&queries, limit)
+            .await
+            .map_err(|error| tool_error("memory_search", error))?
+        else {
             return Err(MekaError::ToolExecution {
                 tool_name: "memory_search".to_string(),
                 message: "'queries' contained no searchable words; try different wording"
                     .to_string(),
             });
-        }
-
-        // Four tiers, tried in order and reported by name. Exact handles word endings through the
-        // stemmer, prefix handles a truncation or a trailing typo, substring handles text the
-        // tokenizer does not split into words at all, and spelling handles the rest. The index
-        // sees only the terms it can split into words; a term of a script written without spaces
-        // goes to the substring scan every time, not only as a last resort, so a query mixing
-        // scripts is answered for both halves rather than for the half the index knows.
-        let (indexable, unspaced) = terms.split_by_script();
-        // The window each side is asked for. Alone, the tiers answer with `limit` hits. When the
-        // halves of a mixed query are merged, each side is asked for the widest window the tool
-        // ever shows, so a memory past `limit` on words alone still meets its substring hit and
-        // rises; the cut to `limit` is taken after the merge.
-        let window = if unspaced.is_empty() {
-            limit
-        } else {
-            MAX_SEARCH_LIMIT
         };
-        let mut tier = Tier::Exact;
-        let mut results = SearchResults::default();
-        if !indexable.is_empty() {
-            results = store.search(indexable.match_expression(), window).await?;
-            if results.hits.is_empty() {
-                tier = Tier::Prefix;
-                results = store
-                    .search(indexable.prefix_match_expression(), window)
-                    .await?;
-            }
-            // Still the prefix tier, in the other direction: the query may be the *longer*
-            // derived form. Longest prefix first, stopping at the first that answers, so the
-            // most specific query that can find anything is the one that does. See
-            // `Terms::trimmed_prefix_match_expressions`.
-            if results.hits.is_empty() {
-                for expression in indexable.trimmed_prefix_match_expressions() {
-                    results = store.search(expression, window).await?;
-                    if !results.hits.is_empty() {
-                        break;
-                    }
-                }
-            }
-        }
-        // The scanned terms that found something and those that found nothing, named apart in
-        // the result so the model is never told a term matched when no memory holds it.
-        let mut scanned: Vec<String> = Vec::new();
-        let mut missed: Vec<String> = Vec::new();
-        if !indexable.is_empty() && results.hits.is_empty() {
-            // Every term takes the scan, the indexable ones included: this is the last resort for
-            // text the tokenizer joined into one token, an identifier or a path as much as a
-            // sentence of Chinese.
-            tier = Tier::Substring;
-            results = store.substring_search(terms.words(), limit).await?;
-        } else {
-            // One scan per term, so the result can say which terms it answered for. With no
-            // indexable half this is the whole answer rather than a fallback, so the tier is not
-            // the substring one, whose preamble says the words matched nothing.
-            for term in &unspaced {
-                let found = store
-                    .substring_search(std::slice::from_ref(term), window)
-                    .await?;
-                if found.hits.is_empty() {
-                    missed.push(term.clone());
-                } else {
-                    scanned.push(term.clone());
-                    results = results.merge(found, window);
-                }
-            }
-            results.hits.truncate(limit);
-        }
+        let crate::store::memory::Found {
+            tier,
+            results,
+            scanned,
+            missed,
+            beside_words,
+            words,
+        } = found;
+        let tier = Tier::from(tier);
 
         let now = std::time::SystemTime::now();
         if !results.hits.is_empty() {
@@ -781,7 +736,7 @@ impl Tool for MemorySearchTool {
                     ScannedTerms {
                         found: &scanned,
                         missed: &missed,
-                        beside_words: !indexable.is_empty(),
+                        beside_words,
                     },
                     &results,
                     limit,
@@ -798,7 +753,7 @@ impl Tool for MemorySearchTool {
             .index()
             .await
             .map_err(|error| tool_error("memory_search", error))?;
-        let (fuzzy, candidates) = Self::fuzzy_by_spelling(&index, terms.words(), limit);
+        let (fuzzy, candidates) = Self::fuzzy_by_spelling(&index, &words, limit);
         if fuzzy.is_empty() {
             return Ok(ToolOutput::text(
                 format!(

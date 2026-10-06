@@ -472,6 +472,7 @@ mod tests {
             finished_at: Some(chrono::Utc::now()),
             announced_at: None,
             delivered_at: None,
+            subagent_id: None,
         };
         manager
             .background_store()

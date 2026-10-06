@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Turns are a resource: `GET /v1/sessions/{id}/turns` lists them with source, outcome and usage.
+- `last_turn` on a session record is its latest turn, whichever host ran it.
+- Each message on `GET /messages` carries the `turn_id` of the turn that added it.
+- `GET /messages` answers with an `ETag`; `If-Match` on rewind and fork refuses a changed view.
+- `conversation.rewound` on the session feed, and `revision` on every terminal event.
+- `approvals_pending` on a session record counts the prompts parked on it.
+- `permission_resolved` says how a parked prompt closed; `permission_required` has `expires_at`.
+- A prompt a sub-agent's call parks names the sub-agent in `subagent_id`.
+- A running sub-agent's id answers `GET /v1/sessions/{id}/stream` with its own read-only feed.
+- `GET /v1/stream`, the server feed: every change to a session record, across sessions.
+- A session's own feed carries `session.updated` when its record changes.
+- `GET /v1/sessions` filters by `parent`, `profile`, `pinned` and `updated_since`.
+- `GET /v1/tasks` lists every session's background tasks; a backgrounded spawn names its sub-agent.
+- `GET /v1/memory?q=<words>` finds what the agent's own memory search would, with the snippet.
+- A session archive carries its turns; an archive an older meka wrote still imports.
+
+### Changed
+
+- **Breaking:** a blocking turn's `messages` is the whole turn; `final_text` and `tool_calls` go.
+- **Breaking:** `last_turn_at` and `used_percent` are gone; see the upgrade guide.
+- **Breaking:** `turn_id` on `GET /messages` is the turn's id; the label moved to `turn_label`.
+- **Breaking:** `vision` moved from `GET /v1/info` to each entry of `GET /v1/profiles`.
+- **Breaking:** `GET /v1/sessions/{id}/schedule` is now `GET /v1/schedule?session=<id>`.
+- **Breaking:** deleting a job or a task over HTTP takes the full id, not a prefix.
+- **Breaking:** `subagent.activity` is gone from the HTTP feed; read the sub-agent's own feed.
+- **Breaking:** the stream route on a sub-agent not running here is 409 `subagent-not-running`.
+- A sub-agent its parent is running reports `turn_in_flight: true` on its record and in listings.
+- A parked approval prompt waits out `stream_reattach_grace` after its last attender leaves.
+- The store gains a table of turns; the migration runs on open behind the usual backup.
+
+### Fixed
+
+- Turn labels on `GET /messages` no longer count a tool round's results as a new turn.
+
 ## [0.69.0] - 2026-10-03
 
 ### Added

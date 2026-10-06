@@ -29,14 +29,6 @@ pub(crate) struct InfoResponse {
     pub(crate) version: String,
     pub(crate) default_permission: String,
     pub(crate) enabled_permissions: Vec<String>,
-    /// Whether the process default profile accepts image attachments. The HTTP analog of ACP's
-    /// `promptCapabilities.image`, so a client can tell whether attaching one is worth the base64
-    /// payload instead of discovering it from a 422.
-    ///
-    /// An answer for the process, like everything else on this endpoint, and therefore only for a
-    /// session created without naming a `profile`. `POST /turn` asks the session itself
-    /// (`ResidentSession::accepts_images`), so a session on another profile can differ.
-    pub(crate) vision: bool,
     /// The scopes the calling token holds, sorted. A client otherwise learns what it may do by
     /// collecting 403s.
     pub(crate) scopes: Vec<String>,
@@ -76,7 +68,6 @@ pub(crate) async fn info(
             .iter()
             .map(|p| p.to_string())
             .collect(),
-        vision: config.vision,
         scopes,
     }))
 }
@@ -192,7 +183,9 @@ pub(crate) async fn mcp_tools(
             ProblemDetail::new(
                 ErrorKind::Provider,
                 StatusCode::BAD_GATEWAY,
-                format!("MCP server '{name}' could not list its tools; the reason is in the meka log"),
+                format!(
+                    "MCP server '{name}' could not list its tools; the reason is in the meka log"
+                ),
             )
             .with("server", name.clone())
         })?;

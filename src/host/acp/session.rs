@@ -429,7 +429,10 @@ pub(super) async fn handle_list_sessions(
     let (rows, next_cursor) = match state
         .shared
         .store
-        .list_sessions(PAGE_SIZE, false, cwd_filter.as_deref(), cursor)
+        .list_sessions(PAGE_SIZE, cursor, &crate::store::SessionFilter {
+            cwd: cwd_filter.clone(),
+            ..Default::default()
+        })
         .await
     {
         Ok(pair) => pair,

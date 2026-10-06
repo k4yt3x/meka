@@ -8,7 +8,7 @@ use super::*;
 /// away included: the reader takes this version's shape alone, and an older archive the migration
 /// module knows is brought forward before it is read. `meka session import` refuses any other
 /// version.
-pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 6;
+pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 7;
 /// Decode an archive, refusing one written for another `format_version` before its shape is read.
 ///
 /// The version is read on its own first, because a release that changed the shape also changed
@@ -143,6 +143,8 @@ pub(crate) struct ExportedSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pinned_at: Option<String>,
     pub(crate) stats: crate::stats::SessionStatsSnapshot,
+    /// Every turn that began on the session, oldest first, as its rows record them.
+    pub(crate) turns: Vec<ExportedTurn>,
     pub(crate) events: Vec<ExportedEvent>,
     pub(crate) scratchpad_entries: std::collections::BTreeMap<String, String>,
 }
@@ -151,6 +153,41 @@ pub(crate) struct ExportedEvent {
     /// RFC 3339 timestamp the event row was persisted; preserved across import.
     pub(crate) at: String,
     pub(crate) event: crate::conversation::Event,
+    /// The turn that added the row, one of the session's `turns`, or none.
+    pub(crate) turn_id: Option<String>,
+}
+/// A turn as its row records it: the stored names (`status`, `error_type`) rather than the API's
+/// spellings, so an import writes the row back as it was.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ExportedTurn {
+    pub(crate) id: String,
+    pub(crate) source: String,
+    pub(crate) started_at: String,
+    pub(crate) ended_at: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) stop_reason: Option<String>,
+    pub(crate) error_type: Option<String>,
+    pub(crate) detail: Option<String>,
+    pub(crate) usage: crate::store::turns::TurnUsage,
+}
+impl From<crate::store::turns::TurnRecord> for ExportedTurn {
+    fn from(turn: crate::store::turns::TurnRecord) -> Self {
+        let (error_type, detail) = match turn.error {
+            Some(error) => (Some(error.kind.name().to_string()), Some(error.detail)),
+            None => (None, None),
+        };
+        Self {
+            id: turn.id.to_string(),
+            source: turn.source,
+            started_at: turn.started_at,
+            ended_at: turn.ended_at,
+            status: turn.status.map(|status| status.name().to_string()),
+            stop_reason: turn.stop_reason,
+            error_type,
+            detail,
+            usage: turn.usage,
+        }
+    }
 }
 /// Assemble the structured JSON export envelope for a session and every sub-agent descendant.
 /// Per-event timestamps and cumulative stats are preserved; `token_id` is intentionally excluded.
@@ -166,7 +203,18 @@ pub(crate) async fn build_session_export(
             .load_events_with_timestamps(meta.id)
             .await?
             .into_iter()
-            .map(|(at, event)| ExportedEvent { at, event })
+            .map(|(stamp, event)| ExportedEvent {
+                at: stamp.created_at,
+                event,
+                turn_id: stamp.turn_id.map(|id| id.to_string()),
+            })
+            .collect();
+        let turns: Vec<ExportedTurn> = store
+            .turn_store()
+            .load_turns(meta.id)
+            .await?
+            .into_iter()
+            .map(ExportedTurn::from)
             .collect();
         for exported in &events {
             for hash in super::blobs::blob_references(&exported.event) {
@@ -196,6 +244,7 @@ pub(crate) async fn build_session_export(
             title: meta.title,
             pinned_at: meta.pinned_at,
             stats,
+            turns,
             events,
             scratchpad_entries,
         });
@@ -356,6 +405,53 @@ pub(crate) fn plan_import(
             .parent_id
             .as_ref()
             .and_then(|parent| remap.get(parent).copied());
+        // Turns take ids of their own, as sessions do, and the events that name them follow.
+        let mut turn_ids: std::collections::HashMap<String, uuid::Uuid> =
+            std::collections::HashMap::new();
+        let mut turns = Vec::with_capacity(session.turns.len());
+        for mut turn in session.turns {
+            require_rfc3339(&session.id, "a turn's started_at", &turn.started_at)?;
+            if let Some(ended_at) = &turn.ended_at {
+                require_rfc3339(&session.id, "a turn's ended_at", ended_at)?;
+            }
+            if let Some(status) = &turn.status
+                && status.parse::<crate::store::turns::TurnStatus>().is_err()
+            {
+                return Err(crate::error::MekaError::Usage(format!(
+                    "session {} in the archive records a turn status meka does not know: '{status}'",
+                    session.id
+                )));
+            }
+            if let Some(error_type) = &turn.error_type
+                && crate::error::ErrorKind::from_name(error_type).is_none()
+            {
+                return Err(crate::error::MekaError::Usage(format!(
+                    "session {} in the archive records an error type meka does not know: \
+                     '{error_type}'",
+                    session.id
+                )));
+            }
+            let new_turn = uuid::Uuid::new_v4();
+            turn_ids.insert(
+                std::mem::replace(&mut turn.id, new_turn.to_string()),
+                new_turn,
+            );
+            turns.push(turn);
+        }
+        let mut events = Vec::with_capacity(session.events.len());
+        for event in session.events {
+            let turn = match event.turn_id {
+                Some(old) => Some(turn_ids.get(&old).copied().ok_or_else(|| {
+                    crate::error::MekaError::Usage(format!(
+                        "session {} in the archive has an event naming turn '{old}', which the \
+                         archive does not carry",
+                        session.id
+                    ))
+                })?),
+                None => None,
+            };
+            events.push((event.at, event.event, turn));
+        }
         let permission = match (session.permission, default_permission) {
             (Some(level), _) => level,
             (None, Some(level)) => level,
@@ -418,11 +514,8 @@ pub(crate) fn plan_import(
             },
             pinned_at: session.pinned_at,
             stats: session.stats,
-            events: session
-                .events
-                .into_iter()
-                .map(|event| (event.at, event.event))
-                .collect(),
+            turns,
+            events,
             scratchpad_entries: session.scratchpad_entries.into_iter().collect(),
         });
     }
@@ -502,7 +595,7 @@ mod tests {
     #[test]
     fn a_current_archive_missing_a_field_is_refused_rather_than_defaulted() {
         let mut archive = serde_json::to_value(archive_on("work")).expect("serialize");
-        for field in ["approvals", "additional_roots", "profile"] {
+        for field in ["approvals", "additional_roots", "profile", "turns"] {
             let mut lacking = archive.clone();
             lacking["sessions"][0]
                 .as_object_mut()
@@ -540,6 +633,7 @@ mod tests {
                 "subagent_spec_json": null,
                 "profile": profile,
                 "stats": crate::stats::SessionStatsSnapshot::default(),
+                "turns": [],
                 "events": [],
                 "scratchpad_entries": {},
             }],

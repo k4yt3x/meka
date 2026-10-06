@@ -364,9 +364,9 @@ mod tests {
                 is_error: false,
             }],
         });
-        store.save_event(session, &first).await.expect("save");
+        store.save_event(session, &first, None).await.expect("save");
         store
-            .save_events_atomic(session, vec![second.clone()])
+            .save_events_atomic(session, vec![second.clone()], None)
             .await
             .expect("save batch");
 
@@ -406,6 +406,7 @@ mod tests {
             .save_event(
                 owner,
                 &Event::Append(Message::user_with_images("look", vec![image("aGk=")])),
+                None,
             )
             .await
             .expect("save");
@@ -443,8 +444,14 @@ mod tests {
                 data: "aGVsbG8=".to_string(),
             },
         ]));
-        store.save_event(session, &as_png).await.expect("save");
-        store.save_event(session, &as_jpeg).await.expect("save");
+        store
+            .save_event(session, &as_png, None)
+            .await
+            .expect("save");
+        store
+            .save_event(session, &as_jpeg, None)
+            .await
+            .expect("save");
         assert_eq!(
             store.blob_count().await.expect("count"),
             1,

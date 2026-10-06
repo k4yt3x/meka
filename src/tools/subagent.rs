@@ -732,7 +732,20 @@ impl Tool for AgentSpawnTool {
             }
         };
         tracing::info!("spawning sub-agent {sub_session_id} for parent {parent_sid}");
-
+        // A detached spawn is a task row; the row names the session it runs, so a client
+        // connects the two without parsing the task's words. Best-effort: the link is
+        // bookkeeping, and the run does not wait on it.
+        if let Some(task_id) = &context.task_id
+            && let Err(error) = self
+                .tool_builder_params
+                .materials
+                .store
+                .background_store()
+                .record_task_subagent(task_id, sub_session_id)
+                .await
+        {
+            tracing::warn!("failed to record the task's sub-agent: {error}");
+        }
         // The last step that can fail before the worker exists in its own right. Nothing here is
         // reachable in practice (the web client is built from config the root already used, and a
         // fresh registry cannot collide), but the row is already on disk, so a failure would leave
@@ -770,6 +783,16 @@ impl Tool for AgentSpawnTool {
                 return Err(error);
             }
         };
+        // Registered for the whole of the run, lock or no lock: a sub-agent is never a resident
+        // session of any host, so this is what a session record answers `turn_in_flight` from.
+        // Taken after the build, which installs the worker's feed, so a record that says the
+        // worker is running never names a feed that is not yet there to read.
+        let _running = self
+            .tool_builder_params
+            .materials
+            .core
+            .running_subagents
+            .run(sub_session_id, crate::session::SubagentRun::Spawned);
 
         // Run the sub-agent's single turn via the shared `Agent::run_turn` path. Conversation
         // persistence (user message, assistant messages, tool results) happens inside `run_turn`
@@ -1509,7 +1532,6 @@ impl Tool for AgentFollowupTool {
                     error => format!("cannot follow up on sub-agent {agent_id}: {error}"),
                 },
             })?;
-
         let binding = worker_binding(
             &self.tool_builder_params,
             pinned.as_deref(),
@@ -1526,6 +1548,13 @@ impl Tool for AgentFollowupTool {
             &context,
         )
         .await?;
+        // After the build, for the reason `agent_spawn` registers after its own.
+        let _running = self
+            .tool_builder_params
+            .materials
+            .core
+            .running_subagents
+            .run(agent_id, crate::session::SubagentRun::Resumed);
 
         // Rehydrate the worker's own conversation through the door every resume uses.
         // `from_events` arms the resume notice, and it is left armed deliberately: every
@@ -1798,11 +1827,11 @@ async fn build_subagent(
     // sub-agent's output flows back as this tool's result, not as live notifications). The one
     // exception is the sub-agent's tool calls, which are rolled up into this call's own display
     // so a long run is not an opaque spinner, hence the tool-call id.
-    let sub_frontend: Arc<dyn crate::frontend::Frontend> =
-        Arc::new(crate::frontend::PermissionForwardingFrontend::new(
-            Arc::clone(&params.cells.frontend),
-            call.tool_call_id.clone(),
-        ));
+    let sub_frontend: Arc<dyn crate::frontend::Frontend> = params.cells.frontend.for_subagent(
+        Arc::clone(&params.cells.frontend),
+        sub_session_id,
+        call.tool_call_id.clone(),
+    );
     // The worker's own cells: its clamped permission, the directory and roots it was handed, a
     // session of its own, fresh gauges, and a profile seeded from its binding. A
     // worker has no prompt gauge and no session entry watching it, and it never switches, so
@@ -2553,6 +2582,7 @@ mod tests {
                     },
                     builtin_filter: BuiltinToolFilter::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
+                    running_subagents: Default::default(),
                 },
                 skills: crate::skills::SkillCache::for_root(None),
                 memories: crate::store::memory::MemoryStore::detached(),
@@ -2624,6 +2654,7 @@ mod tests {
                     },
                     builtin_filter: BuiltinToolFilter::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
+                    running_subagents: Default::default(),
                 },
                 skills: crate::skills::SkillCache::for_root(None),
                 memories: crate::store::memory::MemoryStore::detached(),
@@ -4365,7 +4396,7 @@ mod tests {
             steered,
             Event::Append(Message::assistant_text("done")),
         ] {
-            store.save_event(child, &event).await.expect("save");
+            store.save_event(child, &event, None).await.expect("save");
         }
 
         let list = AgentListTool {
@@ -6713,6 +6744,7 @@ mod tests {
             prompt_id: Some(prompt_id),
             frontend: Arc::new(crate::frontend::SilentFrontend),
             cancellation: CancellationToken::new(),
+            task_id: None,
         };
 
         let spawning_prompt = Uuid::new_v4();

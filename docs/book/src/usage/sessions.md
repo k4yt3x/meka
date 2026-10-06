@@ -377,9 +377,10 @@ currently say. `meka profile list` shows them.
 
 Both commands take `--format json`. The listing becomes `{"sessions": [...]}` and `show` one object,
 each session carrying `id`, `created_at`, `updated_at`, `profile`, `title`, `approvals`, and, when
-the row records them, `cwd`, `permission`, `capabilities`, `parent_id` and `pinned_at`: the fields
-[`GET /v1/sessions`](http-api.md) returns under the same names, less the two only a running host
-can answer (`turn_in_flight`, `last_turn_at`). Ids are printed in full, and an empty store is
+the row records them, `cwd`, `permission`, `capabilities`, `parent_id`, `pinned_at` and
+`last_turn`: the fields [`GET /v1/sessions`](http-api.md) returns under the same names, less the
+three only a running host can answer (`turn_in_flight`, `inbox_pending`, `approvals_pending`). Ids
+are printed in full, and an empty store is
 `{"sessions": []}`.
 
 ```bash

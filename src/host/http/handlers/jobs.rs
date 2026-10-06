@@ -14,7 +14,7 @@
 use axum::{
     Json,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use chrono::Utc;
@@ -41,12 +41,22 @@ pub(crate) struct ScheduledJobsResponse {
 }
 
 /// `GET /v1/schedule`: every scheduled job in the database, across all sessions.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub(crate) struct ListJobsQuery {
+    /// Only the jobs planted on this session. A session with none, or an id no session has,
+    /// answers an empty list, as every listing filter does.
+    #[serde(default)]
+    pub(crate) session: Option<Uuid>,
+}
+
 #[utoipa::path(
     get,
     path = "/v1/schedule",
     tag = "schedule",
+    params(ListJobsQuery),
     responses(
-        (status = 200, description = "All scheduled jobs", body = ScheduledJobsResponse),
+        (status = 200, description = "Scheduled jobs: every session's, or one session's with `session`", body = ScheduledJobsResponse),
+        (status = 400, description = "`session` is not a UUID (`/errors/invalid-body`)", body = ProblemDetail),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
@@ -56,54 +66,15 @@ pub(crate) struct ScheduledJobsResponse {
 pub(crate) async fn list_all(
     State(state): State<ServerState>,
     scope::Scoped { principal, .. }: scope::Scoped<scope::ScheduleRead>,
+    Query(query): Query<ListJobsQuery>,
 ) -> Result<Json<ScheduledJobsResponse>, ProblemDetail> {
     let reveal_command = principal.has_scope("sessions:r");
-    let jobs = state
-        .shared
-        .store
-        .schedule_store()
-        .list_all_scheduled_jobs()
-        .await
-        .map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to list scheduled jobs", error)
-        })?;
-    Ok(Json(ScheduledJobsResponse {
-        jobs: render_batch(&state, jobs, reveal_command).await,
-    }))
-}
-
-/// `GET /v1/sessions/{id}/schedule`: jobs belonging to one session.
-#[utoipa::path(
-    get,
-    path = "/v1/sessions/{id}/schedule",
-    tag = "schedule",
-    params(("id" = Uuid, Path, description = "Session UUID")),
-    responses(
-        (status = 200, description = "Scheduled jobs for this session", body = ScheduledJobsResponse),
-        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
-        (status = 403, description = "Insufficient scope", body = ProblemDetail),
-        (status = 404, description = "Session not found", body = ProblemDetail),
-        (status = 500, description = "Internal server error", body = ProblemDetail),
-    ),
-    security(("bearerAuth" = ["schedule:r"]))
-)]
-pub(crate) async fn list_for_session(
-    State(state): State<ServerState>,
-    scope::Scoped { principal, .. }: scope::Scoped<scope::ScheduleRead>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<ScheduledJobsResponse>, ProblemDetail> {
-    let reveal_command = principal.has_scope("sessions:r");
-    require_session_exists(&state, id).await?;
-    let jobs = state
-        .shared
-        .store
-        .schedule_store()
-        .list_scheduled_jobs(id)
-        .await
-        .map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to list scheduled jobs", error)
-                .with("session_id", id.to_string())
-        })?;
+    let schedule = state.shared.store.schedule_store();
+    let jobs = match query.session {
+        Some(id) => schedule.list_scheduled_jobs(id).await,
+        None => schedule.list_all_scheduled_jobs().await,
+    }
+    .map_err(|error| ProblemDetail::internal_sanitized("failed to list scheduled jobs", error))?;
     Ok(Json(ScheduledJobsResponse {
         jobs: render_batch(&state, jobs, reveal_command).await,
     }))
@@ -621,23 +592,19 @@ fn parse_schedule(
 /// Keyed on the job id alone rather than nested under its session, because that is how a client
 /// that read `GET /v1/schedule` holds it.
 ///
-/// Takes a unique id prefix as well as the full id, and 404s when nothing matches. Both halves
-/// matter, and for the same reason: the 8-character short form is what every surface that renders a
-/// job to a human shows (`meka schedule list`, the REPL's `/schedule`, the `schedule_list` tool),
-/// so an operator will paste one here, and answering 204 to an id that matched nothing would report
-/// a still-firing job as canceled. A gated job kept alive that way goes on running a shell command
-/// unattended.
+/// Takes the full id and 404s when nothing matches: a client holds the id whole from the listing,
+/// and answering 204 to an id that matched nothing would report a still-firing job as canceled. A
+/// gated job kept alive that way goes on running a shell command unattended.
 #[utoipa::path(
     delete,
     path = "/v1/schedule/{job_id}",
     tag = "schedule",
-    params(("job_id" = String, Path, description = "Scheduled job id, or a unique prefix of one")),
+    params(("job_id" = String, Path, description = "Scheduled job id")),
     responses(
         (status = 204, description = "Job canceled"),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
-        (status = 404, description = "No job matches that id", body = ProblemDetail),
-        (status = 422, description = "The prefix matches more than one job", body = ProblemDetail),
+        (status = 404, description = "No job has that id", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["schedule:w"]))
@@ -647,68 +614,28 @@ pub(crate) async fn cancel(
     _scoped: scope::Scoped<scope::ScheduleWrite>,
     Path(job_id): Path<String>,
 ) -> Result<StatusCode, ProblemDetail> {
-    let jobs = state
-        .shared
-        .store
-        .schedule_store()
-        .list_all_scheduled_jobs()
-        .await
-        .map_err(|error| {
-            ProblemDetail::internal_sanitized("failed to resolve scheduled job", error)
-                .with("job_id", job_id.clone())
-        })?;
-    let wanted = crate::text::id_prefix_for_matching(&job_id);
-    let matches: Vec<&ScheduledJob> = jobs
-        .iter()
-        .filter(|job| crate::text::is_usable_id_prefix(&job_id) && job.id.starts_with(&wanted))
-        .collect();
-    let resolved = match matches.as_slice() {
-        [job] => job.id.clone(),
-        [] => {
-            return Err(ProblemDetail::new(
-                ErrorKind::NotFound,
-                StatusCode::NOT_FOUND,
-                format!("no scheduled job matches '{job_id}'"),
-            )
-            .with("job_id", job_id.clone()));
-        }
-        several => {
-            return Err(ProblemDetail::new(
-                ErrorKind::InvalidBody,
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!(
-                    "'{}' matches {} scheduled jobs; use a longer id",
-                    job_id,
-                    several.len()
-                ),
-            )
-            .with("job_id", job_id.clone()));
-        }
-    };
-
     let removed = state
         .shared
         .store
         .schedule_store()
-        .delete_scheduled_job(&resolved)
+        .delete_scheduled_job(&job_id)
         .await
         .map_err(|error| {
             ProblemDetail::internal_sanitized("failed to cancel scheduled job", error)
-                .with("job_id", resolved.clone())
+                .with("job_id", job_id.clone())
         })?;
-    // The listing above and the delete are two statements, and a scheduler sweep can retire the row
-    // in between. `204` then reported a cancellation this request did not perform, which is exactly
-    // what a client polls this endpoint to establish. `404` is the same answer it would have got a
-    // moment earlier, and is true.
+    // `204` means this request canceled the job, which is what a client polls this endpoint to
+    // establish. A job a scheduler sweep retired a moment earlier is a `404`, the same answer the
+    // request would have got then, and true.
     if !removed {
         return Err(ProblemDetail::new(
             ErrorKind::NotFound,
             StatusCode::NOT_FOUND,
-            format!("scheduled job '{resolved}' was already gone"),
+            format!("no scheduled job has id '{job_id}'"),
         )
-        .with("job_id", resolved));
+        .with("job_id", job_id));
     }
-    tracing::info!("canceled scheduled job {resolved} via HTTP");
+    tracing::info!("canceled scheduled job {job_id} via HTTP");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -749,6 +676,10 @@ pub(crate) struct BackgroundTaskView {
     /// on the session's next turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) delivered_at: Option<String>,
+    /// The session a backgrounded `agent_spawn` runs, once it has made one. Omitted on every
+    /// other task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) subagent_id: Option<Uuid>,
 }
 
 impl From<crate::store::background::BackgroundTask> for BackgroundTaskView {
@@ -765,6 +696,7 @@ impl From<crate::store::background::BackgroundTask> for BackgroundTaskView {
             finished_at: task.finished_at.map(|at| at.to_rfc3339()),
             announced_at: task.announced_at.map(|at| at.to_rfc3339()),
             delivered_at: task.delivered_at.map(|at| at.to_rfc3339()),
+            subagent_id: task.subagent_id,
         }
     }
 }
@@ -772,6 +704,60 @@ impl From<crate::store::background::BackgroundTask> for BackgroundTaskView {
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct BackgroundTasksResponse {
     pub(crate) tasks: Vec<BackgroundTaskView>,
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub(crate) struct TasksQuery {
+    /// Only the tasks in this status: `running`, `completed`, `failed`, `canceled` or
+    /// `interrupted`.
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+}
+
+/// `GET /v1/tasks`: every session's background tasks, newest first.
+#[utoipa::path(
+    get,
+    path = "/v1/tasks",
+    tag = "tasks",
+    params(TasksQuery),
+    responses(
+        (status = 200, description = "Background tasks across every session", body = BackgroundTasksResponse),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 422, description = "`status` is not a task status", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["sessions:r"]))
+)]
+pub(crate) async fn list_all_tasks(
+    State(state): State<ServerState>,
+    _scoped: scope::Scoped<scope::SessionsRead>,
+    Query(query): Query<TasksQuery>,
+) -> Result<Json<BackgroundTasksResponse>, ProblemDetail> {
+    let status = query
+        .status
+        .as_deref()
+        .map(str::parse::<TaskStatus>)
+        .transpose()
+        .map_err(|error| {
+            ProblemDetail::new(
+                ErrorKind::InvalidBody,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                error,
+            )
+        })?;
+    let tasks = state
+        .shared
+        .store
+        .background_store()
+        .list_all_background_tasks(status)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to list background tasks", error)
+        })?;
+    Ok(Json(BackgroundTasksResponse {
+        tasks: tasks.into_iter().map(BackgroundTaskView::from).collect(),
+    }))
 }
 
 /// `GET /v1/sessions/{id}/tasks`: this session's background tasks, newest first.
@@ -824,7 +810,6 @@ pub(crate) async fn list_tasks(
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session or task not found", body = ProblemDetail),
-        (status = 422, description = "The prefix matches more than one task", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["sessions:w"]))
@@ -838,27 +823,17 @@ pub(crate) async fn cancel_task(
         .shared
         .store
         .background_store()
-        .resolve_background_task(id, &task_id)
+        .background_task(id, &task_id)
         .await
-        .map_err(|error| match &error {
-            // `resolve_background_task` accepts an id prefix, and reports an ambiguous one as
-            // `Config`. That is a statement about the caller's input, so it is a 422; routing it
-            // through `internal_sanitized` would report "use a longer id" as a server fault and
-            // hide the one detail that fixes it.
-            crate::error::MekaError::Config(message) => ProblemDetail::new(
-                ErrorKind::InvalidBody,
-                StatusCode::UNPROCESSABLE_ENTITY,
-                message.clone(),
-            )
-            .with("session_id", id.to_string()),
-            _ => ProblemDetail::internal_sanitized("failed to resolve background task", error)
-                .with("session_id", id.to_string()),
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to look up background task", error)
+                .with("session_id", id.to_string())
         })?
     else {
         return Err(ProblemDetail::new(
             ErrorKind::NotFound,
             StatusCode::NOT_FOUND,
-            format!("no background task in session {id} matches '{task_id}'"),
+            format!("session {id} has no background task '{task_id}'"),
         )
         .with("session_id", id.to_string())
         .with("task_id", task_id.clone()));
