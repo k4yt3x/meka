@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.70.1] - 2026-10-07
+
+### Fixed
+
+- A running sub-agent's stream no longer answers 409 once its parent has begun a streaming turn.
+
 ## [0.70.0] - 2026-10-07
 
 ### Added
@@ -2576,7 +2582,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.70.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.70.1...HEAD
+[0.70.1]: https://github.com/k4yt3x/meka/compare/0.70.0...0.70.1
 [0.70.0]: https://github.com/k4yt3x/meka/compare/0.69.0...0.70.0
 [0.69.0]: https://github.com/k4yt3x/meka/compare/0.68.1...0.69.0
 [0.68.1]: https://github.com/k4yt3x/meka/compare/0.68.0...0.68.1

@@ -345,7 +345,9 @@ impl HttpFrontend {
     /// Install the session's feed. Once, when the session becomes resident; a second call is a
     /// no-op, so the first turn on a frontend a test built bare can install one too.
     pub(crate) fn install_feed(&self, session_id: uuid::Uuid, wiring: &FeedWiring) {
-        *crate::sync::lock(&self.wiring) = Some(wiring.clone());
+        // The wiring is kept with the feed: a streaming turn installs a bare one, and the
+        // session's is what registers the feed of every sub-agent the session spawns.
+        crate::sync::lock(&self.wiring).get_or_insert_with(|| wiring.clone());
         let mut guard = crate::sync::lock(&self.feed);
         guard.get_or_insert_with(|| {
             SessionFeed::new(
@@ -1574,6 +1576,41 @@ mod tests {
             "a reader attached at the time still gets the terminal: {seen:?}"
         );
         drop(child_frontend);
+    }
+
+    /// A streaming client's turn installs its stream on the session's frontend, and a sub-agent
+    /// spawned under it, or under any turn after it, is registered through the wiring the
+    /// session was loaded with rather than the stream's bare one.
+    #[tokio::test]
+    async fn a_sub_agent_spawned_under_a_streaming_turn_has_a_feed() {
+        let children: ChildFeeds = Default::default();
+        let root = Arc::new(HttpFrontend::new());
+        root.install_feed(uuid::Uuid::from_u128(0x1), &FeedWiring {
+            children: Some(Arc::clone(&children)),
+            ..FeedWiring::bare(16, 16, Duration::from_secs(30))
+        });
+        let (_client, _ids) =
+            root.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::from_u128(0x7));
+        let child = uuid::Uuid::from_u128(0x2);
+        let root_as_frontend: Arc<dyn Frontend> = Arc::clone(&root) as Arc<dyn Frontend>;
+        let _child_frontend = root.for_subagent(root_as_frontend, child, Some("tu_1".into()));
+        let under_the_stream = crate::sync::lock(&children).get(&child).is_some();
+        let (_receiver, _ids) = root.begin_turn(
+            uuid::Uuid::from_u128(0x8),
+            TurnSource::Client,
+            false,
+            Duration::from_secs(30),
+            16,
+        );
+        let later = uuid::Uuid::from_u128(0x3);
+        let root_as_frontend: Arc<dyn Frontend> = Arc::clone(&root) as Arc<dyn Frontend>;
+        let _later_frontend = root.for_subagent(root_as_frontend, later, Some("tu_2".into()));
+        let under_the_next_turn = crate::sync::lock(&children).get(&later).is_some();
+        assert!(
+            under_the_stream && under_the_next_turn,
+            "registered under the streaming turn: {under_the_stream}; under the blocking turn \
+             after it: {under_the_next_turn}"
+        );
     }
 
     /// The prompt every parking test parks: a gated write with nothing to show.

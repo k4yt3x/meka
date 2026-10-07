@@ -9442,6 +9442,92 @@ fn a_running_sub_agents_feed_streams_its_tool_calls_and_its_terminal() {
     );
 }
 
+/// The feed is there whichever way the parent's turn began. A streaming `POST /turn` installs
+/// the client's stream on the parent's frontend, and a worker spawned under it is registered the
+/// way one spawned under an inbox message is.
+#[test]
+fn a_sub_agents_feed_opens_under_its_parents_streaming_turn() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let notes = workspace.path().join("notes.txt");
+    std::fs::write(&notes, "hello").expect("write notes");
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
+            { "type": "tool_use_end", "input": {"prompt": "read the notes"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "sleep", "ms": 1500 },
+            { "type": "tool_use_start", "id": "tu_w", "name": "file_read" },
+            { "type": "tool_use_end", "input": {"path": notes} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "worker done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "dispatched" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": workspace.path().to_string_lossy()}))
+        .send()
+        .expect("create");
+    let parent = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let streaming = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{parent}/turn"),
+        )
+        .json(&serde_json::json!({"message": "delegate it", "stream": true}))
+        .send()
+        .expect("send");
+    assert_eq!(streaming.status(), 200);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let worker = loop {
+        let children = children_of(&harness, &parent);
+        if let Some(child) = children
+            .iter()
+            .find(|child| child["turn_in_flight"] == true)
+        {
+            break child["id"].as_str().expect("id").to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the worker should have appeared as running: {children:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let feed = open_feed(&harness, &worker, None, Duration::from_secs(30));
+    assert_eq!(
+        feed.status(),
+        200,
+        "the worker's feed opens while a streaming turn runs it"
+    );
+    let body = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+    let started = sse_event_data(&body, "turn.started")
+        .unwrap_or_else(|| panic!("the worker's turn opens its feed: {body}"));
+    assert_eq!(started["parent_id"], parent, "{started}");
+    assert_eq!(started["tool_call_id"], "tu_1", "{started}");
+    assert!(
+        sse_event_data(&body, "tool_call.executing").is_some_and(|call| call["id"] == "tu_w"),
+        "the worker's tool call streams on its feed: {body}"
+    );
+    let parent_body = streaming.text().expect("body");
+    assert!(
+        parent_body.contains("event: turn.finished"),
+        "the streaming turn ends: {parent_body}"
+    );
+}
+
 /// A worker's prompt parks on its parent's feed, where the one answerer is, and the worker's own
 /// feed mirrors the prompt and its resolution, so a reader of the worker sees why it is waiting
 /// and knows where to answer.
