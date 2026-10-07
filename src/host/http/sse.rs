@@ -44,6 +44,7 @@ pub(crate) enum SseEventType {
     ToolCallOutputDelta,
     Progress,
     Notice,
+    FeedGap,
     PermissionRequired,
     ContextCompacted,
     TurnStarted,
@@ -75,9 +76,10 @@ impl SseEventType {
     /// Whether this event is progress rather than history: broadcast to whoever is reading now,
     /// given no id and kept out of the replay ring. A reconnecting client is then handed neither
     /// the deltas of a command that has since completed nor a hole where a chatty one pushed the
-    /// events it needs out of the ring.
+    /// events it needs out of the ring. `feed.gap` is one reader's and never the session's, so it
+    /// is never numbered or kept either.
     pub(crate) const fn is_transient(self) -> bool {
-        matches!(self, Self::ToolCallOutputDelta)
+        matches!(self, Self::ToolCallOutputDelta | Self::FeedGap)
     }
 }
 
@@ -92,6 +94,7 @@ impl SseEventType {
             Self::ToolCallOutputDelta => "tool_call.output_delta",
             Self::Progress => "progress",
             Self::Notice => "notice",
+            Self::FeedGap => "feed.gap",
             Self::PermissionRequired => "permission_required",
             Self::ContextCompacted => "context.compacted",
             Self::TurnStarted => "turn.started",

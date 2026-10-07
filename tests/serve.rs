@@ -3278,6 +3278,91 @@ fn a_sessions_image_is_served_by_hash_and_scoped_to_it() {
     );
 }
 
+/// The hashes of the image blocks in a session's messages, in order.
+fn image_hashes(harness: &ServeTestHarness, id: &str) -> Vec<String> {
+    let messages: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    messages["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+        .filter(|block| block["type"] == "image")
+        .filter_map(|block| block["hash"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// An image the session's history holds is attached again by the `hash` its image block shows,
+/// so a client sends a message again without fetching and uploading the bytes. The hash is
+/// answered from the session's own images alone: another session's, or one nobody sent, is
+/// refused as a bad entry, naming it.
+#[test]
+fn a_turn_attaches_an_image_the_session_holds_by_its_hash() {
+    let harness = ServeTestHarness::spawn("", mock_turns(2));
+    let id = create_session_id(&harness);
+    let uploaded = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({
+            "message": "look",
+            "images": [{"media_type": "image/png", "data": TINY_PNG_BASE64}],
+            "stream": false,
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(uploaded.status(), 200);
+    let hashes = image_hashes(&harness, &id);
+    let hash = hashes
+        .first()
+        .cloned()
+        .expect("the upload's image block carries its hash");
+
+    let again = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({
+            "message": "look again",
+            "images": [{"hash": hash}],
+            "stream": false,
+        }))
+        .send()
+        .expect("send");
+    let status = again.status();
+    assert_eq!(status, 200, "{}", again.text().unwrap_or_default());
+    assert_eq!(
+        image_hashes(&harness, &id),
+        vec![hash.clone(), hash.clone()],
+        "the second message carries the same image"
+    );
+
+    let other = create_session_id(&harness);
+    let refused = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{other}/turn"))
+        .json(&serde_json::json!({
+            "message": "look",
+            "images": [{"hash": hash}],
+            "stream": false,
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(refused.status(), 422);
+    let problem: serde_json::Value = refused.json().expect("parse");
+    assert_eq!(
+        problem["type"].as_str(),
+        Some("https://meka.run/errors/invalid-body"),
+        "{problem}"
+    );
+    assert!(
+        problem["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("`images[0]`") && detail.contains("no image")),
+        "a session that never held the image cannot attach it: {problem}"
+    );
+}
+
 /// An image with no text is a complete request against prior context ("look at this"), so the
 /// empty-`message` check must not reject it.
 #[test]
@@ -10603,11 +10688,21 @@ fn reattach_warns_when_the_replay_buffer_cannot_reach_back_far_enough() {
 
     let body = read_feed_until(
         open_feed(&harness, &id, Some(0), Duration::from_secs(30)),
-        |text| text.contains("replay does not reach"),
+        |text| text.contains("event: feed.gap"),
+    );
+    let gap = sse_event_data(&body, "feed.gap")
+        .unwrap_or_else(|| panic!("a truncated replay is said, not silently delivered: {body}"));
+    assert_eq!(
+        gap["session_id"], id,
+        "the hole names the feed it is on: {gap}"
     );
     assert!(
-        body.contains("event: notice") && body.contains("replay does not reach"),
-        "a truncated replay must be announced, not silently delivered: {body}"
+        gap["dropped"].as_u64().is_some_and(|dropped| dropped > 0),
+        "and counts the events the ring no longer holds: {gap}"
+    );
+    assert!(
+        !body.contains("event: notice"),
+        "the feed's own hole is not something the agent said: {body}"
     );
 }
 
@@ -12102,7 +12197,7 @@ fn a_last_event_id_from_an_earlier_turn_resumes_across_turns() {
         "nothing at or before the client's position comes back: {body}"
     );
     assert!(
-        !body.contains("replay does not reach"),
+        !body.contains("event: feed.gap"),
         "the ring still holds the position, so there is no gap to report: {body}"
     );
 }

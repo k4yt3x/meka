@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.70.1] - 2026-10-07
+## [0.71.0] - 2026-10-07
+
+### Added
+
+- A turn's `images` take `{"hash": ...}` for an image the session's history holds; no re-upload.
+
+### Changed
+
+- **Breaking:** a hole in a feed is a `feed.gap` event, not a `notice`; see the upgrade guide.
+- A feed reader that falls behind is caught up from the replay ring rather than told to re-attach.
 
 ### Fixed
 
@@ -2582,8 +2591,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.70.1...HEAD
-[0.70.1]: https://github.com/k4yt3x/meka/compare/0.70.0...0.70.1
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.71.0...HEAD
+[0.71.0]: https://github.com/k4yt3x/meka/compare/0.70.0...0.71.0
 [0.70.0]: https://github.com/k4yt3x/meka/compare/0.69.0...0.70.0
 [0.69.0]: https://github.com/k4yt3x/meka/compare/0.68.1...0.69.0
 [0.68.1]: https://github.com/k4yt3x/meka/compare/0.68.0...0.68.1

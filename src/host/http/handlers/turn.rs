@@ -35,7 +35,7 @@ use uuid::Uuid;
 use crate::{
     agent::TurnOutcome,
     conversation::ToolResultContent,
-    frontend::{FrontendEvent, Notice, NoticeView},
+    frontend::{FrontendEvent, NoticeView},
     host::{
         TurnGuard,
         http::{
@@ -60,7 +60,7 @@ pub(crate) struct TurnRequest {
     pub(crate) message: String,
     /// Image attachments for this turn. A sibling of `message` rather than a member of
     /// [`TurnOptions`] because these are user content, not a per-turn knob. Requires the session's
-    /// profile to have vision enabled; see [`decode_turn_images`].
+    /// profile to have vision enabled; see [`resolve_turn_images`].
     #[serde(default)]
     pub(crate) images: Vec<ImageInput>,
     /// `false` (default) → blocking JSON response. `true` → SSE.
@@ -71,17 +71,26 @@ pub(crate) struct TurnRequest {
     pub(crate) options: TurnOptions,
 }
 
-/// One inline image attachment. Base64 rather than a path or URL because the API is a network
-/// surface: `[serve].bind` may be non-loopback, so the caller generally shares no filesystem with
-/// the agent and cannot name a file for it to read.
+/// One image attachment: the bytes inline, or a reference to an image the session's history
+/// holds. Bytes are base64 rather than a path or URL because the API is a network surface:
+/// `[serve].bind` may be non-loopback, so the caller generally shares no filesystem with the agent
+/// and cannot name a file for it to read. A reference is the `hash` an image block of
+/// `GET /v1/sessions/{id}/messages` carries, so a client sends an image again, after an edit or a
+/// rewind, without fetching and uploading its bytes.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ImageInput {
-    /// Declared MIME type, e.g. `image/png`. Used as the primary format hint; the payload's magic
-    /// bytes win if this doesn't name a supported format.
-    pub(crate) media_type: String,
+    /// Declared MIME type, e.g. `image/png`, beside `data`. Used as the primary format hint; the
+    /// payload's magic bytes win if this doesn't name a supported format. Refused beside `hash`,
+    /// whose media type is the stored one.
+    #[serde(default)]
+    pub(crate) media_type: Option<String>,
     /// Base64-encoded image bytes (standard alphabet, padding required).
-    pub(crate) data: String,
+    #[serde(default)]
+    pub(crate) data: Option<String>,
+    /// The hash of an image the session's history holds, whose stored bytes are attached.
+    #[serde(default)]
+    pub(crate) hash: Option<String>,
 }
 
 /// Per-turn options. `#[serde(deny_unknown_fields)]` here (and only here) so a typo in
@@ -281,7 +290,13 @@ pub(crate) async fn submit_turn(
         entry.accepts_images()
     };
     let image_count = body.images.len();
-    let images = decode_turn_images(&body.images, accepts_images).await?;
+    let images = resolve_turn_images(
+        &body.images,
+        accepts_images,
+        &state.shared.store,
+        session_id,
+    )
+    .await?;
     // An image with no text passes; against prior context "look at this" is a complete request.
     //
     // The retention is stated before any outcome rides along: a carried outcome overrides the
@@ -459,52 +474,32 @@ fn cancel_if_nobody_else_is_reading(
     }
 }
 
-/// The event a lagging consumer's stream ends with, as `(event type, payload)`.
-///
-/// Two different facts. When the turn was canceled it really did fail, and a retry is the remedy.
-/// When it was not, the turn is still running for the consumer that kept up: `turn.failed` would
-/// be a lie, and the retry it invites returns 409 `turn-in-flight`. Re-attaching with
-/// `Last-Event-ID` is the remedy there, and it recovers the dropped events rather than redoing
-/// them.
-///
-/// The notice is the `level`/`text` shape every other `notice` event carries, with the ids beside
-/// it so the client can confirm which turn it is being told to rejoin.
-fn lag_event_parts(
-    canceled: bool,
+/// The terminal a stream ends with when its consumer fell behind and the turn was canceled for
+/// it, as `(event type, payload)`: a `turn.failed` whose `error` is the cataloged `sse-lag`
+/// problem, so a retry is the remedy it invites. A consumer that fell behind while someone else
+/// kept reading gets no terminal, since the turn goes on; it is caught up from the ring instead.
+fn lag_terminal_parts(
     skipped: u64,
     turn_id: Uuid,
     session_id: Uuid,
 ) -> (crate::host::http::sse::SseEventType, serde_json::Value) {
-    if canceled {
-        let problem = crate::host::http::errors::ProblemDetail::new(
-            crate::host::http::errors::ErrorKind::SseLag,
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "SSE consumer fell behind and {skipped} event(s) were dropped, so the turn was \
-                 canceled; retry it"
-            ),
-        )
-        .instance(format!("/v1/sessions/{session_id}/turn"));
-        return (
-            crate::host::http::sse::SseEventType::TurnFailed,
-            serde_json::json!({
-                "turn_id": turn_id.to_string(),
-                "session_id": session_id.to_string(),
-                "error": serde_json::to_value(problem).unwrap_or(serde_json::Value::Null),
-            }),
-        );
-    }
-    let notice = Notice::warn(format!(
-        "SSE consumer fell behind and {skipped} event(s) were dropped; the turn is still running, \
-         so re-attach with Last-Event-ID"
-    ));
-    let mut data =
-        serde_json::to_value(NoticeView::from(notice)).unwrap_or(serde_json::Value::Null);
-    if let Some(object) = data.as_object_mut() {
-        object.insert("turn_id".into(), turn_id.to_string().into());
-        object.insert("session_id".into(), session_id.to_string().into());
-    }
-    (crate::host::http::sse::SseEventType::Notice, data)
+    let problem = crate::host::http::errors::ProblemDetail::new(
+        crate::host::http::errors::ErrorKind::SseLag,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        format!(
+            "SSE consumer fell behind and {skipped} event(s) were dropped, so the turn was \
+             canceled; retry it"
+        ),
+    )
+    .instance(format!("/v1/sessions/{session_id}/turn"));
+    (
+        crate::host::http::sse::SseEventType::TurnFailed,
+        serde_json::json!({
+            "turn_id": turn_id.to_string(),
+            "session_id": session_id.to_string(),
+            "error": serde_json::to_value(problem).unwrap_or(serde_json::Value::Null),
+        }),
+    )
 }
 
 /// Record a finished blocking turn against its `Idempotency-Key`, if it had one.
@@ -552,9 +547,54 @@ async fn commit_idempotency(
     // clients can retry instead of hitting a permanent 409.
 }
 
-/// Validate and normalize a turn's image attachments through the shared client-image pipeline
+/// What one entry of `images` asks for, once its shape is checked: bytes to decode, or an image
+/// the session already holds.
+enum ImageEntry {
+    Upload { media_type: String, data: String },
+    Reference { hash: String },
+}
+
+/// An entry is bytes with their media type, or a hash, and nothing else: the two forms the API
+/// speaks, told apart by which fields are present so a refusal names what is wrong rather than
+/// that nothing matched.
+fn classify_image(index: usize, input: &ImageInput) -> Result<ImageEntry, ProblemDetail> {
+    match (&input.media_type, &input.data, &input.hash) {
+        (Some(media_type), Some(data), None) => Ok(ImageEntry::Upload {
+            media_type: media_type.clone(),
+            data: data.clone(),
+        }),
+        (None, None, Some(hash)) => Ok(ImageEntry::Reference { hash: hash.clone() }),
+        (Some(_), None, Some(_)) => Err(invalid_image(
+            index,
+            "names a `hash`, which carries its own `media_type`",
+        )),
+        _ => Err(invalid_image(
+            index,
+            "is a `media_type` with `data`, or a `hash`",
+        )),
+    }
+}
+
+/// The 422 every bad entry of `images` answers with, naming the offender so a client sending
+/// several attachments knows which one to fix.
+fn invalid_image(index: usize, what: &str) -> ProblemDetail {
+    ProblemDetail::new(
+        ErrorKind::InvalidBody,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        format!("`images[{index}]` {what}"),
+    )
+}
+
+/// One entry after the blocking work, waiting only on the store.
+enum PendingImage {
+    Decoded(crate::image::ImageSource),
+    Stored { hash: String },
+}
+
+/// Resolve the request's `images` into what the turn carries, in their order: uploaded bytes
+/// decoded and validated through the shared image pipeline
 /// ([`crate::image::decode_base64_image`]), so an HTTP attachment gets exactly the size cap and
-/// format conversion an ACP `image` content block does.
+/// format conversion an ACP `image` content block does, and a hash answered from the store.
 ///
 /// `vision` is the session's answer from `ResidentSession::accepts_images`. Attachments are
 /// refused outright when it is off, as ACP refuses `image` content blocks with `InvalidParams` for
@@ -569,36 +609,34 @@ async fn commit_idempotency(
 /// milliseconds of pure CPU on a multi-megapixel attachment, and on the runtime it blocks every
 /// other task on that worker. One client posting a screenshot must not stall an unrelated
 /// session's stream.
-///
-/// The `allow` matches the rest of this module's validation helpers: `ProblemDetail` is a large
-/// struct by design (RFC 9457 members plus an extensions map) and boxing it here alone would make
-/// the error type inconsistent with every other handler.
-async fn decode_turn_images(
+async fn resolve_turn_images(
     images: &[ImageInput],
     vision: bool,
+    store: &crate::store::Store,
+    session_id: Uuid,
 ) -> Result<Vec<crate::image::ImageSource>, ProblemDetail> {
     if images.is_empty() {
         return Ok(Vec::new());
     }
     refuse_images_without_vision(images.len(), vision)?;
-    let owned: Vec<(String, String)> = images
+    let entries = images
         .iter()
-        .map(|image| (image.data.clone(), image.media_type.clone()))
-        .collect();
-    tokio::task::spawn_blocking(move || {
-        owned
-            .iter()
+        .enumerate()
+        .map(|(index, input)| classify_image(index, input))
+        .collect::<Result<Vec<_>, _>>()?;
+    let pending = tokio::task::spawn_blocking(move || {
+        entries
+            .into_iter()
             .enumerate()
-            .map(|(index, (data, media_type))| {
-                crate::image::decode_base64_image(data, media_type).map_err(|message| {
-                    ProblemDetail::new(
-                        ErrorKind::InvalidBody,
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        format!("`images[{index}]` is invalid: {message}"),
-                    )
-                })
+            .map(|(index, entry)| match entry {
+                ImageEntry::Upload { media_type, data } => {
+                    crate::image::decode_base64_image(&data, &media_type)
+                        .map(PendingImage::Decoded)
+                        .map_err(|message| invalid_image(index, &format!("is invalid: {message}")))
+                }
+                ImageEntry::Reference { hash } => Ok(PendingImage::Stored { hash }),
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
     })
     .await
     .map_err(|error| {
@@ -607,7 +645,37 @@ async fn decode_turn_images(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to decode the images: {error}"),
         )
-    })?
+    })??;
+    let mut resolved = Vec::with_capacity(pending.len());
+    for (index, image) in pending.into_iter().enumerate() {
+        resolved.push(match image {
+            PendingImage::Decoded(source) => source,
+            PendingImage::Stored { hash } => stored_image(store, session_id, index, &hash).await?,
+        });
+    }
+    Ok(resolved)
+}
+
+/// The stored bytes behind a hash, as the inline form a turn carries, through the session-scoped
+/// lookup `GET /v1/sessions/{id}/blobs/{hash}` serves, so a client attaches exactly what it can
+/// read. The bytes were prepared when first stored, so they are not decoded again. A hash the
+/// session holds no image for is refused like any other bad entry.
+async fn stored_image(
+    store: &crate::store::Store,
+    session_id: Uuid,
+    index: usize,
+    hash: &str,
+) -> Result<crate::image::ImageSource, ProblemDetail> {
+    use base64::Engine as _;
+    let blob = store
+        .load_session_blob(session_id, hash)
+        .await
+        .map_err(|error| ProblemDetail::internal_sanitized("failed to load an image", error))?
+        .ok_or_else(|| invalid_image(index, "names a hash this session holds no image for"))?;
+    Ok(crate::image::ImageSource::Base64 {
+        media_type: blob.media_type,
+        data: base64::engine::general_purpose::STANDARD.encode(&blob.bytes),
+    })
 }
 
 /// Extract the `Idempotency-Key` header, validating that it isn't empty and stays within
@@ -856,6 +924,13 @@ fn run_streaming_turn(
         state.config.stream_reattach_grace,
         turn_id,
     );
+    // Where the stream stands before it has received anything: just ahead of the turn's own
+    // `turn.started`, which was published after the receiver subscribed. Read now, while the live
+    // turn is certainly this one, rather than at the stream's first poll.
+    let joined_after = entry
+        .frontend
+        .turn_started_id()
+        .and_then(|id| id.checked_sub(1));
 
     let entry_for_task = entry.clone();
     let cancel_for_task = cancellation.clone();
@@ -915,6 +990,7 @@ fn run_streaming_turn(
         turn_id,
         session_id,
         receiver,
+        joined_after,
         join,
         cancellation,
         ids,
@@ -940,10 +1016,15 @@ fn run_streaming_turn(
     Ok(response)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every fact the stream is built from is a parameter, so no caller can leave one out"
+)]
 fn build_sse_stream(
     turn_id: Uuid,
     session_id: Uuid,
     mut receiver: tokio::sync::broadcast::Receiver<crate::host::http::sse::SseEvent>,
+    joined_after: Option<u64>,
     join: tokio::task::JoinHandle<crate::host::http::sse::SseEvent>,
     cancellation: CancellationToken,
     ids: Arc<crate::host::http::sse::EventIdGenerator>,
@@ -960,6 +1041,7 @@ fn build_sse_stream(
         // terminal arrives the same way, recorded and broadcast by the turn's task; the join
         // handle is the fallback for a task that died without recording one.
         let mut sent_terminal = false;
+        let mut last_delivered = joined_after;
         let mut join = Box::pin(join);
         loop {
             tokio::select! {
@@ -968,44 +1050,51 @@ fn build_sse_stream(
                     match event {
                         Ok(sse) => {
                             let terminal = sse.event_type.is_terminal();
+                            last_delivered = sse.id.or(last_delivered);
                             yield Ok(sse.into_axum());
                             if terminal {
                                 break;
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::warn!(
-                                "SSE consumer lagged, skipped {skipped} events; terminating stream"
-                            );
-                            // Stop burning provider tokens for a consumer that has lost data and
-                            // will need to retry, but only when nobody else is still reading.
-                            let canceled = cancel_if_nobody_else_is_reading(&frontend, &cancellation);
-                            let (event_type, data) =
-                                lag_event_parts(canceled, skipped, turn_id, session_id);
-                            yield Ok(if canceled {
-                                Event::default()
+                            // Stop burning provider tokens for a consumer that has fallen behind,
+                            // but only when nobody else is still reading. For one that is, the
+                            // turn goes on and this reader is caught up from the ring, the way a
+                            // reconnect would be, so the lag is a pause and not a hole.
+                            if cancel_if_nobody_else_is_reading(&frontend, &cancellation) {
+                                tracing::warn!(
+                                    "SSE consumer lagged, skipped {skipped} events; terminating stream"
+                                );
+                                let (event_type, data) =
+                                    lag_terminal_parts(skipped, turn_id, session_id);
+                                yield Ok(Event::default()
                                     .id(ids.next().to_string())
                                     .event(event_type.as_str())
                                     .json_data(data)
-                                    .unwrap_or_else(|_| Event::default().comment("lag-failed serialize-failed"))
-                            } else {
-                                // Deliberately carries no `id`.
-                                //
-                                // Event ids are session-wide and monotonic, so an id here would be
-                                // strictly greater than every event this consumer just lost. A
-                                // client doing the obvious thing (remember the last id, re-attach
-                                // with it) would then ask to resume *after* the gap, get an empty
-                                // backlog and `gap: false`, and carry on missing exactly the events
-                                // this notice exists to tell it about. Per the SSE spec an event
-                                // with no `id:` field leaves the client's last-event-id buffer
-                                // alone, so it re-attaches from the last event it actually received
-                                // and the backlog replays the gap.
-                                Event::default()
-                                    .event(event_type.as_str())
-                                    .json_data(data)
-                                    .unwrap_or_else(|_| Event::default().comment("lag-notice serialize-failed"))
-                            });
-                            break;
+                                    .unwrap_or_else(|_| Event::default().comment("lag-failed serialize-failed")));
+                                break;
+                            }
+                            tracing::warn!("SSE consumer lagged, skipped {skipped} events; catching up");
+                            let Some(caught_up) = frontend.catch_up(last_delivered) else {
+                                yield Ok(join_terminal(&mut join, turn_id, session_id).await);
+                                break;
+                            };
+                            receiver = caught_up.receiver;
+                            if let Some(gap) = caught_up.gap {
+                                yield Ok(gap.event(Some(session_id)).into_axum());
+                            }
+                            let mut ended = false;
+                            for event in caught_up.backlog {
+                                ended = event.event_type.is_terminal();
+                                last_delivered = event.id.or(last_delivered);
+                                yield Ok(event.into_axum());
+                                if ended {
+                                    break;
+                                }
+                            }
+                            if ended {
+                                break;
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             yield Ok(join_terminal(&mut join, turn_id, session_id).await);
@@ -1805,21 +1894,16 @@ pub(crate) async fn stream_server(
     let last_event_id = last_event_id_of(&headers, query.last_event_id);
     let attachment = crate::sync::lock(&state.server_feed).attach(last_event_id);
     let shutdown = state.shutdown;
+    let server_feed = Arc::clone(&state.server_feed);
     let stream = async_stream::stream! {
         yield Ok::<_, Infallible>(Event::default().retry(std::time::Duration::from_secs(3)));
-        if attachment.gap {
-            yield Ok(Event::default()
-                .event("notice")
-                .json_data(serde_json::json!({
-                    "level": "warn",
-                    "text": "the replay does not reach your Last-Event-ID, so events were \
-                             dropped; read `GET /v1/sessions` for the current records",
-                }))
-                .unwrap_or_else(|_| Event::default().comment("gap-notice serialize-failed")));
+        if let Some(gap) = attachment.gap {
+            yield Ok(gap.event(None).into_axum());
         }
         for event in attachment.backlog {
             yield Ok(event.into_axum());
         }
+        let mut last_delivered = attachment.joined_after;
         let mut receiver = attachment.receiver;
         loop {
             let received = tokio::select! {
@@ -1827,18 +1911,25 @@ pub(crate) async fn stream_server(
                 _ = shutdown.cancelled() => break,
             };
             match received {
-                Ok(event) => yield Ok(event.into_axum()),
+                Ok(event) => {
+                    last_delivered = event.id.or(last_delivered);
+                    yield Ok(event.into_axum());
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!("server feed SSE consumer lagged, skipped {skipped} events");
-                    yield Ok(Event::default()
-                        .event("notice")
-                        .json_data(serde_json::json!({
-                            "level": "warn",
-                            "text": format!(
-                                "Fell behind; {skipped} event(s) were dropped from this replay."
-                            ),
-                        }))
-                        .unwrap_or_else(|_| Event::default().comment("lag serialize-failed")));
+                    // Caught up from the ring, the way a reconnect would be, so the lag is a
+                    // pause and not a hole; a hole is said only where the ring cannot reach.
+                    tracing::warn!(
+                        "server feed SSE consumer lagged, skipped {skipped} events; catching up"
+                    );
+                    let caught_up = crate::sync::lock(&server_feed).attach(last_delivered);
+                    receiver = caught_up.receiver;
+                    if let Some(gap) = caught_up.gap {
+                        yield Ok(gap.event(None).into_axum());
+                    }
+                    for event in caught_up.backlog {
+                        last_delivered = event.id.or(last_delivered);
+                        yield Ok(event.into_axum());
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -1873,18 +1964,11 @@ fn build_reattach_stream(
                 .unwrap_or_else(|_| Event::default().comment("resumed turn.started serialize-failed")));
         }
 
-        if attachment.gap {
+        if let Some(gap) = attachment.gap {
             // Said out loud rather than papered over. A transcript with a silent hole in it is
             // worse than one the client knows is incomplete, because only the second can be
             // repaired by reading `GET /messages`.
-            yield Ok(Event::default()
-                .event("notice")
-                .json_data(serde_json::json!({
-                    "level": "warn",
-                    "text": "the replay does not reach your Last-Event-ID, so events were \
-                             dropped; read `GET /v1/sessions/{id}/messages` for the full transcript",
-                }))
-                .unwrap_or_else(|_| Event::default().comment("gap-notice serialize-failed")));
+            yield Ok(gap.event(Some(session_id)).into_axum());
         }
 
         // The terminal is in the backlog too when the turn has ended, since `record_terminal`
@@ -1909,6 +1993,7 @@ fn build_reattach_stream(
             yield Ok(terminal.into_axum());
         }
 
+        let mut last_delivered = attachment.joined_after;
         let mut receiver = attachment.receiver;
         loop {
             // The feed outlives every turn, and this response holds the frontend that owns it, so
@@ -1924,23 +2009,26 @@ fn build_reattach_stream(
             match received {
                 Ok(event) => {
                     sent_terminal |= event.event_type.is_terminal();
+                    last_delivered = event.id.or(last_delivered);
                     yield Ok(event.into_axum());
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!("feed SSE consumer lagged, skipped {skipped} events");
-                    // Unlike the primary stream's lag branch, this does not cancel the turn: the
-                    // original consumer may still be reading it perfectly well, and a turn the
-                    // session runs for itself has nobody to cancel it for.
-                    yield Ok(Event::default()
-                        .event("notice")
-                        .json_data(serde_json::json!({
-                            "level": "warn",
-                            "text": format!(
-                                "Fell behind; {} event(s) were dropped from this replay.",
-                                skipped
-                            ),
-                        }))
-                        .unwrap_or_else(|_| Event::default().comment("lag serialize-failed")));
+                    // Caught up from the ring, the way a reconnect would be, so the lag is a
+                    // pause and not a hole; a hole is said only where the ring cannot reach.
+                    // Nothing is canceled for a feed reader: the turn was not run for it.
+                    tracing::warn!("feed SSE consumer lagged, skipped {skipped} events; catching up");
+                    let Some(caught_up) = frontend.catch_up(last_delivered) else {
+                        break;
+                    };
+                    receiver = caught_up.receiver;
+                    if let Some(gap) = caught_up.gap {
+                        yield Ok(gap.event(Some(session_id)).into_axum());
+                    }
+                    for event in caught_up.backlog {
+                        sent_terminal |= event.event_type.is_terminal();
+                        last_delivered = event.id.or(last_delivered);
+                        yield Ok(event.into_axum());
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -2033,16 +2121,15 @@ mod tests {
 
     /// A lagging consumer is told what happened in a shape a client already parses.
     ///
-    /// The canceled half is a `turn.failed` whose `error` is the cataloged `sse-lag` problem
-    /// rather than a hand-written object that can drift from it. The other half is a `notice` in
-    /// the `level`/`text` shape every other `notice` event carries, which is the shape the docs
-    /// promise.
+    /// The terminal a lag that canceled the turn ends the stream with is a `turn.failed` whose
+    /// `error` is the cataloged `sse-lag` problem rather than a hand-written object that can drift
+    /// from it.
     #[test]
-    fn a_lag_ends_the_stream_with_a_cataloged_failure_or_a_shaped_notice() {
+    fn a_lag_that_cancels_the_turn_ends_the_stream_with_the_cataloged_failure() {
         let turn_id = Uuid::from_u128(1);
         let session_id = Uuid::from_u128(2);
 
-        let (event_type, data) = lag_event_parts(true, 7, turn_id, session_id);
+        let (event_type, data) = lag_terminal_parts(7, turn_id, session_id);
         assert_eq!(event_type, crate::host::http::sse::SseEventType::TurnFailed);
         assert_eq!(
             data["error"]["type"],
@@ -2059,21 +2146,6 @@ mod tests {
                 .unwrap_or_default()
                 .contains("7 event(s)"),
             "{data}"
-        );
-        assert_eq!(data["turn_id"], turn_id.to_string());
-        assert_eq!(data["session_id"], session_id.to_string());
-
-        let (event_type, data) = lag_event_parts(false, 3, turn_id, session_id);
-        assert_eq!(event_type, crate::host::http::sse::SseEventType::Notice);
-        assert_eq!(data["level"], "warn", "{data}");
-        let text = data["text"].as_str().unwrap_or_default();
-        assert!(
-            text.contains("3 event(s)") && text.contains("Last-Event-ID"),
-            "{data}"
-        );
-        assert!(
-            data.get("notice").is_none(),
-            "the undocumented shape must not survive beside the documented one: {data}"
         );
         assert_eq!(data["turn_id"], turn_id.to_string());
         assert_eq!(data["session_id"], session_id.to_string());
@@ -2208,6 +2280,19 @@ mod tests {
         assert_eq!(text_of(&response.messages[0]), "hello");
     }
 
+    /// [`resolve_turn_images`] over a store with nothing in it, which is all an upload needs.
+    async fn resolve(
+        images: &[ImageInput],
+        vision: bool,
+    ) -> Result<Vec<crate::image::ImageSource>, ProblemDetail> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            crate::store::Store::open(Some(&dir.path().join("meka.db")), &Default::default())
+                .await
+                .expect("store");
+        resolve_turn_images(images, vision, &store, Uuid::from_u128(0x1)).await
+    }
+
     fn png_input() -> ImageInput {
         use base64::Engine as _;
         let image = image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]));
@@ -2219,16 +2304,15 @@ mod tests {
             )
             .expect("encode png");
         ImageInput {
-            media_type: "image/png".to_string(),
-            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            media_type: Some("image/png".to_string()),
+            data: Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+            hash: None,
         }
     }
 
     #[tokio::test]
-    async fn decode_turn_images_accepts_a_png() {
-        let decoded = decode_turn_images(&[png_input()], true)
-            .await
-            .expect("should decode");
+    async fn resolve_turn_images_accepts_a_png() {
+        let decoded = resolve(&[png_input()], true).await.expect("should decode");
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].media_type(), "image/png");
         assert!(
@@ -2239,20 +2323,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decode_turn_images_is_a_noop_without_attachments() {
+    async fn resolve_turn_images_is_a_noop_without_attachments() {
         // The vision flag is irrelevant when nothing is attached: a text-only profile must still
         // be able to take ordinary turns.
-        assert!(
-            decode_turn_images(&[], false)
-                .await
-                .expect("no images")
-                .is_empty()
-        );
+        assert!(resolve(&[], false).await.expect("no images").is_empty());
     }
 
     #[tokio::test]
-    async fn decode_turn_images_rejects_attachments_when_vision_is_off() {
-        let problem = decode_turn_images(&[png_input()], false)
+    async fn resolve_turn_images_rejects_attachments_when_vision_is_off() {
+        let problem = resolve(&[png_input()], false)
             .await
             .expect_err("should reject");
         assert_eq!(problem.status, 422);
@@ -2260,14 +2339,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decode_turn_images_rejects_invalid_base64() {
+    async fn resolve_turn_images_rejects_invalid_base64() {
         let bad = ImageInput {
-            media_type: "image/png".to_string(),
-            data: "!!!not-base64!!!".to_string(),
+            media_type: Some("image/png".to_string()),
+            data: Some("!!!not-base64!!!".to_string()),
+            hash: None,
         };
-        let problem = decode_turn_images(&[bad], true)
-            .await
-            .expect_err("should reject");
+        let problem = resolve(&[bad], true).await.expect_err("should reject");
         assert_eq!(problem.status, 422);
         assert!(problem.detail.unwrap_or_default().contains("images[0]"));
     }
@@ -2275,13 +2353,14 @@ mod tests {
     /// The offending index is named so a client sending several attachments knows which one to
     /// fix, rather than being told only that "an image" was bad.
     #[tokio::test]
-    async fn decode_turn_images_names_the_failing_index() {
+    async fn resolve_turn_images_names_the_failing_index() {
         use base64::Engine as _;
         let garbage = ImageInput {
-            media_type: "application/octet-stream".to_string(),
-            data: base64::engine::general_purpose::STANDARD.encode(b"not an image"),
+            media_type: Some("application/octet-stream".to_string()),
+            data: Some(base64::engine::general_purpose::STANDARD.encode(b"not an image")),
+            hash: None,
         };
-        let problem = decode_turn_images(&[png_input(), garbage], true)
+        let problem = resolve(&[png_input(), garbage], true)
             .await
             .expect_err("should reject");
         assert_eq!(problem.status, 422);
@@ -2291,25 +2370,86 @@ mod tests {
 
     /// A declared MIME type that names no supported format still decodes when the payload's magic
     /// bytes do, so a client that labels its upload `application/octet-stream` isn't stuck.
+    /// An entry is one of the two forms the API speaks, and a refusal names the entry and what is
+    /// wrong with it rather than that nothing matched.
     #[tokio::test]
-    async fn decode_turn_images_falls_back_to_magic_bytes() {
+    async fn an_image_entry_is_bytes_with_a_media_type_or_a_hash() {
+        let bare_data = ImageInput {
+            media_type: None,
+            data: Some("AAAA".to_string()),
+            hash: None,
+        };
+        let problem = resolve(&[bare_data], true)
+            .await
+            .expect_err("bytes without their media type");
+        assert_eq!(problem.status, 422);
+        assert!(
+            problem
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail
+                    .contains("`images[0]` is a `media_type` with `data`, or a `hash`")),
+            "{problem:?}"
+        );
+
+        let typed_hash = ImageInput {
+            media_type: Some("image/png".to_string()),
+            data: None,
+            hash: Some("abc".to_string()),
+        };
+        let problem = resolve(&[png_input(), typed_hash], true)
+            .await
+            .expect_err("a hash carries its own media type");
+        assert!(
+            problem
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("`images[1]` names a `hash`")),
+            "{problem:?}"
+        );
+    }
+
+    /// A hash the session holds no image for is refused at the same door as a bad upload, naming
+    /// the entry, before anything reaches the model.
+    #[tokio::test]
+    async fn a_hash_the_session_holds_no_image_for_is_refused() {
+        let unknown = ImageInput {
+            media_type: None,
+            data: None,
+            hash: Some("0".repeat(64)),
+        };
+        let problem = resolve(&[png_input(), unknown], true)
+            .await
+            .expect_err("refused");
+        assert_eq!(problem.status, 422);
+        assert!(
+            problem.detail.as_deref().is_some_and(|detail| {
+                detail.contains("`images[1]` names a hash this session holds no image for")
+            }),
+            "{problem:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_turn_images_falls_back_to_magic_bytes() {
         let mut input = png_input();
-        input.media_type = "application/octet-stream".to_string();
-        let decoded = decode_turn_images(&[input], true)
+        input.media_type = Some("application/octet-stream".to_string());
+        let decoded = resolve(&[input], true)
             .await
             .expect("should decode via magic bytes");
         assert_eq!(decoded[0].media_type(), "image/png");
     }
 
     #[tokio::test]
-    async fn decode_turn_images_rejects_oversized_payloads() {
+    async fn resolve_turn_images_rejects_oversized_payloads() {
         use base64::Engine as _;
         let raw = vec![0u8; crate::image::MAX_IMAGE_RAW_BYTES + 1];
         let oversized = ImageInput {
-            media_type: "image/png".to_string(),
-            data: base64::engine::general_purpose::STANDARD.encode(&raw),
+            media_type: Some("image/png".to_string()),
+            data: Some(base64::engine::general_purpose::STANDARD.encode(&raw)),
+            hash: None,
         };
-        let problem = decode_turn_images(&[oversized], true)
+        let problem = resolve(&[oversized], true)
             .await
             .expect_err("should reject");
         assert_eq!(problem.status, 422);

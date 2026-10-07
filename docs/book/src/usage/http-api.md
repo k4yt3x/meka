@@ -448,9 +448,14 @@ Only a `pending` item can be withdrawn. `DELETE` on one that is already in the c
 
 ### Image attachments
 
-Each entry in `images` is `{"media_type": "...", "data": "<base64>"}`. Images are inlined rather
-than referenced by path because the API is a network surface: a client on another host shares no
-filesystem with the agent, so it can't name a file for the agent to read.
+Each entry in `images` is the bytes, `{"media_type": "...", "data": "<base64>"}`, or an image the
+session's history already holds, `{"hash": "..."}`, the hash its image block carries on
+`GET /messages`. Bytes are inlined rather than referenced by path because the API is a network
+surface: a client on another host shares no filesystem with the agent, so it can't name a file for
+the agent to read. A hash lets a client send a message again, after an edit or a rewind, without
+fetching and uploading the bytes: the stored bytes and media type are used, and only an image the
+session holds can be named, the scope `GET /blobs/{hash}` serves. A `media_type` beside a `hash`,
+or a hash the session holds no image for, is a `422` naming the entry.
 
 ```bash
 curl -s -X POST http://localhost:8080/v1/sessions/$SESSION_ID/turn \
@@ -531,7 +536,8 @@ of the words. It is typed so a client can show or hide it; the `text` blocks alo
 
 An image block, whether an attachment on a user message or a tool result, carries its `media_type`
 and the `hash` of its bytes rather than the bytes. `GET /v1/sessions/{id}/blobs/{hash}` returns them
-under that media type, and only for a session whose messages reference the hash. An image the
+under that media type, and only for a session whose messages reference the hash, and a later turn
+names the image again by that hash; see [Image attachments](#image-attachments). An image the
 request budget redacted to fit the profile's `max_request_bytes` reads as a `text` block saying so:
 the redaction is recorded on the conversation once, so what the model was last sent is what the
 history shows.
@@ -705,14 +711,19 @@ The same information appears on `GET /messages`: the summary message carries a `
 
 A `: keep-alive` comment is sent every 20 seconds. SSE clients ignore these automatically. The stream also sends `retry: 3000` as its first line, hinting clients to reconnect after 3 seconds on disconnect.
 
-### SSE lag
+### Falling behind
 
-The server buffers up to 256 events per SSE stream. If a consumer reads too slowly and falls behind, the server closes that consumer's stream, and what it sends first depends on whether anyone else was still reading:
+A stream's events are broadcast to every reader of the session, and the server buffers up to 256 ahead of a slow one. A reader that falls behind is caught up from the replay ring, the same replay a reconnect with `Last-Event-ID` gets, done by the server on the reader's behalf: it sees a pause and nothing else. When the ring no longer reaches back to what the reader last received, the hole is said as a `feed.gap` event, below, and the stream carries on.
 
-- **Nobody else was reading.** The turn is canceled to stop burning provider tokens, and the stream ends with a terminal `turn.failed` carrying error type `https://meka.run/errors/sse-lag`. That event is the stream's, sent before the turn has unwound, so it carries no `message_withdrawn`; the outcome recorded for a later re-attach is a `turn.canceled` with `reason: "sse_lag"` and does. Retry by submitting a new turn.
-- **Another consumer was keeping up.** The turn keeps running for them, so nothing has failed. The lagging stream ends with a `warn` `notice` explaining the drop (the usual `level` and `text`, plus `turn_id` and `session_id`) and closes. **Re-attach with `Last-Event-ID`** rather than retrying: the turn is still in flight, so a new turn would be refused with `409 turn-in-flight`, and re-attaching recovers the dropped events instead of redoing the work.
+One case ends the stream instead. A `POST /turn` with `stream: true` is run for its client, so when that client is the only reader and falls behind, the turn is canceled to stop burning provider tokens, and the stream ends with a terminal `turn.failed` carrying error type `https://meka.run/errors/sse-lag`. That event is the stream's, sent before the turn has unwound, so it carries no `message_withdrawn`; the outcome recorded for a later re-attach is a `turn.canceled` with `reason: "sse_lag"` and does. Retry by submitting a new turn. A turn is never canceled for a reader of the [session feed](#the-session-feed) or the [server feed](#the-server-feed), because the turn was not run for it.
 
-Turn events are broadcast, so a re-attached client or a second consumer counts as a separate reader. Use `GET /messages` to inspect what the agent completed either way. A reader of the [session feed](#the-session-feed) that falls behind gets the `notice` and keeps its connection; a turn is never canceled for a feed reader, because the turn was not run for it.
+#### The feed itself
+
+| Event | Payload | When |
+|-------|---------|------|
+| `feed.gap` | `session_id` on a session's feed, `dropped` when the feed can count the hole | This reader's copy of the feed has a hole: the replay ring no longer reaches the position it resumed from, or what it fell behind by. Read `GET /messages` (or `GET /v1/sessions` for the server feed) to fill it. Carries no `id`, since it is the reader's and not the session's |
+
+`dropped` is how many numbered events the hole holds. It is absent when the reader resumed from an id this feed never issued, after a restart say, since nothing says how far back it stood.
 
 ### The session feed
 
@@ -734,7 +745,7 @@ Ids run across the whole session and the ring spans turns, so an id from an earl
 
 Three limits, all deliberate:
 
-- **The replay buffer is bounded** by `[serve] stream_replay_events` (default 256). If your `Last-Event-ID` is older than the oldest retained event, you get a `notice` saying the replay has a hole rather than a transcript that silently skips. Read `GET /messages` to fill it.
+- **The replay buffer is bounded** by `[serve] stream_replay_events` (default 256). If your `Last-Event-ID` is older than the oldest retained event, the stream opens with a `feed.gap` rather than a transcript that silently skips; see [Falling behind](#falling-behind). Read `GET /messages` to fill it.
 - **Only the most recent turn's terminal is retained** past the ring. Everything else a late client needs is in `GET /messages`.
 - **A turn opened by `POST /turn` with `stream: true` is not canceled immediately when its client disconnects.** It keeps running for `[serve] stream_reattach_grace` (default 30s) waiting for the client to come back; after that the agent loop stops, since nobody is listening. Set `"0s"` to restore the older behavior where a dropped stream cancels the turn at once. The rule is only for turns a streaming client opened: a turn the server started for a fire, an outcome or an inbox item runs for the session and is never stopped for want of a reader.
 
@@ -773,7 +784,8 @@ process holds, carrying exactly the events that change a session record and noth
 feed is for. A client keeping a list of sessions keeps it current from this and opens a session's
 own feed only for the one it is looking at. It needs `sessions:r`, numbers its events on its own,
 and replays from `Last-Event-ID` (or `?last_event_id=`) out of a ring of its own, with the same
-`notice` when the ring no longer reaches back far enough.
+`feed.gap` when the ring no longer reaches back far enough and the same catch-up for a reader that
+falls behind.
 
 | Event | Payload | When |
 |-------|---------|------|

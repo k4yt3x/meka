@@ -12,6 +12,122 @@ use crate::host::scheduler::TurnSource;
 /// How many events the feed's broadcast channel holds ahead of a slow consumer before it lags.
 pub(crate) const FEED_BROADCAST_CAPACITY: usize = 256;
 
+/// The replay ring behind a feed: the newest `capacity` numbered events, oldest first. It is what
+/// a reader resuming from a `Last-Event-ID` is handed, and what a reader that fell behind the
+/// broadcast is caught up from.
+pub(super) struct Ring {
+    events: std::collections::VecDeque<SseEvent>,
+    capacity: usize,
+}
+
+impl Ring {
+    pub(super) fn new(capacity: usize) -> Self {
+        Self {
+            events: std::collections::VecDeque::with_capacity(capacity.min(64)),
+            capacity,
+        }
+    }
+
+    /// Keep `event`, dropping the oldest once the ring is full. Nothing is kept when replay is
+    /// switched off (`stream_replay_events = 0`).
+    pub(super) fn record(&mut self, event: SseEvent) {
+        if self.capacity == 0 {
+            return;
+        }
+        while self.events.len() >= self.capacity {
+            self.events.pop_front();
+        }
+        self.events.push_back(event);
+    }
+
+    /// What a reader positioned after `last_event_id` is owed, `next_id` being the id the feed
+    /// issues next.
+    ///
+    /// An id at or above `next_id` was never issued here, a fabricated value or one a browser
+    /// carried over from another session, and is discarded rather than filtered against, which
+    /// would silently deliver nothing. A reader naming no position is joining, not resuming, and
+    /// has lost nothing. A hole is measured from the position the reader claims to the oldest
+    /// event the ring holds, or to the present when it holds nothing.
+    pub(super) fn replay(&self, last_event_id: Option<u64>, next_id: u64) -> Replay {
+        let stale = last_event_id.is_some_and(|last| last >= next_id);
+        let resume_from = if stale { None } else { last_event_id };
+        let backlog = self
+            .events
+            .iter()
+            .filter(|event| resume_from.is_none_or(|last| event.id.is_some_and(|id| id > last)))
+            .cloned()
+            .collect();
+        let gap = if stale {
+            Some(Gap { dropped: None })
+        } else {
+            resume_from.and_then(|last| {
+                let oldest_known = self
+                    .events
+                    .front()
+                    .and_then(|event| event.id)
+                    .unwrap_or(next_id);
+                let dropped = oldest_known.saturating_sub(last.saturating_add(1));
+                (dropped > 0).then_some(Gap {
+                    dropped: Some(dropped),
+                })
+            })
+        };
+        Replay {
+            backlog,
+            resume_from,
+            gap,
+        }
+    }
+}
+
+/// What [`Ring::replay`] hands a reader.
+pub(super) struct Replay {
+    /// The ring's events after the reader's position, oldest first.
+    pub(super) backlog: Vec<SseEvent>,
+    /// The position resumption uses once a never-issued id is discarded; `None` is everything.
+    pub(super) resume_from: Option<u64>,
+    /// The hole between the reader's position and the backlog, when there is one.
+    pub(super) gap: Option<Gap>,
+}
+
+/// A hole in what a reader is handed: numbered events between its position and what the feed can
+/// still send, which only the records can fill. Said as a `feed.gap` event, which is the reader's
+/// and not the session's, so it is never numbered or kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Gap {
+    /// How many numbered events the hole holds, when the feed can count them; `None` when the
+    /// reader's position was never issued here, so nothing says how far back it stood.
+    pub(crate) dropped: Option<u64>,
+}
+
+impl Gap {
+    /// The `feed.gap` event for this hole, naming its session on a session's feed.
+    pub(crate) fn event(self, session_id: Option<uuid::Uuid>) -> SseEvent {
+        let mut data = serde_json::Map::new();
+        if let Some(session_id) = session_id {
+            data.insert("session_id".into(), session_id.to_string().into());
+        }
+        if let Some(dropped) = self.dropped {
+            data.insert("dropped".into(), dropped.into());
+        }
+        SseEvent {
+            id: None,
+            event_type: SseEventType::FeedGap,
+            data: serde_json::Value::Object(data),
+        }
+    }
+}
+
+/// What a reader that fell behind the broadcast is handed to go on without a silent hole: the
+/// ring's events after the last it delivered and a fresh subscription, taken under one lock so
+/// nothing is emitted between them, plus the hole when the ring no longer reaches that far. The
+/// same replay a reconnect gets, done by the server on the reader's behalf.
+pub(crate) struct CaughtUp {
+    pub(crate) backlog: Vec<SseEvent>,
+    pub(crate) receiver: broadcast::Receiver<SseEvent>,
+    pub(crate) gap: Option<Gap>,
+}
+
 /// The session's SSE event stream: one channel for the life of the resident session, and a replay
 /// ring behind it.
 ///
@@ -26,9 +142,8 @@ pub(crate) struct SessionFeed {
     pub(super) session_id: uuid::Uuid,
     pub(super) ids: Arc<EventIdGenerator>,
     pub(super) sender: broadcast::Sender<SseEvent>,
-    /// Recent events, oldest first, capped at `replay_capacity`.
-    pub(super) replay: std::collections::VecDeque<SseEvent>,
-    pub(super) replay_capacity: usize,
+    /// The newest events, for a reader resuming from a `Last-Event-ID` or catching up.
+    pub(super) ring: Ring,
     /// The turn publishing right now, if one is.
     pub(super) turn: Option<LiveTurn>,
     /// How many feed readers opened the stream with `attend=true`, each holding an
@@ -62,6 +177,9 @@ pub(super) struct LiveTurn {
     pub(super) attended: bool,
     pub(super) disconnected_since: Option<std::time::Instant>,
     pub(super) reattach_grace: Duration,
+    /// The id of its `turn.started`, the position a stream opened on the turn stands at before
+    /// it has received anything; `None` until the event is published.
+    pub(super) started_id: Option<u64>,
 }
 
 impl SessionFeed {
@@ -79,8 +197,7 @@ impl SessionFeed {
             session_id,
             ids,
             sender,
-            replay: std::collections::VecDeque::with_capacity(replay_capacity.min(64)),
-            replay_capacity,
+            ring: Ring::new(replay_capacity),
             turn: None,
             attending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             unattended_since: Arc::new(std::sync::Mutex::new(None)),
@@ -89,16 +206,6 @@ impl SessionFeed {
             server,
             reattach_grace,
         }
-    }
-
-    fn record(&mut self, event: SseEvent) {
-        if self.replay_capacity == 0 {
-            return;
-        }
-        while self.replay.len() >= self.replay_capacity {
-            self.replay.pop_front();
-        }
-        self.replay.push_back(event);
     }
 
     /// Number, record and broadcast one event, under the lock the caller holds so ids stay
@@ -129,7 +236,7 @@ impl SessionFeed {
             data,
         };
         if !transient {
-            self.record(event.clone());
+            self.ring.record(event.clone());
         }
         if self.sender.send(event.clone()).is_err() {
             tracing::trace!("no consumer is attached; the event is recorded for a re-attach");
@@ -170,10 +277,13 @@ pub(crate) struct StreamAttachment {
     /// that reconnects after the fact gets it immediately rather than waiting on a stream that
     /// will never produce another event for that turn.
     pub(crate) terminal: Option<SseEvent>,
-    /// True when the client's `Last-Event-ID` is older than the oldest event still buffered, so
-    /// the replay has a hole in it. Reported rather than papered over: a transcript with a silent
-    /// gap is worse than one the client knows is incomplete.
-    pub(crate) gap: bool,
+    /// The hole between the client's `Last-Event-ID` and the oldest event still buffered, when
+    /// there is one. Reported rather than papered over: a transcript with a silent gap is worse
+    /// than one the client knows is incomplete.
+    pub(crate) gap: Option<Gap>,
+    /// The last id issued before this attachment, after which its live subscription begins: the
+    /// position a reader that falls behind is caught up from until it has delivered more.
+    pub(crate) joined_after: Option<u64>,
     /// The position resumption should actually use, after discarding a `Last-Event-ID` that this
     /// session never issued.
     ///
@@ -219,8 +329,7 @@ impl Drop for Attendance {
 pub(crate) struct ServerFeed {
     ids: EventIdGenerator,
     sender: broadcast::Sender<SseEvent>,
-    replay: std::collections::VecDeque<SseEvent>,
-    replay_capacity: usize,
+    ring: Ring,
 }
 
 /// The server feed as every session feed and every handler shares it.
@@ -231,8 +340,11 @@ pub(crate) type SharedServerFeed = Arc<std::sync::Mutex<ServerFeed>>;
 pub(crate) struct ServerAttachment {
     pub(crate) backlog: Vec<SseEvent>,
     pub(crate) receiver: broadcast::Receiver<SseEvent>,
-    /// Whether the client's `Last-Event-ID` is older than the ring reaches.
-    pub(crate) gap: bool,
+    /// The hole between the client's `Last-Event-ID` and the oldest event the ring holds, when
+    /// there is one.
+    pub(crate) gap: Option<Gap>,
+    /// The last id issued before this attachment; see [`StreamAttachment::joined_after`].
+    pub(crate) joined_after: Option<u64>,
 }
 
 impl ServerFeed {
@@ -242,8 +354,7 @@ impl ServerFeed {
         Self {
             ids: EventIdGenerator::default(),
             sender,
-            replay: std::collections::VecDeque::with_capacity(replay_capacity.min(64)),
-            replay_capacity,
+            ring: Ring::new(replay_capacity),
         }
     }
 
@@ -268,40 +379,110 @@ impl ServerFeed {
             event_type,
             data,
         };
-        if self.replay_capacity > 0 {
-            while self.replay.len() >= self.replay_capacity {
-                self.replay.pop_front();
-            }
-            self.replay.push_back(event.clone());
-        }
+        self.ring.record(event.clone());
         if self.sender.send(event).is_err() {
             tracing::trace!("no consumer is attached to the server feed; the event is recorded");
         }
     }
 
-    /// The backlog after `last_event_id` and a live subscription. An id at or above the high-water
-    /// mark was never issued here and is discarded rather than filtered against.
+    /// The backlog after `last_event_id` and a live subscription, taken together so nothing is
+    /// emitted between them. A reader that fell behind takes the same door with the last id it
+    /// delivered, and is caught up the way a reconnect would be.
     pub(crate) fn attach(&self, last_event_id: Option<u64>) -> ServerAttachment {
-        let stale = last_event_id.is_some_and(|last| last >= self.ids.peek());
-        let resume_from = if stale { None } else { last_event_id };
-        let backlog: Vec<SseEvent> = self
-            .replay
-            .iter()
-            .filter(|event| resume_from.is_none_or(|last| event.id.is_some_and(|id| id > last)))
-            .cloned()
-            .collect();
-        let gap = stale
-            || match (resume_from, self.replay.front()) {
-                (Some(last), Some(oldest)) => {
-                    oldest.id.is_some_and(|id| id > last.saturating_add(1))
-                }
-                (Some(_), None) => self.replay_capacity == 0,
-                _ => false,
-            };
+        let next_id = self.ids.peek();
+        let replay = self.ring.replay(last_event_id, next_id);
         ServerAttachment {
-            backlog,
+            backlog: replay.backlog,
             receiver: self.sender.subscribe(),
-            gap,
+            gap: replay.gap,
+            joined_after: next_id.checked_sub(1),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server_feed_with(published: u64, ring: usize) -> ServerFeed {
+        let mut feed = ServerFeed::new(16, ring);
+        for index in 0..published {
+            feed.publish(
+                SseEventType::SessionUpdated,
+                serde_json::json!({ "index": index }),
+            );
+        }
+        feed
+    }
+
+    /// A reader's position decides what it is handed: everything after it while the ring reaches,
+    /// the hole counted when it does not, nothing said to one that is joining rather than
+    /// resuming, and a position this feed never issued discarded with its hole unmeasured.
+    #[test]
+    fn a_ring_replays_after_a_position_and_counts_the_hole_it_cannot_cover() {
+        // Ids 0 through 9 were issued; the ring holds 6 through 9.
+        let feed = server_feed_with(10, 4);
+        let resumed = feed.attach(Some(2));
+        let ids: Vec<u64> = resumed
+            .backlog
+            .iter()
+            .filter_map(|event| event.id)
+            .collect();
+        assert_eq!(ids, vec![6, 7, 8, 9]);
+        assert_eq!(
+            resumed.gap.and_then(|gap| gap.dropped),
+            Some(3),
+            "ids 3, 4 and 5 are gone"
+        );
+        assert_eq!(
+            resumed.joined_after,
+            Some(9),
+            "the live subscription begins after 9"
+        );
+        assert!(
+            feed.attach(Some(6)).gap.is_none(),
+            "a position the ring still holds is contiguous"
+        );
+        let joining = feed.attach(None);
+        assert!(joining.gap.is_none(), "joining is not resuming");
+        assert_eq!(joining.backlog.len(), 4);
+        let never_issued = feed.attach(Some(42));
+        assert_eq!(never_issued.gap, Some(Gap { dropped: None }));
+        assert_eq!(
+            never_issued.backlog.len(),
+            4,
+            "a discarded position is handed everything the ring holds"
+        );
+    }
+
+    /// With replay switched off the ring holds nothing, so a resuming reader's hole runs to the
+    /// present, and a reader already at the present has lost nothing.
+    #[test]
+    fn a_ring_of_nothing_counts_everything_since_the_position() {
+        let feed = server_feed_with(5, 0);
+        assert_eq!(
+            feed.attach(Some(1)).gap.and_then(|gap| gap.dropped),
+            Some(3),
+            "ids 2, 3 and 4"
+        );
+        assert!(feed.attach(Some(4)).gap.is_none());
+    }
+
+    /// The event says the hole and whose feed it is on, and is nothing of the session's: no id.
+    #[test]
+    fn a_gap_event_names_its_session_and_counts_when_it_can() {
+        let session = uuid::Uuid::from_u128(0x5);
+        let counted = Gap { dropped: Some(3) }.event(Some(session));
+        assert_eq!(counted.id, None);
+        assert_eq!(counted.event_type, SseEventType::FeedGap);
+        assert_eq!(
+            counted.data,
+            serde_json::json!({ "session_id": session.to_string(), "dropped": 3 })
+        );
+        assert_eq!(
+            Gap { dropped: None }.event(None).data,
+            serde_json::json!({}),
+            "an unmeasured hole on the server feed says only that it is one"
+        );
     }
 }

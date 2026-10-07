@@ -125,7 +125,9 @@ impl Default for SessionCapabilities {
     }
 }
 
-use super::feed::{Attendance, FEED_BROADCAST_CAPACITY, LiveTurn, SessionFeed, StreamAttachment};
+use super::feed::{
+    Attendance, CaughtUp, FEED_BROADCAST_CAPACITY, LiveTurn, SessionFeed, StreamAttachment,
+};
 pub(crate) use crate::host::scheduler::TurnSource;
 
 /// One parked permission request: the channel its answer arrives on. What the prompt is about
@@ -430,9 +432,13 @@ impl HttpFrontend {
             attended,
             disconnected_since: None,
             reattach_grace,
+            started_id: None,
         });
         let receiver = feed.sender.subscribe();
-        feed.publish(SseEventType::TurnStarted, data);
+        let started = feed.publish(SseEventType::TurnStarted, data);
+        if let Some(turn) = feed.turn.as_mut() {
+            turn.started_id = started.id;
+        }
         let ids = Arc::clone(&self.ids);
         drop(guard);
         (receiver, ids)
@@ -500,6 +506,15 @@ impl HttpFrontend {
             .map_or(0, |feed| feed.sender.receiver_count())
     }
 
+    /// The id of the live turn's `turn.started`, once it is published: where a stream opened on
+    /// the turn stands before it has received anything.
+    pub(crate) fn turn_started_id(&self) -> Option<u64> {
+        crate::sync::lock(&self.feed)
+            .as_ref()
+            .and_then(|feed| feed.turn.as_ref())
+            .and_then(|turn| turn.started_id)
+    }
+
     /// Close the turn's view of the feed. The feed itself stays open: the next turn, whoever
     /// starts it, publishes on the same channel and a subscriber keeps its position.
     pub(crate) fn end_turn(&self) {
@@ -548,53 +563,14 @@ impl HttpFrontend {
         if let Some(turn) = feed.turn.as_mut() {
             turn.disconnected_since = None;
         }
-        // Ids are session-monotonic, so an id at or above the high-water mark was never issued
-        // here at all -- a fabricated value, or one carried over from a different session. Discard
-        // it rather than filter against it, which would silently deliver nothing.
-        let stale = last_event_id.is_some_and(|last| last >= feed.ids.peek());
-        let resume_from = if stale { None } else { last_event_id };
+        let next_id = feed.ids.peek();
+        let mut replay = feed.ring.replay(last_event_id, next_id);
         // Taking `pending` while holding `feed` is safe in this order only: `request_permission`
         // releases `pending` before it acquires `feed` (see `park_permission` / `emit_pause`),
         // and `resolve_permission` never touches `feed` at all, so there is no inversion.
         let still_pending = crate::sync::lock(&self.pending);
-        let backlog: Vec<SseEvent> = feed
-            .replay
-            .iter()
-            .filter(|event| resume_from.is_none_or(|last| event.id.is_some_and(|id| id > last)))
-            // A pause is stateful, not additive. Replaying one the client already answered (or
-            // that timed out) would put an approval prompt back on screen for a request that no
-            // longer exists, and any decision sent for it comes back 404. Replay it only while it
-            // is still actionable, which is exactly while it is still parked.
-            .filter(|event| {
-                if event.event_type != SseEventType::PermissionRequired {
-                    return true;
-                }
-                event
-                    .data
-                    .get("request_id")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|request_id| still_pending.contains_key(request_id))
-            })
-            .cloned()
-            .collect();
+        Self::withhold_answered_prompts(&mut replay.backlog, &still_pending);
         drop(still_pending);
-        // A hole exists only relative to a position the client actually claims. `id + 1` because
-        // resuming from exactly the oldest retained id is contiguous.
-        //
-        // A client that names no `Last-Event-ID` is joining, not resuming, and has lost nothing:
-        // warning it about the events before it arrived would fire on every first attach. A
-        // *stale* id is always a gap, because whatever the client was following has ended.
-        let gap = stale
-            || match (resume_from, feed.replay.front()) {
-                (Some(last), Some(oldest)) => {
-                    oldest.id.is_some_and(|id| id > last.saturating_add(1))
-                }
-                // Replay is switched off (`stream_replay_events = 0`), so a client resuming from a
-                // position has been handed nothing between there and now. Reporting no gap would
-                // be the silent truncation the notice exists to rule out.
-                (Some(_), None) => feed.replay_capacity == 0,
-                _ => false,
-            };
         let turn_id = feed.turn.as_ref().map(|turn| turn.turn_id);
         let turn_source = feed.turn.as_ref().map(|turn| turn.source.clone());
         // Handed over only when no turn is running: with one in flight, the live subscription is
@@ -618,14 +594,54 @@ impl HttpFrontend {
             turn_id,
             turn_source,
             attendance,
-            backlog,
+            backlog: replay.backlog,
             receiver: feed.sender.subscribe(),
             terminal,
-            gap,
-            resume_from,
+            gap: replay.gap,
+            resume_from: replay.resume_from,
+            joined_after: next_id.checked_sub(1),
         };
         drop(guard);
         Some(attachment)
+    }
+
+    /// The feed's replay for a reader that fell behind the broadcast, from the last id it
+    /// delivered, with a fresh subscription taken under the same lock; `None` when no feed is
+    /// installed. The reader keeps its attendance and its turn: only the subscription is renewed.
+    pub(crate) fn catch_up(&self, last_delivered: Option<u64>) -> Option<CaughtUp> {
+        let guard = crate::sync::lock(&self.feed);
+        let feed = guard.as_ref()?;
+        let mut replay = feed.ring.replay(last_delivered, feed.ids.peek());
+        let still_pending = crate::sync::lock(&self.pending);
+        Self::withhold_answered_prompts(&mut replay.backlog, &still_pending);
+        drop(still_pending);
+        let caught_up = CaughtUp {
+            backlog: replay.backlog,
+            receiver: feed.sender.subscribe(),
+            gap: replay.gap,
+        };
+        drop(guard);
+        Some(caught_up)
+    }
+
+    /// A pause is stateful, not additive. Replaying one the client already answered (or that
+    /// timed out) would put an approval prompt back on screen for a request that no longer
+    /// exists, and any decision sent for it comes back 404. Replay it only while it is still
+    /// actionable, which is exactly while it is still parked.
+    fn withhold_answered_prompts<Parked>(
+        backlog: &mut Vec<SseEvent>,
+        still_pending: &std::collections::HashMap<String, Parked>,
+    ) {
+        backlog.retain(|event| {
+            if event.event_type != SseEventType::PermissionRequired {
+                return true;
+            }
+            event
+                .data
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|request_id| still_pending.contains_key(request_id))
+        });
     }
 
     /// Drop SSE events the per-session capabilities don't enable. Currently only the
@@ -2241,7 +2257,7 @@ mod tests {
             "oldest-first eviction keeps the newest three"
         );
         assert!(
-            !all.gap,
+            all.gap.is_none(),
             "a client naming no Last-Event-ID is joining, not resuming, so it has lost nothing"
         );
 
@@ -2255,15 +2271,16 @@ mod tests {
             .collect();
         assert_eq!(ids, vec![5], "resume delivers strictly after the given id");
         assert!(
-            !resumed.gap,
+            resumed.gap.is_none(),
             "id 4 is still buffered, so the replay is contiguous"
         );
 
         let stale = frontend
             .attach_stream(Some(0), false)
             .expect("stream installed");
-        assert!(
-            stale.gap,
+        assert_eq!(
+            stale.gap.and_then(|gap| gap.dropped),
+            Some(2),
             "resuming from id 0 when the ring starts at 3 skips events 1 and 2, and must say so"
         );
     }
@@ -2450,5 +2467,70 @@ mod tests {
             "the run over, the feed is gone"
         );
         assert!(feed_of(child).is_some(), "and the child's stays");
+    }
+
+    /// A reader that fell behind the broadcast is handed what the ring holds after the last id it
+    /// delivered, under one lock with its new subscription, so the hole never reaches the client;
+    /// when the ring no longer reaches that far, the hole is counted and said.
+    #[tokio::test]
+    async fn a_reader_that_fell_behind_is_caught_up_from_the_ring() {
+        let frontend = HttpFrontend::new();
+        let (mut receiver, _ids) =
+            frontend.install_stream(4, 16, Duration::from_secs(30), uuid::Uuid::from_u128(0x7));
+        for index in 0..10 {
+            frontend
+                .emit(FrontendEvent::AssistantTextDelta(format!("chunk{index}")))
+                .await;
+        }
+        assert!(
+            matches!(
+                receiver.recv().await,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+            ),
+            "a channel of four overflows under eleven events"
+        );
+        // `turn.started` is id 0, the last thing this reader delivered before it fell behind.
+        let caught_up = frontend.catch_up(Some(0)).expect("feed installed");
+        let ids: Vec<u64> = caught_up
+            .backlog
+            .iter()
+            .filter_map(|event| event.id)
+            .collect();
+        assert_eq!(
+            ids,
+            (1..=10).collect::<Vec<u64>>(),
+            "everything after the position, in order"
+        );
+        assert!(
+            caught_up.gap.is_none(),
+            "the ring reached, so there is no hole to say"
+        );
+        let mut receiver = caught_up.receiver;
+        frontend
+            .emit(FrontendEvent::AssistantTextDelta("after".into()))
+            .await;
+        let next = receiver.recv().await.expect("the new subscription is live");
+        assert_eq!(next.id, Some(11), "and continues where the backlog ended");
+
+        let short = HttpFrontend::new();
+        let (_receiver, _ids) =
+            short.install_stream(4, 4, Duration::from_secs(30), uuid::Uuid::from_u128(0x8));
+        for index in 0..10 {
+            short
+                .emit(FrontendEvent::AssistantTextDelta(format!("chunk{index}")))
+                .await;
+        }
+        let caught_up = short.catch_up(Some(0)).expect("feed installed");
+        let ids: Vec<u64> = caught_up
+            .backlog
+            .iter()
+            .filter_map(|event| event.id)
+            .collect();
+        assert_eq!(ids, vec![7, 8, 9, 10], "the four the ring still holds");
+        assert_eq!(
+            caught_up.gap.and_then(|gap| gap.dropped),
+            Some(6),
+            "ids 1 through 6 are gone, and the hole is counted"
+        );
     }
 }

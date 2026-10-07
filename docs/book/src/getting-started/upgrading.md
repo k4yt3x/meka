@@ -10,6 +10,19 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.70 to 0.71
+
+**A hole in a feed is a `feed.gap` event, no longer a `notice`.** A client that resumed a session
+feed, a sub-agent's feed or the server feed from a `Last-Event-ID` the replay ring no longer
+reached was told so by a `warn` `notice`, and so was one that fell behind while connected. The
+first case is now a `feed.gap` event, with `session_id` on a session's feed and `dropped` when the
+server can count the hole; a client that matched the notice's text, or treated a notice without a
+`turn_id` as a hole, switches on the event name instead. The second case no longer reaches a
+client: a reader that falls behind is caught up from the ring, and only a `POST /turn` stream
+whose client was the sole reader still ends, with the `sse-lag` failure as before. `notice` now
+carries only what the agent or a provider said. See
+[Falling behind](../usage/http-api.md#falling-behind).
+
 ## 0.69 to 0.70
 
 The HTTP API changes shape in the places below. The store gains a table of turns and a column
