@@ -92,6 +92,12 @@ pub(super) struct TurnRecovery {
     /// rounds are past the ceiling gets nothing back from a second pass, and without this every
     /// round after the first would pay for one; the rejection recovery remains the last resort.
     pub(super) ceiling_compacted: bool,
+    /// Consecutive checklist nudges since the last tool round, what the cap counts. A tool round
+    /// resets it: whatever the model did with its tools, it was not the stall the cap exists for.
+    pub(super) checklist_nudges: u32,
+    /// Every checklist nudge this turn, which nothing resets: the bound on a model that puts a
+    /// tool round between every two.
+    pub(super) checklist_nudges_this_turn: u32,
     /// The words this turn is answering, handed to every compaction the loop runs so a summary
     /// that takes the prompt quotes it as the user wrote it.
     pub(super) request_in_flight: Option<String>,
@@ -491,23 +497,93 @@ impl TurnRecovery {
         assistant_message: &Message,
         stop_reason: &StopReason,
     ) -> Result<()> {
-        let assistant_event = crate::conversation::Event::Append(assistant_message.clone());
-        let nudge = Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: THINKING_ONLY_NUDGE.to_string(),
-            }],
-        };
-        let nudge_event = crate::conversation::Event::Append(nudge.clone());
-        agent
-            .save_events_atomic(session_id, vec![assistant_event, nudge_event])
-            .await?;
-        messages.append(assistant_message.clone());
-        messages.append(nudge);
+        self.append_nudge(
+            agent,
+            session_id,
+            messages,
+            assistant_message,
+            crate::conversation::NudgeKind::VisibleReply,
+            crate::conversation::THINKING_ONLY_NUDGE.to_string(),
+        )
+        .await?;
         self.thinking_only_nudged = true;
         tracing::info!(
             "thinking-only response (no visible text, stop_reason {stop_reason:?}); nudging once"
         );
+        Ok(())
+    }
+
+    /// Answer a reply that stopped with checklist items open by appending `nudge` after it, as
+    /// one unit with the reply for the reason [`Self::nudge_thinking_only`] gives. Counted here,
+    /// against the cap, so a caller cannot nudge without counting.
+    pub(super) async fn nudge_checklist(
+        &mut self,
+        agent: &Agent,
+        session_id: Uuid,
+        messages: &mut Conversation,
+        assistant_message: &Message,
+        nudge: String,
+    ) -> Result<()> {
+        self.append_nudge(
+            agent,
+            session_id,
+            messages,
+            assistant_message,
+            crate::conversation::NudgeKind::Checklist,
+            nudge,
+        )
+        .await?;
+        self.checklist_nudges = self.checklist_nudges.saturating_add(1);
+        self.checklist_nudges_this_turn = self.checklist_nudges_this_turn.saturating_add(1);
+        let in_a_row = self.checklist_nudges;
+        let this_turn = self.checklist_nudges_this_turn;
+        let limit = super::CHECKLIST_NUDGE_LIMIT;
+        tracing::info!(
+            "the reply left checklist items open; nudging ({in_a_row} of {limit}, {this_turn} this \
+             turn)"
+        );
+        Ok(())
+    }
+
+    /// Append `assistant_message` and the nudge that answers it as one unit, with what arrived in
+    /// the inbox while the reply was written riding behind the nudge: a nudge round is a round
+    /// boundary like a tool round's results, and reads the inbox the same way. Memory moves only
+    /// once the pair is on disk, for the reason the thinking-only nudge gives, and the nudge is
+    /// announced after.
+    async fn append_nudge(
+        &mut self,
+        agent: &Agent,
+        session_id: Uuid,
+        messages: &mut Conversation,
+        assistant_message: &Message,
+        kind: crate::conversation::NudgeKind,
+        text: String,
+    ) -> Result<()> {
+        let mut nudge = Message::nudge_message(kind, text.clone());
+        let steering = agent.take_steering(session_id, &self.inbox_ids).await;
+        nudge
+            .content
+            .extend(steering.iter().map(|item| ContentBlock::Text {
+                text: crate::prompt::render_inbox_item(item, true),
+            }));
+        let steered: Vec<Uuid> = steering.iter().map(|item| item.id).collect();
+        agent
+            .save_events_atomic_marking_inbox(
+                session_id,
+                vec![
+                    crate::conversation::Event::Append(assistant_message.clone()),
+                    crate::conversation::Event::Append(nudge.clone()),
+                ],
+                &steered,
+            )
+            .await?;
+        messages.append(assistant_message.clone());
+        messages.append(nudge);
+        agent
+            .cells
+            .frontend
+            .emit(crate::frontend::FrontendEvent::Nudged { kind, text })
+            .await;
         Ok(())
     }
 
@@ -1085,6 +1161,8 @@ mod tests {
             user_saved: false,
             inbox_ids: Vec::new(),
             thinking_only_nudged: false,
+            checklist_nudges: 0,
+            checklist_nudges_this_turn: 0,
             outage_reprieve_used: false,
         };
 
@@ -1156,6 +1234,8 @@ mod tests {
             user_saved: false,
             inbox_ids: Vec::new(),
             thinking_only_nudged: false,
+            checklist_nudges: 0,
+            checklist_nudges_this_turn: 0,
             outage_reprieve_used: false,
         };
 
@@ -1210,6 +1290,8 @@ mod tests {
             user_saved: true,
             inbox_ids: Vec::new(),
             thinking_only_nudged: false,
+            checklist_nudges: 0,
+            checklist_nudges_this_turn: 0,
             outage_reprieve_used: false,
         };
         let outage = |retry_after| MekaError::RetryableProvider {
@@ -1273,6 +1355,8 @@ mod tests {
             user_saved: true,
             inbox_ids: Vec::new(),
             thinking_only_nudged: false,
+            checklist_nudges: 0,
+            checklist_nudges_this_turn: 0,
             outage_reprieve_used: false,
         };
         let outage = MekaError::RetryableProvider {
@@ -1765,6 +1849,8 @@ mod tests {
             user_saved: true,
             inbox_ids: Vec::new(),
             thinking_only_nudged: false,
+            checklist_nudges: 0,
+            checklist_nudges_this_turn: 0,
             outage_reprieve_used: true,
         };
 

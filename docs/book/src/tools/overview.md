@@ -13,9 +13,9 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`file_search`](./search.md#file_search) | Read | Search file contents with regex |
 | [`web_fetch`](./web.md#web_fetch) | Read | Fetch a web page as markdown |
 | [`shell_execute`](./shell.md#shell_execute) | Read | Run a shell command (see the note below) |
-| [`todo_write`](./overview.md#todo_write-todo_edit-todo_read) | Read | Create or replace the task list |
-| [`todo_edit`](./overview.md#todo_write-todo_edit-todo_read) | Read | Update task statuses by number |
-| [`todo_read`](./overview.md#todo_write-todo_edit-todo_read) | Read | Read the task list |
+| [`checklist_add`](../usage/checklist.md) | Read | Add items the turn has to finish |
+| [`checklist_edit`](../usage/checklist.md) | Read | Change one item by id |
+| [`checklist_read`](../usage/checklist.md) | Read | Read the checklist |
 | [`agent_spawn`](./overview.md#agent_spawn) | Read | Delegate tasks to a sub-agent |
 | [`agent_list`](./overview.md#agent_list--agent_followup--agent_steer--agent_delete) | Read | List the sub-agents this session spawned |
 | [`agent_followup`](./overview.md#agent_list--agent_followup--agent_steer--agent_delete) | Read | Ask a sub-agent another question |
@@ -60,7 +60,7 @@ Tools are grouped by the minimum permission level required:
 **Read permission** (available at `read` and above):
 - `file_read`, `file_find`, `file_search`, `web_fetch`
 - `shell_execute` (sandboxed, filesystem write-protected)
-- `todo_read`, `todo_write`, `todo_edit`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_steer`, `agent_delete`, `image_render`
+- `checklist_add`, `checklist_edit`, `checklist_read`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_steer`, `agent_delete`, `image_render`
 - All skill tools, including `skill_write` and `skill_delete` when they are enabled: like memory,
   skills live in meka's own config directory, not your working tree
 - `conversation_search`, `conversation_read`, `context_check`, `context_compact`
@@ -150,7 +150,7 @@ It is honored on **every** tool, MCP servers included: the redirect happens wher
 recorded, not inside the tool. Eleven built-ins also *advertise* it in their schema, which is how the
 model discovers it: `file_read`, `file_edit`, `file_write`, `file_find`, `file_search`,
 `web_fetch`, `shell_execute`, `conversation_read`, `agent_spawn`, `agent_followup`
-and the `todo_*` tools, the last for uniformity alone, since its list is kept as state and nothing is redirected.
+and the `checklist_*` tools, the last for uniformity alone, since the list is kept as state and nothing is redirected.
 
 Three of those lift a cap when it is set, producing their full untruncated output: `file_find` (500
 results), `file_search` (100 matches) and `web_fetch` (`limit`). An explicit `limit` on
@@ -167,19 +167,19 @@ results), `file_search` (100 matches) and `web_fetch` (`limit`). An explicit `li
 
 Tool calls and their results are displayed in the terminal so you can see what the agent is doing.
 
-## `todo_write`, `todo_edit`, `todo_read`
+## `checklist_add`, `checklist_edit`, `checklist_read`
 
-A structured task list for a session. The agent uses it to track multi-step work and communicate progress; the list is displayed in the terminal (for the root agent) and injected into the conversation context each turn. Every call returns the full current list with task numbers, so the agent always has the numbers its next edit needs.
+The list of what the agent has committed to do, and the rule that a turn cannot end while an item on it is open. [Checklist](../usage/checklist.md) describes the rule, the nudge and the cap; the tools are:
 
-- `todo_write` creates or replaces the whole list: `title`, a short heading for the overall goal, and `items`, each a task string (status defaults to `pending`) or an object `{text, status}`. Tasks are numbered `1..N` in order. Both parameters are required.
-- `todo_edit` updates statuses by task number: `set`, e.g. `{"1": "completed", "2": "in_progress"}`. This is the common path while working. Every number is checked before any status changes, so one bad number changes nothing.
-- `todo_read` returns the list and takes no arguments.
+- `checklist_add` appends `items`, each a text (added `pending`) or an object `{text, status}` with `status` `pending` or `in_progress`. Returns the ids assigned and the whole list. A text and a reason are kept as one line each.
+- `checklist_edit` changes one item by `id`: `status` (`pending`, `in_progress`, `deferred`, `completed` or `canceled`), `reason` (required with `deferred` and `canceled`, refused otherwise), `task` (with `deferred` only: the background task the item waits on, by the id `task_list` shows; one that has already reported is refused, and a new `reason` drops a task not named again), or `text`. One wrong part refuses the whole call.
+- `checklist_read` returns the list and takes no arguments.
 
-Task statuses are `pending`, `in_progress`, `completed`, and `canceled`.
+Completed and canceled items leave the list; every call returns what remains, with the ids the next edit needs.
 
 ## `agent_spawn`
 
-Spawns a sub-agent to perform research, analysis, or any other delegated task. The sub-agent gets its own private todo list (the `todo_*` tools operate on the sub-agent's own state), runs silently (its tool calls are not surfaced to the terminal), and returns a single text report. Use this to keep exploratory or speculative work out of the main conversation context.
+Spawns a sub-agent to perform research, analysis, or any other delegated task. The sub-agent gets its own private checklist (the `checklist_*` tools operate on the sub-agent's own state), runs silently (its tool calls are not surfaced to the terminal), and returns a single text report. Use this to keep exploratory or speculative work out of the main conversation context.
 
 Multiple `agent_spawn` calls in one assistant turn run in parallel; useful when independent investigations can proceed concurrently.
 
@@ -200,7 +200,7 @@ Multiple `agent_spawn` calls in one assistant turn run in parallel; useful when 
 
 Neither can be granted beyond what you hold yourself, so authority only narrows going down a chain of sub-agents. A sub-agent you gave no memory cannot give its own sub-agents any.
 
-**What it sees.** A sub-agent gets the same per-turn context the root does, over its own registry: the tool discovery index, the skill index, the memories it was granted, and the instructions of the MCP servers it is allowed to use. Its conversation, todo list and scratchpad entries are private; filesystem changes are shared within the workspace it was given.
+**What it sees.** A sub-agent gets the same per-turn context the root does, over its own registry: the tool discovery index, the skill index, the memories it was granted, and the instructions of the MCP servers it is allowed to use. Its conversation, checklist and scratchpad entries are private; filesystem changes are shared within the workspace it was given.
 
 **Follow-up.** `agent_spawn` returns the sub-agent's id on the first line of its result, above the report. Keep it if you might have a second question: with it you can call `agent_followup` instead of re-spawning one that would have to rediscover everything.
 
@@ -219,7 +219,7 @@ A sub-agent is not a one-shot. Its conversation persists under its own session, 
 
 **A follow-up runs under the terms of the spawn, not your current ones.** The permission level, the deny lists, the memory level and the inherited scratchpad names are recorded when the sub-agent is created and replayed on every follow-up. If you spawned a sub-agent at `read` and have since switched to `unrestricted`, following up on it still runs it at `read`. That is deliberate: otherwise a second question would be a way to escalate a sub-agent you deliberately restricted. A sub-agent that shares your workspace keeps the working directory it was spawned in; at `workspace`, a follow-up is refused once that directory lies outside your own boundary, the same check a sub-agent's `writable_roots` get.
 
-Two things do *not* survive a follow-up, because they only ever lived in memory: the sub-agent's todo list, and which files it had read. It is told as much at the start of the turn. Its context gauge does survive: the follow-up starts from the occupancy the sub-agent's row last recorded, so its first turn back is checked against the ceiling like any other.
+One thing does *not* survive a follow-up, because it only ever lived in memory: which files the sub-agent had read. It is told as much at the start of the turn. Its checklist does survive, read back from its own conversation, so a follow-up still owes what the sub-agent left open. Its context gauge does survive: the follow-up starts from the occupancy the sub-agent's row last recorded, so its first turn back is checked against the ceiling like any other.
 
 One follow-up at a time per sub-agent. A second concurrent call on the same sub-agent is refused rather than interleaved, since both would be appending to one conversation from a view of it that the other has already changed.
 

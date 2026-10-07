@@ -49,6 +49,11 @@ The agent then carries on. When the task ends, its outcome arrives as a new turn
 test result: ok. 1674 passed; 0 failed
 ```
 
+That is the model's prompt. The REPL does not echo it, any more than it prints a tool's output:
+a stage direction above the reply says what reported, `(background task 7f3a1c22 finished after
+12m 4s, reporting)`, and the reply carries the result. Under `meka serve` the text rides the feed
+as a `notice`, and an ACP editor shows it as the user turn it is.
+
 Running tasks also appear in the per-turn context under `[Background]`, so the agent can see what it already started and does not launch a second copy:
 
 ```text
@@ -58,7 +63,7 @@ Tasks still running.
 - **7f3a1c22**: cargo test --all
 ```
 
-That section is rendered fresh every turn from live state, like `[Todo list]`, so it is always current rather than something the agent has to reconstruct. It carries **no results**: an outcome is permanent and belongs in the conversation, delivered as its own turn. The section disappears entirely when nothing is running.
+That section is rendered fresh every turn from live state, so it is always current rather than something the agent has to reconstruct. It carries **no results**: an outcome is permanent and belongs in the conversation, delivered as its own turn. The section disappears entirely when nothing is running.
 
 ## Outcomes
 

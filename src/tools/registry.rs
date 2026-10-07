@@ -205,6 +205,9 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "agent_list",
     "agent_spawn",
     "agent_steer",
+    "checklist_add",
+    "checklist_edit",
+    "checklist_read",
     "context_check",
     "context_compact",
     "conversation_read",
@@ -245,9 +248,6 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "skill_write",
     "task_cancel",
     "task_list",
-    "todo_edit",
-    "todo_read",
-    "todo_write",
     "tool_load",
     "tool_search",
     "web_fetch",
@@ -262,10 +262,13 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
 /// The read tools *are* here, because deciding what is worth keeping sometimes means checking
 /// something first. The two delete tools are not: deleting is not saving, and a mistaken
 /// `memory_delete` in an unattended checkpoint is unrecoverable, while the agent can still delete
-/// on any ordinary turn.
+/// on any ordinary turn. Nor are the checklist edits: a checkpoint's calls are not recorded, and
+/// the list is what the recorded calls add up to, so an edit made here would show in the summary
+/// and be undone by the next reading of the log.
 ///
 /// Kept sorted, and every entry must exist in [`BUILTIN_TOOL_NAMES`]; a test enforces both.
 pub(crate) const CHECKPOINT_TOOL_NAMES: &[&str] = &[
+    "checklist_read",
     "conversation_read",
     "conversation_search",
     "file_find",
@@ -278,9 +281,6 @@ pub(crate) const CHECKPOINT_TOOL_NAMES: &[&str] = &[
     "scratchpad_list",
     "scratchpad_read",
     "scratchpad_write",
-    "todo_edit",
-    "todo_read",
-    "todo_write",
 ];
 /// Warn (never fail) on `[tools]` entries that don't match any known built-in. Mirrors MCP's
 /// `warn_on_stale_tool_config()`.
@@ -938,9 +938,10 @@ impl ToolRegistry {
         self.register(tool).expect("builtin tool name collision");
     }
 
-    /// Register the session-scoped tools (tool_load, skill_*, image_render, todo, scratchpad_*) on
-    /// the registry. Shared between [`Self::build_default`] and [`Self::build_for_subagent`] so
-    /// adding a new such tool to the parent automatically gives it to sub-agents too.
+    /// Register the session-scoped tools (tool_load, skill_*, image_render, checklist_*,
+    /// scratchpad_*) on the registry. Shared between [`Self::build_default`] and
+    /// [`Self::build_for_subagent`] so adding a new such tool to the parent automatically gives
+    /// it to sub-agents too.
     ///
     /// `parent_session_id` + `inherited_scratchpad_names` configure read-only scratchpad
     /// inheritance for sub-agents. Both are `None`/empty on the root agent's registry, so no
@@ -964,7 +965,7 @@ impl ToolRegistry {
         } = scope;
         let store = materials.store.clone();
         let site = cells.site();
-        let todo_list = cells.todo_list.clone();
+        let checklist = cells.checklist.clone();
         let skills = materials.skills.clone();
         let memories = materials.memories.clone();
         let background = background.then(|| cells.background_tasks.clone());
@@ -1044,13 +1045,15 @@ impl ToolRegistry {
                 self.register_builtin(tool);
             }
         }
-        self.register_builtin(Arc::new(todo::TodoWriteTool {
-            todo_list: todo_list.clone(),
+        self.register_builtin(Arc::new(checklist::ChecklistAddTool {
+            checklist: checklist.clone(),
         }));
-        self.register_builtin(Arc::new(todo::TodoEditTool {
-            todo_list: todo_list.clone(),
+        self.register_builtin(Arc::new(checklist::ChecklistEditTool {
+            checklist: checklist.clone(),
+            store: store.clone(),
+            site: site.clone(),
         }));
-        self.register_builtin(Arc::new(todo::TodoReadTool { todo_list }));
+        self.register_builtin(Arc::new(checklist::ChecklistReadTool { checklist }));
         self.register_builtin(Arc::new(scratchpad::ScratchpadWriteTool {
             store: store.clone(),
             inherited_names: inherited_scratchpad_names.clone(),
@@ -1255,8 +1258,8 @@ impl ToolRegistry {
     /// Build a registry holding only the core tools, for a scheduled gate's tool probe.
     ///
     /// Nothing session-scoped is registered: a gate is a predicate, and `memory_*` / `skill_*` /
-    /// `todo_*` are not questions about the world. What it does get is the read-only built-ins a
-    /// watcher wants (`file_read`, `web_fetch`), built against the job's cwd rather
+    /// `checklist_*` are not questions about the world. What it does get is the read-only built-ins
+    /// a watcher wants (`file_read`, `web_fetch`), built against the job's cwd rather
     /// than the host process's, for the same reason a shell gate runs there.
     ///
     /// Construction is allocation only, no I/O, so a caller may build one per evaluation.
@@ -1276,8 +1279,8 @@ impl ToolRegistry {
     }
 
     /// Build a tool registry for a sub-agent. Sub-agents get the same session-scoped tools as the
-    /// parent (tool_load, skill_*, memory_*, image_render, todo, scratchpad_*) scoped to their own
-    /// ephemeral child session, through `cells` that are the sub-agent's own.
+    /// parent (tool_load, skill_*, memory_*, image_render, checklist_*, scratchpad_*) scoped to
+    /// their own ephemeral child session, through `cells` that are the sub-agent's own.
     ///
     /// `agent_spawn` is deliberately not registered here, but sub-agents *can* nest: the caller
     /// adds it afterwards when the recursion budget allows (`AgentSpawnTool::execute`), because
@@ -1352,7 +1355,7 @@ mod tests {
         conversation::Role,
         store::Store,
         tools::tests::{
-            shared_permission_for_test, todo_list_for_test, tool_registry_for_test,
+            checklist_for_test, shared_permission_for_test, tool_registry_for_test,
             tool_registry_for_test_with_filter,
         },
     };
@@ -1402,7 +1405,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: crate::session::SharedSessionId::default(),
-                todo_list: todo_list_for_test(),
+                checklist: checklist_for_test(),
                 background_tasks: crate::background::BackgroundTasks::default(),
                 ..crate::session::SessionCells::for_test(
                     permission,
@@ -1480,7 +1483,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: crate::session::SharedSessionId::default(),
-                todo_list: todo_list_for_test(),
+                checklist: checklist_for_test(),
                 background_tasks: crate::background::BackgroundTasks::default(),
                 ..crate::session::SessionCells::for_test(
                     permission.clone(),
@@ -1897,7 +1900,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: crate::session::SharedSessionId::default(),
-                todo_list: todo_list_for_test(),
+                checklist: checklist_for_test(),
                 background_tasks: crate::background::BackgroundTasks::default(),
                 ..crate::session::SessionCells::for_test(
                     shared_permission_for_test(),
@@ -2021,7 +2024,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: crate::session::SharedSessionId::default(),
-                todo_list: todo_list_for_test(),
+                checklist: checklist_for_test(),
                 background_tasks: crate::background::BackgroundTasks::default(),
                 ..crate::session::SessionCells::for_test(
                     permission.clone(),
@@ -2221,12 +2224,15 @@ mod tests {
             "web_fetch",
             "memory_delete",
             "scratchpad_delete",
+            "checklist_add",
+            "checklist_edit",
         ] {
             assert!(
                 !CHECKPOINT_TOOL_NAMES.contains(&name),
                 "{name} must not be reachable from a checkpoint turn"
             );
         }
+        assert!(CHECKPOINT_TOOL_NAMES.contains(&"checklist_read"));
     }
 
     /// `context_replace` is always supplied, even against a registry holding nothing else, because
@@ -2414,7 +2420,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: shared_session_id,
-                todo_list: todo_list_for_test(),
+                checklist: checklist_for_test(),
                 ..crate::session::SessionCells::for_test(
                     crate::permission::SharedPermission::new(
                         Permission::Read,
@@ -2437,7 +2443,7 @@ mod tests {
         .expect("default web client config should build cleanly");
         assert!(registry.get("file_read").is_some());
         assert!(registry.get("web_fetch").is_none());
-        assert!(registry.get("todo_write").is_some());
+        assert!(registry.get("checklist_add").is_some());
         assert!(registry.get("agent_spawn").is_none());
     }
 
@@ -2496,7 +2502,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: crate::session::SharedSessionId::default(),
-                todo_list: todo_list_for_test(),
+                checklist: checklist_for_test(),
                 ..crate::session::SessionCells::for_test(
                     crate::permission::SharedPermission::new(
                         Permission::Unrestricted,
@@ -2772,7 +2778,7 @@ mod tests {
             "file_search",
             "shell_execute",
             "web_fetch",
-            "todo_write",
+            "checklist_add",
             "scratchpad_read",
             "scratchpad_write",
             "scratchpad_edit",

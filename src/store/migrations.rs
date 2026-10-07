@@ -322,6 +322,26 @@ const MIGRATIONS: &[Migration] = &[
         name: "background_tasks_name_their_subagent",
         step: Step::Rust(background_tasks_name_their_subagent),
     },
+    // 0.70 recovers the checklist by replaying the conversation from the last compaction
+    // boundary, which therefore has to carry the list as it stood; a boundary written before the
+    // list was recorded carries an empty one, which is what every list was then.
+    Migration {
+        name: "boundaries_carry_a_checklist_snapshot",
+        step: Step::Rust(boundaries_carry_a_checklist_snapshot),
+    },
+    // 0.70 renames the three todo tools to the checklist tools; the calls a store holds and the
+    // sub-agent specs that deny them take the new names here.
+    Migration {
+        name: "tool_calls_take_their_checklist_names",
+        step: Step::Rust(tool_calls_take_their_checklist_names),
+    },
+    // 0.70 writes the nudge, the message the loop appends to send the model back to work, as a
+    // block of its own, known by its shape; the rows older builds wrote as plain text take that
+    // shape here, so a rewind, a label and every replay read them as nudges.
+    Migration {
+        name: "nudges_are_blocks",
+        step: Step::Rust(nudges_are_blocks),
+    },
 ];
 
 /// The position of the last turn a session opened, beside the eight cumulative counters: `NULL`
@@ -2531,6 +2551,12 @@ const ARCHIVE_FORMAT_0_66: u64 = 5;
 /// The archive `format_version` 0.67 through 0.69 wrote, which carries no turns and names none on
 /// its events.
 const ARCHIVE_FORMAT_0_69: u64 = 6;
+/// The archive `format_version` 0.70's development builds wrote, with turns but with the todo
+/// tools' names and no checklist on its boundaries.
+const ARCHIVE_FORMAT_0_70_DEVELOPMENT: u64 = 7;
+/// The archive `format_version` 0.70's later development builds wrote, with the checklist but
+/// with every nudge as plain text.
+const ARCHIVE_FORMAT_0_70_DEVELOPMENT_2: u64 = 8;
 
 /// Bring a session archive written by an older meka to the current shape, reporting whether it
 /// was one. `current` is the version this build writes, handed in as data the way a [`Context`]
@@ -2541,7 +2567,10 @@ const ARCHIVE_FORMAT_0_69: u64 = 6;
 /// by [`rename_tools_0_60`], and each session's spec on its own, since it rides the archive as a
 /// string. Both then take the fields 0.65 requires, by [`require_fields_0_65`], every version
 /// before 0.67 takes the turn position 0.67 records, by [`number_turns_0_67`], and every version
-/// before 0.70 takes the turns 0.70 records, none, by [`record_turns_0_70`].
+/// before 0.70 takes the turns 0.70 records, none, by [`record_turns_0_70`]. Every version before
+/// the release of 0.70 then takes the checklist tools' names, by [`rename_tools_0_70`], an empty
+/// checklist on each boundary, by [`snapshot_checklists_0_70`], and the nudge's own block where a
+/// nudge was written as text, by [`block_nudges_0_70`].
 pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u64) -> bool {
     match document
         .get("format_version")
@@ -2564,14 +2593,357 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
                 }
             }
         }
-        Some(ARCHIVE_FORMAT_0_64) | Some(ARCHIVE_FORMAT_0_66) | Some(ARCHIVE_FORMAT_0_69) => {}
+        Some(ARCHIVE_FORMAT_0_64)
+        | Some(ARCHIVE_FORMAT_0_66)
+        | Some(ARCHIVE_FORMAT_0_69)
+        | Some(ARCHIVE_FORMAT_0_70_DEVELOPMENT)
+        | Some(ARCHIVE_FORMAT_0_70_DEVELOPMENT_2) => {}
         _ => return false,
     }
     require_fields_0_65(document);
     number_turns_0_67(document);
     record_turns_0_70(document);
+    rename_tools_0_70(document);
+    if let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    {
+        for session in sessions {
+            let renamed = session
+                .get("subagent_spec_json")
+                .and_then(|spec| spec.as_str())
+                .and_then(rename_tools_0_70_in_spec);
+            if let Some(renamed) = renamed {
+                session["subagent_spec_json"] = renamed.into();
+            }
+        }
+    }
+    snapshot_checklists_0_70(document);
+    block_nudges_0_70(document);
     document["format_version"] = current.into();
     true
+}
+
+/// Every 0.70 rename, old name to new: the three todo tools became the checklist tools.
+const RENAMES_0_70: &[(&str, &str)] = &[
+    ("todo_edit", "checklist_edit"),
+    ("todo_read", "checklist_read"),
+    ("todo_write", "checklist_add"),
+];
+
+/// The 0.70 name of `name`, when 0.70 renamed it.
+fn renamed_0_70(name: &str) -> Option<&'static str> {
+    RENAMES_0_70
+        .iter()
+        .find(|(from, _)| *from == name)
+        .map(|(_, to)| *to)
+}
+
+/// Apply every 0.70 rename under `value`, at any depth, and report whether anything changed: a
+/// `tool_use` block by its name, its `input` left as it was, and every `denied_tools` list.
+///
+/// The input is left alone on purpose. The checklist is recovered by replaying these calls, and a
+/// call whose input is the old shape does not parse under the new one, so it counts for nothing:
+/// the list it built never outlived its process, and 0.70 does not invent one.
+///
+/// One walk serves the ledger step and the archive door, the two places an older shape is
+/// converted. Names are matched whole, so an MCP tool that contains one as a substring is left
+/// alone.
+fn rename_tools_0_70(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            let is_call = object.get("type").and_then(|kind| kind.as_str()) == Some("tool_use");
+            let mut changed = false;
+            if is_call
+                && let Some(to) = object
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .and_then(renamed_0_70)
+            {
+                object.insert(
+                    "name".to_string(),
+                    serde_json::Value::String(to.to_string()),
+                );
+                changed = true;
+            }
+            if let Some(list) = object
+                .get_mut("denied_tools")
+                .and_then(|list| list.as_array_mut())
+            {
+                for entry in list.iter_mut() {
+                    if let Some(to) = entry.as_str().and_then(renamed_0_70) {
+                        *entry = serde_json::Value::String(to.to_string());
+                        changed = true;
+                    }
+                }
+            }
+            for (key, child) in object.iter_mut() {
+                if is_call && key == "input" {
+                    continue;
+                }
+                changed |= rename_tools_0_70(child);
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= rename_tools_0_70(item);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// [`rename_tools_0_70`] over a sub-agent spec held as a JSON string, as the session row and the
+/// archive both hold it. `None` when nothing changed or the string is not JSON.
+fn rename_tools_0_70_in_spec(spec: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(spec).ok()?;
+    if !rename_tools_0_70(&mut value) {
+        return None;
+    }
+    serde_json::to_string(&value).ok()
+}
+
+/// The checklist a boundary written before 0.70 recorded: none, as the current shape spells it.
+fn empty_checklist_snapshot_0_70() -> serde_json::Value {
+    serde_json::json!({"next_id": 1, "items": []})
+}
+
+/// Give a `CompactBoundary` event the checklist snapshot 0.70 records, where it has none, and
+/// report whether it had none. The event is the externally tagged value both the store row and
+/// the archive hold.
+fn snapshot_checklist_0_70(event: &mut serde_json::Value) -> bool {
+    let Some(boundary) = event
+        .get_mut("CompactBoundary")
+        .and_then(|boundary| boundary.as_object_mut())
+    else {
+        return false;
+    };
+    if boundary.contains_key("checklist_snapshot") {
+        return false;
+    }
+    boundary.insert(
+        "checklist_snapshot".to_string(),
+        empty_checklist_snapshot_0_70(),
+    );
+    true
+}
+
+/// [`snapshot_checklist_0_70`] over every event of every session in an archive.
+fn snapshot_checklists_0_70(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        if let Some(events) = session
+            .get_mut("events")
+            .and_then(|events| events.as_array_mut())
+        {
+            for event in events {
+                if let Some(event) = event.get_mut("event") {
+                    snapshot_checklist_0_70(event);
+                }
+            }
+        }
+    }
+}
+
+/// The text the loop wrote before 0.70 to coax a visible reply, frozen here: the step that reads
+/// it back must not follow the loop's wording.
+const THINKING_ONLY_NUDGE_0_70: &str = "[Your previous response contained no visible output. \
+                                        Please continue and produce a user-visible response.]";
+/// What the checklist nudge 0.70's development builds wrote opened with, frozen likewise.
+const CHECKLIST_NUDGE_PREFIX_0_70: &str = "[Checklist:";
+
+/// The block 0.70 writes for a nudge whose text is `text`, or `None` for text that is not one.
+fn nudge_block_0_70(text: &str) -> Option<serde_json::Value> {
+    let kind = if text == THINKING_ONLY_NUDGE_0_70 {
+        "visible_reply"
+    } else if text.starts_with(CHECKLIST_NUDGE_PREFIX_0_70) {
+        "checklist"
+    } else {
+        return None;
+    };
+    Some(serde_json::json!({"type": "nudge", "kind": kind, "text": text}))
+}
+
+/// Give an `Append` event whose user message is a nudge written as one text block the nudge's own
+/// block, and report whether it was one. The event is the externally tagged value the archive
+/// holds.
+fn block_nudge_0_70(event: &mut serde_json::Value) -> bool {
+    let Some(message) = event
+        .get_mut("Append")
+        .and_then(|message| message.as_object_mut())
+    else {
+        return false;
+    };
+    if message.get("role").and_then(|role| role.as_str()) != Some("user") {
+        return false;
+    }
+    let block = match message
+        .get("content")
+        .and_then(|content| content.as_array())
+        .map(Vec::as_slice)
+    {
+        Some([only]) if only.get("type").and_then(|kind| kind.as_str()) == Some("text") => only
+            .get("text")
+            .and_then(|text| text.as_str())
+            .and_then(nudge_block_0_70),
+        _ => None,
+    };
+    let Some(block) = block else {
+        return false;
+    };
+    message.insert("content".to_string(), serde_json::Value::Array(vec![block]));
+    true
+}
+
+/// [`block_nudge_0_70`] over every event of an archive.
+fn block_nudges_0_70(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        if let Some(events) = session
+            .get_mut("events")
+            .and_then(|events| events.as_array_mut())
+        {
+            for event in events {
+                if let Some(event) = event.get_mut("event") {
+                    block_nudge_0_70(event);
+                }
+            }
+        }
+    }
+}
+
+/// Every `user` row holding a nudge as plain text becomes a `user_blocks` row holding the
+/// nudge's block. A `user` row is text and nothing else, so a row already converted is not
+/// matched again.
+fn nudges_are_blocks(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT id, content FROM messages WHERE kind = 'user' AND (content = ?1 OR content \
+             LIKE ?2)",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                THINKING_ONLY_NUDGE_0_70,
+                format!("{CHECKLIST_NUDGE_PREFIX_0_70}%")
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, content) in rows {
+        let Some(block) = nudge_block_0_70(&content) else {
+            continue;
+        };
+        let encoded = match serde_json::to_string(&serde_json::Value::Array(vec![block])) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+            }
+        };
+        transaction.execute(
+            "UPDATE messages SET kind = 'user_blocks', content = ?1 WHERE id = ?2",
+            rusqlite::params![encoded, id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Every `compact_boundary` row takes the checklist snapshot 0.70 records, an empty list, where
+/// it has none. Rows that carry one are left alone, so a replay changes nothing.
+fn boundaries_carry_a_checklist_snapshot(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, String)> = {
+        let mut statement = transaction
+            .prepare("SELECT id, content FROM messages WHERE kind = 'compact_boundary'")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, content) in rows {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        if !snapshot_checklist_0_70(&mut value) {
+            continue;
+        }
+        let encoded = match serde_json::to_string(&value) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+            }
+        };
+        transaction.execute(
+            "UPDATE messages SET content = ?1 WHERE id = ?2",
+            rusqlite::params![encoded, id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Every stored call of a todo tool, and every sub-agent spec that denies one, takes the
+/// checklist tool's name; a finished background task that ran one is renamed the same way.
+fn tool_calls_take_their_checklist_names(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, String)> = {
+        let mut statement =
+            transaction.prepare("SELECT id, content FROM messages WHERE content LIKE '%todo_%'")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, content) in rows {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        if !rename_tools_0_70(&mut value) {
+            continue;
+        }
+        let encoded = match serde_json::to_string(&value) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+            }
+        };
+        transaction.execute(
+            "UPDATE messages SET content = ?1 WHERE id = ?2",
+            rusqlite::params![encoded, id],
+        )?;
+    }
+    let specs: Vec<(String, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT id, subagent_spec_json FROM sessions WHERE subagent_spec_json IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, spec) in specs {
+        if let Some(renamed) = rename_tools_0_70_in_spec(&spec) {
+            transaction.execute(
+                "UPDATE sessions SET subagent_spec_json = ?1 WHERE id = ?2",
+                rusqlite::params![renamed, id],
+            )?;
+        }
+    }
+    for (from, to) in RENAMES_0_70 {
+        transaction.execute(
+            "UPDATE background_tasks SET tool = ?2 WHERE tool = ?1",
+            rusqlite::params![from, to],
+        )?;
+    }
+    Ok(())
 }
 
 /// Give each session the turns 0.70 records, none, and each event the turn it names, none: an
@@ -3358,6 +3730,15 @@ mod tests {
                 "background_tasks_name_their_subagent",
                 17443559184355884232_u64,
             ),
+            (
+                "boundaries_carry_a_checklist_snapshot",
+                12503180714611675843_u64,
+            ),
+            (
+                "tool_calls_take_their_checklist_names",
+                17876045330514229377_u64,
+            ),
+            ("nudges_are_blocks", 3286139522237048285_u64),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
         /// every column-zero function it calls, recursively. What a Rust step does is its body and
@@ -3920,9 +4301,11 @@ mod tests {
         let mut connection = rusqlite::Connection::open(&path).expect("reopen");
         let after = stored_messages(&connection);
         assert_eq!(after[0].1, read.replace("read_file", "file_read"));
-        assert_eq!(after[1].1, write.replace("\"todo\"", "\"todo_write\""));
-        assert_eq!(after[2].1, edit.replace("\"todo\"", "\"todo_edit\""));
-        assert_eq!(after[3].1, look.replace("\"todo\"", "\"todo_read\""));
+        // The ledger runs to its head: the 0.60 split lands the three todo names, and the 0.70
+        // rename takes them on to the checklist names, the input left as the model wrote it.
+        assert_eq!(after[1].1, write.replace("\"todo\"", "\"checklist_add\""));
+        assert_eq!(after[2].1, edit.replace("\"todo\"", "\"checklist_edit\""));
+        assert_eq!(after[3].1, look.replace("\"todo\"", "\"checklist_read\""));
         assert_eq!(after[4].1, arguments, "a call's arguments are not a call");
         assert_eq!(
             after[5].1,
@@ -3937,7 +4320,7 @@ mod tests {
             .expect("the spec");
         assert_eq!(
             spec_after,
-            r#"{"permission":"read","denied_tools":["file_write","todo_edit","todo_read","todo_write","memory_read"]}"#
+            r#"{"permission":"read","denied_tools":["file_write","checklist_edit","checklist_read","checklist_add","memory_read"]}"#
         );
         let task_tool: String = connection
             .query_row(
@@ -4074,11 +4457,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(names, ["tool_load", "file_read", "todo_edit"]);
+        assert_eq!(names, ["tool_load", "file_read", "checklist_edit"]);
         assert_eq!(
             export.sessions[0].subagent_spec_json.as_deref(),
             Some(
-                r#"{"permission":"read","denied_tools":["file_write","todo_edit","todo_read","todo_write"]}"#
+                r#"{"permission":"read","denied_tools":["file_write","checklist_edit","checklist_read","checklist_add"]}"#
             )
         );
         // And the fields 0.59 never wrote arrive with what their absence meant.
@@ -4302,6 +4685,302 @@ mod tests {
             .expect("a converted archive reads");
         assert!(export.sessions[0].turns.is_empty());
         assert_eq!(export.sessions[0].events[0].turn_id, None);
+    }
+
+    /// A nudge an older build wrote as a `user` row of text becomes a `user_blocks` row holding
+    /// the nudge's block, by its kind; the person's rows and a row already converted are left
+    /// alone, so a replay changes nothing.
+    #[tokio::test]
+    async fn nudge_rows_become_blocks_and_the_persons_rows_do_not() {
+        let directory = tempfile::tempdir().expect("a directory for the store");
+        let path = directory.path().join("meka.db");
+        let session = uuid::Uuid::new_v4().to_string();
+        let checklist_nudge = "[Checklist: items are still open, so this turn is not over.]\n\n\
+                               Open:\n- [ ] 1 a\n";
+        {
+            let mut connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(BASELINE_0_42)
+                .expect("the baseline builds");
+            stopped_before(&mut connection, "nudges_are_blocks");
+            plant_session(&connection, &session);
+            plant_message_of_kind(&connection, &session, "user", "a person's words");
+            plant_message_of_kind(&connection, &session, "user", THINKING_ONLY_NUDGE_0_70);
+            plant_message_of_kind(&connection, &session, "user", checklist_nudge);
+            plant_message_of_kind(
+                &connection,
+                &session,
+                "user",
+                "[Checklist: a person who typed this] is not a nudge",
+            );
+        }
+
+        crate::store::Store::open(Some(&path), &Context::default())
+            .await
+            .expect("the store migrates on open");
+
+        let mut connection = rusqlite::Connection::open(&path).expect("reopen");
+        let after = stored_messages(&connection);
+        assert_eq!(
+            after[0],
+            ("user".to_string(), "a person's words".to_string())
+        );
+        assert_eq!(after[1].0, "user_blocks");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&after[1].1).expect("json"),
+            serde_json::json!([{
+                "type": "nudge", "kind": "visible_reply", "text": THINKING_ONLY_NUDGE_0_70
+            }])
+        );
+        assert_eq!(after[2].0, "user_blocks");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&after[2].1).expect("json"),
+            serde_json::json!([{"type": "nudge", "kind": "checklist", "text": checklist_nudge}])
+        );
+        assert_eq!(
+            after[3].0, "user_blocks",
+            "words that open like a nudge were a nudge when written as one row of text, which \
+             only the loop wrote"
+        );
+        let blocks: Vec<crate::conversation::ContentBlock> =
+            serde_json::from_str(&after[2].1).expect("the row decodes under the current shape");
+        assert!(matches!(blocks.as_slice(), [
+            crate::conversation::ContentBlock::Nudge {
+                kind: crate::conversation::NudgeKind::Checklist,
+                ..
+            }
+        ]));
+
+        let transaction = connection.transaction().expect("begin");
+        nudges_are_blocks(&transaction).expect("a replay");
+        transaction.commit().expect("commit");
+        assert_eq!(
+            stored_messages(&connection),
+            after,
+            "a replay changes nothing"
+        );
+    }
+
+    /// An archive from the builds that wrote a nudge as text takes the nudge's block on import.
+    #[test]
+    fn a_format_8_archive_takes_the_nudges_block() {
+        let mut document = serde_json::json!({
+            "format_version": 8,
+            "meka_version": "0.70.0-dev",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "blobs": [],
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "cwd": null,
+                "permission": "read",
+                "capabilities_json": null,
+                "approvals": false,
+                "additional_roots": [],
+                "subagent_spec_json": null,
+                "profile": "work",
+                "stats": {
+                    "turns": 1,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "redactions": 0,
+                    "redacted_images": 0,
+                    "redacted_bytes": 0,
+                    "turn_position": null,
+                },
+                "turns": [],
+                "events": [
+                    {
+                        "at": "2020-01-01T00:00:00Z",
+                        "turn_id": null,
+                        "event": {"Append": {"role": "user", "content": [
+                            {"type": "text", "text": "plan it"}
+                        ]}},
+                    },
+                    {
+                        "at": "2020-01-01T00:00:00Z",
+                        "turn_id": null,
+                        "event": {"Append": {"role": "user", "content": [
+                            {"type": "text", "text": "[Checklist: items are still open, so this turn is not over.]"}
+                        ]}},
+                    },
+                    {
+                        "at": "2020-01-01T00:00:00Z",
+                        "turn_id": null,
+                        "event": {"Append": {"role": "user", "content": [
+                            {"type": "text", "text": THINKING_ONLY_NUDGE_0_70}
+                        ]}},
+                    }
+                ],
+                "scratchpad_entries": {},
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        let events = &document["sessions"][0]["events"];
+        assert_eq!(events[0]["event"]["Append"]["content"][0]["type"], "text");
+        assert_eq!(events[1]["event"]["Append"]["content"][0]["type"], "nudge");
+        assert_eq!(
+            events[1]["event"]["Append"]["content"][0]["kind"],
+            "checklist"
+        );
+        assert_eq!(
+            events[2]["event"]["Append"]["content"][0]["kind"],
+            "visible_reply"
+        );
+        let export = crate::store::export::parse_session_export(
+            serde_json::to_string(&document).expect("json").as_bytes(),
+        )
+        .expect("the converted archive parses under the current shape");
+        assert!(matches!(
+            &export.sessions[0].events[1].event,
+            crate::conversation::Event::Append(message) if message.is_nudge()
+        ));
+    }
+
+    /// A boundary row written before the checklist was recorded takes an empty one, so the row
+    /// still decodes under the current shape, and keeps what it did carry. A row that carries one
+    /// is left alone, which is what makes the step safe to run twice.
+    #[tokio::test]
+    async fn boundary_rows_take_the_checklist_they_never_recorded() {
+        let directory = tempfile::tempdir().expect("a directory for the store");
+        let path = directory.path().join("meka.db");
+        let session = uuid::Uuid::new_v4().to_string();
+        let boundary = r#"{"CompactBoundary":{"summary":{"role":"user","content":[{"type":"text","text":"[summary]"}]},"replaced_count":2,"loaded_tools_snapshot":["web_fetch"]}}"#;
+        {
+            let mut connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(BASELINE_0_42)
+                .expect("the baseline builds");
+            stopped_before(&mut connection, "boundaries_carry_a_checklist_snapshot");
+            plant_session(&connection, &session);
+            plant_message_of_kind(&connection, &session, "compact_boundary", boundary);
+        }
+
+        crate::store::Store::open(Some(&path), &Context::default())
+            .await
+            .expect("the store migrates on open");
+
+        let mut connection = rusqlite::Connection::open(&path).expect("reopen");
+        let after = stored_messages(&connection);
+        let value: serde_json::Value = serde_json::from_str(&after[0].1).expect("json");
+        assert_eq!(
+            value["CompactBoundary"]["checklist_snapshot"],
+            serde_json::json!({"next_id": 1, "items": []})
+        );
+        assert_eq!(
+            value["CompactBoundary"]["loaded_tools_snapshot"],
+            serde_json::json!(["web_fetch"])
+        );
+        let event: crate::conversation::Event =
+            serde_json::from_str(&after[0].1).expect("the row decodes under the current shape");
+        assert!(matches!(
+            event,
+            crate::conversation::Event::CompactBoundary { .. }
+        ));
+
+        let transaction = connection.transaction().expect("begin");
+        boundaries_carry_a_checklist_snapshot(&transaction).expect("a replay");
+        transaction.commit().expect("commit");
+        assert_eq!(
+            stored_messages(&connection)[0].1,
+            after[0].1,
+            "a replay changes nothing"
+        );
+    }
+
+    /// A format-7 archive, the one 0.70's development builds wrote, takes the checklist tools'
+    /// names in its calls and its specs and an empty checklist on each boundary, and reads.
+    #[test]
+    fn a_format_7_archive_takes_the_checklist_names_and_the_snapshot_it_never_wrote() {
+        let mut document = serde_json::json!({
+            "format_version": 7,
+            "meka_version": "0.70.0-dev",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "blobs": [],
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "cwd": null,
+                "permission": "read",
+                "capabilities_json": null,
+                "approvals": false,
+                "additional_roots": [],
+                "subagent_spec_json": "{\"permission\":\"read\",\"denied_tools\":[\"todo_read\",\"mcp__x__todo_read\"]}",
+                "profile": "work",
+                "stats": {
+                    "turns": 1,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "redactions": 0,
+                    "redacted_images": 0,
+                    "redacted_bytes": 0,
+                    "turn_position": null,
+                },
+                "turns": [],
+                "events": [
+                    {
+                        "at": "2020-01-01T00:00:00Z",
+                        "turn_id": null,
+                        "event": {"Append": {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": "a", "name": "todo_write",
+                             "input": {"title": "T", "items": ["x"]}}
+                        ]}},
+                    },
+                    {
+                        "at": "2020-01-01T00:00:00Z",
+                        "turn_id": null,
+                        "event": {"CompactBoundary": {
+                            "summary": {"role": "user", "content": [{"type": "text", "text": "[summary]"}]},
+                            "replaced_count": 1,
+                            "loaded_tools_snapshot": []
+                        }},
+                    }
+                ],
+                "scratchpad_entries": {},
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        let session = &document["sessions"][0];
+        assert_eq!(
+            session["events"][0]["event"]["Append"]["content"][0]["name"],
+            "checklist_add"
+        );
+        assert_eq!(
+            session["events"][0]["event"]["Append"]["content"][0]["input"],
+            serde_json::json!({"title": "T", "items": ["x"]}),
+            "the input is the model's words"
+        );
+        assert_eq!(
+            session["events"][1]["event"]["CompactBoundary"]["checklist_snapshot"],
+            serde_json::json!({"next_id": 1, "items": []})
+        );
+        assert_eq!(
+            session["subagent_spec_json"],
+            "{\"permission\":\"read\",\"denied_tools\":[\"checklist_read\",\"mcp__x__todo_read\"]}",
+            "a name is matched whole"
+        );
+        let once = document.clone();
+        document["format_version"] = 7.into();
+        assert!(bring_archive_forward(&mut document, current));
+        assert_eq!(document, once, "a replay is a no-op");
+        let export = crate::store::export::parse_session_export(once.to_string().as_bytes())
+            .expect("a converted archive reads");
+        assert!(matches!(
+            export.sessions[0].events[1].event,
+            crate::conversation::Event::CompactBoundary { .. }
+        ));
     }
 
     fn plant_message_of_kind(

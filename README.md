@@ -84,7 +84,7 @@ The agent has access to the following built-in tools, grouped by class:
 - `file_*`: read, write, edit, find, and search files
 - `web_fetch`: fetch a URL as markdown, raw HTML, or an image
 - `scratchpad_*`: session-scoped working memory, kept out of the context window
-- `todo_*`: track multi-step work in a task list shown in the terminal
+- `checklist_*`: the list of what the agent committed to; a turn cannot end while an item is open
 - `memory_*`: keep durable notes that outlive the session
 - `conversation_*`: search and re-read this session's full conversation
 - `context_*`: measure the live context window, or compact it

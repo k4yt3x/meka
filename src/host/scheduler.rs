@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    background::{only_what_was_won, render_outcomes},
+    background::only_what_was_won,
     error::MekaError,
     host::{ResidentSession, Sessions, claim_undelivered_outcomes},
     schedule::ScheduledJob,
@@ -97,10 +97,12 @@ const INBOX_RETRY_LONGEST_WAIT: std::time::Duration = std::time::Duration::from_
 /// waiting rather than left to look like silence.
 const INBOX_RETRY_CEILING: chrono::Duration = chrono::Duration::hours(1);
 
-/// A prompt the user did not type, shown where the host shows such things before it runs.
+/// A prompt the user did not type, shown where the host shows such things before it runs: as the
+/// text the model is given where the host's transcript shows user turns (ACP), as a stage
+/// direction naming what opened the turn where it does not (the REPL).
 pub(crate) enum OutOfBandPrompt<'a> {
-    /// A batch of finished background work, rendered.
-    Outcomes(&'a str),
+    /// A batch of finished background work.
+    Outcomes(&'a [BackgroundTask]),
     /// A scheduled job about to fire.
     Scheduled(&'a Wakeup),
 }
@@ -322,7 +324,7 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
                 outcomes = riding.len()
             );
         }
-        hooks.show_prompt(&entry, OutOfBandPrompt::Outcomes(&render_outcomes(&riding)));
+        hooks.show_prompt(&entry, OutOfBandPrompt::Outcomes(&riding));
     }
     hooks.show_prompt(&entry, OutOfBandPrompt::Scheduled(&wakeup));
     let input = input.riding(riding);
@@ -494,7 +496,7 @@ where
         }
 
         entry.touch();
-        hooks.show_prompt(&entry, OutOfBandPrompt::Outcomes(&render_outcomes(&ready)));
+        hooks.show_prompt(&entry, OutOfBandPrompt::Outcomes(&ready));
         let cancellation = hooks.cancellation();
         let turn_id = uuid::Uuid::new_v4();
         let _published = entry

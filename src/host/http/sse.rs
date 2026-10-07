@@ -50,10 +50,12 @@ pub(crate) enum SseEventType {
     TurnFinished,
     TurnFailed,
     TurnCanceled,
+    Nudged,
     InboxDelivered,
     InboxFailed,
     InboxWithdrawn,
     ConversationRewound,
+    ChecklistUpdated,
     PermissionResolved,
     SessionCreated,
     SessionUpdated,
@@ -96,10 +98,12 @@ impl SseEventType {
             Self::TurnFinished => "turn.finished",
             Self::TurnFailed => "turn.failed",
             Self::TurnCanceled => "turn.canceled",
+            Self::Nudged => "turn.nudged",
             Self::InboxDelivered => "inbox.delivered",
             Self::InboxFailed => "inbox.failed",
             Self::InboxWithdrawn => "inbox.withdrawn",
             Self::ConversationRewound => "conversation.rewound",
+            Self::ChecklistUpdated => "checklist.updated",
             Self::PermissionResolved => "permission_resolved",
             Self::SessionCreated => "session.created",
             Self::SessionUpdated => "session.updated",
@@ -193,6 +197,10 @@ pub(crate) fn translate(
             SseEventType::InboxDelivered,
             serde_json::json!({ "item_ids": item_ids }),
         ),
+        FrontendEvent::Nudged { kind, text } => (
+            SseEventType::Nudged,
+            serde_json::json!({ "kind": kind.name(), "text": text }),
+        ),
         FrontendEvent::AssistantTextDelta(text) => (
             SseEventType::AssistantTextDelta,
             serde_json::json!({ "text": text }),
@@ -260,9 +268,15 @@ pub(crate) fn translate(
                 "content": tool_result_content_view(&content),
             }),
         ),
-        // Metadata-only events: the recorder captures them for the blocking JSON / terminal
-        // SSE payload but they don't get their own wire events.
-        FrontendEvent::TodoListUpdated { .. } | FrontendEvent::TokenUsage(_) => return None,
+        // The whole open list, as the session record carries it, so a client that shows the
+        // list replaces rather than patches; empty once everything is disposed of.
+        FrontendEvent::ChecklistUpdated { items } => (
+            SseEventType::ChecklistUpdated,
+            serde_json::json!({ "items": items }),
+        ),
+        // Metadata-only: the recorder captures it for the blocking JSON / terminal SSE payload
+        // but it gets no wire event of its own.
+        FrontendEvent::TokenUsage(_) => return None,
         // Progress on one tool call, transient on the wire (`SseEventType::is_transient`): a
         // client appends the chunk to what it shows for the call, and the whole output still
         // arrives with `tool_call.completed`. Coalesced per call before it gets here, by
@@ -436,7 +450,7 @@ mod tests {
     fn translate_tool_call_started_without_a_summary_omits_it() {
         let event = FrontendEvent::ToolCallStarted {
             id: "tu_1".into(),
-            name: "todo_write".into(),
+            name: "checklist_add".into(),
             input: serde_json::json!({}),
             display_summary: None,
         };

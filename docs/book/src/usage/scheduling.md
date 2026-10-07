@@ -254,7 +254,10 @@ Stopping a scheduled turn works the same as stopping any other.
 
 When a job fires at an idle REPL prompt, the turn interrupts the prompt and runs exactly like one
 you typed: output streams, Ctrl+C interrupts it, and anything you had half-typed is handed back
-afterwards.
+afterwards. A stage direction above the reply names the job and the opening of its prompt,
+`(scheduled job 1a2b3c4d fired: remind me to stretch)`, and says how late the fire is when it
+makes up for missed occurrences. The prompt the model is given, with its header and any gate
+output, is not echoed, the way no tool's output is; the reply is what you read.
 
 ## Restarts and missed jobs
 

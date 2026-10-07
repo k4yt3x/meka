@@ -262,6 +262,9 @@ pub(crate) async fn run_interactive(
     };
     // After the agent, so a start the builder refused leaves the row at the level it had.
     record_resume_permission(&store, session_id, permission_to_record).await;
+    // The resumed log is what the list is; read it before the first prompt rather than at the
+    // first turn, so `/status` and a `/fork` between them see the session as it was left.
+    agent.hydrate_checklist(&messages).await;
     // Installed by the host, with the console: the escalation arms print, and a bare `eprintln!`
     // from a spawned task lands wherever the cursor happens to be, which on a second Ctrl+C during
     // a turn is the middle of the thinking indicator's row.
@@ -769,20 +772,25 @@ impl crate::host::scheduler::HostHooks for ReplHooks {
         tokio_util::sync::CancellationToken::new()
     }
 
-    /// Dim, the way a notice is: the reply that follows would otherwise appear under nothing, as
-    /// though the model had spoken unprompted.
+    /// A stage direction naming what opened the turn: the reply that follows would otherwise
+    /// appear under nothing, as though the model had spoken unprompted.
     fn show_prompt(
         &self,
         _entry: &Self::Entry,
         prompt: crate::host::scheduler::OutOfBandPrompt<'_>,
     ) {
-        let text = match prompt {
-            crate::host::scheduler::OutOfBandPrompt::Outcomes(text) => text.to_string(),
-            crate::host::scheduler::OutOfBandPrompt::Scheduled(wakeup) => wakeup.render_prompt(),
+        // In the register of `(interrupted)` and the checklist nudge. The prompt the model is
+        // given stays off the screen the way every tool's output does: the reply that follows is
+        // what the person reads.
+        let direction = match prompt {
+            crate::host::scheduler::OutOfBandPrompt::Outcomes(tasks) => {
+                crate::render::background_report_direction(tasks)
+            }
+            crate::host::scheduler::OutOfBandPrompt::Scheduled(wakeup) => {
+                crate::render::scheduled_fire_direction(wakeup)
+            }
         };
-        with_console(&self.console, |console| {
-            console.notice(&crate::frontend::Notice::info(text))
-        });
+        with_console(&self.console, |console| console.stage_direction(&direction));
     }
 
     async fn finished(

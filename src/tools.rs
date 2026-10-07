@@ -3,6 +3,7 @@
 //! grep, scratchpad, shell, etc.).
 
 pub(crate) mod background;
+pub(crate) mod checklist;
 pub(crate) mod context;
 mod conversation;
 mod file;
@@ -18,7 +19,6 @@ pub(crate) mod scratchpad;
 pub(crate) mod shell;
 mod skill;
 pub(crate) mod subagent;
-pub(crate) mod todo;
 pub(crate) mod util;
 mod web;
 use std::{
@@ -241,12 +241,21 @@ pub(crate) fn admit_arguments(
 /// Whether a tool may be detached with `background: true`. Asked where the flag is offered and
 /// where it is consumed, so the schema and the dispatch cannot disagree about it.
 ///
-/// `context_compact` is the one exception: it does not do work, it parks a request the tool loop
+/// `context_compact` is one exception: it does not do work, it parks a request the tool loop
 /// drains once the batch's results are in. Detaching it would race that drain, leaving the request
 /// to fire a round later than the agent asked for, or against the next turn entirely, and would
-/// persist a `background_tasks` row for an operation that takes microseconds.
+/// persist a `background_tasks` row for an operation that takes microseconds. The checklist tools
+/// are the other: an edit takes microseconds and the model needs the list it returns in the same
+/// round, and a detached one would land at a time the replay that recovers the list cannot know.
 pub(crate) fn detachable(name: &str) -> bool {
-    name != "context_compact"
+    name != "context_compact" && !crate::checklist::is_tool(name)
+}
+
+/// A call's arguments as a built-in that does not own `background` received them: the flag meka
+/// spliced is stripped ahead of dispatch, so a reader of the recorded call, the checklist's
+/// replay, reads what the tool read rather than refusing a key the tool never saw.
+pub(crate) fn without_background_flag(input: &serde_json::Value) -> serde_json::Value {
+    take_background_flag(input, &serde_json::Value::Null).0
 }
 
 /// The level a call to `name` must clear: the `[tools.tool_permissions]` override when one names
@@ -921,12 +930,12 @@ pub(crate) fn primary_param_answers_for_schema(name: &str, parameters: &serde_js
 #[cfg(test)]
 pub(crate) const BUILTINS_WITHOUT_ARGUMENTS: &[&str] = &[
     "agent_list",
+    "checklist_read",
     "context_check",
     "mcp_resource_updates_list",
     "schedule_list",
     "scratchpad_list",
     "task_list",
-    "todo_read",
 ];
 /// The argument a tool-call indicator shows next to the tool's name.
 ///
@@ -947,21 +956,16 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         return None;
     }
 
-    // `todo_edit` has no single primary key: what the agent is doing is the set of status
-    // transitions, so those are shown.
-    if name == "todo_edit" {
-        let parts: Vec<String> = input
-            .get("set")
-            .and_then(|value| value.as_object())
-            .map(|set| {
-                set.iter()
-                    .filter_map(|(id, status)| {
-                        status.as_str().map(|status| format!("#{id} {status}"))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        return (!parts.is_empty()).then(|| parts.join(", "));
+    // `checklist_edit` is about a transition, so the id and the status it moves to are shown
+    // together; an edit that only rewords or re-reasons shows the id alone.
+    if name == crate::checklist::EDIT_TOOL_NAME {
+        let id = input.get("id").and_then(coerce_display_value)?;
+        return Some(
+            match input.get("status").and_then(|status| status.as_str()) {
+                Some(status) => format!("#{id} {status}"),
+                None => format!("#{id}"),
+            },
+        );
     }
 
     // `task_cancel` takes either an id or `all`, and declares neither as required, so there is no
@@ -986,6 +990,7 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
     let key = match name {
         "agent_delete" | "agent_followup" | "agent_steer" => "id",
         "agent_spawn" => "prompt",
+        "checklist_add" => "items",
         "context_compact" => "instructions",
         "conversation_read" => "start",
         "conversation_search" => "query",
@@ -1010,7 +1015,6 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         "shell_execute" => "command",
         "skill_delete" | "skill_read" | "skill_write" => "name",
         "skill_search" => "pattern",
-        "todo_write" => "title",
         "tool_load" => "name",
         "tool_search" => "query",
         "web_fetch" => "url",
@@ -1190,8 +1194,8 @@ mod tests {
         )
     }
 
-    pub(super) fn todo_list_for_test() -> crate::todo::SharedTodoList {
-        crate::todo::SharedTodoList::default()
+    pub(super) fn checklist_for_test() -> crate::checklist::SharedChecklist {
+        crate::checklist::SharedChecklist::default()
     }
 
     /// Every built-in that takes a meaningful argument must be able to show one in the tool-call
@@ -1409,7 +1413,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: shared_session_id,
-                todo_list: todo_list_for_test(),
+                checklist: checklist_for_test(),
                 background_tasks: crate::background::BackgroundTasks::default(),
                 ..crate::session::SessionCells::for_test(
                     shared_permission_for_test(),
@@ -1948,7 +1952,7 @@ mod tests {
         assert!(registry.get("file_search").is_some());
         assert!(registry.get("shell_execute").is_some());
         assert!(registry.get("web_fetch").is_some());
-        assert!(registry.get("todo_write").is_some());
+        assert!(registry.get("checklist_add").is_some());
         assert!(registry.get("scratchpad_write").is_some());
         assert!(registry.get("scratchpad_read").is_some());
         assert!(registry.get("scratchpad_edit").is_some());
@@ -2282,28 +2286,31 @@ mod tests {
     }
 
     #[test]
-    fn builtin_primary_param_todo() {
-        // An edit shows its status transitions; an empty one has nothing to show.
+    fn builtin_primary_param_checklist() {
         assert_eq!(
             builtin_primary_param(
-                "todo_edit",
-                &serde_json::json!({ "set": {"2": "in_progress", "3": "completed"} })
-            )
-            .as_deref(),
-            Some("#2 in_progress, #3 completed")
+                "checklist_edit",
+                &serde_json::json!({ "id": 2, "status": "completed" })
+            ),
+            Some("#2 completed".to_string())
         );
-        assert!(builtin_primary_param("todo_edit", &serde_json::json!({ "set": {} })).is_none());
-        // A write shows the title of the list it builds.
         assert_eq!(
             builtin_primary_param(
-                "todo_write",
-                &serde_json::json!({ "title": "Refactor auth", "items": ["a", "b", "c"] })
-            )
-            .as_deref(),
-            Some("Refactor auth")
+                "checklist_edit",
+                &serde_json::json!({ "id": 2, "text": "x" })
+            ),
+            Some("#2".to_string())
         );
-        // A read takes nothing and shows nothing.
-        assert!(builtin_primary_param("todo_read", &serde_json::json!({})).is_none());
+        assert!(builtin_primary_param("checklist_edit", &serde_json::json!({})).is_none());
+        assert_eq!(
+            builtin_primary_param(
+                "checklist_add",
+                &serde_json::json!({ "items": ["one", {"text": "two"}] })
+            ),
+            Some("one".to_string()),
+            "object items have no short form, so the strings among them are shown"
+        );
+        assert!(builtin_primary_param("checklist_read", &serde_json::json!({})).is_none());
     }
 
     #[test]

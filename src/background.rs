@@ -351,8 +351,10 @@ fn render_outcomes_with_trailer(tasks: &[BackgroundTask], trailer: &str) -> Stri
             rendered.push('\n');
             // Sanitized for the same reason MCP text is: this is content from a shell command or a
             // sub-agent, and a terminal-control or bidi-override sequence in it would be rendered
-            // to the user and fed to the model verbatim.
-            rendered.push_str(&crate::text::sanitize_text(outcome));
+            // to the user and fed to the model verbatim. The report frames the output with its own
+            // line endings, so the output's trailing ones, a shell's final newline above all,
+            // would only put a blank line under it.
+            rendered.push_str(crate::text::sanitize_text(outcome).trim_end());
             rendered.push('\n');
         }
     }
@@ -385,7 +387,8 @@ pub(crate) fn spill_entry_name(task_id: &str, tool_name: &str) -> String {
 }
 
 /// Human-readable duration, coarse on purpose: nobody needs milliseconds on a twenty-minute build.
-fn format_elapsed(elapsed: chrono::Duration) -> String {
+/// How long a task ran, in words: "less than a second", "30s", "12m 4s".
+pub(crate) fn format_elapsed(elapsed: chrono::Duration) -> String {
     let seconds = elapsed.num_seconds().max(0) as u64;
     if seconds == 0 {
         return "less than a second".to_string();
@@ -579,6 +582,14 @@ mod tests {
         assert!(rendered.contains("cargo test --all"), "{rendered}");
         assert!(rendered.contains("finished"), "{rendered}");
         assert!(rendered.contains("42 passed"), "{rendered}");
+    }
+
+    /// A shell's output ends with a newline; the report ends with its own, so the output's would
+    /// only put a blank line under it, on every surface that shows the report.
+    #[test]
+    fn an_outputs_own_trailing_newline_is_not_carried_into_the_report() {
+        let rendered = render_outcomes(&[task(TaskStatus::Completed, Some("42 passed\n\n"))]);
+        assert!(rendered.ends_with(".\n\n42 passed\n"), "{rendered:?}");
     }
 
     /// Each terminal state has to read differently: "your build failed" and "your build never ran"

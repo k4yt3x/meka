@@ -111,18 +111,18 @@ impl Agent {
         let outputs = futures::future::join_all(futures).await;
 
         // Serial pass to accumulate scratchpad hints, emit per-tool completion events in source
-        // order, build ToolResult blocks, and emit a single TodoListUpdated event if any `todo_*`
-        // call landed and actually changed the rendered state.
+        // order, build ToolResult blocks, and emit a single ChecklistUpdated event if any
+        // `checklist_*` call landed and actually changed the state.
         let mut results = Vec::with_capacity(planned.len());
         let mut durations = Vec::with_capacity(planned.len());
-        let mut todo_fired = false;
+        let mut checklist_fired = false;
         for ((id, name, _), (output, elapsed)) in planned.into_iter().zip(outputs) {
             durations.push(crate::provider::ToolDuration {
                 name: name.clone(),
                 elapsed,
             });
-            if crate::tools::todo::changes_the_list(&name) {
-                todo_fired = true;
+            if crate::tools::checklist::changes_the_list(&name) {
+                checklist_fired = true;
             }
             if output.spill_hint != crate::tools::SpillHint::default() {
                 self.scratchpad_hints
@@ -149,28 +149,24 @@ impl Agent {
                 is_error: output.is_error,
             });
         }
-        if todo_fired {
-            let state = self.cells.todo_list.get();
-            // Suppress re-renders for reads and rewrites that change nothing. Drop the guard before
-            // awaiting the emit.
+        if checklist_fired {
+            let state = self.cells.checklist.get();
+            // Suppress re-renders for edits that change nothing. Drop the guard before awaiting
+            // the emit. A list emptied by its last disposition is a change like any other: every
+            // surface clears or says so on an empty one.
             let changed = {
-                let mut last = self.last_rendered_todo.write().await;
-                let changed = last.as_ref() != Some(&state);
+                let mut last = self.last_rendered_checklist.write().await;
+                let shown = last.clone().unwrap_or_default();
+                let changed = !state.shows_the_same_items(&shown);
                 if changed {
                     *last = Some(state.clone());
                 }
                 changed
             };
-            // An empty list renders nothing, so emitting it would be a no-op event that also
-            // corrupts REPL spacing; require something to show.
-            let should_emit = !state.items.is_empty() && changed;
-            if should_emit {
+            if changed {
                 self.cells
                     .frontend
-                    .emit(FrontendEvent::TodoListUpdated {
-                        title: state.title,
-                        items: state.items,
-                    })
+                    .emit(FrontendEvent::ChecklistUpdated { items: state.items })
                     .await;
             }
         }
@@ -232,6 +228,11 @@ impl Agent {
     /// that level, the approval prompt, then the tool itself, and the schema advisory on the way
     /// back. The one sequence for inline dispatch and the checkpoint turn, so a door added here is
     /// a door both have; a copy per caller is a door one of them forgets.
+    ///
+    /// Nothing ahead of the tool's own `execute` awaits for a tool at the level of the checklist
+    /// tools, and `execute_tool_calls` polls a message's calls in source order, which is what lets
+    /// `SharedChecklist::in_turn_order` queue them in that order; an await added to this prelude
+    /// would have to keep it.
     pub(super) async fn run_admitted_call(
         &self,
         tool: &Arc<dyn crate::tools::Tool>,
@@ -1114,8 +1115,8 @@ mod tests {
         .await;
         agent
             .tool_registry
-            .register(Arc::new(crate::tools::todo::TodoWriteTool {
-                todo_list: agent.cells.todo_list.clone(),
+            .register(Arc::new(crate::tools::checklist::ChecklistAddTool {
+                checklist: agent.cells.checklist.clone(),
             }))
             .expect("register");
         let message = Message {
@@ -1123,8 +1124,8 @@ mod tests {
             content: vec![
                 ContentBlock::ToolUse {
                     id: "call-1".to_string(),
-                    name: "todo_write".to_string(),
-                    input: serde_json::json!({"title": "Plan", "items": ["first"]}),
+                    name: "checklist_add".to_string(),
+                    input: serde_json::json!({"items": ["first"]}),
                 },
                 ContentBlock::ToolUse {
                     id: "call-2".to_string(),
@@ -1146,14 +1147,112 @@ mod tests {
             .iter()
             .map(|duration| duration.name.as_str())
             .collect();
-        assert_eq!(names, vec!["todo_write", "no_such_tool"]);
+        assert_eq!(names, vec!["checklist_add", "no_such_tool"]);
     }
 
-    /// One `TodoListUpdated` per change with something to show. A rewrite that changes nothing
-    /// re-renders nothing, and a list emptied out renders nothing either: an empty render is a
-    /// no-op event that also corrupts REPL spacing.
+    /// The calls of one assistant message run concurrently, and an edit that names a task awaits
+    /// the store while one that does not finishes at once; the replay applies them in source
+    /// order, so the live list has to be built in source order too.
     #[tokio::test]
-    async fn an_unchanged_or_emptied_todo_list_is_not_re_rendered() {
+    async fn two_edits_in_one_message_land_in_the_order_the_model_wrote_them() {
+        use crate::{provider::mock::MockProvider, store::background::TaskStatus};
+
+        let (agent, store) = agent_with_registry_for_test(
+            Arc::new(MockProvider::from_rounds(vec![])),
+            crate::tools::ToolRegistry::new(),
+        )
+        .await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("a session");
+        agent.cells.session_id.set(session_id);
+        store
+            .background_store()
+            .start_background_task(&crate::store::background::BackgroundTask {
+                id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+                session_id,
+                tool: "shell_execute".to_string(),
+                label: "make".to_string(),
+                status: TaskStatus::Running,
+                outcome: None,
+                scratchpad_entry: None,
+                started_at: chrono::Utc::now(),
+                finished_at: None,
+                announced_at: None,
+                delivered_at: None,
+                subagent_id: None,
+            })
+            .await
+            .expect("a task");
+        agent
+            .tool_registry
+            .register(Arc::new(crate::tools::checklist::ChecklistAddTool {
+                checklist: agent.cells.checklist.clone(),
+            }))
+            .expect("registration");
+        agent
+            .tool_registry
+            .register(Arc::new(crate::tools::checklist::ChecklistEditTool {
+                checklist: agent.cells.checklist.clone(),
+                store: store.clone(),
+                site: agent.cells.site(),
+            }))
+            .expect("registration");
+        agent.cells.checklist.update(|state| {
+            state.add(vec![crate::checklist::NewItem {
+                text: "build".to_string(),
+                status: crate::checklist::ChecklistStatus::Pending,
+            }]);
+        });
+
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "edit-1".to_string(),
+                    name: "checklist_edit".to_string(),
+                    input: serde_json::json!({
+                        "id": 1, "status": "deferred", "reason": "building", "task": "1a2b3c4d"
+                    }),
+                },
+                ContentBlock::ToolUse {
+                    id: "edit-2".to_string(),
+                    name: "checklist_edit".to_string(),
+                    input: serde_json::json!({"id": 1, "status": "in_progress"}),
+                },
+            ],
+        };
+        let (results, _) = agent
+            .execute_tool_calls(
+                &message,
+                &[],
+                &crate::provider::Attribution::default(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            results
+                .iter()
+                .all(|block| matches!(block, ContentBlock::ToolResult {
+                    is_error: false,
+                    ..
+                })),
+            "both edits apply: {results:?}"
+        );
+        let item = &agent.cells.checklist.get().items[0];
+        assert_eq!(
+            item.status,
+            crate::checklist::ChecklistStatus::InProgress,
+            "the second edit in the message is the last word, as the replay will read it"
+        );
+        assert_eq!(item.task, None);
+    }
+
+    /// One `ChecklistUpdated` per change. A read changes nothing and announces nothing; an edit
+    /// that empties the list announces the empty list, which is what lets a surface clear it.
+    #[tokio::test]
+    async fn an_unchanged_checklist_is_not_re_announced_and_an_emptied_one_is() {
         use crate::provider::mock::MockProvider;
 
         let (mut agent, _store) = agent_with_registry_for_test(
@@ -1163,18 +1262,32 @@ mod tests {
         .await;
         agent
             .tool_registry
-            .register(Arc::new(crate::tools::todo::TodoWriteTool {
-                todo_list: agent.cells.todo_list.clone(),
+            .register(Arc::new(crate::tools::checklist::ChecklistAddTool {
+                checklist: agent.cells.checklist.clone(),
+            }))
+            .expect("registration");
+        agent
+            .tool_registry
+            .register(Arc::new(crate::tools::checklist::ChecklistReadTool {
+                checklist: agent.cells.checklist.clone(),
+            }))
+            .expect("registration");
+        agent
+            .tool_registry
+            .register(Arc::new(crate::tools::checklist::ChecklistEditTool {
+                checklist: agent.cells.checklist.clone(),
+                store: _store.clone(),
+                site: crate::session::ToolSite::for_test(),
             }))
             .expect("registration");
         let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
         agent.cells.frontend = Arc::clone(&frontend) as Arc<dyn crate::frontend::Frontend>;
 
-        let todo_call = |input: serde_json::Value| Message {
+        let call = |name: &str, input: serde_json::Value| Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
-                id: "todo-1".to_string(),
-                name: "todo_write".to_string(),
+                id: "checklist-1".to_string(),
+                name: name.to_string(),
                 input,
             }],
         };
@@ -1182,37 +1295,47 @@ mod tests {
             frontend
                 .events()
                 .iter()
-                .filter(|event| matches!(event, FrontendEvent::TodoListUpdated { .. }))
+                .filter(|event| matches!(event, FrontendEvent::ChecklistUpdated { .. }))
                 .count()
         };
 
-        let list = serde_json::json!({"title": "Plan", "items": ["first"]});
         agent
             .execute_tool_calls(
-                &todo_call(list.clone()),
+                &call("checklist_add", serde_json::json!({"items": ["first"]})),
                 &[],
                 &crate::provider::Attribution::default(),
                 CancellationToken::new(),
             )
             .await;
-        assert_eq!(rendered(), 1, "a new list is rendered once");
+        assert_eq!(rendered(), 1, "a new item is announced once");
         agent
             .execute_tool_calls(
-                &todo_call(list),
+                &call("checklist_read", serde_json::json!({})),
                 &[],
                 &crate::provider::Attribution::default(),
                 CancellationToken::new(),
             )
             .await;
-        assert_eq!(rendered(), 1, "rewriting the same list renders nothing");
+        assert_eq!(rendered(), 1, "a read announces nothing");
         agent
             .execute_tool_calls(
-                &todo_call(serde_json::json!({"title": "Plan", "items": []})),
+                &call(
+                    "checklist_edit",
+                    serde_json::json!({"id": 1, "status": "completed"}),
+                ),
                 &[],
                 &crate::provider::Attribution::default(),
                 CancellationToken::new(),
             )
             .await;
-        assert_eq!(rendered(), 1, "an emptied list has nothing to render");
+        assert_eq!(
+            rendered(),
+            2,
+            "the emptied list is announced, so a surface can clear it"
+        );
+        assert!(matches!(
+            frontend.events().last(),
+            Some(FrontendEvent::ChecklistUpdated { items }) if items.is_empty()
+        ));
     }
 }

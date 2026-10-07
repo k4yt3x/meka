@@ -29,6 +29,13 @@ pub(crate) struct Wakeup {
     pub(crate) coalesced: u32,
 }
 impl Wakeup {
+    /// Whether the fire is late enough to say so, to the model and on the screen alike. A tick's
+    /// worth of delay is normal, and saying so every time would train the model to ignore the line
+    /// that matters after an outage.
+    pub(crate) fn is_materially_late(&self) -> bool {
+        self.late_by > chrono::Duration::minutes(1)
+    }
+
     /// Render the user-turn text delivered to the model.
     ///
     /// The header is not decoration: without it the model reads a bare instruction as if a human
@@ -39,9 +46,7 @@ impl Wakeup {
             self.job.short_id(),
             crate::text::format_timestamp(Utc::now(), crate::text::Precision::Minutes)
         );
-        // Only mention lateness when it is material. A tick's worth of delay is normal and saying
-        // so every time would train the model to ignore the line that matters after an outage.
-        if self.late_by > chrono::Duration::minutes(1) {
+        if self.is_materially_late() {
             rendered.push_str(&format!(
                 "\n[Late by {}; this fire replaces {} missed occurrence(s)]",
                 format_late(self.late_by),

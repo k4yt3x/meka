@@ -29,6 +29,12 @@ fn opens_turn(message: &Message) -> bool {
     message.opens_turn()
 }
 
+/// What the loop writes to coax a visible reply out of a turn that produced only thinking, or
+/// nothing: the text of a [`NudgeKind::VisibleReply`] nudge, kept beside the kind, below every
+/// reader that builds one.
+pub(crate) const THINKING_ONLY_NUDGE: &str = "[Your previous response contained no visible output. Please \
+                                   continue and produce a user-visible response.]";
+
 /// One entry in the underlying event log of a [`Conversation`]. Persisted as a single row in the
 /// `messages` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,11 +44,14 @@ pub(crate) enum Event {
     /// Marks a compaction boundary: when materializing, drop the last `replaced_count` materialized
     /// messages and push `summary` instead. Subsequent `Append` events extend the new tail. Carries
     /// the set of deferred tools that were active at compaction time so `extract_loaded_tool_names`
-    /// can recover them after the boundary (otherwise compaction would silently un-load them).
+    /// can recover them after the boundary (otherwise compaction would silently un-load them), and
+    /// the checklist as it stood, for the same reason: the calls that built it are among the rows
+    /// the boundary replaces, and the replay that recovers the list reads the view.
     CompactBoundary {
         summary: Message,
         replaced_count: usize,
         loaded_tools_snapshot: HashSet<String>,
+        checklist_snapshot: crate::checklist::ChecklistState,
     },
     /// Replaces the last `replaced_count` materialized messages with `messages`. An empty
     /// `messages` therefore means "drop them", which is what [`Conversation::rewind`] emits.
@@ -83,6 +92,9 @@ pub(crate) struct Conversation {
     /// Materialized view kept in lockstep with `events`. Rebuilt by `rebuild_materialized` after
     /// every mutation; reads are zero-cost.
     materialized: Vec<Message>,
+    /// The checklist the boundary whose summary heads the view recorded, when one does; see
+    /// [`Self::checklist_baseline`]. Kept in lockstep with `materialized` by the same rebuild.
+    baseline_checklist: Option<crate::checklist::ChecklistState>,
     /// Images replaced since the last full rebuild, for
     /// [`Conversation::invalid_images_replaced`].
     invalid_images_replaced: usize,
@@ -177,7 +189,7 @@ impl Conversation {
     /// Told once. The conversation the model reads back is a record of what happened, not proof
     /// that any of it still holds: a tool that was holding something open across those turns has
     /// been restarted along with the process, and nothing else in the context block says so
-    /// (permission, cwd, todos, and the tool catalog are all restated every turn regardless).
+    /// (permission, cwd and the tool catalog are all restated every turn regardless).
     pub(crate) fn take_resumed_notice(&mut self) -> bool {
         std::mem::take(&mut self.resumed_undisclosed)
     }
@@ -315,12 +327,14 @@ impl Conversation {
         summary: Message,
         tail: Vec<Message>,
         loaded_tools_snapshot: HashSet<String>,
+        checklist_snapshot: crate::checklist::ChecklistState,
     ) {
         let replaced_count = self.materialized.len();
         self.events.push(Event::CompactBoundary {
             summary,
             replaced_count,
             loaded_tools_snapshot,
+            checklist_snapshot,
         });
         for message in tail {
             self.events.push(Event::Append(message));
@@ -487,8 +501,36 @@ impl Conversation {
 
     fn rebuild_materialized(&mut self) {
         let (placed, _) = replay(self.events.iter());
+        self.baseline_checklist = match placed.first().map(|placed| placed.source) {
+            Some(Source::Boundary(index)) => match self.events.get(index) {
+                Some(Event::CompactBoundary {
+                    checklist_snapshot, ..
+                }) => Some(checklist_snapshot.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
         self.materialized = placed.into_iter().map(|placed| placed.message).collect();
         self.invalid_images_replaced = repair_invalid_images(&mut self.materialized);
+    }
+
+    /// Where a replay of the checklist starts: the list the heading boundary recorded and the
+    /// messages after its summary, or an empty list and the whole view when no boundary heads it.
+    ///
+    /// A boundary clears the view, so its summary is the first message while it stands; a repair
+    /// that truncates past it leaves a view that begins with ordinary rows, which then speak for
+    /// themselves.
+    pub(crate) fn checklist_baseline(&self) -> (crate::checklist::ChecklistState, &[Message]) {
+        match &self.baseline_checklist {
+            Some(snapshot) => (
+                snapshot.clone(),
+                self.materialized.get(1..).unwrap_or_default(),
+            ),
+            None => (
+                crate::checklist::ChecklistState::default(),
+                self.materialized.as_slice(),
+            ),
+        }
     }
 }
 
@@ -559,11 +601,29 @@ fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> (Vec<Placed>, u64) {
             } => {
                 revision = revision.saturating_add(1);
                 let truncate_to = placed.len().saturating_sub(*replaced_count);
+                // A repair that rewrites the whole view and puts something back has rewritten the
+                // summary heading it, not removed it: the first message it places is that summary
+                // as the repair left it, and still stands for the boundary, with the list the
+                // boundary recorded. Only a repair that puts nothing back takes the boundary away.
+                let heading_boundary = (truncate_to == 0)
+                    .then(|| placed.first())
+                    .flatten()
+                    .filter(|first| matches!(first.source, Source::Boundary(_)))
+                    .map(|first| (first.source, first.marker.clone()));
                 placed.truncate(truncate_to);
-                placed.extend(messages.iter().map(|message| Placed {
-                    message: message.clone(),
-                    source: Source::Repair(index),
-                    marker: None,
+                placed.extend(messages.iter().enumerate().map(|(position, message)| {
+                    match (position, &heading_boundary) {
+                        (0, Some((source, marker))) => Placed {
+                            message: message.clone(),
+                            source: *source,
+                            marker: marker.clone(),
+                        },
+                        _ => Placed {
+                            message: message.clone(),
+                            source: Source::Repair(index),
+                            marker: None,
+                        },
+                    }
                 }));
             }
             Event::Redact { images } => {
@@ -903,6 +963,25 @@ pub(crate) enum OpaqueReasoning {
         id: Option<String>,
     },
 }
+/// Why the loop wrote a nudge: the reply it answers had no visible text, or left checklist items
+/// open. What a surface shows for a replayed nudge depends on it, and the wire carries it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NudgeKind {
+    VisibleReply,
+    Checklist,
+}
+
+impl NudgeKind {
+    /// The kind's one spelling, for the wire and the migration that writes it.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::VisibleReply => "visible_reply",
+            Self::Checklist => "checklist",
+        }
+    }
+}
+
 /// One block of a message, in the shape the session store persists and every provider maps from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -910,8 +989,17 @@ pub(crate) enum ContentBlock {
     Text {
         text: String,
     },
+    /// Words meka wrote into the model's own turn in the user's role: the nudge after a reply
+    /// that stopped too soon. Its own block, so a nudge is known by its shape rather than its
+    /// words, every provider renders it as text, every reader that shows what a person said can
+    /// skip it, and an inbox item that arrives while the nudged round runs can ride behind it as a
+    /// `Text` block and still be the person's. A user message carries zero or one of these, first.
+    Nudge {
+        kind: NudgeKind,
+        text: String,
+    },
     /// What meka injected ahead of the user's words for this turn: the permission and environment
-    /// context, todos, world state, budget, background outcomes and the resume notice. Its own
+    /// context, world state, budget, background outcomes and the resume notice. Its own
     /// block, so every reader that shows what the user typed can skip it, and every provider
     /// renders it as text ahead of the words. A user message carries zero or one of these, first.
     TurnContext {
@@ -972,7 +1060,9 @@ impl ContentBlock {
     pub(crate) fn search_text(&self) -> Option<String> {
         match self {
             ContentBlock::Text { text } => Some(text.clone()),
-            ContentBlock::TurnContext { .. } | ContentBlock::Image { .. } => None,
+            ContentBlock::TurnContext { .. }
+            | ContentBlock::Nudge { .. }
+            | ContentBlock::Image { .. } => None,
             ContentBlock::Thinking { thinking, .. } => Some(format!("[thinking] {thinking}")),
             ContentBlock::RedactedThinking { .. } => Some("[redacted thinking]".to_string()),
             ContentBlock::ToolUse { name, input, .. } => {
@@ -1013,17 +1103,58 @@ pub(crate) struct Message {
     pub(crate) content: Vec<ContentBlock>,
 }
 impl Message {
-    /// Whether this message opens a turn: a user message carrying no tool result. The other user
-    /// message, the envelope of results a tool round answers with, continues the turn the model
-    /// is still working on. The one spelling of the rule: a rewind counts turns by it, a
-    /// compaction splits on it, an export and a wire encoder shape the message by it, and a
-    /// worker listing counts by it.
-    pub(crate) fn opens_turn(&self) -> bool {
+    /// Whether this message is the envelope of a tool round's results, the user-role message that
+    /// continues the turn the model is still working on. A wire encoder shapes the message by it.
+    pub(crate) fn carries_tool_results(&self) -> bool {
         self.role == Role::User
-            && !self
+            && self
                 .content
                 .iter()
                 .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+    }
+
+    /// Whether this message is a nudge: words meka wrote into the model's own turn, answering a
+    /// reply that stopped too soon, with no visible text or with checklist items open. Known by
+    /// its shape, a [`ContentBlock::Nudge`] first, whatever else rides behind it.
+    pub(crate) fn is_nudge(&self) -> bool {
+        self.nudge().is_some()
+    }
+
+    /// The nudge this message carries, when it is one: why it was written and its words.
+    pub(crate) fn nudge(&self) -> Option<(NudgeKind, &str)> {
+        if self.role != Role::User {
+            return None;
+        }
+        match self.content.first() {
+            Some(ContentBlock::Nudge { kind, text }) => Some((*kind, text.as_str())),
+            _ => None,
+        }
+    }
+
+    /// The message the loop appends to send the model back to work.
+    pub(crate) fn nudge_message(kind: NudgeKind, text: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: vec![ContentBlock::Nudge {
+                kind,
+                text: text.into(),
+            }],
+        }
+    }
+
+    /// Whether this message is shaped as a prompt to the model: user role, words rather than
+    /// results. The user's turn, a scheduled job's, or a nudge. A compaction splits on it and keeps
+    /// a trailing one, since the model has it to answer whoever wrote it.
+    pub(crate) fn is_prompt(&self) -> bool {
+        self.role == Role::User && !self.carries_tool_results()
+    }
+
+    /// Whether this message opens a turn: a prompt that is not a nudge. A nudge continues the turn
+    /// it answers, so the one spelling of the rule is here: a rewind counts turns by it, a turn
+    /// label starts at it, a worker listing counts by it, and a history shows it as what was
+    /// asked.
+    pub(crate) fn opens_turn(&self) -> bool {
+        self.is_prompt() && !self.is_nudge()
     }
 
     /// A user message carrying only `text`.
@@ -1113,20 +1244,20 @@ impl Message {
             .join("\n\n")
     }
 
-    /// Everything a provider renders as text, in order: the turn's context block, a blank line,
-    /// then the words. What the two were joined with when they were one string, for the wires that
-    /// take a user message as a single string.
+    /// Everything a provider renders as text, in order, a blank line between: the turn's context
+    /// block or a nudge, then the words. What the two were joined with when they were one string,
+    /// for the wires that take a user message as a single string.
     pub(crate) fn wire_text(&self) -> String {
-        let context = self.content.iter().find_map(|block| match block {
-            ContentBlock::TurnContext { text } => Some(text.as_str()),
-            _ => None,
-        });
-        let words = self.text_paragraphs();
-        match context {
-            Some(context) if words.is_empty() => context.to_string(),
-            Some(context) => format!("{context}\n\n{words}"),
-            None => words,
-        }
+        self.content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text }
+                | ContentBlock::TurnContext { text }
+                | ContentBlock::Nudge { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     /// A copy of this message with every [`ContentBlock::ToolUse`] removed. Used when persisting a
@@ -1319,8 +1450,18 @@ pub(crate) fn write_message_markdown(
 
     match message.role {
         crate::conversation::Role::User => {
-            // A `User` message is either a turn or a tool-results envelope; the blocks say which.
-            if !message.opens_turn() {
+            // A `User` message is a turn, a nudge meka wrote into one, or a tool-results envelope;
+            // the blocks say which. An inbox item that rode a nudge or a round's results is the
+            // person's, under its own heading after what it rode.
+            if let Some((_, text)) = message.nudge() {
+                writeln!(output, "## meka\n").ok();
+                writeln!(output, "{text}\n").ok();
+                let words = message.text_paragraphs();
+                if !words.is_empty() {
+                    writeln!(output, "## User\n").ok();
+                    writeln!(output, "{words}\n").ok();
+                }
+            } else if message.carries_tool_results() {
                 for block in &message.content {
                     if let crate::conversation::ContentBlock::ToolResult {
                         content, is_error, ..
@@ -1339,6 +1480,11 @@ pub(crate) fn write_message_markdown(
                         writeln!(output, "```\n{text}\n```\n").ok();
                         writeln!(output, "</details>\n").ok();
                     }
+                }
+                let words = message.text_paragraphs();
+                if !words.is_empty() {
+                    writeln!(output, "## User\n").ok();
+                    writeln!(output, "{words}\n").ok();
                 }
             } else {
                 writeln!(output, "## User\n").ok();
@@ -1375,6 +1521,7 @@ pub(crate) fn write_message_markdown(
                     }
                     crate::conversation::ContentBlock::ToolResult { .. }
                     | crate::conversation::ContentBlock::TurnContext { .. }
+                    | crate::conversation::ContentBlock::Nudge { .. }
                     | crate::conversation::ContentBlock::Thinking { .. }
                     | crate::conversation::ContentBlock::RedactedThinking { .. }
                     | crate::conversation::ContentBlock::Image { .. } => {}
@@ -1469,6 +1616,7 @@ mod tests {
                 summary: Message::user("[Conversation summary from session compaction] found them"),
                 replaced_count: 2,
                 loaded_tools_snapshot: HashSet::new(),
+                checklist_snapshot: Default::default(),
             },
             Event::Append(Message::user_turn(
                 "<context/>",
@@ -1578,6 +1726,40 @@ mod tests {
         );
     }
 
+    /// What rode a round's results or a nudge is the person's, under its own heading after what
+    /// it rode: the results the model read first, then the words it read with them; the nudge
+    /// as meka's, then the words.
+    #[test]
+    fn an_inbox_item_that_rode_a_round_or_a_nudge_exports_after_what_it_rode() {
+        let mut envelope = user_with_tool_result("call_1");
+        envelope.content.push(ContentBlock::Text {
+            text: "[Message from a client, arrived now]\nand name the file".to_string(),
+        });
+        let mut output = String::new();
+        write_message_markdown(&mut output, &envelope, &std::collections::HashMap::new());
+        let results_at = output
+            .find("<summary>Tool result</summary>")
+            .expect("the results");
+        let words_at = output
+            .find("## User\n\n[Message from a client")
+            .expect("the words");
+        assert!(results_at < words_at, "{output}");
+
+        let mut nudge = Message::nudge_message(NudgeKind::Checklist, "[Checklist: open]");
+        nudge.content.push(ContentBlock::Text {
+            text: "[Message from a client, arrived now]\nstop".to_string(),
+        });
+        let mut output = String::new();
+        write_message_markdown(&mut output, &nudge, &std::collections::HashMap::new());
+        let nudge_at = output
+            .find("## meka\n\n[Checklist: open]")
+            .expect("meka's words");
+        let words_at = output
+            .find("## User\n\n[Message from a client")
+            .expect("the words");
+        assert!(nudge_at < words_at, "{output}");
+    }
+
     /// A turn opened with no words exports as a marked line rather than a heading over nothing.
     #[test]
     fn a_turn_with_no_words_exports_as_a_marked_line() {
@@ -1677,6 +1859,7 @@ mod tests {
             Message::user("[summary of everything above]"),
             Vec::new(),
             HashSet::new(),
+            Default::default(),
         );
 
         assert!(
@@ -1693,6 +1876,43 @@ mod tests {
         // The next real turn's prompt, appended on top of the summary, is withdrawable again.
         conversation.append(Message::user("check the news"));
         assert!(conversation.ends_on_a_turn_opening());
+    }
+
+    /// A repair that rewrites the whole view, as a provider's rejection of its content does, puts
+    /// a copy of the summary back at the head; the boundary and the list it recorded stand with
+    /// it. Only a repair that puts nothing back, the rewind of everything, takes them away.
+    #[test]
+    fn a_repair_that_rewrites_the_summary_keeps_the_boundarys_checklist() {
+        let mut snapshot = crate::checklist::ChecklistState::default();
+        snapshot.add(vec![crate::checklist::NewItem {
+            text: "from before".to_string(),
+            status: crate::checklist::ChecklistStatus::Pending,
+        }]);
+        let mut conversation = Conversation::new();
+        conversation.append(Message::user("first"));
+        conversation.append(Message::assistant_text("reply"));
+        conversation.replace_for_compaction(
+            Message::user("[summary of everything above]"),
+            vec![Message::user("kept"), Message::assistant_text("kept reply")],
+            HashSet::new(),
+            snapshot.clone(),
+        );
+        let (baseline, after) = conversation.checklist_baseline();
+        assert_eq!(baseline, snapshot);
+        assert_eq!(after.len(), 2);
+
+        let rewritten: Vec<Message> = conversation.as_slice().to_vec();
+        conversation.replace_tail(rewritten.len(), rewritten);
+        let (baseline, after) = conversation.checklist_baseline();
+        assert_eq!(
+            baseline, snapshot,
+            "the rewritten summary still heads the boundary"
+        );
+        assert_eq!(after.len(), 2);
+
+        conversation.replace_tail(conversation.len(), Vec::new());
+        let (baseline, after) = conversation.checklist_baseline();
+        assert!(baseline.items.is_empty() && after.is_empty());
     }
 
     /// The interaction that makes `run_turn`'s withdrawal guard need *both* of its conditions.
@@ -1716,6 +1936,7 @@ mod tests {
             Message::user("[summary of everything above]"),
             vec![prompt],
             HashSet::new(),
+            Default::default(),
         );
 
         assert!(
@@ -1806,7 +2027,7 @@ mod tests {
 
         let summary = Message::user("[summary]");
         let tail = vec![Message::assistant_text("kept-1"), Message::user("kept-2")];
-        log.replace_for_compaction(summary, tail, HashSet::new());
+        log.replace_for_compaction(summary, tail, HashSet::new(), Default::default());
 
         let view = log.as_slice();
         assert_eq!(view.len(), 3);
@@ -1819,7 +2040,12 @@ mod tests {
     fn message_log_replace_for_compaction_empty_tail() {
         let mut log = Conversation::new();
         log.append(Message::user("m1"));
-        log.replace_for_compaction(Message::user("[summary]"), Vec::new(), HashSet::new());
+        log.replace_for_compaction(
+            Message::user("[summary]"),
+            Vec::new(),
+            HashSet::new(),
+            Default::default(),
+        );
         assert_eq!(log.len(), 1);
         assert_eq!(log.as_slice()[0].text_content(), "[summary]");
     }
@@ -1897,6 +2123,7 @@ mod tests {
             Message::user("summary"),
             vec![Message::user("three")],
             HashSet::new(),
+            Default::default(),
         );
         assert_ne!(log.len(), before.len(), "compaction must have rewritten it");
 
@@ -1920,7 +2147,12 @@ mod tests {
         let mut log = Conversation::new();
         log.append(Message::user("old"));
         log.append(Message::assistant_text("older"));
-        log.replace_for_compaction(Message::user("summary one"), Vec::new(), HashSet::new());
+        log.replace_for_compaction(
+            Message::user("summary one"),
+            Vec::new(),
+            HashSet::new(),
+            Default::default(),
+        );
         log.append(Message::user("after the first summary"));
         let before: Vec<String> = log.iter().map(|m| format!("{m:?}")).collect();
 
@@ -1928,6 +2160,7 @@ mod tests {
             Message::user("summary two"),
             vec![Message::user("kept")],
             HashSet::new(),
+            Default::default(),
         );
         assert!(log.pop_compaction());
         assert_eq!(
@@ -2132,6 +2365,58 @@ mod tests {
         );
     }
 
+    /// A nudge is a user-role message the loop writes inside the model's turn, so it must not be
+    /// where a rewind cuts, a turn label starts, or a worker's turn count steps; a tool round's
+    /// envelope never was. Both stay prompts to the model, which is what a compaction splits on.
+    #[test]
+    fn a_nudge_continues_the_turn_it_answers() {
+        let checklist_nudge = Message::nudge_message(
+            NudgeKind::Checklist,
+            "[Checklist: items are still open, so this turn is not over.]\n\nOpen:\n",
+        );
+        let thinking_nudge = Message::nudge_message(NudgeKind::VisibleReply, THINKING_ONLY_NUDGE);
+        for nudge in [&checklist_nudge, &thinking_nudge] {
+            assert!(nudge.is_nudge());
+            assert!(nudge.is_prompt(), "the model has it to answer");
+            assert!(!nudge.opens_turn());
+        }
+        let envelope = user_with_tool_result("call_1");
+        assert!(envelope.carries_tool_results() && !envelope.is_prompt());
+        assert!(!envelope.opens_turn() && !envelope.is_nudge());
+        let typed = Message::user("[Checklist: the user's own words, were they ever first]");
+        assert!(
+            !typed.is_nudge(),
+            "words alone are never a nudge, whatever they open with"
+        );
+        let mut ridden = checklist_nudge.clone();
+        ridden.content.push(ContentBlock::Text {
+            text: "[Message from a client, arrived now]\nstop".to_string(),
+        });
+        assert!(
+            ridden.is_nudge(),
+            "an item riding behind the block leaves it a nudge"
+        );
+
+        let mut log = Conversation::new();
+        log.append(Message::user("turn one"));
+        log.append(Message::assistant_text("answer one"));
+        log.append(Message::user("plan and do it"));
+        log.append(Message::assistant_text("I have planned it."));
+        log.append(checklist_nudge);
+        log.append(assistant_with_tool_use("call_1"));
+        log.append(user_with_tool_result("call_1"));
+        log.append(Message::assistant_text("Done."));
+        assert!(
+            !log.ends_on_a_turn_opening(),
+            "the turn was answered before the nudge"
+        );
+
+        assert!(log.rewind(1).is_some());
+        let view = log.as_slice();
+        assert_eq!(view.len(), 2, "the whole nudged turn goes: {view:?}");
+        assert_eq!(view[1].text_content(), "answer one");
+    }
+
     #[test]
     fn rewind_past_the_start_returns_none() {
         let mut log = Conversation::new();
@@ -2249,6 +2534,7 @@ mod tests {
             Message::assistant_text("summary"),
             Vec::new(),
             HashSet::new(),
+            Default::default(),
         );
         let boundary = resumed
             .events()
@@ -2368,6 +2654,7 @@ mod tests {
             Message::user("[summary]"),
             vec![Message::user("tail")],
             HashSet::new(),
+            Default::default(),
         );
 
         let post_event_count = log.events().len();
@@ -2392,6 +2679,7 @@ mod tests {
             Message::user("[summary]"),
             vec![Message::assistant_text("kept-1"), Message::user("kept-2")],
             HashSet::new(),
+            Default::default(),
         );
 
         let view = log.as_slice();
@@ -2440,7 +2728,12 @@ mod tests {
         log.append(load_tool_result("u1", false));
 
         let snapshot: HashSet<String> = ["scratchpad_read".to_string()].into_iter().collect();
-        log.replace_for_compaction(Message::user("[summary]"), Vec::new(), snapshot);
+        log.replace_for_compaction(
+            Message::user("[summary]"),
+            Vec::new(),
+            snapshot,
+            Default::default(),
+        );
 
         let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events());
         assert!(loaded.iter().any(|name| name == "scratchpad_read"));
@@ -2458,12 +2751,14 @@ mod tests {
             Message::user("[summary-1]"),
             vec![Message::user("tail-1")],
             snapshot.clone(),
+            Default::default(),
         );
         log.append(Message::assistant_text("m2"));
         log.replace_for_compaction(
             Message::user("[summary-2]"),
             vec![Message::user("tail-2")],
             snapshot,
+            Default::default(),
         );
 
         let view_before: Vec<String> = log.as_slice().iter().map(|m| m.text_content()).collect();
@@ -2511,6 +2806,7 @@ mod tests {
             Message::user("[summary]"),
             vec![load_tool_result("u1", false)],
             HashSet::new(),
+            Default::default(),
         );
 
         let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events());
@@ -2523,7 +2819,12 @@ mod tests {
         // that should remove the failed append, not the boundary.
         let mut log = Conversation::new();
         log.append(Message::user("pre"));
-        log.replace_for_compaction(Message::user("[summary]"), Vec::new(), HashSet::new());
+        log.replace_for_compaction(
+            Message::user("[summary]"),
+            Vec::new(),
+            HashSet::new(),
+            Default::default(),
+        );
         log.append(Message::user("post-comp"));
 
         let popped = log.pop_unsaved();
@@ -2562,6 +2863,7 @@ mod tests {
             summary: Message::user("[summary]"),
             replaced_count: 5,
             loaded_tools_snapshot: snapshot,
+            checklist_snapshot: Default::default(),
         };
         let json = serde_json::to_string(&boundary).expect("serialize boundary");
         let back: Event = serde_json::from_str(&json).expect("deserialize boundary");
@@ -2583,7 +2885,12 @@ mod tests {
         let mut log = Conversation::new();
         log.append(Message::user("u1"));
         log.append(Message::assistant_text("a1"));
-        log.replace_for_compaction(Message::user("[summary]"), Vec::new(), HashSet::new());
+        log.replace_for_compaction(
+            Message::user("[summary]"),
+            Vec::new(),
+            HashSet::new(),
+            Default::default(),
+        );
         // Synthetic summary is a plain user message; sanitize must leave it.
         log.sanitize_orphans();
         assert_eq!(log.len(), 1);

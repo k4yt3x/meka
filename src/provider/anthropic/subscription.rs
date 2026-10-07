@@ -3124,7 +3124,7 @@ mod tests {
         let shared_permission =
             SharedPermission::new(Permission::Read, crate::permission::EnabledPermissions::ALL);
         let shared_session_id = crate::session::SharedSessionId::default();
-        let todo_list = crate::todo::SharedTodoList::default();
+        let checklist = crate::checklist::SharedChecklist::default();
         let registry = ToolRegistry::build_default(
             &crate::session::SessionMaterials {
                 providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
@@ -3152,7 +3152,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: shared_session_id,
-                todo_list,
+                checklist,
                 background_tasks: crate::background::BackgroundTasks::default(),
                 ..crate::session::SessionCells::for_test(
                     shared_permission,
@@ -3178,7 +3178,6 @@ mod tests {
                 one_shot: false,
                 permission: Permission::Read,
                 approvals: false,
-                todos: &crate::todo::TodoState::default(),
                 cwd: std::path::Path::new("."),
                 roots: &[],
                 world_state: "",
@@ -3213,7 +3212,6 @@ mod tests {
                 one_shot: false,
                 permission: Permission::Unrestricted,
                 approvals: false,
-                todos: &crate::todo::TodoState::default(),
                 cwd: std::path::Path::new("."),
                 roots: &[],
                 world_state: "",
@@ -3286,7 +3284,7 @@ mod tests {
             crate::permission::EnabledPermissions::ALL,
         );
         let shared_session_id = crate::session::SharedSessionId::default();
-        let todo_list = crate::todo::SharedTodoList::default();
+        let checklist = crate::checklist::SharedChecklist::default();
         let registry = ToolRegistry::build_default(
             &crate::session::SessionMaterials {
                 providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
@@ -3314,7 +3312,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: shared_session_id,
-                todo_list,
+                checklist,
                 background_tasks: crate::background::BackgroundTasks::default(),
                 ..crate::session::SessionCells::for_test(
                     shared_permission,
@@ -3341,7 +3339,6 @@ mod tests {
                 one_shot: false,
                 permission: Permission::Unrestricted,
                 approvals: false,
-                todos: &crate::todo::TodoState::default(),
                 cwd: std::path::Path::new("."),
                 roots: &[],
                 world_state: "",
@@ -3482,7 +3479,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: crate::session::SharedSessionId::default(),
-                todo_list: crate::todo::SharedTodoList::default(),
+                checklist: crate::checklist::SharedChecklist::default(),
                 background_tasks: crate::background::BackgroundTasks::default(),
                 ..crate::session::SessionCells::for_test(
                     shared_permission,
@@ -3588,7 +3585,7 @@ mod tests {
             crate::permission::EnabledPermissions::ALL,
         );
         let shared_session_id = crate::session::SharedSessionId::default();
-        let todo_list = crate::todo::SharedTodoList::default();
+        let checklist = crate::checklist::SharedChecklist::default();
         let registry = ToolRegistry::build_default(
             &crate::session::SessionMaterials {
                 providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
@@ -3616,7 +3613,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: shared_session_id,
-                todo_list,
+                checklist,
                 background_tasks: crate::background::BackgroundTasks::default(),
                 ..crate::session::SessionCells::for_test(
                     shared_permission,
@@ -3662,6 +3659,7 @@ mod tests {
             Message::user("[summary]"),
             vec![Message::user("question 2")],
             pre_loaded.iter().cloned().collect(),
+            Default::default(),
         );
 
         // The materialized view shrank, but events are append-only.
@@ -3707,7 +3705,7 @@ mod tests {
         let shared_permission =
             SharedPermission::new(Permission::Read, crate::permission::EnabledPermissions::ALL);
         let shared_session_id = crate::session::SharedSessionId::default();
-        let todo_list = crate::todo::SharedTodoList::default();
+        let checklist = crate::checklist::SharedChecklist::default();
         let registry = ToolRegistry::build_default(
             &crate::session::SessionMaterials {
                 providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
@@ -3735,7 +3733,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: shared_session_id,
-                todo_list,
+                checklist,
                 background_tasks: crate::background::BackgroundTasks::default(),
                 ..crate::session::SessionCells::for_test(
                     shared_permission.clone(),

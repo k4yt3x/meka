@@ -9,7 +9,7 @@ control over the agent's capabilities and prevent accidental modifications.
 | Level | Indicator | What it allows |
 |-------|-----------|----------------|
 | **None** | `[n]` (green) | No tools without approval. |
-| **Read** | `[r]` (yellow) | Read-only tools: `file_read`, `file_find`, `file_search`, `web_fetch`, `shell_execute` (sandboxed read-only), `todo_*`, `agent_spawn`, scratchpad tools |
+| **Read** | `[r]` (yellow) | Read-only tools: `file_read`, `file_find`, `file_search`, `web_fetch`, `shell_execute` (sandboxed read-only), `checklist_*`, `agent_spawn`, scratchpad tools |
 | **Workspace** | `[w]` (orange) | File and shell writes stay inside workspace roots. Unconfined MCP calls may need approval or be refused; the shell needs an available sandbox |
 | **Unrestricted** | `[u]` (red) | Every tool, no boundary. `shell_execute` runs with no sandbox at all |
 
@@ -451,7 +451,7 @@ The agent will explain that it cannot write files at `read` and suggest switchin
 |-------|----------|-------|
 | Memory | the `memories` table in `MEKA_DATA_DIR` | `memory_write`, `memory_delete` |
 | Skills | `~/.config/meka/skills/` | `skill_write`, `skill_delete` (only with [`[skills] agent_managed`](../configuration/config-file.md#skills)) |
-| Scratchpad, todos, scheduled jobs, background tasks | the store | various |
+| Scratchpad, scheduled jobs, background tasks | the store | various |
 
 Of those, only the skill tools reach the filesystem at all; memory is a table in the store. Note what that makes `skill_write` at `read`: a persistence primitive. A skill it writes is read back into every later session's prompt, so a prompt-injected instruction can outlive the turn that carried it. That is the reason `[skills] agent_managed` is off by default and the tool is never given to a sub-agent. That boundary is enforced in two places: a skill name must be one path component matching the Agent Skills spec's own rule (lowercase letters, digits and hyphens), so it cannot contain `..` or a path separator, and a symlink sitting at that name is refused rather than followed, so an existing link cannot redirect a write out of the skills directory. Memory names are governed by a different and wider rule (`[A-Za-z0-9_-]`), which is safe for a different reason: a memory name is a primary key in a table, never a path. `file_write`, `file_edit` and `scratchpad_save_file` are the only built-ins that touch your tree, and all three require `workspace` or above, and are fenced to the workspace roots at that level.
 

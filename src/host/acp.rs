@@ -63,6 +63,7 @@ use tokio_util::{
 use self::{frontend::*, prompt::*, session::*};
 use crate::{
     agent::Agent,
+    checklist::{ChecklistItem, ChecklistStatus},
     config::ResolvedConfig,
     conversation::{ContentBlock as MekaContentBlock, Conversation, Role, ToolResultContent},
     error::MekaError,
@@ -74,7 +75,6 @@ use crate::{
     permission::{Permission, SharedPermission},
     skills::SkillCache,
     store::Store,
-    todo::{TodoItem, TodoStatus},
     workspace::{SharedCwd, SharedRoots, resolve_against_cwd},
 };
 
@@ -832,9 +832,9 @@ mod tests {
         assert_eq!(tool_kind_for("file_search"), ToolKind::Search);
         assert_eq!(tool_kind_for("shell_execute"), ToolKind::Execute);
         assert_eq!(tool_kind_for("web_fetch"), ToolKind::Fetch);
-        assert_eq!(tool_kind_for("todo_read"), ToolKind::Read);
-        assert_eq!(tool_kind_for("todo_write"), ToolKind::Think);
-        assert_eq!(tool_kind_for("todo_edit"), ToolKind::Think);
+        assert_eq!(tool_kind_for("checklist_read"), ToolKind::Read);
+        assert_eq!(tool_kind_for("checklist_add"), ToolKind::Think);
+        assert_eq!(tool_kind_for("checklist_edit"), ToolKind::Think);
         assert_eq!(tool_kind_for("agent_spawn"), ToolKind::Think);
         // MCP-loaded tools and anything else fall through.
         assert_eq!(tool_kind_for("mcp__github__create_issue"), ToolKind::Other);
@@ -842,34 +842,65 @@ mod tests {
         assert_eq!(tool_kind_for("totally_unknown"), ToolKind::Other);
     }
 
+    /// The nudge's stage direction arrives between two replies in one agent message, so it
+    /// carries paragraph breaks; an advisory keeps its `[meka]` line.
     #[test]
-    fn todo_items_to_plan_maps_status_and_priority() {
+    fn a_stage_direction_is_a_paragraph_of_its_own_in_the_editor() {
+        let nudged = serde_json::to_string(&crate::host::acp::frontend::notice_update(
+            &crate::frontend::Notice::checklist_nudged(1, 1, 3),
+        ))
+        .expect("serializes");
+        assert!(
+            nudged.contains("\\n\\n(checklist: 1 open item, continuing, nudge 1 of 3)\\n\\n"),
+            "{nudged}"
+        );
+        let advisory = serde_json::to_string(&crate::host::acp::frontend::notice_update(
+            &crate::frontend::Notice::info("context is filling up"),
+        ))
+        .expect("serializes");
+        assert!(
+            advisory.contains("[meka] context is filling up"),
+            "{advisory}"
+        );
+        assert!(!advisory.contains("\\n"), "{advisory}");
+    }
+
+    #[test]
+    fn checklist_to_plan_maps_status_and_priority() {
         let items = vec![
-            TodoItem {
+            ChecklistItem {
+                id: 1,
                 text: "first".to_string(),
-                status: TodoStatus::Pending,
+                status: ChecklistStatus::Pending,
+                reason: None,
+                task: None,
             },
-            TodoItem {
+            ChecklistItem {
+                id: 2,
                 text: "second".to_string(),
-                status: TodoStatus::InProgress,
+                status: ChecklistStatus::InProgress,
+                reason: None,
+                task: None,
             },
-            TodoItem {
+            ChecklistItem {
+                id: 3,
                 text: "third".to_string(),
-                status: TodoStatus::Completed,
-            },
-            TodoItem {
-                text: "fourth".to_string(),
-                status: TodoStatus::Canceled,
+                status: ChecklistStatus::Deferred,
+                reason: Some("waiting on Sam".to_string()),
+                task: None,
             },
         ];
-        let entries = todo_items_to_plan(&items);
-        assert_eq!(entries.len(), 4);
+        let entries = checklist_to_plan(&items);
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].content, "first");
         assert_eq!(entries[0].status, PlanEntryStatus::Pending);
         assert_eq!(entries[1].status, PlanEntryStatus::InProgress);
-        assert_eq!(entries[2].status, PlanEntryStatus::Completed);
-        // Canceled has no ACP analog; it collapses to Completed.
-        assert_eq!(entries[3].status, PlanEntryStatus::Completed);
+        assert_eq!(
+            entries[2].status,
+            PlanEntryStatus::Pending,
+            "deferred is still open"
+        );
+        assert_eq!(entries[2].content, "third (deferred: waiting on Sam)");
         // meka tracks no per-item priority, so every entry is Medium.
         assert!(
             entries
@@ -1005,7 +1036,7 @@ mod tests {
         let cwd = SharedCwd::new(PathBuf::from("/"));
         let input = serde_json::json!({"command": "ls"});
         assert!(tool_locations("shell_execute", &input, &cwd).is_empty());
-        assert!(tool_locations("todo_read", &input, &cwd).is_empty());
+        assert!(tool_locations("checklist_read", &input, &cwd).is_empty());
     }
 
     #[test]

@@ -35,6 +35,19 @@ pub(crate) fn last_n_turns(
     }
 }
 
+/// The stage direction a replayed nudge stands for, or none for a message that is not one. The
+/// live run announced a checklist nudge with its counts, which the message does not carry, so the
+/// replay says what it can; the nudge for a visible reply was announced by nothing, and stands for
+/// nothing here.
+pub(crate) fn nudge_direction(message: &crate::conversation::Message) -> Option<&'static str> {
+    match message.nudge() {
+        Some((crate::conversation::NudgeKind::Checklist, _)) => {
+            Some("checklist: items still open, continuing")
+        }
+        Some((crate::conversation::NudgeKind::VisibleReply, _)) | None => None,
+    }
+}
+
 /// True when `message` opens a turn from the user's perspective: `Message::opens_turn`, the one
 /// spelling of the rule, so a steer that lands beside a round's results does not start a replay
 /// in the middle of the turn it steered.
@@ -86,6 +99,14 @@ pub(crate) fn render_message_history(
     let mut emitted_any = false;
     let mut first_output = Some(on_first_output);
     for message in messages {
+        // The live run showed the nudge as a stage direction, never as its words, and a replay
+        // shows what the user saw. What rode behind it, an inbox item, is the person's and is
+        // shown below as the words it is.
+        if let Some(note) = nudge_direction(message) {
+            separate(spacing.before_standalone(), &mut first_output);
+            render_annotation(note);
+            emitted_any = true;
+        }
         for block in &message.content {
             match block {
                 ContentBlock::Text { text } => match message.role {
@@ -121,6 +142,8 @@ pub(crate) fn render_message_history(
                 },
                 // meka's own preamble for the turn; a replay shows what was typed.
                 ContentBlock::TurnContext { .. } => {}
+                // Said as a stage direction above, where the message was found to be a nudge.
+                ContentBlock::Nudge { .. } => {}
                 // Input images (from an ACP client) have no terminal rendering; show a marker so a
                 // replayed/exported transcript notes the attachment instead of dropping it
                 // silently.
@@ -220,6 +243,29 @@ mod tests {
         conversation::{ContentBlock, Message, Role},
         render::tests::{assistant_text, tool_result_message, user_prompt},
     };
+
+    /// A replay does not put the nudge's words in the user's mouth: a checklist nudge stands for
+    /// the stage direction the live run showed, and the thinking-only one for nothing, as live.
+    #[test]
+    fn a_replayed_nudge_is_a_stage_direction_or_nothing() {
+        let checklist = crate::conversation::Message::nudge_message(
+            crate::conversation::NudgeKind::Checklist,
+            "[Checklist: items are still open, so this turn is not over.]",
+        );
+        assert_eq!(
+            nudge_direction(&checklist),
+            Some("checklist: items still open, continuing")
+        );
+        let thinking = crate::conversation::Message::nudge_message(
+            crate::conversation::NudgeKind::VisibleReply,
+            crate::conversation::THINKING_ONLY_NUDGE,
+        );
+        assert_eq!(nudge_direction(&thinking), None);
+        assert!(
+            !is_user_prompt_boundary(&checklist) && !is_user_prompt_boundary(&thinking),
+            "a replay from a steer must not start at a nudge either"
+        );
+    }
 
     #[test]
     fn is_user_prompt_boundary_classification() {

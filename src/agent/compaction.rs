@@ -306,8 +306,8 @@ fn split_and_retain(
 
 /// The text blocks of `message` a person sent, or none for an assistant message, a tool-result
 /// carrier with no inbox item beside the results, or text meka wrote in a user message's place: a
-/// stand-in, the nudge after a thinking-only reply, or an earlier compaction's summary, whose own
-/// quotes must not be quoted again. An inbox item keeps the header above it, which is what tells
+/// stand-in, a nudge, or an earlier compaction's summary, whose own quotes must not be quoted
+/// again. An inbox item keeps the header above it, which is what tells
 /// the reader it was relayed and by whom; without it a relayed message would read as the
 /// operator's own.
 fn received_blocks(message: &Message) -> Vec<&str> {
@@ -321,7 +321,6 @@ fn received_blocks(message: &Message) -> Vec<&str> {
             ContentBlock::Text { text }
                 if !text.trim().is_empty()
                     && !is_harness_stand_in(text)
-                    && text != super::turn::THINKING_ONLY_NUDGE
                     && !text.starts_with(COMPACTION_SUMMARY_PREFIX) =>
             {
                 Some(text.as_str())
@@ -348,11 +347,12 @@ fn retained_section(entries: &[String]) -> String {
     section
 }
 
-/// Whether a kept tail may start on `message`: a plain user message, or an assistant message that
-/// opens a tool round, since its result is the next message and follows it into the tail.
+/// Whether a kept tail may start on `message`: a prompt, a nudge included, since the model has
+/// it to answer, or an assistant message that opens a tool round, since its result is the next
+/// message and follows it into the tail.
 fn opens_a_boundary(message: &Message) -> bool {
     match message.role {
-        Role::User => message.opens_turn(),
+        Role::User => message.is_prompt(),
         Role::Assistant => message
             .content
             .iter()
@@ -362,11 +362,11 @@ fn opens_a_boundary(message: &Message) -> bool {
 
 /// The whole conversation as the head, save a trailing unanswered prompt, which is the tail.
 ///
-/// Only a plain user message qualifies: a trailing `tool_result` belongs to the `tool_use` before
-/// it, and keeping it alone would orphan the pair the snap-back exists to protect.
+/// Only a prompt qualifies: a trailing `tool_result` belongs to the `tool_use` before it, and
+/// keeping it alone would orphan the pair the snap-back exists to protect.
 fn summarize_all_but_a_trailing_prompt(view: &[Message]) -> (Vec<Message>, Vec<Message>) {
     match view.split_last() {
-        Some((last, head)) if !head.is_empty() && last.opens_turn() => {
+        Some((last, head)) if !head.is_empty() && last.is_prompt() => {
             (head.to_vec(), vec![last.clone()])
         }
         _ => (view.to_vec(), Vec::new()),
@@ -499,7 +499,7 @@ impl Agent {
             || messages
                 .as_slice()
                 .last()
-                .is_some_and(|last| last.opens_turn());
+                .is_some_and(|last| last.is_prompt());
 
         // Split into a head to summarize and a recent tail to keep verbatim, and copy the
         // messages received from the head alone: the tail is carried as it is, so a message there
@@ -513,6 +513,14 @@ impl Agent {
             request.request_in_flight.as_deref(),
             self.context_window(),
         );
+        // The list the boundary carries: as it stood before the kept tail. The replay that
+        // recovers the list starts from the boundary and applies the tail's calls after it, so a
+        // boundary holding the live list, which those calls already built, would have them
+        // applied twice. Taken here, before the summarizer consumes the head.
+        let checklist_snapshot = {
+            let (baseline, _) = messages.checklist_baseline();
+            crate::tools::checklist::replay_checklist_over(baseline, &to_summarize)
+        };
 
         // The first of two places a fired token ends an automatic compaction; the second, after
         // the summary is built, catches an interrupt that lands inside the summarizer. This one is
@@ -540,6 +548,9 @@ impl Agent {
 
         let world = self.read_world_snapshot(session_id).await;
         let post_context = self.build_post_compact_context(session_id, &world).await;
+        // The summary shows the list as it stands, from the cell; the boundary above carries it
+        // as it stood before the tail.
+        let live_checklist = self.cells.checklist.get();
 
         let mut context_message = format!("{COMPACTION_SUMMARY_PREFIX}\n\n{summary_text}");
         // Before the request section, so the message reads in the order things happened: what was
@@ -553,13 +564,23 @@ impl Agent {
         // was an agent spending rounds in the archive recovering the wording its own summary had
         // garbled. A tail that holds the prompt, or an earlier summary's quote of it, needs no
         // second copy; judged by the words themselves, since a kept tail can also open on a plain
-        // user message that is neither, such as the nudge after a thinking-only reply.
+        // user message that is neither, such as a nudge.
         if let Some(words) = request.request_in_flight.as_deref().filter(|words| {
             !to_keep
                 .iter()
                 .any(|message| carries_the_request(message, words))
         }) {
             context_message.push_str(&request_section(words));
+        }
+        // The open list, verbatim rather than through the summarizer, which paraphrases and can
+        // drop an item. The one time the model is shown the list unasked: compaction is the one
+        // event that takes the echoed list out of view in the middle of work, and the next time
+        // it would see the list otherwise is when it tries to stop.
+        if !live_checklist.items.is_empty() {
+            context_message.push_str(&format!(
+                "\n\n[Checklist]\n\n{}",
+                crate::checklist::format_checklist(&live_checklist).trim_end()
+            ));
         }
         if !post_context.is_empty() {
             context_message.push_str(&format!("\n\n[Post-compaction context]\n\n{post_context}"));
@@ -628,6 +649,7 @@ impl Agent {
             summary_user_message,
             to_keep.clone(),
             loaded_tools_snapshot,
+            checklist_snapshot,
         );
 
         // Persist the new compaction-boundary event and the re-appended tail. Pre-compaction rows
@@ -680,7 +702,7 @@ impl Agent {
         // is refused until the file is read again. Kept deliberately: whether the read survived
         // depends on where the kept tail was cut, and re-reading costs a call where trusting a
         // read that fell out of the window costs a blind edit.
-        self.reset_conversation_markers(messages.as_slice()).await;
+        self.reset_conversation_markers(messages).await;
 
         // Publish only after persistence, so a failed compaction cannot suppress a later update
         // about facts it never delivered. The continuing loop already has the full picture.
@@ -820,8 +842,10 @@ impl Agent {
         // conversation already ends with one, and only otherwise as a message of its own.
         //
         // `CompactOrigin::Proactive` is why: it fires after this turn's user message is appended,
-        // so blindly pushing would produce two consecutive user turns, which Anthropic rejects, and
-        // the failure would be near-silent because `compact_session` falls back to the summarizer.
+        // so blindly pushing would produce two consecutive user turns. The Messages API merges
+        // those into one today; a provider that did not would reject the request near-silently,
+        // because `compact_session` falls back to the summarizer, and the instruction reads as
+        // part of the message it follows either way.
         let available =
             prompt::AvailableTools::new(definitions.iter().map(|tool| tool.name.clone()));
         let instruction = checkpoint_instruction(request, &available);
@@ -1632,7 +1656,10 @@ mod tests {
         let (agent, store) = agent_with_checkpoint(provider, false).await;
         let prompt = "Read the entry to the end, then reply with exactly two lines.";
         let mut messages = a_turn_in_progress(prompt, 2);
-        messages.append(Message::user(crate::agent::turn::THINKING_ONLY_NUDGE));
+        messages.append(Message::nudge_message(
+            crate::conversation::NudgeKind::VisibleReply,
+            crate::conversation::THINKING_ONLY_NUDGE,
+        ));
         // Large enough that the nudge plus these two rounds clear the tail budget's floor, so the
         // window below sets the budget exactly.
         for _ in 0..2 {
@@ -1659,9 +1686,8 @@ mod tests {
             .find(|window| compaction_tail_budget(*window) == budget)
             .expect("a window whose tail budget is exactly this one");
         let (_, tail) = compute_compaction_split(messages.as_slice(), budget);
-        assert_eq!(
-            tail.first().map(|first| first.text_content()),
-            Some(crate::agent::turn::THINKING_ONLY_NUDGE.to_string()),
+        assert!(
+            tail.first().is_some_and(Message::is_nudge),
             "the fixture must put the nudge at the head of the tail"
         );
         agent.set_context_window_for_test(window);
@@ -1704,6 +1730,194 @@ mod tests {
         assert!(
             !summary.contains("[The request this turn is answering"),
             "{summary}"
+        );
+    }
+
+    /// The open checklist goes into the summary verbatim, from the cell, since the calls that
+    /// built it are what the summary replaces, and onto the boundary, which is where a replay
+    /// starts after it, with what a deferred item waits on, so a report arriving after the
+    /// compaction still finds the item on its task; an empty list adds nothing to either.
+    #[tokio::test]
+    async fn a_compaction_copies_the_open_checklist_into_the_summary_and_onto_the_boundary() {
+        use crate::checklist::ChecklistState;
+
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::from_rounds(vec![
+            text_round("the summary"),
+            text_round("the summary again"),
+        ]));
+        let (agent, store) = agent_with_checkpoint(provider, false).await;
+        let mut messages = a_turn_in_progress("a request that has been answered", 6);
+        // The list as the model built it, recorded in the conversation the way every list is,
+        // so the cell and the log agree as they do live.
+        let call = |id: &str, name: &str, input: serde_json::Value| Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input,
+            }],
+        };
+        let result = |id: &str| Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: vec![crate::conversation::ToolResultContent::Text {
+                    text: "ok".to_string(),
+                }],
+                is_error: false,
+            }],
+        };
+        messages.append(call(
+            "add-1",
+            "checklist_add",
+            serde_json::json!({"items": ["finish the report", "read the build log"]}),
+        ));
+        messages.append(result("add-1"));
+        messages.append(call(
+            "edit-1",
+            "checklist_edit",
+            serde_json::json!({
+                "id": 2, "status": "deferred", "reason": "building", "task": "1a2b3c4d"
+            }),
+        ));
+        messages.append(result("edit-1"));
+        messages.append(Message::assistant_text("done"));
+        agent.hydrate_checklist(&messages).await;
+        let live = agent.cells.checklist.get();
+        assert_eq!(live.items.len(), 2);
+
+        compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactOrigin::Reactive),
+        )
+        .await;
+
+        let summary = the_summary_message(&messages);
+        assert!(
+            summary.contains(
+                "[Checklist]\n\n- 1 (pending): finish the report\n- 2 (deferred until task \
+                 1a2b3c4d reports: building): read the build log"
+            ),
+            "{summary}"
+        );
+        assert_eq!(
+            crate::tools::checklist::replay_checklist(&messages),
+            live,
+            "the boundary and the kept tail replay to the list as it stood, task included"
+        );
+        assert_eq!(agent.cells.checklist.get(), live);
+        assert_eq!(live.items[1].reason.as_deref(), Some("building"));
+        assert_eq!(live.items[1].task.as_deref(), Some("1a2b3c4d"));
+
+        agent.cells.checklist.replace(ChecklistState::default());
+        messages.append(Message::user("and then"));
+        messages.append(Message::assistant_text("ok"));
+        compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactOrigin::Reactive),
+        )
+        .await;
+        assert!(
+            !the_summary_message(&messages).contains("[Checklist]"),
+            "{}",
+            the_summary_message(&messages)
+        );
+    }
+
+    /// The boundary carries the list as it stood before the kept tail, because the replay that
+    /// recovers the list starts there and applies the tail's calls after it. A boundary holding
+    /// the live list, which those calls already built, has the tail's add applied twice and its
+    /// edit refused: items the model never saw ids for, and a turn held open for them.
+    #[tokio::test]
+    async fn a_compaction_whose_kept_tail_holds_checklist_calls_does_not_apply_them_twice() {
+        let provider: Arc<dyn Provider> =
+            Arc::new(MockProvider::from_rounds(vec![text_round("the summary")]));
+        let (agent, store) = agent_with_checkpoint(provider, false).await;
+        let mut messages = Conversation::new();
+        // A head of rounds each wider than the tail budget at its floor, then a tail of two
+        // checklist rounds and a reply, so the kept tail is exactly those five messages.
+        for round in 0..4 {
+            messages.append(Message::user("q ".repeat(20_000)));
+            messages.append(Message::assistant_text(format!(
+                "earlier answer {round} {}",
+                "a ".repeat(20_000)
+            )));
+        }
+        let call = |id: &str, name: &str, input: serde_json::Value| Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input,
+            }],
+        };
+        let result = |id: &str| Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: vec![crate::conversation::ToolResultContent::Text {
+                    text: "ok".to_string(),
+                }],
+                is_error: false,
+            }],
+        };
+        messages.append(call(
+            "add-1",
+            "checklist_add",
+            serde_json::json!({"items": ["a", "b"]}),
+        ));
+        messages.append(result("add-1"));
+        messages.append(call(
+            "edit-1",
+            "checklist_edit",
+            serde_json::json!({"id": 1, "status": "completed"}),
+        ));
+        messages.append(result("edit-1"));
+        messages.append(Message::assistant_text("a is done"));
+        agent.hydrate_checklist(&messages).await;
+        let before = agent.cells.checklist.get();
+        assert_eq!(
+            before
+                .items
+                .iter()
+                .map(|item| (item.id, item.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "b")]
+        );
+        // The smallest window: its tail budget is the floor, which holds the five small tail
+        // messages and not the round before them.
+        let window = 40_000;
+        let (_, tail) =
+            compute_compaction_split(messages.as_slice(), compaction_tail_budget(window));
+        assert_eq!(tail.len(), 5, "the fixture keeps both checklist rounds");
+        agent.set_context_window_for_test(window);
+
+        compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactOrigin::Reactive),
+        )
+        .await;
+
+        let (boundary, _) = messages.checklist_baseline();
+        assert!(
+            boundary.items.is_empty(),
+            "the boundary holds the list as of the head, before the tail's add: {boundary:?}"
+        );
+        assert_eq!(
+            crate::tools::checklist::replay_checklist(&messages),
+            before,
+            "the replay from the boundary over the kept tail is the live list"
+        );
+        assert_eq!(agent.cells.checklist.get(), before);
+        assert!(
+            the_summary_message(&messages).contains("[Checklist]\n\n- 2 (pending): b"),
+            "and the summary shows the list as it stands"
         );
     }
 
@@ -2493,7 +2707,10 @@ mod tests {
             Message::assistant_text("continuing"),
             Message::user(format!("{HARNESS_NOTE} something meka said")),
             Message::assistant_text("ok"),
-            Message::user(crate::agent::turn::THINKING_ONLY_NUDGE),
+            Message::nudge_message(
+                crate::conversation::NudgeKind::VisibleReply,
+                crate::conversation::THINKING_ONLY_NUDGE,
+            ),
             Message::assistant_text("sorry"),
             Message::user("   \n  "),
             Message::assistant_text("nothing to answer"),

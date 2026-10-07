@@ -131,7 +131,7 @@ impl OpenAiChatCompletionsProvider {
         for message in messages {
             match message.role {
                 Role::User => {
-                    let has_tool_results = !message.opens_turn();
+                    let has_tool_results = message.carries_tool_results();
 
                     if has_tool_results {
                         for block in &message.content {

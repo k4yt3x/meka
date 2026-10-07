@@ -53,10 +53,10 @@ pub(crate) struct Agent {
     tool_registry: ToolRegistry,
     store: Store,
     options: AgentOptions,
-    /// Last todo state pushed to the frontend, so a no-op `todo_*` call (e.g. a rewrite with no
-    /// arguments, or a rewrite that changes nothing) doesn't re-render the list. Private to this
-    /// `Agent`; sub-agents route through `Agent::new` and so get their own.
-    last_rendered_todo: tokio::sync::RwLock<Option<crate::todo::TodoState>>,
+    /// Last checklist state pushed to the frontend, so a `checklist_*` call that changes nothing
+    /// doesn't re-render the list. Private to this `Agent`; sub-agents route through `Agent::new`
+    /// and so get their own.
+    last_rendered_checklist: tokio::sync::RwLock<Option<crate::checklist::ChecklistState>>,
     /// The tool/skill/MCP picture the model was last shown. `None` means "tell it everything": a
     /// fresh or rewound conversation. Compaction publishes the snapshot restored into its saved
     /// summary, so the continuing loop has that picture already.
@@ -194,7 +194,7 @@ impl Agent {
             options,
             tool_registry,
             store: materials.store.clone(),
-            last_rendered_todo: tokio::sync::RwLock::new(None),
+            last_rendered_checklist: tokio::sync::RwLock::new(None),
             last_rendered_world: tokio::sync::RwLock::new(None),
             current_turn: std::sync::Mutex::new(None),
             skills: materials.skills.clone(),
@@ -521,12 +521,18 @@ impl Agent {
     /// estimate of what is left, on the row as well, so `/status` and the next turn's ceiling
     /// check read the conversation as it is rather than as it was, until the provider measures.
     ///
+    /// The checklist is read back from the rewritten log, because the cell is only a copy of what
+    /// the conversation records: a rewind that dropped the turn an item was added in has dropped
+    /// the item, and a compaction carried the list on its boundary.
+    ///
     /// The one reset every door that rewrites the log calls: compaction, and a rewind on every
     /// host. A door that resets its own subset leaves the rest stale.
     pub(crate) async fn reset_conversation_markers(
         &self,
-        messages: &[crate::conversation::Message],
+        conversation: &crate::conversation::Conversation,
     ) {
+        let messages = conversation.as_slice();
+        self.hydrate_checklist(conversation).await;
         self.last_accepted_len
             .store(LAST_ACCEPTED_UNKNOWN, std::sync::atomic::Ordering::Relaxed);
         *self.last_rendered_world.write().await = None;
@@ -535,6 +541,32 @@ impl Agent {
         crate::sync::lock(&self.schema_advisories_sent).clear();
         self.record_context_tokens(self.cells.estimate_context_tokens(messages))
             .await;
+    }
+
+    /// Replace the checklist cell with what `conversation` records, and announce the list when
+    /// that changed what was last shown: a rewind that dropped the turn an item was added in has
+    /// dropped the item, and a resumed session is owed the list it was left with. Called wherever
+    /// the conversation and the cell can disagree: when a persisted session becomes resident, at
+    /// the start of every turn, and after every rewrite of the log. The dispatcher announces the
+    /// changes the tools make through the same marker, so neither door announces twice.
+    pub(crate) async fn hydrate_checklist(&self, conversation: &crate::conversation::Conversation) {
+        let state = crate::tools::checklist::replay_checklist(conversation);
+        self.cells.checklist.replace(state.clone());
+        let changed = {
+            let mut last = self.last_rendered_checklist.write().await;
+            // Nothing shown yet reads as an empty list, so a list emptied by its last disposition
+            // is nothing to announce, as on a fresh session.
+            let shown = last.clone().unwrap_or_default();
+            let changed = !state.shows_the_same_items(&shown);
+            *last = Some(state.clone());
+            changed
+        };
+        if changed {
+            self.cells
+                .frontend
+                .emit(FrontendEvent::ChecklistUpdated { items: state.items })
+                .await;
+        }
     }
 
     /// The compaction the next request is the first to follow, if any; see

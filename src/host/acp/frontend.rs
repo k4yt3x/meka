@@ -513,11 +513,10 @@ impl Frontend for AcpFrontend {
                 );
                 return;
             }
-            FrontendEvent::TodoListUpdated { items, .. } => {
-                // The `todo_*` tools' list maps onto ACP's plan panel. The REPL-only `title` has no
-                // `Plan` analog and is dropped. The agent loop (`agent/dispatch.rs`) never emits
-                // an emptied list, so a cleared plan is not pushed, as on the REPL.
-                SessionUpdate::Plan(Plan::new(todo_items_to_plan(&items)))
+            FrontendEvent::ChecklistUpdated { items } => {
+                // The checklist maps onto ACP's plan panel; an emptied list is an empty plan,
+                // which is how the panel clears once everything is disposed of.
+                SessionUpdate::Plan(Plan::new(checklist_to_plan(&items)))
             }
             FrontendEvent::TokenUsage(_) => {
                 // Mirror the REPL's context gauge as an ACP `usage_update` so editors (e.g. Zed)
@@ -554,7 +553,8 @@ impl Frontend for AcpFrontend {
             | FrontendEvent::TurnFinished
             | FrontendEvent::TurnEnded { .. }
             | FrontendEvent::PromptWithdrawn
-            | FrontendEvent::InboxDelivered { .. } => return,
+            | FrontendEvent::InboxDelivered { .. }
+            | FrontendEvent::Nudged { .. } => return,
         };
 
         self.send_update(update);
@@ -820,12 +820,22 @@ impl Frontend for AcpFrontend {
 /// read by a person looking at their own editor, where the product name needs no gloss, and by
 /// clients matching on the prefix, which a rename would break.
 pub(super) fn notice_update(notice: &crate::frontend::Notice) -> SessionUpdate {
-    let prefix = match notice.level {
-        crate::frontend::NoticeLevel::Info => "[meka]",
-        crate::frontend::NoticeLevel::Warn => "[meka warn]",
+    // A stage direction lands between the reply it annotates and the reply that follows, in one
+    // agent message the editor builds from chunks, so it has to bring its own paragraph breaks or
+    // the two replies read as one sentence with a note in the middle. An advisory is said the way
+    // it always was.
+    let text = match notice.kind {
+        crate::frontend::NoticeKind::StageDirection => format!("\n\n({})\n\n", notice.text),
+        crate::frontend::NoticeKind::Advisory => {
+            let prefix = match notice.level {
+                crate::frontend::NoticeLevel::Info => "[meka]",
+                crate::frontend::NoticeLevel::Warn => "[meka warn]",
+            };
+            format!("{prefix} {}", notice.text)
+        }
     };
     SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-        agent_client_protocol::schema::v1::TextContent::new(format!("{prefix} {}", notice.text)),
+        agent_client_protocol::schema::v1::TextContent::new(text),
     )))
 }
 /// Every argument of a call awaiting approval, as a fenced block for the prompt's content.
@@ -926,14 +936,14 @@ where
 /// MCP-loaded tools (named `mcp__server__tool`) and anything unknown fall through to `Other`.
 pub(super) fn tool_kind_for(name: &str) -> ToolKind {
     match name {
-        "file_read" | "todo_read" => ToolKind::Read,
+        "file_read" | "checklist_read" => ToolKind::Read,
         "file_edit" | "file_write" => ToolKind::Edit,
         "file_find" | "file_search" => ToolKind::Search,
         "shell_execute" => ToolKind::Execute,
         "web_fetch" => ToolKind::Fetch,
         // The list tools plan rather than touch anything, so a client never opens its diff view
         // for them.
-        "agent_spawn" | "todo_write" | "todo_edit" => ToolKind::Think,
+        "agent_spawn" | "checklist_add" | "checklist_edit" => ToolKind::Think,
         // skill, memory_*, scratchpad_*, image_render, tool_load, mcp__*, and any
         // future built-ins.
         _ => ToolKind::Other,
@@ -978,20 +988,27 @@ pub(super) fn sanitize_title(text: &str) -> String {
         format!("{truncated}…")
     }
 }
-/// Convert meka's `todo_*` list into ACP [`PlanEntry`] rows for [`SessionUpdate::Plan`]. meka's
-/// `Canceled` status has no ACP analog, so it maps to `Completed` ("no longer active") to keep
-/// the entry count stable against the model's own todo list. meka tracks no per-item priority, so
-/// every entry is reported as `Medium`.
-pub(super) fn todo_items_to_plan(items: &[TodoItem]) -> Vec<PlanEntry> {
+/// Convert meka's checklist into ACP [`PlanEntry`] rows for [`SessionUpdate::Plan`]. A deferred
+/// item is still open from the user's side and ACP has no fourth state, so it reports as
+/// `Pending`, with what it waits on in its text. Completed and canceled items have left the list,
+/// so the panel only ever shows what remains. meka tracks no per-item priority, so every entry is
+/// reported as `Medium`.
+pub(super) fn checklist_to_plan(items: &[ChecklistItem]) -> Vec<PlanEntry> {
     items
         .iter()
         .map(|item| {
             let status = match item.status {
-                TodoStatus::Pending => PlanEntryStatus::Pending,
-                TodoStatus::InProgress => PlanEntryStatus::InProgress,
-                TodoStatus::Completed | TodoStatus::Canceled => PlanEntryStatus::Completed,
+                ChecklistStatus::Pending | ChecklistStatus::Deferred => PlanEntryStatus::Pending,
+                ChecklistStatus::InProgress => PlanEntryStatus::InProgress,
             };
-            PlanEntry::new(item.text.clone(), PlanEntryPriority::Medium, status)
+            let content = match item.status {
+                ChecklistStatus::Deferred => {
+                    let reason = item.reason.as_deref().unwrap_or_default();
+                    format!("{} (deferred: {reason})", item.text)
+                }
+                ChecklistStatus::Pending | ChecklistStatus::InProgress => item.text.clone(),
+            };
+            PlanEntry::new(content, PlanEntryPriority::Medium, status)
         })
         .collect()
 }
@@ -1145,6 +1162,21 @@ pub(super) fn replay_session_updates(
     let mut open_tools: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for message in messages.as_slice() {
+        // A nudge is meka's words, not the person's: the live run said it as a stage direction,
+        // and the replay says the same, or nothing for the nudge after a reply with no visible
+        // text, as live. What rode behind it, an inbox item, is the person's and follows as a
+        // user chunk like any other text block.
+        if let Some(note) = crate::render::nudge_direction(message) {
+            send_session_update(
+                connection,
+                session_id,
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(format!(
+                        "\n\n({note})\n\n"
+                    )),
+                ))),
+            );
+        }
         match message.role {
             Role::User => {
                 for block in &message.content {

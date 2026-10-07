@@ -210,7 +210,7 @@ pub(crate) struct SessionCells {
     pub(crate) cwd: crate::workspace::SharedCwd,
     pub(crate) roots: crate::workspace::SharedRoots,
     pub(crate) session_id: SharedSessionId,
-    pub(crate) todo_list: crate::todo::SharedTodoList,
+    pub(crate) checklist: crate::checklist::SharedChecklist,
     /// What the session runs on, published so a switch reaches everything holding this.
     pub(crate) profile: crate::provider::PublishedProfile,
     /// Tokens in context after the last provider round; a frontend gauge holds the same cell.
@@ -236,7 +236,7 @@ pub(crate) struct SessionCells {
 }
 
 impl SessionCells {
-    /// The cells of a session that has not run yet: no session id, an empty todo list, fresh
+    /// The cells of a session that has not run yet: no session id, an empty checklist, fresh
     /// gauges, nothing in the background.
     pub(crate) fn new(
         permission: crate::permission::SharedPermission,
@@ -250,7 +250,7 @@ impl SessionCells {
             cwd,
             roots,
             session_id: SharedSessionId::default(),
-            todo_list: crate::todo::SharedTodoList::default(),
+            checklist: crate::checklist::SharedChecklist::default(),
             profile,
             context_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             context_reserved: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -779,6 +779,7 @@ mod tests {
                 summary: Message::user("[summary]"),
                 replaced_count: 2,
                 loaded_tools_snapshot: Default::default(),
+                checklist_snapshot: Default::default(),
             },
         ];
         for event in &root_events {
@@ -1385,6 +1386,7 @@ mod tests {
             user_msg("[Conversation summary from session compaction]\n\nYou discussed things."),
             vec![assistant_text("kept tail answer")],
             std::collections::HashSet::new(),
+            Default::default(),
         );
 
         let markdown = format_session_as_markdown(

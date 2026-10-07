@@ -1,10 +1,10 @@
 //! The `memory_*` tools: the agent's read/write access to its own durable notes
 //! ([`crate::memory`]).
 //!
-//! All four gate at [`Permission::Read`], matching `scratchpad_*` and `todo_*`: these write to a
-//! store meka owns in its own database, not to the user's tree, and the motivating deployment runs
-//! at read permission permanently. Gating them at `workspace` would mean an agent that can never
-//! remember anything, which defeats the feature.
+//! All four gate at [`Permission::Read`], matching `scratchpad_*` and `checklist_*`: these write to
+//! a store meka owns in its own database, not to the user's tree, and the motivating deployment
+//! runs at read permission permanently. Gating them at `workspace` would mean an agent that can
+//! never remember anything, which defeats the feature.
 //!
 //! [`crate::memory::validate_memory_name`] is checked at every door that *writes* a name. The name
 //! is not a path, so it is not a file-write primitive, but it is what `meka memory export` turns

@@ -53,7 +53,7 @@ pub(crate) struct SessionMatch {
 /// again. `the_definition_number_moves_with_the_words` pins the pair of this number and a digest
 /// of what a fixture of rows yields, so a change to the words without a bump, or a bump without a
 /// change, fails.
-const INDEXED_WORDS_DEFINITION: u32 = 3;
+const INDEXED_WORDS_DEFINITION: u32 = 4;
 
 /// The triggers the index needs, and the single place their text lives, so [`reconcile_index`]
 /// compares against exactly what it will write. A delete reaches the index through the first,
@@ -183,7 +183,7 @@ fn tiered_expressions(words: &[String]) -> Vec<String> {
 /// `conversation_search` tool also reads through, so what the index finds the tool can find.
 /// A user message keeps the words a person sent and not what meka put beside them: a stand-in
 /// meka wrote in place of content, and the header above an inbox item, are left out, the way the
-/// title leaves them out.
+/// title leaves them out, and a nudge is its own block, which is not text and so is not here.
 fn spoken_words(message: &Message) -> String {
     let from_a_person = message.role == Role::User;
     message
@@ -621,6 +621,32 @@ mod tests {
         id
     }
 
+    /// What meka wrote to send the model back to work is nobody's words: a search for a word the
+    /// nudge quoted from the list must not find the session by the nudge.
+    #[tokio::test]
+    async fn a_nudges_words_are_not_a_persons() {
+        let store = Store::for_test().await;
+        let nudged = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        store
+            .save_event(
+                nudged,
+                &Event::Append(Message::nudge_message(
+                    crate::conversation::NudgeKind::Checklist,
+                    "[Checklist: items are still open, so this turn is not over.]\n\nOpen:\n- 1 \
+                     (pending): feed the giraffes\n",
+                )),
+                None,
+            )
+            .await
+            .expect("save");
+        assert!(ids_found(&store, "giraffes").await.is_empty());
+        let spoken = session_saying(&store, &["we should feed the giraffes"]).await;
+        assert_eq!(ids_found(&store, "giraffes").await, vec![spoken]);
+    }
+
     async fn ids_found(store: &Store, query: &str) -> Vec<Uuid> {
         store
             .search_sessions(query, 10, false)
@@ -990,6 +1016,17 @@ mod tests {
                 }]),
             ),
             (
+                // A nudge, meka's words in a block of their own, which contributes nothing.
+                "user_blocks",
+                blocks(vec![ContentBlock::Nudge {
+                    kind: crate::conversation::NudgeKind::Checklist,
+                    text:
+                        "[Checklist: items are still open, so this turn is not over.]\n\nOpen:\n- 1 \
+                           (pending): the item\n"
+                            .to_string(),
+                }]),
+            ),
+            (
                 COMPACT_BOUNDARY_KIND,
                 // Shaped the way compaction writes one: a user message opening on the prefix,
                 // with a retained section between the markers, so the digest covers what a
@@ -1004,6 +1041,7 @@ mod tests {
                     )),
                     replaced_count: 2,
                     loaded_tools_snapshot: HashSet::new(),
+                    checklist_snapshot: Default::default(),
                 })
                 .expect("json"),
             ),
@@ -1015,7 +1053,7 @@ mod tests {
             .join("\u{1e}");
         assert_eq!(
             (INDEXED_WORDS_DEFINITION, digest(&words)),
-            (3, 11_673_021_996_248_275_489_u64),
+            (4, 10_743_907_157_442_872_453_u64),
             "the words a row contributes changed, or the definition number moved without them: \
              bump INDEXED_WORDS_DEFINITION and pin the new pair here (the words were: {words:?})"
         );
@@ -1039,6 +1077,7 @@ mod tests {
                     summary: Message::assistant_text("the summary mentions pelicans"),
                     replaced_count: 0,
                     loaded_tools_snapshot: HashSet::new(),
+                    checklist_snapshot: Default::default(),
                 },
                 None,
             )
@@ -1077,6 +1116,7 @@ mod tests {
             summary: Message::user(summary),
             replaced_count: 2,
             loaded_tools_snapshot: HashSet::new(),
+            checklist_snapshot: Default::default(),
         })
         .expect("json");
         let words = indexed_words(COMPACT_BOUNDARY_KIND, &content);

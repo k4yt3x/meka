@@ -213,10 +213,10 @@ fn encode_user_message(message: &Message, input: &mut Vec<serde_json::Value>) {
 
     for block in &message.content {
         match block {
-            // The context block is text on this wire too, ahead of the words.
-            ContentBlock::Text { text } | ContentBlock::TurnContext { text } => {
-                text_parts.push(text)
-            }
+            // The context block and a nudge are text on this wire too, ahead of the words.
+            ContentBlock::Text { text }
+            | ContentBlock::TurnContext { text }
+            | ContentBlock::Nudge { text, .. } => text_parts.push(text),
             // Responses takes `input_image` content parts on the user message. No model gate;
             // non-vision models return a clear error.
             ContentBlock::Image { source } => image_parts.push(input_image_part(source)),

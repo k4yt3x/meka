@@ -1,5 +1,5 @@
 //! Builds the system prompt and per-turn context: permission state, environment info (PWD, date,
-//! shell, OS), todo list, tool catalog, and skill summaries.
+//! shell, OS), tool catalog, and skill summaries.
 //!
 //! The split between the two is a caching decision, not an organizational one. Prompt caching is
 //! prefix-based and the system prompt heads that prefix, so anything rendered into it that later
@@ -12,7 +12,6 @@
 //! - **permission level** and the tools it blocks: `/permission` and Shift+Tab change it mid-turn.
 //! - **cwd and workspace roots**: `/cd`, `--writable-root`, and an ACP client re-sending
 //!   `additionalDirectories`.
-//! - **todo list**: rewritten by the `todo_*` tools.
 //! - **tools, skills, MCP server instructions** ([`WorldSnapshot`]): skills are re-read from disk
 //!   every turn, MCP servers connect late and can hot-swap their tool lists.
 //!
@@ -22,7 +21,7 @@ mod world;
 
 pub(crate) use self::world::render_world_state;
 use self::world::*;
-use crate::{permission::Permission, store::ScratchpadEntry, todo::TodoState};
+use crate::{permission::Permission, store::ScratchpadEntry};
 
 /// A tool's entry in the catalog rendered into the per-turn `<context>` block. Tuple:
 /// `(name, description, required_permission, is_deferred)`. Produced by
@@ -901,7 +900,7 @@ pub(crate) fn build_system_prompt(inputs: SystemPromptInputs<'_>) -> String {
          describe calls, not permission to execute them.\n\n\
          - `none`: no tool calls without approval.\n\
          - `read`: tools classified `read`, including updates to meka-managed memory, scratchpad \
-         entries, and todo state.\n\
+         entries, and the checklist.\n\
          - `workspace`: file and shell writes stay inside the listed workspace roots. An MCP \
          tool that needs more than `workspace` runs in its server's own process, which cannot be \
          confined, so its call needs approval or is refused.\n\
@@ -1129,6 +1128,114 @@ pub(crate) fn render_inbox_item(item: &crate::store::inbox::InboxItem, mid_turn:
     format!("{header}\n{}", item.body)
 }
 
+/// The message the turn loop appends when the model stops with checklist items open: the items
+/// that bind the turn, the other deferred ones for reference, and the ways out. The items are the
+/// model's own words, so they ride as they are; what the message withholds is permission to stop.
+///
+/// It says reasons are recorded and nothing stronger: a client over the HTTP API or a bridge may
+/// show neither the list nor the feed, so "the user will see" would be a promise meka cannot keep.
+pub(crate) fn render_checklist_nudge(
+    state: &crate::checklist::ChecklistState,
+    reported: &[crate::checklist::ReportedTask],
+) -> String {
+    use crate::checklist::{format_item, format_reopened_item, is_open, reported_task};
+
+    let mut text =
+        String::from("[Checklist: items are still open, so this turn is not over.]\n\nOpen:\n");
+    for item in state.open_items(reported) {
+        text.push_str(&match reported_task(item, reported) {
+            Some(task) => format_reopened_item(item, task),
+            None => format_item(item),
+        });
+        text.push('\n');
+    }
+    let waiting: Vec<&crate::checklist::ChecklistItem> = state
+        .items
+        .iter()
+        .filter(|item| !is_open(item, reported))
+        .collect();
+    if !waiting.is_empty() {
+        text.push_str("\nDeferred, for reference:\n");
+        for item in waiting {
+            text.push_str(&format_item(item));
+            text.push('\n');
+        }
+    }
+    text.push_str(
+        "\nFor each open item, keep working until it is done, or set it with checklist_edit: \
+         completed, canceled with a reason, or deferred with a reason and, when it waits on a \
+         background task, that task. Defer only what cannot proceed now because it waits on a \
+         person, an event or an explicit later, never because it is hard or tedious. Reasons are \
+         recorded. Then answer.",
+    );
+    text
+}
+
+#[cfg(test)]
+mod checklist_nudge_tests {
+    use crate::checklist::{
+        ChecklistState, ChecklistStatus, ItemEdit, NewItem, ReportedTask, StatusWord,
+    };
+
+    /// The nudge opens with the prefix the conversation reads back, lists the open items with
+    /// what reopened a deferred one, keeps the items still waiting for reference, and names the
+    /// three ways out without promising the user will see a reason.
+    #[test]
+    fn the_nudge_lists_what_is_open_and_what_waits_and_the_ways_out() {
+        let mut state = ChecklistState::default();
+        state.add(
+            ["write the tests", "read the build log", "ask Sam"]
+                .into_iter()
+                .map(|text| NewItem {
+                    text: text.to_string(),
+                    status: ChecklistStatus::Pending,
+                })
+                .collect(),
+        );
+        state
+            .edit(ItemEdit {
+                id: 2,
+                status: Some(StatusWord::Deferred),
+                reason: Some("building".to_string()),
+                task: Some("1a2b3c4d".to_string()),
+                text: None,
+            })
+            .expect("deferred on a task");
+        state
+            .edit(ItemEdit {
+                id: 3,
+                status: Some(StatusWord::Deferred),
+                reason: Some("waiting on Sam".to_string()),
+                task: None,
+                text: None,
+            })
+            .expect("deferred");
+        let reported = vec![ReportedTask {
+            id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+            ended: "failed",
+        }];
+        let nudge = super::render_checklist_nudge(&state, &reported);
+        assert!(nudge.starts_with("[Checklist:"), "{nudge}");
+        assert!(
+            nudge.contains(
+                "Open:\n- 1 (pending): write the tests\n- 2 (task 1a2b3c4d failed, so this \
+                 item is open again; was deferred: building): read the build log\n"
+            ),
+            "{nudge}"
+        );
+        assert!(
+            nudge.contains("Deferred, for reference:\n- 3 (deferred: waiting on Sam): ask Sam\n"),
+            "{nudge}"
+        );
+        assert!(
+            nudge.contains("completed, canceled with a reason, or deferred with a reason")
+                && nudge.ends_with("Reasons are recorded. Then answer."),
+            "{nudge}"
+        );
+        assert!(!nudge.contains("the user will see"), "{nudge}");
+    }
+}
+
 /// What the per-turn preamble describes: the session as it stands when the turn starts.
 pub(crate) struct TurnContext<'a> {
     pub(crate) permission: Permission,
@@ -1139,7 +1246,6 @@ pub(crate) struct TurnContext<'a> {
     pub(crate) vision: bool,
     /// A one-shot host cannot collect approvals, whatever the switch says.
     pub(crate) one_shot: bool,
-    pub(crate) todos: &'a TodoState,
     pub(crate) cwd: &'a std::path::Path,
     pub(crate) roots: &'a [std::path::PathBuf],
     pub(crate) world_state: &'a str,
@@ -1151,7 +1257,7 @@ pub(crate) struct TurnContext<'a> {
 }
 
 /// Build the `<context>...</context>` block that wraps per-turn user input with permission state,
-/// the active todo list, environment info, and any world-state change. The `[Permission context]`
+/// environment info, and any world-state change. The `[Permission context]`
 /// section is always included so the model sees the current level on every turn.
 ///
 /// `world_state` comes from [`render_world_state`] and is empty on a turn where nothing changed,
@@ -1163,7 +1269,6 @@ pub(crate) fn build_turn_context(context: TurnContext<'_>) -> String {
         approvals,
         vision,
         one_shot,
-        todos,
         cwd,
         roots,
         world_state,
@@ -1194,10 +1299,6 @@ pub(crate) fn build_turn_context(context: TurnContext<'_>) -> String {
         && let Some(rendered) = budget.render()
     {
         sections.push(rendered);
-    }
-
-    if !todos.items.is_empty() {
-        sections.push(crate::todo::format_todo_state(todos));
     }
 
     if !background.is_empty() {
@@ -1237,11 +1338,12 @@ pub(crate) fn build_turn_context(context: TurnContext<'_>) -> String {
 const RESUMED_SECTION: &str = "[Session resumed]\nThis conversation was loaded from disk. The \
                                turns above happened, but state a tool was holding outside the \
                                conversation may not have survived. Files you read are no longer \
-                               recorded as read, so read one again before editing it. MCP servers \
-                               may have reconnected, dropping anything they were holding for you: \
-                               a loaded database, an authenticated session, a subscription. \
-                               Re-establish what you need rather than assuming a call from \
-                               earlier still holds.\n";
+                               recorded as read, so read one again before editing it. Your \
+                               checklist stands as the conversation records it; do not add its \
+                               items again. MCP servers may have reconnected, dropping anything \
+                               they were holding for you: a loaded database, an authenticated \
+                               session, a subscription. Re-establish what you need rather than \
+                               assuming a call from earlier still holds.\n";
 
 /// How much of the context window the conversation is occupying, as the model is told it.
 ///
@@ -2174,13 +2276,6 @@ mod tests {
             !diff.contains("Skills"),
             "reordering must not read as an added or removed skill, got:\n{diff}"
         );
-    }
-
-    fn sample_todo(text: &str, status: crate::todo::TodoStatus) -> crate::todo::TodoItem {
-        crate::todo::TodoItem {
-            text: text.to_string(),
-            status,
-        }
     }
 
     fn sample_catalog() -> Vec<ToolCatalogEntry> {
@@ -3831,7 +3926,7 @@ mod tests {
         assert!(!background_index_is_live(&sample_catalog()));
     }
 
-    /// Running tasks render every turn from live state, beside the todo list, not through the
+    /// Running tasks render every turn from live state, not through the
     /// world-state diff. See [`render_background_section`] for why.
     #[test]
     fn background_section_lists_running_tasks() {
@@ -3840,7 +3935,6 @@ mod tests {
             one_shot: false,
             permission: Permission::Read,
             approvals: false,
-            todos: &TodoState::default(),
             cwd: std::path::Path::new("."),
             roots: &[],
             world_state: "",
@@ -3861,7 +3955,6 @@ mod tests {
             one_shot: false,
             permission: Permission::Read,
             approvals: false,
-            todos: &TodoState::default(),
             cwd: std::path::Path::new("."),
             roots: &[],
             world_state: "",
@@ -3885,7 +3978,6 @@ mod tests {
             one_shot: false,
             permission: Permission::Read,
             approvals: false,
-            todos: &TodoState::default(),
             cwd: std::path::Path::new("."),
             roots: &[],
             world_state: "",
@@ -4238,7 +4330,6 @@ mod tests {
             one_shot: false,
             permission: Permission::None,
             approvals: false,
-            todos: &TodoState::default(),
             cwd: std::path::Path::new("."),
             roots: &[],
             world_state: "",
@@ -4265,7 +4356,6 @@ mod tests {
             one_shot: false,
             permission: Permission::None,
             approvals: false,
-            todos: &TodoState::default(),
             cwd: std::path::Path::new("."),
             roots: &[],
             world_state: "",
@@ -4384,7 +4474,6 @@ mod tests {
             one_shot: false,
             permission: Permission::Read,
             approvals: false,
-            todos: &TodoState::default(),
             cwd: std::path::Path::new("."),
             roots: &[],
             world_state: "[Skills]\nnone",
@@ -4408,7 +4497,6 @@ mod tests {
             one_shot: false,
             permission: Permission::Read,
             approvals: false,
-            todos: &TodoState::default(),
             cwd: std::path::Path::new("."),
             roots: &[],
             world_state: "",
@@ -4432,7 +4520,6 @@ mod tests {
             one_shot: false,
             permission: Permission::Read,
             approvals: false,
-            todos: &TodoState::default(),
             cwd: std::path::Path::new("."),
             roots: &[],
             world_state: "",
@@ -4443,48 +4530,15 @@ mod tests {
         });
         assert!(context.contains("[Permission context]"));
         assert!(context.contains("[Environment context]"));
-    }
-
-    #[test]
-    fn turn_context_includes_todos() {
-        let todos = TodoState {
-            items: vec![sample_todo(
-                "write tests",
-                crate::todo::TodoStatus::InProgress,
-            )],
-            ..Default::default()
-        };
-        let context = build_turn_context(TurnContext {
-            vision: true,
-            one_shot: false,
-            permission: Permission::Read,
-            approvals: false,
-            todos: &todos,
-            cwd: std::path::Path::new("."),
-            roots: &[],
-            world_state: "",
-            budget: None,
-            background: &[],
-            outcomes: None,
-            resumed: false,
-        });
-        assert!(context.contains("write tests"));
-        assert!(context.contains("[Environment context]"));
-        assert!(context.contains("[Permission context]"));
     }
 
     #[test]
     fn turn_context_none_mode_omits_environment() {
-        let todos = TodoState {
-            items: vec![sample_todo("do a thing", crate::todo::TodoStatus::Pending)],
-            ..Default::default()
-        };
         let context = build_turn_context(TurnContext {
             vision: true,
             one_shot: false,
             permission: Permission::None,
             approvals: false,
-            todos: &todos,
             cwd: std::path::Path::new("."),
             roots: &[],
             world_state: "",
@@ -4493,7 +4547,6 @@ mod tests {
             outcomes: None,
             resumed: false,
         });
-        assert!(context.contains("do a thing"));
         assert!(context.contains("[Permission context]"));
         assert!(!context.contains("[Environment context]"));
     }

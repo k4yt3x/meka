@@ -610,9 +610,9 @@ model = "claude-sonnet-4-5"
     );
 }
 
-/// A `todo_write` call surfaces as a `plan` session/update with one entry per item.
+/// A `checklist_add` call surfaces as a `plan` session/update with one entry per item.
 #[test]
-fn acp_todo_tool_emits_plan_update() {
+fn acp_checklist_tool_emits_plan_update() {
     let config_toml = r#"
 [accounts.mock]
 backend = "anthropic-messages"
@@ -627,10 +627,10 @@ model = "claude-sonnet-4-5"
             serde_json::json!([
                 [
                     { "type": "text", "text": "planning...\n" },
-                    { "type": "tool_use_start", "id": "call_todo", "name": "todo_write" },
+                    { "type": "tool_use_start", "id": "call_checklist", "name": "checklist_add" },
                     {
                         "type": "tool_use_end",
-                        "input": { "title": "Work", "items": ["First", "Second"] }
+                        "input": { "items": ["First", "Second"] }
                     },
                     { "type": "message_end", "stop_reason": "tool_use" }
                 ],
@@ -1056,6 +1056,20 @@ model = "claude-sonnet-4-5"
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
+            { "type": "tool_use_start", "id": "call_2", "name": "checklist_add" },
+            { "type": "tool_use_end", "input": { "items": ["write the tests"] } },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "I have planned it." },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "tool_use_start", "id": "call_3", "name": "checklist_edit" },
+            { "type": "tool_use_end", "input": { "id": 1, "status": "completed" } },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
             { "type": "text", "text": "done!" },
             { "type": "message_end", "stop_reason": "end_turn" }
         ]
@@ -1063,6 +1077,8 @@ model = "claude-sonnet-4-5"
     install.write_script(&script);
 
     // First run: drive one prompt to populate the session, capture sessionId, then exit cleanly.
+    // The turn is nudged once on the way (the reply after `checklist_add` leaves the item open),
+    // so the persisted conversation holds a nudge for the replay below to account for.
     let session_id = {
         let mut child = install
             .meka(&["acp"])
@@ -1185,6 +1201,7 @@ model = "claude-sonnet-4-5"
 
     let mut saw_user_chunk = false;
     let mut saw_agent_chunk = false;
+    let mut saw_nudge_direction = false;
     let mut saw_tool_call = false;
     let mut saw_tool_call_update_completed = false;
     let mut load_response: Option<serde_json::Value> = None;
@@ -1196,10 +1213,29 @@ model = "claude-sonnet-4-5"
         if value["method"] == "session/update" {
             let update = &value["params"]["update"];
             match update["sessionUpdate"].as_str() {
-                Some("user_message_chunk") => saw_user_chunk = true,
-                Some("agent_message_chunk") => saw_agent_chunk = true,
+                Some("user_message_chunk") => {
+                    saw_user_chunk = true;
+                    let text = update["content"]["text"].as_str().unwrap_or_default();
+                    assert!(
+                        !text.starts_with("[Checklist:"),
+                        "the nudge is meka's words, never replayed as the user's: {line}"
+                    );
+                }
+                Some("agent_message_chunk") => {
+                    saw_agent_chunk = true;
+                    if update["content"]["text"].as_str().is_some_and(|text| {
+                        text.contains("(checklist: items still open, continuing)")
+                    }) {
+                        saw_nudge_direction = true;
+                    }
+                }
                 Some("tool_call") => {
-                    assert_eq!(update["kind"], "read");
+                    if update["title"]
+                        .as_str()
+                        .is_some_and(|title| title.starts_with("file_read"))
+                    {
+                        assert_eq!(update["kind"], "read");
+                    }
                     saw_tool_call = true;
                 }
                 Some("tool_call_update") if update["status"] == "completed" => {
@@ -1228,6 +1264,11 @@ model = "claude-sonnet-4-5"
     assert!(
         saw_agent_chunk,
         "replay must emit agent_message_chunk; stream:\n{}",
+        dump()
+    );
+    assert!(
+        saw_nudge_direction,
+        "the replayed nudge is the stage direction the live run showed; stream:\n{}",
         dump()
     );
     assert!(

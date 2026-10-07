@@ -249,7 +249,7 @@ pub(crate) fn profile_choices(materials: &crate::session::SessionMaterials) -> V
 /// `profile_choices` is what the `profile` parameter offers; empty, the parameter is absent.
 pub(crate) fn agent_spawn_definition(profile_choices: &[String]) -> ToolDefinition {
     let mut description = "Assign a self-contained task to a sub-agent and receive its report. \
-        It has a private conversation, todo list, and scratchpad; filesystem changes are shared. \
+        It has a private conversation, checklist, and scratchpad; filesystem changes are shared. \
         Supply `prompt`, `skill`, or both. Grant needed context explicitly with `inherit_scratchpad`, \
         `memory`, or `instructions`. Independent calls run concurrently; assign separate work to \
         avoid conflicting edits. Permission and denial restrictions cannot exceed your own grants."
@@ -1558,7 +1558,7 @@ impl Tool for AgentFollowupTool {
 
         // Rehydrate the worker's own conversation through the door every resume uses.
         // `from_events` arms the resume notice, and it is left armed deliberately: every
-        // follow-up really is a fresh registry, a fresh read tracker and an empty todo list, so the
+        // follow-up really is a fresh registry and a fresh read tracker, so the
         // worker is being told something true each time rather than a stale banner.
         let mut messages = self
             .tool_builder_params
@@ -1818,10 +1818,10 @@ async fn build_subagent(
         InstructionAccess::Inherit => params.parent_options.user_instructions.clone(),
         InstructionAccess::None => None,
     };
-    // A fresh, private todo list so the worker's `todo_*` calls don't touch the parent's task
-    // tracking. Not persisted, so a follow-up starts with an empty one; the resume notice the
-    // rehydrated conversation carries is what tells the worker its tool state is gone.
-    let sub_todo_list = crate::todo::SharedTodoList::default();
+    // A fresh, private checklist so the worker's `checklist_*` calls don't touch the parent's.
+    // Empty here; the worker's first turn reads it back from its own conversation, so a
+    // follow-up still owes what the worker left open.
+    let sub_checklist = crate::checklist::SharedChecklist::default();
     let sub_shared_session_id = crate::session::SharedSessionId::new(Some(sub_session_id));
     // Wrap so permission prompts surface in the parent's UI while emits stay silent (the
     // sub-agent's output flows back as this tool's result, not as live notifications). The one
@@ -1842,7 +1842,7 @@ async fn build_subagent(
         cwd: workspace.cwd,
         roots: workspace.roots,
         session_id: sub_shared_session_id,
-        todo_list: sub_todo_list,
+        checklist: sub_checklist,
         profile: crate::provider::PublishedProfile::detached(&binding),
         context_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         context_reserved: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2179,7 +2179,7 @@ fn build_subagent_system_prompt(
     prompt.push_str(
         "\n## Assignment\n\n\
          You were spawned by a parent agent, which receives your final reply as a report; nothing \
-         you ask is answered before then. Your conversation, todo list and scratchpad entries are \
+         you ask is answered before then. Your conversation, checklist and scratchpad entries are \
          private; filesystem changes are shared within your granted workspace.",
     );
     if has_instructions {
@@ -2557,14 +2557,14 @@ mod tests {
     // suites.)
 
     #[tokio::test]
-    async fn subagent_registry_has_independent_todo_list() {
+    async fn subagent_registry_has_an_independent_checklist() {
         use crate::{
             config::BuiltinToolFilter,
             sandbox::{BackendProbe, SandboxCapability},
         };
 
-        let parent_list = crate::todo::SharedTodoList::default();
-        let sub_list = crate::todo::SharedTodoList::default();
+        let parent_list = crate::checklist::SharedChecklist::default();
+        let sub_list = crate::checklist::SharedChecklist::default();
 
         let sub_registry = ToolRegistry::build_for_subagent(
             &crate::session::SessionMaterials {
@@ -2590,7 +2590,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: crate::session::SharedSessionId::default(),
-                todo_list: sub_list.clone(),
+                checklist: sub_list.clone(),
                 ..crate::session::SessionCells::for_test(
                     SharedPermission::new(
                         Permission::Read,
@@ -2612,15 +2612,15 @@ mod tests {
         )
         .expect("subagent registry should build");
 
-        let todo = sub_registry
-            .get("todo_write")
-            .expect("subagent should have todo_write");
-        todo.execute(
-            serde_json::json!({ "title": "Sub work", "items": ["sub task"] }),
+        let add = sub_registry
+            .get("checklist_add")
+            .expect("subagent should have checklist_add");
+        add.execute(
+            serde_json::json!({ "items": ["sub task"] }),
             crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
-        .expect("todo should succeed");
+        .expect("the add should succeed");
 
         assert_eq!(sub_list.get().items.len(), 1);
         assert!(
@@ -2978,6 +2978,72 @@ mod tests {
     /// The whole Phase 4 loop against a scripted provider: spawn returns an id, `agent_list`
     /// reports the worker, a follow-up sees the first turn's history, and `agent_delete`
     /// removes it.
+    /// A worker is held to its own list on its own turn: the nudge and the cap play out inside
+    /// the spawn, and nothing of it reaches the parent's surface, whose list is the parent's.
+    #[tokio::test]
+    async fn a_worker_is_nudged_on_its_own_list_and_its_parent_sees_none_of_it() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent session");
+        let parent_session = crate::session::SharedSessionId::new(Some(parent_sid));
+        // The worker adds an item and then answers four times without touching it: three nudges,
+        // then the cap lets the turn end.
+        let mut rounds = vec![vec![
+            crate::provider::mock::MockEvent::ToolUseStart {
+                id: "add-1".to_string(),
+                name: "checklist_add".to_string(),
+            },
+            crate::provider::mock::MockEvent::ToolUseEnd {
+                input: serde_json::json!({"items": ["reply pong"]}),
+            },
+            crate::provider::mock::MockEvent::MessageEnd {
+                stop_reason: crate::provider::mock::MockStopReason::ToolUse,
+            },
+        ]];
+        rounds.extend((0..4).map(|_| text_round("pong")));
+        let provider: Arc<dyn Provider> =
+            Arc::new(crate::provider::mock::MockProvider::from_rounds(rounds));
+        let recorder = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        let mut params = params_for_test(store.clone(), parent_session);
+        params.cells.frontend = Arc::clone(&recorder) as Arc<dyn crate::frontend::Frontend>;
+        let spawn = spawn_tool_for(params, provider);
+
+        let agent_id = spawned(&spawn, serde_json::json!({ "prompt": "reply pong" })).await;
+
+        let conversation = store
+            .load_conversation(agent_id)
+            .await
+            .expect("the worker's conversation");
+        let nudges = conversation
+            .as_slice()
+            .iter()
+            .filter(|message| message.is_nudge())
+            .count();
+        assert_eq!(nudges, 3, "{:?}", conversation.as_slice());
+        let leaked: Vec<String> = recorder
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                crate::frontend::FrontendEvent::Notice(notice)
+                    if notice.text.starts_with("checklist:") =>
+                {
+                    Some(notice.text.clone())
+                }
+                crate::frontend::FrontendEvent::ChecklistUpdated { .. } => {
+                    Some("a checklist update".to_string())
+                }
+                crate::frontend::FrontendEvent::Nudged { .. } => Some("a nudge".to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "the worker's list is its own: {leaked:?}"
+        );
+    }
+
     #[tokio::test]
     async fn spawn_followup_and_delete_round_trip() {
         let store = store_for_test().await;
@@ -7039,7 +7105,7 @@ mod tests {
             absolute_depth: 0,
         };
         let output = spawn.execute(serde_json::json!({"prompt":"Review the fixture", "memory":"read",
-            "deny_servers":["hidden"], "deny_tools":["todo_write","todo_edit","todo_read","memory_search"]}),
+            "deny_servers":["hidden"], "deny_tools":["checklist_add","checklist_edit","checklist_read","memory_search"]}),
             crate::tools::ToolContext::detached(CancellationToken::new())).await.expect("spawn");
         assert!(!output.is_error, "{}", output.text_content());
         let requests = mock.streams();
@@ -7073,7 +7139,12 @@ mod tests {
                 "{context}"
             );
             assert!(!context.contains("HIDDEN SERVER GUIDANCE"), "{context}");
-            for name in ["todo_write", "todo_edit", "todo_read", "memory_search"] {
+            for name in [
+                "checklist_add",
+                "checklist_edit",
+                "checklist_read",
+                "memory_search",
+            ] {
                 assert!(
                     !request.system_prompt.contains(name),
                     "{}",

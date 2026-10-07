@@ -348,17 +348,19 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
             .send(crate::host::http::webhook::WebhookEvent::InboxFailed, data);
     }
 
-    /// A notice rather than a user message, since this surface has no user-message event. It
-    /// reaches a stream when one is live and the recorder otherwise, where `finished` drains it;
-    /// what it buys today is that every host shows the prompt the same way, so a push channel
-    /// added later inherits it.
+    /// The prompt's text as a notice, since this surface has no user-message event and a client
+    /// mirroring the conversation wants the words the turn answers; the REPL, which shows the
+    /// person no prompt they did not type, announces the turn's opener instead. It reaches a
+    /// stream when one is live and the recorder otherwise, where `finished` drains it.
     fn show_prompt(
         &self,
         entry: &Self::Entry,
         prompt: crate::host::scheduler::OutOfBandPrompt<'_>,
     ) {
         let text = match prompt {
-            crate::host::scheduler::OutOfBandPrompt::Outcomes(text) => text.to_string(),
+            crate::host::scheduler::OutOfBandPrompt::Outcomes(tasks) => {
+                crate::background::render_outcomes(tasks)
+            }
             crate::host::scheduler::OutOfBandPrompt::Scheduled(wakeup) => wakeup.render_prompt(),
         };
         entry

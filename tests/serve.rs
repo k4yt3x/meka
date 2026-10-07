@@ -16368,3 +16368,461 @@ fn the_server_feed_announces_a_sub_agents_run() {
         "the worker's deletion is announced, ahead of its parent's: {rest}"
     );
 }
+
+/// The checklist's hold on a turn, end to end: the feed carries every change to the list and the
+/// nudge itself, the notice that keeps the turn going is announced ahead of the terminal, the
+/// blocking response carries the nudge among the turn's messages in the shape `GET /messages`
+/// reads them back, and the record carries the open list.
+#[test]
+fn a_turn_that_stops_with_an_open_item_continues_and_the_feed_says_so() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "checklist_add" },
+            { "type": "tool_use_end", "input": {"items": ["write the tests"]} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "I have planned it." },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "tool_use_start", "id": "tu_2", "name": "checklist_edit" },
+            { "type": "tool_use_end", "input": {"id": 1, "status": "completed"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "Done." },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("send");
+    let created: serde_json::Value = create.json().expect("parse");
+    let id = created["id"].as_str().expect("id").to_string();
+    assert_eq!(
+        created["checklist"],
+        serde_json::json!([]),
+        "a fresh session the server holds carries an empty list: {created}"
+    );
+
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(10));
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "plan and do it", "stream": false}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().expect("parse");
+    assert_eq!(body["stop_reason"], "end_turn");
+    // The messages are what the turn added, as `GET /messages` shows them: the reply the nudge
+    // answered, the nudge as a user-role message, the round it caused, and the reply after it.
+    let shape: Vec<(String, String)> = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|message| {
+            (
+                message["role"].as_str().expect("role").to_string(),
+                message["content"][0]["type"]
+                    .as_str()
+                    .expect("block type")
+                    .to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            ("assistant", "tool_use"),
+            ("user", "tool_result"),
+            ("assistant", "text"),
+            ("user", "nudge"),
+            ("assistant", "tool_use"),
+            ("user", "tool_result"),
+            ("assistant", "text"),
+        ]
+        .map(|(role, kind)| (role.to_string(), kind.to_string())),
+        "{body}"
+    );
+    assert_eq!(
+        message_text(&body["messages"][2]),
+        "I have planned it.",
+        "{body}"
+    );
+    assert!(
+        message_text(&body["messages"][3]).starts_with("[Checklist:"),
+        "{body}"
+    );
+    assert_eq!(message_text(&body["messages"][6]), "Done.", "{body}");
+    assert_eq!(
+        body["notices"],
+        serde_json::json!([{"level": "info", "text": "checklist: 1 open item, continuing, nudge 1 of 3"}]),
+        "{body}"
+    );
+    let history: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let nudges = history["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|message| {
+            message["role"] == "user" && message_text(message).starts_with("[Checklist:")
+        })
+        .count();
+    assert_eq!(
+        nudges, 1,
+        "the nudge is a message of the conversation: {history}"
+    );
+    assert!(
+        history["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .all(|message| message["turn_label"] == "t_0001"),
+        "the nudge continues the turn rather than labeling a new one: {history}"
+    );
+
+    let feed_body = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+    let updates: Vec<&str> = feed_body
+        .split("event: checklist.updated\n")
+        .skip(1)
+        .filter_map(|rest| rest.lines().next())
+        .collect();
+    assert_eq!(updates.len(), 2, "one update per change: {feed_body}");
+    assert!(updates[0].contains("write the tests"), "{}", updates[0]);
+    assert!(
+        updates[1].contains("\"items\":[]"),
+        "the emptied list is announced: {}",
+        updates[1]
+    );
+    let notice_at = feed_body
+        .find("checklist: 1 open item, continuing, nudge 1 of 3")
+        .unwrap_or_else(|| panic!("the nudge is announced: {feed_body}"));
+    let finished_at = feed_body.find("event: turn.finished").expect("terminal");
+    assert!(notice_at < finished_at, "the notice precedes the terminal");
+    let nudged = sse_event_data(&feed_body, "turn.nudged")
+        .unwrap_or_else(|| panic!("the feed carries the nudge itself: {feed_body}"));
+    assert!(
+        nudged["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("[Checklist:")),
+        "{nudged}"
+    );
+
+    let record: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(record["checklist"], serde_json::json!([]), "{record}");
+}
+
+/// A session made resident reads its checklist back from the conversation before any turn runs
+/// on it: the fork's own response carries the items the source left open, as does the record
+/// read after it.
+#[test]
+fn a_fork_carries_the_checklist_its_source_left_open() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "checklist_add" },
+            { "type": "tool_use_end", "input": {"items": ["ask Sam", "book the room"]} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "tool_use_start", "id": "tu_2", "name": "checklist_edit" },
+            { "type": "tool_use_end", "input": {"id": 1, "status": "deferred", "reason": "waiting on Sam"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "tool_use_start", "id": "tu_3", "name": "checklist_edit" },
+            { "type": "tool_use_end", "input": {"id": 2, "status": "deferred", "reason": "after Sam answers"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "Waiting on Sam." },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("send");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let turn = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "plan it", "stream": false}))
+        .send()
+        .expect("send");
+    assert_eq!(turn.status(), 200);
+
+    let fork = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/fork"))
+        .send()
+        .expect("send");
+    assert_eq!(fork.status(), 201);
+    let forked: serde_json::Value = fork.json().expect("parse");
+    let fork_id = forked["id"].as_str().expect("id").to_string();
+    let expected = serde_json::json!([
+        {"id": 1, "text": "ask Sam", "status": "deferred", "reason": "waiting on Sam"},
+        {"id": 2, "text": "book the room", "status": "deferred", "reason": "after Sam answers"}
+    ]);
+    assert_eq!(forked["checklist"], expected, "{forked}");
+    let record: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{fork_id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(record["checklist"], expected, "{record}");
+}
+
+/// The whole arc over the server, with the poller doing the delivering. An item deferred on a
+/// running task lets its turn end; the task's end, while nothing runs, is found by the poller
+/// and reported as a turn of its own; and that turn cannot end with the item where it was. The
+/// feed shows the nudge inside the background turn and the emptied list after it, and the record
+/// shows the item waiting in between.
+#[test]
+fn a_task_an_item_waits_on_reports_as_a_turn_the_item_holds_open() {
+    const TASK: &str = "1a2b3c4d-0000-4000-8000-000000000000";
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "checklist_add" },
+            { "type": "tool_use_end", "input": {"items": ["read the build log"]} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "tool_use_start", "id": "tu_2", "name": "checklist_edit" },
+            { "type": "tool_use_end", "input": {
+                "id": 1, "status": "deferred", "reason": "building", "task": "1a2b3c4d"
+            } },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "Build started." },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "Noted." },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "tool_use_start", "id": "tu_3", "name": "checklist_edit" },
+            { "type": "tool_use_end", "input": {"id": 1, "status": "completed"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "Read it." },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn(
+        "\n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"200ms\"\n",
+        script,
+    );
+    let id = start_streaming_session(&harness);
+    // The row a backgrounded call records, written once the session is resident so no sweep
+    // retires it; the model names its short id, as it would from the call's result.
+    let store =
+        rusqlite::Connection::open(harness.install.database()).expect("open the server's store");
+    store
+        .execute(
+            "INSERT INTO background_tasks (id, session_id, tool, label, status, started_at) \
+             VALUES (?1, ?2, 'shell_execute', 'make', 'running', ?3)",
+            rusqlite::params![TASK, id, chrono::Utc::now().to_rfc3339()],
+        )
+        .expect("a running task");
+
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "build and read", "stream": false}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().expect("parse");
+    assert_eq!(
+        body["notices"],
+        serde_json::json!([]),
+        "deferred on a running task, the item lets the turn end: {body}"
+    );
+    let record: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        record["checklist"],
+        serde_json::json!([{
+            "id": 1, "text": "read the build log", "status": "deferred",
+            "reason": "building", "task": "1a2b3c4d"
+        }]),
+        "{record}"
+    );
+
+    // The task ends while nothing runs; only the poller can notice.
+    store
+        .execute(
+            "UPDATE background_tasks SET status = 'completed', outcome = 'ok', finished_at = ?2 \
+             WHERE id = ?1",
+            rusqlite::params![TASK, chrono::Utc::now().to_rfc3339()],
+        )
+        .expect("the task ends");
+    let feed_body = read_feed_until(feed, |text| {
+        text.rfind("\"source\":\"background\"")
+            .is_some_and(|at| text[at..].contains("event: turn.finished"))
+    });
+    let at = feed_body
+        .find("\"source\":\"background\"")
+        .expect("the report opened a turn of its own");
+    let delivery = &feed_body[at..];
+    let nudge_at = delivery
+        .find("checklist: 1 open item, continuing, nudge 1 of 3")
+        .unwrap_or_else(|| panic!("the report's turn is held by the item: {feed_body}"));
+    let updates: Vec<&str> = delivery
+        .split("event: checklist.updated\n")
+        .skip(1)
+        .filter_map(|rest| rest.lines().next())
+        .collect();
+    assert_eq!(updates.len(), 1, "one change, the disposition: {feed_body}");
+    assert!(
+        updates[0].starts_with("data: {\"items\":[],"),
+        "the emptied list is announced: {}",
+        updates[0]
+    );
+    let finished_at = delivery.find("event: turn.finished").expect("terminal");
+    assert!(
+        nudge_at < finished_at,
+        "the nudge is inside the turn: {feed_body}"
+    );
+    assert!(
+        !feed_body[..at].contains("checklist: 1 open item"),
+        "and nowhere before it: {feed_body}"
+    );
+
+    let record: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(record["checklist"], serde_json::json!([]), "{record}");
+    let delivered: Option<String> = store
+        .query_row(
+            "SELECT delivered_at FROM background_tasks WHERE id = ?1",
+            [TASK],
+            |row| row.get(0),
+        )
+        .expect("read the task");
+    assert!(delivered.is_some(), "the report was a delivery");
+}
+
+/// A rewind reads the list back from the shortened conversation, and what that changed is
+/// announced like any other change: a feed client that mirrors the list would otherwise keep an
+/// item whose turn is gone, while the record, which reads the cell, had already dropped it.
+#[test]
+fn a_rewind_announces_the_list_it_leaves() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "checklist_add" },
+            { "type": "tool_use_end", "input": {"items": ["ask Sam"]} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "tool_use_start", "id": "tu_2", "name": "checklist_edit" },
+            { "type": "tool_use_end", "input": {"id": 1, "status": "deferred", "reason": "waiting on Sam"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "Asked." },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "tool_use_start", "id": "tu_3", "name": "checklist_add" },
+            { "type": "tool_use_end", "input": {"items": ["book the room"]} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "tool_use_start", "id": "tu_4", "name": "checklist_edit" },
+            { "type": "tool_use_end", "input": {"id": 2, "status": "deferred", "reason": "after Sam"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "Noted." },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = start_streaming_session(&harness);
+    for message in ["ask Sam", "and the room"] {
+        let response = harness
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+            .json(&serde_json::json!({"message": message, "stream": false}))
+            .send()
+            .expect("send");
+        assert_eq!(response.status(), 200);
+    }
+    let record: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        record["checklist"].as_array().map(Vec::len),
+        Some(2),
+        "{record}"
+    );
+
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(10));
+    let rewound = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/rewind"))
+        .json(&serde_json::json!({"turns": 1}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        rewound.status(),
+        200,
+        "{}",
+        rewound.text().unwrap_or_default()
+    );
+    // The feed replays the turns' own updates on open, so the announcement the rewind owes is
+    // the one after the last turn's terminal, ahead of `conversation.rewound`.
+    let feed_body = read_feed_until(feed, |text| text.contains("event: conversation.rewound"));
+    let after_the_turns = feed_body
+        .rfind("event: turn.finished")
+        .map_or(feed_body.as_str(), |at| &feed_body[at..]);
+    let update = sse_event_data(after_the_turns, "checklist.updated")
+        .unwrap_or_else(|| panic!("the rewind announces the list it leaves: {feed_body}"));
+    assert_eq!(
+        update["items"].as_array().map(Vec::len),
+        Some(1),
+        "the item the rewound turn added is gone from the announced list: {update}"
+    );
+    assert_eq!(update["items"][0]["text"], "ask Sam", "{update}");
+    let record: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        record["checklist"].as_array().map(Vec::len),
+        Some(1),
+        "{record}"
+    );
+}

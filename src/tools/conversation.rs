@@ -84,6 +84,8 @@ fn render_message_full(message: &Message) -> String {
             ContentBlock::Text { text } => segments.push(text.clone()),
             // meka's own per-turn preamble, restated every turn; not part of the conversation.
             ContentBlock::TurnContext { .. } => {}
+            // What the model was sent back to work with, as it read it.
+            ContentBlock::Nudge { text, .. } => segments.push(text.clone()),
             ContentBlock::Thinking { thinking, .. } => {
                 segments.push(format!("[thinking]\n{thinking}"))
             }
@@ -404,6 +406,7 @@ mod tests {
             summary: Message::user("[summary]"),
             replaced_count: replaced,
             loaded_tools_snapshot: HashSet::new(),
+            checklist_snapshot: Default::default(),
         }
     }
 

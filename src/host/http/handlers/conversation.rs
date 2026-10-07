@@ -597,10 +597,7 @@ pub(crate) async fn rewind(
         );
     }
     // The conversation was rewritten under the agent; the one reset every rewrite door calls.
-    entry
-        .agent
-        .reset_conversation_markers(conversation.as_slice())
-        .await;
+    entry.agent.reset_conversation_markers(&conversation).await;
     // The repair row just written is the one rewrite since the count, under the mutex.
     let revision = revision + 1;
     // Every reader of the feed learns the view was rewritten, with the tag their next edit needs.

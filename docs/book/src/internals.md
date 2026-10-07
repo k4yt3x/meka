@@ -21,7 +21,7 @@ rank  module          holds
  2    cli             clap definitions and one handler file per subcommand group
  2    relay           tracing output routed around the live REPL prompt
  3    console         the terminal between two prompts: spacing, notices, errors
- 4    render          markdown, tool indicators, todo lists, status lines
+ 4    render          markdown, tool indicators, the checklist, status lines
  5    agent           the turn loop, tool dispatch, compaction, recovery
  5    view            the JSON record shapes --format json and the HTTP API share
  6    tools           the Tool trait, the registry, the built-ins, MCP tools as Tools
@@ -46,7 +46,7 @@ rank  module          holds
 16    memory          the memory entry
 17    entry           what skills and memories share: an indexed entry
 17    permission      levels, the enabled set, the shared cell, the approvals switch
-17    todo            the task list
+17    checklist       the checklist: items, states, the open rule
 17    image           format detection and transcoding
 18    fs              private directories, atomic replace, file locks
 19    error           MekaError
@@ -71,7 +71,7 @@ below, never in `host`. A new module fails the test until it is given a rank.
 | `src/host.rs`, `src/host/` | `host/assembly.rs` builds a session: `SharedDeps`, `build_session_agent`, `hydrate_conversation`, `resolve_profile_switch`, `record_session_change`. `host/session.rs` runs one: `ResidentSession`, `TurnGuard`, the `CancelCell`, the `Sessions` registry and its idle sweep, `fork_and_lock`, outcome claiming. `host/scheduler.rs` is `HostHooks`, `run_wakeup`, the out-of-band turn every host runs the same way, `spawn_outcome_poller`, the one background-outcome poller both servers spawn, and `TurnSource`, who started a turn. `host.rs` keeps `wait_for_shutdown_signal`, and `host/assembly.rs` `apply_recorded_profile`, which both servers call ahead of every turn, `POST /compact` included, so a session runs on the profile its row names. `host/terminal.rs` is what the REPL and one-shot share: Ctrl+C, the interruptible turn. `host.rs` keeps `COMMANDS`, the slash-command table the REPL offers and ACP advertises the `for_editors` rows of. `host/repl`, `host/oneshot`, `host/acp` and `host/http` are the hosts; `host/http/feed.rs` is the session feed, the SSE channel and replay ring `HttpFrontend` produces into and the stream handlers read. |
 | `src/agent.rs`, `src/agent/` | The `Agent` and its options; `turn.rs` runs a turn in phases (`open_turn`, `run_rounds`, `settle_turn`) and owns `TurnInput`, `dispatch.rs` executes tool calls and owns `run_admitted_call`, the one sequence a resolved call goes through, `compaction.rs` summarizes, `recovery.rs` decides what a failed request becomes. |
 | `src/view.rs` | The record shapes `--format json` prints and the HTTP API serves, each defined once with its `From` conversion from the store or config type it shows: `SessionView`, `ProfileView`, `AccountView`, `McpServerView`, `McpToolView`, `ScheduledJobView`, `GateView`, `MemoryDetail`, `ToolView`, `SkillView`, `SkillDetail`. A host adds what only it can answer around the shared core by `#[serde(flatten)]`: the HTTP `SessionResponse` flattens `SessionView` under `capabilities`, `turn_in_flight`, `inbox_pending` and `approvals_pending`; the CLI's `InstalledSkillView` and `ConfiguredToolView` flatten a core under what only a terminal should see, such as a path on this machine. Every `Option` field is omitted when absent, never `null`. |
-| `src/session.rs` | What a session is made of: `CoreMaterials` and `SessionMaterials` (what every agent and registry of a session is built from), `SessionCells` (permission, cwd, roots, session id, todo list, the published profile, the context gauge, background tasks, the frontend, the session lock slot, a pending compaction), `ToolSite` (the four cells a built-in reads), `AgentOptions` and `CompactRequest`. No host and no SQL. |
+| `src/session.rs` | What a session is made of: `CoreMaterials` and `SessionMaterials` (what every agent and registry of a session is built from), `SessionCells` (permission, cwd, roots, session id, checklist, the published profile, the context gauge, background tasks, the frontend, the session lock slot, a pending compaction), `ToolSite` (the four cells a built-in reads), `AgentOptions` and `CompactRequest`. No host and no SQL. |
 | `src/provider.rs`, `src/provider/` | The `Provider` trait, the wire types, `MessageAccumulator`, the registry of profiles, and one backend per API: `anthropic/messages.rs` and `anthropic/subscription.rs` over `anthropic/shared.rs`; `openai/chat_completions.rs`, `openai/responses.rs` and `openai/subscription.rs`, the last two over `openai/responses_wire.rs`. Every streaming backend reads SSE through `provider/sse.rs`; the refresh-once rule for a rejected subscription credential is `oauth::send_with_one_refresh`; `provider/mock.rs` is the scripted provider the test suites drive. |
 | `src/tools.rs`, `src/tools/` | The `Tool` trait, `ToolContext`, `admit_arguments`, the registry and its builders, the gate toolset, the built-in tools, and `mcp_adapter.rs`: each remote MCP tool as a `Tool`, and the registry as a subscriber to the client's tool lists. A built-in reads the session it serves through one `ToolSite`. |
 | `src/mcp.rs`, `src/mcp/` | The MCP client: `ServerEntry` per server, the connector and its reconnects, the client handler, `policy.rs` (which of a server's tools register, load eagerly, and at what level, as pure config policy), each server's tools published to whoever subscribes, progress and resource-update routing on `McpClientContext`, and auth. It never names a registry and never talks to a terminal: an interactive login goes through the `LoginPrompt` that only `meka mcp login` installs. |
@@ -100,7 +100,7 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
    `TurnInput::from_parts` is the empty-prompt rule, raising
    `MekaError::EmptyPrompt` before admission.
 3. **The loop.** `Agent::run_turn` appends one user message of two blocks: a `TurnContext` block
-   holding everything meka injected (permission and environment context, todos, world state, budget,
+   holding everything meka injected (permission and environment context, world state, budget,
    background outcomes, the resume notice) and a `Text` block holding the words as typed. Providers
    render the first as text ahead of the second; exports, `GET /messages`, replays and the title
    read the words. It then sends a `CompletionRequest` and dispatches every tool call the response
@@ -140,8 +140,8 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
 
 Non-secret settings live in `config.toml`. Secrets live in the store. Environment variables are
 operational only. The store is one SQLite file, `meka.db` under `MEKA_DATA_DIR`, opened by `Store`,
-and its shape is whatever the migration ledger says it is: thirty-one entries today, so a current
-store reads `PRAGMA user_version = 31`, and `HEAD_SCHEMA_FINGERPRINT` in `store/migrations.rs` pins the
+and its shape is whatever the migration ledger says it is: thirty-four entries today, so a current
+store reads `PRAGMA user_version = 34`, and `HEAD_SCHEMA_FINGERPRINT` in `store/migrations.rs` pins the
 columns of the tables in `HEAD_TABLES`. The count is the ledger's to state: `the_ledger_is_append_only` digests every entry, so read the ledger rather than this sentence for what the last ones do. The entries after `messages_are_indexed_by_kind` give sessions a title, a pin and a search index, fold every diacritic in the search indexes, and number turns. Before them, `sessions_have_an_inbox` adds the inbox table and `messages_are_indexed_by_kind` indexes a session's rows by kind so a resume finds its last `compact_boundary` row and the context block counts them without reading the whole log; before those, `names_follow_the_vocabulary` gives every table, column and index the name the vocabulary uses and drops the `provider_credentials` view and a column nothing read. That view existed for one replay: the frozen `sessions_name_their_provider` reads the name when no default profile resolves, so `classify_by_shape` classifies a store that lost its `user_version` and has no such view at the version this entry leaves it, past that step, rather than at the baseline. Before it, `sessions_record_their_context_tokens` adds the occupancy a resume checks its first turn against, `background_tasks_spell_canceled_with_one_l` rewrites a task status an earlier meka stored as `cancelled`, and `root_rows_take_the_default_level_once_the_config_reads` stamps `[permissions].default` on a root row that still records no level and refuses to migrate while `config.toml` cannot be read.
 
 | Table | Owner | Columns and indexes |

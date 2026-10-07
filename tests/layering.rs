@@ -68,7 +68,7 @@ const RANKS: &[(&str, u32)] = &[
     ("memory", 16),
     ("entry", 17),
     ("permission", 17),
-    ("todo", 17),
+    ("checklist", 17),
     ("image", 17),
     // Leaves.
     ("fs", 18),

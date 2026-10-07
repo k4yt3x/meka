@@ -166,9 +166,18 @@ Create, get, list, fork and `PATCH` all answer with the same session record:
   },
   "capabilities": {"supports_reasoning_stream": false, "supports_permission_prompts": true},
   "turn_in_flight": false,
-  "approvals_pending": 0
+  "approvals_pending": 0,
+  "checklist": [
+    {"id": 3, "text": "write the tests", "status": "in_progress"},
+    {"id": 4, "text": "ask Sam about the venue", "status": "deferred", "reason": "waiting on Sam"}
+  ]
 }
 ```
+
+`checklist` is the session's open [checklist](checklist.md): every item the agent has committed to
+and not yet disposed of, with its `id`, `text`, `status` (`pending`, `in_progress` or `deferred`),
+and on a deferred item its `reason` and the `task` it waits on when it waits on one. Present on a
+session this server holds; the feed's `checklist.updated` carries the same list on every change.
 
 `created_at` is when the row was made; `updated_at` moves on a turn and on any change to what the
 session runs as (`permission`, `approvals`, `cwd`, `profile`), a `PATCH` included, but not on a
@@ -198,8 +207,8 @@ is not loaded and its row records no level, and `parent_id`, which only a sub-ag
 carries. The same rule gives a turn its `refusal_text` only on a refusal and a tool call its
 `display_summary` only when the tool has a label. It is also why `meka session show --format json`
 prints the same object for the same record: the row's fields are one shape shared by both
-surfaces, and `capabilities`, `turn_in_flight` and `approvals_pending` are what the server adds to
-it.
+surfaces, and `capabilities`, `turn_in_flight`, `approvals_pending` and `checklist` are what the
+server adds to it.
 
 `profile` names a profile in the server's `config.toml`; `GET /v1/profiles` lists them, and a name
 that is not configured is a `422` whose `detail` reads `no profile named 'x' (configured: a, b)`.
@@ -516,7 +525,7 @@ tool-result messages after it share it, which is also how `POST /rewind` counts 
 of labels from a chosen one to the last is the `turns` a rewind to that point takes.
 
 A user message carries what the user typed as a `text` block. Ahead of it, when meka added one,
-sits a `turn_context` block: the permission and environment context, todo list, catalog changes,
+sits a `turn_context` block: the permission and environment context, catalog changes,
 background outcomes and resume notice meka injected for that turn, which the model saw as text ahead
 of the words. It is typed so a client can show or hide it; the `text` blocks alone are the words.
 
@@ -619,6 +628,7 @@ Every resident session has one event feed. Everything a turn emits goes on it, w
 | `turn.finished` | `turn_id`, `session_id`, `stop_reason`, `usage`, `revision`, optional `refusal_text` | Turn completed successfully |
 | `turn.failed` | `turn_id`, `session_id`, `error` (Problem Detail shape), `revision`, `message_withdrawn` when the turn began | Turn failed mid-stream |
 | `turn.canceled` | `turn_id`, `session_id`, `reason` (`"client"`, `"server_shutdown"`, `"sse_lag"` when the only consumer fell behind and the turn was stopped for it, or `"parent"` on a sub-agent's feed, whose turn stops with its parent's), `revision`, `message_withdrawn` when the turn began | Turn was canceled |
+| `turn.nudged` | `kind`, `text`, `turn_id`, `session_id` | The turn went on past the model's reply: meka wrote `text` into the conversation as a user-role message to send the model back to work, `kind` `visible_reply` after a reply with no visible text, `checklist` after one that left checklist items open |
 
 `turn.finished`, `turn.failed`, and `turn.canceled` are **terminal** for the turn: a `POST /turn` stream closes immediately after its own, and the feed carries on to the next turn. `turn.failed` and `turn.canceled` also carry `message_withdrawn` when the turn began, whether it took the message it was sent back out of the conversation; see [Resending a failed turn](#resending-a-failed-turn). All three carry `revision`, the conversation's revision as the turn ends, omitted only when the store could not say, and on [a sub-agent's feed](#a-sub-agents-feed), whose transcript is not the one the precondition guards; see [Detecting a rewritten history](#detecting-a-rewritten-history).
 
@@ -673,6 +683,19 @@ Three limits. The event exists only when meka streams from its provider, so a se
 |-------|---------|------|
 | `context.compacted` | `source`, `replaced_count`, `generation` | The conversation was summarized and the window replaced |
 | `conversation.rewound` | `revision`, `total`, `turns_removed` | `POST /rewind` removed turns; emitted outside any turn, so it carries no `turn_id` |
+| `checklist.updated` | `items`, the whole open list as the session record carries it | A `checklist_*` call changed the list; empty once everything is disposed of |
+
+A turn that stops with a checklist item open does not end: meka sends the model back to the list
+and the turn carries on, inside the same `turn_id`, with a `turn.nudged` carrying the message it
+wrote, a `notice` for each nudge (`checklist: 2 open items, continuing, nudge 1 of 3`) and a `warn`
+notice when a cap ends the turn with items still open: three nudges in a row without a tool call,
+or nine in the turn. The message is a user-role message of the conversation whose first block is a
+`nudge` block, so `GET /messages` shows it between the reply it answered and the reply after it,
+under the same `turn_label`, and a client can tell it from the person's words; a blocking
+`POST /turn` waits through those rounds and carries it among the turn's `messages`. A steer that
+arrives while the model writes the reply that gets nudged rides the nudge as a text block behind
+it, the way one rides a tool round's results, and `inbox.delivered` follows. See
+[Checklist](checklist.md).
 
 `context.compacted` is the one event on this stream that is not additive. Everything else appends, so a client that misses one still holds a prefix of the truth; a compaction *removes* messages the client has already rendered. `source` is `checkpoint` or `summarizer` (they differ in fidelity, not just mechanism), `replaced_count` is how many messages the boundary removed from the view (the whole pre-compaction window, including the tail compaction re-appends verbatim), and `generation` counts compactions from 1.
 

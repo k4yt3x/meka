@@ -192,6 +192,12 @@ pub(crate) struct SessionResponse {
     /// per row. The prompts themselves are on the feed, which replays every one still parked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) approvals_pending: Option<u64>,
+    /// The open checklist: every item the agent has committed to and not yet disposed of. Reported
+    /// for a session this process holds, whose cell is the live list; a dormant session's list is
+    /// in its conversation, which a record does not replay. `checklist.updated` on the feed
+    /// carries the same list on every change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) checklist: Option<Vec<crate::checklist::ChecklistItem>>,
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -432,6 +438,7 @@ pub(crate) async fn create_session(
         inbox_pending: None,
         // Just made: nothing can be parked on it yet.
         approvals_pending: Some(0),
+        checklist: Some(Vec::new()),
     };
     announce_session(
         &state,
@@ -706,6 +713,7 @@ pub(crate) async fn fork_session(
         turn_in_flight: false,
         inbox_pending: None,
         approvals_pending: Some(entry.frontend.approvals_pending()),
+        checklist: Some(entry.agent.cells().checklist.get().items),
     };
     announce_session(
         &state,
@@ -956,6 +964,7 @@ pub(crate) fn listed_session(
         turn_in_flight,
         inbox_pending: None,
         approvals_pending: live.map(|entry| entry.frontend.approvals_pending()),
+        checklist: live.map(|entry| entry.agent.cells().checklist.get().items),
     }
 }
 
@@ -1104,6 +1113,7 @@ pub(crate) async fn get_session(
             turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
             inbox_pending: Some(inbox_pending),
             approvals_pending: Some(entry.frontend.approvals_pending()),
+            checklist: Some(entry.agent.cells().checklist.get().items),
         }));
     }
     let summary = state
@@ -1122,6 +1132,7 @@ pub(crate) async fn get_session(
         turn_in_flight: state.shared.running_subagents.is_running(id),
         inbox_pending: None,
         approvals_pending: None,
+        checklist: None,
     }))
 }
 
@@ -1265,6 +1276,7 @@ async fn dormant_record(state: &ServerState, id: Uuid) -> Result<SessionResponse
         turn_in_flight: false,
         inbox_pending: None,
         approvals_pending: None,
+        checklist: None,
     })
 }
 
@@ -1569,6 +1581,7 @@ pub(crate) async fn patch_session(
         turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
         inbox_pending: None,
         approvals_pending: Some(entry.frontend.approvals_pending()),
+        checklist: Some(entry.agent.cells().checklist.get().items),
     };
     // A `PATCH` that moved nothing is not a change anyone needs to hear of.
     if mutated {

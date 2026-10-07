@@ -30,7 +30,8 @@ use crate::{
 
 /// A session's row: what `meka session list` prints and what `GET /v1/sessions/{id}` answers with,
 /// less the facts only the process holding the session can add (`capabilities`, `turn_in_flight`,
-/// `inbox_pending`, `approvals_pending`), which the HTTP response flattens this under.
+/// `inbox_pending`, `approvals_pending`, `checklist`), which the HTTP response flattens this
+/// under.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub(crate) struct SessionView {

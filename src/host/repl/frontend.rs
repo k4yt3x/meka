@@ -115,13 +115,14 @@ pub(super) fn indicator_action(event: &FrontendEvent, renders_reasoning: bool) -
         | FrontendEvent::ToolCallStarted { .. }
         | FrontendEvent::ToolCallCompleted { .. }
         | FrontendEvent::ToolCallOutputDelta { .. }
-        | FrontendEvent::TodoListUpdated { .. }
+        | FrontendEvent::ChecklistUpdated { .. }
         | FrontendEvent::SubAgentActivity { .. }
         | FrontendEvent::TokenUsage(_)
         | FrontendEvent::Notice(_)
         | FrontendEvent::McpProgress(_)
         | FrontendEvent::PromptWithdrawn
         | FrontendEvent::InboxDelivered { .. }
+        | FrontendEvent::Nudged { .. }
         | FrontendEvent::Compacted { .. } => IndicatorAction::Commit,
     }
 }
@@ -230,6 +231,9 @@ impl Frontend for ReplFrontend {
             // Nothing to draw either: the REPL has no producer for the inbox, so an item here came
             // from a parent agent steering this worker, whose report is what the person reads.
             FrontendEvent::InboxDelivered { .. } => {}
+            // The words are the model's to read; the stage direction that follows is what the
+            // person sees of a nudge.
+            FrontendEvent::Nudged { .. } => {}
             // Closed here so a completed turn does not hold its last paragraph until the prompt,
             // and closed again by the episode for a turn that died without reaching this.
             FrontendEvent::TurnFinished => {
@@ -324,10 +328,8 @@ impl Frontend for ReplFrontend {
             // own `show_*` config knob to go with it. ACP has no such convention to respect -- an
             // editor's tool-call view is the only place a command's output can appear.
             FrontendEvent::ToolCallOutputDelta { .. } => {}
-            FrontendEvent::TodoListUpdated { title, items } => {
-                with_console(&self.config.console, |console| {
-                    console.todo_list(title.as_deref(), &items)
-                });
+            FrontendEvent::ChecklistUpdated { items } => {
+                with_console(&self.config.console, |console| console.checklist(&items));
             }
             FrontendEvent::TokenUsage(usage) => {
                 if self.config.show_token_usage {
@@ -943,10 +945,7 @@ mod tests {
                 IndicatorAction::Commit,
             ),
             (
-                E::TodoListUpdated {
-                    title: None,
-                    items: Vec::new(),
-                },
+                E::ChecklistUpdated { items: Vec::new() },
                 IndicatorAction::Commit,
             ),
             (

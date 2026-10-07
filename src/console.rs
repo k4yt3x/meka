@@ -88,9 +88,9 @@ pub(crate) enum BlockKind {
     Text,
     ToolIndicator(ToolParams),
     Thinking,
-    /// Renders its own leading and trailing blank lines, so it asks for no separator and leaves the
-    /// machine claiming a trailing blank that the next block must not double.
-    TodoList,
+    /// A block set off from whatever is around it on both sides: the checklist, and a stage
+    /// direction about the turn such as the checklist's nudge.
+    Standalone,
 }
 
 /// Something that happens to the console, as a value, so the decision it forces can be tested
@@ -257,14 +257,12 @@ pub(crate) fn step(state: State, spacing: Spacing, action: Action) -> (Emit, Sta
         Action::Block(kind) => {
             let (settle, after_prompt_blank) = open_output(&mut next, spacing);
             let separator_blank = match kind {
-                BlockKind::Chrome | BlockKind::TodoList => false,
+                BlockKind::Chrome => false,
                 BlockKind::Text => next.spacing.before_text(),
                 BlockKind::ToolIndicator(params) => next.spacing.before_tool_indicator(params),
                 BlockKind::Thinking => next.spacing.before_thinking(),
+                BlockKind::Standalone => next.spacing.before_standalone(),
             };
-            if kind == BlockKind::TodoList {
-                next.spacing.after_todo_list();
-            }
             (
                 Emit {
                     settle,
@@ -532,12 +530,26 @@ impl Console {
     /// A [`crate::frontend::Notice`], in the color its level asks for: dim for `Info`, the warning
     /// color for `Warn`.
     pub(crate) fn notice(&mut self, notice: &crate::frontend::Notice) {
+        if notice.kind == crate::frontend::NoticeKind::StageDirection {
+            self.stage_direction(&notice.text);
+            return;
+        }
         self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
         match notice.level {
             crate::frontend::NoticeLevel::Info => render::render_hint(&notice.text),
             crate::frontend::NoticeLevel::Warn => render::render_warning(&notice.text),
         }
+    }
+
+    /// A stage direction between two blocks: the model's reply ended and meka did something with
+    /// it, or something other than the user opened the turn that follows. A block of its own, set
+    /// off on both sides, where [`Self::annotation`] is the same register at the end of an
+    /// episode, flush with what it closes.
+    pub(crate) fn stage_direction(&mut self, note: &str) {
+        self.close_stream();
+        self.act(Action::Block(BlockKind::Standalone));
+        render::render_annotation(note);
     }
 
     pub(crate) fn session_id(&mut self, label: &str, id: &str) {
@@ -593,16 +605,16 @@ impl Console {
         render::render_thinking_preview(content);
     }
 
-    /// An empty list prints nothing and must not claim the trailing blank line that
-    /// [`render::render_todo_list`] would otherwise have left, so the block is opened only once the
-    /// list is known to have content.
-    pub(crate) fn todo_list(&mut self, title: Option<&str>, items: &[crate::todo::TodoItem]) {
+    /// The list as it stands after a change, as a block of its own. An emptied list prints
+    /// nothing: the indicator of the edit that emptied it already says so, and a heading over
+    /// nothing would say less.
+    pub(crate) fn checklist(&mut self, items: &[crate::checklist::ChecklistItem]) {
         if items.is_empty() {
             return;
         }
         self.close_stream();
-        self.act(Action::Block(BlockKind::TodoList));
-        render::render_todo_list(title, items);
+        self.act(Action::Block(BlockKind::Standalone));
+        render::render_checklist(items);
     }
 
     pub(crate) fn token_usage(&mut self, usage: &crate::stats::TokenUsage) {
@@ -1285,19 +1297,35 @@ mod tests {
         }
     }
 
-    /// The todo list paints its own surrounding blanks, so it asks for no separator and leaves
-    /// nothing for the next block to double.
+    /// A standalone block is set off on both sides whatever its neighbors: after a tool indicator,
+    /// before text, before another indicator, before thinking. Right under the prompt it asks for
+    /// nothing, since the episode's own blank is already there.
     #[test]
-    fn a_todo_list_brings_its_own_separation() {
+    fn a_standalone_block_is_set_off_on_both_sides() {
         let emits = run(BOTH, &[
             Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
+            Action::Block(BlockKind::Standalone),
             Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
-            Action::Block(BlockKind::TodoList),
+            Action::Block(BlockKind::Standalone),
             Action::Block(BlockKind::Text),
+            Action::Block(BlockKind::Standalone),
+            Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
+            Action::Block(BlockKind::Standalone),
+            Action::Block(BlockKind::Thinking),
             Action::CloseEpisode(Neighbor::Prompt),
         ]);
-        assert!(!emits[2].separator_blank);
-        assert!(!emits[3].separator_blank);
+        assert!(
+            !emits[1].separator_blank,
+            "under the prompt, the episode's blank serves"
+        );
+        assert!(emits[1].after_prompt_blank);
+        assert!(emits[2].separator_blank, "an indicator after it is set off");
+        assert!(emits[3].separator_blank, "and it after an indicator");
+        assert!(emits[4].separator_blank, "text after it");
+        assert!(emits[5].separator_blank, "and it after text");
+        assert!(emits[6].separator_blank);
+        assert!(emits[7].separator_blank);
+        assert!(emits[8].separator_blank, "thinking after it");
     }
 
     /// Claude sends an estimate and a text delta from one wire event once the token-count beta

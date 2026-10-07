@@ -82,8 +82,9 @@ fn assemble_report(
 ) -> TurnReport {
     use crate::frontend::FrontendEvent;
     let mut text = String::new();
-    // Set by a tool call, so the next round's text starts a paragraph rather than running on from
-    // the sentence the model wrote before it called the tool.
+    // Set by a tool call or a nudge, so the next round's text starts a paragraph rather than
+    // running on from the sentence the model wrote before the tool call or the reply the nudge
+    // answered.
     let mut round_boundary = false;
     let mut tool_calls: Vec<ToolCallReport> = Vec::new();
     let mut started: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -98,6 +99,7 @@ fn assemble_report(
                 round_boundary = false;
                 text.push_str(&delta);
             }
+            FrontendEvent::Nudged { .. } => round_boundary = true,
             FrontendEvent::ToolCallStarted {
                 id, name, input, ..
             } => {
@@ -469,6 +471,88 @@ pub(crate) async fn run_oneshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reply a nudge answered and the reply after it are two paragraphs of the report, as the
+    /// text on either side of a tool call is; glued, "I have planned it.Done." reads as one
+    /// sentence the model never wrote.
+    #[test]
+    fn a_nudge_starts_a_paragraph_in_the_report() {
+        use crate::frontend::FrontendEvent;
+        let report = assemble_report(
+            vec![
+                FrontendEvent::AssistantTextDelta("I have planned it.".to_string()),
+                FrontendEvent::Nudged {
+                    kind: crate::conversation::NudgeKind::Checklist,
+                    text: "[Checklist: items are still open, so this turn is not over.]"
+                        .to_string(),
+                },
+                FrontendEvent::AssistantTextDelta("Done.".to_string()),
+            ],
+            Some(crate::agent::TurnOutcome::EndTurn),
+            None,
+            "work".to_string(),
+        );
+        assert_eq!(report.text, "I have planned it.\n\nDone.");
+    }
+
+    /// The report gathers everything a turn's events say: the text in paragraphs per round, each
+    /// tool call with the error flag its result set, the usage summed over rounds, and the
+    /// notices in order.
+    #[test]
+    fn a_report_gathers_the_turns_calls_usage_and_notices() {
+        use crate::frontend::FrontendEvent;
+        let usage = |input: u64, output: u64| crate::stats::TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_creation_input_tokens: 1,
+            cache_read_input_tokens: 2,
+        };
+        let report = assemble_report(
+            vec![
+                FrontendEvent::AssistantTextDelta("Looking.".to_string()),
+                FrontendEvent::ToolCallStarted {
+                    id: "tu_1".to_string(),
+                    name: "file_read".to_string(),
+                    input: serde_json::json!({"path": "a.txt"}),
+                    display_summary: None,
+                },
+                FrontendEvent::ToolCallCompleted {
+                    id: "tu_1".to_string(),
+                    name: "file_read".to_string(),
+                    is_error: true,
+                    content: Vec::new(),
+                    metadata: None,
+                },
+                FrontendEvent::TokenUsage(usage(10, 3)),
+                FrontendEvent::Notice(crate::frontend::Notice::warn("a warning")),
+                FrontendEvent::AssistantTextDelta("Missing.".to_string()),
+                FrontendEvent::TokenUsage(usage(5, 4)),
+            ],
+            Some(crate::agent::TurnOutcome::EndTurn),
+            None,
+            "work".to_string(),
+        );
+        assert_eq!(report.text, "Looking.\n\nMissing.");
+        assert_eq!(report.tool_calls.len(), 1);
+        assert_eq!(report.tool_calls[0].name, "file_read");
+        assert!(
+            report.tool_calls[0].is_error,
+            "the result's flag reaches the call"
+        );
+        assert_eq!(
+            (report.usage.input_tokens, report.usage.output_tokens),
+            (15, 7)
+        );
+        assert_eq!(
+            (
+                report.usage.cache_creation_input_tokens,
+                report.usage.cache_read_input_tokens
+            ),
+            (2, 4)
+        );
+        assert_eq!(report.notices.len(), 1);
+        assert_eq!(report.notices[0].text, "a warning");
+    }
 
     /// A report for a turn that never got a session leaves `session_id` out rather than sending
     /// `null`, which is the rule every other wire shape follows and what the docs promise.

@@ -345,6 +345,20 @@ fn replay(data: &[u8]) -> Vec<String> {
 }
 
 /// The rows between the line that contains `after` and the next one containing `before`.
+/// The rows `first..=last` are a block of their own: exactly one blank row above and one below,
+/// with a row of content beyond each.
+fn assert_set_off_by_one_blank(rows: &[String], first: usize, last: usize, what: &str) {
+    assert!(
+        first >= 2 && rows[first - 1].is_empty() && !rows[first - 2].is_empty(),
+        "{what}: exactly one blank above it: {rows:#?}"
+    );
+    assert!(
+        rows.get(last + 1).is_some_and(String::is_empty)
+            && rows.get(last + 2).is_some_and(|row| !row.is_empty()),
+        "{what}: exactly one blank below it: {rows:#?}"
+    );
+}
+
 fn between<'a>(rows: &'a [String], after: &str, before: &str) -> &'a [String] {
     let start = rows
         .iter()
@@ -524,10 +538,12 @@ fn an_always_answer_does_not_survive_a_fork() {
     );
 }
 
-/// A scheduled job's prompt is echoed before the reply it triggers, dimmed like a notice, so the
-/// answer that appears while the user is at the prompt is not the model speaking unprompted.
+/// A scheduled fire is announced above the reply it triggers, as a stage direction naming the job
+/// and the opening of its prompt, so the answer that appears while the user is at the prompt is
+/// not the model speaking unprompted. The prompt the model is given is not echoed, the way no
+/// tool's output is.
 #[test]
-fn a_scheduled_fire_echoes_its_prompt_before_the_reply() {
+fn a_scheduled_fire_is_announced_as_a_stage_direction_above_its_reply() {
     const SCHEDULE_THEN_FIRE: &str = r#"[
  [{"type":"tool_use_start","id":"t1","name":"schedule_create"},
   {"type":"tool_use_end","input":{"prompt":"REPL_DELIVERED_MARKER","at":"1s"}},
@@ -545,20 +561,27 @@ fn a_scheduled_fire_echoes_its_prompt_before_the_reply() {
         screen.contains("REPL_SCHEDULED_REPLY"),
         "the fire's reply must reach the screen: {rows:#?}"
     );
-    let echoed = rows
+    let announced = rows
         .iter()
-        .position(|row| row.contains("[Scheduled job") && row.contains("fired"));
+        .position(|row| {
+            row.starts_with("(scheduled job ") && row.ends_with(" fired: REPL_DELIVERED_MARKER)")
+        })
+        .unwrap_or_else(|| panic!("the fire is a stage direction naming the job: {rows:#?}"));
     let replied = rows
         .iter()
-        .position(|row| row.contains("REPL_SCHEDULED_REPLY"));
+        .position(|row| row.contains("REPL_SCHEDULED_REPLY"))
+        .expect("the reply");
     assert!(
-        matches!((echoed, replied), (Some(echo), Some(reply)) if echo < reply),
-        "the job's prompt is shown above the reply it triggered: {rows:#?}"
+        announced < replied,
+        "the direction is above the reply it accounts for: {rows:#?}"
     );
     assert!(
-        screen.contains("REPL_DELIVERED_MARKER"),
-        "and the prompt's own words are what is shown: {rows:#?}"
+        !rows.iter().any(|row| row.contains("[Scheduled job")),
+        "the model's prompt is not echoed: {rows:#?}"
     );
+    // A block of its own: the reply must not sit flush under it, and nothing but the block
+    // machine puts the blank there.
+    assert_set_off_by_one_blank(&rows, announced, announced, "the fire's direction");
 }
 
 #[test]
@@ -935,23 +958,24 @@ fn help_is_bracketed_by_the_repl_thread_too() {
     );
 }
 
-/// The todo list paints its own surrounding blanks, so the block machine must not add more. This is
-/// the one block that would double if it were spaced like the others.
+/// The checklist is a block the console sets off on both sides. The blank under its heading is
+/// the block's own, inside it; no blank of the block's may meet one of the console's, or the two
+/// would double.
 #[test]
-fn a_todo_list_is_not_double_spaced() {
-    const TODO: &str = r#"[
- [{"type":"tool_use_start","id":"t1","name":"todo_write"},
-  {"type":"tool_use_end","input":{"title":"Work","items":["First","Second"]}},
+fn a_checklist_is_not_double_spaced() {
+    const SCRIPT: &str = r#"[
+ [{"type":"tool_use_start","id":"t1","name":"checklist_add"},
+  {"type":"tool_use_end","input":{"items":["First","Second"]}},
   {"type":"message_end","stop_reason":"tool_use"}],
  [{"type":"text","text":"Done."},
   {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
     let install = repl_install(true, true, "");
-    let rows = run_repl(&install, TODO, &["plan it", "/exit"]);
+    let rows = run_repl(&install, SCRIPT, &["plan it", "/exit"]);
 
     let body = between(&rows, "> plan it", "> /exit");
     assert!(
-        body.iter().any(|row| row.contains("TODO: Work")),
+        body.iter().any(|row| row.contains("Checklist")),
         "the list rendered: {body:#?}"
     );
     assert!(
@@ -1489,5 +1513,238 @@ fn a_slash_commands_table_goes_to_stderr_and_the_answer_stays_on_stdout() {
     assert!(
         stderr.contains("stream-audit-memory"),
         "the table is on stderr: {stderr:?}"
+    );
+}
+
+/// A resumed REPL still owes what the session was left with: the second run's edit lands on the
+/// id the first run assigned, which only a list read back from the log can know, and the display
+/// shows the item moving.
+#[test]
+fn a_resumed_repl_holds_the_checklist_it_was_left_with() {
+    const FIRST: &str = r#"[
+ [{"type":"tool_use_start","id":"t1","name":"checklist_add"},
+  {"type":"tool_use_end","input":{"items":["ask Sam"]}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"tool_use_start","id":"t2","name":"checklist_edit"},
+  {"type":"tool_use_end","input":{"id":1,"status":"deferred","reason":"waiting on Sam"}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"Waiting."},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    const SECOND: &str = r#"[
+ [{"type":"tool_use_start","id":"t3","name":"checklist_edit"},
+  {"type":"tool_use_end","input":{"id":1,"status":"in_progress"}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"On it."},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = repl_install(true, true, "");
+    let first = run_repl(&install, FIRST, &["plan it", "/exit"]);
+    let row = first
+        .iter()
+        .position(|row| row.contains("[>] 1 ask Sam"))
+        .unwrap_or_else(|| panic!("{first:#?}"));
+    assert!(
+        first[row + 1].is_empty(),
+        "the row says the item is parked and nothing sits under it: {first:#?}"
+    );
+    let resumed = run_repl(&install, SECOND, &["carry on", "/exit"]);
+    assert!(
+        resumed.iter().any(|row| row.contains("[~] 1 ask Sam")),
+        "the edit landed on the recovered id: {resumed:#?}"
+    );
+}
+
+/// The whole arc on the REPL, through its watcher: an item deferred on a running task lets the
+/// turn end, the task's end wakes the REPL, the report is a turn of its own, and that turn is
+/// held by the item until the model disposes of it, with the stage direction saying so between
+/// the model's note and the round that does.
+///
+/// The task is played by a thread on the store, because the script cannot name an id the real
+/// tool would make up: recorded running once the session exists, and ended once the deferral is
+/// on the record, so its end lands inside the deferring turn, the window the report has to wait
+/// out.
+#[test]
+fn an_outcome_turn_in_the_repl_is_held_by_the_item_deferred_on_its_task() {
+    const TASK: &str = "1a2b3c4d-0000-4000-8000-000000000000";
+    const SCRIPT: &str = r#"[
+ [{"type":"tool_use_start","id":"t1","name":"checklist_add"},
+  {"type":"tool_use_end","input":{"items":["read the build log"]}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"sleep","ms":600},
+  {"type":"tool_use_start","id":"t2","name":"checklist_edit"},
+  {"type":"tool_use_end","input":{"id":1,"status":"deferred","reason":"building","task":"1a2b3c4d"}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"Build started."},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"text","text":"Noted."},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"tool_use_start","id":"t3","name":"checklist_edit"},
+  {"type":"tool_use_end","input":{"id":1,"status":"completed"}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"Read it."},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = repl_install_with_extra(
+        true,
+        true,
+        "",
+        "\n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"200ms\"\n",
+    );
+    let database = install.database();
+    let player = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (connection, session_id) = loop {
+            assert!(Instant::now() < deadline, "the session never appeared");
+            if let Ok(connection) = rusqlite::Connection::open(&database)
+                && let Ok(id) = connection.query_row("SELECT id FROM sessions LIMIT 1", [], |row| {
+                    row.get::<_, String>(0)
+                })
+            {
+                break (connection, id);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        connection
+            .execute(
+                "INSERT INTO background_tasks (id, session_id, tool, label, status, started_at) \
+                 VALUES (?1, ?2, 'shell_execute', 'make', 'running', ?3)",
+                rusqlite::params![TASK, session_id, chrono::Utc::now().to_rfc3339()],
+            )
+            .expect("a running task");
+        loop {
+            assert!(Instant::now() < deadline, "the deferral never landed");
+            let deferred: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE content LIKE '%Item 1 is deferred%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count");
+            if deferred > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        connection
+            .execute(
+                // The output ends with a newline, as a shell's does: the report must not carry
+                // it into a second blank under the block.
+                "UPDATE background_tasks SET status = 'completed', outcome = ?3, \
+                 finished_at = ?2 WHERE id = ?1",
+                rusqlite::params![TASK, chrono::Utc::now().to_rfc3339(), "ok\n"],
+            )
+            .expect("the task ends");
+    });
+    // The pause in the second round is where the thread records the task; it has to stay under
+    // the driver's quiet window, or the driver reads the silence as an idle prompt and types the
+    // exit into it.
+    let rows = run_repl(&install, SCRIPT, &["build and read", "/exit"]);
+    player.join().expect("the task was played");
+
+    let body = between(&rows, "> build and read", "> /exit");
+    let position = |needle: &str| {
+        body.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}: {body:#?}"))
+    };
+    let started = position("Build started.");
+    let report = position("(background task 1a2b3c4d finished after ");
+    let noted = position("Noted.");
+    let nudge = position("(checklist: 1 open item, continuing, nudge 1 of 3)");
+    let read = position("Read it.");
+    assert!(
+        started < report && report < noted && noted < nudge && nudge < read,
+        "the deferring turn ends, the report opens a turn, and the nudge holds it: {body:#?}"
+    );
+    assert_eq!(
+        body.iter()
+            .filter(|row| row.contains("continuing, nudge"))
+            .count(),
+        1,
+        "the deferring turn itself was not nudged: {body:#?}"
+    );
+    assert!(
+        !body.iter().any(|row| row.contains("no open items")),
+        "the emptied list prints nothing; the edit's indicator already said so: {body:#?}"
+    );
+    // The report is announced, not echoed: one stage direction naming the task and how it ended,
+    // a block of its own with one blank above and below, and neither the model's prompt nor the
+    // task's output on the screen, the way no tool's output is.
+    assert!(body[report].ends_with(", reporting)"), "{body:#?}");
+    assert!(
+        !body
+            .iter()
+            .any(|row| row.contains("[Background task reporting") || row == "ok"),
+        "the prompt and the output stay with the model: {body:#?}"
+    );
+    assert_set_off_by_one_blank(body, report, report, "the report's direction");
+}
+
+/// The nudge is a stage direction on the transcript, set off on both sides like a tool call: the
+/// model's reply above it, the next round below it, and a blank line between it and each.
+#[test]
+fn a_nudge_is_a_stage_direction_set_off_from_the_reply_and_the_next_round() {
+    const SCRIPT: &str = r#"[
+ [{"type":"tool_use_start","id":"t1","name":"checklist_add"},
+  {"type":"tool_use_end","input":{"items":["write the tests"]}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"I have planned it."},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"tool_use_start","id":"t2","name":"checklist_edit"},
+  {"type":"tool_use_end","input":{"id":1,"status":"completed"}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"Done."},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = repl_install(true, true, "");
+    let rows = run_repl(&install, SCRIPT, &["plan and do it", "/history 1", "/exit"]);
+    let body = between(&rows, "> plan and do it", "> /history 1");
+    let at = body
+        .iter()
+        .position(|row| row == "(checklist: 1 open item, continuing, nudge 1 of 3)")
+        .unwrap_or_else(|| panic!("the nudge is a parenthesised row of its own: {body:#?}"));
+    assert!(
+        at > 0 && body[at - 1].is_empty(),
+        "a blank above it: {body:#?}"
+    );
+    assert!(
+        body.get(at + 1).is_some_and(String::is_empty),
+        "a blank below it: {body:#?}"
+    );
+    assert!(
+        body[..at]
+            .iter()
+            .any(|row| row.contains("I have planned it.")),
+        "the reply it annotates is above it: {body:#?}"
+    );
+    let heading = body
+        .iter()
+        .position(|row| row == "Checklist")
+        .unwrap_or_else(|| panic!("the list rendered: {body:#?}"));
+    assert!(
+        body[heading - 1].is_empty()
+            && body[heading + 1].is_empty()
+            && body[heading + 2].starts_with("- [ ] 1 "),
+        "the heading is set off above and one blank above its items: {body:#?}"
+    );
+    // The nudge continues the turn, so a history of one turn is the whole of it, and the replay
+    // shows the nudge as the stage direction the live run did, never as the user's words.
+    let replay = between(&rows, "> /history 1", "> /exit");
+    assert!(
+        replay.iter().any(|row| row.contains("plan and do it"))
+            && replay.iter().any(|row| row.contains("I have planned it."))
+            && replay.iter().any(|row| row.contains("Done.")),
+        "one turn is the whole nudged turn: {replay:#?}"
+    );
+    assert!(
+        replay
+            .iter()
+            .any(|row| row == "(checklist: items still open, continuing)"),
+        "the replayed nudge is a stage direction: {replay:#?}"
+    );
+    assert!(
+        !replay.iter().any(|row| row.contains("[Checklist:")),
+        "and never the nudge's words: {replay:#?}"
     );
 }

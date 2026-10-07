@@ -311,10 +311,38 @@ pub(super) fn empty_turn_notice(stop_reason: &StopReason) -> String {
         _ => "[The model returned an empty response.]".to_string(),
     }
 }
-/// Meta message injected to coax a user-visible response out of a turn that produced only thinking
-/// (or nothing).
-pub(super) const THINKING_ONLY_NUDGE: &str = "[Your previous response contained no visible output. Please \
-                                   continue and produce a user-visible response.]";
+/// How many times in a row a turn is sent back to its open checklist items with no tool round in
+/// between before it is allowed to end with them open. Three tells stuck from slow: a model that
+/// answers the nudge three times without touching a tool is not going to touch one on the fourth.
+pub(crate) const CHECKLIST_NUDGE_LIMIT: u32 = 3;
+
+/// How many nudges one turn gets in all, tool rounds or not. A tool round resets the run the cap
+/// above counts, because work between nudges is not the stall it exists for; but a round that
+/// only reads the list, or lists the tasks, is not work either, and a model that slips one in
+/// before every reply would otherwise be sent back to the list for as long as the session has a
+/// budget. Three times the cap: a turn that has been nudged nine times with tool rounds between
+/// them has had its chance.
+pub(crate) const CHECKLIST_NUDGES_PER_TURN: u32 = 9;
+
+/// Whether to send the model back to its checklist after a reply that would otherwise end the
+/// turn: no tool call, a stop reason that means "done" rather than one with its own outcome, at
+/// least one item that binds the turn, fewer than [`CHECKLIST_NUDGE_LIMIT`] nudges in a row
+/// without a tool round, and fewer than [`CHECKLIST_NUDGES_PER_TURN`] in the turn. Pure, so the
+/// rule can be read and tested on its own.
+pub(super) fn should_nudge_checklist(
+    has_tool_calls: bool,
+    stop_reason: &StopReason,
+    open_items: usize,
+    consecutive_nudges: u32,
+    nudges_this_turn: u32,
+) -> bool {
+    !has_tool_calls
+        && open_items > 0
+        && consecutive_nudges < CHECKLIST_NUDGE_LIMIT
+        && nudges_this_turn < CHECKLIST_NUDGES_PER_TURN
+        && matches!(stop_reason, StopReason::EndTurn | StopReason::Unknown(_))
+}
+
 /// Whether to nudge the model for a user-visible response after a turn that made no tool call and
 /// produced no visible text (a thinking-only turn): at most once per turn, and only for a terminal
 /// stop reason without its own handling, since `MaxTokens` and `Refusal` carry their own outcomes
@@ -645,7 +673,6 @@ impl Agent {
         } else {
             Vec::new()
         };
-        let todos = self.cells.todo_list.get();
         let cwd = self.cells.cwd.get();
         let roots = self.cells.roots.get();
         prompt::build_turn_context(prompt::TurnContext {
@@ -653,7 +680,6 @@ impl Agent {
             one_shot: self.options.one_shot,
             permission: self.cells.permission.get(),
             approvals: self.cells.permission.approvals(),
-            todos: &todos,
             cwd: &cwd,
             roots: &roots,
             world_state,
@@ -866,6 +892,8 @@ impl Agent {
                 user_saved: opening.user_eagerly_saved,
                 inbox_ids: opening.inbox_ids.clone(),
                 thinking_only_nudged: false,
+                checklist_nudges: 0,
+                checklist_nudges_this_turn: 0,
                 outage_reprieve_used: false,
             },
             // Accumulated across every provider call within this turn so the per-turn display
@@ -875,6 +903,10 @@ impl Agent {
             last_round_durations: Vec::new(),
         };
 
+        // The cell is a copy of what the log records, and the log is the authority: a session
+        // made resident, a rewind on another host, a follow-up on a worker all reach here with a
+        // log the cell has not read.
+        self.hydrate_checklist(messages).await;
         let result = self.run_rounds(messages, &mut run).await;
         self.settle_turn(messages, run, &opening, retention, &result)
             .await;
@@ -984,8 +1016,7 @@ impl Agent {
         // Taken before the block is built, since the block is where it lands. A freshly spawned
         // sub-agent never sees it (its conversation is empty, so `from_events` never set it), but a
         // followed-up one does, and that is deliberate: it really is running against a fresh
-        // registry, a fresh read tracker and an empty todo list. See
-        // `crate::tools::subagent::AgentFollowupTool`.
+        // registry and a fresh read tracker. See `crate::tools::subagent::AgentFollowupTool`.
         let resumed = messages.take_resumed_notice();
 
         let context_block = self
@@ -1400,6 +1431,60 @@ impl Agent {
                 continue;
             }
 
+            // A reply that stops with checklist items open is not the end of the turn. The model
+            // committed to them, so it is shown what is open and answers again, until every item
+            // is disposed of or the cap says the nudging is going nowhere; then the turn ends with
+            // the items where they are, and the notice says so.
+            if !has_tool_calls {
+                let state = self.cells.checklist.get();
+                let reported = self.reported_tasks(session_id, &state).await;
+                let open = state.open_items(&reported).len();
+                if should_nudge_checklist(
+                    has_tool_calls,
+                    &stop_reason,
+                    open,
+                    run.recovery.checklist_nudges,
+                    run.recovery.checklist_nudges_this_turn,
+                ) {
+                    let nudge = prompt::render_checklist_nudge(&state, &reported);
+                    run.recovery
+                        .nudge_checklist(self, session_id, messages, &assistant_message, nudge)
+                        .await?;
+                    self.cells
+                        .frontend
+                        .emit(FrontendEvent::Notice(
+                            crate::frontend::Notice::checklist_nudged(
+                                open,
+                                run.recovery.checklist_nudges,
+                                CHECKLIST_NUDGE_LIMIT,
+                            ),
+                        ))
+                        .await;
+                    continue;
+                }
+                if open > 0 && matches!(stop_reason, StopReason::EndTurn | StopReason::Unknown(_)) {
+                    // Whichever bound ended it; the turn's own is the last word when both did.
+                    let notice =
+                        if run.recovery.checklist_nudges_this_turn >= CHECKLIST_NUDGES_PER_TURN {
+                            crate::frontend::Notice::checklist_left_open(
+                                open,
+                                CHECKLIST_NUDGES_PER_TURN,
+                                true,
+                            )
+                        } else {
+                            crate::frontend::Notice::checklist_left_open(
+                                open,
+                                CHECKLIST_NUDGE_LIMIT,
+                                false,
+                            )
+                        };
+                    self.cells
+                        .frontend
+                        .emit(FrontendEvent::Notice(notice))
+                        .await;
+                }
+            }
+
             // No tool call and no visible text, and the nudge above didn't fire (already used this
             // turn, or a stop reason with its own handling such as refusal / max tokens). Surface
             // a stand-in in the assistant's place and persist it so the message is non-empty: an
@@ -1449,6 +1534,8 @@ impl Agent {
             }
             self.run_tool_round(messages, run, &assistant_message, &loaded, round_events)
                 .await?;
+            // A tool round is not the stall the cap counts, whatever it did.
+            run.recovery.checklist_nudges = 0;
 
             // A compaction `context_compact` asked for, run here rather than after the loop so
             // the agent that chose the moment gets to act on the result: it takes its checkpoint,
@@ -1457,6 +1544,77 @@ impl Agent {
                 self.compact_at_the_agents_request(messages, run).await;
             self.compact_between_rounds(messages, run, compaction_attempted_this_round)
                 .await;
+        }
+    }
+
+    /// The inbox items a round boundary carries: steers and interrupts, which nothing cuts a tool
+    /// for, while a followup waits for the turn to end. Items the turn already carries (`carried`,
+    /// the opening's, pending still if the prompt's save failed and the lazy one is yet to run)
+    /// are left out. The one read for a tool round's results, for a nudge and for an interrupt,
+    /// so the three cannot disagree about what a boundary takes. A read that fails takes nothing;
+    /// the item waits for the next boundary, as every other inbox read degrades.
+    pub(super) async fn take_steering(
+        &self,
+        session_id: Uuid,
+        carried: &[Uuid],
+    ) -> Vec<crate::store::inbox::InboxItem> {
+        match self
+            .store
+            .inbox_store()
+            .take_pending(
+                session_id,
+                &[
+                    crate::store::inbox::InboxClass::Steer,
+                    crate::store::inbox::InboxClass::Interrupt,
+                ],
+                chrono::Utc::now(),
+            )
+            .await
+        {
+            Ok(mut items) => {
+                items.retain(|item| !carried.contains(&item.id));
+                items
+            }
+            Err(error) => {
+                tracing::warn!("failed to read the inbox at a round boundary: {error}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// The session's background tasks whose outcome the model has been given, for the checklist's
+    /// rule on items deferred on one. Delivery is the fact, not exit: a task that ended while the
+    /// deferring turn was still running has told the model nothing, and reopening the item then
+    /// would have the model close it on the nudge's word rather than on the result, which arrives
+    /// as a turn of its own and is stamped delivered before that turn starts. Read only when an
+    /// item names a task, so a session that never defers on one never pays the query; a failed
+    /// read leaves such items deferred, which is the safe side.
+    async fn reported_tasks(
+        &self,
+        session_id: Uuid,
+        state: &crate::checklist::ChecklistState,
+    ) -> Vec<crate::checklist::ReportedTask> {
+        if !state.items.iter().any(|item| item.task.is_some()) {
+            return Vec::new();
+        }
+        match self
+            .store
+            .background_store()
+            .list_background_tasks(session_id)
+            .await
+        {
+            Ok(tasks) => tasks
+                .into_iter()
+                .filter(|task| task.status.is_terminal() && task.delivered_at.is_some())
+                .map(|task| crate::checklist::ReportedTask {
+                    id: task.id,
+                    ended: task.status.headline(),
+                })
+                .collect(),
+            Err(error) => {
+                tracing::warn!("failed to read the background tasks for the checklist: {error}");
+                Vec::new()
+            }
         }
     }
 
@@ -1724,33 +1882,11 @@ impl Agent {
 
         // The round boundary is where a message that arrived while the tools ran is read: after
         // the results, in the same user message, which every wire accepts and which keeps the
-        // cache prefix ahead of it intact. Steers and interrupts, which nothing cuts a tool for; a
-        // followup waits for the turn to end. Read here and stamped with the round below, so the
+        // cache prefix ahead of it intact. Read here and stamped with the round below, so the
         // text and the stamp are one write.
-        let steering = match self
-            .store
-            .inbox_store()
-            .take_pending(
-                session_id,
-                &[
-                    crate::store::inbox::InboxClass::Steer,
-                    crate::store::inbox::InboxClass::Interrupt,
-                ],
-                chrono::Utc::now(),
-            )
-            .await
-        {
-            Ok(mut items) => {
-                // Pending still, if the prompt's save failed and the lazy one is yet to run;
-                // carried already, either way.
-                items.retain(|item| !run.recovery.inbox_ids.contains(&item.id));
-                items
-            }
-            Err(error) => {
-                tracing::warn!("failed to read the inbox at a round boundary: {error}");
-                Vec::new()
-            }
-        };
+        let steering = self
+            .take_steering(session_id, &run.recovery.inbox_ids)
+            .await;
         tool_results.extend(steering.iter().map(|item| ContentBlock::Text {
             text: prompt::render_inbox_item(item, true),
         }));
@@ -2142,26 +2278,10 @@ impl Agent {
         prompt: &Message,
         partial: Option<Message>,
     ) -> Result<()> {
-        use crate::{conversation::Event, store::inbox::InboxClass};
+        use crate::conversation::Event;
 
-        let inbox = self.store.inbox_store();
-        let mut items = match inbox
-            .take_pending(
-                session_id,
-                &[InboxClass::Steer, InboxClass::Interrupt],
-                chrono::Utc::now(),
-            )
-            .await
-        {
-            Ok(items) => items,
-            Err(error) => {
-                // The cut is spent either way; the request is repeated as it stood, and the
-                // item waits for the next poll, as every other inbox read degrades.
-                tracing::warn!("failed to read the inbox after an interrupt: {error}");
-                Vec::new()
-            }
-        };
-        items.retain(|item| !recovery.inbox_ids.contains(&item.id));
+        // The cut is spent either way: with nothing to carry, the request is repeated as it stood.
+        let items = self.take_steering(session_id, &recovery.inbox_ids).await;
         if items.is_empty() {
             return Ok(());
         }
@@ -2183,6 +2303,9 @@ impl Agent {
                     .iter()
                     .any(|block| matches!(block, ContentBlock::Text { .. }))
             });
+        // A trailing user message is the prompt the cut landed on, or a nudge whose round it cut;
+        // the items join either, as text blocks behind what was there, so a nudge stays one by
+        // its block and the person's words stay the person's as blocks of their own.
         let tail_is_user = messages
             .as_slice()
             .last()
@@ -3269,7 +3392,9 @@ mod tests {
         crate::sync::lock(&agent.schema_advisories_sent).insert("file_edit".to_string());
         agent.cells().record_context_tokens(1_000);
 
-        agent.reset_conversation_markers(&[]).await;
+        agent
+            .reset_conversation_markers(&crate::conversation::Conversation::new())
+            .await;
 
         assert_eq!(agent.tool_registry().tracked_reads_for_test().await, 0);
         assert!(crate::sync::lock(&agent.schema_advisories_sent).is_empty());
@@ -3368,6 +3493,167 @@ mod tests {
                 .any(|text| text == "Interrupted the answer to read a message from 'test'."),
             "the cut is announced: {:?}",
             notices(&frontend)
+        );
+    }
+
+    /// A steer that arrives while the model writes the reply that gets nudged rides the nudge,
+    /// the way one rides a tool round's results: the model reads it with the list, and the item
+    /// is stamped as carried by the nudge's save.
+    #[tokio::test]
+    async fn a_steer_that_arrives_during_the_nudged_reply_rides_the_nudge() {
+        use crate::provider::mock::MockStopReason;
+
+        let (agent, provider, store, session_id, _frontend) = agent_with_session(vec![
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["write the tests"]}),
+            ),
+            vec![
+                MockEvent::Sleep { ms: 400 },
+                MockEvent::Text {
+                    text: "I have planned it.".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+            complete_round("edit-1", 1),
+            answer_round("done", MockStopReason::EndTurn),
+        ])
+        .await;
+        register_checklist_tools(&agent, &store);
+        let enqueued = enqueue_later(
+            &store,
+            session_id,
+            InboxClass::Steer,
+            "and name the file",
+            std::time::Duration::from_millis(150),
+        );
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs on");
+        let item_id = enqueued.await.expect("enqueued");
+
+        let nudge = messages
+            .as_slice()
+            .iter()
+            .find(|message| message.is_nudge())
+            .expect("the reply with the item open was nudged");
+        assert!(
+            text_blocks(nudge)
+                .iter()
+                .any(|text| text.contains("while you were working]\nand name the file")),
+            "the steer rides the nudge: {nudge:?}"
+        );
+        let requests = provider.streams();
+        assert!(
+            requests[2]
+                .messages
+                .last()
+                .is_some_and(|last| last.is_nudge() && text_blocks(last).len() == 1),
+            "the request after the nudge carries the nudge and the steer as one message"
+        );
+        let item = store
+            .inbox_store()
+            .get(item_id)
+            .await
+            .expect("read")
+            .expect("the item");
+        assert_eq!(item.state(), crate::store::inbox::InboxState::Delivered);
+    }
+
+    /// An interrupt that lands during a nudge round rides the nudge, as a text block behind the
+    /// nudge's own: the message stays a nudge by its shape, and the person's words stay the
+    /// person's, in memory and in the store alike.
+    #[tokio::test]
+    async fn an_interrupt_during_a_nudge_round_rides_the_nudge() {
+        use crate::provider::mock::MockStopReason;
+
+        let (agent, _provider, store, session_id, _frontend) = agent_with_session(vec![
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["write the tests"]}),
+            ),
+            answer_round("I have planned it.", MockStopReason::EndTurn),
+            vec![
+                MockEvent::Sleep { ms: 5000 },
+                MockEvent::Text {
+                    text: "late".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+            answer_round("carrying on", MockStopReason::EndTurn),
+            complete_round("edit-1", 1),
+            answer_round("done", MockStopReason::EndTurn),
+        ])
+        .await;
+        register_checklist_tools(&agent, &store);
+        let enqueued = enqueue_later(
+            &store,
+            session_id,
+            InboxClass::Interrupt,
+            "actually, this",
+            std::time::Duration::from_millis(300),
+        );
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs on");
+        enqueued.await.expect("enqueued");
+
+        let view = messages.as_slice();
+        let nudge_at = view
+            .iter()
+            .position(Message::is_nudge)
+            .unwrap_or_else(|| panic!("the reply with the item open was nudged: {view:?}"));
+        let nudge = &view[nudge_at];
+        assert!(
+            text_blocks(nudge)
+                .iter()
+                .any(|text| text.contains("while you were working]\nactually, this")),
+            "the item rides the nudge as a block of its own: {nudge:?}"
+        );
+        assert_eq!(
+            view[nudge_at + 1].role,
+            Role::Assistant,
+            "and nothing else was put between the nudge and the reply: {view:?}"
+        );
+        let stored = store
+            .load_conversation(session_id)
+            .await
+            .expect("the stored conversation");
+        assert_eq!(
+            stored
+                .as_slice()
+                .iter()
+                .filter(|message| message.is_nudge())
+                .count(),
+            view.iter().filter(|message| message.is_nudge()).count(),
+            "the store reads the same nudges back"
+        );
+        assert!(
+            stored.as_slice().iter().any(|message| {
+                message.is_nudge() && message.text_content().contains("actually, this")
+            }),
+            "with the person's words as the person's, behind the nudge: {:?}",
+            stored.as_slice()
         );
     }
 
@@ -4750,6 +5036,70 @@ mod tests {
         );
     }
 
+    /// The checklist nudge is saved with the reply it answers as one unit, and a save that fails
+    /// ends the turn with neither in memory: appended first, the reply would sit in the
+    /// conversation with nothing behind it in the store.
+    #[tokio::test]
+    async fn a_checklist_nudge_whose_save_fails_leaves_memory_untouched() {
+        use crate::provider::mock::MockStopReason;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meka.db");
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["write the tests"]}),
+            ),
+            vec![
+                MockEvent::Sleep { ms: 300 },
+                MockEvent::Text {
+                    text: "I have planned it.".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (agent, store) = agent_at_for_test(provider as Arc<dyn Provider>, &path).await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session_id);
+        register_checklist_tools(&agent, &store);
+        let mut messages = Conversation::new();
+
+        let hide = tokio::spawn({
+            let path = path.clone();
+            async move {
+                // Inside the pause of the reply that would be nudged: the add's round is on disk,
+                // the reply and the nudge are not.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                hide_messages_table(&path, true);
+            }
+        });
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("plan and do it".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("the nudge's save fails");
+        hide.await.expect("the table was hidden");
+
+        assert_eq!(
+            messages.as_slice().len(),
+            3,
+            "the prompt and the add's round alone: neither the reply nor the nudge reached the \
+             store, so neither may be in memory: {:?}",
+            messages.as_slice()
+        );
+        assert_eq!(nudges_in(&messages), 0);
+    }
+
     /// An interrupted round still records what the request budget redacted: a redaction is a fact
     /// about the request the provider accepted, not about how the round ended, and dropping it
     /// with the round makes every later request redact the same image again.
@@ -5876,7 +6226,7 @@ mod tests {
                 MockEvent::Usage { input_tokens: 1234 },
                 MockEvent::ToolUseStart {
                     id: "call-1".to_string(),
-                    name: "todo_read".to_string(),
+                    name: "checklist_read".to_string(),
                 },
                 MockEvent::ToolUseEnd {
                     input: serde_json::json!({}),
@@ -7141,7 +7491,7 @@ mod tests {
             .expect("first turn succeeds");
 
         assert!(messages.rewind(1).is_some(), "the turn is rewound away");
-        agent.reset_conversation_markers(messages.as_slice()).await;
+        agent.reset_conversation_markers(&messages).await;
 
         agent
             .run_turn(
@@ -8545,5 +8895,1304 @@ mod tests {
             assert!(!system.contains("task_list"), "{system}");
             assert!(!system.contains("task_cancel"), "{system}");
         }
+    }
+
+    // ---- The checklist's hold on the turn ----
+
+    /// The three checklist tools on `agent`, sharing its cell and its session, the way the
+    /// registry wires them for a real session.
+    fn register_checklist_tools(agent: &Agent, store: &Store) {
+        let checklist = agent.cells.checklist.clone();
+        agent
+            .tool_registry
+            .register(Arc::new(crate::tools::checklist::ChecklistAddTool {
+                checklist: checklist.clone(),
+            }))
+            .expect("register");
+        agent
+            .tool_registry
+            .register(Arc::new(crate::tools::checklist::ChecklistEditTool {
+                checklist: checklist.clone(),
+                store: store.clone(),
+                site: agent.cells.site(),
+            }))
+            .expect("register");
+        agent
+            .tool_registry
+            .register(Arc::new(crate::tools::checklist::ChecklistReadTool {
+                checklist,
+            }))
+            .expect("register");
+    }
+
+    fn checklist_call_round(id: &str, name: &str, input: serde_json::Value) -> Vec<MockEvent> {
+        vec![
+            MockEvent::ToolUseStart {
+                id: id.to_string(),
+                name: name.to_string(),
+            },
+            MockEvent::ToolUseEnd { input },
+            MockEvent::MessageEnd {
+                stop_reason: crate::provider::mock::MockStopReason::ToolUse,
+            },
+        ]
+    }
+
+    fn answer_round(
+        text: &str,
+        stop_reason: crate::provider::mock::MockStopReason,
+    ) -> Vec<MockEvent> {
+        vec![
+            MockEvent::Text {
+                text: text.to_string(),
+            },
+            MockEvent::MessageEnd { stop_reason },
+        ]
+    }
+
+    fn checklist_notices(frontend: &crate::frontend::testing::RecordingFrontend) -> Vec<String> {
+        frontend
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                FrontendEvent::Notice(notice) if notice.text.starts_with("checklist:") => {
+                    Some(notice.text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn nudges_in(messages: &Conversation) -> usize {
+        messages
+            .as_slice()
+            .iter()
+            .filter(|message| message.is_nudge())
+            .count()
+    }
+
+    #[test]
+    fn the_checklist_rule_binds_a_normal_end_with_open_items_under_the_cap() {
+        use crate::provider::StopReason;
+
+        assert!(should_nudge_checklist(false, &StopReason::EndTurn, 1, 0, 0));
+        assert!(should_nudge_checklist(
+            false,
+            &StopReason::Unknown("odd".to_string()),
+            1,
+            CHECKLIST_NUDGE_LIMIT - 1,
+            CHECKLIST_NUDGES_PER_TURN - 1
+        ));
+        assert!(
+            !should_nudge_checklist(true, &StopReason::EndTurn, 1, 0, 0),
+            "a tool round runs"
+        );
+        assert!(
+            !should_nudge_checklist(false, &StopReason::EndTurn, 0, 0, 0),
+            "nothing is open"
+        );
+        assert!(
+            !should_nudge_checklist(false, &StopReason::EndTurn, 1, CHECKLIST_NUDGE_LIMIT, 3),
+            "the cap on a run"
+        );
+        assert!(
+            !should_nudge_checklist(false, &StopReason::EndTurn, 1, 0, CHECKLIST_NUDGES_PER_TURN),
+            "the cap on the turn, whatever the run"
+        );
+        assert!(!should_nudge_checklist(
+            false,
+            &StopReason::MaxTokens,
+            1,
+            0,
+            0
+        ));
+        assert!(!should_nudge_checklist(
+            false,
+            &StopReason::Refusal(String::new()),
+            1,
+            0,
+            0
+        ));
+        assert!(!should_nudge_checklist(
+            false,
+            &StopReason::ToolUse,
+            1,
+            0,
+            0
+        ));
+    }
+
+    /// The reply that would have ended the turn is answered with the open items, and the turn
+    /// ends only once they are disposed of: the one notice per nudge is what tells a watcher the
+    /// turn is still going.
+    #[tokio::test]
+    async fn a_reply_that_leaves_an_item_open_is_nudged_until_the_item_is_disposed_of() {
+        use crate::provider::mock::MockStopReason;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["write the tests"]}),
+            ),
+            answer_round("I have planned it.", MockStopReason::EndTurn),
+            checklist_call_round(
+                "edit-1",
+                "checklist_edit",
+                serde_json::json!({"id": 1, "status": "completed"}),
+            ),
+            answer_round("Done.", MockStopReason::EndTurn),
+        ]));
+        let (mut agent, store) = agent_for_test(provider).await;
+        register_checklist_tools(&agent, &store);
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = Arc::clone(&frontend) as Arc<dyn crate::frontend::Frontend>;
+        let mut messages = Conversation::new();
+
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("plan and do it".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn ends");
+
+        assert!(matches!(outcome, TurnOutcome::EndTurn));
+        assert_eq!(nudges_in(&messages), 1, "{:?}", messages.as_slice());
+        let last = messages.as_slice().last().expect("a reply");
+        assert_eq!(
+            last.text_content(),
+            "Done.",
+            "the turn ended on the reply after the edit"
+        );
+        assert_eq!(checklist_notices(&frontend), vec![
+            "checklist: 1 open item, continuing, nudge 1 of 3".to_string()
+        ]);
+        assert!(agent.cells.checklist.get().items.is_empty());
+    }
+
+    /// Three answers in a row that touch no tool end the turn with the item where it is and a
+    /// notice saying so; a tool round in between starts the count over.
+    #[tokio::test]
+    async fn the_cap_ends_a_turn_that_answers_the_nudge_three_times_without_a_tool() {
+        use crate::provider::mock::MockStopReason;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["x"]}),
+            ),
+            answer_round("one", MockStopReason::EndTurn),
+            answer_round("two", MockStopReason::EndTurn),
+            checklist_call_round("read-1", "checklist_read", serde_json::json!({})),
+            answer_round("three", MockStopReason::EndTurn),
+            answer_round("four", MockStopReason::EndTurn),
+            answer_round("five", MockStopReason::EndTurn),
+            answer_round("six", MockStopReason::EndTurn),
+        ]));
+        let (mut agent, store) = agent_for_test(provider).await;
+        register_checklist_tools(&agent, &store);
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = Arc::clone(&frontend) as Arc<dyn crate::frontend::Frontend>;
+        let mut messages = Conversation::new();
+
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("do x".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn ends");
+
+        assert!(matches!(outcome, TurnOutcome::EndTurn));
+        // Two nudges, a read that resets the count, three more, then the cap lets "six" stand.
+        assert_eq!(nudges_in(&messages), 5, "{:?}", messages.as_slice());
+        assert_eq!(
+            messages.as_slice().last().expect("a reply").text_content(),
+            "six"
+        );
+        assert_eq!(checklist_notices(&frontend), vec![
+            "checklist: 1 open item, continuing, nudge 1 of 3".to_string(),
+            "checklist: 1 open item, continuing, nudge 2 of 3".to_string(),
+            "checklist: 1 open item, continuing, nudge 1 of 3".to_string(),
+            "checklist: 1 open item, continuing, nudge 2 of 3".to_string(),
+            "checklist: 1 open item, continuing, nudge 3 of 3".to_string(),
+            "checklist: 1 item left open after 3 nudges".to_string(),
+        ]);
+        assert_eq!(
+            agent.cells.checklist.get().items.len(),
+            1,
+            "left where it was"
+        );
+    }
+
+    /// A deferral is the honest way to stop: it does not hold the turn, and the nudge never fires.
+    #[tokio::test]
+    async fn a_deferred_item_does_not_hold_the_turn() {
+        use crate::provider::mock::MockStopReason;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["ask Sam"]}),
+            ),
+            checklist_call_round(
+                "edit-1",
+                "checklist_edit",
+                serde_json::json!({"id": 1, "status": "deferred", "reason": "waiting on Sam"}),
+            ),
+            answer_round("Asked; waiting.", MockStopReason::EndTurn),
+        ]));
+        let (mut agent, store) = agent_for_test(provider).await;
+        register_checklist_tools(&agent, &store);
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = Arc::clone(&frontend) as Arc<dyn crate::frontend::Frontend>;
+        let mut messages = Conversation::new();
+
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("ask Sam".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn ends");
+
+        assert_eq!(nudges_in(&messages), 0, "{:?}", messages.as_slice());
+        assert!(checklist_notices(&frontend).is_empty());
+        assert_eq!(agent.cells.checklist.get().items.len(), 1);
+    }
+
+    /// A task that exited while the deferring turn was still running has reported nothing yet, so
+    /// the item keeps waiting and that turn ends without a nudge. Once the outcome has been
+    /// delivered the item is open again, and the nudge names the task and how it ended.
+    #[tokio::test]
+    async fn an_item_deferred_on_a_task_waits_for_its_report_not_its_exit() {
+        use crate::{provider::mock::MockStopReason, store::background::TaskStatus};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["read the build log"]}),
+            ),
+            checklist_call_round(
+                "edit-1",
+                "checklist_edit",
+                serde_json::json!({
+                    "id": 1, "status": "deferred", "reason": "building", "task": "1a2b3c4d"
+                }),
+            ),
+            answer_round("Build started.", MockStopReason::EndTurn),
+            answer_round("Noted.", MockStopReason::EndTurn),
+            checklist_call_round(
+                "edit-2",
+                "checklist_edit",
+                serde_json::json!({"id": 1, "status": "completed"}),
+            ),
+            answer_round("Read it.", MockStopReason::EndTurn),
+        ]));
+        let (mut agent, store) = agent_for_test(provider).await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("a session");
+        agent.cells.session_id.set(session_id);
+        register_checklist_tools(&agent, &store);
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = Arc::clone(&frontend) as Arc<dyn crate::frontend::Frontend>;
+        let task_id = "1a2b3c4d-0000-4000-8000-000000000000";
+        store
+            .background_store()
+            .start_background_task(&crate::store::background::BackgroundTask {
+                id: task_id.to_string(),
+                session_id,
+                tool: "shell_execute".to_string(),
+                label: "make".to_string(),
+                status: TaskStatus::Running,
+                outcome: None,
+                scratchpad_entry: None,
+                started_at: chrono::Utc::now(),
+                finished_at: None,
+                announced_at: None,
+                delivered_at: None,
+                subagent_id: None,
+            })
+            .await
+            .expect("a task");
+        store
+            .background_store()
+            .finish_background_task(task_id, TaskStatus::Completed, None, None)
+            .await
+            .expect("the task ends before the deferral, which the resolver allows");
+        let mut messages = Conversation::new();
+
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("build and read".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the deferring turn ends");
+        assert_eq!(
+            nudges_in(&messages),
+            0,
+            "exited but unreported, the task holds nothing: {:?}",
+            messages.as_slice()
+        );
+
+        store
+            .background_store()
+            .mark_background_tasks_delivered(&[task_id.to_string()])
+            .await
+            .expect("the driver stamps the row before the reporting turn");
+        let task = store
+            .background_store()
+            .background_task(session_id, task_id)
+            .await
+            .expect("read")
+            .expect("the row");
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::outcomes(vec![task]),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the reporting turn ends");
+
+        let nudge = messages
+            .as_slice()
+            .iter()
+            .filter_map(|message| message.nudge().map(|(_, text)| text.to_string()))
+            .next()
+            .expect("the reported task reopened the item");
+        assert!(
+            nudge.contains("task 1a2b3c4d finished, so this item is open again"),
+            "{nudge}"
+        );
+        assert!(agent.cells.checklist.get().items.is_empty());
+    }
+
+    /// The live shape: the item is deferred on a task that is still running, the turn ends, the
+    /// task ends, and its outcome opens a turn of its own. A reply in that turn that leaves the
+    /// item where it is does not end the turn: the task has ended, so the item is open again.
+    #[tokio::test]
+    async fn an_outcome_turn_is_nudged_for_the_item_deferred_on_its_task() {
+        use crate::{provider::mock::MockStopReason, store::background::TaskStatus};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            // Turn 1: defer on the running task and stop, which is allowed.
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["report the build result"]}),
+            ),
+            checklist_call_round(
+                "edit-1",
+                "checklist_edit",
+                serde_json::json!({
+                    "id": 1, "status": "deferred", "reason": "building", "task": "1a2b3c4d"
+                }),
+            ),
+            answer_round("Build started.", MockStopReason::EndTurn),
+            // Turn 2, opened by the outcome: the model notes it and stops, which is not allowed.
+            answer_round("Noted.", MockStopReason::EndTurn),
+            checklist_call_round(
+                "edit-2",
+                "checklist_edit",
+                serde_json::json!({"id": 1, "status": "completed"}),
+            ),
+            answer_round("Reported.", MockStopReason::EndTurn),
+        ]));
+        let (mut agent, store) = agent_for_test(provider).await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("a session");
+        agent.cells.session_id.set(session_id);
+        register_checklist_tools(&agent, &store);
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = Arc::clone(&frontend) as Arc<dyn crate::frontend::Frontend>;
+        let task_id = "1a2b3c4d-0000-4000-8000-000000000000";
+        store
+            .background_store()
+            .start_background_task(&crate::store::background::BackgroundTask {
+                id: task_id.to_string(),
+                session_id,
+                tool: "shell_execute".to_string(),
+                label: "make".to_string(),
+                status: TaskStatus::Running,
+                outcome: None,
+                scratchpad_entry: None,
+                started_at: chrono::Utc::now(),
+                finished_at: None,
+                announced_at: None,
+                delivered_at: None,
+                subagent_id: None,
+            })
+            .await
+            .expect("a task");
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("build and report".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the first turn ends");
+        assert_eq!(
+            nudges_in(&messages),
+            0,
+            "deferred on a running task, the item waits"
+        );
+
+        store
+            .background_store()
+            .finish_background_task(task_id, TaskStatus::Completed, Some("ok".to_string()), None)
+            .await
+            .expect("the task ends");
+        store
+            .background_store()
+            .mark_background_tasks_delivered(&[task_id.to_string()])
+            .await
+            .expect("the driver stamps the row before the reporting turn");
+        let task = store
+            .background_store()
+            .background_task(session_id, task_id)
+            .await
+            .expect("read")
+            .expect("the row");
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::outcomes(vec![task]),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the outcome turn ends");
+
+        assert_eq!(
+            nudges_in(&messages),
+            1,
+            "the ended task reopened the item: {:?}",
+            messages.as_slice()
+        );
+        assert!(agent.cells.checklist.get().items.is_empty());
+    }
+
+    /// A running task `task_id` of `session_id`, as a backgrounded call records one.
+    async fn start_running_task(store: &Store, session_id: Uuid, task_id: &str) {
+        store
+            .background_store()
+            .start_background_task(&crate::store::background::BackgroundTask {
+                id: task_id.to_string(),
+                session_id,
+                tool: "shell_execute".to_string(),
+                label: "make".to_string(),
+                status: crate::store::background::TaskStatus::Running,
+                outcome: None,
+                scratchpad_entry: None,
+                started_at: chrono::Utc::now(),
+                finished_at: None,
+                announced_at: None,
+                delivered_at: None,
+                subagent_id: None,
+            })
+            .await
+            .expect("a task");
+    }
+
+    /// Stamp `task_id` delivered and read its row back, the way every host does ahead of the turn
+    /// that reports it.
+    async fn claim_task(
+        store: &Store,
+        session_id: Uuid,
+        task_id: &str,
+    ) -> crate::store::background::BackgroundTask {
+        store
+            .background_store()
+            .mark_background_tasks_delivered(&[task_id.to_string()])
+            .await
+            .expect("the driver stamps the row before the reporting turn");
+        store
+            .background_store()
+            .background_task(session_id, task_id)
+            .await
+            .expect("read")
+            .expect("the row")
+    }
+
+    /// An agent with the checklist tools, a recording frontend and a session of its own, so a
+    /// task can be recorded for it.
+    async fn checklist_agent_with_session(
+        rounds: Vec<Vec<MockEvent>>,
+    ) -> (
+        Agent,
+        Store,
+        Uuid,
+        Arc<crate::frontend::testing::RecordingFrontend>,
+    ) {
+        let provider = Arc::new(MockProvider::from_rounds(rounds));
+        let (mut agent, store) = agent_for_test(provider).await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("a session");
+        agent.cells.session_id.set(session_id);
+        register_checklist_tools(&agent, &store);
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = Arc::clone(&frontend) as Arc<dyn crate::frontend::Frontend>;
+        (agent, store, session_id, frontend)
+    }
+
+    fn nudge_text(messages: &Conversation) -> String {
+        messages
+            .as_slice()
+            .iter()
+            .filter_map(|message| message.nudge().map(|(_, text)| text.to_string()))
+            .next_back()
+            .expect("a nudge")
+    }
+
+    const TASK_A: &str = "1a2b3c4d-0000-4000-8000-000000000000";
+    const TASK_B: &str = "2b3c4d5e-0000-4000-8000-000000000000";
+
+    fn defer_round(id: &str, item: u64, task: &str) -> Vec<MockEvent> {
+        checklist_call_round(
+            id,
+            "checklist_edit",
+            serde_json::json!({
+                "id": item, "status": "deferred", "reason": "building", "task": task
+            }),
+        )
+    }
+
+    fn complete_round(id: &str, item: u64) -> Vec<MockEvent> {
+        checklist_call_round(
+            id,
+            "checklist_edit",
+            serde_json::json!({"id": item, "status": "completed"}),
+        )
+    }
+
+    /// The task ends after the model has started it and before it defers the item on it, inside
+    /// the same turn. The deferral is accepted: the task has exited but not reported, and the
+    /// report is what reopens the item, in the turn that carries it.
+    #[tokio::test]
+    async fn a_task_that_ends_before_the_deferral_in_the_same_turn_is_still_one_to_wait_on() {
+        use crate::{provider::mock::MockStopReason, store::background::TaskStatus};
+
+        let mut deferral = vec![MockEvent::Sleep { ms: 300 }];
+        deferral.extend(defer_round("edit-1", 1, "1a2b3c4d"));
+        let (agent, store, session_id, _frontend) = checklist_agent_with_session(vec![
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["read the build log"]}),
+            ),
+            deferral,
+            answer_round("Build started.", MockStopReason::EndTurn),
+            answer_round("Noted.", MockStopReason::EndTurn),
+            complete_round("edit-2", 1),
+            answer_round("Read it.", MockStopReason::EndTurn),
+        ])
+        .await;
+        start_running_task(&store, session_id, TASK_A).await;
+        tokio::spawn({
+            let store = store.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                store
+                    .background_store()
+                    .finish_background_task(TASK_A, TaskStatus::Completed, None, None)
+                    .await
+                    .expect("the task ends during the model's pause");
+            }
+        });
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("build and read".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the deferring turn ends");
+        let task = store
+            .background_store()
+            .background_task(session_id, TASK_A)
+            .await
+            .expect("read")
+            .expect("the row");
+        assert_eq!(
+            task.status,
+            TaskStatus::Completed,
+            "the task ended inside the turn"
+        );
+        let item = &agent.cells.checklist.get().items[0];
+        assert_eq!(item.status, crate::checklist::ChecklistStatus::Deferred);
+        assert_eq!(item.task.as_deref(), Some("1a2b3c4d"));
+        assert_eq!(nudges_in(&messages), 0, "{:?}", messages.as_slice());
+
+        let task = claim_task(&store, session_id, TASK_A).await;
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::outcomes(vec![task]),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the reporting turn ends");
+        assert!(
+            nudge_text(&messages).contains("task 1a2b3c4d finished, so this item is open again")
+        );
+        assert!(agent.cells.checklist.get().items.is_empty());
+    }
+
+    /// The task ends after the deferral and before the turn's end. The end-of-turn check sees a
+    /// task that has exited and not reported, and holds nothing; the report's turn is the one
+    /// held.
+    #[tokio::test]
+    async fn a_task_that_ends_after_the_deferral_and_before_the_turns_end_holds_nothing_yet() {
+        use crate::{provider::mock::MockStopReason, store::background::TaskStatus};
+
+        let (agent, store, session_id, frontend) = checklist_agent_with_session(vec![
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["read the build log"]}),
+            ),
+            defer_round("edit-1", 1, "1a2b3c4d"),
+            vec![
+                MockEvent::Sleep { ms: 300 },
+                MockEvent::Text {
+                    text: "Build started.".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+            answer_round("Noted.", MockStopReason::EndTurn),
+            complete_round("edit-2", 1),
+            answer_round("Read it.", MockStopReason::EndTurn),
+        ])
+        .await;
+        start_running_task(&store, session_id, TASK_A).await;
+        tokio::spawn({
+            let store = store.clone();
+            let list = agent.cells.checklist.clone();
+            async move {
+                // After the deferral, inside the turn: the pause in the last round is where this
+                // lands.
+                while list
+                    .get()
+                    .items
+                    .first()
+                    .and_then(|item| item.task.as_deref())
+                    .is_none()
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                store
+                    .background_store()
+                    .finish_background_task(TASK_A, TaskStatus::Completed, None, None)
+                    .await
+                    .expect("the task ends after the deferral");
+            }
+        });
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("build and read".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the deferring turn ends");
+        let task = store
+            .background_store()
+            .background_task(session_id, TASK_A)
+            .await
+            .expect("read")
+            .expect("the row");
+        assert_eq!(
+            task.status,
+            TaskStatus::Completed,
+            "the task ended inside the turn"
+        );
+        assert_eq!(
+            nudges_in(&messages),
+            0,
+            "exited but unreported, it holds nothing: {:?}",
+            messages.as_slice()
+        );
+        assert!(checklist_notices(&frontend).is_empty());
+
+        let task = claim_task(&store, session_id, TASK_A).await;
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::outcomes(vec![task]),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the reporting turn ends");
+        assert_eq!(nudges_in(&messages), 1);
+        assert_eq!(checklist_notices(&frontend), vec![
+            "checklist: 1 open item, continuing, nudge 1 of 3".to_string()
+        ]);
+        assert!(agent.cells.checklist.get().items.is_empty());
+    }
+
+    /// In the turn that reports the task, deferring the item on that task again is refused: the
+    /// report has arrived, so the item would be open at once and the nudge would never end. A
+    /// new reason states the deferral afresh, off the task, and that ends the turn.
+    #[tokio::test]
+    async fn re_deferring_on_the_task_that_reported_is_refused_and_a_new_reason_moves_off_it() {
+        use crate::{provider::mock::MockStopReason, store::background::TaskStatus};
+
+        let (agent, store, session_id, frontend) = checklist_agent_with_session(vec![
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["report the build result"]}),
+            ),
+            defer_round("edit-1", 1, "1a2b3c4d"),
+            answer_round("Build started.", MockStopReason::EndTurn),
+            // The reporting turn: a note, the nudge, a re-deferral on the same task (refused), a
+            // bare re-deferral that would keep it (refused), then one with a new reason.
+            answer_round("Noted.", MockStopReason::EndTurn),
+            defer_round("edit-2", 1, "1a2b3c4d"),
+            checklist_call_round(
+                "edit-3",
+                "checklist_edit",
+                serde_json::json!({"id": 1, "status": "deferred"}),
+            ),
+            checklist_call_round(
+                "edit-4",
+                "checklist_edit",
+                serde_json::json!({"id": 1, "status": "deferred", "reason": "Sam reviews it"}),
+            ),
+            answer_round("Handed to Sam.", MockStopReason::EndTurn),
+        ])
+        .await;
+        start_running_task(&store, session_id, TASK_A).await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("build and report".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the first turn ends");
+        store
+            .background_store()
+            .finish_background_task(TASK_A, TaskStatus::Failed, Some("boom".to_string()), None)
+            .await
+            .expect("the task fails");
+        let task = claim_task(&store, session_id, TASK_A).await;
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::outcomes(vec![task]),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the reporting turn ends");
+
+        let refusals = messages
+            .as_slice()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|block| match block {
+                ContentBlock::ToolResult {
+                    is_error, content, ..
+                } => {
+                    *is_error
+                        && content.iter().any(|content| match content {
+                            crate::conversation::ToolResultContent::Text { text } => {
+                                text.contains("failed and has reported")
+                            }
+                            _ => false,
+                        })
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            refusals,
+            2,
+            "named and kept alike: {:?}",
+            messages.as_slice()
+        );
+        assert!(nudge_text(&messages).contains("task 1a2b3c4d failed, so this item is open again"));
+        assert_eq!(nudges_in(&messages), 1);
+        assert_eq!(checklist_notices(&frontend), vec![
+            "checklist: 1 open item, continuing, nudge 1 of 3".to_string()
+        ]);
+        let item = &agent.cells.checklist.get().items[0];
+        assert_eq!(item.status, crate::checklist::ChecklistStatus::Deferred);
+        assert_eq!(item.reason.as_deref(), Some("Sam reviews it"));
+        assert_eq!(item.task, None, "off the task, so the turn could end");
+    }
+
+    /// An outcome that does not warrant a turn of its own rides the next prompt, and the item
+    /// reopens there; the nudge says how the task ended, in the report's own words.
+    #[tokio::test]
+    async fn an_item_on_a_task_that_was_canceled_or_interrupted_reopens_on_the_prompt_the_report_rides()
+     {
+        use crate::{provider::mock::MockStopReason, store::background::TaskStatus};
+
+        for (how, ended) in [
+            (Some(TaskStatus::Canceled), "was canceled"),
+            (None, "was interrupted"),
+        ] {
+            let (agent, store, session_id, _frontend) = checklist_agent_with_session(vec![
+                checklist_call_round(
+                    "add-1",
+                    "checklist_add",
+                    serde_json::json!({"items": ["report the build result"]}),
+                ),
+                defer_round("edit-1", 1, "1a2b3c4d"),
+                answer_round("Build started.", MockStopReason::EndTurn),
+                answer_round("Nothing else.", MockStopReason::EndTurn),
+                checklist_call_round(
+                    "edit-2",
+                    "checklist_edit",
+                    serde_json::json!({"id": 1, "status": "canceled", "reason": "no build to report"}),
+                ),
+                answer_round("Dropped it.", MockStopReason::EndTurn),
+            ])
+            .await;
+            start_running_task(&store, session_id, TASK_A).await;
+            let mut messages = Conversation::new();
+            agent
+                .run_turn(
+                    &mut messages,
+                    crate::agent::TurnInput::from_parts("build and report".to_string(), Vec::new())
+                        .expect("a prompt"),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("the first turn ends");
+            match how {
+                Some(status) => store
+                    .background_store()
+                    .finish_background_task(TASK_A, status, None, None)
+                    .await
+                    .expect("the user cancels it"),
+                None => {
+                    store
+                        .background_store()
+                        .sweep_interrupted_background_tasks(session_id)
+                        .await
+                        .expect("a later process sweeps it");
+                }
+            }
+            let task = claim_task(&store, session_id, TASK_A).await;
+            agent
+                .run_turn(
+                    &mut messages,
+                    crate::agent::TurnInput::from_parts("anything else?".to_string(), Vec::new())
+                        .expect("a prompt")
+                        .riding(vec![task]),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("the carrying turn ends");
+            let nudge = nudge_text(&messages);
+            assert!(
+                nudge.contains(&format!(
+                    "task 1a2b3c4d {ended}, so this item is open again"
+                )),
+                "{nudge}"
+            );
+            assert!(agent.cells.checklist.get().items.is_empty());
+        }
+    }
+
+    /// Two items on two tasks: the report of one reopens its item alone, with the other listed
+    /// for reference, and a batch that reports both reopens both.
+    #[tokio::test]
+    async fn only_the_items_on_the_tasks_that_reported_reopen() {
+        use crate::{provider::mock::MockStopReason, store::background::TaskStatus};
+
+        let (agent, store, session_id, _frontend) = checklist_agent_with_session(vec![
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["read log A", "read log B", "read log C"]}),
+            ),
+            defer_round("edit-1", 1, "1a2b3c4d"),
+            defer_round("edit-2", 2, "2b3c4d5e"),
+            checklist_call_round(
+                "edit-3",
+                "checklist_edit",
+                serde_json::json!({"id": 3, "status": "deferred", "reason": "after A and B"}),
+            ),
+            answer_round("Both started.", MockStopReason::EndTurn),
+            // A reports alone.
+            answer_round("Noted A.", MockStopReason::EndTurn),
+            complete_round("edit-4", 1),
+            answer_round("Read A.", MockStopReason::EndTurn),
+        ])
+        .await;
+        start_running_task(&store, session_id, TASK_A).await;
+        start_running_task(&store, session_id, TASK_B).await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("build both".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the deferring turn ends");
+        assert_eq!(nudges_in(&messages), 0);
+
+        store
+            .background_store()
+            .finish_background_task(TASK_A, TaskStatus::Completed, None, None)
+            .await
+            .expect("A ends");
+        let task = claim_task(&store, session_id, TASK_A).await;
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::outcomes(vec![task]),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("A's turn ends");
+        let nudge = nudge_text(&messages);
+        assert!(
+            nudge.contains(
+                "Open:\n- 1 (task 1a2b3c4d finished, so this item is open again; was deferred: \
+                 building): read log A\n\nDeferred, for reference:\n- 2 (deferred until task \
+                 2b3c4d5e reports: building): read log B\n- 3 (deferred: after A and B): read \
+                 log C\n"
+            ),
+            "{nudge}"
+        );
+        let open: Vec<u64> = agent
+            .cells
+            .checklist
+            .get()
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect();
+        assert_eq!(open, vec![2, 3], "B and C still wait");
+    }
+
+    /// Two tasks reporting in one batch reopen both their items in the one turn.
+    #[tokio::test]
+    async fn a_batch_of_reports_reopens_every_item_on_them() {
+        use crate::{provider::mock::MockStopReason, store::background::TaskStatus};
+
+        let (agent, store, session_id, _frontend) = checklist_agent_with_session(vec![
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["read log A", "read log B"]}),
+            ),
+            defer_round("edit-1", 1, "1a2b3c4d"),
+            defer_round("edit-2", 2, "2b3c4d5e"),
+            answer_round("Both started.", MockStopReason::EndTurn),
+            answer_round("Noted both.", MockStopReason::EndTurn),
+            complete_round("edit-3", 1),
+            complete_round("edit-4", 2),
+            answer_round("Read both.", MockStopReason::EndTurn),
+        ])
+        .await;
+        start_running_task(&store, session_id, TASK_A).await;
+        start_running_task(&store, session_id, TASK_B).await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("build both".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the deferring turn ends");
+        for (task, status) in [
+            (TASK_A, TaskStatus::Completed),
+            (TASK_B, TaskStatus::Failed),
+        ] {
+            store
+                .background_store()
+                .finish_background_task(task, status, None, None)
+                .await
+                .expect("ends");
+        }
+        let batch = vec![
+            claim_task(&store, session_id, TASK_A).await,
+            claim_task(&store, session_id, TASK_B).await,
+        ];
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::outcomes(batch),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the batch's turn ends");
+        let nudge = nudge_text(&messages);
+        assert!(
+            nudge.contains("(task 1a2b3c4d finished, so this item is open again;"),
+            "{nudge}"
+        );
+        assert!(
+            nudge.contains("(task 2b3c4d5e failed, so this item is open again;"),
+            "{nudge}"
+        );
+        assert!(!nudge.contains("for reference"), "{nudge}");
+        assert!(agent.cells.checklist.get().items.is_empty());
+    }
+
+    /// A tool round between two nudges resets the run the cap counts, which a round that only
+    /// reads the list would otherwise turn into a turn that never ends. The bound on the turn
+    /// ends it after nine, and the notice names that bound.
+    #[tokio::test]
+    async fn a_tool_round_between_every_two_nudges_does_not_buy_more_than_nine_in_a_turn() {
+        use crate::provider::mock::MockStopReason;
+
+        let mut rounds = vec![checklist_call_round(
+            "add-1",
+            "checklist_add",
+            serde_json::json!({"items": ["write the tests"]}),
+        )];
+        for nudge in 0..CHECKLIST_NUDGES_PER_TURN {
+            rounds.push(answer_round("Done.", MockStopReason::EndTurn));
+            rounds.push(checklist_call_round(
+                &format!("read-{nudge}"),
+                "checklist_read",
+                serde_json::json!({}),
+            ));
+        }
+        rounds.push(answer_round("Done.", MockStopReason::EndTurn));
+        // One more than the turn may use: a loop that got here would take it.
+        rounds.push(answer_round("Still done.", MockStopReason::EndTurn));
+        let (agent, _store, _session_id, frontend) = checklist_agent_with_session(rounds).await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("plan and do it".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn ends");
+        assert_eq!(nudges_in(&messages), CHECKLIST_NUDGES_PER_TURN as usize);
+        let notices = checklist_notices(&frontend);
+        assert_eq!(
+            notices.len(),
+            CHECKLIST_NUDGES_PER_TURN as usize + 1,
+            "{notices:?}"
+        );
+        assert!(
+            notices[..CHECKLIST_NUDGES_PER_TURN as usize]
+                .iter()
+                .all(|notice| notice == "checklist: 1 open item, continuing, nudge 1 of 3"),
+            "every run was reset by the read: {notices:?}"
+        );
+        assert_eq!(
+            notices[CHECKLIST_NUDGES_PER_TURN as usize],
+            "checklist: 1 item left open after 9 nudges this turn"
+        );
+        assert_eq!(agent.cells.checklist.get().items.len(), 1);
+        assert_eq!(
+            messages
+                .as_slice()
+                .last()
+                .map(Message::text_content)
+                .as_deref(),
+            Some("Done."),
+            "the turn ended on the reply after the ninth nudge"
+        );
+    }
+
+    /// A session whose items were all disposed of has a list with a counter and no items; read
+    /// back on open, that is nothing to show and nothing to announce, where a list with items is
+    /// owed to the surface that was not there when they were added.
+    #[tokio::test]
+    async fn a_list_read_back_is_announced_only_when_it_has_items_to_show() {
+        let (agent, store, _session_id, frontend) = checklist_agent_with_session(Vec::new()).await;
+        drop(store);
+        let mut emptied = Conversation::new();
+        emptied.append(Message::user("plan"));
+        emptied.append(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "add-1".to_string(),
+                name: "checklist_add".to_string(),
+                input: serde_json::json!({"items": ["a"]}),
+            }],
+        });
+        emptied.append(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "add-1".to_string(),
+                content: vec![crate::conversation::ToolResultContent::Text {
+                    text: "ok".to_string(),
+                }],
+                is_error: false,
+            }],
+        });
+        emptied.append(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "edit-1".to_string(),
+                name: "checklist_edit".to_string(),
+                input: serde_json::json!({"id": 1, "status": "completed"}),
+            }],
+        });
+        emptied.append(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "edit-1".to_string(),
+                content: vec![crate::conversation::ToolResultContent::Text {
+                    text: "ok".to_string(),
+                }],
+                is_error: false,
+            }],
+        });
+        agent.hydrate_checklist(&emptied).await;
+        let announced = || {
+            frontend
+                .events()
+                .iter()
+                .filter(|event| matches!(event, FrontendEvent::ChecklistUpdated { .. }))
+                .count()
+        };
+        assert_eq!(announced(), 0, "an emptied list is nothing to show");
+
+        let mut open = Conversation::new();
+        open.append(Message::user("plan"));
+        open.append(emptied.as_slice()[1].clone());
+        open.append(emptied.as_slice()[2].clone());
+        agent.hydrate_checklist(&open).await;
+        assert_eq!(announced(), 1, "a list with an item is owed to the surface");
+        agent.hydrate_checklist(&open).await;
+        assert_eq!(announced(), 1, "and not twice for the same list");
+    }
+
+    /// A stop with its own outcome is never answered with the list: the turn ends on its own terms.
+    #[tokio::test]
+    async fn a_token_limit_stop_is_not_nudged() {
+        use crate::provider::mock::MockStopReason;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            checklist_call_round(
+                "add-1",
+                "checklist_add",
+                serde_json::json!({"items": ["x"]}),
+            ),
+            answer_round("cut sh", MockStopReason::MaxTokens),
+        ]));
+        let (mut agent, store) = agent_for_test(provider).await;
+        register_checklist_tools(&agent, &store);
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = Arc::clone(&frontend) as Arc<dyn crate::frontend::Frontend>;
+        let mut messages = Conversation::new();
+
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("do x".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn ends");
+
+        assert!(matches!(outcome, TurnOutcome::MaxTokens));
+        assert_eq!(nudges_in(&messages), 0);
+        assert!(checklist_notices(&frontend).is_empty());
+    }
+
+    /// A turn starts from what the log records, not from what the cell happened to hold: a
+    /// session made resident, a rewind on another host and a worker's follow-up all arrive this
+    /// way.
+    #[tokio::test]
+    async fn a_turn_reads_the_checklist_back_from_the_conversation_it_starts_on() {
+        use crate::{
+            conversation::{Event, Role},
+            provider::mock::MockStopReason,
+        };
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            answer_round("Still on it.", MockStopReason::EndTurn),
+            checklist_call_round(
+                "edit-1",
+                "checklist_edit",
+                serde_json::json!({"id": 1, "status": "completed"}),
+            ),
+            answer_round("Done.", MockStopReason::EndTurn),
+        ]));
+        let (mut agent, store) = agent_for_test(provider).await;
+        register_checklist_tools(&agent, &store);
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = Arc::clone(&frontend) as Arc<dyn crate::frontend::Frontend>;
+        // The log of an earlier process: an item added, the turn ended; the cell knows nothing.
+        let mut messages = Conversation::from_events(vec![
+            Event::Append(Message::user("plan")),
+            Event::Append(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "add-0".to_string(),
+                    name: "checklist_add".to_string(),
+                    input: serde_json::json!({"items": ["finish the report"]}),
+                }],
+            }),
+            Event::Append(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "add-0".to_string(),
+                    content: vec![crate::conversation::ToolResultContent::Text {
+                        text: "Added with ids 1.".to_string(),
+                    }],
+                    is_error: false,
+                }],
+            }),
+            Event::Append(Message::assistant_text("Planned.")),
+        ]);
+        assert!(
+            agent.cells.checklist.get().items.is_empty(),
+            "the cell starts cold"
+        );
+
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("carry on".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn ends");
+
+        assert_eq!(nudges_in(&messages), 1, "the recovered item held the turn");
+        assert!(agent.cells.checklist.get().items.is_empty());
     }
 }

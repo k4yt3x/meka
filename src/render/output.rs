@@ -11,7 +11,8 @@ pub(super) enum LastOutput {
     Text,
     Thinking,
     ToolIndicator,
-    TodoList,
+    /// A block that stands apart from whatever is around it: the checklist, a stage direction.
+    Standalone,
 }
 /// Tracks what was last printed to decide if a blank line is needed next.
 ///
@@ -31,7 +32,10 @@ impl OutputSpacing {
 
     /// Call before printing streamed text. Returns true if a blank line should be emitted first.
     pub(crate) fn before_text(&mut self) -> bool {
-        let need_blank = matches!(self.last, LastOutput::ToolIndicator | LastOutput::Thinking);
+        let need_blank = matches!(
+            self.last,
+            LastOutput::ToolIndicator | LastOutput::Thinking | LastOutput::Standalone
+        );
         self.last = LastOutput::Text;
         need_blank
     }
@@ -44,9 +48,9 @@ impl OutputSpacing {
     /// read as one call with too many parameters.
     pub(crate) fn before_tool_indicator(&mut self, params: ToolParams) -> bool {
         let need_blank = match self.last {
-            LastOutput::Text | LastOutput::Thinking => true,
+            LastOutput::Text | LastOutput::Thinking | LastOutput::Standalone => true,
             LastOutput::ToolIndicator => params == ToolParams::Full,
-            _ => false,
+            LastOutput::Nothing | LastOutput::Prompt => false,
         };
         self.last = LastOutput::ToolIndicator;
         need_blank
@@ -54,14 +58,21 @@ impl OutputSpacing {
 
     /// Call before printing a thinking block. Returns true if a blank line should be emitted first.
     pub(crate) fn before_thinking(&mut self) -> bool {
-        let need_blank = matches!(self.last, LastOutput::Text | LastOutput::ToolIndicator);
+        let need_blank = matches!(
+            self.last,
+            LastOutput::Text | LastOutput::ToolIndicator | LastOutput::Standalone
+        );
         self.last = LastOutput::Thinking;
         need_blank
     }
 
-    /// Call after the todo list is rendered (it has its own trailing newline).
-    pub(crate) fn after_todo_list(&mut self) {
-        self.last = LastOutput::TodoList;
+    /// Call before printing a standalone block. Returns true if a blank line should be emitted
+    /// first: always, except at the top of the output or right under the prompt, whose own blank
+    /// the episode supplies.
+    pub(crate) fn before_standalone(&mut self) -> bool {
+        let need_blank = !matches!(self.last, LastOutput::Nothing | LastOutput::Prompt);
+        self.last = LastOutput::Standalone;
+        need_blank
     }
 
     /// Call after newline_after_prompt is printed.
@@ -277,7 +288,14 @@ pub(super) fn split_held_newlines(text: &str) -> (String, usize) {
     )
 }
 pub(crate) fn render_hint(message: &str) {
-    write_stderr_line(message.with(Color::DarkGrey));
+    write_stderr_line(rows_of(message).with(Color::DarkGrey));
+}
+
+/// A block's text, ending where its last row does. The console's block machine owns the blank
+/// between two blocks, and a trailing newline in the text would print an empty row of its own
+/// under the block, doubling the blank, or standing in for one the machine did not decide on.
+fn rows_of(message: &str) -> &str {
+    message.trim_end_matches('\n')
 }
 /// A warn-level notice: something recoverable the user should see without `-v`.
 ///
@@ -285,7 +303,7 @@ pub(crate) fn render_hint(message: &str) {
 /// [`render_error`]'s red, and it must not recede into the gray a hint or a thinking block uses, or
 /// a refused approval reads as one more line of the model's musings.
 pub(crate) fn render_warning(message: &str) {
-    write_stderr_line(message.with(Color::Yellow));
+    write_stderr_line(rows_of(message).with(Color::Yellow));
 }
 /// Print a single-line CLI error to stderr in the project's standard format.
 pub(crate) fn render_error(error: &dyn std::fmt::Display) {
@@ -303,8 +321,8 @@ pub(crate) fn render_heading(heading: &str) {
 /// background-task notices describe meka doing as it was asked. [`Color::Red`] belongs to
 /// [`render_error`] alone, and is worth keeping at one meaning. Yellow already carries "worth
 /// noticing, nothing went wrong" here: it is the `read` permission indicator and an in-progress
-/// todo. Not [`Color::DarkGrey`] either, which is the right *class* but is what thinking blocks
-/// use, and the mark saying an answer is incomplete should not recede as far as the model's
+/// checklist item. Not [`Color::DarkGrey`] either, which is the right *class* but is what thinking
+/// blocks use, and the mark saying an answer is incomplete should not recede as far as the model's
 /// musings -- spotting it in scrollback is the whole point, since at the time you already knew.
 ///
 /// Parenthesised and lowercase because it annotates the transcript rather than speaking:
@@ -313,7 +331,7 @@ pub(crate) fn render_heading(heading: &str) {
 ///
 /// Every caller passes one of meka's own strings, so there is nothing here to sanitize.
 pub(crate) fn render_annotation(note: &str) {
-    write_stderr_line(format!("({note})").with(Color::Yellow));
+    write_stderr_line(format!("({})", rows_of(note)).with(Color::Yellow));
 }
 
 /// Capturing this process's `tracing` output for the current thread, for tests that assert on a

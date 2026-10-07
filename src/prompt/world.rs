@@ -38,7 +38,7 @@ pub(super) fn render_world_state_full(current: &WorldSnapshot) -> String {
     let active: Vec<&ToolCatalogEntry> = catalog.iter().filter(|(_, _, _, d)| !d).collect();
 
     // `[Section]` headings rather than markdown ones, matching the rest of the `<context>` block
-    // (`[Permission context]`, `[Todo list]`, `[Scratchpad entries]`).
+    // (`[Permission context]`, `[Background]`, `[Scratchpad entries]`).
     let mut sections: Vec<String> = Vec::new();
 
     if !active.is_empty() {
@@ -105,7 +105,7 @@ pub(super) const SCHEDULE_STATUS_MAX_ENTRIES: usize = 5;
 
 /// The `[Background]` section: what is still running, and nothing else.
 ///
-/// Rendered fresh every turn from live state, like `[Todo list]`, rather than living in
+/// Rendered fresh every turn from live state rather than living in
 /// [`WorldSnapshot`]. The snapshot is a record of what the model has been *told*, diffed so an
 /// unchanged picture costs nothing, and it carries an invariant that every difference must produce
 /// something to read. Running tasks fit neither half of that: they churn, a departure is already

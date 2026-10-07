@@ -26,6 +26,7 @@
 
 mod agent;
 mod background;
+mod checklist;
 mod cli;
 mod config;
 mod console;
@@ -56,7 +57,6 @@ mod store;
 mod streams;
 mod sync;
 mod text;
-mod todo;
 mod tokens;
 mod tools;
 mod view;

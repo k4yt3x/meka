@@ -186,7 +186,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                         messages.pop_repair();
                         with_console(console, |console| console.error(&error));
                     } else {
-                        agent.reset_conversation_markers(messages.as_slice()).await;
+                        agent.reset_conversation_markers(messages).await;
                         with_console(console, |console| {
                             console.hint(&format!("Rewound {turns} turn(s)."))
                         });
@@ -195,7 +195,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                 // No session means nothing was ever persisted, so the in-memory rewind
                 // (which did happen) is the whole story.
                 (None, Some(_)) => {
-                    agent.reset_conversation_markers(messages.as_slice()).await;
+                    agent.reset_conversation_markers(messages).await;
                     with_console(console, |console| {
                         console.hint(&format!("Rewound {turns} turn(s)."))
                     });

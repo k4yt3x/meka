@@ -1379,6 +1379,19 @@ impl TurnMessages {
         );
     }
 
+    /// A nudge meka wrote closes the assistant message it answers and is a user-role message of
+    /// its own, as `GET /messages` shows it; the reply after it opens a new assistant message.
+    fn nudge(&mut self, kind: crate::conversation::NudgeKind, text: String) {
+        self.close_assistant();
+        self.close_results();
+        self.messages.push(turn_message(self.turn_id, "user", vec![
+            crate::host::http::handlers::messages::ContentBlockView::Nudge {
+                kind: kind.name().to_string(),
+                text,
+            },
+        ]));
+    }
+
     fn close_assistant(&mut self) {
         if !self.assistant.is_empty() {
             let content = std::mem::take(&mut self.assistant);
@@ -1454,6 +1467,7 @@ fn assemble_response(
                 content,
                 ..
             } => messages.tool_result(id, is_error, &content),
+            FrontendEvent::Nudged { kind, text } => messages.nudge(kind, text),
             FrontendEvent::TokenUsage(token_usage) => {
                 // Last-wins assignment: the agent emits exactly one `TokenUsage` per turn
                 // (accumulated total). If that ever changes, switch to `saturating_add`.
@@ -1465,7 +1479,7 @@ fn assemble_response(
             FrontendEvent::Notice(notice) => {
                 notices.push(NoticeView::from(notice));
             }
-            // Remaining lifecycle / UI-chrome variants (TurnStarted/Finished, TodoListUpdated,
+            // Remaining lifecycle / UI-chrome variants (TurnStarted/Finished, ChecklistUpdated,
             // McpProgress, SessionStarted, ToolCallOutputDelta, SubAgentActivity) aren't part of
             // the blocking JSON envelope.
             // ToolCallComposing does reach here -- `stream: false` picks the response shape, not

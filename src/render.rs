@@ -1,5 +1,5 @@
 //! Terminal rendering: streaming markdown renderer (syntect highlighting + termimad), tool-call
-//! indicators, todo-list display, and helpers for one-off CLI status/error messages. Owns the
+//! indicators, checklist display, and helpers for one-off CLI status/error messages. Owns the
 //! embedded Monokai Extended theme used for code blocks.
 
 use std::{
@@ -25,7 +25,7 @@ mod tool_params;
 
 use self::tool_params::*;
 pub(crate) use self::{
-    history::{HistoryRenderOptions, last_n_turns, render_message_history},
+    history::{HistoryRenderOptions, last_n_turns, nudge_direction, render_message_history},
     output::*,
     status::*,
     tool_params::{render_approval_params, render_tool_indicator},
@@ -463,7 +463,7 @@ impl StreamingRenderer {
 
     pub(crate) fn push_delta(&mut self, delta: &str) -> io::Result<()> {
         // Streamed assistant text is the largest model-controlled surface meka prints, and it was
-        // the only one arriving unfiltered: the tool indicator, thinking block, todo list and
+        // the only one arriving unfiltered: the tool indicator, thinking block, checklist and
         // approval prompt all sanitize, and each has a regression test for the forgery it prevents.
         // The markdown renderer is not a defense -- termimad emits a `Compound`'s bytes verbatim
         // and syntect writes the source slice through -- so a model that has read attacker
@@ -1563,91 +1563,72 @@ fn restyle(plain: &str, runs: &[markdown::OwnedCompound]) -> Vec<markdown::Owned
     out
 }
 
-/// Render the todo list to stderr. Returns `true` if anything was printed, so the caller only
-/// advances `OutputSpacing` when there was actually output; an empty list prints nothing and must
-/// not claim a trailing blank line (otherwise the next text run loses its leading blank).
-pub(crate) fn render_todo_list(title: Option<&str>, items: &[crate::todo::TodoItem]) -> bool {
-    use crate::todo::TodoStatus;
+/// Render the checklist to stderr: the heading, a blank, and one row per item, as one block the
+/// console sets off from its neighbors. The blank inside is the block's own, like the rows; the
+/// blanks around it are the console's. An empty list prints nothing, never a heading over
+/// nothing.
+pub(crate) fn render_checklist(items: &[crate::checklist::ChecklistItem]) {
+    use crate::checklist::ChecklistStatus;
 
     if items.is_empty() {
-        return false;
+        return;
     }
     let width = output_width();
+    write_stderr_line(checklist_heading(width).with(Color::White).bold());
     write_stderr_line("");
-
-    write_stderr_line(todo_heading(title, width).with(Color::White).bold());
-    write_stderr_line("");
-
-    for (index, item) in items.iter().enumerate() {
-        let color = match item.status {
-            TodoStatus::Completed => Color::Green,
-            TodoStatus::InProgress => Color::Yellow,
-            TodoStatus::Pending | TodoStatus::Canceled => Color::DarkGrey,
-        };
+    for item in items {
         // Composed uncolored first, then colored, so the width a test measures is the width that
         // prints. Coloring in place would put escape bytes in the middle of the string.
-        let row = todo_row(index, item, width);
+        let row = checklist_row(item, width);
         let (marker, rest) = row.split_at(row.find(' ').map_or(0, |space| space + 1));
+        // The item in progress takes the yellow every "worth a look" mark takes; the rest recede
+        // in the dark grey of a hint, so the one row that matters stands out of the list.
+        let color = match item.status {
+            ChecklistStatus::InProgress => Color::Yellow,
+            ChecklistStatus::Pending | ChecklistStatus::Deferred => Color::DarkGrey,
+        };
         write_stderr_line(format!("{}{}", marker, rest.with(color)));
     }
-
-    write_stderr_line("");
-    true
 }
 
-/// The `TODO: <title>` heading, not indented, with a fallback when the model omitted a title.
-///
-/// Title and item text are both model-supplied, and this list prints at column zero, so a `\n` or a
-/// `\r` in either needs no trick at all to place a forged line among meka's own output. Separated
-/// from the printing so that is testable.
-fn todo_heading(title: Option<&str>, width: usize) -> String {
-    const PREFIX: &str = "TODO: ";
-    format!(
-        "{}{}",
-        PREFIX,
-        sanitize_to_line(
-            title.unwrap_or("Tasks"),
-            width.saturating_sub(display_width(PREFIX))
-        )
-    )
+/// The columns a row spends before the item's text: `- `, the marker, a space, the id and a space;
+/// none of it model-supplied.
+fn checklist_chrome(item: &crate::checklist::ChecklistItem) -> usize {
+    "- ".len() + 3 + 1 + item.id.to_string().len() + 1
 }
 
-/// One task's whole row, chrome included, fitted to `width`.
+/// The heading, not indented, fitted to `width` like every other composed line.
+fn checklist_heading(width: usize) -> String {
+    truncate_to_width("Checklist", width)
+}
+
+/// One item's whole row, chrome included, fitted to `width`.
 ///
 /// The chrome is computed here rather than at the call site so a test can hold the real budget to
 /// the real width. Held apart, a test that recomputed the subtraction itself passed even with the
 /// caller's subtraction deleted.
-fn todo_row(index: usize, item: &crate::todo::TodoItem, width: usize) -> String {
-    use crate::todo::TodoStatus;
+fn checklist_row(item: &crate::checklist::ChecklistItem, width: usize) -> String {
+    use crate::checklist::ChecklistStatus;
 
     let marker = match item.status {
-        TodoStatus::Completed => "[x]",
-        TodoStatus::InProgress => "[~]",
-        TodoStatus::Pending => "[ ]",
-        TodoStatus::Canceled => "[-]",
+        ChecklistStatus::InProgress => "[~]",
+        ChecklistStatus::Pending => "[ ]",
+        ChecklistStatus::Deferred => "[>]",
     };
-    let number = (index + 1).to_string();
-    // `- `, the marker, a space, the task number and a space; none of it model-supplied.
-    let chrome = "- ".len() + marker.len() + 1 + number.len() + 1;
     format!(
         "- {} {} {}",
         marker,
-        number,
-        todo_item_text(item, width.saturating_sub(chrome))
+        item.id,
+        checklist_item_text(item, width.saturating_sub(checklist_chrome(item)))
     )
 }
 
-/// One task's text, prefixed when canceled. Sanitized for the reason on [`todo_heading`].
-fn todo_item_text(item: &crate::todo::TodoItem, budget: usize) -> String {
-    const CANCELED: &str = "(canceled) ";
-    if item.status == crate::todo::TodoStatus::Canceled {
-        let text = sanitize_to_line(&item.text, budget.saturating_sub(display_width(CANCELED)));
-        // Truncated as one string, not just the part after the prefix: below twelve columns the
-        // subtraction above leaves nothing and the prefix alone is already over budget.
-        truncate_to_width(&format!("{CANCELED}{text}"), budget)
-    } else {
-        sanitize_to_line(&item.text, budget)
-    }
+/// One item's text, fitted to `budget`. Model-supplied, and the list prints at column zero, so
+/// it is sanitized: a `\n` or a `\r` in it would plant a line that looks like meka's own. A
+/// deferred item's reason is not shown: a row says the item is parked, and the reason, a
+/// paragraph as often as not, is in the record, the feed and `checklist_read` for whoever asks.
+fn checklist_item_text(item: &crate::checklist::ChecklistItem, budget: usize) -> String {
+    sanitize_to_line(&item.text, budget)
 }
 
 /// The `/compact` confirmation line.
@@ -1683,6 +1664,186 @@ pub(crate) fn compaction_summary(outcome: &crate::agent::CompactOutcome) -> Stri
         ));
     }
     line
+}
+
+/// How much of a scheduled job's prompt the stage direction quotes, in columns: enough to
+/// recognize the job the person wrote, short enough that the line fits a terminal with the
+/// lateness note on.
+const FIRE_DIRECTION_PROMPT_COLUMNS: usize = 40;
+
+/// The stage direction the REPL prints where a background report's turn begins: which tasks
+/// ended and how. The report itself is the model's prompt and stays off the screen, as every
+/// tool's output does; the reply that follows carries what matters.
+pub(crate) fn background_report_direction(
+    tasks: &[crate::store::background::BackgroundTask],
+) -> String {
+    match tasks {
+        [task] => format!(
+            "background task {} {} after {}, reporting",
+            task.short_id(),
+            task.status.headline(),
+            crate::background::format_elapsed(task.elapsed())
+        ),
+        _ => {
+            let ended = tasks
+                .iter()
+                .map(|task| format!("{} {}", task.short_id(), task.status.headline()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{} background tasks reporting: {ended}", tasks.len())
+        }
+    }
+}
+
+/// The stage direction the REPL prints where a scheduled fire's turn begins: the job, its
+/// lateness when that is material, and the opening of its prompt, which the person wrote and
+/// needs only to recognize.
+pub(crate) fn scheduled_fire_direction(wakeup: &crate::scheduler::Wakeup) -> String {
+    fire_direction(
+        wakeup.job.short_id(),
+        &wakeup.job.prompt,
+        wakeup
+            .is_materially_late()
+            .then_some((wakeup.late_by, wakeup.coalesced + 1)),
+    )
+}
+
+/// [`scheduled_fire_direction`] on its parts: the job's short id, its prompt, and when the fire
+/// is late, how late and how many occurrences it stands in for.
+fn fire_direction(short_id: &str, prompt: &str, late: Option<(chrono::Duration, u32)>) -> String {
+    let prompt = crate::text::sanitize_to_line(prompt, FIRE_DIRECTION_PROMPT_COLUMNS);
+    match late {
+        Some((late_by, occurrences)) => format!(
+            "scheduled job {short_id} fired {} late, replacing {occurrences} missed \
+             occurrence{}: {prompt}",
+            crate::scheduler::format_late(late_by),
+            if occurrences == 1 { "" } else { "s" }
+        ),
+        None => format!("scheduled job {short_id} fired: {prompt}"),
+    }
+}
+
+#[cfg(test)]
+mod direction_tests {
+    use super::*;
+    use crate::store::background::{BackgroundTask, TaskStatus};
+
+    fn task(id: &str, status: TaskStatus, ran_for_seconds: i64) -> BackgroundTask {
+        let finished_at = chrono::Utc::now();
+        BackgroundTask {
+            id: id.to_string(),
+            session_id: uuid::Uuid::nil(),
+            tool: "shell_execute".to_string(),
+            label: "make".to_string(),
+            status,
+            outcome: Some("ok\n".to_string()),
+            scratchpad_entry: None,
+            started_at: finished_at - chrono::Duration::seconds(ran_for_seconds),
+            finished_at: Some(finished_at),
+            announced_at: None,
+            delivered_at: None,
+            subagent_id: None,
+        }
+    }
+
+    /// One task names how it ended and how long it ran; a batch names each task and its end. The
+    /// output is never in it.
+    #[test]
+    fn a_report_direction_names_the_tasks_and_how_they_ended() {
+        let one = background_report_direction(&[task(
+            "3881c9c6-0000-4000-8000-000000000000",
+            TaskStatus::Completed,
+            30,
+        )]);
+        assert_eq!(
+            one,
+            "background task 3881c9c6 finished after 30s, reporting"
+        );
+        let two = background_report_direction(&[
+            task(
+                "3881c9c6-0000-4000-8000-000000000000",
+                TaskStatus::Failed,
+                5,
+            ),
+            task(
+                "7f3a1c22-0000-4000-8000-000000000000",
+                TaskStatus::Canceled,
+                5,
+            ),
+        ]);
+        assert_eq!(
+            two,
+            "2 background tasks reporting: 3881c9c6 failed, 7f3a1c22 was canceled"
+        );
+        assert!(!one.contains("ok") && !two.contains("ok"));
+    }
+
+    /// A wakeup's direction counts the occurrence being delivered among the ones it stands in
+    /// for, as the prompt the model gets does, and says nothing of a lateness a tick explains.
+    #[test]
+    fn a_wakeups_direction_counts_the_occurrence_it_delivers() {
+        let job = crate::schedule::ScheduledJob {
+            id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+            session_id: uuid::Uuid::nil(),
+            schedule: crate::schedule::Schedule::At(chrono::Utc::now()),
+            prompt: "remind me to stretch".to_string(),
+            gate: None,
+            created_at: chrono::Utc::now(),
+            last_fired_at: None,
+            next_fire_at: chrono::Utc::now(),
+            attempts: 0,
+        };
+        let late = crate::scheduler::Wakeup {
+            job: job.clone(),
+            gate_output: None,
+            late_by: chrono::Duration::hours(2),
+            coalesced: 2,
+        };
+        assert_eq!(
+            scheduled_fire_direction(&late),
+            "scheduled job 1a2b3c4d fired 2h late, replacing 3 missed occurrences: remind me to \
+             stretch"
+        );
+        let on_time = crate::scheduler::Wakeup {
+            job,
+            gate_output: None,
+            late_by: chrono::Duration::seconds(5),
+            coalesced: 0,
+        };
+        assert_eq!(
+            scheduled_fire_direction(&on_time),
+            "scheduled job 1a2b3c4d fired: remind me to stretch"
+        );
+    }
+
+    /// The direction quotes the opening of the prompt on one line, says nothing of lateness a
+    /// tick could explain, and says how late and how many occurrences otherwise.
+    #[test]
+    fn a_fire_direction_quotes_the_prompt_and_the_material_lateness() {
+        assert_eq!(
+            fire_direction("1a2b3c4d", "remind me to stretch", None),
+            "scheduled job 1a2b3c4d fired: remind me to stretch"
+        );
+        assert_eq!(
+            fire_direction(
+                "1a2b3c4d",
+                "remind me to stretch",
+                Some((chrono::Duration::hours(2), 3))
+            ),
+            "scheduled job 1a2b3c4d fired 2h late, replacing 3 missed occurrences: remind me to \
+             stretch"
+        );
+        assert!(
+            fire_direction("1a2b3c4d", "x", Some((chrono::Duration::minutes(5), 1)))
+                .contains("1 missed occurrence:")
+        );
+        let long = fire_direction("1a2b3c4d", &"check the build\n".repeat(20), None);
+        assert!(!long.contains('\n'), "{long}");
+        assert!(
+            long.len() < "scheduled job 1a2b3c4d fired: ".len() + FIRE_DIRECTION_PROMPT_COLUMNS + 4,
+            "{long}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1803,20 +1964,6 @@ mod tests {
         // A 1M-token model window renders compactly rather than as "1047.6k".
         assert_eq!(format_token_count(1_047_576), "1.0M");
         assert_eq!(format_token_count(2_300_000), "2.3M");
-    }
-
-    #[test]
-    fn render_todo_list_reports_whether_it_rendered() {
-        use crate::todo::{TodoItem, TodoStatus};
-
-        // Empty list prints nothing and must report `false` so the caller leaves spacing alone.
-        assert!(!render_todo_list(None, &[]));
-
-        let items = [TodoItem {
-            text: "Do a thing".to_string(),
-            status: TodoStatus::Pending,
-        }];
-        assert!(render_todo_list(Some("My list"), &items));
     }
 
     #[test]
@@ -2951,7 +3098,7 @@ mod tests {
     /// this states the invariant rather than an instance of it.
     #[test]
     fn no_composed_line_ever_exceeds_the_width_it_was_given() {
-        use crate::todo::{TodoItem, TodoStatus};
+        use crate::checklist::{ChecklistItem, ChecklistStatus};
 
         let nasty = [
             "plain",
@@ -2992,8 +3139,8 @@ mod tests {
         ];
         let long_key = "k".repeat(300);
         // Deep nesting and variation selectors are the two shapes that break the invariant while a
-        // test feeding `nasty` only to the thinking and todo assertions, at three levels, stays
-        // green.
+        // test feeding `nasty` only to the thinking and checklist assertions, at three levels,
+        // stays green.
         let mut deep = serde_json::json!("SECRET_PAYLOAD");
         for level in 0..25 {
             deep = serde_json::json!({ format!("k{}", level): deep });
@@ -3118,26 +3265,30 @@ mod tests {
                         );
                     }
                 }
-                let heading = super::todo_heading(Some(text), width);
+                let heading = super::checklist_heading(width);
                 assert!(
                     super::display_width(&heading) <= width,
-                    "todo heading at width {width}: {heading:?}"
+                    "checklist heading at width {width}: {heading:?}"
                 );
-                for status in [TodoStatus::Pending, TodoStatus::Canceled] {
-                    // Through `todo_row`, which is what computes the chrome. Calling
-                    // `todo_item_text` with a budget the test worked out itself passed even when
-                    // the caller's subtraction was deleted.
-                    let items: Vec<TodoItem> = (0..101)
-                        .map(|_| TodoItem {
+                for status in [ChecklistStatus::Pending, ChecklistStatus::Deferred] {
+                    // Through `checklist_row`, which is what computes the chrome. Calling
+                    // `checklist_item_text` with a budget the test worked out itself passed even
+                    // when the caller's subtraction was deleted.
+                    let items: Vec<ChecklistItem> = (1..102)
+                        .map(|id| ChecklistItem {
+                            id,
                             text: text.to_string(),
                             status,
+                            reason: (status == ChecklistStatus::Deferred).then(|| text.to_string()),
+                            task: None,
                         })
                         .collect();
-                    for (index, item) in items.iter().enumerate() {
-                        let rendered = super::todo_row(index, item, width);
+                    for item in &items {
+                        let rendered = super::checklist_row(item, width);
                         assert!(
                             super::display_width(&rendered) <= width,
-                            "todo row {index} at width {width}: {rendered:?}"
+                            "checklist row {} at width {width}: {rendered:?}",
+                            item.id
                         );
                     }
                 }
@@ -3205,7 +3356,7 @@ mod tests {
     }
 
     /// An array fans out one line per element, so the cap has to cover containers and not just a
-    /// long string, or a `todo_write` with 5000 items evicts the turn from scrollback.
+    /// long string, or a `checklist_add` with 5000 items evicts the turn from scrollback.
     #[test]
     fn an_arguments_container_is_capped_like_a_long_string() {
         let items: Vec<u32> = (0..5000).collect();
@@ -3937,25 +4088,21 @@ mod tests {
     }
 
     /// Falling through to `Value::to_string` prints a top-level array as raw JSON, contradicting
-    /// the format's own rule that arrays are bullets. The todo list prints unindented at column
+    /// the format's own rule that arrays are bullets. The checklist prints unindented at column
     /// zero, so model text carrying a newline needs no trick at all to sit among meka's own output
     /// looking like part of it.
     #[test]
-    fn a_todo_list_cannot_plant_a_line_of_its_own() {
-        use crate::todo::{TodoItem, TodoStatus};
+    fn a_checklist_cannot_plant_a_line_of_its_own() {
+        use crate::checklist::{ChecklistItem, ChecklistStatus};
 
-        assert_eq!(
-            super::todo_heading(
-                Some("Plan\n[approval] shell_execute rm -rf / (Y/n) y"),
-                TEST_WIDTH
-            ),
-            "TODO: Plan [approval] shell_execute rm -rf / (Y/n) y"
-        );
-        let item = TodoItem {
+        let item = ChecklistItem {
+            id: 1,
             text: "step\u{1b}[2J\rdone".to_string(),
-            status: TodoStatus::Pending,
+            status: ChecklistStatus::Pending,
+            reason: None,
+            task: None,
         };
-        let rendered = super::todo_item_text(&item, TEST_WIDTH);
+        let rendered = super::checklist_item_text(&item, TEST_WIDTH);
         assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
         assert!(!rendered.contains('\r'), "{rendered:?}");
         assert_eq!(rendered.lines().count(), 1, "{rendered:?}");
@@ -4016,8 +4163,13 @@ mod tests {
     #[test]
     fn an_empty_summary_renders_bare_rather_than_as_empty_backticks() {
         assert_eq!(
-            tool_indicator_line("todo_read", &serde_json::json!({}), Some("   "), TEST_WIDTH),
-            "[tool todo_read]"
+            tool_indicator_line(
+                "checklist_read",
+                &serde_json::json!({}),
+                Some("   "),
+                TEST_WIDTH
+            ),
+            "[tool checklist_read]"
         );
     }
 

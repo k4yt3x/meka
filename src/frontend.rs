@@ -1,7 +1,7 @@
 //! `Frontend`: the swappable driver for agent output and approval round-trips.
 //!
 //! `Agent::run_turn` emits its user-facing output (streamed assistant text, thinking blocks,
-//! tool-call indicators, todo lists, token usage) and its tool-approval requests through `Arc<dyn
+//! tool-call indicators, checklists, token usage) and its tool-approval requests through `Arc<dyn
 //! Frontend>` instead of calling `render::*` and `std::sync::mpsc` directly. The REPL today is one
 //! impl ([`crate::host::repl::frontend::ReplFrontend`]); ACP, a Telegram bridge, or a web UI become
 //! additional impls without touching the agent core.
@@ -25,7 +25,7 @@ use std::{
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::{stats::TokenUsage, todo::TodoItem};
+use crate::{checklist::ChecklistItem, stats::TokenUsage};
 
 /// How long a host with a client on the far side waits for an approval answer before denying.
 ///
@@ -379,6 +379,15 @@ pub(crate) enum FrontendEvent {
     /// text. Emitted at that request rather than when the text was appended, so whoever enqueued
     /// an item learns when it was read and not merely written down.
     InboxDelivered { item_ids: Vec<Uuid> },
+    /// A message meka wrote into the turn in the user's role: the nudge after a reply with no
+    /// visible text or with checklist items open. The conversation holds it, so a client that
+    /// mirrors the conversation from the feed needs it, and the blocking turn's messages carry it
+    /// where `GET /messages` would; the REPL says it as a stage direction and never shows the
+    /// words.
+    Nudged {
+        kind: crate::conversation::NudgeKind,
+        text: String,
+    },
     /// A streamed chunk of assistant text. Multiple deltas concatenate into one logical text run;
     /// any non-text event closes the run.
     AssistantTextDelta(String),
@@ -475,14 +484,11 @@ pub(crate) enum FrontendEvent {
     /// stdout and stderr arrive interleaved in production order, the way a terminal shows them.
     /// The model-facing result assembled at completion still separates the two streams.
     ToolCallOutputDelta { id: String, chunk: String },
-    /// The shared todo list changed via a `todo_*` tool. Emitted by the agent loop after the tool
-    /// succeeds and only when the rendered state actually changed; the REPL renders the list and
-    /// the agent's per-turn `OutputSpacing` is advanced. `title` is the heading the agent set
-    /// for the list.
-    TodoListUpdated {
-        title: Option<String>,
-        items: Vec<TodoItem>,
-    },
+    /// The session's checklist changed via a `checklist_*` tool. Emitted by the agent loop after
+    /// the tool succeeds and only when the state actually changed; the REPL renders the list and
+    /// the agent's per-turn `OutputSpacing` is advanced. `items` is the whole open list, empty
+    /// once the last item is disposed of, so a surface that shows it can clear it.
+    ChecklistUpdated { items: Vec<ChecklistItem> },
     /// A sub-agent running under the `agent_spawn` tool call `tool_call_id` did something worth
     /// showing. `summary` is the *whole* rolling activity block, not a delta, because ACP's
     /// `tool_call_update` replaces a tool call's content rather than appending to it.
@@ -593,12 +599,13 @@ pub(crate) enum PermissionOutcome {
 }
 
 /// Frontend wrapper used by sub-agents when the parent is interactive enough to host permission
-/// prompts. Streaming output (text, thinking, todos, token usage) is dropped; sub-agents' final
-/// reports flow back through the parent's `agent_spawn` tool result, not through this frontend.
-/// The exceptions are:
+/// prompts. Streaming output (text, thinking, checklists, token usage) is dropped; sub-agents'
+/// final reports flow back through the parent's `agent_spawn` tool result, not through this
+/// frontend. The exceptions are:
 ///
 /// - `Notice`: provider-side advisories the user should still see, e.g. a redaction during a
-///   sub-agent's turn.
+///   sub-agent's turn. A stage direction is not one: it annotates the turn it was emitted in, which
+///   is the sub-agent's, not the one the user is watching.
 /// - `request_permission` and `handle_elicitation`: round-trips forwarded so the user is asked in
 ///   their original UI (REPL approval line, ACP `session/request_permission` /
 ///   `elicitation/create`).
@@ -660,7 +667,14 @@ impl Frontend for PermissionForwardingFrontend {
     async fn emit(&self, event: FrontendEvent) {
         match event {
             // Provider advisories about the sub-agent's request belong in the user's primary UI.
-            FrontendEvent::Notice(_) => self.delegate.emit(event).await,
+            // A stage direction does not: it says what meka did with the sub-agent's reply, in
+            // the register of the turn it belongs to, and shown in the parent's transcript it
+            // would read as a note on the parent's own turn and its own list.
+            FrontendEvent::Notice(ref notice) => {
+                if notice.kind == NoticeKind::Advisory {
+                    self.delegate.emit(event).await;
+                }
+            }
             // Roll the sub-agent's tool calls up into the parent's `agent_spawn` tool call, so a
             // long-running sub-agent shows what it is doing instead of an opaque spinner. Only the
             // call being *started* is recorded: it answers "where is it now", which is the
@@ -691,8 +705,8 @@ impl Frontend for PermissionForwardingFrontend {
             // sub-agent's own record; forwarding it too would have two writers fighting over one
             // tool call's content.
             FrontendEvent::SubAgentActivity { .. } => {}
-            // Everything else (text deltas, thinking, tool results, todos, token usage, session
-            // lifecycle) is sub-agent chrome the user shouldn't see.
+            // Everything else (text deltas, thinking, tool results, checklists, token usage,
+            // session lifecycle) is sub-agent chrome the user shouldn't see.
             //
             // [`FrontendEvent::ToolCallOutputDelta`] and [`FrontendEvent::ToolCallComposing`] must
             // stay in here rather than being forwarded. Both are keyed by the sub-agent's own
@@ -798,12 +812,26 @@ impl From<Notice> for NoticeView {
         }
     }
 }
-/// User-visible advisory surfaced by a provider during a request. Frontends format the message
-/// themselves; the one structured payload is for the agent, not for display.
+/// What a notice is, to a surface that draws in more than one register. The wire carries the
+/// level and the text alone; this is for the terminal, which sets the two apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoticeKind {
+    /// meka or a provider saying something to the user: a hint or a warning, printed as chrome
+    /// between the model's blocks.
+    Advisory,
+    /// A note on the transcript about the turn itself, in the register of `(interrupted)`: the
+    /// model's reply ended and meka did something with it. A block of its own, set off from what
+    /// it annotates on both sides, because it marks a boundary between rounds.
+    StageDirection,
+}
+
+/// User-visible advisory surfaced during a request. Frontends format the message themselves; the
+/// one structured payload is for the agent, not for display.
 #[derive(Debug, Clone)]
 pub(crate) struct Notice {
     pub(crate) level: NoticeLevel,
     pub(crate) text: String,
+    pub(crate) kind: NoticeKind,
     /// Set when the advisory reports an image-redaction pass, so the agent can count it against
     /// the session the request belonged to.
     pub(crate) redaction: Option<crate::stats::Redaction>,
@@ -813,6 +841,7 @@ impl Notice {
         Self {
             level: NoticeLevel::Info,
             text: text.into(),
+            kind: NoticeKind::Advisory,
             redaction: None,
         }
     }
@@ -821,6 +850,18 @@ impl Notice {
         Self {
             level: NoticeLevel::Warn,
             text: text.into(),
+            kind: NoticeKind::Advisory,
+            redaction: None,
+        }
+    }
+
+    /// A [`NoticeKind::StageDirection`] at `level`. Lowercase and without a final stop, since the
+    /// terminal wraps it in parentheses.
+    fn stage_direction(level: NoticeLevel, text: String) -> Self {
+        Self {
+            level,
+            text,
+            kind: NoticeKind::StageDirection,
             redaction: None,
         }
     }
@@ -853,6 +894,32 @@ impl Notice {
         format!(
             "approvals are on but nobody can answer here, so '{tool_name}' was refused without \
              asking"
+        )
+    }
+
+    /// What every frontend says when a turn goes on past the model's answer because checklist
+    /// items are open. A notice rather than a log line: without it a turn that keeps working after
+    /// its answer looks like a hang, on the REPL and on the feed alike.
+    pub(crate) fn checklist_nudged(open: usize, nudge: u32, limit: u32) -> Self {
+        Self::stage_direction(
+            NoticeLevel::Info,
+            format!(
+                "checklist: {open} open item{}, continuing, nudge {nudge} of {limit}",
+                if open == 1 { "" } else { "s" }
+            ),
+        )
+    }
+
+    /// What every frontend says when a cap ends a turn with checklist items still open: the cap
+    /// on nudges in a row, or with `this_turn`, the one on nudges in the turn.
+    pub(crate) fn checklist_left_open(open: usize, nudges: u32, this_turn: bool) -> Self {
+        Self::stage_direction(
+            NoticeLevel::Warn,
+            format!(
+                "checklist: {open} item{} left open after {nudges} nudges{}",
+                if open == 1 { "" } else { "s" },
+                if this_turn { " this turn" } else { "" }
+            ),
         )
     }
 
@@ -1163,7 +1230,7 @@ mod tests {
         for (name, summary) in [
             ("file_read", Some("/etc/hosts".to_string())),
             ("file_find", Some("**/*.rs".to_string())),
-            ("todo_read", None),
+            ("checklist_read", None),
         ] {
             forwarder
                 .emit(FrontendEvent::ToolCallStarted {
@@ -1186,7 +1253,7 @@ mod tests {
                 assert_eq!(tool_call_id, "toolu_parent");
                 assert_eq!(
                     summary,
-                    "file_read: /etc/hosts\nfile_find: **/*.rs\ntodo_read"
+                    "file_read: /etc/hosts\nfile_find: **/*.rs\nchecklist_read"
                 );
             }
             other => panic!("expected SubAgentActivity; got {other:?}"),
@@ -1354,6 +1421,36 @@ mod tests {
             }
             other => panic!("expected Notice, got {other:?}"),
         }
+    }
+
+    /// A stage direction is about the sub-agent's own turn: its checklist nudge, shown in the
+    /// parent's transcript, would read as a note on the parent's turn and the parent's list.
+    #[tokio::test]
+    async fn permission_forwarding_frontend_keeps_a_stage_direction_to_the_sub_agent() {
+        let recorder = Arc::new(RecordingFrontend::new());
+        let delegate: Arc<dyn Frontend> = recorder.clone();
+        let forwarder = PermissionForwardingFrontend::new(delegate, None, None);
+        forwarder
+            .emit(FrontendEvent::Notice(
+                crate::frontend::Notice::checklist_nudged(1, 1, 3),
+            ))
+            .await;
+        forwarder
+            .emit(FrontendEvent::Notice(
+                crate::frontend::Notice::checklist_left_open(1, 3, false),
+            ))
+            .await;
+        assert!(
+            recorder.events().is_empty(),
+            "the sub-agent's stage directions stay with its turn: {:?}",
+            recorder.events()
+        );
+        forwarder
+            .emit(FrontendEvent::Notice(crate::frontend::Notice::warn(
+                "an advisory",
+            )))
+            .await;
+        assert_eq!(recorder.events().len(), 1, "an advisory still forwards");
     }
 
     #[tokio::test]

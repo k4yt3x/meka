@@ -428,8 +428,11 @@ pub(super) fn convert_messages_to_claude_content(
                 .iter()
                 .filter_map(|block| {
                     Some(match block {
-                        // The turn's context block is text on this wire, ahead of the words.
-                        ContentBlock::Text { text } | ContentBlock::TurnContext { text } => {
+                        // The turn's context block and a nudge are text on this wire, ahead of
+                        // the words.
+                        ContentBlock::Text { text }
+                        | ContentBlock::TurnContext { text }
+                        | ContentBlock::Nudge { text, .. } => {
                             serde_json::json!({
                                 "type": "text",
                                 "text": text,

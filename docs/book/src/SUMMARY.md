@@ -23,6 +23,7 @@
 - [HTTP API](./usage/http-api.md)
 - [Permissions](./usage/permissions.md)
 - [Sessions](./usage/sessions.md)
+- [Checklist](./usage/checklist.md)
 - [MCP](./usage/mcp.md)
 - [Instructions](./usage/instructions.md)
 - [Skills](./usage/skills.md)

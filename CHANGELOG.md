@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.70.0] - 2026-10-07
+
 ### Added
 
 - Turns are a resource: `GET /v1/sessions/{id}/turns` lists them with source, outcome and usage.
@@ -23,7 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GET /v1/sessions` filters by `parent`, `profile`, `pinned` and `updated_since`.
 - `GET /v1/tasks` lists every session's background tasks; a backgrounded spawn names its sub-agent.
 - `GET /v1/memory?q=<words>` finds what the agent's own memory search would, with the snippet.
-- A session archive carries its turns; an archive an older meka wrote still imports.
+- A session archive carries its turns and checklists; one an older meka wrote still imports.
+- The checklist: a turn cannot end while an item the agent committed to is open; see the docs page.
+- `checklist` on a session record and `checklist.updated` on the session feed carry the open items.
+- `turn.nudged` on the session feed carries the message that sends the model back to its work.
+- A steer sent while a reply is being nudged rides the nudge instead of waiting for a tool round.
+- `GET /messages` shows the message that sent the model back to work as a `nudge` block.
 
 ### Changed
 
@@ -35,15 +42,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** deleting a job or a task over HTTP takes the full id, not a prefix.
 - **Breaking:** `subagent.activity` is gone from the HTTP feed; read the sub-agent's own feed.
 - **Breaking:** the stream route on a sub-agent not running here is 409 `subagent-not-running`.
+- **Breaking:** the `todo_*` tools are `checklist_add`, `checklist_edit` and `checklist_read`.
+- **Breaking:** checklist items have ids and are edited one at a time; a cancel needs a reason.
+- **Breaking:** the per-turn context no longer carries the checklist; compaction copies it.
 - A sub-agent its parent is running reports `turn_in_flight: true` on its record and in listings.
 - A parked approval prompt waits out `stream_reattach_grace` after its last attender leaves.
-- The store gains a table of turns; the migration runs on open behind the usual backup.
+- The REPL announces a task's report or a scheduled fire as a stage direction, not as the prompt.
+- A compaction checkpoint can read the checklist but no longer edit it.
+- The store migrates on open behind the usual backup: a turns table, the renamed tools, nudges.
 - Upgrade `rusqlite` to 0.40 (SQLite 3.53.2) and `croner` to 4; the cron grammar is unchanged.
 - Upgrade `agent-client-protocol` to 2.2, `rmcp` to 3.5, reedline to 0.52 and `utoipa` to 6.
 
 ### Fixed
 
 - Turn labels on `GET /messages` no longer count a tool round's results as a new turn.
+- A rewind, a turn label and a sub-agent's turn count no longer treat a nudge meka wrote as a turn.
+- Session search no longer finds a session by the words of a nudge meka wrote.
 
 ## [0.69.0] - 2026-10-03
 
@@ -2562,7 +2576,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.69.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.70.0...HEAD
+[0.70.0]: https://github.com/k4yt3x/meka/compare/0.69.0...0.70.0
 [0.69.0]: https://github.com/k4yt3x/meka/compare/0.68.1...0.69.0
 [0.68.1]: https://github.com/k4yt3x/meka/compare/0.68.0...0.68.1
 [0.68.0]: https://github.com/k4yt3x/meka/compare/0.67.0...0.68.0

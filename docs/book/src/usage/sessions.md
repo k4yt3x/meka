@@ -81,7 +81,7 @@ A resume restores the conversation, not the world it ran in. The messages come b
 - **Which files have been read.** meka tracks reads in memory so `file_edit` can refuse to write over a file the agent has not seen. A new process starts with that record empty, so the first edit to any file asks for a `file_read` first.
 - **Anything an MCP server was holding.** A loaded database, an authenticated session, a subscription: these belong to the server's process, not to the conversation, and a reconnect drops them. meka has no way to model what a given server keeps open.
 
-Everything else is restated in the per-turn context on every turn regardless (permission level, working directory, todo list, tool catalog), and background tasks that were running deliver an `interrupted` outcome, so none of those can go stale unnoticed.
+Everything else is restated in the per-turn context on every turn regardless (permission level, working directory, tool catalog), the [checklist](checklist.md) is read back from the conversation, and background tasks that were running deliver an `interrupted` outcome, so none of those can go stale unnoticed.
 
 Because the second kind is unknowable from meka's side, the first turn after a resume carries a `[Session resumed]` note telling the agent to re-establish rather than assume. It appears once and is not repeated. There is nothing to configure.
 
@@ -237,7 +237,7 @@ By default the summary is written by **the agent itself**, in a *checkpoint turn
 
 This matters because compaction is the one moment information is destroyed, and before this it was also the one moment the agent could not act. The alternative, a separate summarizer call, knows nothing about who the agent is or what it is for.
 
-A checkpoint can **save, but not act**. It reaches the memory, scratchpad, todo, conversation-history and read-only search tools, and nothing else: no shell, no file writes, no sub-agents, no scheduling, no MCP. The delete tools are excluded too, since deleting is not saving and a mistaken delete in an unattended checkpoint is unrecoverable. A tool disabled in `[tools]` stays disabled here.
+A checkpoint can **save, but not act**. It reaches the memory, scratchpad, conversation-history and read-only search tools and `checklist_read`, and nothing else: no shell, no file writes, no sub-agents, no scheduling, no MCP. The delete tools are excluded too, since deleting is not saving and a mistaken delete in an unattended checkpoint is unrecoverable, and so are the checklist edits, since a checkpoint's calls are not recorded and the list is what the recorded calls add up to. A tool disabled in `[tools]` stays disabled here.
 
 You can say what to keep:
 
@@ -253,7 +253,7 @@ Session compacted. Wrote 2 memories: deploy-pipeline-quirks, api-rate-limits.
 
 Note that an *automatic* compaction runs a checkpoint too, unattended, and can write memory without anyone watching.
 
-Compaction preserves scratchpad entries and the todo list, and re-injects environment context so the agent isn't disoriented afterwards. The tool catalog, skill list, and MCP server instructions are restated in full on the next turn, since the messages that carried them may have been summarized away. Tools loaded via `tool_load` stay loaded; the deferred-tool active set is snapshotted into the compaction boundary. If a detail was dropped, the model can `conversation_search` / `conversation_read` the full pre-compaction history, which stays on disk.
+Compaction preserves scratchpad entries, copies the open [checklist](checklist.md) into the summary verbatim, and re-injects environment context so the agent isn't disoriented afterwards. The tool catalog, skill list, and MCP server instructions are restated in full on the next turn, since the messages that carried them may have been summarized away. Tools loaded via `tool_load` stay loaded; the deferred-tool active set is snapshotted into the compaction boundary. If a detail was dropped, the model can `conversation_search` / `conversation_read` the full pre-compaction history, which stays on disk.
 
 Internally, compaction does not delete pre-compaction rows from the store. It appends a `compact_boundary` row to the `messages` table; the materialized view is reconstructed from the event log, so the persisted log itself stays append-only. A resume reads that log from its last `compact_boundary` row: nothing before it can reach the view, so opening a session costs the same however long its history is. `conversation_search`, `conversation_read`, `GET /messages`, a rewind and an export still read the whole log.
 
@@ -503,7 +503,7 @@ Pass `--format json` for a structured export instead of rendered Markdown:
 meka session export 550e8400-e29b-41d4-a716-446655440000 --format json
 ```
 
-This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, and scratchpad entries. The archive carries `format_version: 6`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 5), which is brought forward as it is read. Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
+This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, and scratchpad entries. The archive carries `format_version: 9`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 8), which is brought forward as it is read. Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
 
 ## Importing a session
 

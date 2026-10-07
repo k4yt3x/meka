@@ -3597,6 +3597,7 @@ mod tests {
                 summary: Message::user("summary"),
                 replaced_count: 2,
                 loaded_tools_snapshot: Default::default(),
+                checklist_snapshot: Default::default(),
             },
             Event::Append(Message::user("three")),
             Event::Append(Message::assistant_text("four")),
@@ -5507,6 +5508,7 @@ mod tests {
             summary: Message::user("[summary]"),
             replaced_count: 3,
             loaded_tools_snapshot: snapshot,
+            checklist_snapshot: Default::default(),
         };
 
         let repair_event = Event::Repair {
@@ -5557,6 +5559,7 @@ mod tests {
                 replaced_count,
                 loaded_tools_snapshot,
                 summary,
+                ..
             } => {
                 assert_eq!(*replaced_count, 3);
                 assert!(loaded_tools_snapshot.contains("mcp__notion__fetch"));
@@ -5704,6 +5707,7 @@ mod tests {
             summary: Message::user(summary),
             replaced_count: 2,
             loaded_tools_snapshot: tools.iter().map(|tool| tool.to_string()).collect(),
+            checklist_snapshot: Default::default(),
         };
         for event in [
             Event::Append(Message::user("first")),
@@ -5788,6 +5792,7 @@ mod tests {
                 summary: Message::user("[summary]"),
                 replaced_count: 4,
                 loaded_tools_snapshot: Default::default(),
+                checklist_snapshot: Default::default(),
             },
             Event::Append(Message::user_with_images("look", vec![image])),
             Event::Append(Message {
@@ -7078,7 +7083,6 @@ mod tests {
             one_shot: false,
             permission,
             approvals: false,
-            todos: &crate::todo::TodoState::default(),
             cwd: std::path::Path::new("."),
             roots: &[],
             world_state: "",
@@ -7380,6 +7384,7 @@ mod tests {
                 summary: Message::user("[Conversation summary from session compaction] nothing"),
                 replaced_count: 2,
                 loaded_tools_snapshot: std::collections::HashSet::new(),
+                checklist_snapshot: Default::default(),
             },
             Event::Append(mock_run_turn_user_message(
                 crate::permission::Permission::Read,

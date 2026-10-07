@@ -156,7 +156,7 @@ assumption is the entire return, and it is lost the moment a second place tolera
 - A value enum with a wire spelling follows `Backend`: one `const fn name()`, `Display` and
   `FromStr` derived from an `ALL` table plus `name()`, serde through `try_from = "String"` and
   `into = "String"`, clap parsers `.parse()`. One spelling per value; no aliases, no alternates.
-  Values a model emits (todo status words) are the one exception.
+  Values a model emits (checklist status words) are the one exception.
 
 ## Build gate
 
@@ -409,7 +409,8 @@ sort key.
   object (`mcp_resource`, `mcp_prompt`). It is not always the module the tool lives in. The verb is
   the operation, one per tool: arguments shape an operation and never select one, so a tool whose
   operation depends on which arguments are present is a family that wants splitting, which is how
-  `todo` became `todo_write`, `todo_edit` and `todo_read`.
+  the one `todo` tool became an add, an edit and a read, now `checklist_add`, `checklist_edit`
+  and `checklist_read`.
 - **A trailing object only where the verb alone would read as acting on the noun itself**:
   `scratchpad_load_file` and `scratchpad_save_file`, because `load` and `save` alone would read as
   acting on the scratchpad. Accepted as names, not as a pattern.

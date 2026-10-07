@@ -13,7 +13,25 @@ and `-shm` companions with the file.
 ## 0.69 to 0.70
 
 The HTTP API changes shape in the places below. The store gains a table of turns and a column
-naming each message's turn; the migration runs on open and needs nothing from you.
+naming each message's turn, the three todo tools become the checklist tools, every compaction
+boundary takes a checklist, and the message meka writes to send the model back to work (after a
+reply with no visible text, or with checklist items open) becomes a block of its own; the
+migration runs on open and needs nothing from you, and an older archive converts on import.
+
+**`todo_write`, `todo_edit` and `todo_read` are `checklist_add`, `checklist_edit` and
+`checklist_read`, and the list is binding.** A turn can no longer end while an item on the list
+is pending or in progress: the model is sent back to its open items, up to three times in a row
+without a tool call, before the turn is allowed to end with them open. There is no title and no
+replace-all; items have ids, `checklist_edit` changes one at a time, and `completed` and
+`canceled` take an item off the list, the latter with a reason. [Checklist](../usage/checklist.md)
+has the rule. The old names in a session's history, in a sub-agent's denied tools and in an
+archive are renamed on open and on import; a list from before 0.70 is not recovered, since it
+never survived a restart anyway. A `[tools]` filter or a skill that names a `todo_*` tool needs
+the new name.
+
+**The per-turn context no longer carries the list.** The model sees it in every `checklist_*`
+result, in the nudge, and through `checklist_read`; compaction copies the open list into the
+summary.
 
 **A blocking turn's response carries the turn's messages, and `final_text` and `tool_calls` are
 gone.** `messages` now holds what the turn added to the conversation, in the shape
@@ -57,9 +75,11 @@ runs the sub-agent it is the sub-agent's own feed; otherwise it is `409` `subage
 a type of its own, where 0.69 answered `422` `session-not-drivable`. A client that branched on
 the `422` to recognize a sub-agent reads `parent_id` on the record instead.
 
-**Session archives are `format_version` 7.** Each session carries its `turns`, and each event
-names the turn that added it in `turn_id`, so an import keeps a session's turns under ids of its
-own. An archive of version 3 through 6 still imports, with no turns and no turn named.
+**Session archives are `format_version` 9.** Each session carries its `turns`, each event names
+the turn that added it in `turn_id`, so an import keeps a session's turns under ids of its own,
+each compaction boundary carries the checklist as it stood, and a nudge is a block of its own. An
+archive of version 3 through 8 still imports, with no turns and no turn named where it had none,
+an empty checklist on its boundaries, and every nudge it wrote as text taken as the block.
 
 ## 0.67 to 0.68
 

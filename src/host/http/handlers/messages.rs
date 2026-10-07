@@ -104,9 +104,16 @@ pub(crate) enum ContentBlockView {
         text: String,
     },
     /// What meka injected ahead of the user's words for that turn (permission and environment
-    /// context, todos, catalog changes, background outcomes, the resume notice), which the model
+    /// context, catalog changes, background outcomes, the resume notice), which the model
     /// saw as text ahead of them. Typed so a client can show or hide it; `text` alone is the words.
     TurnContext {
+        text: String,
+    },
+    /// Words meka wrote into the model's own turn in the user's role, to send it back to work:
+    /// `kind` is `visible_reply` after a reply with no visible text, `checklist` after one that
+    /// left checklist items open. Typed so a client can show it as meka's rather than the person's.
+    Nudge {
+        kind: String,
         text: String,
     },
     Image {
@@ -324,6 +331,10 @@ fn view_for_block(block: &ContentBlock) -> ContentBlockView {
     match block {
         ContentBlock::Text { text } => ContentBlockView::Text { text: text.clone() },
         ContentBlock::TurnContext { text } => ContentBlockView::TurnContext { text: text.clone() },
+        ContentBlock::Nudge { kind, text } => ContentBlockView::Nudge {
+            kind: kind.name().to_string(),
+            text: text.clone(),
+        },
         ContentBlock::Image { source } => ContentBlockView::Image {
             media_type: source.media_type().to_string(),
             hash: blob_hash(source),
@@ -442,6 +453,25 @@ mod tests {
             call,
             result,
             Message::assistant_text("done"),
+            Message::user("second"),
+        ];
+        assert_eq!(derive_turn_indexes(&messages), [
+            "t_0001", "t_0001", "t_0001", "t_0001", "t_0002"
+        ]);
+    }
+
+    /// A nudge is a user-role message meka wrote inside the turn; the label it would start is the
+    /// turn the client is already looking at.
+    #[test]
+    fn a_nudge_shares_the_label_of_the_turn_it_continues() {
+        let messages = vec![
+            Message::user("plan and do it"),
+            Message::assistant_text("I have planned it."),
+            Message::nudge_message(
+                crate::conversation::NudgeKind::Checklist,
+                "[Checklist: items are still open, so this turn is not over.]",
+            ),
+            Message::assistant_text("Done."),
             Message::user("second"),
         ];
         assert_eq!(derive_turn_indexes(&messages), [

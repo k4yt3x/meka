@@ -109,7 +109,9 @@ pub(crate) fn estimate_message(message: &Message) -> u64 {
         let block_tokens = match block {
             ContentBlock::Text { text } => estimate_text(text),
             // Sent as text ahead of the words, so it costs what text costs.
-            ContentBlock::TurnContext { text } => estimate_text(text),
+            ContentBlock::TurnContext { text } | ContentBlock::Nudge { text, .. } => {
+                estimate_text(text)
+            }
             ContentBlock::Image { .. } => IMAGE_TOKENS,
             // The readable half only, which is the whole cost under `Signed` and an under-read
             // under `Sealed`: there the text is a summary and the reasoning is the sealed blob

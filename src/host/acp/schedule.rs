@@ -153,8 +153,10 @@ impl crate::host::scheduler::HostHooks for AcpHooks {
         prompt: crate::host::scheduler::OutOfBandPrompt<'_>,
     ) {
         match prompt {
-            crate::host::scheduler::OutOfBandPrompt::Outcomes(text) => {
-                entry.frontend.push_out_of_band_prompt(text);
+            crate::host::scheduler::OutOfBandPrompt::Outcomes(tasks) => {
+                entry
+                    .frontend
+                    .push_out_of_band_prompt(&crate::background::render_outcomes(tasks));
             }
             crate::host::scheduler::OutOfBandPrompt::Scheduled(wakeup) => {
                 entry.frontend.push_scheduled_prompt(wakeup);

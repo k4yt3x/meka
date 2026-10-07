@@ -1198,7 +1198,7 @@ retention = "30d"
 
 ### `session.auto_compact`
 
-Automatically compact the conversation once it is past `context_ceiling_percent` of the context window, between turns or between two tool rounds of one turn. Compaction summarizes older messages and preserves recent ones, the todo list, and scratchpad entries. Off changes nothing else: a whole `scratchpad_read` still stops at the ceiling, and a request past the window fails the turn.
+Automatically compact the conversation once it is past `context_ceiling_percent` of the context window, between turns or between two tool rounds of one turn. Compaction summarizes older messages and preserves recent ones, the open checklist, and scratchpad entries. Off changes nothing else: a whole `scratchpad_read` still stops at the ceiling, and a request past the window fails the turn.
 
 Default: `true`
 
@@ -1386,8 +1386,8 @@ budget subtracts fixed chrome first, and below roughly that the subtraction leav
 1000 it is clamped down, also with a warning, since no terminal is that wide and the value is far
 more likely to be a typo than a request.
 
-This covers meka's own output: tool indicators and their argument block, thinking previews, todo
-lists, and the approval prompt. Assistant markdown is not affected and keeps reflowing to the
+This covers meka's own output: tool indicators and their argument block, thinking previews, the
+checklist, and the approval prompt. Assistant markdown is not affected and keeps reflowing to the
 real terminal through [`display.render_mode`](#displayrender_mode). With output piped there is no
 terminal to measure, so an unset width falls back to 100 columns and a captured run stays byte-stable.
 

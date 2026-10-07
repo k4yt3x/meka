@@ -475,6 +475,10 @@ pub(crate) async fn open_session(
         "open_session was handed a spec for another id"
     );
     let agent = build_session_agent(shared, spec).await?;
+    // The record a client reads next carries the checklist from the agent's cell, which starts
+    // empty; the conversation just loaded is what the list is, so the cell reads it now rather
+    // than at the first turn.
+    agent.hydrate_checklist(&conversation).await;
     Ok(ResidentSession::new(
         id,
         agent,
