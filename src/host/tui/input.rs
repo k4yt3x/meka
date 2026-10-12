@@ -989,11 +989,24 @@ impl Composer {
 
 /// The directory as the status row shows it, with the home directory as `~`.
 pub(crate) fn shorten_path_with_tilde(path: &std::path::Path) -> String {
-    if let Some(home) = dirs::home_dir() {
+    shorten_under_home(path, dirs::home_dir())
+}
+
+/// [`shorten_path_with_tilde`] against `home` as given and in its canonical spelling, since a
+/// session's directory is recorded canonical and a home reached through a link (macOS keeps
+/// `/var` under `/private`) would otherwise never shorten.
+fn shorten_under_home(path: &std::path::Path, home: Option<PathBuf>) -> String {
+    let Some(home) = home else {
+        return path.display().to_string();
+    };
+    let canonical = std::fs::canonicalize(&home)
+        .ok()
+        .filter(|canonical| *canonical != home);
+    for home in std::iter::once(&home).chain(canonical.as_ref()) {
         if path == home {
             return "~".to_string();
         }
-        if let Ok(relative) = path.strip_prefix(&home) {
+        if let Ok(relative) = path.strip_prefix(home) {
             // Forward slashes on every platform, so the tilde form reads the same way everywhere.
             let relative = relative.display().to_string().replace('\\', "/");
             return format!("~/{relative}");
@@ -1579,6 +1592,33 @@ mod tests {
         assert_eq!(
             shorten_path_with_tilde(&home.join("projects")),
             "~/projects"
+        );
+    }
+
+    /// A home reached through a link shortens a directory spelled either way: as recorded, in
+    /// the canonical spelling, or through the link itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_home_still_shortens_to_a_tilde() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real = temp.path().join("real");
+        std::fs::create_dir_all(real.join("work")).expect("dirs");
+        let real = std::fs::canonicalize(&real).expect("canonical");
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let home = Some(link.clone());
+        assert_eq!(
+            shorten_under_home(&real.join("work"), home.clone()),
+            "~/work"
+        );
+        assert_eq!(
+            shorten_under_home(&link.join("work"), home.clone()),
+            "~/work"
+        );
+        assert_eq!(shorten_under_home(&real, home.clone()), "~");
+        assert_eq!(
+            shorten_under_home(&temp.path().join("elsewhere"), home),
+            temp.path().join("elsewhere").display().to_string()
         );
     }
 

@@ -49,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A failed turn is reported once; the stream's own error line no longer repeats the host's.
 - A list whose items are separated by blank lines keeps its bullets rather than reading as prose.
 - A long checklist item and an MCP server's URL wrap rather than being cut.
+- A home directory reached through a link still shortens to `~` on the status row and in lists.
 
 ## [0.71.0] - 2026-10-07
 

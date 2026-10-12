@@ -1120,25 +1120,38 @@ fn a_hangup_kills_the_running_command_and_leaves() {
 
 /// The pids whose command line carries `marker`.
 fn processes_running(marker: &str) -> Vec<i32> {
-    let mut found = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return found;
-    };
-    for entry in entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
-            continue;
-        };
-        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        if String::from_utf8_lossy(&cmdline)
-            .replace('\0', " ")
-            .contains(marker)
-        {
-            found.push(pid);
+    // `/proc` where there is one; macOS has none, and `ps` answers the same question there.
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        let mut found = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            if String::from_utf8_lossy(&cmdline)
+                .replace('\0', " ")
+                .contains(marker)
+            {
+                found.push(pid);
+            }
         }
+        return found;
     }
-    found
+    let Ok(listed) = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,args="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, command) = line.trim_start().split_once(' ')?;
+            command.contains(marker).then(|| pid.parse().ok()).flatten()
+        })
+        .collect()
 }
 
 const TWO_WRITES_AT_ONCE: &str = r#"[
