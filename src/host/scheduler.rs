@@ -435,19 +435,27 @@ where
         if !hooks.announce(&unannounced).await {
             continue;
         }
+        // Read ahead of the lock. A session carries a canceled task undelivered until a turn
+        // folds it in, and this runs every tick, so the lock is not taken on the chance of
+        // something to deliver: a client's turn is refused while it is held, and a hold the
+        // poller has not admitted is one `turn_in_flight` says nothing about.
+        let ready = match store.list_undelivered_background_tasks(session_id).await {
+            Ok(ready) if ready.iter().any(|task| task.status.wakes_a_host()) => ready,
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    "failed to list undelivered background tasks for session {session_id}: {error}"
+                );
+                continue;
+            }
+        };
         let Ok(mut conversation) = entry.conversation.try_lock() else {
             continue;
         };
-        // The snapshot above is from before the store round trips; an entry the idle sweep evicted
-        // and released meanwhile has no registry and no tasks left to report into.
-        if !hooks.still_resident(&entry).await {
-            continue;
-        }
-        if !a_turn_can_carry_them(&entry.agent).await {
-            continue;
-        }
-        // Admitted ahead of the stamp below, which is one-way: a batch refused for capacity stays
-        // undelivered for the next tick rather than stamped and never handed out.
+        // Admitted the moment the lock is held, so the session reports the hold as a turn in
+        // flight for as long as it lasts, and ahead of the stamp below, which is one-way: a batch
+        // refused for capacity stays undelivered for the next tick rather than stamped and never
+        // handed out.
         let busy = match hooks.admit(&entry) {
             Ok(busy) => busy,
             Err(refused) => {
@@ -459,6 +467,14 @@ where
                 continue;
             }
         };
+        // The snapshot above is from before the store round trips; an entry the idle sweep evicted
+        // and released meanwhile has no registry and no tasks left to report into.
+        if !hooks.still_resident(&entry).await {
+            continue;
+        }
+        if !a_turn_can_carry_them(&entry.agent).await {
+            continue;
+        }
         if let Err(error) = hooks.prepare(&entry).await {
             tracing::warn!(
                 "holding a background outcome report for session {session_id} until its profile \
@@ -466,19 +482,8 @@ where
             );
             continue;
         }
-        let ready = match store.list_undelivered_background_tasks(session_id).await {
-            Ok(ready) if !ready.is_empty() => ready,
-            Ok(_) => continue,
-            Err(error) => {
-                tracing::warn!(
-                    "failed to list undelivered background tasks for session {session_id}: {error}"
-                );
-                continue;
-            }
-        };
-        if !ready.iter().any(|task| task.status.wakes_a_host()) {
-            continue;
-        }
+        // A turn that ran between the read and the lock may have folded the batch in already;
+        // the stamp below then wins nothing, and the tick moves on.
         if !hooks.announce(&ready).await {
             continue;
         }
@@ -791,6 +796,37 @@ pub(crate) async fn a_turn_can_carry_them(agent: &crate::agent::Agent) -> bool {
 }
 #[cfg(test)]
 mod tests {
+
+    /// The outcome poller runs every tick on every resident session, so it reads what there is to
+    /// deliver before it takes the conversation lock, and admits the hold the moment it has it:
+    /// the lock refuses a client's turn as in flight, and `turn_in_flight` only knows what was
+    /// admitted.
+    #[test]
+    fn the_outcome_poller_takes_the_lock_only_for_what_wakes_a_host() {
+        let poller = include_str!("scheduler.rs")
+            .split("pub(crate) async fn deliver_ready_outcomes")
+            .nth(1)
+            .expect("the poller")
+            .split("\n}\n")
+            .next()
+            .expect("the poller ends");
+        let position = |needle: &str| poller.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let listed = position("list_undelivered_background_tasks(");
+        let decided = position("wakes_a_host()");
+        let locked = position("conversation.try_lock()");
+        let admitted = position("hooks.admit(");
+        let checked = position("still_resident(");
+        let stamped = position("mark_background_tasks_delivered(");
+        assert!(
+            listed < decided && decided < locked,
+            "the read and the decision come first"
+        );
+        assert!(
+            locked < admitted && admitted < checked,
+            "admitted as soon as the lock is held"
+        );
+        assert!(admitted < stamped, "and ahead of the one-way stamp");
+    }
     /// A fire that completed before the drain reached it is complete: its reply is in the store,
     /// and a deferred occurrence would deliver it again on the next start. Only the drain's own
     /// interruption hands the occurrence back.
