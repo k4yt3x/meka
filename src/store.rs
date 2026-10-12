@@ -8,8 +8,8 @@
 //! `crate::store::memory::reconcile_index`.
 //!
 //! `prompt_history` is in the ledger like every other table, but it is read and written on a
-//! separate synchronous connection ([`history::HistoryStore`]) because the line editor that
-//! consumes it is synchronous.
+//! separate synchronous connection ([`history::HistoryStore`]) because the composer that
+//! consumes it walks it on a key press, synchronously.
 //!
 //! Per-session mutual exclusion is provided by an OS-level file lock ([`FileLock`]) so the
 //! kernel reclaims it whenever the holder dies: no PID-aliveness check, no risk of stale locks.
@@ -49,6 +49,8 @@ use uuid::Uuid;
 use self::backup::*;
 // The lock vocabulary is the store's own; only the list below leaves the module.
 use self::locks::*;
+#[cfg(test)]
+pub(crate) use self::sessions::LogRow;
 pub(crate) use self::{
     credentials::{
         AuthCredential, CredentialWrite, McpCredentialKind, StoredCredential, TokenStore,
@@ -57,7 +59,7 @@ pub(crate) use self::{
     scratchpad::{RenameOutcome, ScratchpadEntry},
     search::SessionMatch,
     sessions::{
-        ForkOverrides, ImportSessionRecord, SessionFilter, SessionMetaRow, SessionPatch,
+        ForkOverrides, ImportSessionRecord, LogPage, SessionFilter, SessionMetaRow, SessionPatch,
         SessionSummary, SessionSweep, SourceLock, SpawnTerms, normalize_title,
     },
 };
@@ -68,7 +70,7 @@ pub(crate) struct Store {
     connection: Arc<Connection>,
     lock_dir: PathBuf,
     /// Resolved path to the on-disk database (or `:memory:`). Exposed via [`Self::database_path`]
-    /// so the REPL can open a second connection for persistent input history.
+    /// so the screen can open a second connection for persistent input history.
     database_path: PathBuf,
     /// Set only for an in-memory database, whose lock dir is a fresh temp directory nothing else
     /// would ever clean up. Held behind an `Arc` so the removal happens when the *last* clone of
@@ -79,6 +81,9 @@ pub(crate) struct Store {
     /// on the scheduler because the readers that explain a held job, and the delete that has to
     /// forget one, hold the store and not the scheduler.
     scheduler_memory: Arc<crate::schedule::SchedulerMemory>,
+    /// The rows this build could not read and has said so about. Shared by every clone, since a
+    /// resume's hydration and the screen's page read meet the same rows.
+    warned_rows: Arc<sessions::WarnedRows>,
     /// Serializes the forks that probe their source within this process, so two concurrent forks
     /// of one dormant session do not refuse each other. `flock` cannot tell a sibling fork
     /// mid-copy from another process mid-turn, and the two deserve opposite answers: a copy is
@@ -214,10 +219,11 @@ impl Store {
                 // fresh install (a systemd unit and a shell coming up together, which is the
                 // ordinary case).
                 //
-                // WAL is what lets the REPL's history connection read without blocking the agent's
-                // writes, so a database left in rollback mode is a live contention problem rather
-                // than a cosmetic one: worth several attempts before giving up. (On `:memory:` the
-                // request is silently ignored and the first attempt always succeeds.)
+                // WAL is what lets the screen's history connection read without blocking the
+                // agent's writes, so a database left in rollback mode is a live
+                // contention problem rather than a cosmetic one: worth several
+                // attempts before giving up. (On `:memory:` the request is silently
+                // ignored and the first attempt always succeeds.)
                 let giving_up_at = std::time::Instant::now() + WAL_CONVERSION_DEADLINE;
                 loop {
                     match connection.execute_batch("PRAGMA journal_mode = WAL;") {
@@ -242,15 +248,16 @@ impl Store {
             lock_dir,
             database_path,
             scheduler_memory: Arc::default(),
+            warned_rows: Arc::default(),
         };
         store.initialize_schema(context).await?;
         store.prune_orphan_lock_files().await;
         Ok(store)
     }
 
-    /// Resolved path to the on-disk database (or `:memory:`). The REPL opens a second synchronous
+    /// Resolved path to the on-disk database (or `:memory:`). The screen opens a second synchronous
     /// connection here for persistent input history (see
-    /// [`crate::host::repl::history::PromptHistory`]).
+    /// [`crate::store::history::HistoryStore`]).
     pub(crate) fn database_path(&self) -> &Path {
         &self.database_path
     }
@@ -265,7 +272,7 @@ impl Store {
         // transaction that replaces them; the replacement itself is one immediate transaction, so
         // no process ever sees a half-applied trigger set, but a second process can see a snapshot
         // the winner is about to invalidate and then act on it after it has stopped being true. A
-        // systemd unit and a shell REPL starting together is exactly when that happens.
+        // systemd unit and an interactive session starting together is exactly when that happens.
         //
         // An OS file lock rather than a SQLite transaction, the same primitive `FileLock` uses,
         // held for the whole of the schema work so the check and the write it authorizes cannot be

@@ -880,6 +880,27 @@ fn flatten_tool_text(output: &ToolOutput) -> String {
         .join("")
 }
 
+/// The argument of a built-in that is a program, and the language it is written in: what the
+/// screen highlights as code rather than showing as a value. The tool's own fact, kept beside
+/// the primary-parameter table it extends.
+pub(crate) fn builtin_code_param(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        "shell_execute" => Some(("command", "bash")),
+        _ => None,
+    }
+}
+
+/// The arguments of a built-in that its reported change already shows: the text a write puts in
+/// a file, the strings an edit swaps. A screen drawing the change leaves these out of the
+/// argument block, where they would say the same thing twice.
+pub(crate) fn builtin_change_params(name: &str) -> &'static [&'static str] {
+    match name {
+        "file_write" => &["content"],
+        "file_edit" => &["old_string", "new_string"],
+        _ => &[],
+    }
+}
+
 /// Resolve the summary string shown next to a tool-call indicator and in the approval prompt. Tries
 /// the hardcoded built-in map first; falls back to the tool's JSON schema `required[0]` when
 /// provided (covers MCP tools, whose schemas are authored upstream and can't be enumerated here).
@@ -942,7 +963,8 @@ pub(crate) const BUILTINS_WITHOUT_ARGUMENTS: &[&str] = &[
 /// One rule per name in [`BUILTIN_TOOL_NAMES`] that takes an argument, the complement of
 /// `BUILTINS_WITHOUT_ARGUMENTS`. Covering every one of them is what the map is for:
 /// [`resolve_primary_param`]'s other half needs the tool's JSON Schema, and replayed history has
-/// none, so a built-in missing from here renders bare in `/history` having rendered fully live.
+/// none, so a built-in missing from here replays bare on the screen's history pages having
+/// rendered fully live.
 fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String> {
     // `image_render` accepts either `from_scratchpad` or inline `base64`. Show the scratchpad name
     // when present; for inline base64 the payload is opaque so there's nothing useful to display.
@@ -1202,7 +1224,7 @@ mod tests {
     /// indicator, and must still be able to when the tool's schema next changes.
     ///
     /// Three failure modes: no rule at all (replayed history has no schema, so the built-in
-    /// renders bare in `/history`); no rule and no `required` (even the live line has nothing to
+    /// replays bare from the log); no rule and no `required` (even the live line has nothing to
     /// reach for); and a rule that has gone stale, because the map names a parameter by string and
     /// renaming that parameter silently breaks it, which is why the probe is built from each
     /// tool's declared properties rather than from a fixed list.
@@ -1255,7 +1277,7 @@ mod tests {
                 "{} takes arguments, but `builtin_primary_param` returns nothing for an input \
                  built from its own schema: either it has no rule, or its rule names a parameter \
                  the tool no longer declares. Its tool-call indicator renders with no argument, \
-                 live and in `/history`.",
+                 live and when replayed from the log.",
                 definition.name,
             );
         }

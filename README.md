@@ -33,7 +33,7 @@ A general-purpose AI agent harness.
 
 The same agent core is available through several interfaces:
 
-- **CLI**: a REPL, or one-shot commands for scripts.
+- **CLI**: an interactive screen in the terminal, or one-shot commands for scripts.
 - **ACP**: runs inside editors like Zed via the [Agent Client Protocol](https://agentclientprotocol.com/).
 - **HTTP API**: use meka to power your own apps and bots.
 - [**mekaweb**](https://github.com/k4yt3x/mekaweb), a web interface, hosted at [web.meka.run](https://web.meka.run).

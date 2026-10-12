@@ -361,7 +361,7 @@ pub(super) async fn handle_load_session(
     // this handler declined to open must not come away pointing somewhere else.
     //
     // A write that fails is not a refusal: `record_session_change` warns and returns `Ok`, so the
-    // load goes on in the client's directory with the row still naming the old one, as the REPL's
+    // load goes on in the client's directory with the row still naming the old one, as the screen's
     // `/cd` does. The error arm is for whatever that function decides a door must refuse (today a
     // profile, which this patch never carries), and it releases the runtime for the reason a failed
     // build does: it holds the session's lock and an MCP-attached registry.
@@ -1155,7 +1155,7 @@ pub(super) async fn build_session_runtime(
 ) -> anyhow::Result<BuiltSession> {
     let cwd = SharedCwd::new(cwd_path);
     // `--writable-root` is a flag on the process the editor launched, so it belongs to every
-    // session that process serves, not only the REPL's. Merged into the live handle and
+    // session that process serves, not only the screen's. Merged into the live handle and
     // deliberately not into the persisted row: the row is what `session/load` hands back to the
     // client as its `additionalDirectories`, and reporting a folder the client never asked for
     // would misdescribe its own request to it.

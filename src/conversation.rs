@@ -102,9 +102,9 @@ pub(crate) struct Conversation {
     ///
     /// Set by [`Self::from_events`] and consumed once by [`Self::take_resumed_notice`]. Lives here
     /// rather than on the agent because the conversation is the thing that was hydrated, and
-    /// hydration has four entry points (REPL resume, two ACP paths, serve reattach) that all reach
-    /// `from_events`. A flag set at those call sites instead would be a flag the fifth one
-    /// forgets.
+    /// hydration has four entry points (screen resume, two ACP paths, serve reattach) that all
+    /// reach `from_events`. A flag set at those call sites instead would be a flag the fifth
+    /// one forgets.
     resumed_undisclosed: bool,
 }
 

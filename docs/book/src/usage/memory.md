@@ -180,7 +180,8 @@ meka memory export --dir ~/backup/memory            # one Markdown file per memo
 | `--from-file <PATH>` | Read the body from this file instead of `--body`. |
 | `--force` | Update an existing memory instead of refusing; whatever is not mentioned is kept. |
 
-In the REPL, `/memory` lists what is saved and `/memory <name>` prints one memory's body.
+On the screen, `/memory` is a picker of what is saved, by name and description, and Enter (or
+`/memory <name>`) shows one memory in full.
 
 `--format json` prints each memory with the fields [`GET /v1/memory`](http-api.md) uses (`name`, `description`, `priority`, `tags`, `created_at`, `updated_at` as RFC 3339) plus `read_count`; `show` adds `body` as stored, and `list` and `get` leave it out.
 

@@ -6176,7 +6176,7 @@ fn acp_scheduled_job_fires_without_a_prompt() {
 
 /// A scheduled turn has no `session/prompt` response to carry its outcome, so when it fails the
 /// editor would otherwise show the job's prompt and nothing under it. The failure is said as a
-/// `[meka warn]` chunk, the way the REPL prints it and `meka serve` posts a `failed` webhook.
+/// `[meka warn]` chunk, the way the screen shows it and `meka serve` posts a `failed` webhook.
 #[test]
 fn acp_reports_a_failed_scheduled_turn_as_a_warn_notice() {
     let script = serde_json::json!([

@@ -166,8 +166,8 @@ impl crate::host::scheduler::HostHooks for AcpHooks {
 
     /// An out-of-band turn has no `session/prompt` response to carry its outcome, so a failure
     /// would otherwise leave the editor with a prompt and nothing under it. Said as the notice the
-    /// REPL prints and the webhook `meka serve` posts; a clean finish needs no announcement, since
-    /// the reply is one.
+    /// screen prints and the webhook `meka serve` posts; a clean finish needs no announcement,
+    /// since the reply is one.
     async fn finished(
         &self,
         entry: &Self::Entry,

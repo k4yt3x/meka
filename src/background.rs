@@ -87,8 +87,8 @@ impl BackgroundTasks {
         self.inner.lock().await.remove(id);
     }
 
-    /// How many tasks this process is running, across sessions. For the REPL's survivor line, which
-    /// cannot name a session for the same reason [`Self::cancel_all`] cannot.
+    /// How many tasks this process is running, across sessions. For the screen's survivor line,
+    /// which cannot name a session for the same reason [`Self::cancel_all`] cannot.
     pub(crate) async fn running_count_all(&self) -> usize {
         self.inner.lock().await.len()
     }
@@ -139,9 +139,9 @@ impl BackgroundTasks {
 
     /// Signal every task this process is running, returning how many were signaled.
     ///
-    /// For the REPL's second Ctrl+C, which cannot name a session: on the first turn the id does not
-    /// exist yet (`run_turn` creates it), and a REPL process has exactly one conversation anyway,
-    /// since sub-agents never get background calls.
+    /// For the screen's second Ctrl+C, which cannot name a session: on the first turn the id does
+    /// not exist yet (`run_turn` creates it), and a screen process has exactly one conversation
+    /// anyway, since sub-agents never get background calls.
     pub(crate) async fn cancel_all(&self) -> usize {
         let guard = self.inner.lock().await;
         for handle in guard.values() {

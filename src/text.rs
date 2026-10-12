@@ -244,23 +244,40 @@ pub(crate) fn take_columns(text: &str, max_columns: usize) -> String {
     let mut settled_columns = 0usize;
     let mut cluster_start = 0usize;
     let mut cluster_characters = 0usize;
+    // Regional indicators in the open cluster: two make a flag, which is one glyph that a cut
+    // must not land inside, and a third starts the next one.
+    let mut cluster_indicators = 0usize;
     for character in text.chars() {
-        let opens_cluster = char_width(character) > 0
+        let joins_flag = is_regional_indicator(character) && cluster_indicators == 1;
+        let opens_cluster = (char_width(character) > 0 && !joins_flag)
             || breaks_cluster(character)
             || cluster_characters >= CLUSTER_WINDOW;
         if opens_cluster && cluster_characters > 0 {
             settled_columns += display_width(&kept[cluster_start..]);
             cluster_start = kept.len();
             cluster_characters = 0;
+            cluster_indicators = 0;
         }
         kept.push(character);
         cluster_characters += 1;
+        if is_regional_indicator(character) {
+            cluster_indicators += 1;
+        }
         if settled_columns + display_width(&kept[cluster_start..]) > max_columns {
             kept.pop();
+            // A flag that does not fit goes whole: its first half alone is a letter in a box,
+            // one column wide to this measure and two to the terminal.
+            if cluster_indicators == 2 {
+                kept.truncate(cluster_start);
+            }
             break;
         }
     }
     kept
+}
+/// One of the 26 regional indicator symbols, two of which a terminal draws as one flag.
+pub(crate) fn is_regional_indicator(character: char) -> bool {
+    ('\u{1F1E6}'..='\u{1F1FF}').contains(&character)
 }
 /// A zero-width character that starts its own cluster rather than attaching to the one before it:
 /// the format characters that separate rather than join. A variation selector, a joiner or a
@@ -900,6 +917,28 @@ pub(crate) fn format_timestamp(at: DateTime<Utc>, precision: Precision) -> Strin
         .to_string()
 }
 
+/// How long ago `then` was, for a row read at a glance: `just now`, `5m ago`, `3h ago`, `2d ago`,
+/// `3w ago`, or the date once a season has passed.
+pub(crate) fn format_age(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = now.signed_duration_since(then).num_seconds().max(0);
+    let minutes = seconds / 60;
+    let hours = minutes / 60;
+    let days = hours / 24;
+    if minutes < 1 {
+        "just now".to_string()
+    } else if hours < 1 {
+        format!("{minutes}m ago")
+    } else if days < 1 {
+        format!("{hours}h ago")
+    } else if days < 7 {
+        format!("{days}d ago")
+    } else if days < 90 {
+        format!("{}w ago", days / 7)
+    } else {
+        then.with_timezone(&Local).format("%Y-%m-%d").to_string()
+    }
+}
+
 /// The one sentence for a name that matches nothing: `no <noun> named '<given>' (configured: a,
 /// b)`, or `(none configured)` when there is nothing to list. Every door that refuses by name
 /// renders it here, so a profile and an account are refused in the same words on every host.
@@ -1172,6 +1211,24 @@ mod tests {
 
     /// The longest prefix that fits, whether the cut lands between characters or in front of a
     /// wide one that would overflow, and the whole text when it fits: both ways out of the loop.
+    /// A flag is two regional indicators drawn as one glyph. A cut never lands between them: the
+    /// pair fits or it goes, and a third indicator starts the next flag.
+    #[test]
+    fn a_flag_is_cut_as_one_glyph() {
+        assert_eq!(
+            take_columns("abcdefghi\u{1F1FA}\u{1F1F8}x", 10),
+            "abcdefghi"
+        );
+        assert_eq!(
+            take_columns("ab\u{1F1FA}\u{1F1F8}", 4),
+            "ab\u{1F1FA}\u{1F1F8}"
+        );
+        assert_eq!(
+            take_columns("\u{1F1FA}\u{1F1F8}\u{1F1E6}\u{1F1FA}", 2),
+            "\u{1F1FA}\u{1F1F8}"
+        );
+    }
+
     #[test]
     fn take_columns_keeps_the_longest_prefix_that_fits() {
         assert_eq!(take_columns("abcdef", 3), "abc");
@@ -1257,5 +1314,25 @@ mod tests {
         );
         assert_eq!(super::redact_urls("no url here"), "no url here");
         assert_eq!(super::redact_urls("https://"), "https://");
+    }
+
+    /// An age reads in the coarsest unit that still says something, and turns into a date once
+    /// it would be read as a number of weeks nobody counts.
+    #[test]
+    fn an_age_reads_in_its_coarsest_unit() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-12T12:00:00+00:00")
+            .expect("a timestamp")
+            .with_timezone(&chrono::Utc);
+        let ago = |seconds: i64| now - chrono::Duration::seconds(seconds);
+        assert_eq!(crate::text::format_age(ago(20), now), "just now");
+        assert_eq!(crate::text::format_age(ago(5 * 60), now), "5m ago");
+        assert_eq!(crate::text::format_age(ago(3 * 3600), now), "3h ago");
+        assert_eq!(crate::text::format_age(ago(2 * 86_400), now), "2d ago");
+        assert_eq!(crate::text::format_age(ago(20 * 86_400), now), "2w ago");
+        assert!(crate::text::format_age(ago(200 * 86_400), now).starts_with("2026-0"));
+        assert_eq!(
+            crate::text::format_age(now + chrono::Duration::seconds(5), now),
+            "just now"
+        );
     }
 }

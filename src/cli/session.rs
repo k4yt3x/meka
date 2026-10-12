@@ -120,7 +120,7 @@ pub(crate) async fn run_session_subcommand(
             // snapshot of a conversation mid-turn carries an unanswered user message that `meka
             // session import` then restores as an unusable session. See `hold_still_for_a_copy`.
             let _source = hold_still_for_a_copy(store, session_id)?;
-            // The written path is only interesting to the REPL; out here the shell (and the `-o`
+            // The written path is only interesting to the screen; out here the shell (and the `-o`
             // the user typed) already knows where it went.
             export_session(store, session_id, output.as_deref(), *format).await?;
             Ok(())
@@ -395,7 +395,7 @@ pub(crate) async fn rewind_session_command(
     if turns == 0 {
         anyhow::bail!("`-n` must be 1 or more");
     }
-    // Held for the whole read-modify-write. A REPL, `meka serve`, or `meka acp` holding this
+    // Held for the whole read-modify-write. A screen, `meka serve`, or `meka acp` holding this
     // session has its own in-memory conversation that would overwrite the rewind on its next turn.
     if !store.session_exists(session_id).await? {
         return Err(crate::error::MekaError::SessionNotFound(session_id).into());
@@ -716,9 +716,9 @@ pub(crate) fn report_sessions_left_open(sweep: crate::store::SessionSweep) {
 /// `meka session rewind` takes this lock too. Fork probes inside `Store::fork_session_locked`,
 /// where every fork door reaches it; export is the door left here.
 ///
-/// Deliberately *not* pushed down into [`export_session`]: the REPL's `/export` acts on the session
-/// the REPL is already holding, and `flock` is per open file description, so asking again inside
-/// the same process would refuse a session that is legitimately ours.
+/// Deliberately *not* pushed down into [`export_session`]: the screen's `/export` acts on the
+/// session the screen is already holding, and `flock` is per open file description, so asking again
+/// inside the same process would refuse a session that is legitimately ours.
 pub(crate) fn hold_still_for_a_copy(
     store: &Store,
     session_id: uuid::Uuid,

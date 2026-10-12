@@ -9,7 +9,7 @@ use crate::{
 
 /// Why an [`Agent::run_turn`] invocation finished cleanly. Callers that drive a user-facing
 /// protocol (e.g. the ACP `session/prompt` response) use this to map to a protocol-level stop
-/// reason; REPL and one-shot callers discard it. `Interrupted` is not represented here. It
+/// reason; screen and one-shot callers discard it. `Interrupted` is not represented here. It
 /// surfaces as `Err(MekaError::Interrupted)` so the success-path return type stays straightforward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TurnOutcome {
@@ -258,7 +258,7 @@ pub(super) fn gate_on_required_servers(not_ready: Vec<crate::mcp::NotConnected>)
         // `debug!`, not `warn!`: this runs on *every* turn, and a server that is down stays down,
         // so at warn level a single unreachable server would print a line before every reply for
         // the life of the session. The connector already reports the failure once, and `/mcp list`
-        // in the REPL shows live state on demand; repeating it per turn is noise.
+        // on the screen shows live state on demand; repeating it per turn is noise.
         let count = names.len();
         tracing::debug!("mcp: proceeding without {count} optional server(s): {names:?}");
     }
@@ -798,7 +798,7 @@ impl Agent {
 
     /// Park the lock on a session this agent has just created where the host can reach it.
     ///
-    /// Claiming the lock in the REPL's post-turn block instead would leave no lock file for the
+    /// Claiming the lock in the screen's post-turn block instead would leave no lock file for the
     /// whole of a first turn, so a second `meka -c --oneshot` in that window would write into the
     /// same conversation and leave a log with non-alternating roles that the provider refuses.
     ///
@@ -923,8 +923,8 @@ impl Agent {
             .create_session_locked(
                 Some(self.cells.cwd.get()),
                 // The level this session starts at. The row is the one answer every process
-                // reads for a scheduled gate, and a row with no level runs nothing; the REPL
-                // keeps it current through `ReplEvent::PermissionChanged`, ACP through
+                // reads for a scheduled gate, and a row with no level runs nothing; the screen
+                // keeps it current through `HostEvent::PermissionChanged`, ACP through
                 // `session/set_mode`. The approvals switch travels beside it for a resume.
                 self.cells.permission.get().to_string(),
                 self.cells.permission.approvals(),
@@ -1211,7 +1211,7 @@ impl Agent {
             }
             // Bail out if the frontend has noticed its client went away (e.g. ACP stdio
             // disconnect). No point burning more provider tokens for an audience that won't see
-            // the output. REPL frontends report `false` here, so this is a no-op for them.
+            // the output. The screen's frontend reports `false` here, so this is a no-op for them.
             if self.cells.frontend.client_disconnected() {
                 run.recovery.undo_rejected_repair(messages);
                 return Err(MekaError::Interrupted);
@@ -2653,10 +2653,12 @@ impl Agent {
                     self.forward_notice(notice.clone()).await;
                 }
                 StreamEvent::Error(error) => {
-                    // Log only, no return: every producer of this event sends it immediately
-                    // before its own typed `Err` return (see `provider::sse`), so the channel
-                    // closes and the `stream_handle.await` below surfaces the original typed
-                    // error, which `run_streaming`'s retry logic needs to see.
+                    // No return: every producer of this event sends it immediately before its
+                    // own typed `Err` return (see `provider::sse`), so the channel closes and the
+                    // `stream_handle.await` below surfaces the original typed error, which
+                    // `run_streaming`'s retry logic needs to see. Logged at debug only, because
+                    // that typed error is said once already: as a warning by the retry when it
+                    // retries, and by the host when it does not.
                     //
                     // Close out any thinking before logging: a failed turn emits no `TurnFinished`
                     // and `ThinkingComplete` only comes from a `content_block_stop` this stream
@@ -2664,7 +2666,7 @@ impl Agent {
                     // open, and the log below would print onto that row. Sent unconditionally
                     // because every frontend ignores it when nothing is drawn.
                     self.cells.frontend.emit(FrontendEvent::ThinkingEnded).await;
-                    tracing::error!("stream error: {error}");
+                    tracing::debug!("stream error: {error}");
                 }
             }
             accumulator.push(event);

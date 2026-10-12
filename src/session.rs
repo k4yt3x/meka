@@ -315,7 +315,7 @@ impl SessionCells {
         )
     }
 
-    /// The same cells, bound to a session that already exists. Every host but the REPL's first
+    /// The same cells, bound to a session that already exists. Every host but the screen's first
     /// turn knows the row before it builds the agent, and seeding it here is what lets a tool read
     /// the id before any turn has run.
     pub(crate) fn with_session(mut self, id: Uuid) -> Self {
@@ -1058,7 +1058,7 @@ mod tests {
         );
     }
 
-    /// `/fork` must own the copy's lock before the REPL lets go of the one it is holding. That
+    /// `/fork` must own the copy's lock before the screen lets go of the one it is holding. That
     /// ordering is structural: [`fork_and_lock`] is handed no lock, so it has no way to release
     /// the caller's. This pins the pair of facts that make the structure sound: the returned lock
     /// is genuinely held on the copy, and the source's lock is untouched.

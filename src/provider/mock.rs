@@ -3,7 +3,7 @@
 //! final text round) without touching the network.
 //!
 //! Activated when `MEKA_MOCK_PROVIDER` is set to `1`, which every surface honors: `meka acp`,
-//! `meka serve`, and the CLI entry point behind the REPL and `--oneshot`. That last one is what
+//! `meka serve`, and the CLI entry point behind the screen and `--oneshot`. That last one is what
 //! lets a test ask what two `meka` processes do to each other's sessions. A second variable,
 //! `MEKA_MOCK_PROVIDER_SCRIPT`, names the file holding the JSON-encoded script (see
 //! [`crate::provider::mock::load_script`]). Both are read by `ResolvedConfig::resolve`, like

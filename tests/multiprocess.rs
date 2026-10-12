@@ -437,12 +437,12 @@ fn gate_runs(log: &Path) -> usize {
 
 /// A session is locked from the instant its row exists, not from the end of its first turn.
 ///
-/// The measured hole: for the whole of a first turn `locks/` held nothing, because the REPL claimed
-/// the lock in its post-turn block and `--oneshot` never claimed one at all. A second `meka -c`
-/// started in that window attached to the same session and wrote into it, ten times out of ten,
-/// with rc=0 and no warning on either side. What came out was `user, user, assistant, assistant`,
-/// which the Anthropic Messages API rejects for non-alternating roles -- so the session was left
-/// permanently unusable, and nothing said so.
+/// The measured hole: for the whole of a first turn `locks/` held nothing, because the interactive
+/// host claimed the lock in its post-turn block and `--oneshot` never claimed one at all. A second
+/// `meka -c` started in that window attached to the same session and wrote into it, ten times out
+/// of ten, with rc=0 and no warning on either side. What came out was `user, user, assistant,
+/// assistant`, which the Anthropic Messages API rejects for non-alternating roles -- so the session
+/// was left permanently unusable, and nothing said so.
 #[test]
 fn a_session_is_locked_while_its_first_turn_runs() {
     let cluster = Cluster::new("");
@@ -483,8 +483,8 @@ fn a_session_is_locked_while_its_first_turn_runs() {
 ///
 /// The measured behavior: rc=0 with no output whatsoever -- the count goes through
 /// `tracing::info!`, invisible at the default level -- while the row and its messages cascaded away
-/// and the live REPL carried on as though nothing had happened, until its next turn ran against the
-/// provider and *then* failed on a foreign-key violation. Tokens spent, answer lost, and every
+/// and the live screen carried on as though nothing had happened, until its next turn ran against
+/// the provider and *then* failed on a foreign-key violation. Tokens spent, answer lost, and every
 /// later turn failing the same way with no recovery.
 #[test]
 fn a_second_process_cannot_delete_a_session_in_use() {

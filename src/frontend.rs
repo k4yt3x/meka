@@ -2,13 +2,13 @@
 //!
 //! `Agent::run_turn` emits its user-facing output (streamed assistant text, thinking blocks,
 //! tool-call indicators, checklists, token usage) and its tool-approval requests through `Arc<dyn
-//! Frontend>` instead of calling `render::*` and `std::sync::mpsc` directly. The REPL today is one
-//! impl ([`crate::host::repl::frontend::ReplFrontend`]); ACP, a Telegram bridge, or a web UI become
-//! additional impls without touching the agent core.
+//! Frontend>` instead of calling `render::*` and `std::sync::mpsc` directly. The screen today is
+//! one impl ([`crate::host::tui::frontend::TuiFrontend`]); ACP, a Telegram bridge, or a web UI
+//! become additional impls without touching the agent core.
 //!
 //! This module owns the trait, the event/permission types, and the two UI-agnostic impls
 //! ([`SilentFrontend`], [`PermissionForwardingFrontend`]). Concrete UI impls live with their UI
-//! (`ReplFrontend` in `crate::host::repl::editor`, `AcpFrontend` in `crate::host::acp`) so the
+//! (`TuiFrontend` in `crate::host::tui`, `AcpFrontend` in `crate::host::acp`) so the
 //! abstraction layer never depends on a specific frontend by name.
 //!
 //! The event-based shape mirrors ACP's `session/update` notification: one channel for every kind
@@ -34,7 +34,7 @@ use crate::{checklist::ChecklistItem, stats::TokenUsage};
 /// (an editor whose UI thread has wedged, a headless harness that speaks the protocol but shows no
 /// prompt), not a deadline on the user, so it is generous. A prompt still open after this long has
 /// been abandoned, and the turn holding the session's runtime open for it blocks everything queued
-/// behind it. The REPL has no such backstop: a human is at the keyboard, and Ctrl+D or `n` is how
+/// behind it. The screen has no such backstop: a human is at the keyboard, and Ctrl+D or `n` is how
 /// they leave a prompt.
 pub(crate) const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
@@ -50,8 +50,8 @@ pub(crate) trait Frontend: Send + Sync {
     /// Round-trip request for user approval of a tool call, sent when the session's approvals
     /// switch submits a call above its level. [`PermissionOutcome::Canceled`] is
     /// distinct from [`PermissionOutcome::Deny`]; it indicates the user canceled the enclosing
-    /// turn (Ctrl+C, `session/cancel`), which ACP will surface later. Today's REPL collapses it to
-    /// deny semantics.
+    /// turn (Ctrl+C, `session/cancel`), which ACP will surface later. Today's screen collapses it
+    /// to deny semantics.
     async fn request_permission(&self, request: PermissionRequest) -> PermissionOutcome;
 
     /// The frontend a sub-agent of this one runs under: its prompts and elicitations forwarded
@@ -103,8 +103,8 @@ pub(crate) trait Frontend: Send + Sync {
     /// [`crate::error::MekaError::Interrupted`] so it doesn't keep burning provider / MCP cycles
     /// for an audience that's gone away.
     ///
-    /// REPL and silent frontends never disconnect in this sense, so the default `false` is correct
-    /// for them.
+    /// The screen and silent frontends never disconnect in this sense, so the default `false` is
+    /// correct for them.
     fn client_disconnected(&self) -> bool {
         false
     }
@@ -114,7 +114,7 @@ pub(crate) trait Frontend: Send + Sync {
     ///
     /// Answers the one thing `content_started` needs to know about a
     /// [`FrontendEvent::ThinkingDelta`] and the agent cannot: would retrying the attempt
-    /// deliver the same reasoning twice. Only the frontend knows -- the REPL renders deltas
+    /// deliver the same reasoning twice. Only the frontend knows -- the screen renders deltas
     /// under `[thinking].show_content` and drops them otherwise, and the SSE stream forwards
     /// them only for a session that asked for reasoning.
     ///
@@ -143,7 +143,7 @@ pub(crate) trait Frontend: Send + Sync {
     ///
     /// Called through the frontend on the tool call's [`crate::tools::ToolContext`]. Concrete
     /// impls today:
-    /// [`crate::host::repl::frontend::ReplFrontend`] (routes through the REPL thread),
+    /// [`crate::host::tui::frontend::TuiFrontend`] (asks the screen),
     /// `crate::host::acp::AcpFrontend` (issues ACP `elicitation/create`, declining when the client
     /// doesn't advertise the mode), and [`PermissionForwardingFrontend`] (hands a sub-agent's
     /// elicitation to the parent).
@@ -164,9 +164,10 @@ pub(crate) trait Frontend: Send + Sync {
 /// alone.
 ///
 /// One definition for every frontend that offers a sticky answer (`always` and `never` at the
-/// REPL, `allow_always` and `reject_always` on ACP, `allow_always` and `deny_always` over HTTP), so
-/// what such an answer covers cannot drift between hosts: every later call to that tool, whatever
-/// its arguments, until the session ends. Held in memory with the frontend and never persisted.
+/// screen, `allow_always` and `reject_always` on ACP, `allow_always` and `deny_always` over HTTP),
+/// so what such an answer covers cannot drift between hosts: every later call to that tool,
+/// whatever its arguments, until the session ends. Held in memory with the frontend and never
+/// persisted.
 #[derive(Debug, Default)]
 pub(crate) struct StickyApprovals {
     remembered: Mutex<StickySets>,
@@ -366,8 +367,8 @@ pub(crate) enum FrontendEvent {
         turn_id: Uuid,
         ending: crate::store::turns::TurnEnding,
     },
-    /// The agent finished a turn cleanly. The REPL closes any open streaming text block on this, as
-    /// a block boundary; the closing blank belongs to the episode, not to the turn.
+    /// The agent finished a turn cleanly. The screen closes any open streaming text block on this,
+    /// as a block boundary; the closing blank belongs to the episode, not to the turn.
     TurnFinished,
     /// The turn took its own prompt back: it ended before anything from the model reached the
     /// conversation, and the prompt's retention said to; see
@@ -382,7 +383,7 @@ pub(crate) enum FrontendEvent {
     /// A message meka wrote into the turn in the user's role: the nudge after a reply with no
     /// visible text or with checklist items open. The conversation holds it, so a client that
     /// mirrors the conversation from the feed needs it, and the blocking turn's messages carry it
-    /// where `GET /messages` would; the REPL says it as a stage direction and never shows the
+    /// where `GET /messages` would; the screen says it as a stage direction and never shows the
     /// words.
     Nudged {
         kind: crate::conversation::NudgeKind,
@@ -456,9 +457,9 @@ pub(crate) enum FrontendEvent {
         display_summary: Option<String>,
     },
     /// A previously-announced tool call has finished. Emitted once per tool in source order after
-    /// the parallel dispatch settles. The REPL impl ignores this today (tool results render through
-    /// the model's next assistant message); the ACP impl translates it to `session/update:
-    /// tool_call_update` with `status: completed | failed`.
+    /// the parallel dispatch settles. The screen impl ignores this today (tool results render
+    /// through the model's next assistant message); the ACP impl translates it to
+    /// `session/update: tool_call_update` with `status: completed | failed`.
     ToolCallCompleted {
         id: String,
         /// Tool name (matches the [`Self::ToolCallStarted`] `name`). Lets a frontend format the
@@ -485,8 +486,8 @@ pub(crate) enum FrontendEvent {
     /// The model-facing result assembled at completion still separates the two streams.
     ToolCallOutputDelta { id: String, chunk: String },
     /// The session's checklist changed via a `checklist_*` tool. Emitted by the agent loop after
-    /// the tool succeeds and only when the state actually changed; the REPL renders the list and
-    /// the agent's per-turn `OutputSpacing` is advanced. `items` is the whole open list, empty
+    /// the tool succeeds and only when the state actually changed; the screen renders the list.
+    /// `items` is the whole open list, empty
     /// once the last item is disposed of, so a surface that shows it can clear it.
     ChecklistUpdated { items: Vec<ChecklistItem> },
     /// A sub-agent running under the `agent_spawn` tool call `tool_call_id` did something worth
@@ -502,15 +503,17 @@ pub(crate) enum FrontendEvent {
     /// End-of-turn token-usage summary.
     TokenUsage(TokenUsage),
     /// User-visible advisory raised by meka itself or by the provider layer (e.g. image redaction
-    /// when the request body would exceed the API limit). `ReplFrontend` renders it in the color
-    /// its [`NoticeLevel`] asks for; `AcpFrontend` forwards it as an `AgentMessageChunk` with a
-    /// `[meka] ` or `[meka warn] ` prefix so the editor's transcript records the side-effect; the
-    /// HTTP and one-shot JSON surfaces carry it as a [`NoticeView`]. `SilentFrontend` drops it.
+    /// when the request body would exceed the API limit). The terminal frontends render it in the
+    /// color its [`NoticeLevel`] asks for; `AcpFrontend` forwards it as an `AgentMessageChunk`
+    /// with a `[meka] ` or `[meka warn] ` prefix so the editor's transcript records the
+    /// side-effect; the HTTP and one-shot JSON surfaces carry it as a [`NoticeView`].
+    /// `SilentFrontend` drops it.
     Notice(crate::frontend::Notice),
     /// Incremental progress from an in-flight MCP tool (`notifications/progress`). Routed
     /// per-session via the frontend the MCP call registered with its progress token. See
-    /// [`crate::mcp::progress::ProgressRegistry`]. `ReplFrontend` renders an inline status line
-    /// (carriage-return overwrite); `HttpFrontend` streams it as a `progress` SSE event;
+    /// [`crate::mcp::progress::ProgressRegistry`]. The screen shows it under the running call's
+    /// row and the one-shot as an inline status line; `HttpFrontend` streams it as a `progress`
+    /// SSE event;
     /// `AcpFrontend` logs at `info!` today (no protocol primitive yet). `SilentFrontend` drops
     /// them.
     McpProgress(crate::frontend::ProgressUpdate),
@@ -519,7 +522,7 @@ pub(crate) enum FrontendEvent {
     /// Emitted for every compaction whatever triggered it, including the automatic ones that fire
     /// mid-turn without anyone asking. A frontend holding its own view of the transcript needs this
     /// because compaction is the one event that makes messages it already rendered stop existing:
-    /// the REPL and ACP re-read from the agent each turn and so never noticed, but an HTTP client
+    /// the screen and ACP re-read from the agent each turn and so never noticed, but an HTTP client
     /// polling `GET /messages` sees `total` shrink with no explanation unless it is told.
     Compacted {
         /// `checkpoint` or `summarizer`. The two differ in fidelity, not just mechanism.
@@ -538,7 +541,7 @@ pub(crate) enum FrontendEvent {
 
 /// Structured side-channel a tool can attach to its [`crate::tools::ToolOutput`] for frontends that
 /// know how to render it. Frontends that don't understand a variant ignore it (the regular
-/// `content` text is still the source of truth for the model and the REPL).
+/// `content` text is still the source of truth for the model and the screen).
 #[derive(Debug, Clone)]
 pub(crate) enum ToolOutputMetadata {
     /// Pre/post file content produced by `file_edit` / `file_write`. `old_text == None` means the
@@ -594,7 +597,7 @@ pub(crate) enum PermissionOutcome {
     Allow,
     Deny,
     /// The enclosing turn was canceled while the request was in flight. The ACP frontend surfaces
-    /// this as `{outcome: canceled}`; the REPL collapses it to a deny-shaped tool error.
+    /// this as `{outcome: canceled}`; the screen collapses it to a deny-shaped tool error.
     Canceled,
 }
 
@@ -607,7 +610,7 @@ pub(crate) enum PermissionOutcome {
 ///   sub-agent's turn. A stage direction is not one: it annotates the turn it was emitted in, which
 ///   is the sub-agent's, not the one the user is watching.
 /// - `request_permission` and `handle_elicitation`: round-trips forwarded so the user is asked in
-///   their original UI (REPL approval line, ACP `session/request_permission` /
+///   their original UI (screen approval line, ACP `session/request_permission` /
 ///   `elicitation/create`).
 /// - `ToolCallStarted`: not forwarded as-is, but rolled up into [`FrontendEvent::SubAgentActivity`]
 ///   against the parent's `agent_spawn` call so a long delegated task shows its progress instead of
@@ -872,7 +875,7 @@ impl Notice {
     }
 
     /// What every frontend says when a call needs approval and nothing can put the question to a
-    /// human: the one-shot run, the silent frontend, a REPL whose prompt thread is gone.
+    /// human: the one-shot run, the silent frontend, a screen whose prompt thread is gone.
     ///
     /// A `warn`, and a notice rather than a log line, because the run is otherwise
     /// indistinguishable from a model that chose not to use its tools, and that has sent people
@@ -899,7 +902,7 @@ impl Notice {
 
     /// What every frontend says when a turn goes on past the model's answer because checklist
     /// items are open. A notice rather than a log line: without it a turn that keeps working after
-    /// its answer looks like a hang, on the REPL and on the feed alike.
+    /// its answer looks like a hang, on the screen and on the feed alike.
     pub(crate) fn checklist_nudged(open: usize, nudge: u32, limit: u32) -> Self {
         Self::stage_direction(
             NoticeLevel::Info,

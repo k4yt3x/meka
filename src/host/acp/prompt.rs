@@ -94,7 +94,7 @@ pub(super) async fn build_usage_text(
         ),
     }
 }
-/// Plain-text `/status` output: the block the REPL prints, from [`crate::host::format_status`],
+/// Plain-text `/status` output: the block the screen prints, from [`crate::host::format_status`],
 /// under a heading and after the permission level, which an ACP client may not otherwise surface.
 pub(super) async fn build_status_text(
     agent: &crate::agent::Agent,
@@ -231,7 +231,7 @@ pub(super) fn split_acp_slash(prompt_text: &str) -> Option<(String, String)> {
 ///   like `/etc/hosts` or a `//` comment): returned unchanged so the model can see it.
 /// - `/<skill-name>` matching an installed skill: returns `extra\n\n{body}` where `body` is
 ///   [`crate::skills::load_skill_body`]'s output (the skill's base-directory header followed by its
-///   body verbatim). Empty `extra` collapses to just `body`. Same composition the REPL's
+///   body verbatim). Empty `extra` collapses to just `body`. Same composition the screen's
 ///   `SlashCommand::SkillInvoke` handler uses.
 /// - `/<name>` with a syntactically valid skill name but no installed skill of that name:
 ///   `SkillNotFound`. The caller sends the original text to the model rather than failing the

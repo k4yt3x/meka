@@ -613,9 +613,9 @@ fn snapshot_roots(
 
 /// Skill names for a synchronous caller, recomputed only when the files under `roots` change.
 ///
-/// [`SkillCache`] is the async equivalent and the one the agent uses; this exists because
-/// reedline's `Completer` is sync and the REPL loop that feeds it runs on its own blocking thread,
-/// so it cannot `await` `SkillCache::current`. What it must *not* do is re-discover
+/// [`SkillCache`] is the async equivalent and the one the agent uses; this exists because the
+/// completion list is built on a key press, synchronously, so the screen cannot `await`
+/// `SkillCache::current` for it. What it must *not* do is re-discover
 /// unconditionally: [`discover_skills_in_roots`] reads and parses every `SKILL.md` under every root
 /// and warns per unloadable or shadowed one, so calling it before each prompt would put a full tree
 /// parse on the path to drawing the prompt and reprint those warnings after every turn, every
@@ -662,7 +662,7 @@ impl SkillNameWatch {
 
 /// Shared, atomically-swappable view of the skill list. Construction runs an initial
 /// [`discover_skills_in_roots`] pass so broken-skill warnings surface during agent startup (above
-/// the first REPL prompt) instead of during the first turn. Subsequent reads via
+/// the first screen prompt) instead of during the first turn. Subsequent reads via
 /// [`SkillCache::current`] perform a cheap mtime-snapshot check and only re-discover when the
 /// on-disk state actually changed; identical broken-skill warnings naturally dedup across turns
 /// because the inner walk is skipped when the snapshot is stable.
@@ -3728,7 +3728,7 @@ mod tests {
         assert!(super::write_skill(temp.path(), "a/b", "d", 5, None, Some("b")).is_err());
     }
 
-    /// The REPL completer's refresh must be a stat pass, not a parse pass.
+    /// The screen completer's refresh must be a stat pass, not a parse pass.
     ///
     /// It runs before every prompt, and `discover_skills_in_roots` reads and parses every
     /// `SKILL.md` and warns per unloadable or shadowed one. Called unconditionally it would put a

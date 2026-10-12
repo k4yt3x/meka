@@ -20,27 +20,9 @@ fn usage_err(message: impl Into<String>) -> MekaError {
     MekaError::Usage(message.into())
 }
 
-/// `/mcp list` in the REPL: the configured servers with their transport and target.
-///
-/// With a `manager`, the table also carries a `State` column with each server's live lifecycle
-/// state; `meka mcp list` has no running manager and gets the table without it.
-pub(crate) async fn run_list(
-    servers: &[McpServerConfig],
-    manager: Option<&std::sync::Arc<crate::mcp::McpClientManager>>,
-    token_store: &TokenStore,
-) -> Result<()> {
-    list_servers(
-        servers,
-        manager,
-        token_store,
-        crate::cli::OutputFormat::Plain,
-        crate::render::Stream::Stderr,
-    )
-    .await
-}
-
-/// [`run_list`] under a chosen format; the REPL's `/mcp list` has no format flag and takes the door
-/// above. `--format json` prints `{"servers": [...]}` and leaves the orphan report on stderr.
+/// `meka mcp list` under a chosen format. The screen's `/mcp` is a picker built on
+/// [`crate::mcp::McpClientManager::server_entry`] instead, so this path is the CLI's alone.
+/// `--format json` prints `{"servers": [...]}` and leaves the orphan report on stderr.
 pub(crate) async fn list_servers(
     servers: &[McpServerConfig],
     manager: Option<&std::sync::Arc<crate::mcp::McpClientManager>>,
@@ -156,9 +138,9 @@ pub(crate) async fn list_servers(
 /// goes away by hand, so an OAuth bundle can outlive its server indefinitely. This diff is the only
 /// thing that can name one, and `meka mcp remove <name>` then clears it.
 ///
-/// Safe to compute here only because every caller of `run_list` has already failed on an unreadable
-/// config. An empty server list that came from a config meka could not parse would report every
-/// credential in the database as an orphan.
+/// Safe to compute here only because every caller of `list_servers` has already failed on an
+/// unreadable config. An empty server list that came from a config meka could not parse would
+/// report every credential in the database as an orphan.
 async fn orphaned_credentials(
     servers: &[McpServerConfig],
     token_store: &TokenStore,
@@ -636,14 +618,18 @@ pub(crate) async fn run_store_secret(
     Ok(())
 }
 
-/// Connect `config` once with a terminal at hand for the browser step, and say whether it ended
+/// Connect `config` once with a person at hand for the browser step, and say whether it ended
 /// connected. Split from `run_login` so every way the flow can end short of `Connected`, an error
 /// included, reaches the one place that puts the previous bundle back.
-async fn run_login_flow(config: &McpServerConfig, token_store: &TokenStore) -> Result<bool> {
+async fn run_login_flow(
+    config: &McpServerConfig,
+    token_store: &TokenStore,
+    prompt: Arc<dyn crate::mcp::auth::LoginPrompt>,
+) -> Result<bool> {
     let context = McpClientContext::new();
-    // The one place a person is at the terminal to finish a browser login, so the one place the
-    // client is given a way to ask them.
-    context.set_login_prompt(std::sync::Arc::new(TerminalLogin));
+    // The one place a person is there to finish a browser login, so the one place the client is
+    // given a way to ask them.
+    context.set_login_prompt(prompt);
     // No `[mcp].default_permission`, for the reason `run_reconnect` gives.
     let (manager, connected) = connect_alone(config, None, token_store, context).await?;
     manager.shutdown_arc().await;
@@ -651,8 +637,8 @@ async fn run_login_flow(config: &McpServerConfig, token_store: &TokenStore) -> R
 }
 
 /// The terminal's side of an interactive MCP login: the URL on stderr, and the pasted callback read
-/// from stdin when stdin is a terminal.
-struct TerminalLogin;
+/// from stdin when stdin is a terminal. The screen has its own, since it owns both.
+pub(crate) struct TerminalLogin;
 
 #[async_trait::async_trait]
 impl crate::mcp::auth::LoginPrompt for TerminalLogin {
@@ -696,7 +682,8 @@ impl crate::mcp::auth::LoginPrompt for TerminalLogin {
     }
 }
 
-/// Run `meka mcp login <name>`: an interactive OAuth flow.
+/// Run `meka mcp login <name>`: an interactive OAuth flow, with `prompt` as the person's side of
+/// it.
 ///
 /// An explicit `[auth]` block is honored as written. An HTTP server without one is assumed to take
 /// `type = "oauth"`, and on success that block is written back to `config.toml` so later runs do
@@ -705,6 +692,7 @@ pub(crate) async fn run_login(
     servers: &[McpServerConfig],
     token_store: &TokenStore,
     name: &str,
+    prompt: Arc<dyn crate::mcp::auth::LoginPrompt>,
 ) -> Result<()> {
     let base_config = require_server(servers, name)?.clone();
 
@@ -759,7 +747,7 @@ pub(crate) async fn run_login(
         .clear_mcp_credentials_of_kind(name, crate::store::McpCredentialKind::OAuth)
         .await?;
 
-    let connected = run_login_flow(&config, token_store).await;
+    let connected = run_login_flow(&config, token_store, prompt).await;
     let connected = match connected {
         Ok(true) => true,
         Ok(false) | Err(_) => {
@@ -1144,6 +1132,7 @@ async fn probe_then_login(resolved: &ResolvedAddArgs, token_store: &TokenStore) 
         std::slice::from_ref(&server_config),
         token_store,
         &resolved.name,
+        Arc::new(TerminalLogin),
     )
     .await
 }
@@ -1942,7 +1931,15 @@ pub(crate) async fn run_mcp_subcommand(
                     )
                     .await?
                 }
-                None => crate::cli::mcp::run_login(&config.mcp_servers, &token_store, name).await?,
+                None => {
+                    crate::cli::mcp::run_login(
+                        &config.mcp_servers,
+                        &token_store,
+                        name,
+                        Arc::new(TerminalLogin),
+                    )
+                    .await?
+                }
             }
         }
         crate::cli::McpAction::Logout { name } => {
@@ -2465,9 +2462,14 @@ mod tests {
             let had_auth = auth.is_some();
             server.auth = auth;
 
-            let error = run_login(std::slice::from_ref(&server), &store, "api")
-                .await
-                .expect_err("a stored bearer must stop the login");
+            let error = run_login(
+                std::slice::from_ref(&server),
+                &store,
+                "api",
+                Arc::new(TerminalLogin),
+            )
+            .await
+            .expect_err("a stored bearer must stop the login");
             assert!(
                 format!("{error}").contains("meka mcp logout api"),
                 "the error should name the command that drops it (auth block: {had_auth}), got: {error}"

@@ -321,7 +321,7 @@ impl Agent {
     /// The slot holding the lock on a session this agent created, for a host that has to outlive
     /// the turn that took it.
     ///
-    /// The REPL needs all three of what this allows: to leave the lock held between turns, to
+    /// The screen needs all three of what this allows: to leave the lock held between turns, to
     /// replace it when `/fork` moves the conversation to a copy, and to drop it after its last
     /// message rather than whenever the agent happens to fall out of scope.
     pub(crate) fn session_lock_slot(&self) -> crate::store::SessionLockSlot {
@@ -423,7 +423,7 @@ impl Agent {
         self.tool_registry.background_enabled()
     }
 
-    /// Snapshot of the per-session counters used by `/status`. Called from the REPL on demand.
+    /// Snapshot of the per-session counters used by `/status`. Called from the screen on demand.
     pub(crate) fn session_stats_snapshot(&self) -> crate::stats::SessionStatsSnapshot {
         self.session_stats.snapshot()
     }
@@ -525,8 +525,9 @@ impl Agent {
     /// the conversation records: a rewind that dropped the turn an item was added in has dropped
     /// the item, and a compaction carried the list on its boundary.
     ///
-    /// The one reset every door that rewrites the log calls: compaction, and a rewind on every
-    /// host. A door that resets its own subset leaves the rest stale.
+    /// The one reset every door that rewrites the log, or swaps it for another session's, calls:
+    /// compaction, a rewind on every host, and the screen's `/resume`. A door that resets its own
+    /// subset leaves the rest stale.
     pub(crate) async fn reset_conversation_markers(
         &self,
         conversation: &crate::conversation::Conversation,
@@ -588,19 +589,19 @@ impl Agent {
         self.background_max_tasks = max_tasks;
     }
 
-    /// The shared registry, for the REPL's `/task` command and its Ctrl+C handling.
+    /// The shared registry, for the screen's `/task` command and its Ctrl+C handling.
     pub(crate) fn background_tasks(&self) -> crate::background::BackgroundTasks {
         self.cells.background_tasks.clone()
     }
 
     /// This agent's session store, so a signal handler can record a terminal outcome without the
-    /// REPL threading a second handle through every call site.
+    /// screen threading a second handle through every call site.
     pub(crate) fn store(&self) -> Store {
         self.store.clone()
     }
 
-    /// Shared handle to the auto-refreshing skill cache. The REPL's `/skill <name>` dispatch reads
-    /// from this so the agent's system prompt and the user-invocable list never diverge.
+    /// Shared handle to the auto-refreshing skill cache. The screen's `/skill <name>` dispatch
+    /// reads from this so the agent's system prompt and the user-invocable list never diverge.
     pub(crate) fn skills(&self) -> &Arc<SkillCache> {
         &self.skills
     }

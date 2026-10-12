@@ -176,7 +176,7 @@ rely on one:
 | Host | Fires | Notes |
 |------|-------|-------|
 | `meka serve` | Every job, except on a session another process has locked | Revives evicted sessions on demand. **The durable path.** |
-| REPL | Only jobs for the session it has open | Best-effort; a job goes dormant if you next start a different session |
+| Screen | Only jobs for the session it has open | Best-effort; a job goes dormant if you next start a different session |
 | ACP | Only jobs for sessions the editor has open | The prompt appears in the transcript as the turn that triggered the reply |
 | `--oneshot` | Never | The process exits; jobs stay on disk for a later run |
 
@@ -186,7 +186,7 @@ opening with a `turn.started` whose `source` is `schedule` and which names the `
 watching the session sees the agent act on its own schedule as it happens. A message posted to the
 session's [inbox](./http-api.md#the-inbox) while a fire runs is read at the fire's next round
 boundary, and a `followup` waits for it to end.
-In the REPL, a job created in one session resumes only when that session does; `meka --continue`
+On the screen, a job created in one session resumes only when that session does; `meka --continue`
 picks up where you left off.
 
 Jobs all live in the same store, so a host that does not fire a job has not lost it. A job whose
@@ -223,7 +223,7 @@ turn, and then advances the schedule (or retires a one-shot). Three consequences
   job is not deleted: it stays listed, cancelable, and marked as held with the reason, because a
   prompt that crashes meka is something to look at rather than something to throw away. Recreate it,
   or cancel it. A host that simply declines a job it cannot take (`meka serve` finding the session
-  locked by a REPL) does not count, since that says nothing about the job.
+  locked by a screen) does not count, since that says nothing about the job.
 
 `[schedule] claim_lease` (default `"1h"`) is how long a lease is good for, and therefore how long a
 crashed host's occurrence waits before another host takes it. It should exceed a gate probe plus a
@@ -252,10 +252,10 @@ Under ACP the editor is a live client, which changes one thing: approvals genuin
 a scheduled job can prompt you in the editor rather than being denied for want of anybody to ask.
 Stopping a scheduled turn works the same as stopping any other.
 
-When a job fires at an idle REPL prompt, the turn interrupts the prompt and runs exactly like one
-you typed: output streams, Ctrl+C interrupts it, and anything you had half-typed is handed back
-afterwards. A stage direction above the reply names the job and the opening of its prompt,
-`(scheduled job 1a2b3c4d fired: remind me to stretch)`, and says how late the fire is when it
+When a job fires at an idle screen, the turn runs exactly like one you typed: output streams, Esc
+or Ctrl+C stops it, and what you had half-typed stays in the composer. A stage direction above the
+reply names the job and the opening of its prompt, `scheduled job 1a2b3c4d fired: remind me to
+stretch`, and says how late the fire is when it
 makes up for missed occurrences. The prompt the model is given, with its header and any gate
 output, is not echoed, the way no tool's output is; the reply is what you read.
 
@@ -304,11 +304,11 @@ approval resolves to **deny** and the job fails to do whatever needed approval. 
 the session transcript rather than anywhere louder, so a job on such a session that seems to do
 nothing is worth checking there first.
 
-The REPL and ACP both have someone attached, so approvals reach them normally.
+The screen and ACP both have someone attached, so approvals reach them normally.
 
 A job's **turn** runs at whatever permission the session holds when it fires, not at the level the
 job was created with: the level lives on the session and the session is mutable, through Shift+Tab in
-the REPL or `PATCH /v1/sessions/{id}` under `serve`.
+the screen or `PATCH /v1/sessions/{id}` under `serve`.
 
 With one floor: a session at `none` fires nothing, gated or not. Nothing is executable there, so the
 turn would read nothing, change nothing, and could not even reach `schedule_cancel` to stop itself
@@ -333,11 +333,11 @@ server and not verified by meka, which is a weaker footing under a gate than und
 conversation, because nobody reads the result of a gate.
 
 That second level is the session's own, recorded on its row and kept current by whichever surface
-owns it: Shift+Tab and `/permission` in the REPL, `session/set_mode` under ACP, `PATCH
+owns it: Shift+Tab and `/permission` on the screen, `session/set_mode` under ACP, `PATCH
 /v1/sessions/{id}` under `serve`. The process that has the session open reads the level the session
 holds right now, so a change takes effect there even if writing it to the row failed. Every other
 process that polls the schedule reads the row, so withdrawing the level works across processes: a
-`meka serve` daemon sharing the data directory will refuse a gate you just dropped in a REPL.
+`meka serve` daemon sharing the data directory will refuse a gate you just dropped in a screen.
 Nothing else is read: every surface records a level when it creates a session, and a row that
 somehow carries none fires nothing at all, rather than falling back to whatever the polling process
 was started with.
@@ -367,10 +367,9 @@ Four surfaces report it, and each says only what it can establish:
 
 - **`[Scheduled]` and `schedule_list`** carry the full sentence, since the agent is the one that can
   recreate or cancel the job.
-- **`/schedule`** has a `Held` column: `yes` when the job cannot fire, blank when it can, and `?`
-  when this process cannot establish the answer. Blank means "it will fire", not "I did not check".
-  It runs inside a host and uses its MCP manager, so it resolves tool gates; it shows `?` for a job
-  whose session level it could not read, since that is unestablished rather than fine.
+- **`/schedule`** marks a job `held` when it cannot fire and `held?` when this process cannot
+  establish the answer; no mark means "it will fire", not "I did not check". It shows `held?` for a
+  job whose session level it could not read, since that is unestablished rather than fine.
 - **`meka schedule show`** spells the same verdict out on a `withheld:` line. It is a separate
   process from any host and so cannot resolve a tool gate, reporting that as unknown rather than as
   fine. `meka schedule list` does not carry it at all: a column that is blank on almost every row is
@@ -431,11 +430,10 @@ collided), and an unfiltered `meka schedule list` always prints a prefix that re
 a gate runs, the session's full id, when it last fired, and whether it is withheld. Nothing there is
 truncated, which is why it is a separate command rather than a wider table.
 
-In the REPL, `/schedule` lists the current session's jobs, `/schedule show <id>` prints one in full,
-and `/schedule cancel <id>` cancels one. All three answer inside the conversation you are in: a job
-belonging to another session is not found here, which is what makes the ids the listing prints the
-ids the other two take. The table drops the `Session` column, which would repeat one id down every
-row, and spends the width on `Held` instead.
+On the screen, `/schedule` is a picker of the current session's jobs, each with its schedule and
+prompt, and Enter (or `/schedule show <id>`) shows one in full; `/schedule cancel <id>` cancels one.
+All three answer inside the conversation you are in: a job belonging to another session is not
+found here, which is what makes the ids the picker shows the ids the other two take.
 
 ## Configuration
 

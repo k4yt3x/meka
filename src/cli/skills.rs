@@ -31,16 +31,6 @@ pub(crate) struct AddArgs<'a> {
     pub(crate) edit: bool,
 }
 
-/// `/skill` in the REPL, which has no format flag: the plain table.
-pub(crate) fn run_list(roots: &[std::path::PathBuf], paths: bool) -> Result<()> {
-    list(
-        roots,
-        paths,
-        crate::cli::OutputFormat::Plain,
-        crate::render::Stream::Stderr,
-    )
-}
-
 /// `meka skill list`: a column table of every installed skill, or under `--format json` the
 /// palette as `{"skills": [...]}`. The empty table is a status note on stderr, not data, so a
 /// caller piping it gets a clean empty stdout.

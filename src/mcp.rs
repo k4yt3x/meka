@@ -113,7 +113,7 @@ pub(crate) struct McpClientManager {
     settled: tokio::sync::watch::Sender<bool>,
     /// Entries waiting to be connected by [`Self::start_connector`]. `None` once the connector has
     /// been started so a second call is a no-op; avoids re-spawning the connector if a test or the
-    /// REPL re-enters the same manager.
+    /// screen re-enters the same manager.
     pending_entries: std::sync::Mutex<Option<Vec<Arc<ServerEntry>>>>,
     /// Live snapshot of every connected server's currently-registered tools. The connector writes
     /// here as each server reaches `Connected`, and `on_tool_list_changed` writes here on dynamic

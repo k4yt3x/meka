@@ -19,9 +19,9 @@ rank  module          holds
  0    main            argument parsing; picks a host or a cli handler
  1    host            the layer between a host and the agent, and the four hosts under it
  2    cli             clap definitions and one handler file per subcommand group
- 2    relay           tracing output routed around the live REPL prompt
- 3    console         the terminal between two prompts: spacing, notices, errors
- 4    render          markdown, tool indicators, the checklist, status lines
+ 2    relay           tracing output routed to the screen, or around a one-shot run's rows
+ 3    console         a one-shot run's terminal: the blank between blocks, the transient row, notices
+ 4    render          markdown, tool indicators, the checklist, status lines, for a stream and for the screen
  5    agent           the turn loop, tool dispatch, compaction, recovery
  5    view            the JSON record shapes --format json and the HTTP API share
  6    tools           the Tool trait, the registry, the built-ins, MCP tools as Tools
@@ -56,9 +56,9 @@ rank  module          holds
 20    text            pure text helpers: widths, columns, sizes, timestamps, unknown_name
 ```
 
-`relay` is installed by the two terminal hosts (`host/repl.rs`, `host/oneshot.rs`) and by
-`main.rs` as tracing's writer; it writes through `console`, which draws with `render`. `render` and
-`console` are reached only from `host`, `cli` and `relay`. `text` is the lowest leaf so that `error`
+`relay` is installed by the two terminal hosts (`host/tui.rs`, `host/oneshot.rs`) and by
+`main.rs` as tracing's writer; the screen drains it, and a one-shot run writes it through `console`,
+which draws with `render`. `render` and `console` are reached only from `host`, `cli` and `relay`. `text` is the lowest leaf so that `error`
 can render `MekaError::ProfileNotConfigured` through `text::unknown_name`.
 
 Put new code where its callers already are: a type read by `store` and `host` belongs in `store` or
@@ -68,7 +68,7 @@ below, never in `host`. A new module fails the test until it is given a rank.
 |--------|-------|
 | `src/main.rs` | Dispatch only: parse arguments, pick a host or a CLI handler, map the exit code. |
 | `src/cli.rs`, `src/cli/` | The clap definitions and one handler file per subcommand group: `account`, `profile`, `session`, `history`, `mcp`, `tool`, `skills`, `memory`, `instructions`, `schedule`, `background`. Everything that owns the stdout/stderr contract lives here. |
-| `src/host.rs`, `src/host/` | `host/assembly.rs` builds a session: `SharedDeps`, `build_session_agent`, `hydrate_conversation`, `resolve_profile_switch`, `record_session_change`. `host/session.rs` runs one: `ResidentSession`, `TurnGuard`, the `CancelCell`, the `Sessions` registry and its idle sweep, `fork_and_lock`, outcome claiming. `host/scheduler.rs` is `HostHooks`, `run_wakeup`, the out-of-band turn every host runs the same way, `spawn_outcome_poller`, the one background-outcome poller both servers spawn, and `TurnSource`, who started a turn. `host.rs` keeps `wait_for_shutdown_signal`, and `host/assembly.rs` `apply_recorded_profile`, which both servers call ahead of every turn, `POST /compact` included, so a session runs on the profile its row names. `host/terminal.rs` is what the REPL and one-shot share: Ctrl+C, the interruptible turn. `host.rs` keeps `COMMANDS`, the slash-command table the REPL offers and ACP advertises the `for_editors` rows of. `host/repl`, `host/oneshot`, `host/acp` and `host/http` are the hosts; `host/http/feed.rs` is the session feed, the SSE channel and replay ring `HttpFrontend` produces into and the stream handlers read. |
+| `src/host.rs`, `src/host/` | `host/assembly.rs` builds a session: `SharedDeps`, `build_session_agent`, `hydrate_conversation`, `resolve_profile_switch`, `record_session_change`. `host/session.rs` runs one: `ResidentSession`, `TurnGuard`, the `CancelCell`, the `Sessions` registry and its idle sweep, `fork_and_lock`, outcome claiming. `host/scheduler.rs` is `HostHooks`, `run_wakeup`, the out-of-band turn every host runs the same way, `spawn_outcome_poller`, the one background-outcome poller both servers spawn, and `TurnSource`, who started a turn. `host.rs` keeps `wait_for_shutdown_signal`, and `host/assembly.rs` `apply_recorded_profile`, which both servers call ahead of every turn, `POST /compact` included, so a session runs on the profile its row names. `host/terminal.rs` is what the screen and one-shot share: Ctrl+C, the interruptible turn. `host.rs` keeps `COMMANDS`, the slash-command table the screen offers and ACP advertises the `for_editors` rows of. `host/tui`, `host/oneshot`, `host/acp` and `host/http` are the hosts; `host/tui/model.rs` is the transcript the screen draws from (a bounded window of the session's log plus this run's tail), `host/tui/view.rs` how each item is drawn and the viewport, `host/tui/panel.rs` the panel a command's answer, a picker or the approval prompt opens in, `host/tui/screen.rs` the task that owns the terminal; `host/http/feed.rs` is the session feed, the SSE channel and replay ring `HttpFrontend` produces into and the stream handlers read. |
 | `src/agent.rs`, `src/agent/` | The `Agent` and its options; `turn.rs` runs a turn in phases (`open_turn`, `run_rounds`, `settle_turn`) and owns `TurnInput`, `dispatch.rs` executes tool calls and owns `run_admitted_call`, the one sequence a resolved call goes through, `compaction.rs` summarizes, `recovery.rs` decides what a failed request becomes. |
 | `src/view.rs` | The record shapes `--format json` prints and the HTTP API serves, each defined once with its `From` conversion from the store or config type it shows: `SessionView`, `ProfileView`, `AccountView`, `McpServerView`, `McpToolView`, `ScheduledJobView`, `GateView`, `MemoryDetail`, `ToolView`, `SkillView`, `SkillDetail`. A host adds what only it can answer around the shared core by `#[serde(flatten)]`: the HTTP `SessionResponse` flattens `SessionView` under `capabilities`, `turn_in_flight`, `inbox_pending` and `approvals_pending`; the CLI's `InstalledSkillView` and `ConfiguredToolView` flatten a core under what only a terminal should see, such as a path on this machine. Every `Option` field is omitted when absent, never `null`. |
 | `src/session.rs` | What a session is made of: `CoreMaterials` and `SessionMaterials` (what every agent and registry of a session is built from), `SessionCells` (permission, cwd, roots, session id, checklist, the published profile, the context gauge, background tasks, the frontend, the session lock slot, a pending compaction), `ToolSite` (the four cells a built-in reads), `AgentOptions` and `CompactRequest`. No host and no SQL. |
@@ -92,7 +92,7 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
    `host::http::state::admit_turn` to add the process-wide cap. A scheduled fire, an outcome
    delivery or an inbox turn goes through `HostHooks::admit`, which under `serve` counts on the
    same cap and steps back for the next tick when it is full; HTTP compact and rewind take
-   `claim_idle`, which refuses while anything is in flight. The REPL and the one-shot drive one
+   `claim_idle`, which refuses while anything is in flight. The screen and the one-shot drive one
    session from one thread, so they sample `cancel.admit()` themselves and take the conversation
    lock.
 2. **Input.** The host builds a `TurnInput`: the typed prompt or the outcomes it carries, images,
@@ -132,7 +132,7 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
    advances only after the replacement is saved. Finished background outcomes are not delivered
    again during this rebuild.
 5. **Output.** Text, thinking, tool indicators, approval prompts and elicitations all reach the
-   user through the session's `Frontend`. The REPL, ACP and HTTP each implement it once; a
+   user through the session's `Frontend`. The screen, ACP and HTTP each implement it once; a
    sub-agent's `PermissionForwardingFrontend` forwards its approval prompts and notices to its
    parent's; `SilentFrontend` answers a call with nobody behind it.
 
@@ -156,7 +156,7 @@ columns of the tables in `HEAD_TABLES`. The count is the ledger's to state: `the
 | `scheduled_jobs` | `store/schedule.rs` | `id`, `session_id`, `kind`, `spec`, `prompt`, `gate_kind`, `gate_spec_json`, `gate_last_output`, `gate_permission`, `claimed_by`, `claim_expires_at`, `attempts`, `created_at`, `last_fired_at`, `next_fire_at`. `idx_scheduled_jobs_next_fire_at`, `idx_scheduled_jobs_session_id`. |
 | `background_tasks` | `store/background.rs` | `id`, `session_id`, `tool`, `label`, `status`, `outcome`, `scratchpad_entry`, `started_at`, `finished_at`, `announced_at`, `delivered_at`. `idx_background_tasks_session_id_status`. |
 | `memories`, `memories_fts` | `store/memory.rs` | `id`, `name`, `description`, `tags`, `body`, `priority`, `created_at`, `updated_at`, `read_count`. `idx_memories_priority_created_at`. The FTS index and its triggers are rebuilt to this build's definition by `reconcile_index` on every open, so they are outside the ledger's fingerprint. |
-| `prompt_history` | `store/history.rs` | The REPL's input history: `id`, `command_line`, `created_at`. |
+| `prompt_history` | `store/history.rs` | The screen's input history: `id`, `command_line`, `created_at`. |
 
 Per-process state that is not a table has an owner too: the scheduler's memory of which refusals it
 has already reported is the `SchedulerMemory` on the `Store`; MCP progress routing and resource
@@ -172,12 +172,12 @@ they guard. When adding a path, call the predicate rather than restating the rul
 
 | Rule | Predicate | Doors |
 |------|-----------|-------|
-| Whether a turn may start | `ResidentSession::admit_turn` and `claim_idle` on the one `in_flight` cell | `admit_turn`: HTTP `POST /turn` (under the process cap, `host::http::state::admit_turn`) and ACP `session/prompt`, and through `HostHooks::admit` the scheduled fires, outcome deliveries and inbox turns in `host/scheduler.rs` (under the same cap in `serve`); `claim_idle`: HTTP compact and rewind. The REPL and one-shot sample `cancel.admit()` directly. |
+| Whether a turn may start | `ResidentSession::admit_turn` and `claim_idle` on the one `in_flight` cell | `admit_turn`: HTTP `POST /turn` (under the process cap, `host::http::state::admit_turn`) and ACP `session/prompt`, and through `HostHooks::admit` the scheduled fires, outcome deliveries and inbox turns in `host/scheduler.rs` (under the same cap in `serve`); `claim_idle`: HTTP compact and rewind. The screen and one-shot sample `cancel.admit()` directly. |
 | Whether a second turn is refused | the conversation mutex, `try_lock` | HTTP `POST /turn` (`try_lock_owned`, 409), ACP `session/prompt` (`InvalidParams`) |
 | Whether a session is idle enough to evict | `host::session::idle_on`, behind `ResidentSession::is_idle_given` and `Sessions::sweep_idle` | the HTTP GC and the ACP idle sweep |
 | Whether a prompt is empty | `TurnInput::from_parts` | every host, before admission |
 | Whether a tool call runs, is put to the user, or is refused | `tools::admit_tool_call`, called through `Agent::run_admitted_call`, the one sequence from the level read at the enforcement site to the tool's own refusal, the approval prompt and the schema advisory | inline dispatch, the checkpoint turn in `agent/compaction.rs` |
-| What forgets the conversation's old shape when the log is rewritten | `Agent::reset_conversation_markers`: the accepted-prefix marker, the world snapshot, the read tracker, the schema advisories, the gauge and its row | compaction, REPL `/rewind`, HTTP `POST /rewind` |
+| What forgets the conversation's old shape when the log is rewritten | `Agent::reset_conversation_markers`: the accepted-prefix marker, the world snapshot, the read tracker, the schema advisories, the gauge and its row | compaction, screen `/rewind`, HTTP `POST /rewind` |
 | Whether a turn runs on the profile its row names | `host::apply_recorded_profile`, under the conversation lock | ACP `session/prompt` and its fires, HTTP `POST /turn`, `POST /compact` and its fires, through `HostHooks::prepare` |
 | Whether a session is a sub-agent's | `store::spawned_session_sql` in SQL; `SpawnTerms::describe` for the sentence every refusal starts with | every listing, `meka -c`, session search, the inbox driver; the refusals of the HTTP fork, the ACP fork, `POST /responses`, a job on it, and every builder |
 | What the retention sweep may take | `EXPIRABLE`: a root by its own age, spared while a pin or a job sits anywhere in its tree | the retention sweep, `meka session delete --older-than-days` |
@@ -190,13 +190,13 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | Whether a recorded level still applies | `EnabledPermissions::admit_recorded` | a resume on every host (`host/assembly.rs`, `host/http/reattach.rs`, `host/acp/session.rs`), the scheduler |
 | The refusal for a level the set does not admit | `EnabledPermissions::disabled_level`, raising `MekaError::DisabledLevel` | `SharedPermission::try_set` behind `/permission`, ACP `session/set_mode` and its permission option; HTTP create and `PATCH` |
 | Whether a profile name is configured | `config::require_profile`, raising `MekaError::ProfileNotConfigured` | `--profile` and `default_profile` selection, `resolve_profile_switch` and the resume repin (`host/assembly.rs`), HTTP create and `PATCH`, the provider registry, `meka profile use` |
-| What a session's row may move to, and what a failed write costs | `Store::update_session` taking a `SessionPatch`; the policy is `host::record_session_change` | REPL `/permission`, `/approvals`, `/cd`; ACP `session/set_mode` and `session/set_config_option`; HTTP `PATCH`; the profile switch and resume reconciliation. A patch that fails to write the level, switch, directory or roots is warned about and the command continues; one carrying a profile fails the request. The one writer below `host` is the sub-agent tool recording the profile a worker ran on, which warns. |
-| Whether a working directory is accepted, and how it is spelled | `workspace::accept_cwd`; `cwd_filter` for a listing filter | ACP `session/new`, `load`, `resume`, `fork`; REPL `/cd`; HTTP create, `PATCH` and `?cwd=` |
+| What a session's row may move to, and what a failed write costs | `Store::update_session` taking a `SessionPatch`; the policy is `host::record_session_change` | screen `/permission`, `/approvals`, `/cd`; ACP `session/set_mode` and `session/set_config_option`; HTTP `PATCH`; the profile switch and resume reconciliation. A patch that fails to write the level, switch, directory or roots is warned about and the command continues; one carrying a profile fails the request. The one writer below `host` is the sub-agent tool recording the profile a worker ran on, which warns. |
+| Whether a working directory is accepted, and how it is spelled | `workspace::accept_cwd`; `cwd_filter` for a listing filter | ACP `session/new`, `load`, `resume`, `fork`; screen `/cd`; HTTP create, `PATCH` and `?cwd=` |
 | Whether a session accepts an image | `ResidentSession::accepts_images`, off the published profile's `vision` | HTTP `POST /turn`, ACP `session/prompt` |
 | A session's title | `Conversation::title` (the first user `Append` in the log with a non-blank `Text` block that is not a redaction placeholder or harness note, whitespace collapsed, `TITLE_CHARS` = 80; `TITLE_ROW_WHERE_SQL` is the same rule in SQL) | `SessionSummary`, the HTTP turn response, ACP's title update (from the resident log after a first prompt, from the row on a load, resume or fork, since a hydrated log begins at the last boundary) |
-| Making a persisted session resident | `Store::open_session_row`: lock first, then read | REPL and one-shot resume, `serve` re-attach (`ensure_session_loaded`), ACP `session/load` and `session/resume` |
+| Making a persisted session resident | `Store::open_session_row`: lock first, then read | screen and one-shot resume, `serve` re-attach (`ensure_session_loaded`), ACP `session/load` and `session/resume` |
 | What a resident session's log holds | `Store::load_conversation`: the rows from the last `compact_boundary` on (`load_view_events`), images inlined, orphaned `tool_use` dropped; the whole log is read only by `load_events` for the readers that want history | every host resume through `host::hydrate_conversation`, the sub-agent follow-up |
-| Forking | `Store::fork_session_locked` with `SourceLock::{Probe, HeldByCaller}` | `meka session fork` (`Probe`); REPL `/fork` through `host::fork_and_lock` (`HeldByCaller`); HTTP `POST /fork` and ACP `session/fork`, which hold a resident source still under `HeldByCaller` (refusing it mid-turn) and `Probe` a dormant one |
+| Forking | `Store::fork_session_locked` with `SourceLock::{Probe, HeldByCaller}` | `meka session fork` (`Probe`); screen `/fork` through `host::fork_and_lock` (`HeldByCaller`); HTTP `POST /fork` and ACP `session/fork`, which hold a resident source still under `HeldByCaller` (refusing it mid-turn) and `Probe` a dormant one |
 | What an HTTP caller may do | `scope::Scoped<R>` as an extractor | every handler, by its signature |
 | Whether a path may be written | `workspace::WriteScope` | `file_write`, `file_edit`, `scratchpad_save_file`, `shell_execute`'s confinement |
 | Whether meka's own directories, or a process's own `/proc` entries, may be read, with the skills store as the readable part | `workspace::private_read_refusal` and `workspace::ReadFence` | `tools/util.rs` for the readers, `file_find`, `file_search` |
@@ -210,8 +210,8 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | The sentence for a name that matches nothing | `text::unknown_name` | every refusal by name: profiles, accounts, MCP servers, configuration options, scopes, gates |
 | How a terminal shows a time, a size, an id | `text::format_timestamp` with `Precision`, `text::format_size` with `KIB` and `MIB`, `text::ID_PREFIX` | every listing and status line; the wire keeps RFC 3339 and raw byte counts |
 | The `Authorization` value for a token | `text::bearer` | every backend that sends one, and `store/credentials.rs` |
-| What a sticky approval answer covers | `StickyApprovals` in `frontend.rs` | the REPL, ACP and HTTP frontends |
-| How long a host waits for an approval answer | `APPROVAL_TIMEOUT` in `frontend.rs` (30 minutes) | the ACP and HTTP frontends; the REPL has a human and no timeout |
+| What a sticky approval answer covers | `StickyApprovals` in `frontend.rs` | the screen, ACP and HTTP frontends |
+| How long a host waits for an approval answer | `APPROVAL_TIMEOUT` in `frontend.rs` (30 minutes) | the ACP and HTTP frontends; the screen has a human and no timeout |
 | How a notice serializes | `NoticeView` | SSE `notice`, the blocking response, the one-shot JSON report |
 | Whether an upstream's own words may reach a caller | `host::relay_provider_errors`, bounded by `error::bounded_upstream_body` | `ProblemDetail::for_error`'s `provider_response`, `acp_error_for`'s `data` |
 | How much of a reply is read | `error::MAX_REPLY_BYTES`, through `error::read_whole_reply` for a whole reply and `provider::sse::drive` for one streamed event; a redirect is refused ahead of either by `provider::succeeded`, since `provider::build_http_client` follows none | every provider reply, the token exchange included |
@@ -233,13 +233,13 @@ maps the enum once, and no handler rewrites the sentence:
   behind it. The `type` URIs live under `https://meka.run/errors/`.
 - ACP: `acp_error_for` in `host/acp.rs`. Everything the caller can act on is `InvalidParams`
   (`-32602`) with the `Display` as `data`; everything else is `InternalError`.
-- REPL: `console.error(&error)`, the `Display` on stderr.
+- Screen: an error item in the transcript, the `Display` text.
 - One-shot and CLI: the `Display` on stderr and exit code 1; 130 when the turn was interrupted.
 
 **Two classes never travel verbatim, on either wire.** `Installation` is meka's own sentence about
 the *operator's* setup -- a `[web]` client that will not build, a `base_url` shape a backend refuses
 -- so it names a path or an endpoint from `config.toml` that no caller can act on: HTTP answers a
-sanitized 500 and ACP an `InternalError` with the text in the log, while the REPL and the CLI print
+sanitized 500 and ACP an `InternalError` with the text in the log, while the screen and the CLI print
 it, since their reader is the operator. The web client is built once in `build_shared_deps`, so on
 every host a bad `[web]` block fails the process at startup rather than surfacing per session.
 
@@ -248,7 +248,7 @@ And an upstream's own response text travels only when `[serve] relay_provider_er
 `provider_response`; `acp_error_for` appends it to `data`; both bound it with
 `error::bounded_upstream_body`. An MCP connector's reason, a `Database` and an `Io` never travel at
 all, on either.
-- REPL: `console.error(&error)`, the `Display` on stderr.
+- Screen: an error item in the transcript, the `Display` text.
 - One-shot and CLI: the `Display` on stderr and exit code 1; 130 when the turn was interrupted.
 
 ## What each host offers
@@ -257,7 +257,7 @@ The hosts do not offer the same operations, and the gaps are recorded here rathe
 "Run" is `meka` with `-p`, `-c`, `-r`, `--profile` and `--permission`; the one-shot is that run
 with `--oneshot`.
 
-| Operation | REPL | One-shot | ACP | HTTP | `meka session` |
+| Operation | Screen | One-shot | ACP | HTTP | `meka session` |
 |-----------|------|----------|-----|------|----------------|
 | New session | at launch | at launch | `session/new` | `POST /v1/sessions` | no |
 | Resume | `-c`, `-r` at launch | `-c`, `-r` at launch | `session/load`, `session/resume` | implicit re-attach of a dormant id on any request | no |
@@ -271,9 +271,9 @@ with `--oneshot`.
 | Level switch | `/permission`, Shift+Tab | `--permission` at launch | `session/set_mode`, config option | `PATCH` `permission`, live | no |
 | Approvals | `/approvals` | config only | `session/set_config_option` | `PATCH` `approvals`, live | no |
 | List, show | `/session`, `/status` | no | `session/list` | `GET`, `GET /{id}` | `list`, `show` |
-| Cancel a turn | Ctrl+C | Ctrl+C | `session/cancel` | `POST /{id}/cancel` | no |
+| Cancel a turn | Esc, Ctrl+C | Ctrl+C | `session/cancel` | `POST /{id}/cancel` | no |
 
-The REPL and the one-shot share `COMMANDS` in `host.rs` for what a slash command is; ACP advertises
+The screen and the one-shot share `COMMANDS` in `host.rs` for what a slash command is; ACP advertises
 the three rows marked `for_editors` (`/mcp`, `/status`, `/usage`) as `available_commands`.
 
 ### Mid-turn
@@ -320,25 +320,26 @@ differently by design.
 
 ## Frontends
 
-Six things implement or stand in for `Frontend`: `ReplFrontend` (`host/repl/frontend.rs`, also the
-plain one-shot), `AcpFrontend` (`host/acp/frontend.rs`), `HttpFrontend`
+Seven things implement or stand in for `Frontend`: `TuiFrontend` (`host/tui/frontend.rs`, the
+screen), `PlainFrontend` (`host/oneshot/frontend.rs`, the plain one-shot), `AcpFrontend`
+(`host/acp/frontend.rs`), `HttpFrontend`
 (`host/http/http_frontend.rs`, which records for the blocking response and broadcasts to SSE
 through `host/http/sse.rs`), `JsonFrontend` (`host/oneshot.rs`, `--format json`), `SilentFrontend`
 and `PermissionForwardingFrontend` (`frontend.rs`; the latter forwards notices and approval prompts
 to the parent's frontend and drops the rest). Where they differ:
 
-| Event | REPL | ACP | HTTP stream | HTTP blocking | One-shot JSON | Silent |
+| Event | Screen | ACP | HTTP stream | HTTP blocking | One-shot JSON | Silent |
 |-------|------|-----|-------------|---------------|---------------|--------|
-| `Notice` info / warn | `console.notice`, dim or warn-colored | agent-message chunk prefixed `[meka]` / `[meka warn]` | `notice` event (`NoticeView`) | `notices[]` | `notices[]` | dropped |
-| `McpProgress` | inline status line | `tracing::info!` | `progress` event | dropped | dropped | dropped |
-| `Compacted` | nothing (`/compact` prints `render::compaction_summary`) | info notice | `context.compacted` event | dropped; `GET /messages` carries the marker | dropped | dropped |
-| Approval with nobody to ask | warn `approval_refused_without_asking`, deny (REPL thread gone) | asks the client; deny after `APPROVAL_TIMEOUT`, `Canceled` on cancel | `permission_required` event while a streaming client or a feed reader with `attend=true` is there; deny after `APPROVAL_TIMEOUT`, `Canceled` when the last of them leaves; refused with a warn notice otherwise | as HTTP stream: a feed attendee answers a blocking turn's prompt too; without one, warn notice, deny | warn `approval_refused_without_asking`, deny | deny; the notice goes nowhere |
-| Elicitation | asks through the REPL thread; warn `elicitation_declined` and decline when it is gone | `elicitation/create`; warn `elicitation_declined` and decline when the client lacks the mode or two sessions have calls in flight on the server | warn `elicitation_declined`, decline | same | trait default: warn `elicitation_declined`, decline | same, dropped |
-| Scheduled fire prompt | dim info notice on the console | `UserMessageChunk` | info notice into the stream | info notice, drained after the turn | no scheduler | n/a |
-| Scheduled fire failure | `console.error`; "interrupted" annotation on a cancel | warn notice `scheduled job '<id>' failed: ...`; info on a cancel | `schedule.fired` webhook, `status` `completed`, `canceled`, `failed` or `not_run`; nothing on the frontend | same webhook | no scheduler | n/a |
+| `Notice` info / warn | a dim `•` row, or a yellow `!` row | agent-message chunk prefixed `[meka]` / `[meka warn]` | `notice` event (`NoticeView`) | `notices[]` | `notices[]` | dropped |
+| `McpProgress` | the running call's progress line under its row | `tracing::info!` | `progress` event | dropped | dropped | dropped |
+| `Compacted` | nothing live; the log's boundary reads back as `• context compacted`, and `/compact` adds its summary as a dim row | info notice | `context.compacted` event | dropped; `GET /messages` carries the marker | dropped | dropped |
+| Approval with nobody to ask | warn `approval_refused_without_asking`, deny (the screen is gone) | asks the client; deny after `APPROVAL_TIMEOUT`, `Canceled` on cancel | `permission_required` event while a streaming client or a feed reader with `attend=true` is there; deny after `APPROVAL_TIMEOUT`, `Canceled` when the last of them leaves; refused with a warn notice otherwise | as HTTP stream: a feed attendee answers a blocking turn's prompt too; without one, warn notice, deny | warn `approval_refused_without_asking`, deny | deny; the notice goes nowhere |
+| Elicitation | asks the screen; warn `elicitation_declined` and decline when it is gone | `elicitation/create`; warn `elicitation_declined` and decline when the client lacks the mode or two sessions have calls in flight on the server | warn `elicitation_declined`, decline | same | trait default: warn `elicitation_declined`, decline | same, dropped |
+| Scheduled fire prompt | a dim `• scheduled job <id> fired: …` row | `UserMessageChunk` | info notice into the stream | info notice, drained after the turn | no scheduler | n/a |
+| Scheduled fire failure | a red `■` row; `! interrupted` on a cancel | warn notice `scheduled job '<id>' failed: ...`; info on a cancel | `schedule.fired` webhook, `status` `completed`, `canceled`, `failed` or `not_run`; nothing on the frontend | same webhook | no scheduler | n/a |
 
 The scheduled-fire rows come from each host's `HostHooks` (`show_prompt`, `finished`) rather than
-its `Frontend`, in `host/repl.rs`, `host/acp/schedule.rs` and `host/http/schedule.rs`.
+its `Frontend`, in `host/tui.rs`, `host/acp/schedule.rs` and `host/http/schedule.rs`.
 
 ## Building
 
@@ -353,7 +354,7 @@ variable, and acted on by `host::build_shared_deps`.
 
 The integration crates are gated on the same fact: `tests/acp.rs` and `tests/cli.rs` carry
 `#![cfg(any(debug_assertions, feature = "mock-provider"))]`; `tests/serve.rs` and
-`tests/multiprocess.rs` add `feature = "serve"`; `tests/repl_pty.rs` adds `unix`. Only
+`tests/multiprocess.rs` add `feature = "serve"`; `tests/tui_pty.rs` adds `unix`. Only
 `tests/layering.rs` runs unconditionally. Unit tests open the store with `Store::for_test()`, an
 in-memory database at the current schema; `Path::new(":memory:")` is spelled out because `None`
 means the default path. The integration crates share `tests/harness/support.rs`, whose `Install` is

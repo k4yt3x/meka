@@ -69,18 +69,18 @@ pub(crate) enum ForkHandoff {
 /// Fork `source` and take the copy's lock, in that order and without touching the caller's own.
 ///
 /// The ordering is the point. Releasing the current lock first and then failing to acquire the new
-/// one would leave the REPL running against an unlocked session that a second `meka` process could
-/// open and interleave events into. Acquiring first means the failure path is simply "stay put",
-/// and the caller drops its old lock only by overwriting it with the new one.
+/// one would leave the screen running against an unlocked session that a second `meka` process
+/// could open and interleave events into. Acquiring first means the failure path is simply "stay
+/// put", and the caller drops its old lock only by overwriting it with the new one.
 pub(crate) async fn fork_and_lock(
     store: &Store,
     source: uuid::Uuid,
 ) -> anyhow::Result<ForkHandoff> {
     // Locked before the copy's row exists, not after: a row committed ahead of its lock is one a
     // concurrent `session delete --all` enumerates and deletes, after which this function would
-    // lock the vanished id successfully and hand the REPL a session whose next turn dies on a
+    // lock the vanished id successfully and hand the screen a session whose next turn dies on a
     // foreign-key violation. See `Store::fork_session_locked`.
-    // The REPL holds the source it is forking, so the source stands still by construction and a
+    // The screen holds the source it is forking, so the source stands still by construction and a
     // probe would refuse this process its own session.
     let Some((forked, lock)) = store
         .fork_session_locked(
@@ -359,7 +359,7 @@ impl ResidentSession {
         }
     }
 
-    /// View handles a host already holds as a resident session. For the REPL, whose agent and
+    /// View handles a host already holds as a resident session. For the screen, whose agent and
     /// conversation exist before the session row does, and whose lock is already in the cells'
     /// slot.
     pub(crate) fn from_parts(

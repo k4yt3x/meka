@@ -1,4 +1,4 @@
-//! `meka history`: the REPL's input history.
+//! `meka history`: the screen's input history.
 
 use crate::store::Store;
 

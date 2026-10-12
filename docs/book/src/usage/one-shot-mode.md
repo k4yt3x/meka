@@ -10,7 +10,7 @@ git diff | meka --oneshot -p -      # `-p -` reads the prompt from stdin
 
 The agent processes the prompt (including any tool calls), prints its response, and the process terminates. The session id is printed to stderr on exit. A run interrupted with Ctrl+C exits 130, whatever it had printed by then.
 
-A prompt **without** `--oneshot` is not a one-shot run: it seeds the first turn and then leaves you at the REPL prompt, which is the right default when you are working interactively and the first thing you want is already in your shell history.
+A prompt **without** `--oneshot` is not a one-shot run: it seeds the first turn and then leaves you on the screen, which is the right default when you are working interactively and the first thing you want is already in your shell history.
 
 `--oneshot` requires something to do, so it needs `-p` or `--skill`.
 

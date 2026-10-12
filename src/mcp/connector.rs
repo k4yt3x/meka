@@ -32,8 +32,8 @@ const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(300);
 
 /// Drive the actual connect work for every `Pending` entry, split into a stdio stream and an HTTP
 /// stream, each bounded by its own concurrency cap. Runs in a spawned task so
-/// [`super::McpClientManager::start_connector`] can return immediately and the REPL paints without
-/// waiting.
+/// [`super::McpClientManager::start_connector`] can return immediately and the screen paints
+/// without waiting.
 ///
 /// When both streams drain, flips the `settled` watch so the turn gate can short-circuit, then
 /// hands any entry that failed to [`retry_until_connected`]. Settling first is deliberate: the
@@ -124,9 +124,9 @@ pub(super) async fn run_connector(
 /// its tools when it recovers.
 ///
 /// The manager is held weakly so this loop can't outlive it. `crate::cli::mcp::run_reconnect`
-/// builds a throwaway manager per invocation, and it is reachable from the REPL's `/mcp reconnect`
-/// in a process that keeps running; a strong reference there would leave a task respawning a
-/// failing server every five minutes for a manager nobody is using.
+/// builds a throwaway manager per invocation, and it is reachable from the screen's `/mcp
+/// reconnect` in a process that keeps running; a strong reference there would leave a task
+/// respawning a failing server every five minutes for a manager nobody is using.
 pub(super) async fn retry_until_connected(
     entry: Arc<ServerEntry>,
     manager: std::sync::Weak<McpClientManager>,
@@ -196,7 +196,7 @@ fn is_repeat_failure(state: &ServerState, cause: &str) -> bool {
 ///
 /// A server that is down stays down, and [`retry_until_connected`] keeps trying every five minutes
 /// for the life of the process. Logged at `warn!` on every attempt, a missing binary or an
-/// unreachable endpoint prints forever, on top of an idle REPL prompt. The first failure, and any
+/// unreachable endpoint prints forever, on top of an idle screen prompt. The first failure, and any
 /// *change* of cause, is worth saying; a repeat of the same one is not.
 pub(super) async fn record_connect_failure(
     entry: &Arc<ServerEntry>,
@@ -491,7 +491,7 @@ pub(super) async fn build_mcp_tools(
 
 /// Drain a stdio MCP child's stderr line by line into meka's tracing stream. Many MCP servers log
 /// diagnostics to stderr; with rmcp's default inherited stderr those lines land directly on meka's
-/// terminal and corrupt the REPL. Emitting at `debug!` keeps them off the terminal at default
+/// terminal and corrupt the screen. Emitting at `debug!` keeps them off the terminal at default
 /// verbosity while still surfacing under `-v` / `RUST_LOG`, tagged with the server name. The task
 /// is detached: it ends on its own when the child exits and stderr reaches EOF.
 fn forward_child_stderr(server_name: String, stderr: tokio::process::ChildStderr) {
@@ -631,7 +631,7 @@ pub(super) async fn connect_server(
             // to run rather than a hostile one. Revisit when rmcp exposes the read length.
             //
             // Stderr is piped rather than inherited because an MCP server that logs to stderr
-            // would otherwise write straight onto meka's terminal and corrupt the REPL display.
+            // would otherwise write straight onto meka's terminal and corrupt the screen display.
             let (transport, stderr) = rmcp::transport::TokioChildProcess::builder(command)
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -756,7 +756,7 @@ mod tests {
     }
 
     /// A dead server is retried every five minutes for the life of the process. Announcing each
-    /// attempt buried an idle REPL prompt in identical warnings long after the user had read the
+    /// attempt buried an idle screen prompt in identical warnings long after the user had read the
     /// first one, so only a new or changed cause is worth saying out loud.
     #[test]
     fn repeat_failure_is_recognized_and_a_changed_cause_is_not() {
@@ -1097,7 +1097,7 @@ mod tests {
     }
 
     /// The retry must not outlive its manager. `crate::cli::mcp::run_reconnect` builds a throwaway
-    /// manager per invocation and is reachable from the REPL's `/mcp reconnect`, so a strong
+    /// manager per invocation and is reachable from the screen's `/mcp reconnect`, so a strong
     /// reference here would leave a task respawning a failing server for the life of the process.
     #[cfg(unix)]
     #[tokio::test]

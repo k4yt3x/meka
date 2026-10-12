@@ -99,7 +99,7 @@ const INBOX_RETRY_CEILING: chrono::Duration = chrono::Duration::hours(1);
 
 /// A prompt the user did not type, shown where the host shows such things before it runs: as the
 /// text the model is given where the host's transcript shows user turns (ACP), as a stage
-/// direction naming what opened the turn where it does not (the REPL).
+/// direction naming what opened the turn where it does not (the screen).
 pub(crate) enum OutOfBandPrompt<'a> {
     /// A batch of finished background work.
     Outcomes(&'a [BackgroundTask]),
@@ -126,7 +126,7 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
     /// `session/close` and `serve`'s idle eviction remove the entry and wait on or skip the same
     /// lock, and the fire then ran a whole turn against a session the editor had closed, pushing
     /// its transcript to a session id the client no longer had. Hosts with a map answer from
-    /// the map; the REPL's one session is never released while it runs.
+    /// the map; the screen's one session is never released while it runs.
     async fn still_resident(&self, _entry: &Self::Entry) -> bool {
         true
     }
@@ -893,22 +893,22 @@ mod tests {
             "a fired job's words are typed by nobody, so the fire must restate their origin"
         );
 
-        let typed = include_str!("repl.rs")
-            .split("ReplEvent::UserInput(input) => {")
+        let typed = include_str!("tui.rs")
+            .split("HostEvent::UserInput { text, images } => {")
             .nth(1)
-            .expect("the REPL's typed-prompt arm")
-            .split("ReplEvent::Command(command) => {")
+            .expect("the screen's typed-prompt arm")
+            .split("HostEvent::Command(command) => {")
             .next()
             .expect("splitting always yields a first part");
         let admitted = typed
             .find("TurnInput::from_parts(")
-            .expect("the REPL admits the typed prompt");
+            .expect("the host admits the typed prompt");
         let claimed = typed
             .find("collect_background_outcomes(")
-            .expect("the REPL claims the outcomes that ride it");
+            .expect("the host claims the outcomes that ride it");
         assert!(
             admitted < claimed,
-            "the REPL must admit a typed prompt before claiming outcomes; found \
+            "the host must admit a typed prompt before claiming outcomes; found \
              admit@{admitted} claim@{claimed}"
         );
     }

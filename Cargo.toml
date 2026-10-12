@@ -1,6 +1,6 @@
 [package]
 name = "meka"
-version = "0.71.0"
+version = "0.72.0"
 edition = "2024"
 rust-version = "1.95"
 license = "AGPL-3.0-or-later"
@@ -14,7 +14,9 @@ serve = ["dep:axum", "dep:tower-http", "dep:utoipa", "dep:utoipa-swagger-ui"]
 
 [dependencies]
 agent-client-protocol = { version = "2.2", features = ["unstable_end_turn_token_usage", "unstable_session_fork"] }
+ansi-to-tui = "8"
 anyhow = "1"
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", optional = true }
@@ -22,7 +24,7 @@ base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "wrap_help"] }
 croner = "4"
-crossterm = "0.29"
+crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }
 dirs = "7"
 eventsource-stream = "0.2"
 fast_html2md = "0.0"
@@ -35,12 +37,13 @@ hmac = "0.13.0"
 humantime-serde = "1"
 image = { version = "0.25", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 infer = { version = "0.22", default-features = false }
-nu-ansi-term = "0.50"
 open = "5"
 percent-encoding = "2"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 rand = "0.10"
-reedline = { version = "0.52", features = ["external_printer"] }
+ratatui = "0.30"
+ratatui-textarea = "0.9"
+ratskin = "0.3"
 regex = "1"
 reqwest = { version = "0.13", features = ["json", "query", "stream", "gzip", "deflate", "brotli", "cookies"] }
 rmcp = { version = "3.5", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth", "auth-client-credentials-jwt"] }
@@ -49,10 +52,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_norway = "0.9.42"
 sha2 = "0.11"
+similar = "2"
 strsim = "0.11"
 subtle = "2"
-syntect = { version = "5", default-features = false, features = ["default-syntaxes", "parsing", "plist-load", "regex-fancy"] }
-termimad = "0.35"
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "parsing", "regex-fancy"] }
+# 0.34 and not newer: the version ratskin 0.3 builds on.
+termimad = "0.34"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-rusqlite = "0.8"
@@ -62,6 +67,7 @@ toml_edit = "0.25"
 tower-http = { version = "0.7", features = ["cors", "limit", "trace"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-segmentation = "1"
 unicode-width = "0.2"
 url = "2"
 utoipa = { version = "6", features = ["axum_extras", "chrono", "uuid"], optional = true }
@@ -85,6 +91,7 @@ http = "1"
 reqwest = { version = "0.13", features = ["blocking", "json"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
+vt100 = "0.16"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

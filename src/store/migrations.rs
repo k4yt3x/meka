@@ -1702,7 +1702,7 @@ fn mcp_credentials_exist_on_every_store(
 /// re-fires the webhook on every poll.
 ///
 /// The backfill copies the stamp across for every delivered row, recording that the outcome was
-/// reported rather than that any endpoint received it: a REPL, ACP or one-shot run has no
+/// reported rather than that any endpoint received it: a screen, ACP or one-shot run has no
 /// subscribers, and even `meka serve` sends only to endpoints subscribed at the time. The store
 /// cannot know which, and this is the only answer available to it.
 ///

@@ -1036,7 +1036,7 @@ mod tests {
     /// response-read, and each is a place the shared classifier could be bypassed.
     ///
     /// Nothing retries these -- their callers are `meka account usage` / `whoami` / `stats` and the
-    /// REPL's `/usage`, none inside a retry loop -- so classifying them changes only how the
+    /// screen's `/usage`, none inside a retry loop -- so classifying them changes only how the
     /// failure reads. Still worth pinning: it is the same classifier the turn path depends on, and
     /// a probe that stops calling it is a probe that has grown its own private rules.
     #[tokio::test]

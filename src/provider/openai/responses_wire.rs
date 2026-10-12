@@ -143,7 +143,7 @@ pub(super) fn drop_replayed_reasoning(body: &mut serde_json::Value) {
 /// Ask the server for a reasoning summary, the only part of its reasoning it will show a person.
 ///
 /// Without this the model still reasons, but `summary` comes back empty and there is nothing for
-/// the REPL to render, so a long think looks like a hang. Codex asks for `auto` by default
+/// the screen to render, so a long think looks like a hang. Codex asks for `auto` by default
 /// (`ReasoningSummary::Auto`, and its `supports_reasoning_summary_parameter` defaults to true), so
 /// this is what the first-party client's own users see.
 ///

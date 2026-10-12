@@ -17,7 +17,7 @@
 //!
 //! `[instructions].files` names more places, a project's `AGENTS.md` among them. Those are read
 //! when a session opens rather than at startup, because a relative entry means the session's
-//! working directory, which the REPL takes from where it was launched, a resume from what the row
+//! working directory, which the screen takes from where it was launched, a resume from what the row
 //! recorded, and `serve` and ACP from the client, per session.
 
 use std::path::{Path, PathBuf};

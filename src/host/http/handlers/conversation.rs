@@ -2,9 +2,9 @@
 //! occupancy, and export / import.
 //!
 //! What the four share is that they are the HTTP surface for machinery the server already runs
-//! (auto-compaction) or the CLI already exposes (`meka session export`), and that the REPL reaches
-//! through `/compact`, `/rewind` and `/export`. None of them are new capability; they are the
-//! missing way to ask for it over the wire.
+//! (auto-compaction) or the CLI already exposes (`meka session export`), and what the screen
+//! reaches through `/compact`, `/rewind` and `/export`. None of them are new capability; they are
+//! the missing way to ask for it over the wire.
 //!
 //! Compaction and rewind rewrite the conversation rather than appending to it, so on a session this
 //! process holds they take its runtime mutex and refuse while a turn is in flight. Reading the DB
@@ -584,7 +584,7 @@ pub(crate) async fn rewind(
     let messages_after = conversation.len();
     // The in-memory log is already rewound; persisting is what makes it survive eviction.
     if let Err(error) = state.shared.store.save_rewind(id, &event).await {
-        // Put the turns back rather than leave memory and disk disagreeing, exactly as the REPL's
+        // Put the turns back rather than leave memory and disk disagreeing, exactly as the screen's
         // `/rewind` does. Left diverged, `GET /messages` reads the DB and still shows the turns
         // with `revision` unmoved -- so the counter added to make a rewrite detectable reports
         // that nothing happened -- while the model no longer sees them, and a client retrying the

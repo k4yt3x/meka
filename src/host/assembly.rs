@@ -7,13 +7,13 @@ use super::*;
 /// Process-wide dependencies that every ACP session shares. Built once at `meka acp` startup by
 /// [`build_shared_deps`]; sessions hold an [`Arc<SharedDeps>`] and read fields by reference.
 /// Cheap to clone (every field is either an `Arc`, an owned-but-small value, or a clonable handle).
-/// Every host builds one, the REPL and `--oneshot` included, so all four assemble a session through
-/// the same [`build_session_agent`].
+/// Every host builds one, the screen and `--oneshot` included, so all four assemble a session
+/// through the same [`build_session_agent`].
 #[derive(Clone)]
 pub(crate) struct SharedDeps {
     pub(crate) config: Arc<ResolvedConfig>,
     /// The profile a session created here takes when it names none. `None` for a run that resumes
-    /// a session and has no default of its own, which only the REPL and `--oneshot` allow; the
+    /// a session and has no default of its own, which only the screen and `--oneshot` allow; the
     /// long-lived hosts refuse to start without one, through [`Self::default_profile`].
     pub(crate) default_profile: Option<String>,
     pub(crate) store: Store,
@@ -48,8 +48,8 @@ pub(crate) struct SharedDeps {
 /// One reading of the key for both hosts that answer a caller over a wire. `meka serve` resolves it
 /// once into [`crate::host::http::config::ResolvedServeConfig`] and `meka acp` asks per failure, so
 /// stating the default in each of them is how the two came to be able to disagree about what a
-/// deployment configured to withhold actually withholds. The REPL and `--oneshot` never consult it:
-/// their reader is the operator.
+/// deployment configured to withhold actually withholds. The screen and `--oneshot` never consult
+/// it: their reader is the operator.
 pub(crate) fn relay_provider_errors(serve: Option<&crate::config::ServeConfig>) -> bool {
     serve
         .and_then(|serve| serve.relay_provider_errors)
@@ -296,7 +296,7 @@ pub(crate) async fn build_shared_deps(
 /// the registry to the MCP manager, and finally constructs the `Agent` itself.
 ///
 /// The order this runs in relative to `start_connector` does not matter. `build_shared_deps` runs
-/// the connector once for ACP and `serve`, before any session exists; the REPL runs it after this
+/// the connector once for ACP and `serve`, before any session exists; the screen runs it after this
 /// returns. Either way every attached registry converges on the same tool set, because
 /// [`crate::mcp::McpClientManager::update_server_tools`] writes the snapshot before fanning out and
 /// [`crate::mcp::McpClientManager::subscribe`] replays the whole of it. What a late attach
@@ -327,7 +327,7 @@ pub(crate) async fn assemble_agent(
 }
 /// What one session is built around: its row, if it exists yet, and the handles the host holds
 /// before the agent exists. The gauges are the host's because a frontend built before the agent
-/// (the REPL prompt, ACP's `usage_update`) has to hold the cell the agent publishes into rather
+/// (the screen prompt, ACP's `usage_update`) has to hold the cell the agent publishes into rather
 /// than a copy something re-stores beside every provider switch; `serve` keeps them so
 /// `GET /v1/sessions/{id}/context` never waits on a turn.
 pub(crate) struct SessionSpec {
@@ -427,7 +427,7 @@ fn session_agent_options(shared: &SharedDeps, directory: &std::path::Path) -> Ag
     options.user_instructions = crate::instructions::join(options.user_instructions.take(), listed);
     options
 }
-/// What [`ResidentSession::release`] does, for an agent that never became a session: a REPL that
+/// What [`ResidentSession::release`] does, for an agent that never became a session: a screen that
 /// exits before its first turn has a lock slot, a registry and a cancel cell to let go of, and no
 /// id.
 pub(crate) async fn release_agent(
@@ -551,20 +551,7 @@ pub(crate) async fn record_profile_switch(
     .await?;
     Ok(())
 }
-/// Say what a canceled turn left running.
-///
-/// Ctrl+C stops the turn, not the detached work, which is the shell's contract and the right
-/// default. But the user may not have registered that anything was detached, so what survived has
-/// to be visible rather than merely discoverable.
-pub(crate) async fn report_background_survivors(agent: &Agent) {
-    let running = agent.background_tasks().running_count_all().await;
-    if running > 0 {
-        crate::streams::write_stderr_line(format!(
-            "{running} background task(s) still running; stop them with `/task cancel --all`."
-        ));
-    }
-}
-/// [`crate::host::claim_undelivered_outcomes`] for the REPL, which reaches these paths before
+/// [`crate::host::claim_undelivered_outcomes`] for the screen, which reaches these paths before
 /// it has a session to claim against.
 ///
 /// Stamped delivered *before* the turn runs, matching the scheduler's own claim and for the same
@@ -622,14 +609,14 @@ pub(crate) struct ResumedSession {
     /// the deliberate exception, because its client passes an authoritative project root per
     /// request.
     pub(crate) cwd: Option<std::path::PathBuf>,
-    /// What the caller's first episode opens against: the resume banner, printed above and
-    /// standing in for the line you typed, or the shell's prompt when none was.
-    pub(crate) follows: crate::console::Neighbor,
+    /// The session to announce as resumed, when `[display].show_session_id_on_resume` asks for
+    /// it. The caller prints it, since where a banner goes is the host's business: ahead of the
+    /// first prompt on a stream, or as the first item on a screen.
+    pub(crate) announce: Option<uuid::Uuid>,
 }
 pub(crate) async fn resolve_session_resume(
     store: &Store,
     config: &ResolvedConfig,
-    console: &std::sync::Mutex<crate::console::Console>,
 ) -> anyhow::Result<ResumedSession> {
     let fresh = || ResumedSession {
         permission_to_record: None,
@@ -643,7 +630,7 @@ pub(crate) async fn resolve_session_resume(
         repin: None,
         // Nor a directory to reopen: a fresh session starts where the shell is, and records that.
         cwd: None,
-        follows: crate::console::Neighbor::Shell,
+        announce: None,
     };
     let resolved = match &config.request.session_resume {
         None => return Ok(fresh()),
@@ -653,6 +640,8 @@ pub(crate) async fn resolve_session_resume(
         Some(crate::config::SessionResume::Id(value)) => {
             Some(store.resolve_session_id(value).await?)
         }
+        // The pick is made on the screen once it is up; until then there is nothing to resume.
+        Some(crate::config::SessionResume::Pick) => return Ok(fresh()),
     };
     let Some(id) = resolved else {
         return Ok(fresh());
@@ -684,7 +673,7 @@ pub(crate) async fn resolve_session_resume(
     // resolves permission this way, through one admitter: ACP, the HTTP API, the scheduler's fire
     // door and `meka schedule` read the row and clamp it to `[permissions].enabled`, so a level the
     // operator has since withdrawn drops the session to the configured default rather than granting
-    // authority the configuration no longer does. This function is what the REPL and `--oneshot`
+    // authority the configuration no longer does. This function is what the screen and `--oneshot`
     // share, so both read the row here; `--oneshot` is the half that matters most, a scripted run
     // whose level silently differing from the one the session was created with has nobody
     // watching it.
@@ -701,17 +690,6 @@ pub(crate) async fn resolve_session_resume(
         .requested_permission
         .filter(|requested| recorded.permission != Some(*requested));
 
-    // Printed before the caller opens its first episode, because the banner is what that episode
-    // follows: it stands in for the line you typed, and the blank below it is the one that would
-    // have followed a typed line.
-    let follows = if config.show_session_id_on_resume {
-        with_console(console, |console| {
-            console.session_id("Resuming session", &id.to_string())
-        });
-        crate::console::Neighbor::Prompt
-    } else {
-        crate::console::Neighbor::Shell
-    };
     let messages = hydrate_conversation(store, id).await?;
     Ok(ResumedSession {
         session_id: Some(id),
@@ -723,18 +701,18 @@ pub(crate) async fn resolve_session_resume(
         permission_to_record,
         // Read off the row already loaded above, not fetched again.
         cwd: recorded.cwd,
-        follows,
+        announce: config.show_session_id_on_resume.then_some(id),
     })
 }
 /// Record where `/cd` moved the session, so the row keeps saying where the session is.
 ///
-/// A free function rather than a block inside the REPL's event loop because the loop is not
-/// reachable from a test: reedline needs a terminal, and a piped stdin fails the read outright, so
-/// everything inline there is verified only by running meka by hand.
+/// A free function rather than a block inside the host loop because the loop is reachable from a
+/// test only through a pseudo-terminal: the screen refuses a piped stdin outright, so what is
+/// inline there is verified through `tests/tui_pty.rs` alone.
 ///
-/// The directory has already moved in this process, so a failed write is warned about and the REPL
-/// continues; [`record_session_change`] states the policy. The consequence is real: this session's
-/// next resume, and any scheduled gate it holds, still read the old directory.
+/// The directory has already moved in this process, so a failed write is warned about and the
+/// screen continues; [`record_session_change`] states the policy. The consequence is real: this
+/// session's next resume, and any scheduled gate it holds, still read the old directory.
 pub(crate) async fn record_session_cwd(
     store: &Store,
     session_id: Option<uuid::Uuid>,
@@ -1031,7 +1009,7 @@ mod tests {
     }
 
     /// `/cd` reaches the row, which is what makes the recorded directory mean "where the session
-    /// is" rather than "where it was created". Nothing else covers this: the REPL loop that sends
+    /// is" rather than "where it was created". Nothing else covers this: the screen loop that sends
     /// the event needs a terminal, so a test cannot drive `/cd` itself.
     #[tokio::test]
     async fn a_cd_records_the_directory_on_the_session_row() {
@@ -1062,8 +1040,8 @@ mod tests {
 
     /// Before the first turn there is no row to correct: the directory the creation snapshot reads
     /// is the cell `/cd` has already written. So this is a no-op, and in particular it must not
-    /// reach for some other session's row -- a REPL sharing a store with a `meka serve` has plenty
-    /// to choose from.
+    /// reach for some other session's row -- a screen sharing a store with a `meka serve` has
+    /// plenty to choose from.
     #[tokio::test]
     async fn a_cd_before_the_first_turn_writes_nobody_elses_row() {
         let manager = crate::store::Store::for_test().await;

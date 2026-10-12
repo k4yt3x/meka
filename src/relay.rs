@@ -1,21 +1,15 @@
-//! Relays `tracing` output around the live REPL prompt.
+//! Relays `tracing` output to wherever the host can show it.
 //!
-//! Without this layer, `tracing` writes directly to `std::io::stderr`, and a line written while
-//! reedline is in raw mode is overwritten by its next redraw of the prompt.
+//! Without this layer, `tracing` writes directly to `std::io::stderr`, which the interactive screen
+//! has taken over: a line written there lands on the alternate screen and is painted over by the
+//! next frame.
 //!
-//! [`Relay`] holds the sending half of an optional [`reedline::ExternalPrinter`], a bounded channel
-//! reedline drains every poll tick to print messages *above* the prompt without clobbering it.
-//! Tracing output goes through the printer when the REPL has registered one; otherwise it falls
-//! back to plain stderr so
-//! the non-interactive paths (`meka session export`, `meka session list`, etc.) and the pre-REPL
-//! startup window still see logs.
-//!
-//! Crucially, reedline only drains that channel while `read_line()` is running, so the printer is
-//! used *only* while the prompt is live (tracked via [`Relay::set_at_prompt`]). Off-prompt windows,
-//! most importantly during a turn while the REPL thread is blocked on the agent, write straight to
-//! stderr instead, so warnings surface as they happen rather than being buffered until the turn
-//! ends and the next prompt is drawn.
-
+//! [`Relay`] holds the sending half of an optional channel the screen drains every frame and shows
+//! as items, fed by [`ScreenLayer`] with each event's level and message while the screen is up
+//! (from [`Relay::attach_screen`] until the [`ScreenLogs`] it returns is dropped). Otherwise the
+//! formatted line falls back to plain stderr, so the non-interactive paths (`meka session export`,
+//! `meka session list`, etc.) and the startup window before a screen exists still see logs, and a
+//! one-shot run settles the row the line lands on through its console first.
 use std::{
     io::{self, Write},
     sync::{
@@ -29,29 +23,40 @@ use tracing_subscriber::fmt::MakeWriter;
 
 use crate::console::Console;
 
-/// Process-global relay. Tracing's `MakeWriter` clones this; the REPL installs its printer at
+/// Process-global relay. Tracing's `MakeWriter` clones this; the screen installs its sender at
 /// startup. Stays uninstalled for non-interactive commands, so they keep getting plain stderr
 /// output.
 pub(crate) static RELAY: LazyLock<Relay> = LazyLock::new(Relay::new);
 
-/// Routes log output through reedline's [`reedline::ExternalPrinter`] when the interactive REPL
-/// has installed its sender; falls back to stderr otherwise.
+/// One log event as the screen shows it: the level decides the row's glyph, the target is named
+/// only on the lines `-v` lets through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LogLine {
+    pub(crate) at: chrono::DateTime<chrono::Utc>,
+    pub(crate) level: tracing::Level,
+    pub(crate) target: String,
+    pub(crate) message: String,
+    /// Whether the user's own log filter passes it: drawn on the transcript when it does, kept
+    /// for `/log` either way.
+    pub(crate) shown: bool,
+}
+
+/// Routes log output to the screen when it has installed its sender; falls back to stderr
+/// otherwise.
 #[derive(Clone)]
 pub(crate) struct Relay {
-    /// The sending half of the REPL's external printer. reedline keeps the printer itself, whose
-    /// receiving half cannot be shared between threads, so this is all a logging thread can hold.
-    sender: Arc<RwLock<Option<SyncSender<String>>>>,
-    /// True only while reedline's `read_line()` owns the terminal. reedline drains the
-    /// `ExternalPrinter` channel only inside that loop, so a line routed through it at any other
-    /// time would sit until the next prompt is drawn; off-prompt the terminal is in cooked mode
-    /// and stderr is safe.
-    at_prompt: Arc<AtomicBool>,
+    /// The sending half of the screen's log channel; the screen keeps the receiving half, so this
+    /// is all a logging thread can hold.
+    sender: Arc<RwLock<Option<SyncSender<LogLine>>>>,
+    /// True only while the screen owns the terminal and drains the channel. Off it, the terminal
+    /// is the shell's again and stderr is safe.
+    screen_attached: Arc<AtomicBool>,
     /// The host's console, so an off-prompt log line can settle the row before landing on it.
     ///
-    /// Weak on purpose: this static outlives every REPL, and an owning handle would keep a console
-    /// (and the renderer behind it) alive for the life of the process after the host that made it
-    /// has gone. A dead weak pointer answers the same as no console at all, which is the
-    /// non-interactive behavior.
+    /// Weak on purpose: this static outlives every screen, and an owning handle would keep a
+    /// console (and the renderer behind it) alive for the life of the process after the host
+    /// that made it has gone. A dead weak pointer answers the same as no console at all, which
+    /// is the non-interactive behavior.
     console: Arc<RwLock<Weak<Mutex<Console>>>>,
 }
 
@@ -59,30 +64,178 @@ impl Relay {
     fn new() -> Self {
         Self {
             sender: Arc::new(RwLock::new(None)),
-            at_prompt: Arc::new(AtomicBool::new(false)),
+            screen_attached: Arc::new(AtomicBool::new(false)),
             console: Arc::new(RwLock::new(Weak::new())),
         }
     }
 
-    /// Register the console a log line should settle the row through, off-prompt.
+    /// Register the console a log line should settle the row through, when no screen is attached.
     ///
-    /// Both CLI hosts install one. `--oneshot` has no reedline and so no `ExternalPrinter`, but it
-    /// draws the same thinking indicator, so it has the same row to be written over.
+    /// The one-shot run installs one: it draws the thinking indicator on a row a log line would
+    /// otherwise be written over.
     pub(crate) fn install_console(&self, console: &Arc<Mutex<Console>>) {
         *crate::sync::write(&self.console) = Arc::downgrade(console);
     }
 
-    /// Register the sending half of a [`reedline::ExternalPrinter`] so subsequent log lines get
-    /// printed above the live prompt instead of racing reedline's redraw. The printer itself goes
-    /// to [`reedline::Reedline::with_external_printer`], its only drainer.
-    pub(crate) fn install(&self, sender: SyncSender<String>) {
+    /// Register the sending half of the screen's log channel, so subsequent log lines are shown
+    /// on the screen instead of written over it.
+    fn install(&self, sender: SyncSender<LogLine>) {
         *crate::sync::write(&self.sender) = Some(sender);
     }
 
-    /// Mark whether reedline's `read_line()` is currently active; the REPL sets this around each
-    /// call.
-    pub(crate) fn set_at_prompt(&self, at_prompt: bool) {
-        self.at_prompt.store(at_prompt, Ordering::Relaxed);
+    /// Start queuing every event for a screen, up to `capacity` lines at a time, and hand back
+    /// the queue's receiving end. From here on nothing the relay sees reaches stderr until the
+    /// returned value is dropped, which is what makes the queue safe to open before the screen
+    /// is: what the screen never drew goes to stderr then, rather than nowhere.
+    pub(crate) fn attach_screen(&self, capacity: usize) -> ScreenLogs {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(capacity);
+        self.install(sender);
+        self.set_screen_attached(true);
+        ScreenLogs { receiver }
+    }
+
+    /// Mark whether a screen is up and draining the channel.
+    fn set_screen_attached(&self, screen_attached: bool) {
+        self.screen_attached
+            .store(screen_attached, Ordering::Relaxed);
+    }
+
+    fn is_screen_attached(&self) -> bool {
+        self.screen_attached.load(Ordering::Relaxed)
+    }
+
+    /// Hand one event to the screen, while it is up. Nothing is reported about a line that could
+    /// not be handed over: an event raised inside tracing's own layer is dropped by its
+    /// re-entrancy guard.
+    fn offer(&self, line: LogLine) {
+        if !self.is_screen_attached() {
+            return;
+        }
+        let Some(sender) = self.sender.read().ok().and_then(|guard| guard.clone()) else {
+            return;
+        };
+        // `try_send`, never `send`: the channel is bounded and drained once per frame, and `send`
+        // blocks when it is full, which would hang the screen for good when the screen, the only
+        // drainer, is the task logging. A full queue loses the line.
+        match sender.try_send(line) {
+            Ok(()) | Err(TrySendError::Disconnected(_) | TrySendError::Full(_)) => {}
+        }
+    }
+}
+
+/// The screen's end of the log queue, from the moment the relay starts queuing until the screen
+/// has drained it for the last time. Dropping it stops the queuing and writes whatever was queued
+/// and never drawn to stderr: the lines logged while a session was assembled, when the run fails
+/// before the screen opens, and the lines a turn the exit cut short logs after the screen is gone.
+pub(crate) struct ScreenLogs {
+    receiver: std::sync::mpsc::Receiver<LogLine>,
+}
+
+impl ScreenLogs {
+    /// The next queued line, or `None` when the queue is empty; never waits.
+    pub(crate) fn try_recv(&self) -> Option<LogLine> {
+        self.receiver.try_recv().ok()
+    }
+
+    /// Stop queuing and write what was queued to stderr, where it would have gone unqueued. Done
+    /// before an error is printed on the way out, so the lines read in the order they happened.
+    pub(crate) fn release(&self) {
+        RELAY.set_screen_attached(false);
+        while let Ok(line) = self.receiver.try_recv() {
+            crate::streams::write_stderr_line(format!(
+                "{} {:>5} {}: {}",
+                crate::text::format_timestamp(line.at, crate::text::Precision::Seconds),
+                line.level,
+                line.target,
+                line.message
+            ));
+        }
+    }
+}
+
+impl Drop for ScreenLogs {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// The layer that hands each event to the screen with its level and message, beside the
+/// formatting layer that writes the line for every other host. It is given a wider filter than
+/// the user asked for, so `/log` has the lines a `-v` would have shown; the user's own filter
+/// decides which of them the transcript draws.
+pub(crate) struct ScreenLayer {
+    shown: tracing_subscriber::EnvFilter,
+}
+
+impl ScreenLayer {
+    /// A layer whose lines are drawn on the transcript when `shown` passes them.
+    pub(crate) fn new(shown: tracing_subscriber::EnvFilter) -> Self {
+        Self { shown }
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for ScreenLayer
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if !RELAY.is_screen_attached() {
+            return;
+        }
+        let shown =
+            tracing_subscriber::layer::Filter::enabled(&self.shown, event.metadata(), &context);
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        RELAY.offer(LogLine {
+            at: chrono::Utc::now(),
+            level: *event.metadata().level(),
+            target: event.metadata().target().to_string(),
+            message: fields.into_message(),
+            shown,
+        });
+    }
+}
+
+/// An event's fields as the formatting layer would print them: the message first, every other
+/// field after it as `name=value`.
+#[derive(Default)]
+struct Fields {
+    message: String,
+    rest: Vec<String>,
+}
+
+impl Fields {
+    fn into_message(self) -> String {
+        let mut out = self.message;
+        for field in self.rest {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&field);
+        }
+        out
+    }
+}
+
+impl tracing::field::Visit for Fields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        } else {
+            self.rest.push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.rest.push(format!("{}={value}", field.name()));
+        }
     }
 }
 
@@ -90,57 +243,27 @@ impl<'a> MakeWriter<'a> for Relay {
     type Writer = RelayWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
-        let sender = self.sender.read().ok().and_then(|guard| guard.clone());
         let console = self.console.read().ok().and_then(|guard| guard.upgrade());
         RelayWriter {
-            sender,
-            at_prompt: Arc::clone(&self.at_prompt),
+            screen_attached: Arc::clone(&self.screen_attached),
             console,
         }
     }
 }
 
-/// Per-write borrow handed back to the tracing formatter. Holds a clone of the printer's sender
-/// captured at the moment `make_writer` was called, so an install racing with an in-flight write
-/// doesn't tear. `at_prompt` is read at write time so the routing reflects the live REPL state,
-/// not whatever it was at `make_writer`.
+/// Per-write borrow handed back to the tracing formatter. `screen_attached` is read at write time
+/// so the routing reflects the live screen state, not whatever it was at `make_writer`.
 pub(crate) struct RelayWriter {
-    sender: Option<SyncSender<String>>,
-    at_prompt: Arc<AtomicBool>,
+    screen_attached: Arc<AtomicBool>,
     console: Option<Arc<Mutex<Console>>>,
 }
 
 impl Write for RelayWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        // Only hand the line to the printer while the prompt is live: reedline drains that channel
-        // only inside `read_line()`, so an off-prompt line would sit until the next prompt.
-        if self.at_prompt.load(Ordering::Relaxed)
-            && let Some(sender) = &self.sender
-        {
-            // The printer adds its own line break, so the newline tracing's formatter appends is
-            // stripped, and an empty message (formatter buffering) would print as a blank line.
-            match std::str::from_utf8(buffer) {
-                Ok(text) => {
-                    let trimmed = text.trim_end_matches('\n');
-                    if trimmed.is_empty() {
-                        return Ok(buffer.len());
-                    }
-                    // `try_send`, never `send`: the printer is a bounded channel reedline drains
-                    // once per poll, and `send` blocks when it is full, which hangs the REPL
-                    // thread for good when that thread, the only drainer, is the one logging. A
-                    // full queue falls through to stderr below.
-                    match sender.try_send(trimmed.to_string()) {
-                        Ok(()) => return Ok(buffer.len()),
-                        // The editor has gone and the line with it. Not logged: an event raised
-                        // inside tracing's own writer is dropped by its re-entrancy guard.
-                        Err(TrySendError::Disconnected(_)) => return Ok(buffer.len()),
-                        Err(TrySendError::Full(_)) => {}
-                    }
-                }
-                Err(_) => {
-                    // Non-UTF-8 bytes fall through to stderr rather than being dropped.
-                }
-            }
+        // While the screen is up the layer has already handed it the event, and the formatted
+        // line has nowhere to go: stderr is the alternate screen.
+        if self.screen_attached.load(Ordering::Relaxed) {
+            return Ok(buffer.len());
         }
         self.settle_the_row();
         io::stderr().write(buffer)
@@ -160,7 +283,7 @@ impl RelayWriter {
     ///
     /// `try_lock`, never `lock`: [`Console`] methods log through `render::report_lost_output`, so a
     /// thread already inside one re-enters here holding the lock, and a blocking acquire would
-    /// deadlock the REPL. Contention falls through to the raw stderr write.
+    /// deadlock the screen. Contention falls through to the raw stderr write.
     ///
     /// A poisoned mutex is recovered rather than treated as contention: `TryLockError` folds the
     /// two together, and treating them alike would let one panic inside a console method stop
@@ -188,38 +311,31 @@ mod tests {
     use super::*;
     use crate::{
         config::RenderMode,
-        console::{Console, Neighbor, RowState, Spacing},
+        console::{Console, RowState},
     };
 
     fn console() -> Arc<Mutex<Console>> {
-        Arc::new(Mutex::new(Console::new(
-            Spacing {
-                newline_before_prompt: true,
-                newline_after_prompt: true,
-            },
-            RenderMode::Raw,
-        )))
+        Arc::new(Mutex::new(Console::new(RenderMode::Raw)))
     }
 
-    /// A full printer queue does not block the writer. The queue is drained only inside reedline's
-    /// `read_line`, so a write that waited for room could wait on the very thread doing the
-    /// writing.
+    /// A full queue does not block the layer. The queue is drained only by the screen's frame
+    /// loop, so an offer that waited for room could wait on the very task doing the logging.
     #[test]
-    fn a_full_printer_queue_does_not_block_a_log_line() {
+    fn a_full_queue_does_not_block_a_log_line() {
         let relay = Relay::new();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         relay.install(sender);
-        relay.set_at_prompt(true);
+        relay.set_screen_attached(true);
         let (done, finished) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            use std::io::Write as _;
-
-            use tracing_subscriber::fmt::MakeWriter;
-            for line in ["first\n", "second\n", "third\n"] {
-                relay
-                    .make_writer()
-                    .write_all(line.as_bytes())
-                    .expect("write");
+            for message in ["first", "second", "third"] {
+                relay.offer(LogLine {
+                    at: chrono::Utc::now(),
+                    level: tracing::Level::WARN,
+                    target: "meka".to_string(),
+                    message: message.to_string(),
+                    shown: true,
+                });
             }
             done.send(()).expect("report");
         });
@@ -231,47 +347,72 @@ mod tests {
         drop(receiver);
     }
 
-    /// An off-prompt log line settles the row instead of landing on it, and counts for nothing
-    /// else.
+    /// An event's fields read as the formatting layer prints them: the message, then the rest.
+    #[test]
+    fn an_event_s_fields_become_its_message() {
+        use tracing::field::Visit;
+        let mut fields = Fields::default();
+        fields.record_str(&field("message"), "stream error");
+        fields.record_debug(&field("attempt"), &2);
+        assert_eq!(fields.into_message(), "stream error attempt=2");
+    }
+
+    fn field(name: &'static str) -> tracing::field::Field {
+        use tracing::{callsite::Callsite, metadata::Kind};
+        struct Site;
+        static META: tracing::Metadata<'static> = tracing::Metadata::new(
+            "test",
+            "test",
+            tracing::Level::INFO,
+            None,
+            None,
+            None,
+            tracing::field::FieldSet::new(
+                &["message", "attempt"],
+                tracing::callsite::Identifier(&SITE),
+            ),
+            Kind::EVENT,
+        );
+        static SITE: Site = Site;
+        impl Callsite for Site {
+            fn set_interest(&self, _: tracing::subscriber::Interest) {}
+
+            fn metadata(&self) -> &tracing::Metadata<'_> {
+                &META
+            }
+        }
+        META.fields()
+            .field(name)
+            .expect("a field of the test's set")
+    }
+
+    /// An off-prompt log line settles the row instead of landing on it.
     ///
-    /// This is the wiring, not the state machine: `step` already knows that a log line erases a
-    /// transient row and spends no bracket. The row is the thinking indicator's, and the line that
-    /// lands on it is the retry path's `warn!`, which fires at default verbosity.
-    ///
-    /// `force_row` because the drawing API cannot reach `Transient` without a terminal:
-    /// `thinking_indicator` returns early on `!live_indicator_supported()`.
+    /// The row is the thinking indicator's, and the line that lands on it is the retry path's
+    /// `warn!`, which fires at default verbosity. `force_row` because the drawing API cannot reach
+    /// `Transient` without a terminal: `thinking_indicator` returns early on
+    /// `!live_indicator_supported()`.
     #[test]
     fn an_off_prompt_log_line_settles_the_row_it_would_have_landed_on() {
         let console = console();
         let relay = Relay::new();
         relay.install_console(&console);
-        relay.set_at_prompt(false);
-
-        console
-            .lock()
-            .expect("console")
-            .open_episode(RowState::Empty, Neighbor::Prompt);
+        relay.set_screen_attached(false);
+        console.lock().expect("console").start(RowState::Empty);
         console
             .lock()
             .expect("console")
             .force_row(RowState::Transient);
-
         relay
             .make_writer()
             .write_all(b"WARN provider stream failed transiently, retrying\n")
             .expect("the stderr fall-through always succeeds");
-
         let console = console.lock().expect("console");
         assert_eq!(
             console.row(),
             RowState::Empty,
             "the indicator's row has to be settled before the line lands, or the next \
              `Settle::Erase` takes the line with it"
-        );
-        assert!(
-            !console.has_printed(),
-            "and the episode must not count it, or a warning at startup earns the first prompt a \
-             blank above it"
         );
     }
 
@@ -288,28 +429,22 @@ mod tests {
         let console = console();
         let relay = Relay::new();
         relay.install_console(&console);
-        relay.set_at_prompt(false);
-
+        relay.set_screen_attached(false);
         let mut held = console.lock().expect("console");
-        held.open_episode(RowState::Empty, Neighbor::Prompt);
-
+        held.start(RowState::Empty);
         relay
             .make_writer()
             .write_all(b"DEBUG console renderer push_delta failed\n")
             .expect("the stderr fall-through always succeeds");
-
-        assert!(
-            !held.has_printed(),
-            "the console could not be consulted, so it must not have been told anything either"
-        );
+        assert_eq!(held.row(), RowState::Empty);
     }
 
     /// With no console installed (every non-interactive command) nothing changes: the whole line
-    /// reaches stderr, none of it swallowed by a printer that is not there.
+    /// reaches stderr, none of it swallowed by a screen that is not there.
     #[test]
     fn a_host_with_no_console_still_writes_to_stderr() {
         let relay = Relay::new();
-        relay.set_at_prompt(false);
+        relay.set_screen_attached(false);
         let line = b"WARN config.toml could not be read\n";
         let written = relay
             .make_writer()

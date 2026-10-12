@@ -307,7 +307,7 @@ impl TurnRecovery {
                 // provider judged nothing, and this is the turn's last guess at the cause.
                 //
                 // No provider body here: `reason` is the verbatim rejection text, and this notice
-                // reaches the REPL and ACP as well as `serve`, where `[serve]
+                // reaches the screen and ACP as well as `serve`, where `[serve]
                 // relay_provider_errors` does not apply. The full text is on the
                 // `warn!` above.
                 //

@@ -10,6 +10,50 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.71 to 0.72
+
+**The interactive terminal is a screen, not a line editor.** `meka` without `--oneshot` now takes
+over the terminal the way an editor does: the conversation fills the screen, the composer stays at
+the bottom, and you can type while the agent works. What that changes for an existing setup:
+
+- **Six `[display]` keys are gone, and the file refuses them by name.** `render_mode`,
+  `input_style`, `newline_before_prompt` and `newline_after_prompt` described a stream the screen
+  no longer writes. Delete them from `config.toml`. `--render-mode` and `MEKA_RENDER_MODE` are gone
+  with the first; a one-shot run now renders markdown when stdout is a terminal and writes the
+  source as written when it is a pipe, so a script gets the words without asking.
+  `show_path_in_prompt` and `show_context_in_prompt` are replaced by
+  [`status_row`](../configuration/config-file.md#displaystatus_row), a list of what the status
+  row shows in order. The default shows the path; to have the gauge back, list it:
+  `status_row = ["path", "profile", "context", "tasks", "subagents"]`.
+- **Answers no longer go to stdout in interactive mode.** The screen draws on one stream.
+  `meka --oneshot` and the HTTP API are the doors for a script, and both keep their contracts.
+- **A terminal is required.** A pipe on stdin or stdout is refused with a line naming
+  `--oneshot`. A harness that drove the old prompt through pipes drives `--oneshot` or the HTTP
+  API instead.
+- **`!command` output is captured** into the transcript rather than the child taking the
+  terminal. A command that needs a terminal of its own runs in a shell beside meka.
+- **The syntect and raw views are gone.** The screen renders markdown; a thinking block or a tool
+  call expands to its whole content on a click or a key, so the source views have nothing left to
+  show that the screen cannot.
+- **`/history` and `/clear` are gone, and `display.resume_show_recent` with them; the file refuses
+  the key by name.** The screen opens on the last page of the session's log and reads older turns
+  as you scroll up, however long the session is, so there is nothing left for either command to
+  do. Delete `resume_show_recent` from `config.toml`.
+- **A slash command's answer is a panel, not rows of the transcript.** `/help`, `/status`,
+  `/usage` and every listing open in place of the composer until Esc closes them; a bare
+  `/permission`, `/approvals` or `/profile` is a picker. A command is no longer echoed as a prompt.
+- **The approval prompt is a picker.** The four answers are picked with the cursor, their keys
+  (`y`, `a`, `n`) or their numbers; `always` and `never` are no longer typed. Esc denies.
+- **Every row has a glyph.** `[tool name(...)]`, `Thinking...`, `Error:`, `(interrupted)` and
+  the bracketed usage line are replaced on the screen by one register: `•`, `!` and `■` in
+  column 0 and the text at column 2. A one-shot run keeps the old spellings on its stream, with
+  one change: consecutive tool indicators at the summary level now have a blank line between
+  them, as every other pair of blocks does.
+
+Two keys are new: [`display.mouse`](../configuration/config-file.md#displaymouse), on by default,
+and [`session.send_class`](../configuration/config-file.md#sessionsend_class), `steer` by default.
+[Interactive mode](../usage/interactive-mode.md) describes the screen.
+
 ## 0.70 to 0.71
 
 **A hole in a feed is a `feed.gap` event, no longer a `notice`.** A client that resumed a session

@@ -669,7 +669,7 @@ pub(crate) fn spawn_sandboxed_command(
     // session cwd is client-supplied and the process cwd is wherever the editor or unit
     // started, so at `workspace` the ACE was granted on one directory and the command ran in
     // another: relative writes hit a directory with no capability and were denied, and relative
-    // reads silently read the wrong tree. Invisible in a plain terminal REPL, where the two are
+    // reads silently read the wrong tree. Invisible in a plain terminal screen, where the two are
     // the same path.
     let cwd_utf16: Vec<u16> = cwd
         .as_os_str()

@@ -1,35 +1,19 @@
-//! The terminal between two prompts.
+//! The terminal of a one-shot run: the one writer for everything it prints, and the one rule for
+//! the space between two things it prints.
 //!
-//! meka's `[display]` spacing is described in terms of prompts, not turns: `newline_after_prompt`
-//! is a blank line after the line you typed and `newline_before_prompt` one before the next prompt,
-//! and both apply to *anything* printed in between. The unit is therefore an **episode**, and this
-//! module owns it.
-//!
-//! Two rules make the shapes that break unrepresentable.
-//!
-//! **One owner, and it is the one that always runs.** Split ownership -- the agent opening the
-//! blanks on `FrontendEvent::TurnStarted` and closing them on success, the host closing them on
-//! failure -- brackets a turn that failed before it started, or a slash command that answered
-//! without running a turn, once or not at all. An episode is closed by whoever is about to draw the
-//! next prompt, which happens exactly once per prompt whatever went on before it.
-//!
-//! **An episode either prints, and gets its brackets, or it leaves no trace.** The opening blank is
-//! *armed* rather than printed, and fires just before the episode's first real output, so nothing
-//! can slip above it. If nothing ever prints, [`Console::close_episode`] restores the row it opened
-//! on, which is what stops a scheduler wake that finds nothing to run from leaving a second prompt
-//! behind.
-//!
-//! [`RowState`] exists because a blank line only makes a gap when the cursor is at column zero. Two
-//! writers park it mid-row deliberately (the thinking indicator and the MCP progress line), and
-//! reedline leaves a drawn prompt behind when it breaks out for a wake; a blank printed over either
-//! is spent terminating the row instead.
+//! Every block (the answer, a thinking block, a tool indicator, a notice, the session id) is set
+//! off from the one before it by a single blank line, and the first prints flush under the
+//! shell's command line. [`RowState`] exists because a blank line only makes a gap when the
+//! cursor is at column zero: two writers park it mid-row deliberately (the thinking indicator and
+//! the MCP progress line), and whatever prints next erases that row first. The blank above an
+//! erased row stays where it is, so the row's replacement owes none.
 
 use std::io::Write;
 
 use crate::{
     config::{RenderMode, ToolParams},
     render,
-    render::{OutputSpacing, StreamingRenderer},
+    render::StreamingRenderer,
 };
 
 /// What occupies the row the cursor is sitting on.
@@ -41,73 +25,17 @@ pub(crate) enum RowState {
     /// an MCP progress line whose text comes from the server. Neither is content, so meka's own
     /// output replaces it rather than following it.
     Transient,
-    /// reedline returned without the CRLF it normally writes on the way out of `read_line`, leaving
-    /// the prompt it drew on this row and the cursor at the end of it. Real output has to move past
-    /// it; an episode that produces none has to erase it, or reedline paints a second prompt on the
-    /// row below.
-    PromptParked,
-}
-
-/// Which prompt an episode borders, on the side in question.
-///
-/// The two `[display]` blanks space an episode away from *meka's* prompt, and a shell lays out its
-/// own, so a blank spent against the shell's prompt is one meka adds to somebody else's terminal:
-/// the last episode of a run closes against `Shell` and prints nothing below `Leaving session:`. On
-/// the way in, the `Resuming session:` banner prints before the first episode opens and stands in
-/// for the line you typed, so a run that shows it opens against `Prompt`, and one that hides it, or
-/// resumed nothing, opens against `Shell` with the shell's own command line above.
-///
-/// Like [`Spacing`], and for the same reason, this gates *printing* and nothing else. Declining to
-/// arm the opening blank looks equivalent and is not: `printed` is set when that blank is spent,
-/// and it is what the closing bracket answers to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Neighbor {
-    Prompt,
-    Shell,
-}
-
-/// The `[display]` blank-line settings.
-///
-/// They gate *printing* and nothing else. Every state transition below runs identically with them
-/// off, which is the difference between "no blank line here" and "the spacing machine stops
-/// advancing"; the latter leaks the previous turn's last block into the next one and prints the
-/// blank the setting just disabled.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Spacing {
-    pub(crate) newline_before_prompt: bool,
-    pub(crate) newline_after_prompt: bool,
-}
-
-/// A kind of block, in the sense that matters to spacing: what separates it from what came before.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BlockKind {
-    /// meka speaking for itself: an error, a hint, a session id, a status table. Deliberately does
-    /// not advance the block machine, because these are punctuation between the model's blocks
-    /// rather than blocks of their own.
-    Chrome,
-    Text,
-    ToolIndicator(ToolParams),
-    Thinking,
-    /// A block set off from whatever is around it on both sides: the checklist, and a stage
-    /// direction about the turn such as the checklist's nudge.
-    Standalone,
 }
 
 /// Something that happens to the console, as a value, so the decision it forces can be tested
 /// without a terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Action {
-    OpenEpisode(RowState, Neighbor),
-    CloseEpisode(Neighbor),
-    /// Output that `Console` cannot see is about to print: a slash command answering through one of
-    /// the `cli` modules, or a child process meka handed the terminal to.
-    AnnounceForeign,
     /// A `tracing` line is about to print. It takes a row of its own, because the row it would land
-    /// on may be a status line about to be erased or a parked prompt, and spends neither blank: a
-    /// log is not the episode's output, so a warning at startup does not earn the first prompt a
-    /// blank above it, and one right after a typed line does not take the blank owed to the answer.
+    /// on may be a status line about to be erased.
     AnnounceLog,
-    Block(BlockKind),
+    /// A block is about to print.
+    Block,
     /// An in-place status line is about to be drawn.
     OpenTransient,
     /// Keep the transient line by writing the newline its writer withheld.
@@ -130,162 +58,70 @@ pub(crate) enum Settle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Emit {
     pub(crate) settle: Settle,
-    /// The `newline_after_prompt` blank, fired late so it can never land below the first thing the
-    /// episode prints.
-    pub(crate) after_prompt_blank: bool,
-    /// The separator between two blocks of different kinds, from [`OutputSpacing`].
+    /// The blank that sets a block off from the one above it.
     pub(crate) separator_blank: bool,
-    /// The `newline_before_prompt` blank.
-    pub(crate) before_prompt_blank: bool,
-}
-
-impl Emit {
-    const NOTHING: Self = Self {
-        settle: Settle::Nothing,
-        after_prompt_blank: false,
-        separator_blank: false,
-        before_prompt_blank: false,
-    };
 }
 
 /// The console's state, separated from the console so [`step`] can be a pure function of it.
 #[derive(Clone, Copy)]
 pub(crate) struct State {
     pub(crate) row: RowState,
-    spacing: OutputSpacing,
-    /// Whether the `newline_after_prompt` blank is still owed. Armed by `OpenEpisode`, spent by
-    /// the first thing that prints.
-    pending_after_blank: bool,
-    /// Which prompt this episode opened against, carried because the blank above it is armed at
-    /// the open and spent later, by whatever turns out to print first.
-    opened_against: Neighbor,
-    /// Whether this episode has printed anything. Set when the opening blank is spent, *whether or
-    /// not the flag let it print*, so it means "something happened" rather than "a blank was
-    /// written".
-    printed: bool,
+    /// Whether a block has printed and nothing has yet been set off from it: the next block owes
+    /// a blank above. Cleared when the blank is spent on a transient row, which keeps it when the
+    /// row is erased, so its replacement does not add a second.
+    owes_separator: bool,
 }
 
 impl State {
-    fn new() -> Self {
+    fn new(row: RowState) -> Self {
         Self {
-            row: RowState::Empty,
-            spacing: OutputSpacing::new(),
-            pending_after_blank: false,
-            // Never read before an `OpenEpisode` sets it: nothing is owed until an episode arms it.
-            opened_against: Neighbor::Shell,
-            printed: false,
+            row,
+            owes_separator: false,
         }
-    }
-
-    #[cfg(test)]
-    fn printed(&self) -> bool {
-        self.printed
     }
 }
 
 /// The whole decision, as a pure function.
 ///
-/// Every blank line meka prints between two prompts is one of the three in [`Emit`], and this is
-/// the only place any of them is decided. Split out from the printing for the same reason
-/// `repl::indicator_action` is: in a dispatch that mixes the two, the only way to see a wrong
-/// answer is to run a terminal and look at it.
-pub(crate) fn step(state: State, spacing: Spacing, action: Action) -> (Emit, State) {
+/// Every blank line a one-shot run prints is the one in [`Emit`], and this is the only place it is
+/// decided. Split out from the printing because, in a dispatch that mixes the two, the only way to
+/// see a wrong answer is to run a terminal and look at it.
+pub(crate) fn step(state: State, action: Action) -> (Emit, State) {
     let mut next = state;
     match action {
-        Action::OpenEpisode(row, follows) => {
-            next.row = row;
-            next.pending_after_blank = true;
-            next.opened_against = follows;
-            next.printed = false;
-            // Unconditional: this records "a prompt is what came last", which is true whether or
-            // not a blank followed it. Gated on `newline_after_prompt`, the next episode reads the
-            // previous one's final block and prints the separator the setting disabled.
-            next.spacing.after_prompt();
-            (Emit::NOTHING, next)
-        }
-        Action::CloseEpisode(precedes) => {
-            let settle = match state.row {
-                RowState::Empty => Settle::Nothing,
-                // A leftover status line is not content and must not survive into the prompt.
-                RowState::Transient => Settle::Erase,
-                // A parked prompt still here means the episode printed nothing, because whatever
-                // prints settles the row first. So the screen has to look exactly as it did, and
-                // erasing lets reedline repaint on this row instead of choosing the one below.
-                // Asking `printed` too, and terminating where it is set, reads like the guarantee
-                // that a wake keeping its prompt rests on. It is not: `open_output` terminates
-                // that row, before this can run.
-                RowState::PromptParked => Settle::Erase,
-            };
-            next.row = RowState::Empty;
-            next.pending_after_blank = false;
-            // Closing twice is closing once. Without this a second call would emit the closing
-            // blank again, which is reachable on the way out: the shutdown path closes after the
-            // last prompt and then has more to say.
-            next.printed = false;
-            (
-                Emit {
-                    settle,
-                    before_prompt_blank: state.printed
-                        && precedes == Neighbor::Prompt
-                        && spacing.newline_before_prompt,
-                    ..Emit::NOTHING
-                },
-                next,
-            )
-        }
-        Action::AnnounceForeign => {
-            let (settle, after_prompt_blank) = open_output(&mut next, spacing);
-            (
-                Emit {
-                    settle,
-                    after_prompt_blank,
-                    ..Emit::NOTHING
-                },
-                next,
-            )
-        }
         Action::AnnounceLog => {
             let settle = settle_row(&mut next);
             (
                 Emit {
                     settle,
-                    ..Emit::NOTHING
+                    separator_blank: false,
                 },
                 next,
             )
         }
-        Action::Block(kind) => {
-            let (settle, after_prompt_blank) = open_output(&mut next, spacing);
-            let separator_blank = match kind {
-                BlockKind::Chrome => false,
-                BlockKind::Text => next.spacing.before_text(),
-                BlockKind::ToolIndicator(params) => next.spacing.before_tool_indicator(params),
-                BlockKind::Thinking => next.spacing.before_thinking(),
-                BlockKind::Standalone => next.spacing.before_standalone(),
-            };
+        Action::Block => {
+            let settle = settle_row(&mut next);
+            let separator_blank = state.owes_separator;
+            next.owes_separator = true;
             (
                 Emit {
                     settle,
-                    after_prompt_blank,
                     separator_blank,
-                    before_prompt_blank: false,
                 },
                 next,
             )
         }
         Action::OpenTransient => {
-            // A redraw overwrites its own row, so only a parked prompt has to be moved past.
-            let settle = match state.row {
-                RowState::PromptParked => Settle::Terminate,
-                RowState::Empty | RowState::Transient => Settle::Nothing,
-            };
-            let after_prompt_blank = spend_pending(&mut next, spacing);
+            // A redraw overwrites its own row, so nothing has to be moved past; the first draw
+            // takes the blank the block above is owed, and the row is not a block until it is
+            // committed.
+            let separator_blank = state.owes_separator;
+            next.owes_separator = false;
             next.row = RowState::Transient;
             (
                 Emit {
-                    settle,
-                    after_prompt_blank,
-                    ..Emit::NOTHING
+                    settle: Settle::Nothing,
+                    separator_blank,
                 },
                 next,
             )
@@ -297,10 +133,11 @@ pub(crate) fn step(state: State, spacing: Spacing, action: Action) -> (Emit, Sta
                 Settle::Nothing
             };
             next.row = RowState::Empty;
+            next.owes_separator = true;
             (
                 Emit {
                     settle,
-                    ..Emit::NOTHING
+                    separator_blank: false,
                 },
                 next,
             )
@@ -315,7 +152,7 @@ pub(crate) fn step(state: State, spacing: Spacing, action: Action) -> (Emit, Sta
             (
                 Emit {
                     settle,
-                    ..Emit::NOTHING
+                    separator_blank: false,
                 },
                 next,
             )
@@ -323,31 +160,14 @@ pub(crate) fn step(state: State, spacing: Spacing, action: Action) -> (Emit, Sta
     }
 }
 
-/// Settle the row and spend the opening blank, which is what every writer of real output does
-/// first.
-fn open_output(next: &mut State, spacing: Spacing) -> (Settle, bool) {
-    let settle = settle_row(next);
-    (settle, spend_pending(next, spacing))
-}
-
 /// Settle the row so the next thing printed starts at column zero of a row of its own.
 fn settle_row(next: &mut State) -> Settle {
     let settle = match next.row {
         RowState::Empty => Settle::Nothing,
         RowState::Transient => Settle::Erase,
-        RowState::PromptParked => Settle::Terminate,
     };
     next.row = RowState::Empty;
     settle
-}
-
-fn spend_pending(next: &mut State, spacing: Spacing) -> bool {
-    if !next.pending_after_blank {
-        return false;
-    }
-    next.pending_after_blank = false;
-    next.printed = true;
-    next.opened_against == Neighbor::Prompt && spacing.newline_after_prompt
 }
 
 /// A streamed block in progress, and which kind it is.
@@ -394,18 +214,15 @@ fn indicator_may_draw(open: Option<StreamKind>) -> bool {
     !matches!(open, Some(StreamKind::Thinking))
 }
 
-/// The single writer for everything that appears between two prompts.
+/// The single writer for everything a one-shot run prints.
 ///
-/// Shared by the blocking REPL thread and the agent's frontend task, which also gives the two
-/// threads that write to the terminal one lock to contend on rather than none.
+/// Shared by the host and the agent's frontend task, which also gives the two threads that write
+/// to the terminal one lock to contend on rather than none.
 pub(crate) struct Console {
     state: State,
-    spacing: Spacing,
     render_mode: RenderMode,
     /// Open across consecutive deltas of one kind; closed by any other block, and by the end of
-    /// the episode. Episode-bounded rather than turn-bounded so a turn that dies mid-paragraph
-    /// still shows what it streamed, in its own episode, instead of having it flushed under
-    /// the next prompt.
+    /// the run.
     ///
     /// One slot, not one per kind. The two alternate but never overlap -- a provider streams one
     /// block at a time -- so a second slot could only ever hold a block nothing had closed, and
@@ -421,10 +238,9 @@ pub(crate) struct Console {
 }
 
 impl Console {
-    pub(crate) fn new(spacing: Spacing, render_mode: RenderMode) -> Self {
+    pub(crate) fn new(render_mode: RenderMode) -> Self {
         Self {
-            state: State::new(),
-            spacing,
+            state: State::new(RowState::Empty),
             render_mode,
             stream: None,
             lost_output: None,
@@ -460,129 +276,73 @@ impl Console {
         if let Some((kind, Err(error))) = ended {
             self.lost_output(lost_output_of(kind), error);
         }
-        let (emit, next) = step(self.state, self.spacing, action);
+        let (emit, next) = step(self.state, action);
         self.state = next;
         match emit.settle {
             Settle::Nothing => {}
             Settle::Terminate => crate::streams::write_stderr_line(""),
             Settle::Erase => render::begin_own_line(),
         }
-        if emit.after_prompt_blank {
-            crate::streams::write_stderr_line("");
-        }
         if emit.separator_blank {
             crate::streams::write_stderr_line("");
         }
-        if emit.before_prompt_blank {
-            crate::streams::write_stderr_line("");
-        }
     }
 
-    /// Begin an episode, given what reedline left on the row and which prompt is above it.
-    pub(crate) fn open_episode(&mut self, row: RowState, follows: Neighbor) {
-        // A new episode is a new chance to say that output is not arriving. Once per process is
-        // right for a one-shot run and wrong for a shell someone leaves open all day, where the
-        // first lost answer would otherwise be the only one mentioned.
+    /// Begin the run's output, given what is on the row the cursor sits on.
+    pub(crate) fn start(&mut self, row: RowState) {
+        // A new run is a new chance to say that output is not arriving.
         render::reset_lost_output_report();
-        self.act(Action::OpenEpisode(row, follows));
+        self.state = State::new(row);
     }
 
-    /// End the episode, immediately before the prompt below it is drawn.
-    pub(crate) fn close_episode(&mut self, precedes: Neighbor) {
+    /// End the run's output: flush the open block, and erase a status line left drawn, which is
+    /// not content and must not survive into the shell's prompt.
+    pub(crate) fn finish(&mut self) {
         self.close_stream();
-        self.act(Action::CloseEpisode(precedes));
-    }
-
-    /// Declare that output this console cannot see is about to print.
-    ///
-    /// Needed only where meka hands the terminal to something else: a slash command that answers
-    /// through one of the `cli` modules, or a child process under `!command`. Anything printed
-    /// through the methods below announces itself.
-    ///
-    /// A command that prints *nothing* must not call this, or it gets blank lines wrapped around an
-    /// empty region. Every REPL command says something, even if only that a list is empty; the
-    /// exceptions are a successful `/cd` and `/clear`, where the prompt and the cleared screen are
-    /// the confirmation.
-    pub(crate) fn announce_foreign_output(&mut self) {
-        self.act(Action::AnnounceForeign);
+        self.act(Action::EraseTransient);
     }
 
     /// Declare that a `tracing` line is about to print.
     ///
     /// Called by the relay for every line it writes to stderr off-prompt. See
-    /// [`Action::AnnounceLog`] for what a log line does and does not spend.
+    /// [`Action::AnnounceLog`] for what a log line does.
     pub(crate) fn announce_log_line(&mut self) {
         self.act(Action::AnnounceLog);
-    }
-
-    pub(crate) fn error(&mut self, error: &dyn std::fmt::Display) {
-        self.close_stream();
-        self.act(Action::Block(BlockKind::Chrome));
-        render::render_error(error);
-    }
-
-    pub(crate) fn hint(&mut self, message: &str) {
-        self.close_stream();
-        self.act(Action::Block(BlockKind::Chrome));
-        render::render_hint(message);
     }
 
     /// A [`crate::frontend::Notice`], in the color its level asks for: dim for `Info`, the warning
     /// color for `Warn`.
     pub(crate) fn notice(&mut self, notice: &crate::frontend::Notice) {
+        self.close_stream();
+        self.act(Action::Block);
         if notice.kind == crate::frontend::NoticeKind::StageDirection {
-            self.stage_direction(&notice.text);
+            render::render_annotation(&notice.text);
             return;
         }
-        self.close_stream();
-        self.act(Action::Block(BlockKind::Chrome));
         match notice.level {
             crate::frontend::NoticeLevel::Info => render::render_hint(&notice.text),
             crate::frontend::NoticeLevel::Warn => render::render_warning(&notice.text),
         }
     }
 
-    /// A stage direction between two blocks: the model's reply ended and meka did something with
-    /// it, or something other than the user opened the turn that follows. A block of its own, set
-    /// off on both sides, where [`Self::annotation`] is the same register at the end of an
-    /// episode, flush with what it closes.
-    pub(crate) fn stage_direction(&mut self, note: &str) {
-        self.close_stream();
-        self.act(Action::Block(BlockKind::Standalone));
-        render::render_annotation(note);
-    }
-
     pub(crate) fn session_id(&mut self, label: &str, id: &str) {
         self.close_stream();
-        self.act(Action::Block(BlockKind::Chrome));
+        self.act(Action::Block);
         render::render_session_id(label, id);
-    }
-
-    /// The heading above a block of command output. See [`render::render_heading`].
-    pub(crate) fn heading(&mut self, heading: &str) {
-        self.close_stream();
-        self.act(Action::Block(BlockKind::Chrome));
-        render::render_heading(heading);
     }
 
     /// A stage direction about the output: `(interrupted)`. See [`render::render_annotation`].
     pub(crate) fn annotation(&mut self, note: &str) {
         self.close_stream();
-        self.act(Action::Block(BlockKind::Chrome));
+        self.act(Action::Block);
         render::render_annotation(note);
     }
 
-    pub(crate) fn line(&mut self, line: &str) {
-        self.close_stream();
-        self.act(Action::Block(BlockKind::Chrome));
-        crate::streams::write_stderr_line(line);
-    }
-
-    /// Print through a closure, for the callers whose painter takes arguments this module has no
-    /// reason to model (`render_session_status`, `render_account_usage`, the help text).
+    /// Print through a closure, for a caller whose painter takes arguments this module has no
+    /// reason to model.
     pub(crate) fn chrome(&mut self, paint: impl FnOnce()) {
         self.close_stream();
-        self.act(Action::Block(BlockKind::Chrome));
+        self.act(Action::Block);
         paint();
     }
 
@@ -594,14 +354,14 @@ impl Console {
         params: ToolParams,
     ) {
         self.close_stream();
-        self.act(Action::Block(BlockKind::ToolIndicator(params)));
+        self.act(Action::Block);
         render::render_tool_indicator(name, input, display_summary, params);
     }
 
     /// The one dimmed line shown for a thinking block under `show_content = false`.
     pub(crate) fn thinking_preview(&mut self, content: &str) {
         self.close_stream();
-        self.act(Action::Block(BlockKind::Thinking));
+        self.act(Action::Block);
         render::render_thinking_preview(content);
     }
 
@@ -613,13 +373,13 @@ impl Console {
             return;
         }
         self.close_stream();
-        self.act(Action::Block(BlockKind::Standalone));
+        self.act(Action::Block);
         render::render_checklist(items);
     }
 
     pub(crate) fn token_usage(&mut self, usage: &crate::stats::TokenUsage) {
         self.close_stream();
-        self.act(Action::Block(BlockKind::Chrome));
+        self.act(Action::Block);
         render::render_token_usage(usage);
     }
 
@@ -627,13 +387,12 @@ impl Console {
     ///
     /// Off a tty this returns before the action, where redrawing in place would instead accumulate
     /// one line per update. Nothing is spent: an indicator that cannot be drawn must not take the
-    /// episode's opening blank or move the row, or it shifts the layout of the output that *is*
-    /// produced.
+    /// blank above it or move the row, or it shifts the layout of the output that *is* produced.
     ///
-    /// A `draw` that answers false *past* that gate has already spent whatever opening blank this
-    /// episode owed, so only the row is restored: the line may be partly on screen. No caller does
-    /// today -- both write through helpers that accept a failed write -- but the contract is the
-    /// one a fallible drawer would need.
+    /// A `draw` that answers false *past* that gate has already spent whatever blank was owed, so
+    /// only the row is restored: the line may be partly on screen. No caller does today -- both
+    /// write through helpers that accept a failed write -- but the contract is the one a fallible
+    /// drawer would need.
     pub(crate) fn transient(&mut self, draw: impl FnOnce() -> bool) -> bool {
         if !render::live_indicator_supported() {
             return false;
@@ -648,9 +407,10 @@ impl Console {
 
     /// Draw the thinking indicator, returning whether it reached the terminal.
     ///
-    /// `opening` separates the first draw of a block like the thinking block it stands in for, so
-    /// the line it eventually commits to sits apart from what preceded it. Redraws overwrite their
-    /// own row and ask for nothing.
+    /// `opening` is the first draw of a block, which closes whatever was streaming: the indicator
+    /// draws from column zero, and an open text run would have its last line overwritten, damage
+    /// that stays on screen since the indicator is kept rather than erased. Redraws overwrite
+    /// their own row and close nothing.
     pub(crate) fn thinking_indicator(&mut self, opening: bool, estimate: Option<u64>) -> bool {
         if !indicator_may_draw(self.open_stream_kind()) {
             return false;
@@ -659,11 +419,7 @@ impl Console {
             return false;
         }
         if opening {
-            // The indicator draws from column zero, so an open text run would have its last line
-            // overwritten -- and since the indicator is kept rather than erased, that damage would
-            // stay on screen.
             self.close_stream();
-            self.act(Action::Block(BlockKind::Thinking));
         }
         self.act(Action::OpenTransient);
         let drawn = render::render_thinking_indicator(estimate);
@@ -690,7 +446,7 @@ impl Console {
     }
 
     /// Whether a text block is still open, for the frontend's tests: a run left open past the end
-    /// of its episode is what flushes a failed turn's tail under the next prompt.
+    /// of the run is what flushes a failed turn's tail under the shell's prompt.
     #[cfg(test)]
     pub(crate) fn has_open_text(&self) -> bool {
         self.open_stream_kind() == Some(StreamKind::Text)
@@ -712,14 +468,11 @@ impl Console {
             .is_some_and(|open| open.renderer.is_row_open())
     }
 
-    /// Whether this episode has printed anything, for [`crate::relay`]'s tests.
-    ///
-    /// The one bit of console state a caller outside this module can observe without a terminal,
-    /// and enough to answer the question the relay's test asks: did a log line reach the console at
-    /// all, or go round it to stderr.
+    /// Whether a block has printed, for the frontend's tests: the one bit of console state a
+    /// caller outside this module can observe without a terminal.
     #[cfg(test)]
     pub(crate) fn has_printed(&self) -> bool {
-        self.state.printed()
+        self.state.owes_separator
     }
 
     /// Put the row into a state a test cannot reach through the drawing API.
@@ -754,10 +507,7 @@ impl Console {
             self.close_stream();
         }
         if self.stream.is_none() {
-            self.act(Action::Block(match kind {
-                StreamKind::Text => BlockKind::Text,
-                StreamKind::Thinking => BlockKind::Thinking,
-            }));
+            self.act(Action::Block);
             self.stream = Some(OpenStream {
                 kind,
                 renderer: match kind {
@@ -816,52 +566,101 @@ impl Console {
 mod tests {
     use super::*;
 
-    const BOTH: Spacing = Spacing {
-        newline_before_prompt: true,
-        newline_after_prompt: true,
-    };
-    const NEITHER: Spacing = Spacing {
-        newline_before_prompt: false,
-        newline_after_prompt: false,
-    };
-    const BEFORE_ONLY: Spacing = Spacing {
-        newline_before_prompt: true,
-        newline_after_prompt: false,
-    };
-    const AFTER_ONLY: Spacing = Spacing {
-        newline_before_prompt: false,
-        newline_after_prompt: true,
-    };
-
     /// Replay a sequence from a fresh console, returning what each action emitted.
-    fn run(spacing: Spacing, actions: &[Action]) -> Vec<Emit> {
-        let mut state = State::new();
+    fn run(actions: &[Action]) -> Vec<Emit> {
+        let mut state = State::new(RowState::Empty);
         actions
             .iter()
             .map(|action| {
-                let (emit, next) = step(state, spacing, *action);
+                let (emit, next) = step(state, *action);
                 state = next;
                 emit
             })
             .collect()
     }
 
-    fn blanks(emit: &Emit) -> usize {
-        usize::from(emit.after_prompt_blank)
-            + usize::from(emit.separator_blank)
-            + usize::from(emit.before_prompt_blank)
+    /// The first block prints flush under the shell's command line; every later one is set off
+    /// from the one above by one blank, whatever kind either is.
+    #[test]
+    fn every_block_after_the_first_is_set_off_by_one_blank() {
+        let emits = run(&[Action::Block, Action::Block, Action::Block]);
+        assert!(!emits[0].separator_blank, "nothing above the first");
+        assert!(emits[1].separator_blank);
+        assert!(emits[2].separator_blank);
+        assert!(
+            emits.iter().all(|emit| emit.settle == Settle::Nothing),
+            "an empty row needs no settling"
+        );
     }
 
-    fn total_blanks(emits: &[Emit]) -> usize {
-        emits.iter().map(blanks).sum()
+    /// A blank line only makes a gap from column zero. An in-place status line is discarded rather
+    /// than terminated, because its row is not content, and the blank spent above it serves the
+    /// block that replaces it.
+    #[test]
+    fn a_transient_row_is_erased_by_whatever_prints_next_and_its_blank_is_kept() {
+        let emits = run(&[
+            Action::Block,
+            Action::OpenTransient,
+            Action::OpenTransient,
+            Action::Block,
+        ]);
+        assert!(
+            emits[1].separator_blank,
+            "the first draw is set off from the block above"
+        );
+        assert!(!emits[2].separator_blank, "a redraw overwrites its own row");
+        assert_eq!(emits[3].settle, Settle::Erase);
+        assert!(
+            !emits[3].separator_blank,
+            "the blank above the erased row already sets the block off"
+        );
+        let erased = run(&[
+            Action::Block,
+            Action::OpenTransient,
+            Action::EraseTransient,
+            Action::Block,
+        ]);
+        assert_eq!(erased[2].settle, Settle::Erase);
+        assert!(!erased[3].separator_blank);
+    }
+
+    /// A committed status line is a block: the next one is set off from it.
+    #[test]
+    fn committing_a_transient_line_keeps_it_and_sets_the_next_block_off() {
+        let emits = run(&[
+            Action::OpenTransient,
+            Action::CommitTransient,
+            Action::Block,
+        ]);
+        assert_eq!(emits[1].settle, Settle::Terminate);
+        assert!(emits[2].separator_blank);
+        let nothing = run(&[Action::CommitTransient, Action::EraseTransient]);
+        assert!(
+            nothing.iter().all(|emit| emit.settle == Settle::Nothing),
+            "with no transient row drawn there is nothing to keep or discard"
+        );
+    }
+
+    /// A log line takes a row of its own: the row it would land on may be a status line about to
+    /// be erased. It is not a block, so it spends no blank.
+    #[test]
+    fn a_log_line_settles_its_row_and_spends_no_blank() {
+        let emits = run(&[Action::Block, Action::OpenTransient, Action::AnnounceLog]);
+        assert_eq!(emits[2].settle, Settle::Erase);
+        assert!(!emits[2].separator_blank);
+        let flush = run(&[Action::AnnounceLog, Action::Block]);
+        assert!(
+            !flush[1].separator_blank,
+            "a warning at startup earns the first block no blank"
+        );
     }
 
     /// A log line arriving while a thinking block holds its first paragraph lands under the label
     /// rather than on its row, and the block stays open to continue below it.
     #[test]
     fn a_log_line_ends_the_row_a_streaming_block_left_open() {
-        let mut console = Console::new(NEITHER, RenderMode::Raw);
-        console.open_episode(RowState::Empty, Neighbor::Prompt);
+        let mut console = Console::new(RenderMode::Raw);
+        console.start(RowState::Empty);
         console.thinking_delta("partial");
         assert!(
             console.has_open_row(),
@@ -878,454 +677,19 @@ mod tests {
         );
     }
 
-    /// One typed line, answered by a turn that streams text: the shape every other case is a
-    /// variation on.
-    fn plain_turn() -> Vec<Action> {
-        vec![
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::Block(BlockKind::Text),
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]
-    }
-
+    /// Finishing closes the open block and erases a status line left drawn, which must not
+    /// survive into the shell's prompt; finishing twice is finishing once.
     #[test]
-    fn a_turn_is_bracketed_once_on_each_side() {
-        let emits = run(BOTH, &plain_turn());
-        assert!(
-            emits[1].after_prompt_blank,
-            "the blank fires before the text"
-        );
-        assert!(
-            !emits[1].separator_blank,
-            "nothing precedes the text to separate it from"
-        );
-        assert!(emits[2].before_prompt_blank);
-        assert_eq!(total_blanks(&emits), 2);
-    }
-
-    #[test]
-    fn each_flag_removes_exactly_its_own_blank() {
-        assert_eq!(total_blanks(&run(BOTH, &plain_turn())), 2);
-        assert_eq!(total_blanks(&run(NEITHER, &plain_turn())), 0);
-
-        let before = run(BEFORE_ONLY, &plain_turn());
-        assert!(!before[1].after_prompt_blank);
-        assert!(before[2].before_prompt_blank);
-
-        let after = run(AFTER_ONLY, &plain_turn());
-        assert!(after[1].after_prompt_blank);
-        assert!(!after[2].before_prompt_blank);
-    }
-
-    /// The run's outer edges border the shell's prompt, and a shell lays out its own. On the way
-    /// out the last episode closes against it and prints nothing below `Leaving session:`. On the
-    /// way in the `Resuming session:` banner prints before any episode opens, so nothing is owed
-    /// above it, and the episode then opens against the banner as against a typed line; with the
-    /// banner hidden it opens against the shell and its first output gets no blank.
-    #[test]
-    fn the_shell_s_prompt_gets_neither_bracket() {
-        let first = run(BOTH, &[
-            Action::Block(BlockKind::Chrome),
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::AnnounceForeign,
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]);
-        assert_eq!(
-            blanks(&first[0]),
-            0,
-            "the resume banner prints before any episode opens, so nothing is owed above it",
-        );
-        assert!(
-            first[2].after_prompt_blank,
-            "the replay is spaced from the banner as from a typed line",
-        );
-        assert!(
-            first[3].before_prompt_blank,
-            "and the first prompt is bracketed like every later one",
-        );
-
-        let hidden = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Shell),
-            Action::AnnounceForeign,
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]);
-        assert!(
-            !hidden[1].after_prompt_blank,
-            "with the banner hidden, the replay is meka's first word under the shell's command line",
-        );
-        assert!(hidden[2].before_prompt_blank);
-
-        let last = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::Block(BlockKind::Chrome),
-            Action::CloseEpisode(Neighbor::Shell),
-        ]);
-        assert!(
-            last[1].after_prompt_blank,
-            "the line the user typed is spaced from what it produced, as always",
-        );
-        assert!(!last[2].before_prompt_blank);
-    }
-
-    /// The regression that made `newline_after_prompt = false` do nothing from the second turn on:
-    /// the block machine stopped being reset when the blank was not printed, so the next episode's
-    /// first tool indicator saw the previous episode's text and asked for a separator.
-    #[test]
-    fn a_disabled_opening_blank_still_resets_the_block_machine() {
-        for spacing in [NEITHER, BEFORE_ONLY] {
-            let emits = run(spacing, &[
-                Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-                Action::Block(BlockKind::Text),
-                Action::CloseEpisode(Neighbor::Prompt),
-                Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-                Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
-                Action::CloseEpisode(Neighbor::Prompt),
-            ]);
-            assert!(
-                !emits[4].separator_blank,
-                "a new episode's first block has nothing above it to separate from",
-            );
-            assert!(!emits[4].after_prompt_blank);
-        }
-    }
-
-    /// Every path that would otherwise be bracketed by whoever happened to notice: a turn that
-    /// failed before it started, a slash command answering without a turn, a command that ran
-    /// several turns. All of them are one episode with one bracket.
-    #[test]
-    fn every_episode_is_bracketed_the_same_however_it_answered() {
-        let error_only = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::Block(BlockKind::Chrome),
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]);
-        assert_eq!(total_blanks(&error_only), 2);
-
-        let foreign = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::AnnounceForeign,
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]);
-        assert_eq!(total_blanks(&foreign), 2);
-
-        // Two turns fired by one wake. The gap between them is the blocks' own separator, not a
-        // second pair of prompt brackets.
-        let two_turns = run(BOTH, &[
-            Action::OpenEpisode(RowState::PromptParked, Neighbor::Prompt),
-            Action::Block(BlockKind::Text),
-            Action::Block(BlockKind::Text),
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]);
-        assert!(two_turns[1].after_prompt_blank);
-        assert!(two_turns[3].before_prompt_blank);
-        assert_eq!(total_blanks(&two_turns), 2);
-    }
-
-    /// An episode that prints nothing gets no blank lines, and hands the row back as it found it.
-    /// The second half is what stops a scheduler wake with nothing due from leaving a duplicate
-    /// prompt on screen.
-    #[test]
-    fn an_episode_that_prints_nothing_leaves_no_trace() {
-        for spacing in [BOTH, NEITHER] {
-            let emits = run(spacing, &[
-                Action::OpenEpisode(RowState::PromptParked, Neighbor::Prompt),
-                Action::CloseEpisode(Neighbor::Prompt),
-            ]);
-            assert_eq!(total_blanks(&emits), 0);
-            assert_eq!(
-                emits[1].settle,
-                Settle::Erase,
-                "the stale prompt has to go, or reedline paints a second one below it",
-            );
-        }
-    }
-
-    /// The same wake, but something did run: the prompt row is real output's backdrop and must be
-    /// kept.
-    #[test]
-    fn a_wake_that_runs_something_keeps_the_prompt_it_broke_out_of() {
-        let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::PromptParked, Neighbor::Prompt),
-            Action::Block(BlockKind::Text),
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]);
-        assert_eq!(emits[1].settle, Settle::Terminate);
-        assert_eq!(emits[2].settle, Settle::Nothing);
-        assert_eq!(total_blanks(&emits), 2);
-    }
-
-    /// A blank line only makes a gap from column zero. An in-place status line is discarded rather
-    /// than terminated, because its row is not content.
-    #[test]
-    fn a_transient_row_is_erased_by_whatever_prints_next() {
-        let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::OpenTransient,
-            Action::Block(BlockKind::Text),
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]);
-        assert_eq!(emits[2].settle, Settle::Erase);
-        assert!(
-            emits[1].after_prompt_blank && !emits[2].after_prompt_blank,
-            "the opening blank is spent once, by the first thing on screen",
-        );
-
-        // Left drawn at the end of an episode it is still not content, so it must not survive into
-        // the prompt.
-        let leftover = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::Block(BlockKind::Text),
-            Action::OpenTransient,
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]);
-        assert_eq!(leftover[3].settle, Settle::Erase);
-    }
-
-    /// The shutdown path closes the last episode and then still has things to say, so closing an
-    /// already-closed episode has to be free rather than a second closing blank.
-    #[test]
-    fn closing_an_episode_twice_closes_it_once() {
-        let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::Block(BlockKind::Text),
-            Action::CloseEpisode(Neighbor::Prompt),
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]);
-        assert!(emits[2].before_prompt_blank);
-        assert!(!emits[3].before_prompt_blank);
-        assert_eq!(emits[3].settle, Settle::Nothing);
-
-        // The shape the sentence above actually names, which closing twice back-to-back does not
-        // reach: the shutdown path closes, says one more thing, and closes again. The parting word
-        // belongs to no episode, so it takes neither bracket.
-        //
-        // The episode prints nothing before closing, which is what leaves its opening blank still
-        // armed. With a block in there the blank is already spent and the first assertion holds
-        // whatever `CloseEpisode` does with it.
-        let parting_word = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::CloseEpisode(Neighbor::Prompt),
-            Action::Block(BlockKind::Chrome),
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]);
-        assert!(
-            !parting_word[2].after_prompt_blank,
-            "a closed episode owes no opening blank to what prints after it",
-        );
-        assert!(
-            !parting_word[3].before_prompt_blank,
-            "and cannot be bracketed a second time by it",
-        );
-    }
-
-    /// A log line takes a row of its own and spends no bracket. The row, because what it lands on
-    /// may be a status line about to be erased or a parked prompt; no bracket, because a log is
-    /// not the episode's output: counted, a warning at startup earns the first prompt a blank
-    /// above it, and one right after a typed line takes the blank owed to the answer.
-    #[test]
-    fn a_log_line_settles_its_row_and_spends_no_bracket() {
-        let at_startup = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Shell),
-            Action::AnnounceLog,
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]);
-        assert_eq!(
-            total_blanks(&at_startup),
-            0,
-            "a warning under the shell's command line is followed straight by the first prompt",
-        );
-
-        let before_the_answer = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::AnnounceLog,
-            Action::Block(BlockKind::Text),
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]);
-        assert!(
-            !before_the_answer[1].after_prompt_blank,
-            "the log line sits under the typed line",
-        );
-        assert!(
-            before_the_answer[2].after_prompt_blank,
-            "and the answer keeps the blank the typed line owes it",
-        );
-        assert!(before_the_answer[3].before_prompt_blank);
-
-        let over_a_status_line = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::OpenTransient,
-            Action::AnnounceLog,
-        ]);
-        assert_eq!(
-            over_a_status_line[2].settle,
-            Settle::Erase,
-            "the indicator is replaced, not written over",
-        );
-
-        let after_a_wake = run(BOTH, &[
-            Action::OpenEpisode(RowState::PromptParked, Neighbor::Prompt),
-            Action::AnnounceLog,
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]);
-        assert_eq!(
-            after_a_wake[1].settle,
-            Settle::Terminate,
-            "the parked prompt is moved past",
-        );
-        assert_eq!(
-            total_blanks(&after_a_wake),
-            0,
-            "and a wake that only logged leaves no gap before the prompt is redrawn",
-        );
-    }
-
-    /// Output the console cannot see still has to start on a row of its own. Enforced here rather
-    /// than by hand at each prompt, which is how the MCP elicitation path goes without: a server's
-    /// progress line parks the cursor mid-row, and meka's own chrome continuing that row is what
-    /// makes a forged prompt possible.
-    #[test]
-    fn foreign_output_settles_the_row_it_lands_on() {
-        let after_wake = run(BOTH, &[
-            Action::OpenEpisode(RowState::PromptParked, Neighbor::Prompt),
-            Action::AnnounceForeign,
-        ]);
-        assert_eq!(
-            after_wake[1].settle,
-            Settle::Terminate,
-            "the prompt row is content: move past it",
-        );
-
-        let after_status_line = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::OpenTransient,
-            Action::AnnounceForeign,
-        ]);
-        assert_eq!(
-            after_status_line[2].settle,
-            Settle::Erase,
-            "a status line is not content: replace it",
-        );
-    }
-
-    /// A status line drawn straight after a scheduler wake still has the drawn prompt beneath the
-    /// cursor, and that row is content: it has to be moved past, not overwritten.
-    #[test]
-    fn a_transient_line_moves_past_a_parked_prompt_rather_than_over_it() {
-        let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::PromptParked, Neighbor::Prompt),
-            Action::OpenTransient,
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]);
-        assert_eq!(emits[1].settle, Settle::Terminate);
-        assert!(
-            emits[1].after_prompt_blank,
-            "an indicator is the episode's first output like anything else",
-        );
-        assert_eq!(
-            emits[2].settle,
-            Settle::Erase,
-            "and the indicator itself is still not content",
-        );
-    }
-
-    #[test]
-    fn committing_a_transient_line_keeps_it_and_erasing_it_does_not() {
-        let committed = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::OpenTransient,
-            Action::CommitTransient,
-        ]);
-        assert_eq!(committed[2].settle, Settle::Terminate);
-
-        let erased = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::OpenTransient,
-            Action::EraseTransient,
-        ]);
-        assert_eq!(erased[2].settle, Settle::Erase);
-
-        // Neither writes anything when no indicator is drawn, which is what lets the frontend call
-        // them from a dispatch that cannot know.
-        let absent = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::CommitTransient,
-            Action::EraseTransient,
-        ]);
-        assert_eq!(absent[1].settle, Settle::Nothing);
-        assert_eq!(absent[2].settle, Settle::Nothing);
-    }
-
-    /// The opening blank fires before the episode's *first* output whatever that turns out to be,
-    /// so a session-id notice can no longer print above it.
-    #[test]
-    fn the_opening_blank_precedes_whatever_prints_first() {
-        let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::Block(BlockKind::Chrome),
-            Action::Block(BlockKind::Text),
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]);
-        assert!(emits[1].after_prompt_blank);
-        assert!(!emits[2].after_prompt_blank);
-    }
-
-    /// Intra-episode separators are the block machine's, not the prompt brackets', so they are
-    /// unaffected by either flag.
-    #[test]
-    fn block_separators_do_not_follow_the_prompt_flags() {
-        for spacing in [BOTH, NEITHER, BEFORE_ONLY, AFTER_ONLY] {
-            let emits = run(spacing, &[
-                Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-                Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
-                Action::Block(BlockKind::Text),
-                Action::CloseEpisode(Neighbor::Prompt),
-            ]);
-            assert!(
-                emits[2].separator_blank,
-                "text after a tool indicator is always separated from it",
-            );
-            let adjacent = run(spacing, &[
-                Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-                Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
-                Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
-                Action::CloseEpisode(Neighbor::Prompt),
-            ]);
-            assert!(
-                !adjacent[2].separator_blank,
-                "a run of summary indicators reads as a list of steps",
-            );
-        }
-    }
-
-    /// A standalone block is set off on both sides whatever its neighbors: after a tool indicator,
-    /// before text, before another indicator, before thinking. Right under the prompt it asks for
-    /// nothing, since the episode's own blank is already there.
-    #[test]
-    fn a_standalone_block_is_set_off_on_both_sides() {
-        let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::Block(BlockKind::Standalone),
-            Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
-            Action::Block(BlockKind::Standalone),
-            Action::Block(BlockKind::Text),
-            Action::Block(BlockKind::Standalone),
-            Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
-            Action::Block(BlockKind::Standalone),
-            Action::Block(BlockKind::Thinking),
-            Action::CloseEpisode(Neighbor::Prompt),
-        ]);
-        assert!(
-            !emits[1].separator_blank,
-            "under the prompt, the episode's blank serves"
-        );
-        assert!(emits[1].after_prompt_blank);
-        assert!(emits[2].separator_blank, "an indicator after it is set off");
-        assert!(emits[3].separator_blank, "and it after an indicator");
-        assert!(emits[4].separator_blank, "text after it");
-        assert!(emits[5].separator_blank, "and it after text");
-        assert!(emits[6].separator_blank);
-        assert!(emits[7].separator_blank);
-        assert!(emits[8].separator_blank, "thinking after it");
+    fn finishing_closes_the_block_and_erases_a_leftover_status_line() {
+        let mut console = Console::new(RenderMode::Raw);
+        console.start(RowState::Empty);
+        console.text_delta("half an answer");
+        console.force_row(RowState::Transient);
+        console.finish();
+        assert!(!console.has_open_text());
+        assert_eq!(console.row(), RowState::Empty);
+        console.finish();
+        assert_eq!(console.row(), RowState::Empty);
     }
 
     /// Claude sends an estimate and a text delta from one wire event once the token-count beta
@@ -1347,20 +711,5 @@ mod tests {
             !indicator_may_draw(Some(StreamKind::Thinking)),
             "the block's own text is the progress, and drawing over it would close the block",
         );
-    }
-
-    /// `printed` means "the episode did something", not "a blank was written", or turning the
-    /// spacing off would also turn off the closing bracket's condition.
-    #[test]
-    fn output_is_recorded_even_when_no_blank_is_printed() {
-        let mut state = State::new();
-        for action in [
-            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
-            Action::Block(BlockKind::Text),
-        ] {
-            let (_, next) = step(state, NEITHER, action);
-            state = next;
-        }
-        assert!(state.printed());
     }
 }

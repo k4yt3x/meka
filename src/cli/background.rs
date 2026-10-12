@@ -1,4 +1,4 @@
-//! Listing and canceling background tasks from outside the agent.
+//! Showing and canceling background tasks from outside the agent.
 //!
 //! Read-and-cancel only, for the same reason [`crate::cli::schedule`] is: *starting* one needs a
 //! session for the result to be reported into, and the decision to detach belongs to the agent
@@ -8,72 +8,6 @@ use crate::{
     error::{MekaError, Result},
     store::{Store, background::TaskStatus},
 };
-
-/// Ceiling on the tool name. Server-chosen, so nothing else bounds it, and `show` has it in full.
-const TOOL_TRUNCATE: usize = 24;
-
-/// Ceiling on the command line a task ran, so the result keeps a share of the row. Chosen with
-/// [`TOOL_TRUNCATE`] so that a row whose fixed cells are all at their widest (`completed`, a
-/// seven-column elapsed) still leaves the result its floor.
-const LABEL_TRUNCATE: usize = 36;
-
-/// The listing's columns: the id prefix `show` and `cancel` accept, three facts, the two cells the
-/// model or a program wrote for information, and the result spending the rest.
-const TASK_COLUMNS: [crate::text::Column; 6] = [
-    crate::text::Column::content("ID"),
-    crate::text::Column::content("Status"),
-    crate::text::Column::capped("Tool", TOOL_TRUNCATE),
-    crate::text::Column::capped("What", LABEL_TRUNCATE),
-    crate::text::Column::content("Elapsed"),
-    crate::text::Column::remainder("Result"),
-];
-
-/// `/task` in the REPL: one row per task in this conversation.
-pub(crate) async fn run_list_for_session(store: &Store, session: uuid::Uuid) -> Result<()> {
-    render(
-        store
-            .background_store()
-            .list_background_tasks(session)
-            .await?,
-        crate::render::Stream::Stderr,
-    )
-}
-
-fn render(
-    tasks: Vec<crate::store::background::BackgroundTask>,
-    stream: crate::render::Stream,
-) -> Result<()> {
-    if tasks.is_empty() {
-        // stderr: an empty list is a status note, not the data a script asked for.
-        crate::streams::write_stderr_line("No background tasks.");
-        return Ok(());
-    }
-
-    stream.write(crate::text::format_table(&TASK_COLUMNS, &task_rows(&tasks)))?;
-    Ok(())
-}
-
-/// One row per task, separated from printing so the layout can be asserted.
-fn task_rows(tasks: &[crate::store::background::BackgroundTask]) -> Vec<Vec<String>> {
-    let ids: Vec<&str> = tasks.iter().map(|task| task.id.as_str()).collect();
-    let id_width = crate::text::unique_prefix_len(ids.iter().copied()).max("ID".len());
-    tasks
-        .iter()
-        .map(|task| {
-            vec![
-                task.id.get(..id_width).unwrap_or(&task.id).to_string(),
-                task.status.name().to_string(),
-                task.tool.clone(),
-                crate::text::prose_cell(&task.label),
-                format_elapsed(task),
-                match &task.outcome {
-                    Some(outcome) if task.status.is_terminal() => crate::text::prose_cell(outcome),
-                    _ => "-".to_string(),
-                },
-            ]
-        })
-        .collect()
-}
 
 /// `/task show <id>`: one task, with the id in full.
 ///
@@ -438,42 +372,5 @@ mod tests {
                 .await
                 .is_err()
         );
-    }
-
-    /// The table has a budget, and both cells that carry authored text respect it.
-    ///
-    /// `tool` is chosen by an MCP server, so nothing else bounds it, and a long one would push
-    /// every later column off the screen.
-    #[test]
-    fn the_task_table_fits_its_budget_and_sanitizes_what_it_did_not_write() {
-        let task = BackgroundTask {
-            id: uuid::Uuid::new_v4().to_string(),
-            session_id: uuid::Uuid::new_v4(),
-            tool: "mcp__a_very_long_server_name__an_even_longer_tool".to_string(),
-            label: "cargo test\u{1b}[31m\n1234abcd  running  x  y  z  forged".to_string(),
-            status: TaskStatus::Completed,
-            outcome: Some("out\u{1b}[31m\nput ".to_string() + &"x".repeat(400)),
-            scratchpad_entry: None,
-            started_at: chrono::Utc::now(),
-            finished_at: Some(chrono::Utc::now()),
-            announced_at: None,
-            delivered_at: None,
-            subagent_id: None,
-        };
-
-        let table = crate::text::format_table(&TASK_COLUMNS, &task_rows(&[task]));
-        assert_eq!(table.lines().count(), 2, "one task, one row: {table}");
-        for line in table.lines() {
-            assert!(
-                !line.contains('\u{1b}'),
-                "a line reaches a terminal verbatim, so an escape may not survive: {line:?}"
-            );
-            let width = crate::text::display_width(line);
-            assert!(
-                width <= crate::text::TABLE_WIDTH,
-                "the row spends {width} of a {} budget: {line}",
-                crate::text::TABLE_WIDTH
-            );
-        }
     }
 }

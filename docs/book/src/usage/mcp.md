@@ -96,7 +96,7 @@ authorized 'notion'
 
 The probe and the auto-login only run for HTTP servers, and only when the user didn't provide `--auth-token-stdin` (static bearer) or `--auth` (other than `oauth`). Stdio servers skip both.
 
-Only `meka mcp login` runs the browser flow. A host that connects a server and finds no stored credential (the REPL at startup, `meka serve`, `meka acp`, `/mcp reconnect`) marks it failed and names `meka mcp login <name>` as the remedy, rather than printing a URL to a terminal nobody may be watching.
+Only `meka mcp login` runs the browser flow. A host that connects a server and finds no stored credential (the screen at startup, `meka serve`, `meka acp`, `/mcp reconnect`) marks it failed and names `meka mcp login <name>` as the remedy, rather than printing a URL to a terminal nobody may be watching.
 
 ### Remote hosts / SSH sessions
 
@@ -120,12 +120,13 @@ http://127.0.0.1:46437/callback?code=…&state=…     ← paste here
 authorized 'notion'
 ```
 
-### REPL parity
+### Slash command parity
 
-Inside the REPL:
-- `/mcp list` (or a bare `/mcp`): list configured servers.
+On the screen:
+- `/mcp list` (or a bare `/mcp`): a picker of the configured servers with their state; Enter offers reconnect, login and logout for the picked one.
 - `/mcp reconnect <server>`: reconnect smoke-test.
-- `/mcp login <server>` / `/mcp logout <server>`: run the auth flow or revoke.
+- `/mcp login <server>` / `/mcp logout <server>`: run the auth flow or revoke. On the screen the
+  URL and the paste field above are one question in the composer's place; Esc on it ends the login.
 - `/mcp <server>:<prompt> [args...]`: render a server-defined prompt as the next user turn.
 
 ## Resources and prompts
@@ -162,11 +163,11 @@ Both are tuning knobs: rarely needed, but useful if you're running ~30 stdio ser
 - **Progress notifications**: MCP tool calls attach a per-request `progressToken`; incoming `notifications/progress` render as a live status line under the tool invocation.
 - **Call identity**: `tools/call` carries two extra keys in `_meta` alongside the progress token. `meka/sessionId` is the id (a UUID) of the session the call came from, letting a server scope per-session state (a cache, a workspace, an audit trail) to one conversation; a sub-agent reports its own child session id. `meka/toolUseId` is the provider's tool-use id for the call. Both are absent for calls made outside a session, such as connection-time handshakes.
 - **Server instructions**: `InitializeResult.instructions` is captured once per connection and delivered in the per-turn context (sanitized and truncated to 2048 chars) under `[MCP server instructions]`. A server that connects late, or reconnects with different instructions, is announced as a change rather than rewriting anything already sent.
-- **stdio server logs**: a stdio server's own stderr (many servers log there) is captured, not inherited, so it never corrupts the REPL display. Each line is re-emitted on meka's `tracing` stream at `debug` level tagged with the server name, so it stays silent at default verbosity and surfaces under `-v` / `RUST_LOG`.
+- **stdio server logs**: a stdio server's own stderr (many servers log there) is captured, not inherited, so it never corrupts the screen display. Each line is re-emitted on meka's `tracing` stream at `debug` level tagged with the server name, so it stays silent at default verbosity and surfaces under `-v` / `RUST_LOG`.
 - `resources/list_changed`, `prompts/list_changed`, and `resources/updated` notifications are logged at `info`/`debug` level.
 
 ## Server-to-client features
 
 | Feature | meka behavior |
 |---------|----------------|
-| `elicitation/create` | Routed to the calling session's frontend (REPL / ACP form or URL prompt) with a 60s timeout, when the server's in-flight tool calls all come from one session. Declined, with a warning, when no tool call is in flight, when the user does not answer in time, or when two sessions have calls in flight on the same server: the protocol ties an elicitation to nothing that names the call that provoked it, so routing it would be a guess. |
+| `elicitation/create` | Routed to the calling session's frontend (screen / ACP form or URL prompt) with a 60s timeout, when the server's in-flight tool calls all come from one session. Declined, with a warning, when no tool call is in flight, when the user does not answer in time, or when two sessions have calls in flight on the same server: the protocol ties an elicitation to nothing that names the call that provoked it, so routing it would be a guess. |

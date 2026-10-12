@@ -18,7 +18,7 @@ max_tasks = 10   # concurrent per session
 
 This changes the contract of the primary interaction. Without it, you ask and the agent answers. With it, you ask, the agent answers, and something else may interrupt you several minutes later.
 
-That is right for an **assistant** that runs unattended, keeps talking while work proceeds, and reports when it lands. It is usually wrong for the interactive case, someone at a terminal using the REPL like a command line, where blocking is what you want and asynchrony is a surprise.
+That is right for an **assistant** that runs unattended, keeps talking while work proceeds, and reports when it lands. It is usually wrong for the interactive case, someone at a terminal using the screen like a command line, where blocking is what you want and asynchrony is a surprise.
 
 Every other capability block (`[schedule]`, `[skills]`, `[memory]`) defaults on. This one does not, because those add capability without changing when a turn ends.
 
@@ -49,9 +49,9 @@ The agent then carries on. When the task ends, its outcome arrives as a new turn
 test result: ok. 1674 passed; 0 failed
 ```
 
-That is the model's prompt. The REPL does not echo it, any more than it prints a tool's output:
-a stage direction above the reply says what reported, `(background task 7f3a1c22 finished after
-12m 4s, reporting)`, and the reply carries the result. Under `meka serve` the text rides the feed
+That is the model's prompt. The screen does not echo it, any more than it prints a tool's output:
+a stage direction above the reply says what reported, `background task 7f3a1c22 finished after
+12m 4s, reporting`, and the reply carries the result. Under `meka serve` the text rides the feed
 as a `notice`, and an ACP editor shows it as the user turn it is.
 
 Running tasks also appear in the per-turn context under `[Background]`, so the agent can see what it already started and does not launch a second copy:
@@ -76,7 +76,7 @@ Every task ends in one of four states, and every one of them is reported (as a t
 | `canceled` | Stopped on request, via `task_cancel`, `/task cancel`, or a second Ctrl+C |
 | `interrupted` | The process holding it went away |
 
-`interrupted` is the one that matters most. A task in flight when meka exits cannot be resumed, so it is retired and reported the next time something takes ownership of that session: a REPL resume, a `meka serve` reattach, or an ACP `session/load`. Nothing is written at exit; the *next* owner does the retiring, because holding the session lock is what proves the previous owner is gone. Without this the agent would wait forever on a result it had usually already promised someone.
+`interrupted` is the one that matters most. A task in flight when meka exits cannot be resumed, so it is retired and reported the next time something takes ownership of that session: a screen resume, a `meka serve` reattach, or an ACP `session/load`. Nothing is written at exit; the *next* owner does the retiring, because holding the session lock is what proves the previous owner is gone. Without this the agent would wait forever on a result it had usually already promised someone.
 
 Large output is written to a [scratchpad](../tools/scratchpad.md) entry and the delivered turn carries the beginning plus the entry name, so a long build log does not occupy the conversation permanently.
 
@@ -112,9 +112,9 @@ the report with it. The task row is already stamped as reported and is not hande
 outcome is gone rather than redelivered. `meka session export` still has it: the log is append-only,
 and a rewind changes what the model sees rather than what was recorded.
 
-## Ctrl+C
+## Esc and Ctrl+C
 
-**The first Ctrl+C cancels the turn only. Background tasks keep running.**
+**The first Esc or Ctrl+C cancels the turn only. Background tasks keep running.**
 
 This is the shell's contract, where Ctrl+C signals the foreground process group and `&`-ed jobs survive. Losing a twenty-minute build to a keystroke aimed at the answer on screen is unrecoverable, and it is not what the keystroke meant.
 
@@ -125,13 +125,13 @@ meka prints what survived so nothing is hidden:
 2 background task(s) still running; stop them with `/task cancel --all`.
 ```
 
-A **second** Ctrl+C during the same turn stops them. Between turns, `/task cancel --all` is the route.
+A **second** press during the same turn stops them. Between turns, `/task cancel --all` is the route.
 
 ## Where it works
 
 | Host | Behavior |
 |------|-----------|
-| REPL | Full. Outcomes arrive between turns |
+| Screen | Full. Outcomes arrive between turns |
 | `meka serve` | Full, for sessions currently resident |
 | ACP | Full, for sessions the editor has open |
 | `--oneshot` | The run waits for outstanding tasks before exiting |

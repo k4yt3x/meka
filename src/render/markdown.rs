@@ -168,6 +168,11 @@ struct Builder {
     style: CompositeStyle,
     inline: InlineStyle,
     lists: Vec<ListLevel>,
+    /// Paragraphs opened inside the current list item. A loose item (one blank lines separate
+    /// from its neighbors) wraps its text in a paragraph, and that first paragraph is the item:
+    /// giving it a paragraph's style would drop the bullet. Later paragraphs of the same item have
+    /// no minimad shape of their own and render as paragraphs.
+    item_paragraphs: usize,
     /// Set while inside a blockquote, so paragraphs within it keep the quote styling that minimad
     /// expresses per line rather than as a container.
     quote_depth: usize,
@@ -184,6 +189,7 @@ impl Default for Builder {
             style: CompositeStyle::Paragraph,
             inline: InlineStyle::default(),
             lists: Vec::new(),
+            item_paragraphs: 0,
             quote_depth: 0,
             table: None,
             link_target: None,
@@ -233,7 +239,14 @@ impl Builder {
 
     fn start(&mut self, tag: Tag<'_>) {
         match tag {
-            Tag::Paragraph => self.style = self.block_style(),
+            Tag::Paragraph => {
+                if self.lists.is_empty() || self.item_paragraphs > 0 {
+                    self.style = self.block_style();
+                }
+                if !self.lists.is_empty() {
+                    self.item_paragraphs += 1;
+                }
+            }
             Tag::Heading { level, .. } => self.style = CompositeStyle::Header(header_depth(level)),
             Tag::BlockQuote(_) => {
                 self.quote_depth += 1;
@@ -276,8 +289,15 @@ impl Builder {
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
-            // An item ends without a separator: consecutive items belong to one list.
+            // A tight item ends without a separator: consecutive items belong to one list.
             TagEnd::Item => self.flush_composite(),
+            // A paragraph inside an item is what a loose list is made of, and the blank line the
+            // source put between its items is kept, since a run of long items reads as one slab
+            // without it.
+            TagEnd::Paragraph if !self.lists.is_empty() => {
+                self.flush_composite();
+                self.push_blank_line();
+            }
             TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::CodeBlock => self.end_block(),
             TagEnd::BlockQuote(_) => {
                 self.flush_composite();
@@ -344,6 +364,7 @@ impl Builder {
     fn start_item(&mut self) {
         // Close the previous item before adopting this one's style, so sibling items don't merge.
         self.flush_composite();
+        self.item_paragraphs = 0;
         // minimad caps nesting at three levels; deeper items clamp rather than disappear.
         let depth = self.lists.len().saturating_sub(1).min(3) as u8;
         match self.lists.last_mut() {

@@ -83,7 +83,7 @@ pub(crate) enum FireOutcome {
     /// The turn ran, or failed in a way that re-running would not fix.
     Ran,
     /// This host could not take the job now and the occurrence is restored rather than burnt. The
-    /// concrete cases are `meka serve` finding the session's file lock held by a REPL, which has
+    /// concrete cases are `meka serve` finding the session's file lock held by a screen, which has
     /// its own watcher and will run the job itself, and a process at its concurrent-turn cap,
     /// which takes the job on a later sweep.
     Deferred,
@@ -156,7 +156,7 @@ impl ResidentPermissions for ResidentAt {
 ///
 /// Every host answers a predicate rather than claiming a static set, because none of them can
 /// actually take every job: `meka serve` can revive any session but not one another process has
-/// locked, the REPL owns exactly the conversation it has open, and ACP owns whatever the editor
+/// locked, the screen owns exactly the conversation it has open, and ACP owns whatever the editor
 /// currently has open.
 ///
 /// Asked here rather than letting a host decline afterwards: `prepare` evaluates a job's gate
@@ -165,7 +165,7 @@ impl ResidentPermissions for ResidentAt {
 /// could never serve.
 #[derive(Clone)]
 pub(crate) enum SchedulerScope {
-    /// Only jobs belonging to this session. The REPL, which has exactly one conversation open.
+    /// Only jobs belonging to this session. The screen, which has exactly one conversation open.
     OneSession(uuid::Uuid),
     /// Jobs the predicate accepts, re-asked every sweep, so a host whose set of runnable jobs moves
     /// under it (ACP's open editors, serve's session locks) is never working from a snapshot.
@@ -261,9 +261,9 @@ where
 /// One sweep: evaluate every due job in scope and fire what survives, up to
 /// [`crate::config::ResolvedScheduleConfig::max_consecutive_fires`] turns per session.
 ///
-/// Public because the REPL drives it directly rather than from a timer. There, the agent loop owns
-/// the conversation and must be the one to run the turn, so a watcher only nudges reedline awake
-/// and this runs on the agent side. `meka serve` reaches it through [`spawn`] instead.
+/// Public because the screen drives it directly rather than from a timer. There, the host loop
+/// owns the conversation and must be the one to run the turn, so a watcher only hands the screen
+/// a wake and this runs on the host side. `meka serve` reaches it through [`spawn`] instead.
 ///
 /// What the budget buys is a seam, not a ceiling. A sweep contains the turns it fires (they are
 /// awaited here), so forty due jobs still cost forty turns however small the budget is; what
@@ -780,7 +780,7 @@ pub(crate) async fn prepare(
     // Lease the occurrence before doing anything that can fail or hang.
     //
     // This is what arbitrates between hosts, which is why it is conditional. Every `meka serve`,
-    // REPL and ACP session polls the same table, so one occurrence is in several hosts' due lists
+    // screen and ACP session polls the same table, so one occurrence is in several hosts' due lists
     // at once; whoever takes the lease owns it, and the rest return here having neither evaluated
     // the gate nor spent the occurrence.
     //

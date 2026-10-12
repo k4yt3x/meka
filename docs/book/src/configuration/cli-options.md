@@ -65,8 +65,8 @@ See [Sessions](../usage/sessions.md#exporting-a-session) for details.
 
 ### `history`
 
-View or clear the REPL input history that powers Up-arrow / Ctrl+R recall (distinct from saved
-sessions and from the `/history` slash command).
+View or clear the input history that powers Up-arrow / Ctrl+R recall (distinct from saved
+sessions).
 
 ```bash
 meka history list [-n <LIMIT>] [--format <FORMAT>]   # default 50; -n 0 shows all
@@ -187,15 +187,15 @@ meka serve --bind 0.0.0.0:8080
 
 ### `-p`, `--prompt <TEXT>`
 
-Run the agent's first turn immediately with this text as the user message, then drop into the REPL for follow-up. Pair with [`--oneshot`](#--oneshot) to exit after the first turn instead of opening the REPL. `-p -` reads the prompt from stdin, to end of input.
+Run the agent's first turn immediately with this text as the user message, then stay on the interactive screen for follow-up. Pair with [`--oneshot`](#--oneshot) to exit after the first turn instead of opening the screen. `-p -` reads the prompt from stdin, to end of input.
 
 ```bash
-meka -p "list all files larger than 1MB in the current directory"   # first turn, then REPL
+meka -p "list all files larger than 1MB in the current directory"   # first turn, then the screen
 meka --oneshot -p "list all files larger than 1MB"                  # first turn, then exit
 git diff | meka --oneshot -p -                                      # the prompt is the diff
 ```
 
-When omitted, meka starts the REPL with no initial input. There is no bare positional prompt, so a mistyped subcommand is an error rather than a session opened with the typo as its first turn.
+When omitted, meka opens the screen with no initial input. There is no bare positional prompt, so a mistyped subcommand is an error rather than a session opened with the typo as its first turn.
 
 ### `-c`, `--continue`
 
@@ -208,15 +208,22 @@ meka -c -p "and now add tests" # …with an opening prompt
 
 Starting fresh when there is no session yet is not an error; meka just begins a new one.
 
-### `-r`, `--resume <SESSION>`
+### `-r`, `--resume [SESSION]`
 
-Resume a specific session. Accepts either the full id or any unique leading prefix.
+Resume a specific session, or pick one. The value is the full id or any unique leading prefix;
+with nothing after it, the screen opens on a picker: the fifty newest sessions, filtered after `/`,
+Enter resuming the pick and Esc leaving you in a new session.
 
 ```bash
+meka -r                                          # pick from a list
 meka -r 550e8400-e29b-41d4-a716-446655440000     # full id
 meka -r 550e                                     # prefix; works if unique
 meka -r 550e -p "and now add tests"              # …with an opening prompt
 ```
+
+The value can be left off because nothing on the root command is positional: the prompt is `-p`,
+so `meka -r -p "fix it"` reads as a pick with an opening prompt. A scripted run has no screen to
+pick on, so `--oneshot -r` needs the session named.
 
 Errors if the session does not exist, the prefix matches multiple sessions (with the matching ids listed for disambiguation), or the session is locked by another meka instance.
 
@@ -274,7 +281,7 @@ host `/tmp` including every X11, D-Bus and tmux socket in it, which is a route s
 the sandbox. The cost is that a session started with `cd /tmp` has no write boundary, which is the
 safe direction to fail.
 
-The flag reaches the REPL, one-shot runs, and ACP sessions. It does **not** reach sessions created
+The flag reaches the interactive screen, one-shot runs, and ACP sessions. It does **not** reach sessions created
 through `POST /v1/sessions`, which are single-root by design, and therefore does not reach a
 scheduled turn under `meka serve` either: those run in the session the job belongs to, which the
 HTTP API created.
@@ -322,22 +329,6 @@ Disable streaming for this run. The agent waits for the complete response before
 meka --no-stream
 ```
 
-### `--render-mode <RENDERER>`
-
-Markdown render mode. Accepts `termimad` (default), `syntect`, or `raw`.
-
-- `syntect`: Syntax-highlighted markdown source, including per-language code blocks. Nothing is reflowed, so a table with long cells runs past the terminal width.
-- `termimad`: Rendered markdown, reflowed to the terminal: paragraphs re-wrap, wide tables wrap inside their box, and markers are consumed rather than shown. meka parses the CommonMark itself, so `-`/`+` bullets, `__bold__`, `_italic_`, ordered lists, and links all render. Colors come from the same theme as `syntect`, and fenced code blocks are syntax-highlighted by it.
-- `raw`: Raw markdown printed verbatim with aligned tables.
-
-`termimad` is the default: meka's own output is table-heavy (`task_list`, `scratchpad_list`, anything the model tabulates), and those run past the right edge under `syntect`. Pick `syntect` when you want to see the markdown source as the model wrote it.
-
-```bash
-meka --render-mode raw
-```
-
-Can also be set permanently via `display.render_mode` in the config file.
-
 ### `--instructions <STRING>`
 
 Standing [instructions](../usage/instructions.md) for this run, replacing the `instructions.md` file and both `MEKA_INSTRUCTIONS*` environment variables. Takes the text itself, not a path; use `"$(cat file.md)"` to read one.
@@ -348,10 +339,10 @@ meka --instructions "Be terse. No code fences in answers."
 
 ### `--skill <NAME>`
 
-Invoke a [skill](../usage/skills.md) as the first turn. Mirrors the REPL slash command [`/skill <name> [extra...]`](../usage/skills.md#invoking-a-skill-from-the-cli). `-p`, if given, is prepended to the rendered skill body as additional context. Pair with [`--oneshot`](#--oneshot) to exit after the turn instead of opening the REPL.
+Invoke a [skill](../usage/skills.md) as the first turn. Mirrors the slash command [`/skill <name> [extra...]`](../usage/skills.md#invoking-a-skill-from-the-cli). `-p`, if given, is prepended to the rendered skill body as additional context. Pair with [`--oneshot`](#--oneshot) to exit after the turn instead of opening the screen.
 
 ```bash
-meka --skill download-videos -p "https://example.com/video"             # first turn, then REPL
+meka --skill download-videos -p "https://example.com/video"             # first turn, then the screen
 meka --skill download-videos --oneshot -p "https://example.com/video"   # first turn, then exit
 ```
 

@@ -179,7 +179,7 @@ pub(crate) struct SessionResponse {
     ///
     /// `false` for a GC-evicted session, since eviction requires an idle session, and `true` for
     /// a sub-agent this process is running under its parent, which is never resident itself. A
-    /// session another process runs (a REPL open on it) reads as idle: only its file lock knows,
+    /// session another process runs (a screen open on it) reads as idle: only its file lock knows,
     /// and a read may not probe it.
     pub(crate) turn_in_flight: bool,
     /// Inbox items waiting to be appended. Reported for a loaded session only, since it is what a
@@ -544,7 +544,7 @@ pub(crate) async fn fork_session(
         .with("session_id", id.to_string()));
     }
 
-    // The locked fork, as the REPL's and ACP's: the copy's lock is taken before its row exists,
+    // The locked fork, as the screen's and ACP's: the copy's lock is taken before its row exists,
     // and handed to re-attach below, which cannot take a lock this process already holds (`flock`
     // is per open file description). Committing first and locking after left a window in which
     // `meka session delete --all` enumerated the copy, took the lock nobody held, and deleted it,
@@ -794,8 +794,8 @@ pub(crate) async fn list_sessions(
         })?;
 
     // Enrich DB rows with live in-memory metadata where available; sessions with no in-memory entry
-    // fall back to persisted columns, which are NULL for rows the HTTP server did not create (REPL,
-    // ACP, sub-agent, imported).
+    // fall back to persisted columns, which are NULL for rows the HTTP server did not create
+    // (screen, ACP, sub-agent, imported).
     let in_memory = state.sessions.read().await;
     let sessions = rows
         .iter()
@@ -1358,15 +1358,16 @@ pub(crate) async fn patch_session(
     }
 
     // The level and the approvals switch apply during a turn: tool dispatch reads both cells live,
-    // which is what makes the level a brake, and the REPL's Shift+Tab and ACP's `session/set_mode`
-    // move them mid-turn for that reason. The working directory and the profile are different. The
-    // file tools resolve every path against the live cwd cell, so a directory moved under a
-    // running turn moves its write fence, and the profile is a turn's wire. A body naming either
-    // claims the session the way compact and rewind do: `claim_idle` under the sessions read-lock,
-    // so DELETE's re-check sees it, then the conversation mutex, both held to the end of the
-    // handler across the row write, the cell writes and the agent swap. A turn arriving meanwhile
-    // finds the mutex held and answers 409, and so does a second PATCH naming these fields, which
-    // is accepted. A body naming only the level or the approvals switch claims nothing.
+    // which is what makes the level a brake, and the screen's Shift+Tab and ACP's
+    // `session/set_mode` move them mid-turn for that reason. The working directory and the
+    // profile are different. The file tools resolve every path against the live cwd cell, so a
+    // directory moved under a running turn moves its write fence, and the profile is a turn's
+    // wire. A body naming either claims the session the way compact and rewind do: `claim_idle`
+    // under the sessions read-lock, so DELETE's re-check sees it, then the conversation mutex,
+    // both held to the end of the handler across the row write, the cell writes and the agent
+    // swap. A turn arriving meanwhile finds the mutex held and answers 409, and so does a
+    // second PATCH naming these fields, which is accepted. A body naming only the level or the
+    // approvals switch claims nothing.
     //
     // A claim and not a read of `in_flight`: three awaits separate this point from the cell write,
     // and a turn admitted inside them ran in the new directory.
@@ -1739,9 +1740,10 @@ pub(crate) async fn delete_session(
     //
     // Two doors, by who holds the session's file lock. A resident entry holds it through
     // `entry.session_lock`, so the locked door would refuse this process's own claim. A session
-    // this process has not loaded may be open in a REPL or another server, and this is exactly the
-    // caller `delete_session_unless_attached` exists for: taking the plain door cascaded the rows
-    // away under a conversation that carried on until its next turn failed on a foreign key.
+    // this process has not loaded may be open in a screen or another server, and this is exactly
+    // the caller `delete_session_unless_attached` exists for: taking the plain door cascaded
+    // the rows away under a conversation that carried on until its next turn failed on a
+    // foreign key.
     let deleted = match removed.as_ref() {
         Some(_) => state.shared.store.delete_session(id).await,
         None => state.shared.store.delete_session_unless_attached(id).await,
@@ -1776,7 +1778,7 @@ pub(crate) async fn delete_session(
         // `background_tasks` rows with the session -- which is what makes this the last chance to
         // stop it. Without this the task and its whole process group run on with no row to find
         // them by, so `DELETE /v1/sessions/{id}/tasks/{task_id}` now 404s and only restarting the
-        // server (which still would not reap the process group) ends it. The REPL does the same
+        // server (which still would not reap the process group) ends it. The screen does the same
         // thing on its way out.
         let signaled = entry.release(state.shared.mcp_manager.as_ref()).await;
         if signaled > 0 {

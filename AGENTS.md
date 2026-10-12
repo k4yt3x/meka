@@ -244,7 +244,7 @@ One word per concept, everywhere it is written or read:
   Rows reach the printer raw; it sanitizes and cuts. A table handed to the model uses
   `format_columns`.
 - A top-level command whose verbs act on instances names the object in the singular (`account`,
-  `profile`, `session`, `skill`, `memory`, `schedule`, `tool`, the REPL's `/task`); a command over
+  `profile`, `session`, `skill`, `memory`, `schedule`, `tool`, the screen's `/task`); a command over
   one thing keeps the concept's own word (`history`, `instructions`). `mcp tools <name>` lists a
   server's tools and is a verb, not a noun.
 - **`--format`** is the one output-format flag, on the run and on every `list`, `show` and `export`:
@@ -257,14 +257,14 @@ One word per concept, everywhere it is written or read:
 `info!` / `debug!` are silent unless the user passes `-v`, `-vv`, or `RUST_LOG`. Aim for quiet on
 success.
 
-`println!` / `eprintln!` only for: requested data; content the user must copy, type, or visit; REPL
-command output; and hard errors. Everything else is `tracing`.
+`println!` / `eprintln!` only for: requested data; content the user must copy, type, or visit; the
+lines around the screen (the session id on leaving); and hard errors. Everything else is `tracing`.
 
 The stream is a contract:
 
-- **stdout**: only the data the command was invoked to obtain. In the REPL that is the model's
-  answers (and the line editor, which draws there); every slash command's output, tables included,
-  is stderr.
+- **stdout**: only the data the command was invoked to obtain. In a one-shot run that is the
+  model's answer and nothing else; the interactive screen owns the terminal, draws everything on
+  stdout, and refuses a pipe.
 - **stderr**: everything else, including prompts, live UI, indicators, hints, status and errors,
   and every spacing blank line emitted around them.
 
@@ -307,14 +307,12 @@ output; don't demote it to `info!`.
   - Retiring a config key that held a secret gets no compatibility shim. It stops being modeled and
     `deny_unknown_fields` names the key and line; the upgrade guide carries the remedy.
 - **Environment variables are operational only**: `MEKA_CONFIG_DIR`, `MEKA_DATA_DIR`, permission,
-  instructions, sandbox backend, render mode, MCP tool timeout, `RUST_LOG`. Precedence is CLI > env
+  instructions, sandbox backend, MCP tool timeout, `RUST_LOG`. Precedence is CLI > env
   > file, written as `cli.x.or_else(env).or(file)` in `ResolvedConfig::resolve`, and every layer
   below the hosts takes the result as a value. `tests/layering.rs` keeps every other file from
   reading a `MEKA_*` variable (`ENVIRONMENT_READERS`); `MEKA_CONFIG_DIR` and `MEKA_DATA_DIR` are
   `paths.rs`'s, because they locate the file `resolve` reads.
 - **Session and display tuning is config-only.** No env vars or flags for set-once preferences.
-  Render mode is the one exception, because the program that launches meka, not the user, knows
-  whether its output is a terminal.
 - **Config sections keep one order**, the same on the reference page (`config-file.md`) and in
   `ConfigFile`'s fields, which is the order a file is best written in: the multi-entry blocks
   first (`default_profile`, `[accounts.*]`, `[profiles.*]`, `[mcp]`), then each flat table from
@@ -437,7 +435,7 @@ change meaning with `action` is a family that wants splitting.
 
 ## Layering
 
-The tree reads top-down. `src/main.rs` dispatches to `host/` and `cli/`; the REPL's slash commands
+The tree reads top-down. `src/main.rs` dispatches to `host/` and `cli/`; the screen's slash commands
 run the `cli` handlers, so `host` sits above `cli`. Both call `agent`, which calls `tools`, which
 calls `provider` and `mcp`, which call `store`. `mcp` publishes its tools and never names a registry;
 `tools/mcp_adapter.rs` is where they become `Tool`s. `render` and `console` are reached only from

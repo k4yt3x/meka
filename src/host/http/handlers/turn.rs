@@ -100,13 +100,14 @@ pub(crate) struct ImageInput {
 pub(crate) struct TurnOptions {
     /// Optional installed-skill name. When set, `message` is combined with the skill's body (user
     /// text first, then the skill body) before the agent runs, matching `/skill <name> <prompt>`
-    /// in the REPL and the `--skill` CLI flag. An unknown skill is a 422.
+    /// on the screen and the `--skill` CLI flag. An unknown skill is a 422.
     #[serde(default)]
     pub(crate) skill: Option<String>,
     /// What becomes of `message` if the turn ends, failed or canceled, before anything from the
-    /// model reached the conversation. `keep` (default) leaves it in place, as the REPL does for a
-    /// prompt whose turn failed; `withdraw` takes it back, for a client that will resend it. Once
-    /// a partial answer or a tool call is in the conversation, the message stays regardless.
+    /// model reached the conversation. `keep` (default) leaves it in place, as the screen does for
+    /// a prompt whose turn failed; `withdraw` takes it back, for a client that will resend it.
+    /// Once a partial answer or a tool call is in the conversation, the message stays
+    /// regardless.
     #[serde(default)]
     #[schema(value_type = String)]
     pub(crate) unanswered_message: crate::conversation::PromptRetention,
@@ -261,7 +262,7 @@ pub(crate) async fn submit_turn(
                     error,
                 )
             })?;
-        // The composition `--skill [PROMPT]` and the REPL's `/skill` use: the body alone when
+        // The composition `--skill [PROMPT]` and the screen's `/skill` use: the body alone when
         // nothing was typed, so a skill invoked without a message is a turn rather than a blank
         // line above one.
         if body.message.trim().is_empty() {

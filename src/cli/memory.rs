@@ -38,19 +38,8 @@ pub(crate) struct AddArgs<'a> {
     pub(crate) force: bool,
 }
 
-/// A table of every memory in index order, as the REPL's `/memory` prints it: plain, on stderr.
-pub(crate) async fn run_list(store: &MemoryStore) -> Result<()> {
-    list(
-        store,
-        crate::cli::OutputFormat::Plain,
-        crate::render::Stream::Stderr,
-    )
-    .await
-}
-
-/// [`run_list`] under a chosen format and stream. The REPL's `/memory` has no format flag and
-/// takes the door above; `--format json` prints `{"memories": [...]}`, the shape `GET /v1/memory`
-/// answers with.
+/// `meka memory list` under a chosen format and stream: a table of every memory in index order,
+/// or under `--format json` `{"memories": [...]}`, the shape `GET /v1/memory` answers with.
 pub(crate) async fn list(
     store: &MemoryStore,
     format: crate::cli::OutputFormat,
@@ -141,8 +130,9 @@ pub(crate) async fn run_show(store: &MemoryStore, name: &str) -> Result<()> {
     .await
 }
 
-/// [`run_show`] under a chosen format; the REPL's `/memory <name>` takes the door above. The object
-/// carries the body as stored, since it is data rather than something a terminal will act on.
+/// [`run_show`] under a chosen format; the screen's `/memory <name>` takes the door above. The
+/// object carries the body as stored, since it is data rather than something a terminal will act
+/// on.
 pub(crate) async fn show(
     store: &MemoryStore,
     name: &str,

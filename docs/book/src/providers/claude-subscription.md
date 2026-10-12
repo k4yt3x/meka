@@ -65,7 +65,7 @@ the default, sends `thinking.display = "summarized"` and streams a short readabl
 is what Claude Code sends with its `showThinkingSummaries` setting on. `updates`, Claude Code's
 own default since 2.1.263, sends `thinking.display = "updates"` under the
 `thinking-display-updates-2026-08-18` beta: the server streams a running token count instead of
-the text, which the REPL draws as `Thinking... (150 tokens)`. `redacted` sends the
+the text, which the screen draws as `Thinking · 150 tokens`. `redacted` sends the
 `redact-thinking-2026-02-12` beta and no display field, and the server may answer with opaque
 `redacted_thinking` blocks. In every mode the `thinking` blocks come back signed, and meka stores
 and replays them verbatim, so multi-turn reasoning continuity is maintained. With thinking off

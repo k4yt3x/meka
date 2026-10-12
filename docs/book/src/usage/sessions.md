@@ -18,6 +18,18 @@ meka -c
 
 This resumes the most recently updated session. `-c` takes no value; give an opening prompt with `-p`: `meka -c -p "and now add tests"`.
 
+### From a list
+
+```bash
+meka -r
+```
+
+With nothing after `-r`, the screen opens on a picker: the fifty newest root sessions, each with
+its directory, its profile and when it was last touched at the right edge. `/` then typing filters the
+list, j and k move the pick, Enter resumes the pick, and Esc leaves you in a new session. The same picker opens from a running session with
+`/resume`, and `/resume <id>` switches to a session by id or unique prefix; either way the lock
+moves with you and the session you left stays as it was.
+
 ### By id
 
 ```bash
@@ -58,7 +70,7 @@ against its own.
 Naming `--profile` on a resume **repins the session**: the row is rewritten, so it keeps that
 profile from then on rather than for one run. `--permission` repins the same way.
 
-You can also change the profile mid-session: `/profile <name>` in the REPL,
+You can also change the profile mid-session: `/profile <name>` on the screen,
 `PATCH /v1/sessions/{id}` with `{"profile": "..."}` over HTTP, or the Profile picker in an ACP
 client. Each rewrites the row.
 
@@ -134,7 +146,7 @@ the words of `messages` that [`meka session search`](#searching-sessions) reads.
 seven more, which the features that own them document: `scheduled_jobs`
 ([scheduling](./scheduling.md)), `background_tasks` ([background work](./background.md)),
 `memories` and its `memories_fts` full-text index ([memory](./memory.md)), `prompt_history` (the
-REPL's [input history](./interactive-mode.md#input-history)), and `account_credentials` and
+screen's [input history](./interactive-mode.md#input-history)), and `account_credentials` and
 `mcp_credentials` (secrets, never in `config.toml`).
 
 **sessions**, one row per session:
@@ -213,7 +225,7 @@ Deleting a session also removes its messages, scratchpad entries, and any sub-ag
 
 A session is locked from the moment it exists: the lock is taken before the row is written, so a sweep in another terminal cannot catch it in between. That holds for new sessions, for sub-agent sessions, for forks made from any surface, and for the root of an imported archive while it is written. Copying a conversation holds it still too: every fork door (`meka session fork`, `/fork`, `POST /v1/sessions/{id}/fork`, ACP `session/fork`) and `meka session export` refuse a session another process has open, because a copy taken mid-turn ends on a user message the model never answered and restores as an unusable session. `meka session rewind` has always done this.
 
-No deletion touches a session another meka process has open. Naming one by id fails and says so; `--all`, `--older-than-days` and the startup sweep skip it and report how many they left behind. This matters most for the startup sweep, because only turns bump a session's timestamp (resuming does not), so a REPL left at its prompt past the window looks expired while somebody is sitting in front of it.
+No deletion touches a session another meka process has open. Naming one by id fails and says so; `--all`, `--older-than-days` and the startup sweep skip it and report how many they left behind. This matters most for the startup sweep, because only turns bump a session's timestamp (resuming does not), so a screen left at its prompt past the window looks expired while somebody is sitting in front of it.
 
 See [Config file](../configuration/config-file.md#session) for details.
 
@@ -406,7 +418,7 @@ back to being labeled by its first words:
 meka session set 550e8400 title ""
 ```
 
-From the REPL, `/title <text>` titles the session you are in and bare `/title` shows the current
+From the screen, `/title <text>` titles the session you are in and bare `/title` shows the current
 one. Over HTTP it is `PATCH /v1/sessions/{id}` with `{"title": "..."}`. Titling a session does not
 move its `updated_at`, so it stays where it was in the listing and `meka -c` still continues the
 session you last used, not the one you last renamed. A fork carries the title with it, since it
@@ -554,7 +566,7 @@ its own, and it is continued through `agent_followup` like any other sub-agent.
 
 Forking copies what has been committed to the store, and only between turns. A session another meka process has open is refused rather than copied (see [Session locking](#session-locking)), and so is one with a turn in flight in the process that holds it: `POST /v1/sessions/{id}/fork` answers `409` `turn-in-flight` and ACP `session/fork` answers `InvalidParams`. The user message is persisted before the model is called, so a copy taken mid-turn would end on a prompt with no reply and restore as an unusable session. Cancel the turn or wait for it.
 
-The same operation is available from the REPL as `/fork`, which switches you into the copy and leaves the original where you branched (an `always` or `never` given at an approval prompt stays with the original; see [Permissions](permissions.md#approvals)); over HTTP as `POST /v1/sessions/{id}/fork`; and over ACP as `session/fork`.
+The same operation is available from the screen as `/fork`, which switches you into the copy and leaves the original where you branched (an `always` or `never` given at an approval prompt stays with the original; see [Permissions](permissions.md#approvals)); over HTTP as `POST /v1/sessions/{id}/fork`; and over ACP as `session/fork`.
 
 ### Fork or export/import?
 
@@ -571,7 +583,7 @@ meka session rewind 550e8400-e29b-41d4-a716-446655440000 -n 3
 
 The cut lands on a turn boundary, so a tool call is never separated from its result, and a compaction summary counts as a turn, so a rewind that reaches it removes the summary too. Nothing is deleted: the dropped turns stay in the event log and still appear in `meka session export`, marked at the point of the rewind. The model simply stops seeing them.
 
-The command takes the session lock, so it refuses to run while a REPL, `meka serve`, or `meka acp` holds the session; that process has its own copy of the conversation in memory and would write over the rewind on its next turn. In the REPL use `/rewind` instead. Under ACP there is no in-session equivalent, so close the session in the editor and run this command; over HTTP, `POST /v1/sessions/{id}/rewind` does the same to a live session.
+The command takes the session lock, so it refuses to run while a screen, `meka serve`, or `meka acp` holds the session; that process has its own copy of the conversation in memory and would write over the rewind on its next turn. On the screen use `/rewind` instead. Under ACP there is no in-session equivalent, so close the session in the editor and run this command; over HTTP, `POST /v1/sessions/{id}/rewind` does the same to a live session.
 
 Its main use is recovering a session a provider has started rejecting. A provider validates the whole conversation on every request, so one piece of content it rejects fails every later turn too.
 
@@ -627,7 +639,7 @@ pinned ones included.
 
 ## Input history
 
-Separate from your saved conversations, meka keeps a rolling history of the prompts you *type* at the REPL, so **Up-arrow** recall and **Ctrl+R** reverse-search work across runs (shell-style). This is distinct from a session (a stored conversation) and from the `/history` slash command (which reprints the current conversation).
+Separate from your saved conversations, meka keeps a rolling history of the prompts you *type* on the screen, so **Up-arrow** recall and **Ctrl+R** reverse-search work across runs (shell-style). This is distinct from a session (a stored conversation), which the screen reads back as you scroll up.
 
 List recent input-history entries (oldest first; `-n 0` shows all), one per line, or as
 `{"history": [...]}` with `--format json`:

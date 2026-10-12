@@ -410,7 +410,7 @@ impl InboxStore {
             .call(move |connection| -> rusqlite::Result<Vec<String>> {
                 // `IMMEDIATE`, as every read-then-write transaction in the store is: a deferred
                 // one that read while another process wrote cannot upgrade, and SQLite answers
-                // that with `SQLITE_BUSY` at once, past the busy timeout, so a REPL beside
+                // that with `SQLITE_BUSY` at once, past the busy timeout, so a screen beside
                 // `serve` leaves the items appended and a rewind then delivers them again.
                 let transaction = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -845,7 +845,7 @@ mod tests {
 
     /// The delivery mark takes the write lock up front. A deferred transaction that read while
     /// another process wrote cannot upgrade, and SQLite answers that with `SQLITE_BUSY` at once,
-    /// past the busy timeout; a REPL beside `serve` then leaves the items appended, and a rewind
+    /// past the busy timeout; a screen beside `serve` then leaves the items appended, and a rewind
     /// delivers them again. A second connection stands in for the other process, writing and
     /// committing while the mark would sit between its read and its write.
     #[tokio::test]

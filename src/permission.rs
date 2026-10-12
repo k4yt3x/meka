@@ -1,7 +1,7 @@
 //! Permission state machine governing what tools the agent may invoke. Levels: `none` (read-only,
 //! no env info), `read` (filesystem reads), `workspace` (writes confined to the workspace roots),
-//! `unrestricted` (no boundary at all). The level is held in an [`AtomicU8`] so the REPL can mutate
-//! it concurrently with the agent loop.
+//! `unrestricted` (no boundary at all). The level is held in an [`AtomicU8`] so the screen can
+//! mutate it concurrently with the agent loop.
 //!
 //! Beside the level sits one switch, **approvals**: whether a call needing more than the level is
 //! submitted to the user for approval rather than refused. The level bounds *reach* and the switch
@@ -84,24 +84,13 @@ impl Permission {
         }
     }
 
-    /// Single-character prompt indicator: the level name's first letter. Display only; the flag
-    /// and the config file take the full name and nothing else.
-    pub(crate) fn indicator(self) -> &'static str {
-        match self {
-            Permission::None => "n",
-            Permission::Read => "r",
-            Permission::Workspace => "w",
-            Permission::Unrestricted => "u",
-        }
-    }
-
     /// Prompt-indicator color. Green, yellow, orange and red form one temperature ramp over the
     /// four levels.
     ///
     /// Orange is spelled as truecolor rather than `DarkYellow`, which renders as olive or brown on
     /// most themes and would be confusable with the `Yellow` immediately below it in the cycle.
-    /// `Color::Rgb` is already what the prompt line uses (`crate::config::default_input_style`), so
-    /// this adds no assumption that was not being made one column to the left.
+    /// `Color::Rgb` is what every truecolor terminal takes, and the levels are told apart by hue
+    /// rather than by a palette slot a theme can remap.
     pub(crate) fn indicator_color(self) -> Color {
         match self {
             Permission::None => Color::Green,
@@ -366,7 +355,7 @@ impl EnabledPermissions {
 }
 
 /// Lock-free shared handle to the current [`Permission`] level and the approvals switch. Cloned
-/// freely across agent, REPL, and tool-dispatch tasks. The REPL mutates it when the user cycles
+/// freely across agent, screen, and tool-dispatch tasks. The screen mutates it when the user cycles
 /// permission via `Shift+Tab` or `/permission`, or toggles `/approvals`; the dispatch loop reads it
 /// once at the enforcement site so mid-turn changes can't leave a tool acting on a stale snapshot.
 #[derive(Clone)]
@@ -834,20 +823,6 @@ mod tests {
         }
     }
 
-    /// The prompt's indicator is display, not a second name: one spelling per level, so the flag,
-    /// the environment variable and the config file all take the full word and nothing shorter.
-    #[test]
-    fn an_indicator_character_is_not_a_level_name() {
-        for level in EVERY {
-            assert_eq!(level.indicator().chars().count(), 1);
-            assert!(
-                Permission::from_str(level.indicator()).is_err(),
-                "indicator {} must not parse as {level}",
-                level.indicator()
-            );
-        }
-    }
-
     /// The refusal names every level, so a user typing a level meka does not have learns what it
     /// does have without a second lookup.
     #[test]
@@ -965,7 +940,7 @@ mod tests {
 
     /// A recorded level the enabled set excludes is read as no level at all, and said so once.
     ///
-    /// Every host reads a session's row through this. Before there was one definition the REPL
+    /// Every host reads a session's row through this. Before there was one definition the screen
     /// warned, ACP logged at `debug!` and the HTTP re-attach said nothing, so the same row was
     /// loud on one surface and silent on the other two.
     #[test]

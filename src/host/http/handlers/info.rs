@@ -72,7 +72,7 @@ pub(crate) async fn info(
     }))
 }
 
-/// `GET /v1/skills`: installed skill palette. Mirrors what the REPL `/skill` command and
+/// `GET /v1/skills`: installed skill palette. Mirrors what the screen's `/skill` command and
 /// the ACP `available_commands_update` notification surface.
 #[utoipa::path(
     get,

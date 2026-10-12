@@ -14,7 +14,7 @@ You describe the goal in natural language and the agent decides which tools to u
 
 The same agent core is exposed through four front-ends:
 
-- **Interactive**: a permission-gated REPL for conversational work in your terminal
+- **Interactive**: a permission-gated screen for conversational work in your terminal
 - **One-shot**: `meka --oneshot -p "..."` for scripts, pipelines, and CI
 - **Editor (ACP)**: run as an [Agent Client Protocol](https://agentclientprotocol.com/) agent inside editors like Zed
 - **HTTP service**: [`meka serve`](./usage/http-api.md) exposes the agent over HTTP+JSON for bots, web UIs, and other programs

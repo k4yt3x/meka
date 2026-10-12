@@ -38,7 +38,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: SessionAction,
     },
-    /// View or clear REPL input history
+    /// View or clear screen input history
     History {
         #[command(subcommand)]
         action: HistoryAction,
@@ -1030,9 +1030,9 @@ pub(crate) struct Cli {
     #[arg(short = 'c', long = "continue", conflicts_with = "resume")]
     pub(crate) continue_last: bool,
 
-    /// Resume a session by id or any unique prefix
-    #[arg(short = 'r', long = "resume", value_name = "SESSION")]
-    pub(crate) resume: Option<String>,
+    /// Resume a session by id or unique prefix, or pick one from a list
+    #[arg(short = 'r', long = "resume", value_name = "SESSION", num_args = 0..=1)]
+    pub(crate) resume: Option<Option<String>>,
 
     #[arg(
         long = "permission",
@@ -1075,17 +1075,6 @@ pub(crate) struct Cli {
     /// Disable streaming for this run (see `[display] stream`)
     #[arg(long = "no-stream")]
     pub(crate) no_stream: bool,
-
-    #[arg(
-        long = "render-mode",
-        value_name = "RENDERER",
-        help = listed(
-            "Markdown render mode",
-            crate::config::RenderMode::ALL.iter().map(|mode| mode.name()),
-            " (default: termimad)"
-        )
-    )]
-    pub(crate) render_mode: Option<crate::config::RenderMode>,
 
     /// Standing instructions for this run, replacing the discovered ones
     #[arg(long = "instructions", value_name = "STRING")]
@@ -1142,7 +1131,6 @@ impl Cli {
             sandbox_backend: self.sandbox_backend,
             writable_roots: self.writable_root.clone(),
             no_stream: self.no_stream,
-            render_mode: self.render_mode,
             resume: self.resume.clone(),
             continue_last: self.continue_last,
             prompt: self.prompt.clone(),
@@ -1207,7 +1195,6 @@ mod tests {
         assert!(cli.profile.is_none());
         assert_eq!(cli.format, OutputFormat::Plain);
         assert!(!cli.no_stream);
-        assert!(cli.render_mode.is_none());
         assert!(cli.skill.is_none());
         assert!(!cli.oneshot);
         assert!(cli.eager_load_tool.is_empty());
@@ -1338,10 +1325,21 @@ mod tests {
     fn cli_resume_specific_session() {
         let cli = Cli::parse_from(["meka", "-r", "550e8400-e29b-41d4-a716-446655440000"]);
         assert_eq!(
-            cli.resume.as_deref(),
-            Some("550e8400-e29b-41d4-a716-446655440000")
+            cli.resume,
+            Some(Some("550e8400-e29b-41d4-a716-446655440000".to_string()))
         );
         assert!(!cli.continue_last);
+    }
+
+    /// `-r` alone asks for the picker. The value can be optional because the root command has
+    /// no positional: the prompt is `-p`, so nothing after a bare `-r` is mistaken for a session.
+    #[test]
+    fn cli_bare_resume_asks_for_the_picker() {
+        let cli = Cli::parse_from(["meka", "-r"]);
+        assert_eq!(cli.resume, Some(None));
+        let cli = Cli::parse_from(["meka", "-r", "-p", "hi"]);
+        assert_eq!(cli.resume, Some(None));
+        assert_eq!(cli.prompt.as_deref(), Some("hi"));
     }
 
     /// `-c` takes no value: it would otherwise be the only root flag that could swallow the next
@@ -1356,7 +1354,10 @@ mod tests {
     #[test]
     fn cli_resume_takes_the_id_and_leaves_the_prompt() {
         let cli = Cli::parse_from(["meka", "-r", "550e8400", "-p", "fix the bug"]);
-        assert_eq!(cli.resume.as_deref(), Some("550e8400"));
+        assert_eq!(
+            cli.resume.as_ref().and_then(|given| given.as_deref()),
+            Some("550e8400")
+        );
         assert_eq!(cli.prompt.as_deref(), Some("fix the bug"));
     }
 
@@ -1408,11 +1409,10 @@ mod tests {
                 }
             })
         ));
-        let refused: [&[&str]; 7] = [
+        let refused: [&[&str]; 6] = [
             &["meka", "session", "export", "x", "--format", "md"],
             &["meka", "session", "export", "x", "--format", "JSON"],
             &["meka", "--oneshot", "-p", "x", "--format", "Json"],
-            &["meka", "--render-mode", "RAW", "-p", "x"],
             &["meka", "--sandbox-backend", "Landlock", "-p", "x"],
             &["meka", "--permission", "Read", "-p", "x"],
             &["meka", "mcp", "add", "s", "http://x", "--transport", "HTTP"],
@@ -1463,7 +1463,7 @@ mod tests {
     fn cli_resume_long_form() {
         let cli = Cli::parse_from(["meka", "--resume", "550e8400-e29b-41d4-a716-446655440000"]);
         assert_eq!(
-            cli.resume.as_deref(),
+            cli.resume.as_ref().and_then(|given| given.as_deref()),
             Some("550e8400-e29b-41d4-a716-446655440000")
         );
     }

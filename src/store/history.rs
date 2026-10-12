@@ -1,14 +1,13 @@
-//! The REPL's input history: the `prompt_history` table, one row per entry, global across sessions
-//! and runs so Up-arrow and Ctrl+R recall what the user typed in *any* previous run. Multi-line
-//! entries round-trip intact because each entry is a single TEXT column, not a line in a
+//! The screen's input history: the `prompt_history` table, one row per entry, global across
+//! sessions and runs so Up-arrow and Ctrl+R recall what the user typed in *any* previous run.
+//! Multi-line entries round-trip intact because each entry is a single TEXT column, not a line in a
 //! newline-delimited file.
 //!
-//! This is the SQL alone. What reedline needs of it is an adapter in the REPL,
-//! `host::repl::history`, because the store must not carry a line editor. It runs on its own
-//! synchronous connection: reedline's `History` trait is synchronous, and the store's connection is
-//! async. WAL and `busy_timeout` on both sides keep the two safe together. The table is the
-//! ledger's (`prompt_history_is_in_the_ledger`), so the store must have been opened once before
-//! this.
+//! This is the SQL alone. What the composer needs of it is a walk and a search in
+//! `host::tui::input`, because the store must not carry an editor. It runs on its own synchronous
+//! connection: a key press walks the history synchronously, and the store's connection is async.
+//! WAL and `busy_timeout` on both sides keep the two safe together. The table is the ledger's
+//! (`prompt_history_is_in_the_ledger`), so the store must have been opened once before this.
 
 use std::path::Path;
 
@@ -27,16 +26,13 @@ pub(crate) struct HistoryFilter {
 
 /// How a search's text is matched against `command_line`.
 pub(crate) enum CommandLineMatch {
-    Prefix(String),
     Substring(String),
-    Exact(String),
 }
 
 /// Which end of the history a search reads from first.
 #[derive(Clone, Copy)]
 pub(crate) enum HistoryOrder {
     NewestFirst,
-    OldestFirst,
 }
 
 /// The `prompt_history` table, on its own synchronous connection.
@@ -60,10 +56,6 @@ impl HistoryStore {
     }
 
     /// The most entries the table retains; `0` disables storage.
-    pub(crate) fn capacity(&self) -> usize {
-        self.capacity
-    }
-
     /// Most-recent entries, returned oldest-first for display. `limit == 0` returns all of them.
     pub(crate) fn recent(&self, limit: usize) -> Result<Vec<String>> {
         // SQLite treats a negative LIMIT as unbounded, so `0` maps to `-1` and needs no second
@@ -121,32 +113,6 @@ impl HistoryStore {
         Ok(id)
     }
 
-    /// One entry by id.
-    pub(crate) fn get(&self, id: i64) -> Result<Option<String>> {
-        self.connection
-            .query_row(
-                "SELECT command_line FROM prompt_history WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(database)
-    }
-
-    /// How many entries match `filter`.
-    pub(crate) fn count(&self, filter: &HistoryFilter) -> Result<i64> {
-        let (conditions, bindings) = where_clause(filter);
-        let mut sql = String::from("SELECT COUNT(*) FROM prompt_history");
-        if !conditions.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&conditions.join(" AND "));
-        }
-        let refs: Vec<&dyn ToSql> = bindings.iter().map(|binding| binding.as_ref()).collect();
-        self.connection
-            .query_row(&sql, refs.as_slice(), |row| row.get(0))
-            .map_err(database)
-    }
-
     /// Matching rows as `(id, command_line)`, in `order`, at most `limit` of them.
     pub(crate) fn search(
         &self,
@@ -162,7 +128,6 @@ impl HistoryStore {
         }
         sql.push_str(match order {
             HistoryOrder::NewestFirst => " ORDER BY id DESC",
-            HistoryOrder::OldestFirst => " ORDER BY id ASC",
         });
         if let Some(limit) = limit {
             sql.push_str(" LIMIT ?");
@@ -175,25 +140,6 @@ impl HistoryStore {
             .map_err(database)?;
         rows.collect::<rusqlite::Result<Vec<(i64, String)>>>()
             .map_err(database)
-    }
-
-    /// Replace one entry's text.
-    pub(crate) fn update(&self, id: i64, command_line: &str) -> Result<()> {
-        self.connection
-            .execute(
-                "UPDATE prompt_history SET command_line = ?1 WHERE id = ?2",
-                params![command_line, id],
-            )
-            .map_err(database)?;
-        Ok(())
-    }
-
-    /// Remove one entry.
-    pub(crate) fn delete(&self, id: i64) -> Result<()> {
-        self.connection
-            .execute("DELETE FROM prompt_history WHERE id = ?1", params![id])
-            .map_err(database)?;
-        Ok(())
     }
 }
 
@@ -210,17 +156,9 @@ fn where_clause(filter: &HistoryFilter) -> (Vec<String>, Vec<Box<dyn ToSql>>) {
         bindings.push(Box::new(above));
     }
     match &filter.command_line {
-        Some(CommandLineMatch::Prefix(text)) => {
-            conditions.push("command_line LIKE ? ESCAPE '\\'".to_string());
-            bindings.push(Box::new(format!("{}%", like_escape(text))));
-        }
         Some(CommandLineMatch::Substring(text)) => {
             conditions.push("command_line LIKE ? ESCAPE '\\'".to_string());
             bindings.push(Box::new(format!("%{}%", like_escape(text))));
-        }
-        Some(CommandLineMatch::Exact(text)) => {
-            conditions.push("command_line = ?".to_string());
-            bindings.push(Box::new(text.clone()));
         }
         None => {}
     }

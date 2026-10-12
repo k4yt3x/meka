@@ -201,7 +201,7 @@ impl SessionStatsSnapshot {
 }
 
 /// What one provider response reported spending.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct TokenUsage {
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,

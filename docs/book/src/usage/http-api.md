@@ -102,7 +102,7 @@ Every payload carries `turn_id` and `session_id`; the later events above elide t
 
 ### Sessions
 
-A session is a persistent conversation with its own working directory, permission level, and message history. Sessions live in the same store as REPL and ACP sessions; they're interchangeable.
+A session is a persistent conversation with its own working directory, permission level, and message history. Sessions live in the same store as screen and ACP sessions; they're interchangeable.
 
 ```
 POST   /v1/sessions           Create a session
@@ -243,7 +243,7 @@ A body naming **only** `profile` is also the rescue for a session whose profile 
 currently run. Adding `permission` or `cwd` to the same body loses that, because those need a loaded
 session and loading one is exactly what fails; send the profile on its own first.
 
-The `cwd` field is validated on create, fork and patch, by the same rule the REPL's `/cd` and ACP
+The `cwd` field is validated on create, fork and patch, by the same rule the screen's `/cd` and ACP
 apply:
 
 - Must be an **absolute path** (no relative paths).
@@ -386,7 +386,7 @@ client timeout shorter than your longest turn is safe, and why retrying on one d
 rather than recovering it.
 
 `turn_in_flight` answers for this process: a session it holds, and a sub-agent it is running under
-a parent. A session another process is running, a REPL open on it say, reads as idle, because only
+a parent. A session another process is running, a screen open on it say, reads as idle, because only
 that session's file lock knows and a read never probes the lock. Once a turn has ended, however it
 ended, `last_turn` on the record says how.
 
@@ -411,8 +411,8 @@ The turn request body accepts five fields:
 | `message` | string | *(required)* | The user message. May be empty when `images` is non-empty |
 | `images` | array | `[]` | Image attachments; see [Image attachments](#image-attachments) |
 | `stream` | bool | `false` | `false` → single JSON response; `true` → SSE stream |
-| `options.skill` | string \| null | `null` | When set, activates the named [skill](./skills.md) for this turn (equivalent to `/skill <name>` in the REPL). With an empty `message` the skill body runs alone, as `--skill` does; a turn with no text, no image and no skill is a `422` |
-| `options.unanswered_message` | string | `keep` | What becomes of `message` if the turn ends, failed or canceled, before anything from the model reached the conversation. `keep` leaves it in place, as the REPL does with a typed prompt. `withdraw` takes it back, for a client that resends a failed turn; see [Resending a failed turn](#resending-a-failed-turn) |
+| `options.skill` | string \| null | `null` | When set, activates the named [skill](./skills.md) for this turn (equivalent to `/skill <name>` on the screen). With an empty `message` the skill body runs alone, as `--skill` does; a turn with no text, no image and no skill is a `422` |
+| `options.unanswered_message` | string | `keep` | What becomes of `message` if the turn ends, failed or canceled, before anything from the model reached the conversation. `keep` leaves it in place, as the screen does with a typed prompt. `withdraw` takes it back, for a client that resends a failed turn; see [Resending a failed turn](#resending-a-failed-turn) |
 
 ### The inbox
 
@@ -442,7 +442,7 @@ An item is `pending` until its text is in the conversation, `appended` until the
 
 `Idempotency-Key` works here as on `POST /turn`: the same key with another `message` or `class` is refused with `409` `idempotency`. One difference matters to a bridge: the key is recorded on the row rather than in memory, so a retry that lands after a meka restart still finds its earlier item and answers it with `replayed: true`, and the key stays bound to that item for the session's life, withdrawn or delivered. The item is durable before the `202`; a session evicted for idleness is revived to run it, and a process that restarts finds it waiting.
 
-A turn opened on inbox items that fails before anything from the model reached the conversation withdraws its prompt and offers the items again, waiting 10 seconds, then twice that per attempt, up to five minutes between attempts. After an hour from when an item was enqueued it is given up on: withdrawn, with `inbox.failed` on the feed and the webhook, so whoever is waiting is told rather than left with silence. An item a tool round already carried into the conversation is not retried: it is history, and the next turn of any kind delivers it. An item on a session another process holds (a REPL open on it, say) is asked about again every ten seconds until the holder lets go, or the holder's own next turn carries it; those waits count toward the hour.
+A turn opened on inbox items that fails before anything from the model reached the conversation withdraws its prompt and offers the items again, waiting 10 seconds, then twice that per attempt, up to five minutes between attempts. After an hour from when an item was enqueued it is given up on: withdrawn, with `inbox.failed` on the feed and the webhook, so whoever is waiting is told rather than left with silence. An item a tool round already carried into the conversation is not retried: it is history, and the next turn of any kind delivers it. An item on a session another process holds (a screen open on it, say) is asked about again every ten seconds until the holder lets go, or the holder's own next turn carries it; those waits count toward the hour.
 
 Only a `pending` item can be withdrawn. `DELETE` on one that is already in the conversation answers `409` `inbox-appended`, since only a turn can answer it now; a delivered or withdrawn one is `404`. A `DELETE` that lands in the instant between a turn reading the item and writing it may still be read by the model. Canceling a turn the inbox opened, with `POST /cancel`, withdraws the items it opened on, the way a canceled client turn loses its prompt, and the feed reports each as `inbox.withdrawn`. The endpoint refuses a sub-agent's session exactly as `POST /turn` does: a worker's inbox is its parent's, written with the `agent_steer` tool. No images in this release.
 
@@ -548,7 +548,7 @@ history shows.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `instructions` | string | *(none)* | Guidance on what to keep or drop, as `/compact <instructions>` in the REPL |
+| `instructions` | string | *(none)* | Guidance on what to keep or drop, as `/compact <instructions>` on the screen |
 | `keep_recent` | bool | *(meka decides)* | Whether to keep the most recent turns verbatim after the summary |
 
 The response carries `source` (`checkpoint` or `summarizer`) and `memories_written`, the
@@ -774,7 +774,7 @@ sub-agent's feed is refused with `422` `session-not-drivable`.
 Once the run ends the feed is gone, and the route answers `409` `subagent-not-running`, naming
 the parent whose run it belongs to. What the sub-agent did is in its history, `GET /messages` and
 `GET /turns` on its own id, and `last_turn` on its record says how the run ended. A sub-agent a
-different process runs, a REPL on the same store say, has no feed here: the same limit
+different process runs, a screen on the same store say, has no feed here: the same limit
 `turn_in_flight` has.
 
 ### The server feed
@@ -798,7 +798,7 @@ falls behind.
 A `session.updated` carries the whole record so a client replaces its row rather than patching
 it. The same `session.updated` goes to the session's own feed, so a client on one session also
 learns its title or profile moved under it. The feed sees this process's changes only: a session
-another process renamed or deleted, a REPL open on the same store say, is not announced, the
+another process renamed or deleted, a screen open on the same store say, is not announced, the
 same limit `turn_in_flight` has.
 
 ## Webhooks
@@ -875,7 +875,7 @@ Delivery is fire-and-forget on a detached task, so a slow or dead receiver never
 
 The same four [permission levels](./permissions.md) apply: `none`, `read`, `workspace`, `unrestricted`. Set the level at session creation or update it via `PATCH /v1/sessions/{id}`; `approvals` sits beside it on both, and `{"approvals": true}` in a `PATCH` body turns it on for a live session.
 
-Both apply during a turn: the next tool call is checked against the new level and the new switch, as the REPL's Shift+Tab and ACP's `session/set_mode` do, so dropping a running session to `read` is a brake and not a request to stop. `cwd` and `profile` wait for the turn to end, and a body naming either answers `409` `turn-in-flight` meanwhile.
+Both apply during a turn: the next tool call is checked against the new level and the new switch, as the screen's Shift+Tab and ACP's `session/set_mode` do, so dropping a running session to `read` is a brake and not a request to stop. `cwd` and `profile` wait for the turn to end, and a body naming either answers `409` `turn-in-flight` meanwhile.
 
 ### Approvals
 
@@ -1091,7 +1091,7 @@ Streaming turns that fail mid-stream emit a `turn.failed` SSE event with the sam
 
 ### Resending a failed turn
 
-A failed turn keeps the message you sent, in the conversation and on disk. That is the REPL's
+A failed turn keeps the message you sent, in the conversation and on disk. That is the screen's
 behavior too: the person who typed the prompt can see it and expects the agent to have it, and a
 turn that got as far as a partial answer or a tool call has work behind it that refers to the
 message. For a client that answers a `502` by resending the same message it is the wrong default,
@@ -1435,7 +1435,7 @@ A `schedule:*`-only token can still plant ordinary prompt-only jobs; it cannot r
 
 `GET /v1/tasks` lists every session's background tasks, newest first, and `?status=running` (or `completed`, `failed`, `canceled`, `interrupted`) keeps one status; a status that is none of those is a `422`. A task that is a backgrounded `agent_spawn` carries `subagent_id`, the session it runs, once the spawn has made one, so a dashboard connects the task to the sub-agent's record without parsing the task's label.
 
-Canceling a background task records the cancellation and signals the running task, but only `meka serve` can signal work `meka serve` started. If the session is open in another process (a `meka -r` REPL, say), the row is marked `canceled` and the command keeps running there until it ends on its own; its result is then discarded, because the row is no longer `running`.
+Canceling a background task records the cancellation and signals the running task, but only `meka serve` can signal work `meka serve` started. If the session is open in another process (a `meka -r` screen, say), the row is marked `canceled` and the command keeps running there until it ends on its own; its result is then discarded, because the row is no longer `running`.
 
 `POST /v1/mcp/{name}/reconnect` answers 200 with where the server now stands, which is not the same as "it worked": **read `state`, not the status code**. An attempt that ran and failed is a 200 carrying `state: "failed"`, not a 502. A server the startup sweep is still connecting comes back as `state: "pending"` with no attempt made, so a dashboard polling `GET /v1/mcp` during startup does not mistake "still coming up" for "down". The two non-200s are narrow: 422 when the server is `disabled` in config, and 502 when an already-connected server's transport could not be re-established within `[mcp] connect_timeout`. Neither carries the reason, which is in the meka log: a connector's reason has quoted a spawn command line and a URL with its key.
 

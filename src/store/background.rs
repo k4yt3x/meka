@@ -182,7 +182,7 @@ impl BackgroundStore {
     /// re-announced on every poll.
     ///
     /// Bounded to the undelivered pool, which is what keeps it news. `announced_at` is written only
-    /// by `meka serve`, so every task a REPL or ACP session ever ran is unannounced forever in a
+    /// by `meka serve`, so every task a screen or ACP session ever ran is unannounced forever in a
     /// shared store; without this clause, opening one of those sessions in `meka serve` would fire
     /// `task.finished` for work that finished weeks ago and was reported at the time. A task still
     /// in the pool has been reported to nobody, which is the case worth pushing.
@@ -1065,7 +1065,7 @@ mod tests {
     /// The announce pool is the undelivered pool, so old news is never pushed as new.
     ///
     /// `announced_at` is written only by `meka serve`, and a data directory is shared: every task a
-    /// REPL or ACP session ever ran sits unannounced forever. Opening one of those sessions in
+    /// screen or ACP session ever ran sits unannounced forever. Opening one of those sessions in
     /// `meka serve` must not fire `task.finished` for work that finished weeks ago and was reported
     /// to the model at the time. A task still undelivered has been reported to nobody, which is the
     /// case worth pushing -- including one interrupted before any host could report it.
@@ -1091,7 +1091,7 @@ mod tests {
                 .expect("finish");
         }
 
-        // Delivered without being announced, which is exactly what a REPL turn leaves behind.
+        // Delivered without being announced, which is exactly what a screen turn leaves behind.
         store
             .background_store()
             .mark_background_tasks_delivered(std::slice::from_ref(&reported.id))

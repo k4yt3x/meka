@@ -30,7 +30,7 @@ use std::{
 /// lower number to a strictly greater one.
 const RANKS: &[(&str, u32)] = &[
     ("main", 0),
-    // The hosts, then the clap handlers: the REPL's slash commands are the interactive twins of
+    // The hosts, then the clap handlers: the screen's slash commands are the interactive twins of
     // the subcommands and run their handlers, so `host` sits above `cli`.
     ("host", 1),
     ("cli", 2),

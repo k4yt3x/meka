@@ -1,6 +1,7 @@
 //! Terminal rendering: streaming markdown renderer (syntect highlighting + termimad), tool-call
 //! indicators, checklist display, and helpers for one-off CLI status/error messages. Owns the
-//! embedded Monokai Extended theme used for code blocks.
+//! code theme and the markdown skin, both built on the terminal's own palette, which the screen
+//! draws with too.
 
 use std::{
     io::{self, Write},
@@ -12,27 +13,27 @@ mod markdown;
 use crossterm::style::{Attribute, Color, Stylize};
 use syntect::{
     easy::HighlightLines,
-    highlighting::{FontStyle, Theme, ThemeSet},
-    parsing::{Scope, SyntaxReference, SyntaxSet},
-    util::{LinesWithEndings, as_24_bit_terminal_escaped},
+    highlighting::Theme,
+    parsing::{SyntaxReference, SyntaxSet},
+    util::LinesWithEndings,
 };
-use termimad::{Alignment, MadSkin};
+use termimad::{Alignment, CompoundStyle, MadSkin};
 
 mod history;
 mod output;
 mod status;
 mod tool_params;
+pub(crate) mod tui;
 
 use self::tool_params::*;
 pub(crate) use self::{
-    history::{HistoryRenderOptions, last_n_turns, nudge_direction, render_message_history},
+    history::nudge_direction,
     output::*,
     status::*,
-    tool_params::{render_approval_params, render_tool_indicator},
+    tool_params::{render_tool_indicator, render_whole_params},
 };
 use crate::{
     config::{RenderMode, ToolParams},
-    conversation::REDACTED_THINKING,
     streams::write_stderr_line,
     text::{
         CSI_PATTERN, TAB_WIDTH, TRUNCATION_MARKER, display_width, elide_to_width,
@@ -41,9 +42,6 @@ use crate::{
     },
     tools::resolve_primary_param,
 };
-
-/// Monokai Extended theme, vendored from bat's `sharkdp/sublime-monokai-extended` (MIT).
-const MONOKAI_EXTENDED_TMTHEME: &[u8] = include_bytes!("../assets/themes/Monokai Extended.tmTheme");
 
 /// `[display].max_width`, or `None` to follow the terminal. Set once at startup.
 static CONFIGURED_MAX_WIDTH: OnceLock<Option<usize>> = OnceLock::new();
@@ -229,7 +227,7 @@ impl StreamingRenderer {
             // syntax-set load, which `Raw` otherwise never pays for.
             skin: match mode {
                 RenderMode::Termimad => markdown_skin().clone(),
-                _ => MadSkin::default(),
+                RenderMode::Raw => MadSkin::default(),
             },
             mode,
             started: false,
@@ -247,15 +245,7 @@ impl StreamingRenderer {
     }
 
     /// A renderer for a thinking block: stderr, one color throughout, behind `Thinking... `.
-    ///
-    /// `Syntect` resolves to `Raw` here, in this one place rather than at each site that would
-    /// otherwise have to remember. Highlighting is that mode's entire content, and its 24-bit theme
-    /// colors cannot be gray, so honoring it would mean reasoning as colorful as the answer.
     pub(crate) fn for_thinking(mode: RenderMode) -> Self {
-        let mode = match mode {
-            RenderMode::Syntect => RenderMode::Raw,
-            other => other,
-        };
         // Built from `Raw` rather than from `mode`, then given its own skin. Struct-update syntax
         // evaluates the whole base first, so taking it from `mode` would build `markdown_skin()` --
         // paying the ~1 MB syntax-set load `Self::new`'s own comment is about -- for a value thrown
@@ -264,7 +254,7 @@ impl StreamingRenderer {
         renderer.mode = mode;
         renderer.skin = match mode {
             RenderMode::Termimad => thinking_skin().clone(),
-            _ => MadSkin::default(),
+            RenderMode::Raw => MadSkin::default(),
         };
         // Row one rides behind the label and later rows behind the indent, so budgeting for the
         // wider of the two makes every row fit: `12 + (width - 12)` and `2 + (width - 12)`.
@@ -390,7 +380,7 @@ impl StreamingRenderer {
     /// after an interruption; a no-op whenever the label is not owed.
     ///
     /// Every mode holds text back until it settles (a line, a paragraph, a whole table), so
-    /// nothing else can mark the phase while the first of it is still arriving. On the REPL the
+    /// nothing else can mark the phase while the first of it is still arriving. On the screen the
     /// label takes the row the transient indicator gives up at this same delta, which otherwise
     /// stays blank for as long as the first paragraph takes.
     fn open_lead(&mut self) -> io::Result<()> {
@@ -455,12 +445,6 @@ impl StreamingRenderer {
         Ok(())
     }
 
-    /// Syntax-highlight markdown prose and write it. The caller owns any surrounding newlines.
-    fn write_highlighted(&mut self, text: &str) -> io::Result<()> {
-        let highlighted = highlight_markdown_to_string(text);
-        self.write(&highlighted)
-    }
-
     pub(crate) fn push_delta(&mut self, delta: &str) -> io::Result<()> {
         // Streamed assistant text is the largest model-controlled surface meka prints, and it was
         // the only one arriving unfiltered: the tool indicator, thinking block, checklist and
@@ -469,8 +453,8 @@ impl StreamingRenderer {
         // and syntect writes the source slice through -- so a model that has read attacker
         // text could clear the screen and repaint a convincing `[approval]` block, then let the
         // real prompt scroll past invisibly behind a leaked `\x1b[8m`. Sanitizing here
-        // covers every render mode and every caller, rather than at each of the three mode
-        // arms below.
+        // covers both render modes and every caller, rather than at each mode arm
+        // below.
         let sanitized = sanitize_stream_text(delta);
         // A tab is the one character [`sanitize_stream_text`] keeps that meka cannot measure: a
         // terminal advances it to the next tab stop, so a row holding one is wider than every width
@@ -503,7 +487,6 @@ impl StreamingRenderer {
         self.buffer.push_str(delta);
 
         match self.mode {
-            RenderMode::Syntect => self.flush_syntect(),
             RenderMode::Termimad => self.flush_termimad(),
             RenderMode::Raw => self.flush_raw(),
         }
@@ -511,48 +494,6 @@ impl StreamingRenderer {
 
     pub(crate) fn finish(&mut self) -> io::Result<()> {
         match self.mode {
-            RenderMode::Syntect => {
-                {
-                    let remaining = std::mem::take(&mut self.buffer);
-                    let trimmed = remaining.trim_end_matches('\n');
-                    let mut needs_newline = false;
-                    for line in trimmed.lines() {
-                        let is_fence = line.trim_start().starts_with("```");
-
-                        if !self.code_block_lines.is_empty() {
-                            self.code_block_lines.push(line.to_string());
-                            if is_fence {
-                                self.flush_syntect_code_block()?;
-                                needs_newline = false;
-                            }
-                        } else if is_fence {
-                            self.flush_syntect_table()?;
-                            self.code_block_lines.push(line.to_string());
-                            needs_newline = false;
-                        } else if is_table_line(line) {
-                            self.raw_table_lines.push(line.to_string());
-                            needs_newline = false;
-                        } else if line.is_empty() {
-                            self.flush_syntect_table()?;
-                            self.write("\n")?;
-                            needs_newline = false;
-                        } else {
-                            self.flush_syntect_table()?;
-                            self.write_highlighted(line)?;
-                            needs_newline = true;
-                        }
-                    }
-                    // Deliberately not gated on a non-empty buffer. A turn whose last delta ended
-                    // in a newline leaves the buffer empty while a table or an unterminated fence
-                    // is still pending, and skipping these drains discarded it: a reply ending in a
-                    // markdown table lost the table entirely.
-                    self.flush_syntect_code_block()?;
-                    self.flush_syntect_table()?;
-                    if needs_newline {
-                        self.write("\n")?;
-                    }
-                }
-            }
             RenderMode::Termimad => {
                 // Not gated on a non-empty buffer: an unterminated fence whose lines have all been
                 // consumed leaves the buffer empty and the block pending, and skipping the drain
@@ -583,67 +524,6 @@ impl StreamingRenderer {
         }
         self.settle_last_row()?;
         self.sink.flush()
-    }
-
-    fn flush_syntect(&mut self) -> io::Result<()> {
-        self.buffer = normalize_spacing(&self.buffer, !self.code_block_lines.is_empty());
-
-        while let Some(newline_pos) = self.buffer.find('\n') {
-            let line = self.buffer[..newline_pos].to_string();
-            let is_fence = line.trim_start().starts_with("```");
-
-            // If we're inside a code block, accumulate lines
-            if !self.code_block_lines.is_empty() {
-                self.buffer = self.buffer[newline_pos + 1..].to_string();
-                self.code_block_lines.push(line);
-                if is_fence {
-                    self.flush_syntect_code_block()?;
-                }
-                continue;
-            }
-
-            // Opening fence starts a new code block
-            if is_fence {
-                self.buffer = self.buffer[newline_pos + 1..].to_string();
-                self.flush_syntect_table()?;
-                self.code_block_lines.push(line);
-                continue;
-            }
-
-            self.buffer = self.buffer[newline_pos + 1..].to_string();
-
-            if is_table_line(&line) {
-                self.raw_table_lines.push(line);
-            } else {
-                self.flush_syntect_table()?;
-                if line.is_empty() {
-                    self.write("\n")?;
-                } else {
-                    self.write_highlighted(&format!("{line}\n"))?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn flush_syntect_code_block(&mut self) -> io::Result<()> {
-        if self.code_block_lines.is_empty() {
-            return Ok(());
-        }
-        let block = self.take_code_block();
-        self.write(&block)
-    }
-
-    fn flush_syntect_table(&mut self) -> io::Result<()> {
-        if self.raw_table_lines.is_empty() {
-            return Ok(());
-        }
-
-        let lines = std::mem::take(&mut self.raw_table_lines);
-        let formatted = format_table(&lines);
-        let table_text = formatted.join("\n");
-        self.write_highlighted(&table_text)?;
-        self.write("\n")
     }
 
     /// Render markdown prose through termimad.
@@ -697,7 +577,7 @@ impl StreamingRenderer {
 
         // Every iteration below either stops or strictly consumes from the buffer, so the loop
         // terminates. This tracks that invariant rather than trusting it, because the cost of
-        // getting it wrong is a frozen REPL. Stopping early is harmless, since `finish` drains
+        // getting it wrong is a frozen screen. Stopping early is harmless, since `finish` drains
         // whatever is left.
         let mut buffered_before = usize::MAX;
 
@@ -960,8 +840,8 @@ fn normalize_spacing(text: &str, starts_inside_fence: bool) -> String {
     output
 }
 
-/// Holds the expensive-to-load syntect assets, a `SyntaxSet` (~1 MB bincode blob) and a dark
-/// `Theme`, so subsequent highlighting calls can reuse them without paying the decode cost each
+/// Holds the expensive-to-load syntect assets, a `SyntaxSet` (~1 MB bincode blob) and the code
+/// theme, so subsequent highlighting calls can reuse them without paying the decode cost each
 /// time. Session-resume reprint and live streaming both highlight per line;
 /// initializing assets once per process turns that cost from ~50 ms/call into <1 ms/call.
 struct Highlighter {
@@ -971,134 +851,134 @@ struct Highlighter {
 
 static HIGHLIGHTER: OnceLock<Highlighter> = OnceLock::new();
 
-#[allow(
-    clippy::expect_used,
-    reason = "the theme is a compile-time `include_bytes!()`; a parse failure is caught by the first test"
-)]
 fn highlighter() -> &'static Highlighter {
-    HIGHLIGHTER.get_or_init(|| {
-        let syntax_set = SyntaxSet::load_defaults_newlines();
-        let mut cursor = std::io::Cursor::new(MONOKAI_EXTENDED_TMTHEME);
-        let theme =
-            ThemeSet::load_from_reader(&mut cursor).expect("embedded Monokai Extended theme loads");
-        Highlighter { syntax_set, theme }
+    HIGHLIGHTER.get_or_init(|| Highlighter {
+        syntax_set: SyntaxSet::load_defaults_newlines(),
+        theme: code_theme(),
     })
 }
 
-/// The termimad skin, derived from the same theme the syntect path highlights with.
-///
-/// Cached because [`syntect::highlighting::Highlighter::style_for_stack`] documents itself as
-/// "convenient but expensive", and a skin is otherwise rebuilt per renderer (one per turn, plus one
-/// per message when reprinting history).
+/// A color in the code theme: the terminal's own, by its place in the sixteen, carried in the
+/// red channel with an alpha of one, or the default foreground with an alpha of zero. Syntect
+/// colors are RGB; this is how a theme built on the palette rides in one, and
+/// [`palette_slot`] is the one reader of the encoding.
+const fn palette(index: u8) -> syntect::highlighting::Color {
+    syntect::highlighting::Color {
+        r: index,
+        g: 0,
+        b: 0,
+        a: 1,
+    }
+}
+
+/// The terminal's default foreground, in the same encoding.
+const FOREGROUND: syntect::highlighting::Color = syntect::highlighting::Color {
+    r: 0,
+    g: 0,
+    b: 0,
+    a: 0,
+};
+
+/// The palette slot a code theme color names, or `None` for the default foreground.
+pub(crate) fn palette_slot(color: syntect::highlighting::Color) -> Option<u8> {
+    (color.a == 1).then_some(color.r)
+}
+
+/// The code theme: the terminal's sixteen colors, one each for the five things worth telling
+/// apart in a fenced block, so code reads in the palette the rest of the output uses and follows
+/// the terminal's theme as the prose does. Everything unnamed here is the plain foreground.
+fn code_theme() -> Theme {
+    use syntect::highlighting::{ScopeSelectors, StyleModifier, ThemeItem, ThemeSettings};
+    let rules: [(&str, u8); 5] = [
+        ("comment, punctuation.definition.comment", 8),
+        ("string, string.quoted, string.regexp, markup.raw", 2),
+        ("constant.numeric, constant.language, constant.character", 3),
+        ("keyword, storage, keyword.operator.word", 4),
+        (
+            "entity.name.function, support.function, entity.name.type, entity.name.class, \
+             support.type, support.class",
+            6,
+        ),
+    ];
+    let scopes = rules
+        .iter()
+        .filter_map(|(selector, index)| {
+            let scope = match selector.parse::<ScopeSelectors>() {
+                Ok(scope) => scope,
+                Err(error) => {
+                    tracing::debug!("failed to parse a code theme selector: {error:?}");
+                    return None;
+                }
+            };
+            Some(ThemeItem {
+                scope,
+                style: StyleModifier {
+                    foreground: Some(palette(*index)),
+                    background: None,
+                    font_style: None,
+                },
+            })
+        })
+        .collect();
+    Theme {
+        name: Some("meka terminal".to_string()),
+        author: None,
+        settings: ThemeSettings {
+            foreground: Some(FOREGROUND),
+            ..ThemeSettings::default()
+        },
+        scopes,
+    }
+}
+
+/// The SGR sequence that selects a code theme color on a terminal: the palette slot's own
+/// number, or the default foreground.
+fn palette_escape(color: syntect::highlighting::Color) -> String {
+    match palette_slot(color) {
+        Some(index @ 0..=7) => format!("\x1b[3{index}m"),
+        Some(index) => format!("\x1b[9{}m", index.saturating_sub(8).min(7)),
+        None => "\x1b[39m".to_string(),
+    }
+}
+
+/// The markdown skin, cached because a skin is otherwise rebuilt per renderer (one per turn, plus
+/// one per message when reprinting history).
 static MARKDOWN_SKIN: OnceLock<MadSkin> = OnceLock::new();
 
-/// The context scope a markdown document is highlighted under. Several of the theme's markdown
-/// rules are nested selectors (`text.html.markdown markup.raw.inline`), which only match when this
-/// sits below the element scope on the stack; looking the element up alone silently falls through
-/// to the default foreground.
-const MARKDOWN_CONTEXT_SCOPE: &str = "text.html.markdown";
-
-/// Resolve a TextMate scope stack against the embedded theme.
-///
-/// Returns `None` for a scope the theme doesn't style or that fails to parse, so a caller falls
-/// back to termimad's own default for that element rather than to an invented color.
-fn theme_style(scope: &str) -> Option<(Option<Color>, FontStyle)> {
-    let theme = &highlighter().theme;
-    let highlighter = syntect::highlighting::Highlighter::new(theme);
-    let stack = [
-        Scope::new(MARKDOWN_CONTEXT_SCOPE).ok()?,
-        Scope::new(scope).ok()?,
-    ];
-    let style = highlighter.style_for_stack(&stack);
-    let foreground = style.foreground;
-    // syntect hands back the enclosing context's foreground for an unmatched scope. Passing that
-    // through would paint every element the same color, so treat "same as the context" as
-    // "unstyled" and leave termimad's default in place.
-    let default_foreground = highlighter
-        .style_for_stack(&[Scope::new(MARKDOWN_CONTEXT_SCOPE).ok()?])
-        .foreground;
-    let color = (foreground != default_foreground).then_some(Color::Rgb {
-        r: foreground.r,
-        g: foreground.g,
-        b: foreground.b,
-    });
-    Some((color, style.font_style))
-}
-
-/// Apply a scope's color and font style to one `CompoundStyle`, keeping whatever termimad already
-/// set for anything the theme is silent about.
-fn apply_scope(style: &mut termimad::CompoundStyle, scope: &str) {
-    let Some((color, font_style)) = theme_style(scope) else {
-        return;
+/// The skin for an answer: the terminal's own colors, emphasis by weight, the accent on inline
+/// code, structure in gray, and no background behind code, which would fight any terminal not
+/// already using that shade. The screen draws with this skin too, so a one-shot answer and an
+/// interactive one read alike.
+pub(crate) fn quiet_skin() -> MadSkin {
+    let mut strikeout = CompoundStyle::with_attr(Attribute::CrossedOut);
+    strikeout.set_fg(Color::DarkGrey);
+    let mut skin = MadSkin {
+        bold: CompoundStyle::with_attr(Attribute::Bold),
+        italic: CompoundStyle::with_attr(Attribute::Italic),
+        strikeout,
+        // crossterm's `Cyan` is the bright slot; `DarkCyan` is ANSI 6, the accent.
+        inline_code: CompoundStyle::with_fg(Color::DarkCyan),
+        ellipsis: CompoundStyle::with_fg(Color::DarkGrey),
+        ..MadSkin::default()
     };
-    if let Some(color) = color {
-        style.set_fg(color);
+    // A fenced block never reaches termimad (syntect draws it); an indented one does, and takes
+    // the plain foreground.
+    skin.code_block.compound_style = CompoundStyle::default();
+    for header in &mut skin.headers {
+        header.compound_style = CompoundStyle::with_attr(Attribute::Bold);
+        // `MadSkin::default()` centers the first header. Centering a heading mid-transcript reads
+        // as a formatting glitch rather than structure.
+        header.align = Alignment::Left;
     }
-    if font_style.contains(FontStyle::BOLD) {
-        style.add_attr(Attribute::Bold);
-    }
-    if font_style.contains(FontStyle::ITALIC) {
-        style.add_attr(Attribute::Italic);
-    }
-    if font_style.contains(FontStyle::UNDERLINE) {
-        style.add_attr(Attribute::Underlined);
-    }
+    skin.bullet.set_fg(Color::DarkGrey);
+    skin.quote_mark.set_fg(Color::DarkGrey);
+    skin.horizontal_rule.set_fg(Color::DarkGrey);
+    skin.table.compound_style = CompoundStyle::with_fg(Color::DarkGrey);
+    skin
 }
 
-/// Foreground color for a scope, for the fields that are a styled character rather than a span.
-fn scope_color(scope: &str) -> Option<Color> {
-    theme_style(scope).and_then(|(color, _)| color)
-}
-
-/// Build the markdown skin from the embedded theme.
-///
-/// termimad's `default_dark()` is defined entirely in `gray(n)`, so out of the box every element
-/// renders in the same four grayscale tones and the mode is unreadable. The theme meka already
-/// ships for syntect defines all of these elements (`markup.heading`, `markup.bold`, …), so reading
-/// them from there gives termimad the same visual language as the syntect mode *and* keeps the two
-/// in sync automatically if the theme is ever swapped.
 fn markdown_skin() -> &'static MadSkin {
-    MARKDOWN_SKIN.get_or_init(|| {
-        let mut skin = MadSkin::default_dark();
-
-        apply_scope(&mut skin.bold, "markup.bold");
-        apply_scope(&mut skin.italic, "markup.italic");
-        apply_scope(&mut skin.strikeout, "markup.strike");
-        apply_scope(&mut skin.inline_code, "markup.raw.inline");
-        apply_scope(&mut skin.code_block.compound_style, "markup.raw.block");
-
-        if let Some(color) = scope_color("markup.heading") {
-            skin.set_headers_fg(color);
-        }
-        for header in &mut skin.headers {
-            // `MadSkin::default()` centers the first header. Centring a heading mid-transcript
-            // reads as a formatting glitch rather than structure.
-            header.align = Alignment::Left;
-        }
-
-        if let Some(color) = scope_color("punctuation.definition.list_item.markdown") {
-            skin.bullet.set_fg(color);
-        }
-        if let Some(color) = scope_color("markup.quote") {
-            skin.quote_mark.set_fg(color);
-        }
-        // Borders and rules are structure, not content. `markup.table` in this theme is a saturated
-        // red that competes with the cells it frames, so the comment color (the theme's own
-        // "recede into the background" tone) is the better fit.
-        if let Some(color) = scope_color("comment") {
-            skin.table.compound_style.set_fg(color);
-            skin.horizontal_rule.set_fg(color);
-            skin.ellipsis.set_fg(color);
-        }
-
-        // Foreground only, matching the syntect path, which renders with
-        // `as_24_bit_terminal_escaped(.., false)` and so never emits a background. A hardcoded dark
-        // background would fight any terminal not already using one.
-        skin.inline_code.object_style.background_color = None;
-        skin.code_block.compound_style.object_style.background_color = None;
-
-        skin
-    })
+    MARKDOWN_SKIN.get_or_init(quiet_skin)
 }
 
 /// The skin for a block that must read as a footnote rather than as the answer.
@@ -1142,10 +1022,10 @@ fn highlight_markdown_to_string(text: &str) -> String {
     highlight_with_syntax(text, syntax)
 }
 
-/// Highlight `text` line-by-line with an explicit syntect grammar and return 24-bit ANSI escapes.
-/// Shared core of the Markdown-prose path and the per-language code-block path; the passed `syntax`
-/// must come from the same static [`highlighter`] so its context indices match the `syntax_set`
-/// used to resolve embeds.
+/// Highlight `text` line-by-line with an explicit syntect grammar and return it with the code
+/// theme's palette escapes. Shared core of the fence-line path and the per-language code-block
+/// path; the passed `syntax` must come from the same static [`highlighter`] so its context
+/// indices match the `syntax_set` used to resolve embeds.
 fn highlight_with_syntax(text: &str, syntax: &SyntaxReference) -> String {
     let highlighter = highlighter();
     let mut highlight = HighlightLines::new(syntax, &highlighter.theme);
@@ -1154,7 +1034,10 @@ fn highlight_with_syntax(text: &str, syntax: &SyntaxReference) -> String {
     for line in LinesWithEndings::from(text) {
         match highlight.highlight_line(line, &highlighter.syntax_set) {
             Ok(ranges) => {
-                out.push_str(&as_24_bit_terminal_escaped(&ranges[..], false));
+                for (style, text) in ranges {
+                    out.push_str(&palette_escape(style.foreground));
+                    out.push_str(text);
+                }
             }
             Err(error) => {
                 // Plain text rather than nothing, so a grammar failure never loses content.
@@ -1311,9 +1194,10 @@ fn format_table(lines: &[String]) -> Vec<String> {
 /// Whether a live, redrawn-in-place indicator can be shown at all.
 ///
 /// Callers gate their whole indicator path on this rather than relying on the drawer's own check:
-/// drawing is only the last step, and the steps before it (closing a text run, claiming a blank
-/// line from [`OutputSpacing`]) are shared state that must not move for output that will never
-/// appear. Piping a run through `cat` otherwise gained a stray blank line per thinking block.
+/// drawing is only the last step, and the steps before it (closing a text run, claiming the
+/// blank the console owes the next block) are shared state that must not move for output that
+/// will never appear. Piping a run through `cat` otherwise gained a stray blank line per
+/// thinking block.
 pub(crate) fn live_indicator_supported() -> bool {
     std::io::IsTerminal::is_terminal(&std::io::stderr())
 }
@@ -1444,22 +1328,6 @@ fn collapse_to_line(text: &str, max_chars: usize) -> (String, bool) {
     (collapsed, false)
 }
 
-/// Render a whole thinking block that arrived at once: a replayed one, or a turn that streamed
-/// nothing.
-///
-/// Goes through the same [`StreamingRenderer::for_thinking`] the live path streams into, pushed as
-/// one delta, so replay and a live turn cannot render the same block differently. The shape mirrors
-/// [`history::render_assistant_text`], which does this for the answer.
-pub(crate) fn render_thinking_block(thinking: &str, render_mode: RenderMode) {
-    let mut renderer = StreamingRenderer::for_thinking(render_mode);
-    if let Err(error) = renderer.push_delta(thinking) {
-        report_lost_output("a thinking block did not reach the terminal", &error);
-    }
-    if let Err(error) = renderer.finish() {
-        report_lost_output("a thinking block did not reach the terminal", &error);
-    }
-}
-
 /// Render a thinking block as the one dimmed line shown under `show_content = false`.
 ///
 /// Reasoning is model output and gets the same escape-stripping as a tool argument. It is not
@@ -1496,7 +1364,15 @@ pub(crate) fn render_thinking_preview(thinking: &str) {
 fn thinking_preview_runs(thinking: &str, width: usize) -> Vec<markdown::OwnedCompound> {
     // The row is the label plus the preview, so the preview gets what the label leaves. Same total
     // as the tool indicator, which spends the whole width on one line too.
-    let budget = width.saturating_sub(display_width(THINKING_PREFIX));
+    thinking_preview_runs_within(
+        thinking,
+        width.saturating_sub(display_width(THINKING_PREFIX)),
+    )
+}
+
+/// The preview's styled runs cut to `budget` columns, for a row whose label is not
+/// [`THINKING_PREFIX`].
+fn thinking_preview_runs_within(thinking: &str, budget: usize) -> Vec<markdown::OwnedCompound> {
     // Collapsed well past what the row can show, because the cut is made on the markdown *source*
     // and markdown does not survive being cut: a span whose closing `**` falls beyond the budget
     // never closes, and its opener renders as the text this preview exists to stop showing. A fixed
@@ -1671,7 +1547,7 @@ pub(crate) fn compaction_summary(outcome: &crate::agent::CompactOutcome) -> Stri
 /// lateness note on.
 const FIRE_DIRECTION_PROMPT_COLUMNS: usize = 40;
 
-/// The stage direction the REPL prints where a background report's turn begins: which tasks
+/// The stage direction the screen prints where a background report's turn begins: which tasks
 /// ended and how. The report itself is the model's prompt and stays off the screen, as every
 /// tool's output does; the reply that follows carries what matters.
 pub(crate) fn background_report_direction(
@@ -1695,7 +1571,7 @@ pub(crate) fn background_report_direction(
     }
 }
 
-/// The stage direction the REPL prints where a scheduled fire's turn begins: the job, its
+/// The stage direction the screen prints where a scheduled fire's turn begins: the job, its
 /// lateness when that is material, and the opening of its prompt, which the person wrote and
 /// needs only to recognize.
 pub(crate) fn scheduled_fire_direction(wakeup: &crate::scheduler::Wakeup) -> String {
@@ -2026,14 +1902,21 @@ mod tests {
         assert!(stripped.starts_with(input));
     }
 
+    /// Code is colored from the terminal's palette, by slot, never in 24-bit: a string in the
+    /// green slot, a keyword in the blue one, and the rest the default foreground.
     #[test]
-    fn highlighter_uses_monokai_extended() {
-        // Regression guard: the embedded theme file must parse and identify as Monokai Extended.
-        // Catches accidental theme-file swaps or corrupted asset bytes at test time. Force OnceLock
-        // init.
-        let _ = highlight_markdown_to_string("");
-        let theme = &highlighter().theme;
-        assert_eq!(theme.name.as_deref(), Some("Monokai Extended"));
+    fn code_is_highlighted_in_the_terminal_s_palette() {
+        let lines = [
+            "```rust".to_string(),
+            "let name = \"s\";".to_string(),
+            "```".to_string(),
+        ];
+        let out = render_code_block_to_string(&lines);
+        assert!(out.contains("\x1b[34mlet"), "the keyword slot: {out:?}");
+        assert!(out.contains("\x1b[32m\""), "the string slot: {out:?}");
+        assert!(!out.contains("\x1b[38;2;"), "no 24-bit color: {out:?}");
+        assert_eq!(palette_slot(palette(6)), Some(6));
+        assert_eq!(palette_slot(FOREGROUND), None);
     }
 
     #[test]
@@ -2145,22 +2028,28 @@ mod tests {
     }
 
     /// The distinct 24-bit foreground colors (`ESC[38;2;R;G;B`) in ANSI-escaped output.
+    /// Every foreground SGR in `ansi`, by its parameter: a palette slot (`3n`, `9n`), an indexed
+    /// color (`38;5;n`) or a 24-bit one (`38;2;r;g;b`), the default (`39`) left out.
     fn fg_color_set(ansi: &str) -> std::collections::BTreeSet<String> {
         let mut colors = std::collections::BTreeSet::new();
         let mut rest = ansi;
-        while let Some(pos) = rest.find("\x1b[38;2;") {
-            rest = &rest[pos + 7..];
-            if let Some(end) = rest.find('m') {
-                colors.insert(rest[..end].to_string());
-                rest = &rest[end + 1..];
-            } else {
+        while let Some(pos) = rest.find("\x1b[") {
+            rest = &rest[pos + 2..];
+            let Some(end) = rest.find('m') else {
                 break;
+            };
+            let parameter = &rest[..end];
+            rest = &rest[end + 1..];
+            let is_foreground = parameter.starts_with("38;")
+                || matches!(parameter.len(), 2 if parameter.starts_with('3') || parameter.starts_with('9'));
+            if is_foreground && parameter != "39" {
+                colors.insert(parameter.to_string());
             }
         }
         colors
     }
 
-    /// Count distinct 24-bit foreground colors in ANSI-escaped output.
+    /// Count distinct foreground colors in ANSI-escaped output.
     fn distinct_fg_colors(ansi: &str) -> usize {
         fg_color_set(ansi).len()
     }
@@ -2211,11 +2100,11 @@ mod tests {
     fn collapse_to_line_pulls_content_up_past_a_short_first_line() {
         assert_eq!(
             collapse_to_line(
-                "Key facts:\nthe lock is held by the REPL\nso serve defers",
+                "Key facts:\nthe lock is held by the screen\nso serve defers",
                 80
             ),
             (
-                "Key facts: the lock is held by the REPL so serve defers".to_string(),
+                "Key facts: the lock is held by the screen so serve defers".to_string(),
                 false
             )
         );
@@ -2581,7 +2470,7 @@ mod tests {
     /// the block's *end* only ever exercise the dropping one.
     #[test]
     fn a_paragraph_break_between_two_chunks_survives() {
-        for mode in [RenderMode::Raw, RenderMode::Termimad, RenderMode::Syntect] {
+        for mode in [RenderMode::Raw, RenderMode::Termimad] {
             let mut renderer = super::StreamingRenderer::new(mode).capturing(80);
             renderer
                 .push_delta("para one.\n\n")
@@ -2642,7 +2531,7 @@ mod tests {
     /// cursor sits mid-line, which is exactly the state this guards against.
     #[test]
     fn a_finished_row_is_terminated_before_the_write_returns() {
-        for mode in [RenderMode::Raw, RenderMode::Termimad, RenderMode::Syntect] {
+        for mode in [RenderMode::Raw, RenderMode::Termimad] {
             let mut renderer = super::StreamingRenderer::new(mode).capturing(80);
             renderer
                 .push_delta("line one\n\nline two\n\n")
@@ -2701,7 +2590,7 @@ mod tests {
     /// comes. Both streamed kinds go through the same writer, so both are pinned here.
     #[test]
     fn a_block_does_not_end_on_a_blank_row() {
-        for mode in [RenderMode::Raw, RenderMode::Termimad, RenderMode::Syntect] {
+        for mode in [RenderMode::Raw, RenderMode::Termimad] {
             let thinking = thinking_rows("one\n\ntwo\n\n", mode, 80);
             assert!(
                 thinking.ends_with("two\n"),
@@ -2741,7 +2630,7 @@ mod tests {
     fn a_full_thinking_block_cannot_forge_a_line_of_meka_chrome() {
         let forged = "Let me check.\nResuming session: 550e8400-e29b-41d4-a716-446655440000";
         let chrome = "Resuming session: 550e8400-e29b-41d4-a716-446655440000";
-        for mode in [RenderMode::Raw, RenderMode::Termimad, RenderMode::Syntect] {
+        for mode in [RenderMode::Raw, RenderMode::Termimad] {
             let body = thinking_rows(forged, mode, TEST_WIDTH);
             assert!(
                 body.lines()
@@ -2780,8 +2669,8 @@ mod tests {
     }
 
     /// Replayed history has no tool schemas, so it passes no summary. Showing a bare
-    /// `[tool file_read]` there made `/history` and `resume_show_recent` strictly less informative
-    /// than the live line they are replaying, for tools whose primary parameter needs no schema.
+    /// `[tool file_read]` there made a replay strictly less informative than the live line it is
+    /// replaying, for tools whose primary parameter needs no schema.
     #[test]
     fn a_replayed_builtin_recovers_its_argument_without_a_schema() {
         assert_eq!(
@@ -3032,7 +2921,7 @@ mod tests {
     }
 
     /// A line padded with zero-width characters is wrapped in time linear in its length. A loop
-    /// that re-measures the whole prefix per character holds the REPL for minutes on a thinking
+    /// that re-measures the whole prefix per character holds the screen for minutes on a thinking
     /// line of two hundred thousand zero-width spaces, or one base with that many combining marks.
     #[test]
     fn wrapping_a_zero_width_flood_is_linear() {
@@ -3211,20 +3100,20 @@ mod tests {
                 }
             }
             for input in &inputs {
-                // The approval block wraps rather than cutting, which is the case where a row can
+                // The whole block wraps rather than cutting, which is the case where a row can
                 // exceed the width if the wrap arithmetic is wrong, and where a continuation row
                 // could land at column zero.
-                for line in super::render_approval_params(input, width) {
+                for line in super::render_whole_params(input, width) {
                     assert!(
                         super::display_width(&line) <= width,
-                        "approval at width {}: {} columns in {:?}",
+                        "whole block at width {}: {} columns in {:?}",
                         width,
                         super::display_width(&line),
                         line
                     );
                     assert!(
                         line.starts_with(super::TOOL_PARAM_INDENT),
-                        "approval row at column zero: {line:?}"
+                        "whole block row at column zero: {line:?}"
                     );
                 }
             }
@@ -3420,23 +3309,31 @@ mod tests {
 
     /// The failure that made a decision surface show less than a notification: a 90 KB
     /// `shell_execute` filled every row the wrap was given and stopped, leaving the end of the
-    /// pipeline -- where `; rm -rf /` lives -- off the last row. The `full` indicator, which elides
-    /// from the middle, showed that tail. Whatever else is cut, an approval keeps the end.
+    /// pipeline -- where `; rm -rf /` lives -- off the last row. The whole block keeps every
+    /// character of it, start, middle and end, with no marker in place of any of them.
     #[test]
-    fn an_approval_keeps_the_end_of_a_command_too_long_to_show() {
+    fn the_whole_block_keeps_every_character_of_a_long_command() {
         let command = format!("echo start; {} ; rm -rf /important", "PAD".repeat(30000));
-        let rendered =
-            super::render_approval_params(&serde_json::json!({ "command": command }), 80);
-        let joined = rendered.join("\n");
+        let rendered = super::render_whole_params(&serde_json::json!({ "command": command }), 80);
+        let joined: String = rendered
+            .iter()
+            .map(|row| row.trim_start())
+            .collect::<Vec<_>>()
+            .concat();
         assert!(
             joined.contains("rm -rf /important"),
-            "the end of the command was hidden: {:?}",
-            rendered.last()
+            "the end of the command was hidden"
         );
         assert!(joined.contains("echo start"), "the start went instead");
+        assert_eq!(
+            joined.matches("PAD").count(),
+            30000,
+            "every character is on screen: {:?}",
+            rendered.last()
+        );
         assert!(
-            rendered.iter().any(|row| row.contains("more characters")),
-            "nothing said how much was omitted: {rendered:?}"
+            !rendered.iter().any(|row| row.contains("more ")),
+            "nothing is omitted, so nothing is counted: {rendered:?}"
         );
     }
 
@@ -3451,28 +3348,23 @@ mod tests {
                 .collect(),
         );
         for width in [MIN_OUTPUT_WIDTH, 21, 25, 26, 27, 40, 80] {
-            for limits in [
-                super::BlockLimits::indicator(),
-                super::BlockLimits::approval(),
-            ] {
-                let rendered = super::render_tool_params(&input, width, limits);
-                let last = rendered.last().cloned().unwrap_or_default();
-                // At the narrow end the word itself is cut; the marker and the count survive, which
-                // is what tells a reader something was dropped. How many go depends on the limits,
-                // so the count is not pinned here.
-                assert!(last.trim_start().starts_with("... "), "{last:?}");
-                assert!(
-                    last.chars().any(|character| character.is_ascii_digit()),
-                    "no count survived: {last:?}"
-                );
-                assert!(
-                    super::display_width(&last) <= width,
-                    "width {}: {} columns in {:?}",
-                    width,
-                    super::display_width(&last),
-                    last
-                );
-            }
+            let rendered =
+                super::render_tool_params(&input, width, super::BlockLimits::indicator());
+            let last = rendered.last().cloned().unwrap_or_default();
+            // At the narrow end the word itself is cut; the marker and the count survive, which
+            // is what tells a reader something was dropped.
+            assert!(last.trim_start().starts_with("... "), "{last:?}");
+            assert!(
+                last.chars().any(|character| character.is_ascii_digit()),
+                "no count survived: {last:?}"
+            );
+            assert!(
+                super::display_width(&last) <= width,
+                "width {}: {} columns in {:?}",
+                width,
+                super::display_width(&last),
+                last
+            );
         }
     }
 
@@ -3481,10 +3373,8 @@ mod tests {
     /// the per-argument cap sharing `block_rows` made it twice what the field claimed.
     #[test]
     fn a_block_stays_inside_the_ceiling_its_limits_add_up_to() {
-        for limits in [
-            super::BlockLimits::indicator(),
-            super::BlockLimits::approval(),
-        ] {
+        {
+            let limits = super::BlockLimits::indicator();
             // The worst case needs the huge argument to be the one that *crosses* the line, so the
             // block must be one row short of its gate when that argument is reached. Padding past
             // the gate instead drops the huge one by name and never renders it, which is a block of
@@ -3523,11 +3413,48 @@ mod tests {
             .map(|index| format!("line {} {}", index, "x".repeat(280)))
             .collect::<Vec<_>>()
             .join("\n");
-        let rendered = super::render_approval_params(&serde_json::json!({ "content": body }), 80);
+        let rendered = super::render_tool_params(
+            &serde_json::json!({ "content": body }),
+            80,
+            super::BlockLimits::indicator(),
+        );
         assert!(
             rendered.iter().any(|row| row.contains("more lines")),
             "the line count was cut away: {:?}",
             rendered.last()
+        );
+    }
+
+    /// The whole block has no ceiling of any kind: every line of every argument, wrapped, and
+    /// every argument by name. The screen scrolls; a count in place of rows is what hid a
+    /// payload's tail before.
+    #[test]
+    fn the_whole_block_keeps_every_line_of_every_argument() {
+        let body = (0..500)
+            .map(|index| format!("line {} {}", index, "x".repeat(280)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut fields = serde_json::Map::new();
+        for index in 0..300 {
+            fields.insert(format!("a{index:03}"), serde_json::json!("v"));
+        }
+        fields.insert("content".to_string(), serde_json::json!(body));
+        let rendered = super::render_whole_params(&serde_json::Value::Object(fields), 80);
+        assert!(
+            rendered.iter().any(|row| row.contains("line 499")),
+            "the last line is on screen: {:?}",
+            rendered.last()
+        );
+        assert_eq!(
+            rendered.iter().filter(|row| row.contains(": v")).count(),
+            300,
+            "every argument is on screen by name"
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|row| row.trim_start().starts_with("... ")),
+            "nothing is dropped, so nothing is counted: {rendered:?}"
         );
     }
 
@@ -3628,7 +3555,7 @@ mod tests {
     /// Fitting text to a budget re-measures a growing prefix, so a character that never advances
     /// the count made the loop walk the whole string and re-measure it every step. Forty
     /// thousand combining marks in a tool name -- which is model-supplied, unvalidated, and
-    /// rendered in every `tool_params` mode including `off` -- froze the REPL for minutes.
+    /// rendered in every `tool_params` mode including `off` -- froze the screen for minutes.
     #[test]
     fn fitting_text_to_a_budget_is_bounded_by_the_budget() {
         let zalgo = format!("{}{}", "\u{0301}".repeat(40_000), "A".repeat(300));
@@ -3732,14 +3659,13 @@ mod tests {
             93,
             "config-file.md quotes 93 rows"
         );
-        let approval = super::BlockLimits::approval();
-        assert_eq!(approval.lines_per_argument, 20);
-        assert_eq!(approval.rows_per_argument, 60);
-        assert_eq!(approval.block_rows, 100);
-        assert_eq!(
-            approval.block_rows + approval.rows_per_argument + 1,
-            161,
-            "permissions.md quotes 161 rows"
+        let whole = super::BlockLimits::whole();
+        assert!(
+            whole.wrap
+                && whole.lines_per_argument == usize::MAX
+                && whole.rows_per_argument == usize::MAX
+                && whole.block_rows == usize::MAX,
+            "permissions.md says nothing is left out"
         );
     }
 
@@ -4338,40 +4264,35 @@ mod tests {
         output
     }
 
-    /// termimad's own `default_dark()` is defined entirely in `gray(n)`, which is what made this
-    /// mode unreadable: every element rendered in the same handful of grayscale tones. Each element
-    /// must now carry a distinct color from the theme.
+    /// The skin is the quiet palette the screen draws with: emphasis by weight, inline code in
+    /// the accent slot, a heading bold, and nothing in 24-bit color.
     #[test]
-    fn markdown_skin_is_not_greyscale() {
+    fn the_markdown_skin_is_the_quiet_palette() {
         force_colors();
         let rendered = termimad_render(
             "# Title\n\nText with **bold**, *italic*, and `code`.\n\n> quoted\n\n* item\n",
         );
-        let colors = fg_color_set(&rendered);
         assert!(
-            colors.len() >= 5,
-            "expected a distinct color per element; got {colors:?}",
+            rendered.contains("\x1b[1mbold"),
+            "bold by weight: {rendered:?}"
         );
-        // A grayscale color has r == g == b; a skin that regressed to the default would be all of
-        // them, so assert the palette actually carries hue.
-        let has_hue = colors.iter().any(|color| {
-            let parts: Vec<&str> = color.split(';').collect();
-            parts.len() == 3 && !(parts[0] == parts[1] && parts[1] == parts[2])
-        });
-        assert!(has_hue, "every color was grayscale: {colors:?}");
-    }
-
-    /// The theme's markdown rules are nested selectors (`text.html.markdown markup.raw.inline`),
-    /// so resolving an element scope on its own silently yields the default foreground. Inline code
-    /// is the one that exposes this.
-    #[test]
-    fn inline_code_resolves_through_the_markdown_context() {
-        force_colors();
-        let rendered = termimad_render("uses `inline_code` here\n");
         assert!(
-            fg_color_set(&rendered).contains("236;53;51"),
-            "inline code should take the theme's markup.raw.inline color; got {:?}",
-            fg_color_set(&rendered),
+            rendered.contains("\x1b[3mitalic"),
+            "italic by attribute: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\x1b[38;5;6mcode"),
+            "inline code in the accent slot: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\x1b[1mTitle"),
+            "a heading is bold: {rendered:?}"
+        );
+        assert!(
+            fg_color_set(&rendered)
+                .iter()
+                .all(|color| !color.starts_with("38;2;")),
+            "nothing is a 24-bit color: {rendered:?}"
         );
     }
 
@@ -4526,11 +4447,7 @@ mod tests {
     /// `buffer`.
     #[test]
     fn finish_drains_pending_state_when_the_buffer_is_empty() {
-        let cases = [
-            (RenderMode::Syntect, "| a | b |\n"),
-            (RenderMode::Syntect, "```rust\nfn main() {}\n"),
-            (RenderMode::Termimad, "```rust\nfn main() {}\n"),
-        ];
+        let cases = [(RenderMode::Termimad, "```rust\nfn main() {}\n")];
         for (mode, input) in cases {
             let mut renderer = StreamingRenderer::new(mode);
             renderer.push_delta(input).unwrap();
@@ -4538,12 +4455,12 @@ mod tests {
                 renderer.buffer.is_empty()
                     && (!renderer.raw_table_lines.is_empty()
                         || !renderer.code_block_lines.is_empty()),
-                "{mode} / {input:?}: precondition is an empty buffer with content still pending",
+                "{mode:?} / {input:?}: precondition is an empty buffer with content still pending",
             );
             renderer.finish().unwrap();
             assert!(
                 renderer.raw_table_lines.is_empty() && renderer.code_block_lines.is_empty(),
-                "{mode} / {input:?}: finish must render pending content, not drop it",
+                "{mode:?} / {input:?}: finish must render pending content, not drop it",
             );
         }
     }
@@ -4673,7 +4590,7 @@ mod tests {
     /// same buffers.
     #[test]
     fn finish_leaves_nothing_buffered_in_any_mode() {
-        let modes = [RenderMode::Syntect, RenderMode::Termimad, RenderMode::Raw];
+        let modes = [RenderMode::Termimad, RenderMode::Raw];
         for document in STREAMING_CORPUS {
             for mode in modes {
                 for chunk in [1, 3, 17, usize::MAX] {
@@ -4689,7 +4606,7 @@ mod tests {
                         renderer.buffer.is_empty()
                             && renderer.raw_table_lines.is_empty()
                             && renderer.code_block_lines.is_empty(),
-                        "{mode} left content buffered after finish for chunk {chunk} of \
+                        "{mode:?} left content buffered after finish for chunk {chunk} of \
                          {document:?}: buffer={:?} table={:?} code={:?}",
                         renderer.buffer,
                         renderer.raw_table_lines,
@@ -4735,16 +4652,14 @@ mod tests {
     /// inserts a blank line into the user's code.
     #[test]
     fn code_block_body_is_not_reflowed_as_markdown() {
-        for mode in [RenderMode::Termimad, RenderMode::Syntect] {
-            let mut renderer = StreamingRenderer::new(mode);
-            renderer.push_delta("```sh\n").expect("fence");
-            renderer.push_delta("# comment\nls -la\n").expect("body");
-            assert_eq!(
-                renderer.code_block_lines,
-                vec!["```sh", "# comment", "ls -la"],
-                "{mode} injected markdown spacing into a code block body",
-            );
-        }
+        let mut renderer = StreamingRenderer::new(RenderMode::Termimad);
+        renderer.push_delta("```sh\n").expect("fence");
+        renderer.push_delta("# comment\nls -la\n").expect("body");
+        assert_eq!(
+            renderer.code_block_lines,
+            vec!["```sh", "# comment", "ls -la"],
+            "markdown spacing was injected into a code block body",
+        );
     }
 
     /// Blocks have to be separated by a blank line. minimad renders a flat list of lines with no
@@ -4863,48 +4778,6 @@ mod tests {
             "a redirected run must not be hard-wrapped to the 50-column fallback; longest line \
              was {longest}",
         );
-    }
-
-    #[test]
-    fn render_mode_parses_syntect_only() {
-        assert_eq!("syntect".parse(), Ok(RenderMode::Syntect));
-        assert_eq!("termimad".parse(), Ok(RenderMode::Termimad));
-        // One spelling per mode, on the flag and in `config.toml` alike: a second name for the
-        // same renderer is refused in both places rather than accepted in one and not the other.
-        #[derive(serde::Deserialize)]
-        struct Display {
-            render_mode: RenderMode,
-        }
-        assert!("markdown".parse::<RenderMode>().is_err());
-        assert!(toml::from_str::<Display>("render_mode = \"markdown\"").is_err());
-        assert_eq!(
-            toml::from_str::<Display>("render_mode = \"termimad\"")
-                .expect("the one spelling")
-                .render_mode,
-            RenderMode::Termimad
-        );
-        assert_eq!(RenderMode::Syntect.to_string(), "syntect");
-        // A name that isn't a mode errors rather than silently falling back to the default, so a
-        // user who asks for a renderer meka doesn't have hears about it.
-        assert!("bat".parse::<RenderMode>().is_err());
-        assert!("nope".parse::<RenderMode>().is_err());
-        // `silent` gets its own line rather than being left to the two nonsense words above: a
-        // retired name is the one an existing config still holds, so reintroducing it would pass
-        // unnoticed where `bat` would not.
-        assert!("silent".parse::<RenderMode>().is_err());
-    }
-
-    /// The config tier rejects the same names the flag tier does. A `render_mode` that isn't a mode
-    /// has to fail at load rather than deserialize into the default, which would leave the user
-    /// staring at a renderer they didn't ask for with nothing to explain it.
-    #[test]
-    fn render_mode_config_rejects_unknown_names() {
-        assert_eq!(
-            serde_json::from_str::<RenderMode>("\"syntect\"").unwrap(),
-            RenderMode::Syntect,
-        );
-        assert!(serde_json::from_str::<RenderMode>("\"bat\"").is_err());
-        assert!(serde_json::from_str::<RenderMode>("\"silent\"").is_err());
     }
 
     #[test]
@@ -5246,235 +5119,5 @@ mod tests {
         let input = "| A | B |\n|---|---|\n| 1 | 2 |";
         let output = normalize_spacing(input, false);
         assert_eq!(output, "| A | B |\n|---|---|\n| 1 | 2 |");
-    }
-
-    use crate::{
-        conversation::{ContentBlock, Message, Role, ToolResultContent},
-        image::ImageSource,
-    };
-
-    pub(super) fn user_prompt(text: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: text.to_string(),
-            }],
-        }
-    }
-
-    pub(super) fn assistant_text(text: &str) -> Message {
-        Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Text {
-                text: text.to_string(),
-            }],
-        }
-    }
-
-    pub(super) fn tool_result_message(tool_use_id: &str, body: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: tool_use_id.to_string(),
-                content: vec![ToolResultContent::Text {
-                    text: body.to_string(),
-                }],
-                is_error: false,
-            }],
-        }
-    }
-
-    #[test]
-    fn last_n_turns_handles_empty() {
-        assert!(last_n_turns(&[], 1).is_empty());
-        assert!(last_n_turns(&[], 0).is_empty());
-    }
-
-    #[test]
-    fn last_n_turns_zero_returns_empty() {
-        let messages = vec![user_prompt("hi"), assistant_text("hello")];
-        assert!(last_n_turns(&messages, 0).is_empty());
-    }
-
-    #[test]
-    fn last_n_turns_one_counts_to_last_user_prompt() {
-        let messages = vec![
-            user_prompt("first"),
-            assistant_text("ack one"),
-            user_prompt("second"),
-            assistant_text("ack two"),
-        ];
-        let slice = last_n_turns(&messages, 1);
-        assert_eq!(slice.len(), 2);
-        assert!(matches!(slice[0].role, Role::User));
-        // The "second" prompt is the boundary; both messages after it belong to that turn.
-        assert_eq!(
-            slice[0].text_content(),
-            "second",
-            "boundary should be the most recent user prompt"
-        );
-    }
-
-    #[test]
-    fn last_n_turns_two_returns_from_earlier_boundary() {
-        let messages = vec![
-            user_prompt("first"),
-            assistant_text("ack one"),
-            user_prompt("second"),
-            assistant_text("ack two"),
-        ];
-        let slice = last_n_turns(&messages, 2);
-        assert_eq!(slice.len(), 4, "N=2 includes both turns end-to-end");
-        assert_eq!(slice[0].text_content(), "first");
-    }
-
-    #[test]
-    fn last_n_turns_n_exceeds_available_returns_all() {
-        let messages = vec![user_prompt("only"), assistant_text("ack")];
-        let slice = last_n_turns(&messages, 99);
-        assert_eq!(slice.len(), 2);
-        assert_eq!(slice[0].text_content(), "only");
-    }
-
-    #[test]
-    fn last_n_turns_skips_tool_result_user_messages() {
-        // A User message that's purely ToolResult blocks must not count as a turn boundary;
-        // otherwise N=1 would land on the tool result echo instead of the user's actual prompt.
-        let messages = vec![
-            user_prompt("real prompt"),
-            assistant_text("calling tool"),
-            tool_result_message("toolu_1", "tool output"),
-            assistant_text("answer"),
-        ];
-        let slice = last_n_turns(&messages, 1);
-        assert_eq!(slice.len(), 4, "all messages belong to the one real turn");
-        assert_eq!(slice[0].text_content(), "real prompt");
-    }
-
-    #[test]
-    fn last_n_turns_no_user_prompt_returns_empty() {
-        // Assistant-only history (rare; only happens if the materialized view starts
-        // mid-conversation) has no turn boundaries; N doesn't find anything.
-        let messages = vec![assistant_text("orphan reply")];
-        assert!(last_n_turns(&messages, 1).is_empty());
-    }
-
-    #[test]
-    fn render_message_history_does_not_panic_on_all_block_kinds() {
-        // We can't capture stderr/stdout easily from a unit test, so we settle for "every variant
-        // flows through without panicking".
-        let messages = vec![
-            user_prompt("can you read the file?"),
-            Message {
-                role: Role::Assistant,
-                content: vec![
-                    ContentBlock::Thinking {
-                        thinking: "I should call file_read.".to_string(),
-                        opaque: None,
-                    },
-                    ContentBlock::RedactedThinking {
-                        data: "opaque".to_string(),
-                    },
-                    ContentBlock::Text {
-                        text: "Sure, reading now.".to_string(),
-                    },
-                    ContentBlock::ToolUse {
-                        id: "u1".to_string(),
-                        name: "file_read".to_string(),
-                        input: serde_json::json!({"path": "a.txt"}),
-                    },
-                ],
-            },
-            Message {
-                role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "u1".to_string(),
-                    content: vec![
-                        ToolResultContent::Text {
-                            text: "hello\n".to_string(),
-                        },
-                        ToolResultContent::Image {
-                            source: ImageSource::Base64 {
-                                media_type: "image/png".to_string(),
-                                data: "deadbeef".to_string(),
-                            },
-                        },
-                    ],
-                    is_error: false,
-                }],
-            },
-            assistant_text("File starts with `hello`."),
-        ];
-        // The output goes to the real stdout, which a unit test cannot read back; what it can
-        // check is that every block kind renders something and that the first-output hook fires,
-        // so a renderer that silently skipped a kind would fail here.
-        let opts_with_thinking = HistoryRenderOptions {
-            render_mode: RenderMode::Raw,
-            tool_params: ToolParams::Summary,
-            show_thinking: true,
-            input_style: nu_ansi_term::Style::default(),
-            newline_before_prompt: true,
-            newline_after_prompt: true,
-        };
-        let mut first_output = false;
-        assert!(render_message_history(
-            &messages,
-            &opts_with_thinking,
-            || first_output = true
-        ));
-        assert!(
-            first_output,
-            "the hook fires ahead of the first rendered block"
-        );
-        // And off: the call must still complete cleanly.
-        let opts_no_thinking = HistoryRenderOptions {
-            show_thinking: false,
-            ..opts_with_thinking
-        };
-        assert!(render_message_history(&messages, &opts_no_thinking, || {}));
-        // Also: no-newline-prompt config must still produce non-panicking output.
-        let opts_tight = HistoryRenderOptions {
-            newline_before_prompt: false,
-            newline_after_prompt: false,
-            ..opts_with_thinking
-        };
-        assert!(render_message_history(&messages, &opts_tight, || {}));
-    }
-
-    #[test]
-    fn render_message_history_reports_when_it_showed_nothing() {
-        let opts = HistoryRenderOptions {
-            render_mode: RenderMode::Raw,
-            tool_params: ToolParams::Summary,
-            show_thinking: false,
-            input_style: nu_ansi_term::Style::default(),
-            newline_before_prompt: true,
-            newline_after_prompt: true,
-        };
-        assert!(!render_message_history(&[], &opts, || {}));
-
-        // Non-empty but invisible: tool results are deliberately not echoed and blank assistant
-        // text is skipped, so this renders to nothing at all. `/history` prints its empty-state
-        // line off this answer, and the caller's `[display]` blanks would otherwise bracket a
-        // region with nothing in it.
-        let invisible = vec![
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "   \n".to_string(),
-                }],
-            },
-            Message {
-                role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "u1".to_string(),
-                    content: vec![ToolResultContent::Text {
-                        text: "hello".to_string(),
-                    }],
-                    is_error: false,
-                }],
-            },
-        ];
-        assert!(!render_message_history(&invisible, &opts, || {}));
     }
 }

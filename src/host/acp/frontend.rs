@@ -327,8 +327,8 @@ impl Frontend for AcpFrontend {
             // Nothing to show, and no transient UI to close: ACP thought chunks accumulate, so a
             // counter meant to be drawn over and replaced would leave a trail of stale figures in
             // the thread. Matched explicitly rather than left to the catch-all below, which is for
-            // REPL signage an editor has its own UI for -- these two are the opposite case, signals
-            // this frontend structurally cannot represent.
+            // screen signage an editor has its own UI for -- these two are the opposite case,
+            // signals this frontend structurally cannot represent.
             FrontendEvent::ThinkingProgress { .. } | FrontendEvent::ThinkingEnded => return,
             // ACP takes reasoning whole, from `ThinkingBlock` below. The deltas carry the same text
             // and forwarding both would double every thought chunk in the thread.
@@ -491,7 +491,7 @@ impl Frontend for AcpFrontend {
                  ({source}, compaction {generation})"
             ))),
             FrontendEvent::McpProgress(update) => {
-                // ACP has no protocol primitive for tool-progress streams. The REPL renders these
+                // ACP has no protocol primitive for tool-progress streams. The screen renders these
                 // inline as a carriage-return-overwrite status line; in the ACP world the editor
                 // already has its own visibility into MCP server activity (or can subscribe to the
                 // stderr log stream of the spawned agent). Log at info so `-v` users can still see
@@ -519,7 +519,7 @@ impl Frontend for AcpFrontend {
                 SessionUpdate::Plan(Plan::new(checklist_to_plan(&items)))
             }
             FrontendEvent::TokenUsage(_) => {
-                // Mirror the REPL's context gauge as an ACP `usage_update` so editors (e.g. Zed)
+                // Mirror the screen's context gauge as an ACP `usage_update` so editors (e.g. Zed)
                 // show "tokens used / context window". `used` is read from the shared atomic the
                 // agent updates each round (current occupancy: all input tiers + output) rather
                 // than the event's per-turn total, which over-counts multi-round tool turns;
@@ -545,7 +545,7 @@ impl Frontend for AcpFrontend {
                 self.live_output().clear();
                 return;
             }
-            // REPL signage. The editor named the session it created, and the `session/prompt`
+            // Screen signage. The editor named the session it created, and the `session/prompt`
             // response is what tells it the turn is over. A withdrawn prompt is a scheduled fire's,
             // never one the editor sent, so its transcript has nothing to amend. Spelled out rather
             // than left to a catch-all so a variant added later has to be placed here on purpose.
@@ -580,7 +580,7 @@ impl Frontend for AcpFrontend {
         // command line alone, so a bare "Always allow" reads as approving the command the user just
         // read, when it actually approves every shell command for the rest of the session. Spelling
         // the tool out is what makes the affordance and the semantics agree, and it is spelled the
-        // way the REPL spells it.
+        // way the screen spells it.
         let options = vec![
             PermissionOption::new(OPTION_ALLOW_ONCE, "Allow", PermissionOptionKind::AllowOnce),
             PermissionOption::new(
@@ -841,7 +841,7 @@ pub(super) fn notice_update(notice: &crate::frontend::Notice) -> SessionUpdate {
 /// Every argument of a call awaiting approval, as a fenced block for the prompt's content.
 ///
 /// The title names the destination; this is what would be written there. Pretty-printed JSON
-/// rather than the REPL's key-per-line rendering because an editor renders markdown, where a code
+/// rather than the screen's key-per-line rendering because an editor renders markdown, where a code
 /// block keeps a multi-line `content` legible and a client-side width does the wrapping.
 pub(super) fn approval_arguments_block(input: &serde_json::Value) -> String {
     let rendered = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
@@ -951,7 +951,7 @@ pub(super) fn tool_kind_for(name: &str) -> ToolKind {
 }
 /// Build the human-readable `title` for a tool call: the tool's name, then the resolved primary
 /// argument (`display_summary`: the path for `file_read`, the URL for `web_fetch`, ...), so editors
-/// show what's running and not only which tool. The name is the one the REPL's indicator and
+/// show what's running and not only which tool. The name is the one the screen's indicator and
 /// approval prompt show, so the surfaces share one vocabulary. `raw_input` still carries the full
 /// argument object for clients that want it.
 ///
@@ -1385,7 +1385,7 @@ pub(super) fn parse_mode_id(id: &str) -> Option<Permission> {
     id.parse().ok()
 }
 /// Human-readable label for a permission level, shown in editor mode pickers next to each option.
-/// Kept in lock-step with the REPL's `/permission` output and the `[permissions]` keys in
+/// Kept in lock-step with the screen's `/permission` output and the `[permissions]` keys in
 /// `config.toml` so users see the same vocabulary everywhere.
 pub(super) fn level_display_name(permission: Permission) -> &'static str {
     match permission {

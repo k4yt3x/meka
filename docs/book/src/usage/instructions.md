@@ -67,7 +67,7 @@ Setting both environment variables is refused at startup. There is no reading un
 files = ["AGENTS.md", "~/notes/meka-site.md"]
 ```
 
-A relative entry is resolved against the **session's working directory**: where the REPL or a one-shot run was launched, the `cwd` an ACP client or a `POST /v1/sessions` body named, and on a resume the directory the session recorded. That is what makes `AGENTS.md` mean "this project's file" wherever the session opens. An absolute entry is read as given, and a leading `~` is expanded.
+A relative entry is resolved against the **session's working directory**: where the screen or a one-shot run was launched, the `cwd` an ACP client or a `POST /v1/sessions` body named, and on a resume the directory the session recorded. That is what makes `AGENTS.md` mean "this project's file" wherever the session opens. An absolute entry is read as given, and a leading `~` is expanded.
 
 The list is empty unless you write it, and deliberately so. A relative entry lets whatever sits in the working directory speak with the operator's authority: a cloned repository's `AGENTS.md` lands in the system prompt verbatim, and under `meka serve` the client chooses the directory. Name a relative entry only where every directory a session may open in is one you trust, and prefer an absolute path for a file that is yours.
 

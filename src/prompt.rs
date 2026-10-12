@@ -1347,7 +1347,7 @@ const RESUMED_SECTION: &str = "[Session resumed]\nThis conversation was loaded f
 
 /// How much of the context window the conversation is occupying, as the model is told it.
 ///
-/// The harness knows this (it drives auto-compaction and the REPL's live gauge); without it the
+/// The harness knows this (it drives auto-compaction and the screen's live gauge); without it the
 /// model decides how much of a file to read, whether to summarize before a long stretch of work,
 /// and whether a task fits at all, entirely by feel. Rendered into the per-turn `<context>` block
 /// rather than the system prompt because it moves every turn and the system prompt is the cached
@@ -2762,7 +2762,7 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains("`[Permission context]`"));
-        // No key, command or endpoint: the level is raised differently in the REPL, over ACP and
+        // No key, command or endpoint: the level is raised differently on the screen, over ACP and
         // over HTTP, and a prompt that names one sends the model to tell a chat user to press a
         // key they do not have.
         for surface in ["Shift+Tab", "/permission", "POST ", "endpoint"] {
@@ -4246,7 +4246,7 @@ mod tests {
         assert!(context.is_empty());
     }
 
-    /// Single-root output must be untouched: every REPL, HTTP, and single-folder ACP session goes
+    /// Single-root output must be untouched: every screen, HTTP, and single-folder ACP session goes
     /// through here, and an extra line would change the prompt for all of them.
     #[test]
     fn environment_context_omits_roots_when_empty() {

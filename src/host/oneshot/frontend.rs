@@ -1,51 +1,38 @@
-//! The REPL's [`Frontend`]: how streamed output, tool indicators and thinking reach the terminal
-//! while the editor owns the prompt line.
+//! The one-shot run's [`Frontend`]: how streamed output, tool indicators and thinking reach the
+//! terminal when the answer is written once, to stdout, and nothing can be asked of a human.
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use super::{editor::*, prompts::ApprovalDecision};
 use crate::{
-    frontend::{
-        Frontend, FrontendEvent, Notice, PermissionOutcome, PermissionRequest, StickyApprovals,
-    },
+    frontend::{Frontend, FrontendEvent, Notice, PermissionOutcome, PermissionRequest},
+    host::terminal::with_console,
     render::{self},
 };
 
-/// Construction-time configuration for [`ReplFrontend`]. UI concerns, so they live on the frontend
-/// impl rather than on `AgentOptions`.
-pub(crate) struct ReplFrontendConfig {
-    /// Where everything printed between two prompts goes, shared with the REPL thread and the host
-    /// loop. The frontend decides *what* to say and the console decides how it is spaced, which is
-    /// what stops a turn's blank lines from being a different mechanism to a slash command's.
+/// Construction-time configuration for [`PlainFrontend`]. UI concerns, so they live on the
+/// frontend impl rather than on `AgentOptions`.
+pub(crate) struct PlainFrontendConfig {
+    /// Where everything printed goes. The frontend decides *what* to say and the console decides
+    /// how it is spaced.
     pub(crate) console: Arc<Mutex<crate::console::Console>>,
     pub(crate) show_session_id_on_create: bool,
     pub(crate) show_token_usage: bool,
     pub(crate) thinking_show_content: bool,
     pub(crate) tool_params: crate::config::ToolParams,
-    /// Sender for the REPL's `AgentToReplEvent` channel, which carries approval requests to the
-    /// blocking REPL thread.
-    pub(crate) agent_event_sender: std::sync::mpsc::Sender<AgentToReplEvent>,
 }
-/// REPL-side [`Frontend`] impl: a translator from [`FrontendEvent`] to
+/// The write-once [`Frontend`]: a translator from [`FrontendEvent`] to
 /// [`crate::console::Console`], plus the thinking indicator's own bookkeeping.
 ///
 /// It decides *what* to say and nothing about spacing. The blank lines belong to the episode the
 /// turn happens inside, which is longer than the turn and outlives one that fails, so an owner that
 /// only exists while a turn is running cannot be the one that closes them.
-///
-/// Lives in `crate::repl` (alongside the REPL thread it talks to) rather than in `crate::frontend`,
-/// so the trait module stays free of concrete UI types. See the module docs in `crate::frontend`.
-pub(crate) struct ReplFrontend {
-    pub(super) config: ReplFrontendConfig,
-    pub(super) state: Mutex<ReplFrontendState>,
-    /// The `always` and `never` answers given at the approval prompt. One frontend serves every
-    /// session a REPL run moves through, so these are cleared when a new session starts rather
-    /// than with the frontend.
-    sticky: StickyApprovals,
+pub(crate) struct PlainFrontend {
+    pub(super) config: PlainFrontendConfig,
+    pub(super) state: Mutex<PlainFrontendState>,
 }
-pub(super) struct ReplFrontendState {
+pub(super) struct PlainFrontendState {
     /// The thinking indicator currently drawn on the cursor's line. `None` when nothing is drawn.
     /// The row it occupies is the console's business; what the indicator *says* is this struct's.
     pub(super) thinking_indicator: Option<ThinkingIndicator>,
@@ -134,21 +121,14 @@ pub(super) fn indicator_action(event: &FrontendEvent, renders_reasoning: bool) -
 pub(super) fn peak_estimate(previous: Option<u64>, incoming: Option<u64>) -> Option<u64> {
     incoming.map(|estimate| previous.map_or(estimate, |peak| peak.max(estimate)))
 }
-impl ReplFrontend {
-    pub(crate) fn new(config: ReplFrontendConfig) -> Self {
+impl PlainFrontend {
+    pub(crate) fn new(config: PlainFrontendConfig) -> Self {
         Self {
             config,
-            state: Mutex::new(ReplFrontendState {
+            state: Mutex::new(PlainFrontendState {
                 thinking_indicator: None,
             }),
-            sticky: StickyApprovals::default(),
         }
-    }
-
-    /// Forget the `always` and `never` answers given so far, for a host that has moved this
-    /// frontend onto another session.
-    pub(crate) fn forget_session_answers(&self) {
-        self.sticky.clear();
     }
 
     /// Close out the thinking indicator, if one is drawn, by keeping it.
@@ -156,7 +136,7 @@ impl ReplFrontend {
     /// Writes the newline the redraw loop deliberately withheld, so the last figure drawn becomes a
     /// permanent line. The reasoning phase is then legible after the fact -- the same way a visible
     /// thinking block stays on screen -- rather than vanishing the instant the answer starts.
-    pub(super) fn commit_thinking_indicator(&self, state: &mut ReplFrontendState) {
+    pub(super) fn commit_thinking_indicator(&self, state: &mut PlainFrontendState) {
         if state.thinking_indicator.take().is_some() {
             with_console(&self.config.console, |console| console.commit_transient());
         }
@@ -167,14 +147,14 @@ impl ReplFrontend {
     /// Only for the case where a thinking block with real text is about to render: that block opens
     /// with the same `Thinking...` prefix, so committing first would print the word twice for one
     /// phase of reasoning.
-    pub(super) fn erase_thinking_indicator(&self, state: &mut ReplFrontendState) {
+    pub(super) fn erase_thinking_indicator(&self, state: &mut PlainFrontendState) {
         if state.thinking_indicator.take().is_some() {
             with_console(&self.config.console, |console| console.erase_transient());
         }
     }
 }
 #[async_trait]
-impl Frontend for ReplFrontend {
+impl Frontend for PlainFrontend {
     /// Reasoning stays on screen only when the deltas are what render it. Under the default the
     /// line shown is built from the completed block, which an attempt that failed never reaches,
     /// so a retry repeats nothing.
@@ -206,11 +186,6 @@ impl Frontend for ReplFrontend {
 
         match event {
             FrontendEvent::SessionStarted { id } => {
-                // A sticky answer is "for the rest of the session", and a first turn creating one
-                // arrives here before any call it could be asked about. The other way this
-                // frontend changes session is `/fork`, which the REPL loop answers by calling
-                // `forget_session_answers` when it moves.
-                self.forget_session_answers();
                 if self.config.show_session_id_on_create {
                     with_console(&self.config.console, |console| {
                         console.session_id("Creating new session", &id.to_string())
@@ -228,8 +203,9 @@ impl Frontend for ReplFrontend {
             // withdrawal is the schedule's own bookkeeping, not news for the person at the
             // keyboard.
             FrontendEvent::PromptWithdrawn => {}
-            // Nothing to draw either: the REPL has no producer for the inbox, so an item here came
-            // from a parent agent steering this worker, whose report is what the person reads.
+            // Nothing to draw either: a one-shot run has no producer for the inbox, so an item
+            // here came from a parent agent steering this worker, whose report is what the
+            // person reads.
             FrontendEvent::InboxDelivered { .. } => {}
             // The words are the model's to read; the stage direction that follows is what the
             // person sees of a nudge.
@@ -318,15 +294,12 @@ impl Frontend for ReplFrontend {
                     console.tool_indicator(&name, &input, display_summary.as_deref(), params)
                 });
             }
-            // The REPL renders tool results inline through the agent's own message-history path
-            // (the next assistant turn). No additional UI is needed at completion time; the
-            // model's response that follows already summarizes what happened.
+            // A one-shot run shows a tool's result through the model's next message, which
+            // summarizes what happened; the indicator is the whole of what the call itself gets.
             FrontendEvent::ToolCallCompleted { .. } => {}
-            // Same reasoning as `ToolCallCompleted`: the REPL deliberately doesn't show tool output
-            // at all, so streaming a command's output here would be the only tool output it ever
-            // printed. That's a change to the interactive UX rather than a fix, and it wants its
-            // own `show_*` config knob to go with it. ACP has no such convention to respect -- an
-            // editor's tool-call view is the only place a command's output can appear.
+            // Same reasoning as `ToolCallCompleted`: a one-shot run shows no tool output, so a
+            // command's streamed output would be the only tool output it ever printed, and the
+            // screen is where output is read as it arrives.
             FrontendEvent::ToolCallOutputDelta { .. } => {}
             FrontendEvent::ChecklistUpdated { items } => {
                 with_console(&self.config.console, |console| console.checklist(&items));
@@ -339,9 +312,9 @@ impl Frontend for ReplFrontend {
             FrontendEvent::Notice(notice) => {
                 with_console(&self.config.console, |console| console.notice(&notice));
             }
-            // The REPL already prints the sub-agent's tool indicators as they happen, via the
-            // parent's own renderer; a rolling rewrite of one tool call's content has no place in
-            // a scrolling transcript.
+            // The run already prints the sub-agent's tool indicators as they happen, via the
+            // parent's own renderer; a rolling rewrite of one tool call's content has no place on
+            // a stream written once.
             FrontendEvent::SubAgentActivity { .. } => {}
             // Nothing to draw: the transcript on screen is a scrollback the user wrote, not a view
             // of the model's window, so a compaction does not invalidate anything they can see.
@@ -350,114 +323,73 @@ impl Frontend for ReplFrontend {
             // the conversation and would otherwise watch it shrink; see `host::http::sse`.
             FrontendEvent::Compacted { .. } => {}
             FrontendEvent::McpProgress(update) => {
-                // Forward through the existing REPL channel so the blocking REPL thread renders
-                // the inline status line (carriage-return overwrite via `render_progress_update`).
-                // If the REPL is gone the send is a no-op; we don't want to block the agent's
-                // streaming loop on UI delivery.
-                if self
-                    .config
-                    .agent_event_sender
-                    .send(AgentToReplEvent::McpProgress(update))
-                    .is_err()
-                {
-                    tracing::debug!("MCP progress dropped (REPL disconnected)");
-                }
+                let line = format_progress_update(&update);
+                with_console(&self.config.console, |console| {
+                    // Always drawn as far as this can tell: `write_stderr` accepts a failed write
+                    // rather than reporting it down the stream that just refused it.
+                    console.transient(|| {
+                        crate::streams::write_stderr(&line);
+                        true
+                    })
+                });
             }
         }
     }
 
     async fn request_permission(&self, request: PermissionRequest) -> PermissionOutcome {
-        if let Some(remembered) = self.sticky.remembered(&request.tool_name) {
-            return remembered;
-        }
-        let (response_sender, response_receiver) =
-            tokio::sync::oneshot::channel::<ApprovalDecision>();
-        let tool_name = request.tool_name.clone();
-        let cancellation = request.cancellation.clone();
-        let approval = ToolApprovalRequest {
-            tool_name: request.tool_name,
-            input: request.input,
-            response_sender,
-        };
-        if self
-            .config
-            .agent_event_sender
-            .send(AgentToReplEvent::ApprovalRequest(approval))
-            .is_err()
-        {
-            // REPL thread is gone; there is no human to ask. In one-shot mode this is the
-            // *permanent* state rather than a shutdown race, so it is said on the console rather
-            // than logged: a run whose every tool is refused otherwise reads as a model that chose
-            // not to use them. Denied rather than canceled, because nothing stopped the turn;
-            // the call was refused, and the tool result should say so.
-            self.emit(FrontendEvent::Notice(
-                Notice::approval_refused_without_asking(&tool_name),
-            ))
-            .await;
-            return PermissionOutcome::Deny;
-        }
-        // Raced against the turn's own stop, as the other two frontends race it: otherwise a Ctrl+C
-        // at the prompt does nothing visible, and the next keystroke, usually the Enter that reads
-        // as allow, approves the call the user has just tried to stop. The REPL thread is blocked
-        // in `read_line`; dropping the receiver is what tells it to discard the answer.
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                crate::streams::write_stderr_line(
-                    "(the turn was stopped and this approval withdrawn; press Enter to clear the prompt)",
-                );
-                PermissionOutcome::Canceled
-            }
-            response = response_receiver => match response {
-                Ok(decision) => {
-                    match decision {
-                        ApprovalDecision::AllowAlways => self.sticky.remember_allow(&tool_name),
-                        ApprovalDecision::DenyAlways => self.sticky.remember_deny(&tool_name),
-                        ApprovalDecision::Allow | ApprovalDecision::Deny => {}
-                    }
-                    if decision.allows() {
-                        PermissionOutcome::Allow
-                    } else {
-                        PermissionOutcome::Deny
-                    }
-                }
-                Err(_) => PermissionOutcome::Canceled,
-            },
-        }
+        // There is no human to ask. Said on the console rather than logged: a run whose every
+        // tool is refused otherwise reads as a model that chose not to use them. Denied rather
+        // than canceled, because nothing stopped the turn; the call was refused, and the tool
+        // result should say so.
+        self.emit(FrontendEvent::Notice(
+            Notice::approval_refused_without_asking(&request.tool_name),
+        ))
+        .await;
+        PermissionOutcome::Deny
     }
 
     async fn handle_elicitation(
         &self,
         prompt: crate::frontend::ElicitationPrompt,
     ) -> crate::frontend::ElicitationResponse {
-        // Forward to the blocking REPL thread through the existing agent→shell channel. The thread
-        // renders the prompt, collects user input, and pushes the response back via the oneshot
-        // sender so this `.await` resolves.
-        let (responder, receiver) =
-            tokio::sync::oneshot::channel::<crate::frontend::ElicitationResponse>();
-        let server_name = prompt.server_name.clone();
-        if self
-            .config
-            .agent_event_sender
-            .send(AgentToReplEvent::McpElicitation { prompt, responder })
-            .is_err()
-        {
-            // REPL thread is gone: no human to ask. Decline so the server learns the elicitation
-            // wasn't answered, and say so on the console for `request_permission`'s reason: in
-            // one-shot mode there is no REPL thread to begin with, so this is the permanent answer
-            // rather than a shutdown race, and the tool call that needed the answer then fails
-            // with nothing else naming the cause.
-            self.emit(FrontendEvent::Notice(Notice::elicitation_declined(
-                &server_name,
-                "no interactive prompt is available here",
-            )))
-            .await;
-            return crate::frontend::ElicitationResponse::Decline;
-        }
-        receiver
-            .await
-            .unwrap_or(crate::frontend::ElicitationResponse::Decline)
+        // No human to ask, as for an approval: declined, and said on the console, because the
+        // tool call that needed the answer then fails with nothing else naming the cause.
+        self.emit(FrontendEvent::Notice(Notice::elicitation_declined(
+            &prompt.server_name,
+            "no interactive prompt is available here",
+        )))
+        .await;
+        crate::frontend::ElicitationResponse::Decline
     }
+}
+
+/// The one-row progress line for a running MCP tool. Sanitizes server-controlled strings so a
+/// server cannot inject escapes to clear the screen or spoof a prompt.
+///
+/// Every field is flattened to a single line and width-bounded. The line opens with meka's own
+/// `\r` to overwrite the previous progress, so anything that survived a newline in a server's
+/// string would be painted at column zero on a fresh row, below chrome the user has already read.
+fn format_progress_update(update: &crate::frontend::ProgressUpdate) -> String {
+    let server = crate::text::sanitize_to_line(&update.server_name, usize::MAX);
+    let tool = crate::text::sanitize_to_line(&update.tool_name, usize::MAX);
+    let counter = match update.total {
+        Some(total) if total > 0.0 => format!("{:.0}/{:.0}", update.progress, total),
+        _ => format!("{:.0}", update.progress),
+    };
+    let prefix = format!("[mcp:{server}/{tool}] {counter} ");
+    // What is left of the row after meka's own chrome and the trailing pad. Saturating: a narrow
+    // terminal or a long name leaves no room for the message rather than underflowing.
+    let pad = 5;
+    let budget = crate::render::output_width()
+        .saturating_sub(prefix.chars().count())
+        .saturating_sub(pad);
+    let message = update
+        .message
+        .as_deref()
+        .map(|raw| crate::text::sanitize_to_line(raw, budget))
+        .unwrap_or_default();
+    // Padded with a few spaces so the next draw clears the tail of a longer previous line.
+    format!("\r{}{}{}", prefix, message, " ".repeat(pad))
 }
 
 #[cfg(test)]
@@ -467,71 +399,27 @@ mod tests {
 
     fn console() -> Arc<Mutex<crate::console::Console>> {
         Arc::new(Mutex::new(crate::console::Console::new(
-            crate::console::Spacing {
-                newline_before_prompt: true,
-                newline_after_prompt: true,
-            },
             crate::config::RenderMode::Termimad,
         )))
     }
 
-    fn frontend_on(console: Arc<Mutex<crate::console::Console>>) -> ReplFrontend {
-        let (sender, _receiver) = std::sync::mpsc::channel();
-        ReplFrontend::new(ReplFrontendConfig {
+    fn frontend_on(console: Arc<Mutex<crate::console::Console>>) -> PlainFrontend {
+        PlainFrontend::new(PlainFrontendConfig {
             console,
             show_session_id_on_create: false,
             show_token_usage: false,
             thinking_show_content: false,
             tool_params: crate::config::ToolParams::Summary,
-            agent_event_sender: sender,
         })
     }
 
-    /// A stop during an approval prompt ends the prompt as canceled rather than waiting for the
-    /// answer the user is no longer giving. The editor thread here never answers, which is the
-    /// state a blocked `read_line` is in.
-    #[tokio::test]
-    async fn a_stopped_turn_withdraws_its_approval_prompt() {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let frontend = ReplFrontend::new(ReplFrontendConfig {
-            console: console(),
-            show_session_id_on_create: false,
-            show_token_usage: false,
-            thinking_show_content: false,
-            tool_params: crate::config::ToolParams::Summary,
-            agent_event_sender: sender,
-        });
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        cancellation.cancel();
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            frontend.request_permission(crate::frontend::PermissionRequest {
-                tool_name: "file_write".to_string(),
-                primary_param: Some("/tmp/x".to_string()),
-                input: serde_json::json!({"path": "/tmp/x"}),
-                cancellation,
-                subagent_id: None,
-            }),
-        )
-        .await
-        .expect("a canceled turn must not wait on the prompt");
-        assert_eq!(outcome, crate::frontend::PermissionOutcome::Canceled);
-        // The prompt was still dispatched, so the editor thread has one to discard.
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(AgentToReplEvent::ApprovalRequest(_))
-        ));
-    }
-
-    fn showing_thinking(console: Arc<Mutex<crate::console::Console>>) -> ReplFrontend {
-        let (sender, _receiver) = std::sync::mpsc::channel();
-        ReplFrontend::new(ReplFrontendConfig {
+    fn showing_thinking(console: Arc<Mutex<crate::console::Console>>) -> PlainFrontend {
+        PlainFrontend::new(PlainFrontendConfig {
             console,
             show_session_id_on_create: false,
             show_token_usage: false,
             thinking_show_content: true,
             tool_params: crate::config::ToolParams::Summary,
-            agent_event_sender: sender,
         })
     }
 
@@ -666,33 +554,25 @@ mod tests {
             "a text delta opens a block"
         );
 
-        // No `TurnFinished`: this is the failed turn. The episode still ends.
-        with_console(&console, |console| {
-            console.close_episode(crate::console::Neighbor::Prompt)
-        });
+        // No `TurnFinished`: this is the failed turn. The run's output still ends.
+        with_console(&console, |console| console.finish());
 
         assert!(
             !with_console(&console, |console| console.has_open_text()),
-            "the episode must not hand an open block to the next one"
+            "the run must not leave a block open under the shell's prompt"
         );
     }
 
-    /// A dead `agent_event_sender` is one-shot mode's permanent state, not a shutdown race, so an
-    /// elicitation declined for want of a prompt has to be said on the console, where the rest of
-    /// the run's chrome is, rather than logged where the default `warn` floor may or may not show
-    /// it. The tool call waiting on the answer then fails, and this is the only thing that names
-    /// the cause. Asserted on the console rather than on the return value, which no assertion
-    /// could catch: `Decline` is correct either way.
+    /// Nothing here can show a prompt, so an elicitation declined for want of one has to be said
+    /// on the console, where the rest of the run's chrome is, rather than logged where the default
+    /// `warn` floor may or may not show it. The tool call waiting on the answer then fails, and
+    /// this is the only thing that names the cause. Asserted on the console rather than on the
+    /// return value, which no assertion could catch: `Decline` is correct either way.
     #[tokio::test]
     async fn an_elicitation_nobody_can_answer_is_declined_on_the_console() {
         let console = console();
-        // The console counts what it prints per episode, so one has to be open, as it is for the
-        // whole of a one-shot run.
         with_console(&console, |console| {
-            console.open_episode(
-                crate::console::RowState::Empty,
-                crate::console::Neighbor::Shell,
-            )
+            console.start(crate::console::RowState::Empty)
         });
         let response = frontend_on(Arc::clone(&console))
             .handle_elicitation(crate::frontend::ElicitationPrompt {
@@ -723,10 +603,7 @@ mod tests {
     async fn a_tool_nobody_can_approve_is_denied_and_said_on_the_console() {
         let console = console();
         with_console(&console, |console| {
-            console.open_episode(
-                crate::console::RowState::Empty,
-                crate::console::Neighbor::Shell,
-            )
+            console.start(crate::console::RowState::Empty)
         });
         let outcome = frontend_on(Arc::clone(&console))
             .request_permission(crate::frontend::PermissionRequest {
@@ -742,114 +619,6 @@ mod tests {
             with_console(&console, |console| console.has_printed()),
             "the refusal must be said where the run's other chrome is"
         );
-    }
-
-    fn permission_request(tool_name: &str) -> crate::frontend::PermissionRequest {
-        crate::frontend::PermissionRequest {
-            tool_name: tool_name.to_string(),
-            primary_param: Some("/tmp/x".to_string()),
-            input: serde_json::json!({"path": "/tmp/x"}),
-            cancellation: tokio_util::sync::CancellationToken::new(),
-            subagent_id: None,
-        }
-    }
-
-    /// Answer the prompt the frontend just dispatched, the way the editor thread does.
-    fn answer_pending(
-        receiver: &std::sync::mpsc::Receiver<AgentToReplEvent>,
-        decision: ApprovalDecision,
-    ) {
-        match receiver.try_recv() {
-            Ok(AgentToReplEvent::ApprovalRequest(request)) => {
-                request
-                    .response_sender
-                    .send(decision)
-                    .expect("the frontend is waiting on this answer");
-            }
-            other => panic!(
-                "expected a dispatched approval prompt, got {:?}",
-                other.is_ok()
-            ),
-        }
-    }
-
-    /// `always` and `never` answer for the tool until the session ends, so the next call to it is
-    /// not put to the user again; a new session starts with nothing remembered.
-    #[tokio::test]
-    async fn a_sticky_answer_skips_the_prompt_until_the_session_changes() {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let frontend = Arc::new(ReplFrontend::new(ReplFrontendConfig {
-            console: console(),
-            show_session_id_on_create: false,
-            show_token_usage: false,
-            thinking_show_content: false,
-            tool_params: crate::config::ToolParams::Summary,
-            agent_event_sender: sender,
-        }));
-
-        // The first call is put to the user, who answers for the rest of the session.
-        let asked = tokio::spawn({
-            let frontend = Arc::clone(&frontend);
-            async move {
-                frontend
-                    .request_permission(permission_request("file_write"))
-                    .await
-            }
-        });
-        tokio::task::yield_now().await;
-        answer_pending(&receiver, ApprovalDecision::AllowAlways);
-        assert_eq!(asked.await.expect("task"), PermissionOutcome::Allow);
-
-        // The second call to the same tool is not asked about; another tool still is. Bounded,
-        // because a frontend that forgot the answer would dispatch a prompt nobody here answers
-        // and hang rather than fail.
-        let remembered = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            frontend.request_permission(permission_request("file_write")),
-        )
-        .await
-        .expect("a remembered answer resolves without a prompt");
-        assert_eq!(remembered, PermissionOutcome::Allow);
-        assert!(
-            receiver.try_recv().is_err(),
-            "a remembered answer must not dispatch a prompt"
-        );
-        let other = tokio::spawn({
-            let frontend = Arc::clone(&frontend);
-            async move {
-                frontend
-                    .request_permission(permission_request("shell_execute"))
-                    .await
-            }
-        });
-        tokio::task::yield_now().await;
-        answer_pending(&receiver, ApprovalDecision::DenyAlways);
-        assert_eq!(other.await.expect("task"), PermissionOutcome::Deny);
-        let remembered = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            frontend.request_permission(permission_request("shell_execute")),
-        )
-        .await
-        .expect("a remembered denial resolves without a prompt");
-        assert_eq!(remembered, PermissionOutcome::Deny);
-
-        // A new session forgets both, so the prompt is dispatched again.
-        frontend
-            .emit(FrontendEvent::SessionStarted {
-                id: uuid::Uuid::nil(),
-            })
-            .await;
-        let asked_again = tokio::spawn({
-            let frontend = Arc::clone(&frontend);
-            async move {
-                frontend
-                    .request_permission(permission_request("file_write"))
-                    .await
-            }
-        });
-        tokio::task::yield_now().await;
-        answer_pending(&receiver, ApprovalDecision::Deny);
-        assert_eq!(asked_again.await.expect("task"), PermissionOutcome::Deny);
     }
 
     /// The happy path still closes on `TurnFinished`, so a completed turn doesn't hold its last
@@ -1001,5 +770,87 @@ mod tests {
         let carried = peak_estimate(Some(900), None);
         assert_eq!(carried, None, "a block opening resets rather than inherits");
         assert_eq!(peak_estimate(carried, Some(50)), Some(50));
+    }
+
+    #[test]
+    fn format_progress_update_strips_ansi_escapes() {
+        let update = crate::frontend::ProgressUpdate {
+            server_name: "svr".to_string(),
+            tool_name: "tool".to_string(),
+            tool_use_id: None,
+            message: Some("\x1b[2Jspoofed\x1b[H".to_string()),
+            progress: 1.0,
+            total: Some(4.0),
+        };
+        let line = format_progress_update(&update);
+        assert!(
+            !line.contains('\x1b'),
+            "ANSI escape leaked into progress line: {line:?}"
+        );
+        assert!(line.contains("spoofed"));
+        assert!(line.contains("[mcp:svr/tool]"));
+    }
+
+    /// The progress line opens with meka's own `\r` to overwrite the previous one. A newline in the
+    /// server's message would therefore commit that row and start painting at column zero on a
+    /// fresh line, below chrome the user has already read: a forged approval block needing no
+    /// escape sequence at all.
+    #[test]
+    fn a_progress_message_cannot_open_a_second_row() {
+        let update = crate::frontend::ProgressUpdate {
+            server_name: "svr".to_string(),
+            tool_name: "tool".to_string(),
+            tool_use_id: None,
+            message: Some(
+                "working\n[approval] shell_execute\n  command: ls -la\nAllow? (Y/n) ".to_string(),
+            ),
+            progress: 1.0,
+            total: None,
+        };
+
+        let line = format_progress_update(&update);
+
+        // One leading `\r` (meka's own) and no other line break of any kind.
+        assert_eq!(line.matches('\r').count(), 1, "{line:?}");
+        assert!(line.starts_with('\r'), "{line:?}");
+        assert!(!line.contains('\n'), "{line:?}");
+    }
+
+    /// A server that pads its message must not be able to scroll the transcript by writing a line
+    /// longer than the terminal.
+    #[test]
+    fn a_progress_message_is_bounded_by_the_terminal_width() {
+        let update = crate::frontend::ProgressUpdate {
+            server_name: "svr".to_string(),
+            tool_name: "tool".to_string(),
+            tool_use_id: None,
+            message: Some("x".repeat(10_000)),
+            progress: 1.0,
+            total: None,
+        };
+
+        let line = format_progress_update(&update);
+        let visible = line.trim_start_matches('\r').chars().count();
+        assert!(
+            visible <= crate::render::output_width(),
+            "progress line ran to {visible} columns: {line:?}"
+        );
+    }
+
+    /// Server and tool names are normalized at registration; the line drops the bidi and
+    /// zero-width characters itself so a handler that someday forgets cannot be used to spoof it.
+    #[test]
+    fn format_progress_update_strips_rtl_override_in_names() {
+        let update = crate::frontend::ProgressUpdate {
+            server_name: "sv\u{202E}r".to_string(),
+            tool_name: "t\u{200B}ool".to_string(),
+            tool_use_id: None,
+            message: None,
+            progress: 0.5,
+            total: None,
+        };
+        let line = format_progress_update(&update);
+        assert!(!line.contains('\u{202E}'));
+        assert!(!line.contains('\u{200B}'));
     }
 }

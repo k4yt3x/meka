@@ -778,7 +778,7 @@ pub(crate) struct PublishedProfile {
 impl PublishedProfile {
     /// `window` is supplied rather than made here, for the reason
     /// [`crate::session::SessionCells`] gives about its `context_tokens`: a frontend gauge (the
-    /// REPL prompt indicator, ACP's `usage_update`) is built before the agent exists and has to
+    /// screen prompt indicator, ACP's `usage_update`) is built before the agent exists and has to
     /// hold the same cell. Made internally, each host would keep a second copy and re-store it by
     /// hand beside every `set_provider` call. The caller's seed value is irrelevant; this
     /// overwrites it.

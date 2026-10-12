@@ -1,163 +1,274 @@
 # Interactive mode
 
-Start meka without `--oneshot` to enter interactive mode:
+Start meka without `--oneshot` to open the interactive screen:
 
 ```bash
 meka
 ```
 
-You get a prompt:
+The screen takes over the terminal, the way an editor does. A new session opens on meka's mark,
+the `M` of its icon in the terminal's cyan, two columns in, beside three lines: the version, the
+profile the session runs on with its model, and the directory it opened in. It stands while
+nothing but a warning stands with it, and goes with the first prompt. The
+conversation fills the screen from the top;
+the composer sits at the bottom, a gray block behind a `>`; and a status row under the composer
+opens with the permission level, a cell of the level's color and its name in the same color, then
+names the session's working directory (shortened with `~`), the profile the session runs on with
+its model, and `2 background tasks` and `1 sub-agent` while any run.
+[`display.status_row`](../configuration/config-file.md#displaystatus_row) picks the
+facts after the level and their order, and can add the context gauge. Type and press **Enter**. What you sent stays on the transcript behind the same `>` in the same gray
+block, in white, and the answer streams in under it as it arrives, word by word, settling into
+rendered markdown as each line completes.
+
+While the agent works, a row of its own appears above the composer, under the blank line that
+always keeps the conversation off it: a spinner in column 0, then what the agent is doing
+(`Working`, `Thinking`, `Answering` or `Using a tool`), how many seconds the turn has run, and
+`Esc to stop`. The spinner stands still as `•` while the turn waits on you, for an approval or a
+question, and the row goes when the turn ends. A `!command` has the same row, as `Running command`.
+
+Everything on the transcript shares one left edge. Column 0 holds a glyph that says what a row is:
+`>` what you sent, `•` something the agent or meka did (a tool call, a thinking block, a notice, a
+command's outcome), `!` a warning, `■` an error, and nothing for the answer itself. No glyph is
+an emoji, so none is drawn as a picture. The text of
+every row starts in column 2. Color is spent sparingly: an answer's emphasis is weight (bold is
+bold, headings are bold), the terminal's cyan names things (inline code, a tool call, the
+checklist), structure (bullets, rules, the quote bar) is gray, and red and yellow mean an error
+and a warning, nothing else. Fenced code is
+highlighted from the same palette: comments gray, keywords blue, strings green, numbers yellow,
+names of functions and types cyan. Every color is the terminal's own, so the screen follows your
+terminal's theme.
 
 ```text
-meka ~/project [r] >
+> summarize the project
+
+• Thinking · The user wants a summary of the project state. I should look at…
+
+• shell_execute ls -la && cat notes.txt
+  └ total 12
+    drwxr-xr-x 2 k4yt3x k4yt3x 4096 Oct 11 09:55 .
+    … +3 lines
+    gamma
+• file_read missing.txt
+  └ failed: failed to resolve path 'missing.txt'
+
+• Checklist
+  └ › Review the conflict section
+    □ Write the summary
+
+  Project state
+  Here is a quick overview of where things stand.
 ```
 
-The path is the session's working directory, shortened with `~`; set [`display.show_path_in_prompt = false`](../configuration/config-file.md#displayshow_path_in_prompt) to drop it. Type your instruction and press **Enter** to submit. The agent processes your request and prints its response (streamed in real time as Markdown). When it finishes, you get another prompt.
+The transcript is drawn from what meka knows, not written once and scrolled away, so what is on
+screen can be changed after the fact: a thinking block or a tool call is a block that expands and
+collapses, the whole transcript re-wraps when the window is resized, older turns load as you scroll
+up, and you can type while the agent works.
 
-## Keybindings
+## While a turn runs
 
-meka uses Emacs-style keybindings (provided by reedline).
+Enter does not wait for the turn to end. What it does is the session's **send class**. While a turn
+runs the empty composer names it: `Steer the agent`, `Queue a followup` or `Interrupt the agent`.
 
-### Input
+| Class | What Enter does |
+|-------|-----------------|
+| `steer` (default) | Posts the message to the session's inbox; the agent reads it at its next round, between two tool calls or after its reply |
+| `followup` | Holds the message and sends it as the next turn once this one ends |
+| `interrupt` | Cuts the answer being streamed and hands the agent the message at once |
+
+**Alt+S** cycles the class for this run;
+[`session.send_class`](../configuration/config-file.md#sessionsend_class) sets where it starts. The
+prompt appears in the transcript with its class and reads `waiting` until the agent has read it.
+A slash command that would have to wait on the turn is refused while one runs; see
+[Slash commands](#slash-commands).
+
+The steer and interrupt classes are the inbox the HTTP API exposes; see
+[the inbox](./http-api.md#the-inbox) for what each one does inside the turn.
+
+## Expanding and collapsing
+
+Reasoning shows as one dimmed `• Thinking · …` row: the first words of the block once it has
+ended, its latest line while it still streams, or the token count when the provider reports only
+that. A tool call is its name with the one argument that identifies it, `• file_read notes.txt`,
+and under a `└` the opening of what it produced: the lines up to the first blank one, at most
+three, each cut at the edge, and a count of the rest, so a listing shows its header and first row
+and a file its first lines, while what a tool wrote for the model after its payload is counted
+rather than shown. A
+call that failed says `failed:` in red there. A shell command is highlighted as code on the row.
+A call that changed a file (`file_write`, `file_edit`) draws the change as a diff in place of
+the words the tool wrote: the line before, the line taken out in red with its old number, the
+line put in in green with its new number, the line after, and `…` between hunks; its row counts
+the change, `+1 -1`, and the arguments the diff already shows are left out of its expanded
+block. Collapsed, a change gets twenty rows rather than the three of plain output, so a small
+edit shows whole and a rewrite shows its first rows and a count. Either expands to the whole thing: the full reasoning, or every argument of the call
+wrapped in full and all of its output. The row drops its summary once the arguments are under it; they hang
+on a `│` bar from the row down to the `└` of the result, a shell command first, behind `$`,
+highlighted and wrapped whole. Nothing in an expanded block is cut.
+
+- **Click** a block to toggle it. A block lights up under the mouse, which is the hint that it
+  opens.
+- **Ctrl+T** shows or hides every thinking block at once; **Ctrl+O** expands or collapses every
+  tool call. [`thinking.show_content`](../configuration/config-file.md#thinkingshow_content) and
+  [`display.tool_params`](../configuration/config-file.md#displaytool_params) decide what a new
+  block starts as.
+- **Alt+Up** and **Alt+Down** pick a block out from the keyboard, newest first; **Enter** or
+  **Space** toggles the picked one, and **Esc** lets go of it.
+
+Everything else on the transcript is what it was when it happened: the prompts, the checklist as
+it stood (the item in progress marked `›`, the rest `□`, a deferred one `»` with its reason),
+the notices, the stage directions, and `! interrupted` where a turn was stopped. A slash command's
+answer is not on the transcript at all; see [Slash commands](#slash-commands).
+
+## Images
+
+An image goes with the next prompt. Paste or drag a path to an image file (`png`, `jpg`, `gif`,
+`webp` or `bmp`) onto the composer and the file is attached, or press **Ctrl+V** to attach the
+image on the clipboard. meka reads that from the operating system, since a terminal pastes text
+alone, so it needs a display on the machine meka runs on and does not work over SSH; a path does.
+Each attachment is a chip above the text, **Backspace** on an empty composer drops the last one,
+and **Enter** sends them with the words, shown as `• image` rows on the transcript. The profile has
+to accept images (`[profiles.<name>].vision`), the limits are the HTTP API's, and an image waits
+for the turn to end rather than riding on a steer.
+
+## Scrolling and the mouse
+
+The wheel scrolls the transcript; **PgUp** and **PgDn** scroll it half a screen, **Ctrl+Home** jumps
+to the top of what is loaded and **Ctrl+End** to the end. The view follows new output while it is
+at the bottom. Scrolling up pauses that, and `↓ back to bottom` appears in the row above the
+composer, on the working row while the agent works, until you return: click it, press **Esc**, or
+send a prompt.
+
+Once an answer has pushed your prompt off the top, the prompt's first line sticks there as a bar.
+Click it and the prompt comes to the top of the view, with the prompt before it stuck in the bar's
+place, so clicking on walks back through the conversation one prompt at a time.
+
+The screen opens on the last page of the session's log and reads the page above it whenever you
+scroll near the top, so a resumed session shows its last turns at once and the first scroll up
+reaches the ones before, however far back the session goes. What is held is bounded: scrolling far
+up lets the newest pages go, and scrolling back down reads them again; returning to the bottom
+always shows the end of the log with this run's rows after it. Older history shows what the log
+holds, with a row for each compaction (`• context compacted`) and each rewind.
+
+The screen captures the mouse so that the wheel, a click and a drag reach it. Dragging over the
+transcript selects the text it covers, and releasing copies it: to the terminal's own clipboard
+through the OSC 52 sequence, which works over SSH and inside tmux where they allow it, and to the
+system clipboard where meka can reach one. The status row says how many rows went. The terminal's
+own selection still works with its modifier held (**Shift**; **Option** in iTerm2, **Fn** in
+Terminal.app). Set [`display.mouse = false`](../configuration/config-file.md#displaymouse) to
+leave the mouse to the terminal entirely; the keyboard still scrolls and toggles.
+
+Inside tmux, the wheel needs tmux's own mouse mode (`set -g mouse on`).
+
+## Keys
 
 | Key | Action |
 |-----|--------|
-| Enter | Submit the current prompt |
-| Alt+Enter, Shift+Enter | Insert a newline (for multi-line input) |
+| Enter | Send, or post to the inbox while a turn runs |
+| Alt+Enter, Ctrl+J, Shift+Enter | Insert a newline; Shift+Enter where the terminal speaks the kitty keyboard protocol |
 | Shift+Tab | Cycle the permission level, skipping any not in `[permissions].enabled` (by default none &rarr; read &rarr; workspace &rarr; unrestricted &rarr; none) |
+| Alt+S | Cycle the send class |
+| Tab | Fill in the picked completion and keep typing; open the list again after Esc |
+| Up, Down | Move the pick while the completion list is open; otherwise recall what you sent before, at the first and last line of the composer |
+| Ctrl+R | Search what you sent before; Ctrl+R again steps to the next match |
+| Ctrl+V | Attach the image on the clipboard to the next prompt |
+| Ctrl+T, Ctrl+O | Show or hide every thinking block; expand or collapse every tool call |
+| Alt+Up, Alt+Down | Pick a block; Enter or Space toggles it, Esc lets go |
+| PgUp, PgDn, Ctrl+Home, Ctrl+End | Scroll the transcript; older turns load as you reach the top |
+| Esc | Close the completion list or a panel (`q` closes a panel too); stop the turn, then the background tasks, then leave (see [Interrupting the agent](#interrupting-the-agent)); when nothing runs, back to the bottom, let go of a picked block |
+| Ctrl+C | The same ladder as Esc while the agent works; clear the composer when idle, or climb the ladder from an empty one |
+| Ctrl+D | Leave, when the composer is empty |
+| Ctrl+L | Redraw the screen |
 
-### Navigation
-
-| Key | Action |
-|-----|--------|
-| Ctrl+A | Move cursor to start of line |
-| Ctrl+E | Move cursor to end of line |
-| Ctrl+F | Move cursor forward one character |
-| Ctrl+B | Move cursor backward one character |
-| Alt+F | Move cursor forward one word |
-| Alt+B | Move cursor backward one word |
-| Up / Down | Recall the previous / next input from history |
-
-### Editing
-
-| Key | Action |
-|-----|--------|
-| Ctrl+D | Delete character under cursor / exit on empty line |
-| Ctrl+H, Backspace | Delete character before cursor |
-| Ctrl+K | Kill text from cursor to end of line |
-| Ctrl+U | Kill text from start of line to cursor |
-| Ctrl+W | Kill word before cursor |
-| Ctrl+Y | Yank (paste) killed text |
-
-### Control
-
-| Key | Action |
-|-----|--------|
-| Ctrl+C | Interrupt the running agent (see [Interrupting the agent](#interrupting-the-agent)); clear the line if idle |
-| Ctrl+D | Exit the shell (when the line is empty) |
-| Ctrl+R | Reverse incremental search through history |
-| Ctrl+L | Clear the screen |
+The composer takes the usual editing keys: Ctrl+A and Ctrl+E for the ends of the line, Ctrl+K and
+Ctrl+U to kill to either end, Ctrl+W to kill a word, Alt+F and Alt+B to move by word, and the arrow
+keys. It grows as you type, up to a third of the screen, and scrolls inside after that.
 
 ### Input history
 
-The prompts you type are saved to the store, so Up / Down and Ctrl+R recall what
-you typed in **any previous run**. A brand-new `meka`, a resumed `meka -c`, and the current
-session all share one history. Multi-line prompts are preserved intact, and only the most recent
-entries are kept (older ones are pruned). This input history is separate from the conversation
-shown by `/history`.
-
-## Prompt format
-
-```text
-meka <path> [indicator] >
-```
-
-The indicator shows the current permission level:
-
-| Level | Indicator | Color |
-|------|-----------|-------|
-| None | `[n]` | Green |
-| Read | `[r]` | Yellow |
-| Workspace | `[w]` | Orange |
-| Unrestricted | `[u]` | Red |
-
-The color provides a visual cue about the agent's current capabilities. Orange means the agent can modify your system inside the workspace roots; red means it can modify anything you can.
-
-## Multi-line input
-
-Press **Alt+Enter** or **Shift+Enter** to insert a newline instead of submitting. Each continuation line is prefixed with `::: `:
-
-```text
-meka ~/project [r] > write a python script that
-::: prints hello world
-::: and saves it to hello.py
-```
-
-Press **Enter** on the last line to submit the entire multi-line input.
-
-Pasting multi-line content also works seamlessly: all pasted lines appear in the buffer for review, and you press **Enter** to submit.
+What you send is saved to the store, so Up, Down and Ctrl+R recall what you typed in **any
+previous run**. A brand-new `meka`, a resumed `meka -c`, and the current session all share one
+history. Multi-line prompts are kept whole, and only the most recent entries are kept (older ones
+are pruned). This input history is separate from the conversation itself.
 
 ## Slash commands
 
-meka supports `/` prefix commands for controlling the shell. `/help` prints this table, with the
-`/mcp` subcommands beneath `/mcp` and the three shortcuts below it. Every slash command writes to
-stderr, beside the prompts and notices; the model's answers stay on stdout.
+Commands start with `/`. `/help` shows this table, with the `/mcp` subcommands beneath `/mcp` and
+the shortcuts below it. A command is not echoed on the transcript. What a command has to *show*
+(`/help`, `/status`, a listing) opens in a **panel** in place of the composer: Up, Down, PgUp,
+PgDn and the wheel scroll it, **Esc** or **Enter** closes it, and nothing of it stays on the
+transcript. What the screen holds the answer to works at any time, a turn running or not: the
+listings and pickers (`/skill`, `/memory`, `/schedule`, `/task`, `/session`, `/help`, `/log`), the
+settings (`/permission`, `/approvals`, `/cd`), `/task cancel` and `/schedule cancel`, and `/exit`.
+A command that needs the agent's turn to be over (`/compact`, `/rewind`, `/fork`, `/export`,
+`/title`, `/status`, `/usage`, every `/mcp` verb and prompt, `/skill <name>` and
+`/profile <name>`) is refused while a turn runs, in a panel naming it: stop the turn with Esc
+first, or wait for it to end. What a command *does* (set a level, change directory,
+cancel a job) is one dimmed `•` row on the transcript. What a command has to *say back* instead, a
+refusal, a failure or an empty list, is a panel as well, closed with Esc, and leaves no row.
+`/log` opens the last few hundred log lines at every level, newest last, whatever `-v` lets onto
+the transcript: a warning is a row as it happens, and the debug lines around it are there to read
+without restarting.
+
+A bare `/permission`, `/approvals`, `/profile` or `/resume` is a **picker**: the choices in a panel with the
+cursor on the current one, Up and Down (or **j** and **k**) to move it, PgUp and PgDn to move it by
+a page, Ctrl+Home and Ctrl+End to the ends, **Enter** to apply, **Esc** to leave it as it was. In `/resume`'s list, **/** starts typing a filter that keeps only the rows
+matching the text; **Esc** stops typing and keeps the filter, and a second **Esc** closes the list. With an argument each sets the value directly. A bare `/skill`, `/memory`, `/task` or
+`/schedule` is a picker too: the skills and memories by name and description, the tasks and jobs by
+id with what each is doing (a job that cannot fire is marked `held`), and **Enter** runs the picked
+skill or shows the picked memory, task or job in full. A bare `/mcp` lists the configured servers
+with their state, and **Enter** offers reconnect, login and logout for the picked one.
 
 | Command | Description |
 |---------|-------------|
 | `/help` (or `/?`) | Show this help message |
-| `/exit` (or `/quit`) | Exit the shell |
-| `/clear` | Clear the terminal screen |
+| `/exit` (or `/quit`) | Leave |
 | `/session` | Show the current session id |
 | `/title [text]` | Show this session's title, or set it |
-| `/permission [none\|read\|workspace\|unrestricted]` | Show or set the permission level |
-| `/approvals [on\|off]` | Show or set whether calls above the level are submitted for approval |
-| `/profile [name]` | Show or change the profile this session runs on |
+| `/permission [level]` | Pick or set the permission level |
+| `/approvals [on\|off]` | Pick or set whether calls above the level are submitted for approval |
+| `/profile [name]` | Pick or set the profile this session runs on |
+| `/resume [session]` | Pick a session to switch to, or switch to one by id or unique prefix |
 | `/compact [instructions]` | Summarize and compact the session, optionally saying what to keep |
 | `/rewind [N]` | Drop the last N turns from the conversation (default 1) |
 | `/export` | Export the current session as Markdown |
 | `/fork` | Fork this session and continue in the copy |
 | `/cd [path]` | Change working directory (bare: back to where meka started) |
-| `/skill [name] [extra...]` | List skills, or invoke one with extra context |
-| `/memory [name]` | List saved memories, or show one by name |
-| `/schedule [show <id> \| cancel <id>]` | List this session's scheduled jobs, show one, or cancel one by id |
-| `/task [show <id> \| cancel <id\|--all>]` | List background tasks, show one, or cancel one by id |
+| `/skill [name] [extra]` | Pick a skill to run, or run one by name with extra context |
+| `/memory [name]` | Pick a memory to show, or show one by name |
+| `/schedule [show\|cancel <id>]` | Pick a scheduled job to show; show or cancel one by id |
+| `/task [show\|cancel <id>]` | Pick a background task to show; show or cancel one by id, or all |
 | `/mcp <subcommand>` | Manage MCP servers and prompts |
-| `/mcp list` | List configured MCP servers |
+| `/mcp list` | Pick a server to reconnect, log in or log out |
 | `/mcp reconnect <server>` | Reconnect smoke-test for one server |
 | `/mcp login <server>` | Run the OAuth flow for a server |
 | `/mcp logout <server>` | Clear stored credentials for a server |
 | `/mcp <server>:<prompt> [args]` | Render an MCP prompt as the next turn |
 | `/status` | Show the profile, model, context use and cumulative session stats |
+| `/log` | Show the recent log lines, at every level |
 | `/usage` | Show account rate-limit usage (subscription backends) |
-| `/history [N]` | Reprint past conversation (bare = all, N = last N turns) |
 
-Some of the grammar the table compresses: a bare `/mcp` is `/mcp list`, and the listing shows each
+Some of the grammar the table compresses: a bare `/mcp` is `/mcp list`, and the picker shows each
 server's live state (`pending` / `connected` / `failed` / `disabled`); `/task cancel all` is
 accepted for `--all`; `/schedule cancel`, `/task cancel` and the two `show`s take an id or any
 unique prefix; `/cd ~` still goes home; `/export` writes `session-<id>.md` in the working directory
 and prints where it landed; `/skill <name>` prepends anything typed after the name to the skill body;
-`/memory` lists memories most important first.
+`/memory` lists memories most important first; `/mcp login <server>` puts the authorization URL
+as a question in the composer's place, with one field for the callback URL pasted from the
+browser's address bar when the browser cannot reach meka, and Esc on it ends the login.
 
-Press **Tab** after typing `/` to open a completion menu of command names, each shown with its description; keep typing to narrow it (`/comp` + Tab completes to `/compact`). Tab also completes arguments: permission levels for `/permission`, `on`/`off` for `/approvals`, configured profile names for
-`/profile`, installed skill names for `/skill`, the subcommands and configured servers for `/mcp`, and directory paths for `/cd` (Tab again after a completed directory drills into its subdirectories). The leading command token is colored as you type: green when it names a known command, red when it does not.
-
-### `/history`
-
-Replays prior messages in the current session so you can scroll back through context without exiting and re-resuming. `/history` with no argument dumps every materialized message; `/history 5` shows the last 5 turns (a *turn* = the user's prompt plus everything the agent did to respond). Any non-numeric argument (`/history all`, `/history foo`) falls back to the dump-everything path.
-
-The renderer mimics the live REPL: assistant text flows through the same markdown highlighter, tool calls honor [`display.tool_params`](../configuration/config-file.md#displaytool_params) (by default a one-line `[tool file_read(...)]` indicator), and thinking blocks honor [`[thinking].show_content`](../configuration/config-file.md#thinkingshow_content), rendered by the same renderer the live turn streams into so a replayed block looks like the one you watched arrive. User prompts are prefixed with a cyan `>` so they stand out from agent text.
-
-One difference: a call to a tool from an [MCP server](../configuration/config-file.md#mcpservers) replays as a bare `[tool name]`, without the argument it showed live. Which of a tool's arguments is the one worth showing comes from its JSON Schema, which the server publishes at connect time and the conversation does not store; meka knows its own tools' arguments from their names alone, so those replay in full.
-
-For users who always want extra context at resume time, set [`display.resume_show_recent`](../configuration/config-file.md#displayresume_show_recent); the resume code path then renders the last N turns through the same function.
+Typing `/` opens the list of commands above the composer, each with its description, and the list
+narrows as you type. **Up** and **Down** move the pick, **Enter** runs the picked command, **Tab**
+fills it in so you can go on to an argument, and **Esc** closes the list until you type again. An
+argument's list opens the same way: permission levels for `/permission`, `on`/`off` for
+`/approvals`, configured profile names for `/profile`, installed skill names for `/skill`, the
+subcommands and configured servers for `/mcp`, and directory paths for `/cd` (Tab after a completed
+directory drills into its subdirectories).
 
 ### `/status`
 
-Print the session's resolved model parameters followed by its cumulative counters:
+Shows the session's resolved model parameters followed by its cumulative counters, in a panel:
 
 ```
-Session status
+/status
   Profile:         work
   Account:         anthropic (claude-subscription)
   Model:           claude-opus-4-8
@@ -179,7 +290,7 @@ fields, so the two can be read side by side: the `Profile` with its account and 
 provider applies its own default; `claude-subscription` sends `high` when the profile sets none),
 and the `Thinking` mode. The rest are cumulative counters for the session.
 
-`Context` is the live context-window occupancy: the total tokens of the most recent exchange (all input tiers plus output, i.e. what the next request re-sends minus your new prompt), against the active model's context window, with the percent used and tokens remaining. Use it to decide whether to `/compact` before continuing; after `/compact` it drops to the compacted size immediately. It reflects this session only; sub-agents spawned via `agent_spawn` have their own context and are not counted (a sub-agent's returned result is counted only once it lands in this session as a tool result). It is shown from the start, at `0 / <window>` before the first turn, since the window is your `context_window` setting (or the documented default) and this is where you confirm it took effect; it is omitted only when the window is unknown. Set [`display.show_context_in_prompt`](../configuration/config-file.md#displayshow_context_in_prompt) to show the same gauge in the prompt itself.
+`Context` is the live context-window occupancy: the total tokens of the most recent exchange (all input tiers plus output, i.e. what the next request re-sends minus your new prompt), against the active model's context window, with the percent used and tokens remaining. Use it to decide whether to `/compact` before continuing; after `/compact` it drops to the compacted size immediately. It reflects this session only; sub-agents spawned via `agent_spawn` have their own context and are not counted (a sub-agent's returned result is counted only once it lands in this session as a tool result). It is shown from the start, at `0 / <window>` before the first turn, since the window is your `context_window` setting (or the documented default) and this is where you confirm it took effect; it is omitted only when the window is unknown. Add `context` to [`display.status_row`](../configuration/config-file.md#displaystatus_row) to show the same gauge in the status row.
 
 `Input tokens` (and the other cumulative counters) is the total billed across every turn of the whole session. These totals are persisted, so resuming a session with `meka -c` continues them rather than restarting at zero.
 
@@ -191,10 +302,10 @@ and the `Thinking` mode. The rest are cumulative counters for the session.
 
 ### `/usage`
 
-Fetch the account's current rate-limit usage from the account the session's profile bills and print each rolling window with its percentage used and reset time:
+Fetches the account's current rate-limit usage from the account the session's profile bills and shows each rolling window with its percentage used and reset time, in a panel:
 
 ```
-Account usage
+/usage
   5-hour (session)   [#---------]   8% used  (resets in 4h 12m, 2026-07-02 02:10 +02:00)
   Weekly             [----------]   2% used  (resets in 22h 50m, 2026-07-02 13:00 +02:00)
 ```
@@ -245,36 +356,59 @@ here.) See [Forking a session](./sessions.md#forking-a-session) for exactly what
 
 ## Shell escape
 
-Prefix any input with `!` to execute it directly as a shell command, bypassing the LLM entirely:
+Type `!` into the empty composer and it enters **shell mode**: the `>` becomes a red `!`, the
+status row drops its facts for a red `Run command in shell`, and what you type runs as a shell
+command on **Enter**, bypassing the model entirely. **Backspace** on the empty composer leaves the mode, and a recalled
+`!cmd` comes back in it. On the transcript the command keeps its `!`:
 
 ```text
-meka ~/projects [r] > !pwd
-/home/user/projects
-meka ~/projects [r] > !ls -la
+> !ls -la
 total 32
 drwxr-xr-x  5 user user 4096 Mar  4 10:00 .
 ...
-meka ~/projects [r] > !ping 1.1.1.1 -c 2
-PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
-...
 ```
 
-The command runs with inherited stdin/stdout/stderr, so it behaves exactly like a regular shell. This is useful for quick checks without waiting for the LLM.
+The command runs in the session's working directory, so it follows `/cd`. Its output is captured
+and shown in the transcript, colors included, with a line naming the exit status when it failed.
+It runs beside the screen, which keeps drawing and counts the seconds in the status row; **Esc** or
+**Ctrl+C** kills it, with everything it started, and marks it `! interrupted`; so does leaving
+meka, a hangup or SIGTERM included. (On Windows the shell alone is killed.) Its output keeps its
+last 1 MiB and 10,000 lines, and a row says when more was let go. It reads nothing from the keyboard, and a command that needs the terminal itself (an editor, a pager) belongs in a
+shell beside meka.
 
 ## Exiting
 
-You can exit meka in any of these ways:
+You can leave meka in any of these ways:
 
 - Type `/exit` or `/quit`
 - Type `exit` or `quit`
-- Press **Ctrl+D** on an empty line
+- Press **Ctrl+D** on an empty composer
+
+Leaving while the agent is working stops the turn first, so nothing keeps running once the screen
+is gone; a `!command` still running is killed, and background tasks are stopped on the way out,
+with how many said.
+
+The screen hands the terminal back as it found it. The session's id is printed on the way out
+when [`display.show_session_id_on_exit`](../configuration/config-file.md#displayshow_session_id_on_exit)
+says so; the conversation itself stays in the store, and `meka -c` reopens it.
 
 ## Interrupting the agent
 
-Press **Ctrl+C** while the agent is running to interrupt it. Presses escalate:
+Press **Esc** or **Ctrl+C** while the agent is running to interrupt it. The two keys count on one
+ladder, and presses escalate:
 
 1. The first press cancels the current turn: the request in flight is dropped and any shell command the turn spawned is killed. Background tasks keep running, because a keystroke aimed at the answer on screen should not lose a twenty-minute build.
 2. A second press during the same turn stops every running background task, records each as canceled, and says how many it stopped.
-3. A third press prints `(interrupted)`, gives the canceled work up to two seconds to unwind, and exits with status 130.
+3. A third press leaves, the way `/exit` does: what was canceled is given its moment to unwind, the background tasks are stopped, and the exit status is 130.
 
-The count starts over with each new turn, so the first press of the next turn cancels that turn whatever happened during the last one, and it ends with the turn: a press during a wait that is not a turn (`/usage`, a stuck `/mcp reconnect`) starts a count of its own from the first step. At an idle prompt Ctrl+C clears the line instead.
+The count starts over with each new turn, so the first press of the next turn cancels that turn whatever happened during the last one, and it ends with the turn: a press during a wait that is not a turn (`/usage`, a stuck `/mcp reconnect`) starts a count of its own from the first step. When nothing is running, Esc goes back to the bottom of the transcript, and Ctrl+C clears a composer with text in it; on an empty one it counts on the ladder, so a second press stops the background tasks and a third leaves.
+
+A question the agent asks replaces the composer until it is answered. An approval prompt is a
+panel titled with the call, its arguments under it and four answers to pick from: **Allow** (`y`),
+**Allow for the session** (`a`), **Deny** (`n`), **Deny for the session**, each also reachable by
+its number; Esc denies. A server that asks for a URL to be opened asks the same way, with
+**Open in the browser** (`y`), **Skip** (`s`) and **Decline** (`n`) to pick from. An MCP form
+takes typed answers, one field at a time; Esc declines. While any of these is open, Esc answers
+it rather than stopping the turn; Ctrl+C stops the turn, which withdraws the question. Questions
+are put one at a time: when two tool calls dispatched together both ask, the second waits until
+the first is answered.

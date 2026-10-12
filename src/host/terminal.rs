@@ -1,5 +1,5 @@
-//! What the two terminal hosts share: the interrupt relay behind Ctrl+C, the console episode
-//! helpers, and the turn wrappers that race a turn against an interrupt.
+//! What the screen and the one-shot host share: the interrupt relay behind Ctrl+C, the turn
+//! wrappers that race a turn against an interrupt, and the one-shot console's finishing.
 
 use super::*;
 
@@ -15,9 +15,9 @@ use super::*;
 /// the second press of the fifth turn means what the second press of the first one did, and a
 /// press between turns starts a ladder of its own; see [`InterruptRelay::count_press`].
 ///
-/// Nothing here competes with the prompt. reedline reads Ctrl+C as a key event in raw mode, where
-/// the terminal generates no SIGINT at all, so this listener only ever sees a press made while a
-/// turn is running -- which is the only window it is about.
+/// Nothing here competes with the screen. Its raw mode delivers Ctrl+C as a key the screen
+/// answers itself, and the terminal generates no SIGINT, so while the screen is up this listener
+/// only ever sees a signal sent from outside; in a one-shot run it is the whole of Ctrl+C.
 pub(crate) struct InterruptRelay {
     pub(crate) presses: std::sync::atomic::AtomicUsize,
     /// Whether the ladder being climbed found a turn on its first press. A ladder a turn started
@@ -108,18 +108,47 @@ pub(crate) fn background_cancellation_notice(signaled: usize) -> Option<String> 
         )
     })
 }
-/// Start the process's single SIGINT listener. Idempotent; every turn path calls it, and only the
-/// first call spawns.
+/// Start the process's single SIGINT listener, and on Unix the SIGHUP and SIGTERM listeners with
+/// it. Idempotent; every turn path calls it, and only the first call spawns. `announce` says what a
+/// press did where the host shows such things, and `leave` is how the host leaves on the ladder's
+/// last press, once the canceled work has had its moment: the one-shot exits on the spot, while the
+/// screen has a terminal to give back first and goes through its own exit.
 pub(crate) fn install_interrupt_handler(
     cancel: crate::host::CancelCell,
     agent: &Agent,
-    console: Arc<std::sync::Mutex<crate::console::Console>>,
+    announce: impl Fn(&str) + Send + Sync + 'static,
+    leave: impl Fn() + Send + Sync + 'static,
 ) {
     static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     if INSTALLED.set(()).is_err() {
         return;
     }
 
+    let leave: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(leave);
+    // A hangup or a termination has no ladder: the terminal is going or gone, so the turn is
+    // stopped and the host leaves through its own exit, which kills a `!command` still running
+    // and gives the terminal back where there is one.
+    #[cfg(unix)]
+    tokio::spawn({
+        let leave = std::sync::Arc::clone(&leave);
+        let cancel = cancel.clone();
+        async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let (Ok(mut hangup), Ok(mut terminate)) = (
+                signal(SignalKind::hangup()),
+                signal(SignalKind::terminate()),
+            ) else {
+                tracing::warn!("failed to listen for SIGHUP and SIGTERM");
+                return;
+            };
+            tokio::select! {
+                _ = hangup.recv() => {}
+                _ = terminate.recv() => {}
+            }
+            cancel.cancel();
+            leave();
+        }
+    });
     let tasks = agent.background_tasks();
     let store = agent.store();
     tokio::spawn(async move {
@@ -134,29 +163,13 @@ pub(crate) fn install_interrupt_handler(
                 // `count_press` has already fired the turn's token, when there was one.
                 Escalation::CancelTurn => {}
                 Escalation::CancelBackgroundTasks => {
-                    // Recorded before signaling, so what the agent hears is "you stopped it"
-                    // rather than the `failed` its own interruption would otherwise write.
-                    for id in tasks.task_ids().await {
-                        if let Err(error) = store
-                            .background_store()
-                            .finish_background_task(
-                                &id,
-                                crate::store::background::TaskStatus::Canceled,
-                                None,
-                                None,
-                            )
-                            .await
-                        {
-                            tracing::warn!("failed to record task {id} as canceled: {error}");
-                        }
-                    }
-                    let signaled = tasks.cancel_all().await;
+                    let signaled = cancel_background_tasks(&tasks, &store).await;
                     if let Some(notice) = background_cancellation_notice(signaled) {
-                        with_console(&console, |console| console.annotation(&notice));
+                        announce(&notice);
                     }
                 }
                 Escalation::Leave => {
-                    with_console(&console, |console| console.annotation("interrupted"));
+                    announce("interrupted");
                     if tokio::time::timeout(INTERRUPT_DRAIN_GRACE, tasks.wait_all())
                         .await
                         .is_err()
@@ -165,14 +178,34 @@ pub(crate) fn install_interrupt_handler(
                             "background tasks did not unwind within {INTERRUPT_DRAIN_GRACE:?}; exiting anyway"
                         );
                     }
-                    // This arm exits from inside a spawned task, so it never reaches the funnel in
-                    // `main` and has to release the grants itself.
-                    crate::sandbox::release_process_grants();
-                    std::process::exit(130);
+                    leave();
                 }
             }
         }
     });
+}
+/// Stop every background task of this process, recording each as canceled first so what the
+/// agent hears is "you stopped it" rather than the `failed` its own interruption would write.
+/// Returns how many were signaled.
+pub(crate) async fn cancel_background_tasks(
+    tasks: &crate::background::BackgroundTasks,
+    store: &Store,
+) -> usize {
+    for id in tasks.task_ids().await {
+        if let Err(error) = store
+            .background_store()
+            .finish_background_task(
+                &id,
+                crate::store::background::TaskStatus::Canceled,
+                None,
+                None,
+            )
+            .await
+        {
+            tracing::warn!("failed to record task {id} as canceled: {error}");
+        }
+    }
+    tasks.cancel_all().await
 }
 /// Publish a turn's token where Ctrl+C reaches it, and start the escalation count over: the
 /// first press of a new turn cancels that turn, whatever happened during the last one.
@@ -218,8 +251,8 @@ pub(crate) async fn compact_interruptible(
 }
 /// Run one agent turn with Ctrl+C wired to a fresh cancellation token. Hands the token to
 /// [`InterruptRelay`] for the turn's duration, so a SIGINT during the turn cancels it and every
-/// tool and sub-agent it spawned. Every `run_turn` callsite in the REPL / CLI path must go through
-/// here; a bare `CancellationToken` with no signal source silently swallows Ctrl+C.
+/// tool and sub-agent it spawned. Every `run_turn` callsite on the screen / CLI path must go
+/// through here; a bare `CancellationToken` with no signal source silently swallows Ctrl+C.
 pub(crate) async fn run_turn_interruptible(
     cancel: &crate::host::CancelCell,
     admission: crate::host::Admission,
@@ -230,62 +263,19 @@ pub(crate) async fn run_turn_interruptible(
 ) -> crate::error::Result<crate::agent::TurnOutcome> {
     let cancellation = CancellationToken::new();
     let _published = publish_for_interrupts(cancel, admission, cancellation.clone());
-    // The REPL does not surface a stop reason; `--oneshot --format json` reports it.
+    // The screen does not surface a stop reason; `--oneshot --format json` reports it.
     let outcome = agent.run_turn(messages, input, cancellation).await;
-    // The REPL keeps its own copy for the loop that owns the console; the agent's cell is the
+    // The screen keeps its own copy for the loop that owns the console; the agent's cell is the
     // authority, and a first turn has just filled it.
     *session_id = agent.session_id();
     outcome
 }
-/// How long leaving the REPL waits for its canceled background tasks to unwind.
+/// How long leaving the screen waits for its canceled background tasks to unwind.
 ///
 /// Long enough for the work a canceled task actually has left -- signal its process group, write
 /// one row -- and short enough that a task ignoring its token cannot hold the terminal. Whatever
 /// overruns it is swept to `interrupted` when the session is next opened.
 pub(crate) const BACKGROUND_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-/// Translate the live-REPL display config into the options that
-/// [`crate::render::render_message_history`] consumes. Keeps the spacing / styling rules between
-/// live output and history rendering in sync from a single source of truth.
-pub(crate) fn history_render_options(
-    config: &ResolvedConfig,
-) -> crate::render::HistoryRenderOptions {
-    crate::render::HistoryRenderOptions {
-        render_mode: config.render_mode,
-        show_thinking: config.thinking_show_content,
-        tool_params: config.tool_params,
-        input_style: config.input_style,
-        newline_before_prompt: config.newline_before_prompt,
-        newline_after_prompt: config.newline_after_prompt,
-    }
-}
-/// Reprint the last message's words on a resume. `on_output` runs immediately before the first row
-/// and not at all for a message that renders to nothing (a tool-call-only turn), so the console
-/// spends no blank on an empty region; [`crate::render::render_message_history`] holds the same
-/// contract for a slice of turns.
-pub(crate) fn reprint_last_message(
-    messages: &[crate::conversation::Message],
-    render_mode: crate::config::RenderMode,
-    on_output: impl FnOnce(),
-) {
-    let Some(last) = messages.last() else {
-        return;
-    };
-
-    // The words for either role: a user turn's context block is not a `Text` block.
-    let text = last.text_content();
-    if text.is_empty() {
-        return;
-    }
-
-    on_output();
-    let mut renderer = crate::render::StreamingRenderer::new(render_mode);
-    if let Err(error) = renderer.push_delta(&text) {
-        crate::render::report_lost_output("a replayed message did not reach stdout", &error);
-    }
-    if let Err(error) = renderer.finish() {
-        crate::render::report_lost_output("a replayed message did not reach stdout", &error);
-    }
-}
 /// Borrow the shared console for one synchronous run of writes.
 ///
 /// A poisoned lock is recovered from rather than propagated: the console holds the terminal's
@@ -301,41 +291,29 @@ pub(crate) fn with_console<T>(
 }
 /// Close an episode that no meka prompt follows.
 ///
-/// Every caller is on the way out of the process: a one-shot turn that has finished or failed, and
-/// the REPL after its loop has broken. The prompt below is the shell's own, which the shell has
-/// already spaced, so this closes without the `newline_before_prompt` blank.
-///
-/// "No prompt below" rather than "no output below": a caller can still have a line to print after
-/// it -- the shutdown notice, an outcome a one-shot run waited for, a `warn!` the relay routes
-/// here. A closed episode arms nothing, so each prints flush against the line above. `repl` closes
-/// the episodes a meka prompt really does follow.
-pub(crate) fn close_console_episode(console: &std::sync::Mutex<crate::console::Console>) {
-    with_console(console, |console| {
-        console.close_episode(crate::console::Neighbor::Shell)
-    });
+/// Finish the console's output: flush the open block and erase a status line left drawn. Every
+/// caller is on the way out of the process, and a caller can still have a line to print after
+/// it (the shutdown notice, an outcome a one-shot run waited for), which prints as any block does.
+pub(crate) fn finish_console(console: &std::sync::Mutex<crate::console::Console>) {
+    with_console(console, |console| console.finish());
 }
-/// Closes the run's last episode however its host leaves, on the failing paths as much as the
-/// ordinary one.
+/// Finishes the console however its host leaves, on the failing paths as much as the ordinary
+/// one.
 ///
-/// A `Drop` where the early exits converge rather than a close at each of them, because a close
-/// written at a door is a close the next `return Err` forgets. The path that needs it today is
-/// `repl_handle.await?`, which returns only when the REPL thread panicked, possibly mid-wake with
-/// the prompt it broke out of still drawn and a partial answer still buffered.
-///
-/// Closing twice is closing once, so this composes with the explicit closes rather than replacing
-/// them: those sit ahead of the session lock being released, after the shutdown notice, and ahead
-/// of everything a one-shot run still prints once its turn is over.
-pub(crate) struct LastEpisode(pub(crate) Arc<std::sync::Mutex<crate::console::Console>>);
-impl Drop for LastEpisode {
+/// A `Drop` where the early exits converge rather than a finish at each of them, because a finish
+/// written at a door is a finish the next `return Err` forgets. Finishing twice is finishing
+/// once, so this composes with the explicit finishes rather than replacing them.
+pub(crate) struct FinishConsole(pub(crate) Arc<std::sync::Mutex<crate::console::Console>>);
+impl Drop for FinishConsole {
     fn drop(&mut self) {
-        close_console_episode(&self.0);
+        finish_console(&self.0);
     }
 }
 /// Move a lock into the slot the agent and its host share, replacing whatever was there.
 ///
 /// The replacement is what `/fork` depends on: the new lock is already held by the time this is
 /// called, and the old guard is dropped only once the new one is in place, so the session is never
-/// momentarily unheld. Passing `None` releases outright, which is how the REPL lets go on the way
+/// momentarily unheld. Passing `None` releases outright, which is how the screen lets go on the way
 /// out.
 ///
 /// A poisoned mutex is recovered from rather than propagated. The slot holds one value and every
@@ -398,37 +376,25 @@ mod tests {
     /// A host that leaves through one of its early `?` paths still flushes what it had streamed and
     /// still settles the row.
     ///
-    /// Both halves of what the guard is for, and the second is the one with a screen behind it:
-    /// `repl_handle.await?` fires when the REPL thread panicked, which can be mid-wake with the
-    /// prompt it broke out of still drawn.
+    /// Both halves of what the guard is for: the streamed text and the row.
     ///
     /// Only the mechanism is pinned here. Reaching those paths for real needs a failing provider
-    /// registry or a panicking REPL thread behind a terminal, and an assertion the guard's absence
-    /// cannot fail is not coverage.
+    /// registry, and an assertion the guard's absence cannot fail is not coverage.
     #[test]
-    fn the_last_episode_closes_however_the_host_leaves() {
+    fn the_console_is_finished_however_the_host_leaves() {
         let console = std::sync::Arc::new(std::sync::Mutex::new(crate::console::Console::new(
-            crate::console::Spacing {
-                newline_before_prompt: true,
-                newline_after_prompt: true,
-            },
             crate::config::RenderMode::Raw,
         )));
         with_console(&console, |console| {
-            console.open_episode(
-                crate::console::RowState::Empty,
-                crate::console::Neighbor::Shell,
-            )
+            console.start(crate::console::RowState::Empty)
         });
         {
-            let _last_episode = LastEpisode(std::sync::Arc::clone(&console));
+            let _finish = FinishConsole(std::sync::Arc::clone(&console));
             with_console(&console, |console| {
                 console.text_delta("half an answer");
-                // The drawing API cannot reach a parked prompt without a terminal. A wake that
-                // streamed would have settled the row first, so this pairs a parked prompt with an
-                // open block to exercise both halves of the close at once rather than to reproduce
-                // one state the REPL reaches.
-                console.force_row(crate::console::RowState::PromptParked);
+                // The drawing API cannot reach a status line without a terminal, so this pairs one
+                // with an open block to exercise both halves of the close at once.
+                console.force_row(crate::console::RowState::Transient);
             });
             assert!(
                 with_console(&console, |console| console.has_open_text()),
@@ -442,7 +408,7 @@ mod tests {
         assert_eq!(
             with_console(&console, |console| console.row()),
             crate::console::RowState::Empty,
-            "and the stale prompt goes with it, rather than sitting under the shell's"
+            "and the stale status line goes with it, rather than sitting under the shell's"
         );
     }
 

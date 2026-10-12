@@ -2,7 +2,7 @@
 //!
 //! This is the durable host for [`crate::schedule`]. The server can revive any session on demand
 //! (`reattach::ensure_session_loaded`), so it reaches every job in the database rather than only
-//! those belonging to a conversation it happens to have open, which is the REPL's limit. What it
+//! those belonging to a conversation it happens to have open, which is the screen's limit. What it
 //! leaves alone is a job on a session another process has locked; see [`runnable_here`].
 //!
 //! There is no human on the far end of a scheduled turn. Two consequences run through everything
@@ -54,8 +54,8 @@ pub(crate) fn spawn(state: ServerState) -> tokio::task::JoinHandle<()> {
 /// evaluates a job's *gate* before the host is offered the wakeup, and a job whose session another
 /// process holds comes straight back as a deferral -- which restores its original fire time,
 /// already in the past, so it is due again on the very next tick. A gated hourly job on a session
-/// an operator has open in a REPL would therefore run its shell command every `poll_interval` for
-/// as long as that REPL stayed open. Declining here instead is precisely what [`SchedulerScope`]
+/// an operator has open in a screen would therefore run its shell command every `poll_interval` for
+/// as long as that screen stayed open. Declining here instead is precisely what [`SchedulerScope`]
 /// documents its predicate variant for.
 ///
 /// Every job fires in the session that owns it, so this is asked of every one of them and the
@@ -183,8 +183,8 @@ impl HttpHooks {
 }
 
 /// The `status` a `schedule.fired` webhook carries for a turn that ran. A stop is neither of the
-/// other two: the REPL annotates it as interrupted and reports no failure, and a webhook that said
-/// `failed` sent an operator looking for a fault in a job someone had canceled.
+/// other two: the screen annotates it as interrupted and reports no failure, and a webhook that
+/// said `failed` sent an operator looking for a fault in a job someone had canceled.
 pub(super) fn fired_status(outcome: &Result<(), crate::error::MekaError>) -> &'static str {
     match outcome {
         Ok(()) => "completed",
@@ -349,7 +349,7 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
     }
 
     /// The prompt's text as a notice, since this surface has no user-message event and a client
-    /// mirroring the conversation wants the words the turn answers; the REPL, which shows the
+    /// mirroring the conversation wants the words the turn answers; the screen, which shows the
     /// person no prompt they did not type, announces the turn's opener instead. It reaches a
     /// stream when one is live and the recorder otherwise, where `finished` drains it.
     fn show_prompt(
@@ -437,7 +437,7 @@ mod tests {
         );
     }
 
-    /// The case this exists for: a session an operator has open in a REPL. Declining here is what
+    /// The case this exists for: a session an operator has open in a screen. Declining here is what
     /// keeps `prepare` from evaluating the job's gate, which is the cost the deferral path could
     /// not avoid -- it runs the command first and finds out afterwards.
     #[test]
@@ -468,7 +468,7 @@ mod tests {
         );
     }
 
-    /// A stopped fire is reported as canceled, the way the REPL reports it, not as a failure.
+    /// A stopped fire is reported as canceled, the way the screen reports it, not as a failure.
     #[test]
     fn a_stopped_fire_is_canceled_not_failed() {
         assert_eq!(fired_status(&Ok(())), "completed");

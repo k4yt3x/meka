@@ -1,21 +1,15 @@
-//! Session and account status as the REPL and the CLI show them, and the hint printed when a
-//! session has no usable provider.
+//! Session and account status as every host shows them, and the hint printed when a session has
+//! no usable provider.
 
 use super::*;
-use crate::streams::{write_stderr, write_stderr_line};
-
-/// Print the status under its heading.
-pub(crate) fn render_session_status(text: &str) {
-    render_heading("Session status");
-    write_stderr(text);
-}
+use crate::streams::write_stderr_line;
 
 pub(crate) fn render_session_id(label: &str, id: &str) {
     write_stderr_line(format!("{label}: {id}").with(Color::DarkGrey));
 }
-/// The per-turn token-usage line, `[in 12.3k / cache hit 96% / out 1.2k]`, dimmed and preceded by
-/// a blank line. `in` is the total of all three input-token tiers (live, cache-write, cache-read),
-/// and the hit rate is `cache_read / in`.
+/// The per-turn token-usage line, `[in 12.3k / cache hit 96% / out 1.2k]`, dimmed. `in` is the
+/// total of all three input-token tiers (live, cache-write, cache-read), and the hit rate is
+/// `cache_read / in`.
 pub(crate) fn render_token_usage(usage: &crate::stats::TokenUsage) {
     let total_in = usage
         .input_tokens
@@ -26,7 +20,6 @@ pub(crate) fn render_token_usage(usage: &crate::stats::TokenUsage) {
     } else {
         ((usage.cache_read_input_tokens as f64) / (total_in as f64) * 100.0).round() as u64
     };
-    write_stderr_line("");
     write_stderr_line(
         format!(
             "[in {} / cache hit {}% / out {}]",
@@ -53,10 +46,10 @@ pub(crate) struct ModelStatus<'a> {
 }
 /// The body of the session-status block, without ANSI and without the header line.
 ///
-/// Split out because every non-REPL frontend needs the same numbers in a different envelope; with
+/// Split out because every non-screen frontend needs the same numbers in a different envelope; with
 /// no shared body each re-implements the formatting and they drift. Pairs with
-/// [`render_session_status`], which is this plus the colored header, printed. The same shape as
-/// [`format_account_usage`] / [`render_account_usage`], for the same reason.
+/// the hosts' `/status`, which print this under a colored header. The same shape as
+/// [`format_account_usage`], for the same reason.
 pub(crate) fn format_session_status(
     snap: &crate::stats::SessionStatsSnapshot,
     model: &ModelStatus,
@@ -151,7 +144,7 @@ pub(crate) fn format_session_status(
         .map(|line| format!("  {line}\n"))
         .collect()
 }
-/// Plain-text (no ANSI) rendering of account rate-limit usage, shared by the REPL/ACP `/usage`
+/// Plain-text (no ANSI) rendering of account rate-limit usage, shared by the screen/ACP `/usage`
 /// command and the `meka account usage` CLI. Kept ANSI-free so the CLI can pipe it into scripts
 /// unchanged; the trailing newline lets callers `print!`/`eprint!` it directly.
 pub(crate) fn format_account_usage(usage: &crate::provider::AccountUsage) -> String {
@@ -222,11 +215,6 @@ pub(super) fn format_money(amount: f64, currency: Option<&str>) -> String {
         Some("USD") | None => format!("${amount:.2}"),
         Some(other) => format!("{amount:.2} {other}"),
     }
-}
-/// REPL `/usage` rendering: the shared plain text to stderr (REPL UI feedback). The "not available"
-/// case is handled by the caller via `render_hint`.
-pub(crate) fn render_account_usage(usage: &crate::provider::AccountUsage) {
-    write_stderr(format_account_usage(usage));
 }
 /// A fixed-width `[####------]` gauge for a 0-100 percentage.
 pub(super) fn usage_bar(percent: f64) -> String {

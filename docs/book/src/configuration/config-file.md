@@ -387,8 +387,8 @@ display modes:
   [`thinking.show_content`](#thinkingshow_content)). Sent as `thinking.display = "summarized"`,
   which is what Claude Code sends with its `showThinkingSummaries` setting on.
 - `updates` (Claude Code's own default): the server streams a running token count in place of the
-  text, and the REPL draws `Thinking... (150 tokens)` from it, redrawn as the count climbs and left
-  on screen when the phase ends. Sent as `thinking.display = "updates"` under the
+  text, and the screen draws `• Thinking · 150 tokens` from it (a one-shot run `Thinking... (150
+  tokens)`), redrawn as the count climbs and left on screen when the phase ends. Sent as `thinking.display = "updates"` under the
   `thinking-display-updates-2026-08-18` beta.
 - `redacted`: the server withholds the text and may return opaque `redacted_thinking` blocks. Sent
   as the `redact-thinking-2026-02-12` beta with no display field.
@@ -639,7 +639,7 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | Field | Purpose |
 |-------|---------|
 | `default_permission` | Fallback permission for MCP tools whose server didn't advertise `readOnlyHint` and doesn't have a `permission` override. Accepts `"none"`, `"read"`, `"workspace"`, or `"unrestricted"`; any other value is refused at startup, naming the line. If unset the hardcoded fallback is `"unrestricted"` (strict). It stays there deliberately: an MCP server runs unsandboxed, so `workspace` cannot confine it. |
-| `default_required` | Default for every server's `required` flag. When `true`, all enabled servers gate the turn; when `false` (the default) only servers with `required = true` do. An unavailable optional server doesn't stop the turn; its failure is logged once when it happens, and its live state is shown by `/mcp list` in the REPL or probed with `meka mcp reconnect <name>`. |
+| `default_required` | Default for every server's `required` flag. When `true`, all enabled servers gate the turn; when `false` (the default) only servers with `required = true` do. An unavailable optional server doesn't stop the turn; its failure is logged once when it happens, and its live state is shown by `/mcp list` on the screen or probed with `meka mcp reconnect <name>`. |
 | `grace` | Per-turn cap on how long to wait for still-`Pending` servers to connect before deciding. A duration string; default `"3s"`. `"0s"` skips the wait, for scripts that want to fail fast. |
 | `connect_timeout` | Per-server timeout for connect + `initialize` + `list_tools`. A hung stdio spawn or slow HTTPS handshake can't stall the whole fleet past this bound. A duration string; default `"30s"`. `"0s"` is refused at startup. |
 | `stdio_concurrency` | How many stdio servers connect at once at startup. Each is a process launch, so raising it trades startup latency for load; lower it on a machine where several heavy servers starting together is the problem. Default `3`; `0` is refused at startup. |
@@ -1171,7 +1171,7 @@ enabled = true
 max_tasks = 10
 ```
 
-**Alone among the capability blocks, this one is off by default.** `[schedule]`, `[skills]`, and `[memory]` add capability without changing when a turn ends; this changes the contract of the primary interaction into "you asked, it answered, and something else may interrupt you later". That is right for an unattended assistant and wrong for someone using the REPL as a command line. A scheduled job also takes an explicit act to create, whereas `background` is reachable from any tool call, so an agent will reach for it unprompted.
+**Alone among the capability blocks, this one is off by default.** `[schedule]`, `[skills]`, and `[memory]` add capability without changing when a turn ends; this changes the contract of the primary interaction into "you asked, it answered, and something else may interrupt you later". That is right for an unattended assistant and wrong for someone using the screen as a command line. A scheduled job also takes an explicit act to create, whereas `background` is reachable from any tool call, so an agent will reach for it unprompted.
 
 Setting `enabled = false` keeps the `background` property out of every tool schema and the two `task_*` tools out of every request, rather than advertising a parameter that would only ever be refused.
 
@@ -1187,7 +1187,7 @@ Settings for session history retention and context window management.
 
 Delete sessions not updated for longer than this, at agent startup. A duration string like `"30d"` or `"12h"`. Uses `updated_at`, so an actively-resumed session is preserved even if created long ago. Deletions are reported at `warn` level.
 
-Three kinds of session are spared whatever their timestamp says. A session another meka process has open is skipped, and the sweep reports how many: only turns bump `updated_at`, and resuming does not, so a REPL sitting at its prompt past the window looks expired while somebody is in front of it. A [pinned](../usage/sessions.md#pinning-a-session) session is never expired, nor is any parent of one: a pin is you saying keep this. And a session with a scheduled job still ahead of it is never expired, nor is any parent of one: a gated watcher that evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and deleting it would take the schedule with it.
+Three kinds of session are spared whatever their timestamp says. A session another meka process has open is skipped, and the sweep reports how many: only turns bump `updated_at`, and resuming does not, so an interactive session left open past the window looks expired while somebody is in front of it. A [pinned](../usage/sessions.md#pinning-a-session) session is never expired, nor is any parent of one: a pin is you saying keep this. And a session with a scheduled job still ahead of it is never expired, nor is any parent of one: a gated watcher that evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and deleting it would take the schedule with it.
 
 **Default: unset, meaning nothing is deleted.** `"0s"` is refused at startup, since it would delete everything on every launch. Conversation history isn't reproducible, so meka keeps it until told otherwise. Use `meka session delete --older-than-days <DAYS>` to prune manually instead.
 
@@ -1259,11 +1259,26 @@ Default: `3`
 subagent_max_depth = 3
 ```
 
+### `session.send_class`
+
+What Enter does on the interactive screen while a turn is running: `steer` posts the message to the
+session's inbox, where the agent reads it at its next round; `followup` holds it and sends it as the
+next turn once this one ends; `interrupt` cuts the answer being streamed and hands the agent the
+message at once. Alt+S cycles the class for one run. See
+[While a turn runs](../usage/interactive-mode.md#while-a-turn-runs).
+
+Default: `steer`
+
+```toml
+[session]
+send_class = "followup"
+```
+
 ## `[thinking]`
 
 Presentation and budget settings for extended thinking (`anthropic-messages` and `claude-subscription` backends). Whether thinking is on, and which wire encoding it uses, is the per-profile [`thinking`](#thinking) key, not a setting here.
 
-While the model is thinking, the REPL draws a live `Thinking...` line so a long pause reads as work rather than as a hang. On `claude-subscription` it carries the server's own running estimate (`Thinking... (150 tokens)`), redrawn in place as the count climbs; `anthropic-messages` does not report one, so the line stays bare. The count is coarse: a progress signal, not an accounting figure.
+While the model is thinking, the screen draws a live `• Thinking` row (a one-shot run a `Thinking...` line) so a long pause reads as work rather than as a hang. On `claude-subscription` it carries the server's own running estimate (`• Thinking · 150 tokens`), redrawn in place as the count climbs; `anthropic-messages` does not report one, so the row stays bare. The count is coarse: a progress signal, not an accounting figure.
 
 When the block ends the line stays on screen as a record that the phase happened; if the model returned readable reasoning, that text replaces the line instead. Nothing is drawn when output is piped or redirected, since there is no terminal to redraw on.
 
@@ -1275,15 +1290,17 @@ Default: `16000`
 
 ### `thinking.show_content`
 
-Whether to show the whole text of a thinking block. When `false`, a block carrying readable reasoning is previewed as a single dimmed line, flattened across line breaks and cut to fit [`display.max_width`](#displaymax_width), and the history replayed on resume (`resume_show_recent`) omits it entirely. Emphasis on that line is styling rather than text, so a summary's `**Bold header**` reads as a bold header there too.
+Whether a thinking block starts expanded. When `false`, a block carrying readable reasoning shows as a single dimmed row, `• Thinking · …` on the screen and `Thinking... …` in a one-shot run, with its first words flattened across line breaks and cut to fit [`display.max_width`](#displaymax_width); while the block still streams the screen shows its latest line instead. Emphasis on that row is styling rather than text, so a summary's `**Bold header**` reads as a bold header there too.
 
-When `true`, the block streams to stderr as it arrives, behind the same dimmed `Thinking... ` label, with every line after the first indented by two spaces. There is no height limit: asking to see the reasoning is asking to see all of it. On a model that streams its whole chain of thought this is the difference between a token counter and the text. The label takes the live `Thinking... (N tokens)` indicator's place as soon as reasoning starts to arrive, and the text follows as it settles: a paragraph at a time under `termimad`, a line at a time under `raw` and `syntect`, the same way the answer does. A warning logged while the block streams takes a row of its own, and the block resumes below it behind a second `Thinking... ` label.
+When `true`, the block shows whole under the same dimmed label, every line at the text edge, as it streams. There is no height limit: asking to see the reasoning is asking to see all of it. On a model that streams its whole chain of thought this is the difference between a token counter and the text.
 
-Formatting follows [`display.render_mode`](#displayrender_mode), with one difference: reasoning is painted entirely in dark gray, so emphasis carries as bold or italic rather than as color. That is what keeps a thinking block readable as a footnote rather than as the reply. Under `termimad` the markdown is rendered, so a reasoning summary's `**Bold header**` arrives as a bold header instead of as asterisks; under `raw` and `syntect` the source is shown as written, which for reasoning means those two produce the same output. Fenced code keeps its fences and is not syntax-highlighted, for the same reason.
+On the interactive screen this is only where a block starts: a click, or Ctrl+T for every block at once, shows or hides the reasoning after the fact, whatever this says. See [Expanding and collapsing](../usage/interactive-mode.md#expanding-and-collapsing). In a one-shot run it decides what is printed, and the block is written to stderr as it arrives.
+
+Reasoning is painted entirely in dark gray, so emphasis carries as bold or italic rather than as color. That is what keeps a thinking block readable as a footnote rather than as the reply. The markdown is rendered, so a reasoning summary's `**Bold header**` arrives as a bold header instead of as asterisks; fenced code keeps the same gray and is not syntax-highlighted, for the same reason.
 
 Either way the block is still sent on subsequent turns, for reasoning continuity.
 
-One cost to know about: a turn that has streamed you reasoning will not retry a transient provider failure. meka retries only while nothing the model produced has reached you, since a second attempt would repeat it, and reasoning is the first thing a turn produces. Under the default the deltas are discarded and the one-line preview is built from the completed block, so nothing is repeatable and retries behave as they always have.
+One cost to know about: a turn that has streamed you reasoning will not retry a transient provider failure. meka retries only while nothing the model produced has reached you, since a second attempt would repeat it, and reasoning is the first thing a turn produces. The interactive screen keeps the reasoning whether or not it is shown, so there every turn that reasoned is in that position; in a one-shot run under the default the deltas are discarded and the one-line preview is built from the completed block, so nothing is repeatable and retries behave as they always have.
 
 Default: `false`
 
@@ -1344,27 +1361,6 @@ max_redirects = 0
 
 Settings for output formatting.
 
-### `display.render_mode`
-
-Output render mode. Equivalent to the `--render-mode` CLI flag.
-
-| Value | Description |
-|-------|-------------|
-| `syntect` | Syntax-highlighted markdown source, incl. per-language code blocks; never reflowed |
-| `termimad` | Rendered CommonMark, reflowed to the terminal: paragraphs re-wrap, wide tables wrap, markers are consumed. Same theme colors as `syntect`, and code blocks are highlighted by it. The default |
-| `raw` | Raw markdown printed verbatim with aligned tables |
-
-Default: `termimad`
-
-Reflowing only happens when there is a terminal to reflow to. With output redirected or piped,
-`termimad` renders without wrapping, so a captured answer is not hard-wrapped to some fallback
-width.
-
-```toml
-[display]
-render_mode = "raw"
-```
-
 ### `display.max_width`
 
 Widest line meka composes from model output, in terminal columns.
@@ -1387,9 +1383,10 @@ budget subtracts fixed chrome first, and below roughly that the subtraction leav
 more likely to be a typo than a request.
 
 This covers meka's own output: tool indicators and their argument block, thinking previews, the
-checklist, and the approval prompt. Assistant markdown is not affected and keeps reflowing to the
-real terminal through [`display.render_mode`](#displayrender_mode). With output piped there is no
-terminal to measure, so an unset width falls back to 100 columns and a captured run stays byte-stable.
+checklist, and the approval prompt. On the interactive screen it also caps the width the answer's
+markdown wraps to, for a reader who finds a wide window hard to follow. With a one-shot run's output
+piped there is no terminal to measure, so an unset width falls back to 100 columns and a captured
+run stays byte-stable.
 
 A terminal narrower than 20 columns is treated as 20. That is not a legibility judgment: the
 thinking block's own prefix is twelve columns, so below roughly that meka's chrome no longer fits and
@@ -1397,16 +1394,20 @@ the width stops meaning anything. Such a terminal wraps meka's output whatever t
 
 ### `display.tool_params`
 
-How much of a tool call's input the `[tool ...]` indicator shows.
+How much of a tool call's input its row shows: on the screen `• shell_execute cargo test`, in a
+one-shot run the `[tool ...]` indicator. On the interactive screen this is what a collapsed call
+shows; an expanded one shows every argument and the output whatever this is set to, and the
+setting decides what a new call starts as. See
+[Expanding and collapsing](../usage/interactive-mode.md#expanding-and-collapsing).
 
-This setting covers the indicator only. With approvals on, the approval prompt always shows every
-argument, whatever this is set to: the indicator is a notification, the prompt is a decision,
-and setting `off` for a quiet scrollback must not leave you approving calls you cannot see.
+This setting covers the call's row only. With approvals on, the approval prompt always shows every
+argument, whatever this is set to: the row is a notification, the prompt is a decision, and
+setting `off` for a quiet transcript must not leave you approving calls you cannot see.
 
 | Value | Description |
 |-------|-------------|
-| `off` | Name only: `[tool shell_execute]`. No argument reaches your terminal |
-| `summary` | Name plus the one argument that identifies the call: ``[tool shell_execute(`cargo test`)]`` (default) |
+| `off` | Name only: `• shell_execute`, `[tool shell_execute]`. No argument reaches your terminal |
+| `summary` | Name plus the one argument that identifies the call: `• shell_execute cargo test`, ``[tool shell_execute(`cargo test`)]`` (default) |
 | `full` | Every argument, as an indented block under the name |
 
 Default: `summary`
@@ -1467,10 +1468,10 @@ unflattened.
 
 **`full` puts every argument on screen, secrets included.** `summary` shows only the one argument
 that identifies a call (`file_write`'s path, `web_fetch`'s URL), so a request header carrying a token
-or a file body carrying a key stayed off screen. `full` shows all of them, and replayed history
-reprints them on every `/history` and every resume. meka never puts its own credentials into tool
-arguments, so what appears is what the model itself passed, but that is worth knowing before turning
-this on where somebody can read over your shoulder or your scrollback.
+or a file body carrying a key stays off screen until a call is expanded. `full` shows all of them
+from the start, and a replay shows them on every resume and every page of history. meka never puts its
+own credentials into tool arguments, so what appears is what the model itself passed, but that is
+worth knowing before turning this on where somebody can read over your shoulder.
 
 Values are escape-stripped, their newlines and carriage returns flattened, and Unicode format
 characters (bidi overrides, soft hyphens, zero-width joiners) removed, so an argument cannot move
@@ -1484,8 +1485,8 @@ One residual caveat: the `... N more lines`, `... N more rows` and `... N more a
 ordinary text, so an argument whose content mimics one is indistinguishable from a real elision. That
 does not let an argument run anything, but it can mislead a reader who is not expecting it.
 
-Applies to the REPL, to one-shot runs (`meka --oneshot`), and to replayed history (`/history`,
-`resume_show_recent`). ACP sends structured tool-call fields to the editor and the HTTP API's SSE
+Applies to the interactive screen, to one-shot runs (`meka --oneshot`), and to the history the
+screen reads back. ACP sends structured tool-call fields to the editor and the HTTP API's SSE
 events already carry the raw input, so neither is affected.
 
 ```toml
@@ -1518,61 +1519,52 @@ show_session_id_on_resume = false
 show_session_id_on_exit = false
 ```
 
-### `display.show_path_in_prompt`
+### `display.status_row`
 
-Whether to show the current working directory in the interactive prompt.
+What the status row under the composer shows after the permission level, which always opens it,
+in the order listed:
+
+- `path`: the session's working directory, shortened with `~`
+- `profile`: the profile the session runs on, with its model
+- `context`: the live context-window gauge, e.g. `128.4k/1.0M 13%` (tokens in context / model
+  window / percent used), the same value `/status` shows on its `Context:` line; hidden until the
+  first turn produces a measurement
+- `tasks`: `2 background tasks`, while any run
+- `subagents`: `1 sub-agent`, while any run
+
+A hint (`copied 3 rows`, `the question was withdrawn`) sits at the right edge whatever the
+list says, and an empty list leaves the row to the hints. A word that is not one of these is
+refused by name.
+
+```toml
+[display]
+status_row = ["profile", "context"]
+```
+
+Default: `["path", "profile", "tasks", "subagents"]`
+
+### `display.mouse`
+
+Whether the interactive screen captures the mouse. With it on, the wheel scrolls the transcript and
+a click expands or collapses a block; the terminal's own click-and-drag then needs its modifier key
+(Shift in most terminals, Option in iTerm2) to select text. With it off the mouse is the terminal's,
+and the keyboard still scrolls and toggles. See
+[Scrolling and the mouse](../usage/interactive-mode.md#scrolling-and-the-mouse).
 
 Default: `true`
 
-### `display.show_context_in_prompt`
-
-Whether to show a live context-window gauge in the interactive prompt, e.g. `128.4k/1.0M 13%` (tokens in context / model window / percent used). The figure comes from the most recent turn's reported usage (and an estimate right after `/compact` or on resume), the same value `/status` shows on its `Context:` line. Hidden until the first turn produces a measurement.
-
-Default: `false`
-
-### `display.newline_before_prompt`
-
-Whether to add a blank line before the prompt, after whatever the previous line produced.
-
-Default: `true`
-
-### `display.newline_after_prompt`
-
-Whether to add a blank line after the line you typed, before its output. On a resume there is no typed line: the `Resuming session:` banner takes its place, and this is the blank between that banner and whatever follows it, normally the replayed history. With the banner hidden, the history sits directly under your shell's command line.
-
-Default: `true`
-
-Both apply to **anything printed between two prompts**, not only agent responses. That span is the
-unit, whatever filled it: a turn, a slash command's output (`/task`, `/memory`, `/help`, …), an
-error, a scheduled job waking the shell to run several turns at once, or any combination. It is
-bracketed once, by whichever of those printed first and last, never once per turn inside it, and
-never twice because two things both thought they owned the spacing. Log lines are the one
-exception: a warning (or, under `-v`, anything else `tracing` prints) takes a row of its own and
-spends neither blank, so a warning at startup is followed straight by the first prompt.
-
-Both space output away from *meka's* prompt, so neither applies at the edges of a run, where the
-prompt is your shell's. Whatever meka prints before drawing its first prompt sits directly under the
-command you typed (`Resuming session:` on a resume, or the answer to a prompt you passed on the
-command line), and its last line is followed straight by the shell prompt. Start meka with no
-prompt and there is nothing above its first prompt to space away from, so the rule never comes up.
-
-The blank lines bracket output, so **a span that prints nothing gets neither**, and leaves the
-screen exactly as it found it. In practice every slash command says something, even if only that a
-list is empty. Three cases where nothing is printed and nothing is spaced: a successful `/cd`,
-because the prompt itself is the confirmation; a successful `/clear`, because the cleared screen is;
-and a scheduled wake that finds nothing left to run. `!command` is the one exception in the other
-direction: it is always bracketed, because meka hands the terminal to the child process and never
-learns whether it wrote anything, so a silent `!touch file` still gets its blank lines.
-
-Turning a setting off removes that blank line and nothing else. The spacing *between* blocks of a
-single response (a tool indicator and the answer that follows it, or a thinking block and the text
-after it) is not controlled by either flag and does not change.
+```toml
+[display]
+mouse = false
+```
 
 ### `display.show_token_usage`
 
-When `true`, meka prints a one-line per-turn token-usage summary to stderr after each turn:
+When `true`, meka shows a one-line per-turn token-usage summary after each turn, on the screen as
+a dim row and in a one-shot run as a bracketed line:
 
 ```
+• 12.3k in · 96% cached · 1.2k out
 [in 12.3k / cache hit 96% / out 1.2k]
 ```
 
@@ -1591,44 +1583,6 @@ Default: `true`
 ```toml
 [display]
 stream = false
-```
-
-### `display.resume_show_recent`
-
-When set to a positive integer `N`, resuming a session reprints the **last `N` turns** (each turn = the user's prompt plus everything the agent did in response, styled to match the live REPL) instead of just the last assistant message.
-
-Useful when you regularly resume long-running sessions and want more context than the single-message default. Inside a session, the `/history` slash command provides the same rendering on demand (`/history` dumps everything; `/history N` shows the last N turns).
-
-Default: unset (resume reprints only the last assistant message, today's behavior).
-
-```toml
-[display]
-resume_show_recent = 3
-```
-
-### `display.input_style`
-
-Visual style applied to a REPL prompt once it is submitted. Makes past prompts easy to spot when scrolling back through a long session. A line still being edited keeps the terminal's own colors; the style arrives on reedline's final paint, which is the one that lands in scrollback.
-
-The leading `/command` token is a separate signal and is colored as you type, green when meka recognizes the command and red when it does not. This setting does not affect it.
-
-Accepted values:
-- `default` (or unset): bold white-ish foreground on a slate-blue background, rendered in truecolor RGB so it looks the same across terminal themes.
-- `none`: disable styling entirely.
-- `reverse`: reverse video (swaps the terminal's current foreground and background).
-- `bold`, `dim`, `italic`, `underline`: single attribute, no color change.
-- A color name (`black`, `red`, `green`, `yellow`, `blue`, `magenta` / `purple`, `cyan`, `white`): set only the foreground, mapped to the terminal's palette.
-
-Unknown values warn at startup and fall back to `default`.
-
-Default: the banner preset described above.
-
-```toml
-[display]
-show_path_in_prompt = false
-newline_before_prompt = false
-newline_after_prompt = false
-input_style = "none"    # or "cyan", "bold", "dim", etc.
 ```
 
 ## `[serve]`

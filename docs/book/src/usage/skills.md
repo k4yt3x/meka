@@ -247,13 +247,13 @@ A skill is the reusable unit of sub-agent instruction. Sub-agents do not receive
 
 ## Invoking a skill from the CLI
 
-Any skill can be triggered directly from the command line with `--skill <name>`. The rendered body becomes the first user turn, and meka drops into the REPL after the turn finishes:
+Any skill can be triggered directly from the command line with `--skill <name>`. The rendered body becomes the first user turn, and meka drops into the screen after the turn finishes:
 
 ```bash
 meka --skill download-videos -p "https://example.com/video"
 ```
 
-`-p`, if given, is prepended to the skill body as extra context (equivalent to typing `/skill download-videos https://example.com/video` in the REPL).
+`-p`, if given, is prepended to the skill body as extra context (equivalent to typing `/skill download-videos https://example.com/video` on the screen).
 
 To run the skill and exit immediately (useful for scripts), pair with `--oneshot`:
 
@@ -261,7 +261,7 @@ To run the skill and exit immediately (useful for scripts), pair with `--oneshot
 meka --oneshot --skill download-videos -p "https://example.com/video"
 ```
 
-To invoke a skill mid-session inside the REPL, use the slash command instead:
+To invoke a skill mid-session inside the screen, use the slash command instead:
 
 ```
 /skill download-videos

@@ -246,7 +246,7 @@ impl Default for ResolvedScheduleConfig {
 /// Alone among them it defaults **off**, which is deliberate rather than caution. Those three add
 /// capability without changing when a turn ends; this changes the contract of the primary
 /// interaction from "you asked, it answered" into "and something else may interrupt you later",
-/// which is right for an unattended assistant and wrong for someone using the REPL as a command
+/// which is right for an unattended assistant and wrong for someone using the screen as a command
 /// line. A scheduled job also takes an explicit, visible act to create, whereas `background` is
 /// reachable from any tool call, so an agent will reach for it unprompted.
 #[derive(Debug, Deserialize, Default)]
@@ -459,37 +459,114 @@ pub(crate) struct ThinkingConfig {
     pub(crate) show_content: Option<bool>,
 }
 
+/// One fact the status row can show after the permission level, which always opens it.
+/// `[display].status_row` lists them in the order the row shows them; a word that is not one
+/// of these is refused by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum StatusFact {
+    /// The session's working directory, shortened with `~`.
+    Path,
+    /// The profile the session runs on, with its model.
+    Profile,
+    /// The live context-window gauge, once a turn has measured it.
+    Context,
+    /// `2 background tasks`, while any run.
+    Tasks,
+    /// `1 sub-agent`, while any run.
+    Subagents,
+}
+
+impl StatusFact {
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [StatusFact; 5] = [
+        Self::Path,
+        Self::Profile,
+        Self::Context,
+        Self::Tasks,
+        Self::Subagents,
+    ];
+    /// What the row shows when the config does not say: everything but the gauge, which is
+    /// opted into, since it is one more number to read on every frame.
+    pub(crate) const DEFAULT_ROW: [StatusFact; 4] =
+        [Self::Path, Self::Profile, Self::Tasks, Self::Subagents];
+
+    /// The value's one spelling, in the config.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::Profile => "profile",
+            Self::Context => "context",
+            Self::Tasks => "tasks",
+            Self::Subagents => "subagents",
+        }
+    }
+}
+
+impl std::fmt::Display for StatusFact {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for StatusFact {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|fact| fact.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a status row fact. Supported: {}",
+                    Self::ALL
+                        .iter()
+                        .map(|fact| fact.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for StatusFact {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, String> {
+        value.parse()
+    }
+}
+
+impl From<StatusFact> for String {
+    fn from(fact: StatusFact) -> Self {
+        fact.name().to_string()
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DisplayConfig {
-    pub(crate) newline_before_prompt: Option<bool>,
-    pub(crate) newline_after_prompt: Option<bool>,
     pub(crate) show_session_id_on_create: Option<bool>,
     pub(crate) show_session_id_on_resume: Option<bool>,
     pub(crate) show_session_id_on_exit: Option<bool>,
-    pub(crate) show_path_in_prompt: Option<bool>,
-    pub(crate) show_context_in_prompt: Option<bool>,
+    /// What the status row under the composer shows, in order. Unset shows
+    /// [`StatusFact::DEFAULT_ROW`].
+    pub(crate) status_row: Option<Vec<StatusFact>>,
     pub(crate) show_token_usage: Option<bool>,
-    pub(crate) render_mode: Option<RenderMode>,
-    /// How much of a tool call's input the `[tool X]` indicator shows: `off`, `summary` (default),
-    /// or `full`.
+    /// How much of a collapsed tool call shows: `off`, `summary` (default), or `full`.
     pub(crate) tool_params: Option<ToolParams>,
     /// Widest line meka composes from model output, in terminal columns. Unset follows the
     /// terminal, which is what keeps a line from ever wrapping; a set value is honored exactly,
-    /// so one wider than the terminal will wrap. Covers meka's own output only: assistant
-    /// markdown reflows to the real terminal through `render_mode` either way.
+    /// so one wider than the terminal will wrap.
     pub(crate) max_width: Option<usize>,
-    /// Style applied to the REPL input buffer so submitted prompts stand out in scrollback. Parsed
-    /// by [`parse_input_style`]. Accepts `bold`, `dim`, `none`, or a color name (`cyan`,
-    /// `yellow`, …).
-    pub(crate) input_style: Option<String>,
-    /// When set to `Some(N)` with `N > 0`, resuming a session reprints the last `N` turns (user
-    /// prompts plus the agent's response, styled like the live REPL). Unset reprints only the last
-    /// assistant message.
-    pub(crate) resume_show_recent: Option<usize>,
     /// Whether answers stream as they arrive. `false` is what `--no-stream` asks for one run; a
     /// preference belongs in the file, like every other display setting.
     pub(crate) stream: Option<bool>,
+    /// Whether the interactive screen captures the mouse: the wheel scrolls and a click expands a
+    /// block, at the cost of the terminal's own click-and-drag selection, which then needs its
+    /// modifier key. Default `true`.
+    pub(crate) mouse: Option<bool>,
 }
 
 /// Whether answers stream: the flag turns it off for one run, the file is the standing preference,
@@ -833,6 +910,10 @@ pub(crate) struct SessionConfig {
     pub(crate) compact_checkpoint: Option<bool>,
     pub(crate) context_window: Option<u64>,
     pub(crate) subagent_max_depth: Option<usize>,
+    /// What Enter does on the interactive screen while a turn is running: `steer` (default) is
+    /// read at the turn's next round, `followup` waits for the turn to end, `interrupt` cuts the
+    /// answer being streamed.
+    pub(crate) send_class: Option<SendClass>,
 }
 
 impl Backend {
@@ -994,6 +1075,74 @@ impl std::str::FromStr for Backend {
     }
 }
 
+/// How Enter sends while a turn is running: the inbox class the message takes.
+///
+/// One spelling per value, the inbox's own; the value enum lives here rather than being the
+/// store's because the config is read below the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum SendClass {
+    #[default]
+    Steer,
+    Followup,
+    Interrupt,
+}
+
+impl SendClass {
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [SendClass; 3] = [Self::Steer, Self::Followup, Self::Interrupt];
+
+    /// The value's one spelling, in the config and on the screen.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Steer => "steer",
+            Self::Followup => "followup",
+            Self::Interrupt => "interrupt",
+        }
+    }
+}
+
+impl std::fmt::Display for SendClass {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for SendClass {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|class| class.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a send class. Supported: {}",
+                    Self::ALL
+                        .iter()
+                        .map(|class| class.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for SendClass {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, String> {
+        value.parse()
+    }
+}
+
+impl From<SendClass> for String {
+    fn from(class: SendClass) -> Self {
+        class.name().to_string()
+    }
+}
+
 /// Which session a run should pick up, resolved from the mutually exclusive `--continue` and
 /// `--resume` flags.
 ///
@@ -1009,16 +1158,20 @@ pub(crate) enum SessionResume {
     Last,
     /// `--resume <SESSION>`: a specific UUID, or a leading prefix of one.
     Id(String),
+    /// `--resume` with nothing after it: the screen asks which, from a list.
+    Pick,
 }
 
 impl SessionResume {
     /// `None` when neither flag was given. Clap enforces that they are mutually exclusive, so the
-    /// order of these checks is not load-bearing.
-    pub(crate) fn from_flags(resume: Option<String>, continue_last: bool) -> Option<Self> {
-        if let Some(id) = resume {
-            return Some(Self::Id(id));
+    /// order of these checks is not load-bearing. The outer `Option` is whether `-r` was given at
+    /// all, the inner whether it named a session.
+    pub(crate) fn from_flags(resume: Option<Option<String>>, continue_last: bool) -> Option<Self> {
+        match resume {
+            Some(Some(id)) => Some(Self::Id(id)),
+            Some(None) => Some(Self::Pick),
+            None => continue_last.then_some(Self::Last),
         }
-        continue_last.then_some(Self::Last)
     }
 }
 
@@ -1094,8 +1247,7 @@ pub(crate) struct CliOverrides {
     pub(crate) sandbox_backend: Option<SandboxBackend>,
     pub(crate) writable_roots: Vec<std::path::PathBuf>,
     pub(crate) no_stream: bool,
-    pub(crate) render_mode: Option<RenderMode>,
-    pub(crate) resume: Option<String>,
+    pub(crate) resume: Option<Option<String>>,
     pub(crate) continue_last: bool,
     pub(crate) prompt: Option<String>,
     pub(crate) oneshot: bool,
@@ -1192,22 +1344,22 @@ pub(crate) struct ResolvedConfig {
     /// What a new session's approvals switch starts as. A resumed session brings its own.
     pub(crate) approvals: bool,
     pub(crate) streaming: bool,
-    pub(crate) newline_before_prompt: bool,
-    pub(crate) newline_after_prompt: bool,
     pub(crate) show_session_id_on_create: bool,
     pub(crate) show_session_id_on_resume: bool,
     pub(crate) show_session_id_on_exit: bool,
-    pub(crate) show_path_in_prompt: bool,
-    pub(crate) show_context_in_prompt: bool,
+    /// Resolved `[display].mouse`.
+    pub(crate) mouse: bool,
+    /// Resolved `[session].send_class`.
+    pub(crate) send_class: SendClass,
+    /// Resolved `[display].status_row`: what the status row shows, in order.
+    pub(crate) status_row: Vec<StatusFact>,
     pub(crate) show_token_usage: bool,
-    pub(crate) resume_show_recent: Option<usize>,
     pub(crate) web_client: WebClientConfig,
     pub(crate) sandbox: bool,
     /// `[shell].sandbox_backend` (or its flag and variable), before any auto-pick. Linux-only;
     /// the host resolves and probes it at startup ([`crate::sandbox::resolve_backend`]) because
     /// the pick depends on what the machine has.
     pub(crate) sandbox_backend: Option<SandboxBackend>,
-    pub(crate) render_mode: RenderMode,
     pub(crate) tool_params: ToolParams,
     /// Resolved `[display].max_width`. `None`, the default, follows the terminal.
     pub(crate) max_width: Option<usize>,
@@ -1283,7 +1435,7 @@ pub(crate) struct ResolvedConfig {
     /// `true`; see [`MemoryConfig`].
     pub(crate) memory_enabled: bool,
     /// `[schedule]` with defaults filled. Resolved here rather than at the call site because both
-    /// the REPL and `meka serve` start a scheduler and would otherwise each re-derive it.
+    /// the screen and `meka serve` start a scheduler and would otherwise each re-derive it.
     pub(crate) schedule: ResolvedScheduleConfig,
     /// `[background]` with defaults filled. Off unless the installation asks for it; see
     /// [`BackgroundConfig`].
@@ -1294,7 +1446,6 @@ pub(crate) struct ResolvedConfig {
     pub(crate) builtin_allowed_tools: Option<Vec<String>>,
     pub(crate) builtin_disabled_tools: Vec<String>,
     pub(crate) builtin_tool_permissions: HashMap<String, Permission>,
-    pub(crate) input_style: nu_ansi_term::Style,
     /// First-turn await cap for still-connecting MCP servers.
     pub(crate) mcp_grace: std::time::Duration,
     /// Per-server connect+initialize timeout.
@@ -1447,48 +1598,6 @@ pub(crate) fn substitute_env(input: &str) -> Result<(String, bool), String> {
         return Err(format!("env var `{name}` referenced in config is unset"));
     }
     Ok((expansion.text, environment_supplied))
-}
-
-/// Default input style: bold, white-ish foreground, slate-blue background. Uses truecolor RGB (not
-/// palette indices or named colors) so the visual is consistent across terminals that remap the
-/// standard 16 colors to match their theme.
-pub(crate) fn default_input_style() -> nu_ansi_term::Style {
-    use nu_ansi_term::{Color, Style};
-    Style::new()
-        .bold()
-        .fg(Color::Rgb(240, 240, 240))
-        .on(Color::Rgb(55, 75, 110))
-}
-
-/// Parse a `[display].input_style` value. `"default"` (or unset) yields [`default_input_style`];
-/// `"none"` yields no styling; simple keywords pick a single color or attribute. Unknown keywords
-/// warn and fall back to the default so a typo doesn't lose the session to a panic.
-pub(crate) fn parse_input_style(raw: &str) -> nu_ansi_term::Style {
-    use nu_ansi_term::{Color, Style};
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "default" => default_input_style(),
-        "none" => Style::default(),
-        "reverse" => Style::new().reverse(),
-        "bold" => Style::new().bold(),
-        "dim" => Style::new().dimmed(),
-        "italic" => Style::new().italic(),
-        "underline" => Style::new().underline(),
-        "black" => Style::new().fg(Color::Black),
-        "red" => Style::new().fg(Color::Red),
-        "green" => Style::new().fg(Color::Green),
-        "yellow" => Style::new().fg(Color::Yellow),
-        "blue" => Style::new().fg(Color::Blue),
-        "magenta" | "purple" => Style::new().fg(Color::Magenta),
-        "cyan" => Style::new().fg(Color::Cyan),
-        "white" => Style::new().fg(Color::White),
-        other => {
-            tracing::warn!(
-                "ignoring [display].input_style '{other}'; supported: default, none, reverse, \
-                 bold, dim, italic, underline, a color name"
-            );
-            default_input_style()
-        }
-    }
 }
 
 /// Resolve `[skills] extra_paths` into the read-only roots discovery will scan.
@@ -1916,28 +2025,6 @@ fn parse_sandbox_backend_override(value: &str) -> Option<SandboxBackend> {
     }
 }
 
-/// `MEKA_RENDER_MODE` overrides `[display].render_mode`, with the same tolerance as
-/// [`sandbox_backend_override`]: a value meka does not have is warned about and ignored.
-fn render_mode_override() -> Option<RenderMode> {
-    parse_render_mode_override(&std::env::var("MEKA_RENDER_MODE").ok()?)
-}
-
-/// Parse a `MEKA_RENDER_MODE` value (trimmed). Empty or unrecognized values yield `None`;
-/// unrecognized ones also warn, so a retired spelling does not silently fall to the default.
-fn parse_render_mode_override(value: &str) -> Option<RenderMode> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    match trimmed.parse() {
-        Ok(mode) => Some(mode),
-        Err(message) => {
-            tracing::warn!("ignoring MEKA_RENDER_MODE: {message}");
-            None
-        }
-    }
-}
-
 /// Merge `--eager-load-tool SERVER:TOOL` CLI values into the matching server's
 /// [`McpServerConfig::eager_load_tools`] list. A malformed entry or an unknown server name warns
 /// and is skipped. Appends to the configured list, without repeating an entry already there.
@@ -2181,23 +2268,19 @@ impl ResolvedConfig {
             enabled_permissions,
             approvals: file_permissions.approvals.unwrap_or(false),
             streaming: streaming_enabled(overrides.no_stream, file_display.stream),
-            newline_before_prompt: file_display.newline_before_prompt.unwrap_or(true),
-            newline_after_prompt: file_display.newline_after_prompt.unwrap_or(true),
             show_session_id_on_create: file_display.show_session_id_on_create.unwrap_or(false),
             show_session_id_on_resume: file_display.show_session_id_on_resume.unwrap_or(true),
             show_session_id_on_exit: file_display.show_session_id_on_exit.unwrap_or(true),
+            mouse: file_display.mouse.unwrap_or(true),
+            send_class: file_session.send_class.unwrap_or_default(),
             show_token_usage: file_display.show_token_usage.unwrap_or(false),
-            resume_show_recent: file_display.resume_show_recent,
-            show_path_in_prompt: file_display.show_path_in_prompt.unwrap_or(true),
-            show_context_in_prompt: file_display.show_context_in_prompt.unwrap_or(false),
+            status_row: file_display
+                .status_row
+                .clone()
+                .unwrap_or_else(|| StatusFact::DEFAULT_ROW.to_vec()),
             web_client: WebClientConfig::from_file(&file_web),
             sandbox: file_shell.sandbox.unwrap_or(true),
             sandbox_backend,
-            render_mode: overrides
-                .render_mode
-                .or_else(render_mode_override)
-                .or(file_display.render_mode)
-                .unwrap_or_default(),
             tool_params: file_display.tool_params.unwrap_or_default(),
             max_width: file_display.max_width.map(clamp_max_width),
             retention: file_session.retention,
@@ -2247,11 +2330,6 @@ impl ResolvedConfig {
             builtin_allowed_tools,
             builtin_disabled_tools,
             builtin_tool_permissions,
-            input_style: file_display
-                .input_style
-                .as_deref()
-                .map(parse_input_style)
-                .unwrap_or_else(default_input_style),
             mcp_grace,
             mcp_connect_timeout,
             mcp_tool_timeout,
@@ -2517,63 +2595,15 @@ impl BuiltinToolFilter {
         self.disabled.contains(name)
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
-#[serde(try_from = "String", into = "String")]
+/// How the write-once renderer lays markdown out: rendered for a terminal, or the source as
+/// written for a pipe. Not a setting: a one-shot run decides by whether stdout is a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum RenderMode {
-    /// syntect-based highlighter. Named after the `syntect` crate that does the in-process
-    /// highlighting. Shows the markdown source as the model wrote it, reflowing nothing, so a wide
-    /// table runs past the terminal edge.
-    Syntect,
-    /// Rendered CommonMark, reflowed to the terminal (default).
-    ///
-    /// The default because meka's own output is table-heavy: `task_list`, `scratchpad_list`, and
-    /// anything the model formats as a table all wrap inside their box here and run off the right
-    /// edge under `syntect`. Reading rendered prose is also the common case; wanting to see the
-    /// markers is the exception, and `syntect` is one config line away.
-    ///
-    /// One spelling, `termimad`, on the flag, in the environment and in `config.toml` alike.
+    /// Rendered CommonMark, reflowed to the terminal.
     #[default]
     Termimad,
+    /// The markdown as the model wrote it, reflowing nothing, for a reader that is not a terminal.
     Raw,
-}
-impl RenderMode {
-    /// Every mode, in the order the names sort.
-    pub(crate) const ALL: [RenderMode; 3] = [Self::Raw, Self::Syntect, Self::Termimad];
-
-    /// The one spelling `[display].render_mode`, `--render-mode` and `MEKA_RENDER_MODE` take.
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Syntect => "syntect",
-            Self::Termimad => "termimad",
-            Self::Raw => "raw",
-        }
-    }
-
-    /// The names, joined for a refusal that lists what would have been accepted.
-    pub(crate) fn supported() -> String {
-        Self::ALL
-            .iter()
-            .map(|mode| mode.name())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
-impl std::fmt::Display for RenderMode {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
-    }
-}
-impl TryFrom<String> for RenderMode {
-    type Error = String;
-
-    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
-        value.parse()
-    }
-}
-impl From<RenderMode> for String {
-    fn from(mode: RenderMode) -> Self {
-        mode.name().to_string()
-    }
 }
 /// How much of a tool call's input the tool indicator shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
@@ -2596,23 +2626,6 @@ impl std::fmt::Display for ToolParams {
             ToolParams::Summary => write!(formatter, "summary"),
             ToolParams::Full => write!(formatter, "full"),
         }
-    }
-}
-impl std::str::FromStr for RenderMode {
-    type Err = String;
-
-    /// Refuses with the names that would have been accepted.
-    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|mode| mode.name() == value)
-            .ok_or_else(|| {
-                format!(
-                    "'{value}' is not a render mode. Supported: {}",
-                    Self::supported()
-                )
-            })
     }
 }
 
@@ -3966,6 +3979,40 @@ command = "ida-mcp"
         assert!(resolved.retention.is_none(), "no cleanup by default");
     }
 
+    /// The status row's facts come from the list, in its order; a word that is not a fact is
+    /// refused by name, and so are the two booleans the list replaced.
+    #[test]
+    fn the_status_row_is_a_list_of_facts_in_order() {
+        let parsed =
+            toml::from_str::<ConfigFile>("[display]\nstatus_row = [\"profile\", \"path\"]\n")
+                .expect("a list of facts parses");
+        assert_eq!(
+            parsed.display.and_then(|display| display.status_row),
+            Some(vec![StatusFact::Profile, StatusFact::Path])
+        );
+        let unknown = toml::from_str::<ConfigFile>("[display]\nstatus_row = [\"badge\"]\n")
+            .expect_err("a word that is not a fact must not parse");
+        assert!(
+            unknown
+                .to_string()
+                .contains("'badge' is not a status row fact"),
+            "{unknown}"
+        );
+        for retired in ["show_path_in_prompt", "show_context_in_prompt"] {
+            let error = toml::from_str::<ConfigFile>(&format!("[display]\n{retired} = true\n"))
+                .expect_err("the retired key must not parse");
+            assert!(error.to_string().contains(retired), "{error}");
+        }
+        assert_eq!(
+            StatusFact::DEFAULT_ROW.to_vec(),
+            StatusFact::ALL
+                .into_iter()
+                .filter(|fact| *fact != StatusFact::Context)
+                .collect::<Vec<_>>(),
+            "the default is everything but the gauge"
+        );
+    }
+
     /// A config still carrying the key is refused by name, like every retired key, rather than
     /// parsed and ignored: a user who set it would otherwise believe requests were still being cut.
     #[test]
@@ -4588,44 +4635,6 @@ client_secret = "my-secret"
     }
 
     #[test]
-    fn parse_input_style_known_values() {
-        use nu_ansi_term::{Color, Style};
-        assert_eq!(parse_input_style("bold"), Style::new().bold());
-        assert_eq!(parse_input_style("BOLD"), Style::new().bold());
-        assert_eq!(parse_input_style("dim"), Style::new().dimmed());
-        assert_eq!(parse_input_style("cyan"), Style::new().fg(Color::Cyan));
-        assert_eq!(parse_input_style("purple"), Style::new().fg(Color::Magenta));
-    }
-
-    #[test]
-    fn parse_input_style_none_is_plain() {
-        use nu_ansi_term::Style;
-        assert_eq!(parse_input_style("none"), Style::default());
-    }
-
-    #[test]
-    fn parse_input_style_default_and_empty_yield_preset() {
-        let preset = default_input_style();
-        assert_eq!(parse_input_style(""), preset);
-        assert_eq!(parse_input_style("default"), preset);
-        assert!(preset.is_bold);
-        assert!(preset.foreground.is_some(), "default must set foreground");
-        assert!(preset.background.is_some(), "default must set background");
-    }
-
-    #[test]
-    fn parse_input_style_reverse() {
-        assert!(parse_input_style("reverse").is_reverse);
-    }
-
-    #[test]
-    fn parse_input_style_unknown_falls_back_to_default() {
-        // Invalid keywords warn but must not panic; fall back to the same preset used when the key
-        // is unset.
-        assert_eq!(parse_input_style("superbold"), default_input_style());
-    }
-
-    #[test]
     fn tools_config_deserialization() {
         let toml_str = r#"
 [tools]
@@ -4688,6 +4697,7 @@ file_read = "unrestricted"
         };
 
         assert_eq!(parse(&["meka"]), None);
+        assert_eq!(parse(&["meka", "-r"]), Some(SessionResume::Pick));
         assert_eq!(parse(&["meka", "-c"]), Some(SessionResume::Last));
         assert_eq!(
             parse(&["meka", "-r", "550e8400"]),
@@ -5096,7 +5106,6 @@ thinking = "budgeted"
             }
             assert!("nonsense".parse::<T>().is_err());
         }
-        check(&RenderMode::ALL, RenderMode::name);
         check(&ThinkingMode::ALL, ThinkingMode::name);
         check(&McpTransport::ALL, McpTransport::name);
         check(&OutputFormat::ALL, OutputFormat::name);
@@ -5115,12 +5124,6 @@ thinking = "budgeted"
             assert!(backend.display_name().parse::<SandboxBackend>().is_err());
             assert_eq!(backend.to_string(), backend.display_name());
         }
-        // A retired spelling of a render mode is refused everywhere, including the variable.
-        assert!("rich".parse::<RenderMode>().is_err());
-        assert_eq!(parse_render_mode_override("rich"), None);
-        assert_eq!(parse_render_mode_override(" raw "), Some(RenderMode::Raw));
-        assert_eq!(parse_render_mode_override(""), None);
-        assert!(toml::from_str::<DisplayConfig>("render_mode = \"Raw\"").is_err());
         assert!(toml::from_str::<McpServerConfig>("name = \"s\"\ntransport = \"HTTP\"").is_err());
     }
 

@@ -10,9 +10,9 @@ use std::{
 };
 
 /// Per-session working directory, shared by reference between the agent, every file-touching tool,
-/// the REPL prompt, the `/cd` slash command, and the per-turn environment-context block.
-/// `std::sync::RwLock` (rather than `tokio::sync::RwLock`) so the synchronous REPL prompt can read
-/// it without entering an async context; reads/writes are microseconds (a `PathBuf` clone or
+/// the screen prompt, the `/cd` slash command, and the per-turn environment-context block.
+/// `std::sync::RwLock` (rather than `tokio::sync::RwLock`) so the synchronous screen prompt can
+/// read it without entering an async context; reads/writes are microseconds (a `PathBuf` clone or
 /// replace), never held across `.await`. Poisoning is recovered through [`crate::sync`]: meka never
 /// panics with this lock held, so a poisoned lock is a separate bug that already fired, and serving
 /// the stored path beats failing every later tool call.
@@ -1917,8 +1917,8 @@ mod tests {
         ]);
     }
 
-    /// The single-root case has to stay exactly one path: that is every REPL and HTTP session, and
-    /// every ACP client that sends no extra roots.
+    /// The single-root case has to stay exactly one path: that is every screen and HTTP session,
+    /// and every ACP client that sends no extra roots.
     #[test]
     fn search_roots_without_extras_is_just_cwd() {
         let cwd = SharedCwd::new(PathBuf::from("/work/main"));

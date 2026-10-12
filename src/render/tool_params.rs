@@ -101,9 +101,10 @@ pub(super) const TOOL_VALUE_MIN_WIDTH: usize = 16;
 
 /// How much of a call an argument block may show.
 ///
-/// The same renderer serves two audiences with opposite needs. A tool indicator is a notification
-/// scrolling past, so it may trade completeness for brevity. An approval prompt is a decision, so
-/// it may not: what it hides is what you authorize unseen.
+/// The same renderer serves two audiences with opposite needs. A tool indicator on a one-shot
+/// run's stream is a notification scrolling past, so it may trade completeness for brevity. The
+/// screen's expanded call and its approval prompt are there to be read whole, so they may not:
+/// what they hide is what you audit or authorize unseen.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BlockLimits {
     /// Source lines shown under one argument's key before the rest is summarized as a count.
@@ -152,25 +153,16 @@ impl BlockLimits {
         }
     }
 
-    /// For the approval prompt.
-    ///
-    /// Wrapping rather than cutting, since cutting a line hides the tail of the command being
-    /// approved. Twenty lines rather than thirty because a prompt blocks reading and wants to be
-    /// short.
-    ///
-    /// The block ceiling is generous but real, and worth 161 rows in the worst case. Dropping an
-    /// argument from a decision is bad, and it was tempting to allow none; but leaving the block
-    /// unbounded lets two hundred decoy arguments scroll the real tool name and the real payload
-    /// off the top, which is the same outcome with no marker to warn anybody. A named drop is
-    /// the lesser harm, and it is the signal to deny.
-    pub(super) fn approval() -> Self {
+    /// For the screen: an expanded call, and the approval prompt. Every argument, every line of
+    /// it, wrapped rather than cut, since a cut line hides the tail of the command being read or
+    /// approved. No ceiling, because the screen scrolls: a block that would have scrolled a
+    /// one-shot prompt off the terminal is a block the viewport or the panel pages through, and
+    /// a count in place of the rows is what hid a payload's tail before.
+    pub(super) fn whole() -> Self {
         Self {
-            lines_per_argument: 20,
-            // Three times the line budget, so wrapping has room to be worth having: a single-line
-            // `shell_execute` -- the commonest approval there is -- gets all sixty rows to
-            // itself.
-            rows_per_argument: 60,
-            block_rows: 100,
+            lines_per_argument: usize::MAX,
+            rows_per_argument: usize::MAX,
+            block_rows: usize::MAX,
             wrap: true,
         }
     }
@@ -560,12 +552,11 @@ pub(super) fn scalar_text(value: &serde_json::Value, budget: usize) -> String {
     }
 }
 
-/// The argument block for an approval prompt: every argument, wrapped rather than cut.
-///
-/// Separate entry point from the indicator's so the two sets of limits are named at their call
-/// sites rather than passed in from the REPL, which has no business knowing them.
-pub(crate) fn render_approval_params(input: &serde_json::Value, width: usize) -> Vec<String> {
-    render_tool_params(input, width, BlockLimits::approval())
+/// The argument block as the screen shows it: every argument, every line, wrapped rather than
+/// cut. Separate entry point from the indicator's so the two sets of limits are named at their
+/// call sites rather than passed in from the screen, which has no business knowing them.
+pub(crate) fn render_whole_params(input: &serde_json::Value, width: usize) -> Vec<String> {
+    render_tool_params(input, width, BlockLimits::whole())
 }
 
 /// Split the indicator into its header line and its argument block, per `params`.

@@ -760,8 +760,8 @@ fn killed_command_output(drained: &DrainedOutput, reason: &str) -> ToolOutput {
 /// A failed result that states `reason` first and carries what the command printed after it.
 ///
 /// The reason leads because the output can be 64 MiB and every surface shows a result's head (the
-/// scratchpad preview, a background outcome, the REPL banner), so a reason at the end would be the
-/// one line nobody reads; the record holds all of it either way.
+/// scratchpad preview, a background outcome, the screen banner), so a reason at the end would be
+/// the one line nobody reads; the record holds all of it either way.
 fn led_by_reason(drained: &DrainedOutput, reason: &str) -> ToolOutput {
     let mut text = reason.to_string();
     let printed = join_streams(&drained.stdout, &drained.stderr);

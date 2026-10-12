@@ -71,7 +71,7 @@ where the conversation was had whatever `default_profile` currently says. `--pro
 not a per-run override either: it **repins** the session, rewriting the row so every later resume
 keeps it. `meka session list` shows which profile each session runs on, which is the whole story: a
 session records a profile name and nothing else. You can move a live session with `/profile <name>`
-in the REPL, `PATCH /v1/sessions/{id}` over HTTP, or the Profile picker in an ACP client. See
+on the screen, `PATCH /v1/sessions/{id}` over HTTP, or the Profile picker in an ACP client. See
 [Sessions](../usage/sessions.md#what-a-resume-restores).
 
 ## Pointing a backend somewhere else

@@ -2,17 +2,17 @@
 //!
 //! What every host shares: the process-wide [`SharedDeps`], agent assembly, the doors that decide
 //! whether a session may be driven at all, session resume and repin, and the sweeps a host runs
-//! on the way in and out. The hosts themselves are the children: the interactive REPL, the
+//! on the way in and out. The hosts themselves are the children: the interactive screen, the
 //! one-shot run, and the ACP and HTTP servers.
 pub(crate) mod acp;
 mod assembly;
 #[cfg(feature = "serve")]
 pub(crate) mod http;
 pub(crate) mod oneshot;
-pub(crate) mod repl;
 pub(crate) mod scheduler;
 mod session;
 pub(crate) mod terminal;
+pub(crate) mod tui;
 
 use std::sync::Arc;
 
@@ -20,12 +20,10 @@ pub(crate) use assembly::*;
 pub(crate) use session::*;
 use tokio_util::sync::CancellationToken;
 
-use self::terminal::*;
 use crate::{
     agent::Agent,
     config::ResolvedConfig,
     error::AlreadyReported,
-    host::repl::editor::ReplEvent,
     permission::SharedPermission,
     session::{AgentOptions, CoreMaterials, SessionCells, SessionMaterials},
     store::{Store, TokenStore},
@@ -35,13 +33,13 @@ use crate::{
 /// Render a `--skill <name>` invocation into the user-message string that drives the first turn.
 /// Returns `Ok(None)` when `--skill` is not set so callers can leave the typed prompt untouched.
 ///
-/// Mirrors the REPL's `SlashCommand::SkillInvoke` handler in what it composes: the same
+/// Mirrors the screen's `SlashCommand::SkillInvoke` handler in what it composes: the same
 /// `format!("{extra}\n\n{body}")` order when the positional `[PROMPT]` is supplied.
 ///
 /// It does *not* mirror the lookup, and the difference is deliberate. This runs before the agent
-/// exists, so it walks the roots itself; the REPL reads `agent.skills().current()`, which is the
-/// live cache. Both resolve the same name to the same file, but only the REPL's sees a skill added
-/// mid-session.
+/// exists, so it walks the roots itself; the screen reads `agent.skills().current()`, which is the
+/// live cache. Both resolve the same name to the same file, but only the screen's sees a skill
+/// added mid-session.
 pub(crate) async fn build_skill_prompt(
     skill: Option<&str>,
     prompt: Option<&str>,
@@ -88,7 +86,7 @@ pub(crate) async fn sweep_expired_sessions(
             "deleted {deleted} session(s) not updated in {window} (`[session].retention`)"
         );
     }
-    // Only turns bump `updated_at`, so a REPL idle past the window looks expired while a human is
+    // Only turns bump `updated_at`, so a screen idle past the window looks expired while a human is
     // sitting in front of it. Saying nothing here would leave an operator wondering why their
     // retention setting never takes: the answer is that it did, and spared the one session that
     // was in use.
@@ -131,16 +129,13 @@ pub(crate) async fn wait_for_shutdown_signal() {
     }
 }
 
-/// A slash command a host answers itself. The REPL offers every one; an editor over ACP is told
+/// A slash command a host answers itself. The screen offers every one; an editor over ACP is told
 /// about the ones marked `for_editors`, as its `available_commands`.
 ///
 /// The execution-side grammar (aliases, argument splitting, `/mcp` and `/skill` subcommands) stays
 /// in `parse_slash_command`; this table only models the names that are completed and documented.
 pub(crate) struct HostCommand {
     pub(crate) name: &'static str,
-    /// Alternate spellings the parser also accepts. Honored by the highlighter but never offered
-    /// as separate completions.
-    pub(crate) aliases: &'static [&'static str],
     pub(crate) help: &'static str,
     /// Argument syntax shown after the name in help, empty for no-argument commands. A non-empty
     /// hint is the "takes an argument" predicate that drives completion's trailing space.
@@ -153,149 +148,128 @@ pub(crate) struct HostCommand {
 pub(crate) const COMMANDS: &[HostCommand] = &[
     HostCommand {
         name: "help",
-        aliases: &["?"],
         help: "Show this help message",
         arg_hint: "",
         for_editors: false,
     },
     HostCommand {
         name: "exit",
-        aliases: &["quit"],
-        help: "Exit the shell",
-        arg_hint: "",
-        for_editors: false,
-    },
-    HostCommand {
-        name: "clear",
-        aliases: &[],
-        help: "Clear the terminal screen",
+        help: "Leave",
         arg_hint: "",
         for_editors: false,
     },
     HostCommand {
         name: "session",
-        aliases: &[],
         help: "Show the current session id",
         arg_hint: "",
         for_editors: false,
     },
     HostCommand {
         name: "title",
-        aliases: &[],
         help: "Show or set this session's title",
         arg_hint: "[text]",
         for_editors: false,
     },
     HostCommand {
         name: "permission",
-        aliases: &[],
-        help: "Show or set the permission level",
-        arg_hint: "[none|read|workspace|unrestricted]",
+        help: "Pick or set the permission level",
+        arg_hint: "[level]",
         for_editors: false,
     },
     HostCommand {
         name: "approvals",
-        aliases: &[],
-        help: "Show or set whether calls above the level are submitted for approval",
+        help: "Pick or set whether calls above the level are submitted for approval",
         arg_hint: "[on|off]",
         for_editors: false,
     },
     HostCommand {
         name: "profile",
-        aliases: &[],
-        help: "Show or change the profile this session runs on",
+        help: "Pick or set the profile this session runs on",
         arg_hint: "[name]",
         for_editors: false,
     },
     HostCommand {
+        name: "resume",
+        help: "Pick a session to switch to, or switch to one by id or unique prefix",
+        arg_hint: "[session]",
+        for_editors: false,
+    },
+    HostCommand {
         name: "compact",
-        aliases: &[],
         help: "Summarize and compact the session, optionally saying what to keep",
         arg_hint: "[instructions]",
         for_editors: false,
     },
     HostCommand {
         name: "rewind",
-        aliases: &[],
         help: "Drop the last N turns from the conversation (default 1)",
         arg_hint: "[N]",
         for_editors: false,
     },
     HostCommand {
         name: "export",
-        aliases: &[],
         help: "Export the current session as Markdown",
         arg_hint: "",
         for_editors: false,
     },
     HostCommand {
         name: "fork",
-        aliases: &[],
         help: "Fork this session and continue in the copy",
         arg_hint: "",
         for_editors: false,
     },
     HostCommand {
         name: "cd",
-        aliases: &[],
         help: "Change working directory (bare: back to where meka started)",
         arg_hint: "[path]",
         for_editors: false,
     },
     HostCommand {
         name: "skill",
-        aliases: &[],
-        help: "List skills, or invoke one with extra context",
-        arg_hint: "[name] [extra...]",
+        help: "Pick a skill to run, or run one by name with extra context",
+        arg_hint: "[name] [extra]",
         for_editors: false,
     },
     HostCommand {
         name: "memory",
-        aliases: &[],
         help: "List saved memories, or show one by name",
         arg_hint: "[name]",
         for_editors: false,
     },
     HostCommand {
         name: "schedule",
-        aliases: &[],
         help: "List this session's scheduled jobs, show one, or cancel one by id",
-        arg_hint: "[show <id> | cancel <id>]",
+        arg_hint: "[show|cancel <id>]",
         for_editors: false,
     },
     HostCommand {
         name: "task",
-        aliases: &[],
-        help: "List background tasks, show one, or cancel one by id",
-        arg_hint: "[show <id> | cancel <id|--all>]",
+        help: "List background tasks, show one, or cancel one by id or all",
+        arg_hint: "[show|cancel <id>]",
         for_editors: false,
     },
     HostCommand {
         name: "mcp",
-        aliases: &[],
         help: "Manage MCP servers and prompts",
         arg_hint: "<subcommand>",
         for_editors: true,
     },
     HostCommand {
         name: "status",
-        aliases: &[],
         help: "Show the profile, model, context use and cumulative session stats",
         arg_hint: "",
         for_editors: true,
     },
     HostCommand {
         name: "usage",
-        aliases: &[],
         help: "Show account rate-limit usage (subscription backends)",
         arg_hint: "",
         for_editors: true,
     },
     HostCommand {
-        name: "history",
-        aliases: &[],
-        help: "Reprint past conversation (bare = all, N = last N turns)",
-        arg_hint: "[N]",
+        name: "log",
+        help: "Show the recent log lines, at every level",
+        arg_hint: "",
         for_editors: false,
     },
 ];
@@ -315,7 +289,7 @@ pub(crate) async fn format_status(
             let budget = agent.context_budget(session_id).await;
             (budget.used, budget.window, budget.generation)
         }
-        // The REPL's first turn has no row yet, so nothing could have been compacted.
+        // The screen's first turn has no row yet, so nothing could have been compacted.
         None => {
             let (context_tokens, context_window) = agent.context_usage();
             (context_tokens, context_window, 0)

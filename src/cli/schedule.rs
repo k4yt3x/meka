@@ -56,29 +56,6 @@ pub(crate) async fn run(
     .map_err(Into::into)
 }
 
-/// `/schedule` in the REPL: the same table, scoped to the conversation the user is in.
-///
-/// Trades the `Session` column, which would carry one id on every row here, for `Held`. This
-/// process *is* a host, so it hands the renderer its gate dispatcher and can answer a tool gate;
-/// `meka schedule list` cannot, and is the surface where a spent column is worst.
-pub(crate) async fn run_list_for_session(
-    store: &Store,
-    session: uuid::Uuid,
-    config: &crate::config::ResolvedScheduleConfig,
-) -> Result<()> {
-    let jobs = store.schedule_store().list_scheduled_jobs(session).await?;
-    let jobs = with_levels(store, config, jobs).await;
-    render(
-        store.scheduler_memory(),
-        &jobs,
-        Layout::SessionScoped,
-        None,
-        crate::render::Stream::Stderr,
-        &Resolvable::of(&jobs),
-        crate::cli::OutputFormat::Plain,
-    )
-}
-
 /// Pair each job with the level its session holds now, which is what decides whether it can fire.
 ///
 /// One row read per job, and only for a command the user typed.
@@ -94,7 +71,7 @@ pub(crate) async fn run_list_for_session(
 /// unknown. The host level is deliberately *not* used as a fallback: the host that eventually runs
 /// this job is some other process, and its `--permission` is not something this command can see.
 /// "I cannot tell" is the honest answer.
-async fn with_levels(
+pub(crate) async fn with_levels(
     store: &Store,
     config: &crate::config::ResolvedScheduleConfig,
     jobs: Vec<crate::schedule::ScheduledJob>,
@@ -170,7 +147,7 @@ async fn list(
 /// The table's header, beside the row builder so the two cannot drift apart in width or order.
 ///
 /// `Session` only where it can differ. `meka schedule list` spans every session, so a row without
-/// it names no owner; `/schedule` in the REPL is already scoped to one conversation, where the
+/// it names no owner; `/schedule` on the screen is already scoped to one conversation, where the
 /// column would repeat the same id on every line.
 const COLUMNS: [crate::text::Column; 6] = [
     crate::text::Column::content("ID"),
@@ -378,7 +355,7 @@ pub(crate) async fn show(
     .await
 }
 
-/// [`show`] under a chosen format; the REPL's `/schedule show` has no format flag and takes the
+/// [`show`] under a chosen format; the screen's `/schedule show` has no format flag and takes the
 /// door above.
 async fn show_job(
     store: &Store,
@@ -525,7 +502,7 @@ async fn resolve_job(
         return no_match();
     }
     let jobs = match scope {
-        // `/schedule` in the REPL is one conversation's view, and its `cancel` resolves against
+        // `/schedule` on the screen is one conversation's view, and its `cancel` resolves against
         // that session alone. A `show` that reached outside it would answer about a job the
         // listing above it never mentioned and the `cancel` beside it would refuse.
         Some(session) => store.schedule_store().list_scheduled_jobs(session).await?,
@@ -1000,7 +977,7 @@ mod tests {
 
     /// `meka schedule list` spans every session, so a row that does not name one names nothing.
     ///
-    /// The column is absent from the REPL's listing, which is already scoped to one conversation.
+    /// The column is absent from the screen's listing, which is already scoped to one conversation.
     /// Both header sets are asserted against the row width, since a header and a row that disagree
     /// shift every cell under the wrong title without failing anything.
     #[test]

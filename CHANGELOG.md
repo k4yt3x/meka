@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.72.0] - 2026-10-12
+
+### Added
+
+- An interactive screen: the conversation fills the terminal and you type while the agent works.
+- Enter mid-turn steers the agent by default, or queues a followup or interrupts; Alt+S cycles.
+- A working row above the composer: a spinner, what the agent is doing, the seconds, Esc to stop.
+- Bare `/permission`, `/profile`, `/skill`, `/memory`, `/task`, `/schedule` and `/mcp` are pickers.
+- `meka -r` alone or `/resume` picks a session from a list; `/resume <id>` switches in place.
+- A thinking block or a tool call expands and collapses; a call that changed a file shows a diff.
+- Older turns load as you scroll up, however long the session; `↓ back to bottom` returns.
+- The mouse expands on click, copies on drag, and scrolls; `[display].mouse` turns it off.
+- Ctrl+V attaches the clipboard's image to the next prompt; a pasted image path attaches the file.
+- `/log` shows the recent log lines at every level, whatever `-v` lets onto the transcript.
+- A status row under the composer; `[display].status_row` picks its facts and their order.
+- `[session].send_class` sets what Enter does mid-turn by default.
+
+### Changed
+
+- **Breaking:** interactive mode needs a terminal; a pipe is refused and `--oneshot` named.
+- **Breaking:** the screen draws the answers; stdout carries them only under `--oneshot`.
+- **Breaking:** the approval answers are picked, by cursor, key or number; `always` is `a`.
+- `-r` takes its session optionally: with nothing after it, meka asks which, from a list.
+- A command the turn would have to wait on is refused while a turn runs; stop the turn first.
+- A command's answer opens in a panel over the composer; Esc closes it.
+- `!command` output is captured into the transcript rather than taking the terminal; Esc kills it.
+- One register on the screen: a glyph in column 0, text at column 2, the terminal's own colors.
+- A one-shot run colors from the terminal's palette, and writes the markdown as written to a pipe.
+- `/mcp` no longer reports credentials whose server is gone; `meka mcp list` still does.
+
+### Removed
+
+- **Breaking:** `/history` and `/clear`; scrolling up is the history and the screen is the session.
+- **Breaking:** `[display].render_mode`, `input_style`, `newline_*` and `resume_show_recent`.
+- **Breaking:** `[display].show_path_in_prompt` and `show_context_in_prompt`; see `status_row`.
+- **Breaking:** `--render-mode` and `MEKA_RENDER_MODE`.
+
+### Fixed
+
+- A failed turn is reported once; the stream's own error line no longer repeats the host's.
+- A list whose items are separated by blank lines keeps its bullets rather than reading as prose.
+- A long checklist item and an MCP server's URL wrap rather than being cut.
+
 ## [0.71.0] - 2026-10-07
 
 ### Added
@@ -2591,7 +2634,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.71.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.72.0...HEAD
+[0.72.0]: https://github.com/k4yt3x/meka/compare/0.71.0...0.72.0
 [0.71.0]: https://github.com/k4yt3x/meka/compare/0.70.0...0.71.0
 [0.70.0]: https://github.com/k4yt3x/meka/compare/0.69.0...0.70.0
 [0.69.0]: https://github.com/k4yt3x/meka/compare/0.68.1...0.69.0

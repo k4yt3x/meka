@@ -1653,8 +1653,8 @@ mod tests {
     }
 
     /// A host handing an occurrence back has not spent a turn on it, so the deferral must not spend
-    /// budget either. Otherwise a `meka serve` whose session is held by a REPL would burn its whole
-    /// per-sweep budget on jobs it never ran.
+    /// budget either. Otherwise a `meka serve` whose session is held by a screen would burn its
+    /// whole per-sweep budget on jobs it never ran.
     #[tokio::test]
     async fn a_deferral_does_not_consume_the_fire_budget() {
         let mut harness = SchedulerHarness::new().await;
@@ -2582,10 +2582,10 @@ mod tests {
     ///
     /// This is the cross-process half of the withdrawal. Were the polling process's own startup
     /// flag to stand in for a row with no level, a `meka serve` sharing the data directory would
-    /// use that daemon's `--permission`, not anything the user touched: Shift+Tab-ing the REPL
-    /// down would stop the gate in the REPL and leave serve firing it, unattended and unsandboxed,
-    /// which is the opposite of what `scheduling.md` promises. The row is written at
-    /// session creation and on every level change, and it is the only thing read.
+    /// use that daemon's `--permission`, not anything the user touched: Shift+Tab-ing the screen
+    /// down would stop the gate on the screen and leave serve firing it, unattended and
+    /// unsandboxed, which is the opposite of what `scheduling.md` promises. The row is written
+    /// at session creation and on every level change, and it is the only thing read.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_withdrawn_session_refuses_its_gate() {
@@ -2607,7 +2607,7 @@ mod tests {
             )
             .await;
 
-        // The session has since been withdrawn to `read`: the row the REPL now keeps current.
+        // The session has since been withdrawn to `read`: the row the screen now keeps current.
         harness
             .manager
             .update_session(harness.session_id, crate::store::SessionPatch {
@@ -3372,8 +3372,8 @@ mod tests {
         );
     }
 
-    /// The REPL only owns the conversation it has open; a job belonging to another session must be
-    /// left for whichever host can actually run it.
+    /// The screen only owns the conversation it has open; a job belonging to another session must
+    /// be left for whichever host can actually run it.
     #[tokio::test]
     async fn session_scope_ignores_jobs_from_other_sessions() {
         let harness = SchedulerHarness::new().await;
@@ -3419,9 +3419,9 @@ mod tests {
     }
 
     /// A host that cannot take a job must not consume its occurrence. `meka serve` hits this
-    /// whenever a REPL holds the session's file lock: `prepare` has already stamped and advanced
+    /// whenever a screen holds the session's file lock: `prepare` has already stamped and advanced
     /// the job by the time the lock is attempted, so without the restore the job would be
-    /// silently skipped on every tick for as long as the REPL stayed open.
+    /// silently skipped on every tick for as long as the screen stayed open.
     #[tokio::test]
     async fn a_deferred_job_keeps_its_occurrence() {
         let harness = SchedulerHarness::new().await;
@@ -3472,7 +3472,7 @@ mod tests {
     /// The one-shot case of a deferral, which the recurring test above does not reach. Claiming a
     /// one-shot *deletes* its row, so a restore that only updated columns matched nothing, reported
     /// success, and lost the reminder for good. That is the concrete "remind me in 20 minutes"
-    /// failure when `meka serve` and a REPL race for the same session.
+    /// failure when `meka serve` and a screen race for the same session.
     #[tokio::test]
     async fn a_deferred_one_shot_is_not_lost() {
         let harness = SchedulerHarness::new().await;

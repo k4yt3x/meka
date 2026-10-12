@@ -23,6 +23,21 @@ pub(crate) struct EventStamp {
     /// boundary written between turns or a rewind's repair.
     pub(crate) turn_id: Option<Uuid>,
 }
+
+/// One row of the log with its id, for a reader that walks the log in pages.
+#[derive(Debug, Clone)]
+pub(crate) struct LogRow {
+    pub(crate) id: i64,
+    pub(crate) event: crate::conversation::Event,
+}
+
+/// A page of the log, oldest row first, and whether the log goes on past it in the direction
+/// it was read.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LogPage {
+    pub(crate) rows: Vec<LogRow>,
+    pub(crate) more: bool,
+}
 /// Result of `Store::create_session_with_metadata`. Carries the canonical RFC 3339
 /// `created_at` so the caller's in-memory state shares one timestamp with the DB row; without
 /// this, the handler's `SessionEntry.created_at` and the DB `sessions.created_at` would each
@@ -321,7 +336,8 @@ pub(crate) enum SourceLock {
     /// Nothing in this process holds the source: probe it, and refuse [`MekaError::SessionLocked`]
     /// when another process does.
     Probe,
-    /// This process holds the source: the REPL's own session, or one resident in `serve` or `acp`.
+    /// This process holds the source: the screen's own session, or one resident in `serve` or
+    /// `acp`.
     HeldByCaller,
 }
 /// What the retention sweep may take: a root session whose tree nobody pinned and no schedule
@@ -642,11 +658,78 @@ pub(super) enum RowRange {
 const VIEW_FLOOR_SQL: &str =
     "AND id >= COALESCE((SELECT MAX(id) FROM messages WHERE session_id = ?1 AND kind = ?2), 0)";
 
+fn stored_row_with_id(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, StoredMessage)> {
+    Ok((row.get(0)?, StoredMessage {
+        kind: row.get(1)?,
+        content: row.get(2)?,
+        created_at: row.get(3)?,
+        turn_id: row.get(4)?,
+    }))
+}
+
+/// The ids of the rows this build could not read and has said so about; see
+/// [`warn_once_about_row`].
+pub(crate) type WarnedRows = std::sync::Mutex<std::collections::HashSet<i64>>;
+
+/// Say that row `id` could not be read, once: a resume's hydration and the screen's page read
+/// meet the same rows, and a second warning for one tells the user nothing new. Whether this was
+/// the first time.
+fn warn_once_about_row(
+    warned: &WarnedRows,
+    id: i64,
+    kind: &str,
+    error: Option<&serde_json::Error>,
+) -> bool {
+    if !crate::sync::lock(warned).insert(id) {
+        return false;
+    }
+    match error {
+        Some(error) => {
+            tracing::warn!("failed to decode a session row of kind '{kind}': {error}");
+        }
+        None => tracing::warn!("dropping a session row with unknown kind '{kind}'"),
+    }
+    true
+}
+
+/// A page from rows read one past the asked-for count, in either direction, as the oldest-first
+/// page it is and whether the extra row was there.
+fn log_page(
+    mut stored: Vec<(i64, StoredMessage)>,
+    rows: usize,
+    newest_first: bool,
+    warned: &WarnedRows,
+) -> LogPage {
+    let more = stored.len() > rows;
+    stored.truncate(rows);
+    if newest_first {
+        stored.reverse();
+    }
+    let rows = stored
+        .into_iter()
+        .filter_map(|(id, row)| match decode_event_from_row(&row) {
+            Ok(Some(event)) => Some(LogRow { id, event }),
+            Ok(None) => {
+                warn_once_about_row(warned, id, &row.kind, None);
+                None
+            }
+            Err(error) => {
+                warn_once_about_row(warned, id, &row.kind, Some(&error));
+                None
+            }
+        })
+        .collect();
+    LogPage { rows, more }
+}
+
 /// Decode rows into `(created_at, event)` pairs in the order they were stored, skipping with a
 /// warning any row this build cannot read, so one bad row costs itself and not the session.
-fn decode_rows(stored: Vec<StoredMessage>) -> Vec<(EventStamp, crate::conversation::Event)> {
+fn decode_rows(
+    stored: Vec<(i64, StoredMessage)>,
+    warned: &WarnedRows,
+) -> Vec<(EventStamp, crate::conversation::Event)> {
     let mut events = Vec::with_capacity(stored.len());
-    for row in stored {
+    for (id, row) in stored {
         match decode_event_from_row(&row) {
             Ok(Some(event)) => events.push((
                 EventStamp {
@@ -656,16 +739,10 @@ fn decode_rows(stored: Vec<StoredMessage>) -> Vec<(EventStamp, crate::conversati
                 event,
             )),
             Ok(None) => {
-                tracing::warn!(
-                    "dropping a session row with unknown kind '{kind}'",
-                    kind = row.kind
-                );
+                warn_once_about_row(warned, id, &row.kind, None);
             }
             Err(error) => {
-                tracing::warn!(
-                    "failed to decode a session row of kind '{kind}': {error}",
-                    kind = row.kind
-                );
+                warn_once_about_row(warned, id, &row.kind, Some(&error));
             }
         }
     }
@@ -788,7 +865,7 @@ impl Store {
     }
 
     /// Like [`Self::create_session`] but also persists the HTTP API's per-session metadata
-    /// (`permission` level, `capabilities_json` blob, and `token_id` fingerprint). The REPL
+    /// (`permission` level, `capabilities_json` blob, and `token_id` fingerprint). The screen
     /// and ACP paths derive permission from process config and don't have a bearer token.
     ///
     /// No production caller: every host that creates a session now goes through
@@ -1285,7 +1362,7 @@ impl Store {
     /// foreign-key violation. Under ACP it is quieter still: `load_events` returns empty and the
     /// editor is handed a silently blank fork.
     ///
-    /// The one fork door. Every host reaches it: `meka session fork` and the REPL's `/fork`,
+    /// The one fork door. Every host reaches it: `meka session fork` and the screen's `/fork`,
     /// `POST /v1/sessions/{id}/fork` and ACP's `session/fork`.
     ///
     /// `Ok(None)` means the source is gone; both claims are released *and* their files removed,
@@ -1862,8 +1939,8 @@ impl Store {
         &self,
         session_id: Uuid,
     ) -> Result<Vec<crate::conversation::Event>> {
-        let stored = self.load_messages(session_id, RowRange::All).await?;
-        Ok(decode_rows(stored)
+        let stored = self.load_rows(session_id, RowRange::All).await?;
+        Ok(decode_rows(stored, &self.warned_rows)
             .into_iter()
             .map(|(_, event)| event)
             .collect())
@@ -1887,9 +1964,9 @@ impl Store {
         session_id: Uuid,
     ) -> Result<Vec<crate::conversation::Event>> {
         let stored = self
-            .load_messages(session_id, RowRange::FromLastBoundary)
+            .load_rows(session_id, RowRange::FromLastBoundary)
             .await?;
-        Ok(decode_rows(stored)
+        Ok(decode_rows(stored, &self.warned_rows)
             .into_iter()
             .map(|(_, event)| event)
             .collect())
@@ -1951,8 +2028,8 @@ impl Store {
         &self,
         session_id: Uuid,
     ) -> Result<Vec<(EventStamp, crate::conversation::Event)>> {
-        let stored = self.load_messages(session_id, RowRange::All).await?;
-        Ok(decode_rows(stored))
+        let stored = self.load_rows(session_id, RowRange::All).await?;
+        Ok(decode_rows(stored, &self.warned_rows))
     }
 
     /// Load a session together with every descendant sub-agent session (recursively via
@@ -2259,11 +2336,13 @@ impl Store {
 
     /// Fetch raw rows for a session, in insert order. Internal helper for [`Self::load_events`]
     /// and [`Self::load_view_events`]; external consumers go through the event API.
-    pub(super) async fn load_messages(
+    /// The rows of `range` with their ids, oldest first: what every reader that decodes goes
+    /// through, so a row that cannot be read is known by its id and warned about once.
+    async fn load_rows(
         &self,
         session_id: Uuid,
         range: RowRange,
-    ) -> Result<Vec<StoredMessage>> {
+    ) -> Result<Vec<(i64, StoredMessage)>> {
         let (floor, parameters) = match range {
             RowRange::All => ("", vec![session_id.to_string()]),
             RowRange::FromLastBoundary => (VIEW_FLOOR_SQL, vec![
@@ -2274,25 +2353,108 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(&format!(
-                    "SELECT kind, content, created_at, turn_id FROM messages \
+                    "SELECT id, kind, content, created_at, turn_id FROM messages \
                      WHERE session_id = ?1 {floor} ORDER BY id ASC"
                 ))?;
-
-                let messages = statement
-                    .query_map(rusqlite::params_from_iter(parameters), |row| {
-                        Ok(StoredMessage {
-                            kind: row.get(0)?,
-                            content: row.get(1)?,
-                            created_at: row.get(2)?,
-                            turn_id: row.get(3)?,
-                        })
-                    })?
+                let rows = statement
+                    .query_map(rusqlite::params_from_iter(parameters), stored_row_with_id)?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-
-                Ok(messages)
+                Ok(rows)
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to load messages: {error}")))
+    }
+
+    /// The rows of `range` as stored, for the tests that read them back.
+    #[cfg(test)]
+    pub(super) async fn load_messages(
+        &self,
+        session_id: Uuid,
+        range: RowRange,
+    ) -> Result<Vec<StoredMessage>> {
+        Ok(self
+            .load_rows(session_id, range)
+            .await?
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect())
+    }
+
+    /// The id of the session's last log row, or `None` for a session with no rows.
+    pub(crate) async fn last_log_row(&self, session_id: Uuid) -> Result<Option<i64>> {
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.query_row(
+                    "SELECT MAX(id) FROM messages WHERE session_id = ?1",
+                    [session_id.to_string()],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to read the log's end: {error}")))
+    }
+
+    /// Up to `rows` rows of the log below `before` (from the end when `None`), oldest first, and
+    /// whether older rows remain. The session index serves the walk in row order, so a page costs
+    /// its rows however long the log is. A row this build cannot read is skipped with a warning,
+    /// as on every other read of the log.
+    pub(crate) async fn log_page_before(
+        &self,
+        session_id: Uuid,
+        before: Option<i64>,
+        rows: usize,
+    ) -> Result<LogPage> {
+        let fetch = i64::try_from(rows).unwrap_or(i64::MAX).saturating_add(1);
+        let stored = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(
+                    "SELECT id, kind, content, created_at, turn_id FROM messages \
+                     WHERE session_id = ?1 AND (?2 IS NULL OR id < ?2) \
+                     ORDER BY id DESC LIMIT ?3",
+                )?;
+                let found = statement
+                    .query_map(
+                        rusqlite::params![session_id.to_string(), before, fetch],
+                        stored_row_with_id,
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(found)
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to read a log page: {error}")))?;
+        Ok(log_page(stored, rows, true, &self.warned_rows))
+    }
+
+    /// The mirror of [`Self::log_page_before`]: up to `rows` rows above `after` and at or below
+    /// `through`, oldest first, and whether rows remain between the last one and `through`.
+    pub(crate) async fn log_page_after(
+        &self,
+        session_id: Uuid,
+        after: i64,
+        through: i64,
+        rows: usize,
+    ) -> Result<LogPage> {
+        let fetch = i64::try_from(rows).unwrap_or(i64::MAX).saturating_add(1);
+        let stored = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(
+                    "SELECT id, kind, content, created_at, turn_id FROM messages \
+                     WHERE session_id = ?1 AND id > ?2 AND id <= ?3 \
+                     ORDER BY id ASC LIMIT ?4",
+                )?;
+                let found = statement
+                    .query_map(
+                        rusqlite::params![session_id.to_string(), after, through, fetch],
+                        stored_row_with_id,
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(found)
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to read a log page: {error}")))?;
+        Ok(log_page(stored, rows, false, &self.warned_rows))
     }
 
     /// How many times this session has been compacted, i.e. its compaction *generation*.
@@ -2849,7 +3011,7 @@ impl Store {
     /// Read first, a row's level, directory or profile can move under another process between the
     /// read and the lock (`meka -r --profile`, a `PATCH` on a server sharing the store), and the
     /// new holder then runs on a snapshot nobody else agrees with. The door for every host that
-    /// makes a persisted session resident: a REPL or one-shot resume, `serve`'s re-attach,
+    /// makes a persisted session resident: a screen or one-shot resume, `serve`'s re-attach,
     /// ACP's `session/load` and `session/resume`. A host that refuses a sub-agent does so
     /// before this, on the spawn terms, which never move;
     /// `crate::host::refuse_a_spawned_session` says why that answer has to arrive ahead of
@@ -2924,12 +3086,12 @@ impl Store {
     /// another meka process currently has open.
     ///
     /// The lock check is not a nicety. `updated_at` is bumped by turns only, and resuming a session
-    /// does not touch it, so a REPL left sitting at its prompt past the window is a perfect
+    /// does not touch it, so a screen left sitting at its prompt past the window is a perfect
     /// candidate for deletion while a human is looking at it. Any start that goes through
     /// `async_main` runs this sweep, so without it a completely unrelated `meka` in another
     /// terminal destroys the live session and announces `deleted 1 session(s)`; the operator's
     /// next turn runs against the provider and *then* fails on a foreign-key violation, with the
-    /// answer paid for and lost, and every later turn in that REPL fails the same way.
+    /// answer paid for and lost, and every later turn in that screen fails the same way.
     ///
     /// A root is locked with every sub-agent under it, since the cascade takes them: a child
     /// spawned with `background: true` keeps its lock for as long as it runs, after its parent's
@@ -3301,7 +3463,7 @@ impl Store {
     /// or a sub-agent under it open. The door for a caller acting on a session it does not hold:
     /// `meka session delete`, and the servers' deletes of a session they have not loaded.
     ///
-    /// Without it, `meka session delete <id>` against a live REPL exits 0 having said nothing at
+    /// Without it, `meka session delete <id>` against a live screen exits 0 having said nothing at
     /// all (the count goes through `tracing::info!`, invisible at the default level) while the row
     /// and its messages cascade away underneath a conversation that carries on until its next turn
     /// fails on a foreign-key violation. The sub-agents are locked too, since the cascade takes
@@ -3383,6 +3545,81 @@ mod tests {
             .expect("create");
         store.save_message(id, "user", words).await.expect("seed");
         id
+    }
+
+    /// The log is read in pages from either end: a page from the end holds the last rows and
+    /// says older ones remain, the page below it continues where it left off, and the way back
+    /// up stops at the row it was bounded by.
+    #[tokio::test]
+    async fn the_log_is_read_in_pages_from_either_end() {
+        let store = Store::open(None, &migrations::Context::default())
+            .await
+            .expect("store");
+        let id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        for n in 1..=7 {
+            store
+                .save_message(id, "user", &format!("message {n}"))
+                .await
+                .expect("seed");
+        }
+        let words = |page: &LogPage| -> Vec<String> {
+            page.rows
+                .iter()
+                .map(|row| match &row.event {
+                    crate::conversation::Event::Append(message) => {
+                        message.text_content().to_string()
+                    }
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        };
+        let last = store.log_page_before(id, None, 3).await.expect("page");
+        assert_eq!(words(&last), vec!["message 5", "message 6", "message 7"]);
+        assert!(last.more);
+        let floor = last.rows[0].id;
+        let older = store
+            .log_page_before(id, Some(floor), 3)
+            .await
+            .expect("page");
+        assert_eq!(words(&older), vec!["message 2", "message 3", "message 4"]);
+        assert!(older.more);
+        let oldest = store
+            .log_page_before(id, Some(older.rows[0].id), 3)
+            .await
+            .expect("page");
+        assert_eq!(words(&oldest), vec!["message 1"]);
+        assert!(!oldest.more, "the start of the log");
+        let end = store.last_log_row(id).await.expect("end").expect("rows");
+        assert_eq!(end, last.rows[2].id);
+        let down = store
+            .log_page_after(id, older.rows[2].id, end, 2)
+            .await
+            .expect("page");
+        assert_eq!(words(&down), vec!["message 5", "message 6"]);
+        assert!(
+            down.more,
+            "one row is left below the page, within the bound"
+        );
+        let bounded = store
+            .log_page_after(id, older.rows[2].id, floor, 5)
+            .await
+            .expect("page");
+        assert_eq!(words(&bounded), vec!["message 5"]);
+        assert!(
+            !bounded.more,
+            "the bound is the row read through, not the log's end"
+        );
+        assert!(
+            store
+                .last_log_row(Uuid::new_v4())
+                .await
+                .expect("read")
+                .is_none(),
+            "a session with no rows has no end"
+        );
     }
 
     async fn row(store: &Store, id: Uuid) -> SessionSummary {
@@ -5994,6 +6231,67 @@ mod tests {
         assert_eq!(unnumbered.turns, 5);
     }
 
+    /// A row this build cannot read is said once, whichever reader meets it first: the screen's
+    /// page read and a resume's hydration share the record.
+    #[tokio::test]
+    async fn an_unreadable_row_is_warned_about_once_across_readers() {
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("failed to create session");
+        store
+            .save_message(session_id, "unknown_future_kind", "{}")
+            .await
+            .expect("seed");
+        let page = store
+            .log_page_before(session_id, None, 10)
+            .await
+            .expect("page");
+        assert!(page.rows.is_empty(), "the row is dropped: {page:#?}");
+        assert_eq!(
+            crate::sync::lock(&store.warned_rows).len(),
+            1,
+            "the page read said it"
+        );
+        let events = store.load_events(session_id).await.expect("events");
+        assert!(events.is_empty());
+        assert_eq!(
+            crate::sync::lock(&store.warned_rows).len(),
+            1,
+            "hydration met the row the page read had said"
+        );
+        // And the other way round: hydration first, then the page.
+        let other = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("failed to create session");
+        store
+            .save_message(other, "unknown_future_kind", "{}")
+            .await
+            .expect("seed");
+        store.load_events(other).await.expect("events");
+        assert_eq!(
+            crate::sync::lock(&store.warned_rows).len(),
+            2,
+            "hydration said it"
+        );
+        store.log_page_before(other, None, 10).await.expect("page");
+        assert_eq!(
+            crate::sync::lock(&store.warned_rows).len(),
+            2,
+            "the page read met the row hydration had said"
+        );
+    }
+
+    #[test]
+    fn a_row_is_warned_about_once() {
+        let warned = WarnedRows::default();
+        assert!(warn_once_about_row(&warned, 7, "x", None));
+        assert!(!warn_once_about_row(&warned, 7, "x", None));
+        assert!(warn_once_about_row(&warned, 8, "x", None));
+    }
+
     #[tokio::test]
     async fn save_and_load_messages() {
         let store = Store::for_test().await;
@@ -6138,11 +6436,11 @@ mod tests {
 
     /// A session another meka process has open is not one this process may delete.
     ///
-    /// `meka session delete <id>` against a live REPL exited 0 having said nothing at all: the
+    /// `meka session delete <id>` against a live screen exited 0 having said nothing at all: the
     /// count goes through `tracing::info!`, invisible at the default level. The row and its
     /// messages cascaded away underneath a conversation that carried on as though nothing had
     /// happened, until its next turn ran against the provider and *then* failed on a foreign-key
-    /// violation -- tokens spent, answer lost, and every later turn in that REPL failing the same
+    /// violation -- tokens spent, answer lost, and every later turn in that screen failing the same
     /// way with no recovery.
     #[tokio::test]
     async fn deleting_a_session_another_process_holds_is_refused() {
@@ -6227,7 +6525,7 @@ mod tests {
 
     /// The sweep that runs on every start, against a session someone is sitting in.
     ///
-    /// Only turns bump `updated_at` -- resuming does not touch it -- so a REPL left at its prompt
+    /// Only turns bump `updated_at` -- resuming does not touch it -- so a screen left at its prompt
     /// past the retention window looks expired while a human is looking at it. Any `meka` start
     /// that goes through `async_main` runs this sweep, so an unrelated invocation in another
     /// terminal announced `deleted 1 session(s)` and destroyed the live one.
@@ -7586,7 +7884,7 @@ mod tests {
     async fn session_metadata_round_trips() {
         let store = Store::for_test().await;
 
-        // The NULL shape the REPL and ACP get from `create_session_locked`, which they call with
+        // The NULL shape the screen and ACP get from `create_session_locked`, which they call with
         // permission, capabilities and token id all `None`: unset, so the re-attach helper falls
         // back to the process default.
         let plain = store

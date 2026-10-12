@@ -1,85 +1,9 @@
-//! Writing to the terminal: the two streams, the spacing state between writes, a reader that hung
-//! up, and the styled one-line notices.
+//! Writing to the terminal: the two streams, a reader that hung up, and the styled one-line
+//! notices.
 
 use super::*;
 use crate::streams::{write_stderr, write_stderr_line};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum LastOutput {
-    Nothing,
-    Prompt,
-    Text,
-    Thinking,
-    ToolIndicator,
-    /// A block that stands apart from whatever is around it: the checklist, a stage direction.
-    Standalone,
-}
-/// Tracks what was last printed to decide if a blank line is needed next.
-///
-/// `Copy` so [`crate::console`] can run a transition against a scratch copy and return both the
-/// blank line it implies and the state that follows, which is what lets the console's whole
-/// decision be a pure function a test can enumerate.
-#[derive(Clone, Copy)]
-pub(crate) struct OutputSpacing {
-    pub(super) last: LastOutput,
-}
-impl OutputSpacing {
-    pub(crate) fn new() -> Self {
-        Self {
-            last: LastOutput::Nothing,
-        }
-    }
-
-    /// Call before printing streamed text. Returns true if a blank line should be emitted first.
-    pub(crate) fn before_text(&mut self) -> bool {
-        let need_blank = matches!(
-            self.last,
-            LastOutput::ToolIndicator | LastOutput::Thinking | LastOutput::Standalone
-        );
-        self.last = LastOutput::Text;
-        need_blank
-    }
-
-    /// Call before printing a tool indicator. Returns true if a blank line should be emitted first.
-    ///
-    /// Two adjacent indicators normally sit flush, which is what makes a run of them read as a list
-    /// of steps. Under [`ToolParams::Full`] each one is a multi-line block instead, so flush means
-    /// the next `[tool ...]` header butts against the previous call's last argument and the two
-    /// read as one call with too many parameters.
-    pub(crate) fn before_tool_indicator(&mut self, params: ToolParams) -> bool {
-        let need_blank = match self.last {
-            LastOutput::Text | LastOutput::Thinking | LastOutput::Standalone => true,
-            LastOutput::ToolIndicator => params == ToolParams::Full,
-            LastOutput::Nothing | LastOutput::Prompt => false,
-        };
-        self.last = LastOutput::ToolIndicator;
-        need_blank
-    }
-
-    /// Call before printing a thinking block. Returns true if a blank line should be emitted first.
-    pub(crate) fn before_thinking(&mut self) -> bool {
-        let need_blank = matches!(
-            self.last,
-            LastOutput::Text | LastOutput::ToolIndicator | LastOutput::Standalone
-        );
-        self.last = LastOutput::Thinking;
-        need_blank
-    }
-
-    /// Call before printing a standalone block. Returns true if a blank line should be emitted
-    /// first: always, except at the top of the output or right under the prompt, whose own blank
-    /// the episode supplies.
-    pub(crate) fn before_standalone(&mut self) -> bool {
-        let need_blank = !matches!(self.last, LastOutput::Nothing | LastOutput::Prompt);
-        self.last = LastOutput::Standalone;
-        need_blank
-    }
-
-    /// Call after newline_after_prompt is printed.
-    pub(crate) fn after_prompt(&mut self) {
-        self.last = LastOutput::Prompt;
-    }
-}
 /// Write to stdout, returning a failure rather than panicking on it.
 ///
 /// `print!` and `println!` panic when the write fails, which is the wrong answer for the one stream
@@ -88,6 +12,9 @@ impl OutputSpacing {
 /// [`write_stdout_line`], which is what makes the `io::Result` its methods already return the truth
 /// about what reached the terminal rather than a formality.
 pub(crate) fn write_stdout(text: impl std::fmt::Display) -> io::Result<()> {
+    if crate::streams::captured(&text.to_string()) {
+        return Ok(());
+    }
     let mut out = io::stdout().lock();
     write!(out, "{text}")
         .and_then(|()| out.flush())
@@ -95,6 +22,9 @@ pub(crate) fn write_stdout(text: impl std::fmt::Display) -> io::Result<()> {
 }
 /// [`write_stdout`] plus the newline, without building a second string to hold it.
 pub(crate) fn write_stdout_line(line: impl std::fmt::Display) -> io::Result<()> {
+    if crate::streams::captured(&format!("{line}\n")) {
+        return Ok(());
+    }
     let mut out = io::stdout().lock();
     writeln!(out, "{line}")
         .and_then(|()| out.flush())
@@ -103,14 +33,14 @@ pub(crate) fn write_stdout_line(line: impl std::fmt::Display) -> io::Result<()> 
 /// Where a command's rendered output goes.
 ///
 /// The same table is data on one host and chrome on another: `meka memory list` is invoked for
-/// its table, so it belongs on stdout, while `/memory` inside the REPL is the user glancing at the
-/// UI, where stdout carries only the model's answers. The renderer takes the stream from its door
-/// rather than deciding, so one function serves both without a second copy of the rendering.
+/// its table, so it belongs on stdout, while `/memory` inside the screen is the user glancing at
+/// the UI, where stdout carries only the model's answers. The renderer takes the stream from its
+/// door rather than deciding, so one function serves both without a second copy of the rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stream {
     /// The data a command was invoked to obtain.
     Stdout,
-    /// Everything else, including a REPL slash command's output.
+    /// Everything else, including a screen slash command's output.
     Stderr,
 }
 
@@ -170,7 +100,7 @@ pub(super) fn reader_hung_up(error: io::Error) -> io::Error {
 /// to hang a flag on. Without this the correction is hundreds of identical lines, which buries the
 /// one that matters.
 ///
-/// Cleared by [`reset_lost_output_report`] when an episode opens, so a REPL that runs for hours
+/// Cleared by [`reset_lost_output_report`] when an episode opens, so a screen that runs for hours
 /// says it once per prompt rather than once ever.
 pub(super) static LOST_OUTPUT_REPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -181,7 +111,7 @@ pub(crate) fn reset_lost_output_report() {
 /// Whether this is the first report since the last reset, claiming the right to be it.
 ///
 /// Split from the static so a test can drive it with a latch of its own. The global one is cleared
-/// by `Console::open_episode`, which several other tests in this binary call, and a clear landing
+/// by `Console::start`, which several other tests in this binary call, and a clear landing
 /// between two reports made a test that used it flaky roughly once in four hundred runs.
 pub(super) fn claim_first_report(latch: &std::sync::atomic::AtomicBool) -> bool {
     !latch.swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -308,12 +238,6 @@ pub(crate) fn render_warning(message: &str) {
 /// Print a single-line CLI error to stderr in the project's standard format.
 pub(crate) fn render_error(error: &dyn std::fmt::Display) {
     write_stderr_line(format!("{} {}", "Error:".with(Color::Red), error));
-}
-/// The heading above a block of command output, in the color every other one uses.
-///
-/// Exists so the color is decided once rather than copied per heading.
-pub(crate) fn render_heading(heading: &str) {
-    write_stderr_line(heading.with(Color::Cyan));
 }
 /// A stage direction about the output rather than output of its own: `(interrupted)`.
 ///
@@ -483,12 +407,12 @@ mod tests {
     /// the first lost answer would otherwise be the only one mentioned. The repetition is real:
     /// `Console::text_delta` asks per streamed delta and history replay per replayed message.
     ///
-    /// Driven through a latch of this test's own, not the global. `Console::open_episode` clears
-    /// that one, several tests in this binary call it, and they run in parallel; asserting across
-    /// two reports on a shared flag is a race. What that leaves untested is the wiring -- that
-    /// `report_lost_output` reads the global and `open_episode` clears it -- which is two lines.
+    /// Driven through a latch of this test's own, not the global. `Console::start` clears that
+    /// one, several tests in this binary call it, and they run in parallel; asserting across two
+    /// reports on a shared flag is a race. What that leaves untested is the wiring -- that
+    /// `report_lost_output` reads the global and `start` clears it -- which is two lines.
     #[test]
-    fn a_lost_answer_is_named_once_until_the_next_episode() {
+    fn a_lost_answer_is_named_once_until_the_next_run() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let latch = AtomicBool::new(false);
@@ -503,32 +427,5 @@ mod tests {
             claim_first_report(&latch),
             "until an episode opens, which lets the next lost answer be named too"
         );
-    }
-
-    /// A run of one-line indicators reads as a list of steps, and spacing them out would stretch a
-    /// six-call turn down the screen for nothing.
-    #[test]
-    fn summary_indicators_stay_flush_with_each_other() {
-        let mut spacing = super::OutputSpacing::new();
-        assert!(!spacing.before_tool_indicator(ToolParams::Summary));
-        assert!(!spacing.before_tool_indicator(ToolParams::Summary));
-    }
-
-    /// Under `full` each indicator is a block, so flush would run the next `[tool ...]` header into
-    /// the previous call's last argument.
-    #[test]
-    fn full_indicators_are_separated_from_each_other() {
-        let mut spacing = super::OutputSpacing::new();
-        assert!(!spacing.before_tool_indicator(ToolParams::Full));
-        assert!(spacing.before_tool_indicator(ToolParams::Full));
-    }
-
-    #[test]
-    fn an_indicator_after_text_is_separated_whatever_the_style() {
-        for style in [ToolParams::Off, ToolParams::Summary, ToolParams::Full] {
-            let mut spacing = super::OutputSpacing::new();
-            spacing.before_text();
-            assert!(spacing.before_tool_indicator(style), "{}", style);
-        }
     }
 }

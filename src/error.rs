@@ -53,7 +53,7 @@ pub(crate) enum MekaError {
     /// is a refusal the caller can act on and every host relays it verbatim: a profile with no
     /// stored credential names the login that fixes it. This one names paths and endpoints out of
     /// `config.toml`, which are for the operator's terminal and not for a remote caller, so HTTP
-    /// answers a sanitized 500, ACP an `InternalError` without the text, and the REPL and CLI
+    /// answers a sanitized 500, ACP an `InternalError` without the text, and the screen and CLI
     /// print it. `crate::host::build_shared_deps` raises the web client's at startup, before any
     /// session exists.
     #[error("{0}")]
@@ -179,7 +179,7 @@ pub(crate) enum MekaError {
     /// MCP readiness gate rejected the turn: at least one server marked
     /// [`crate::config::McpServerConfig::required`] wasn't `Connected` within the configured
     /// grace period. Servers that aren't required never appear here. Turn contents haven't been
-    /// sent to the provider. The REPL catches this and loops back to the prompt; one-shot mode
+    /// sent to the provider. The screen catches this and loops back to the prompt; one-shot mode
     /// propagates to a non-zero process exit.
     #[error("mcp: {} server(s) not ready: {}", .servers.len(), .servers.iter().map(|(n, s)| format!("{n} ({s})")).collect::<Vec<_>>().join(", "))]
     McpTurnGated { servers: Vec<(String, String)> },

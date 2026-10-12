@@ -870,7 +870,7 @@ pub(super) enum FileRoute {
     /// The client serves this path. Reads see unsaved buffers, and writes land in the editor's
     /// document model where its buffer state and undo history stay coherent.
     Delegated,
-    /// No client delegate exists at all (the REPL, the HTTP server, a client without the `fs`
+    /// No client delegate exists at all (the screen, the HTTP server, a client without the `fs`
     /// capability). There is no editor view to diverge from, so nothing to disclose.
     Local,
     /// A client exists and was asked, and answered that it cannot serve this path. The call runs

@@ -51,13 +51,13 @@ The client advertises these in `InitializeRequest.clientCapabilities`; meka stas
 - **`_meta.terminal_output: true`**: the client renders agent-owned terminals, so `shell_execute` output is streamed into a real terminal instead of a code block. A *rendering* choice only: meka still spawns and sandboxes the process either way. Advertised by Zed; independent of the `terminal` capability above.
 - **`elicitation.form` / `elicitation.url`**: when an MCP server asks the user for input mid-tool-call, meka issues `elicitation/create` so the prompt renders in the editor. The two are advertised independently and checked separately: a server asking for a form when only `url` is advertised is declined rather than sent. Without the capability meka declines every elicitation, which is what it did unconditionally before. Elicitations raised inside a sub-agent forward to the parent session, like permission prompts.
 
-If the client omits a capability, the matching tool falls back to local syscalls; the user-visible behavior is the same as `meka` in the REPL.
+If the client omits a capability, the matching tool falls back to local syscalls; the user-visible behavior is the same as `meka` on the screen.
 
 ## Shell commands stay inside meka
 
 `shell_execute` never runs in the client's terminal, whatever the client advertises and whatever the permission level. meka spawns the process itself so everything it wraps a command in keeps applying: the sandbox that `read` and `workspace` depend on (Landlock / bwrap / sandbox-exec / restricted token), the environment scrub that keeps API keys out of the child, the per-session cwd from `/cd`, the timeout, and the process-group kill that reaches backgrounded grandchildren. The client's `terminal/*` offers none of that.
 
-meka used to delegate in any level other than `read`, which made every sandboxed level a bypass: meka would refuse to run at all when no sandbox backend was available, then hand the same command to an unsandboxed editor terminal. Delegation is gone rather than narrowed, so `workspace` keeps its boundary here exactly as it does in the REPL.
+meka used to delegate in any level other than `read`, which made every sandboxed level a bypass: meka would refuse to run at all when no sandbox backend was available, then hand the same command to an unsandboxed editor terminal. Delegation is gone rather than narrowed, so `workspace` keeps its boundary here exactly as it does on the screen.
 
 ### Live output
 
@@ -86,7 +86,7 @@ One case can't honor that: a client advertising `fs.readTextFile` but not `fs.wr
 
 ## Session lifecycle
 
-meka holds an in-memory map of `sessionId → SessionEntry`. Any number of sessions can coexist in one `meka acp` process, each with its own cwd, permission level, conversation, cancellation token, and per-session runtime mutex. Prompts on different sessions run in parallel; a second `session/prompt` for a session that already has one in flight is refused with `InvalidParams`. The session row is also locked on disk (the same lock the REPL uses), so two `meka` processes can't simultaneously write events for the same session id.
+meka holds an in-memory map of `sessionId → SessionEntry`. Any number of sessions can coexist in one `meka acp` process, each with its own cwd, permission level, conversation, cancellation token, and per-session runtime mutex. Prompts on different sessions run in parallel; a second `session/prompt` for a session that already has one in flight is refused with `InvalidParams`. The session row is also locked on disk (the same lock the screen uses), so two `meka` processes can't simultaneously write events for the same session id.
 
 An unknown `sessionId`, a session another meka process holds, a sub-agent's id, a turn over the profile's `max_request_bytes` and a profile `config.toml` no longer has are all refused with `InvalidParams`; `InternalError` is reserved for faults in meka or below it.
 
@@ -96,7 +96,7 @@ What an `InternalError`'s `data` carries follows the same policy the HTTP API ap
 - An MCP server's connection reason never travels. The server *names* do, since that is the part to act on; the reason is meka's own subprocess text and has carried a command line and its path.
 - A store or filesystem failure, and a `[web]`/`base_url` misconfiguration, never travel: they name meka's own directories or the operator's config. `data` says where the detail went.
 
-- **`session/new { cwd, mcpServers }`**: mints a fresh persisted session, captures the cwd, takes the on-disk session lock, returns the session id and the current `SessionMode` state. `mcpServers` is ignored, with a warning naming how many entries were dropped; meka's servers come from `config.toml`. On this and every other door, `cwd` must be an existing directory and is recorded in its canonical spelling (symlinks resolved), the rule the REPL's `/cd` and the HTTP API apply too; anything else is `InvalidParams`.
+- **`session/new { cwd, mcpServers }`**: mints a fresh persisted session, captures the cwd, takes the on-disk session lock, returns the session id and the current `SessionMode` state. `mcpServers` is ignored, with a warning naming how many entries were dropped; meka's servers come from `config.toml`. On this and every other door, `cwd` must be an existing directory and is recorded in its canonical spelling (symlinks resolved), the rule the screen's `/cd` and the HTTP API apply too; anything else is `InvalidParams`.
 - **`session/load { sessionId, cwd, mcpServers }`**: replays the persisted conversation as a stream of `session/update` notifications (`user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`) before the response. Orphan tool calls (the persisted log stopped mid-tool) are closed out with a `failed` status so the client's UI doesn't render a stuck spinner. If the client's `cwd` differs from the persisted one, meka updates the persisted row to match; the client wins, but only once the session has actually opened, so a load meka refuses (a sub-agent's id, a profile that has left `config.toml`, an account with no stored credential) leaves the session's recorded directory and roots exactly as they were. `mcpServers` is ignored silently here and on `session/resume`. A sub-agent's id is refused with `InvalidParams` before the session is locked; continue that conversation with `agent_followup` from the parent instead.
 - **`session/list { cwd?, cursor? }`**: paginated index. Filtered to the requested cwd when present, compared in the canonical spelling every session records; sub-agent sessions are always hidden. `nextCursor` is opaque; round-trip it back to keep paging.
 - **`session/resume { sessionId, cwd, mcpServers }`**: adopts the session id without replaying. Use this when the client already has the history rendered. Same cwd-update behavior as `session/load`, including that a refused resume writes nothing. A sub-agent's id is refused on the same terms as `session/load`.
@@ -141,7 +141,7 @@ While the turn runs, meka streams `session/update` notifications:
 
 - `agent_message_chunk` for each piece of assistant text.
 - `agent_thought_chunk` for thinking blocks (Claude OAuth / extended-thinking models).
-- `tool_call` when a tool starts, with `kind`, `status: "in_progress"`, an absolute `locations` array (relative paths resolved against the session cwd, with the start line for `file_read`), the raw input, and a human-readable `title`. The title is the tool's name followed by its primary argument, the same words the REPL's `[tool ...]` indicator uses, so editors show what's running rather than the bare tool name: `file_read <path>` / `file_edit <path>` / `file_write <path>`, `web_fetch <url>`, and the same under an MCP tool's own name. `shell_execute` is the exception: its title is the command itself, whole and with its line breaks, because a client renders an `execute` call's title as the command (Zed shows it in the terminal card and copies it from there, and shows no `rawInput` for that kind). This is also what claude-agent-acp sends.
+- `tool_call` when a tool starts, with `kind`, `status: "in_progress"`, an absolute `locations` array (relative paths resolved against the session cwd, with the start line for `file_read`), the raw input, and a human-readable `title`. The title is the tool's name followed by its primary argument, the same words the screen's tool call row uses, so editors show what's running rather than the bare tool name: `file_read <path>` / `file_edit <path>` / `file_write <path>`, `web_fetch <url>`, and the same under an MCP tool's own name. `shell_execute` is the exception: its title is the command itself, whole and with its line breaks, because a client renders an `execute` call's title as the command (Zed shows it in the terminal card and copies it from there, and shows no `rawInput` for that kind). This is also what claude-agent-acp sends.
 - `tool_call_update` when a tool finishes, with the final `status` (`completed` / `failed`), a `content` array, and `raw_output` (the structured tool result). `shell_execute` output is wrapped in a fenced `console` code block so editors render it monospaced; `file_edit` and `file_write` populate diff content blocks so clients can render the apply-diff UI. (Large outputs offloaded to the scratchpad show the scratchpad reference rather than the full payload.)
 - `plan` whenever a `checklist_add` or `checklist_edit` call changes the [checklist](checklist.md), so clients with a plan panel (e.g. Zed) render the open items. A deferred item is `pending` there, with what it waits on in its text; an emptied list is an empty plan.
 - `session_info_update` once per session, carrying the title (the first user message's words, cut to 80 characters) so a freshly created or loaded tab gets a label without a `session/list` call.
@@ -219,7 +219,7 @@ with `meka -r <id> --profile <name>` from a shell, and load it again.
 
 Changing `profile` rewrites the session's row, so it holds for every later turn and for a resume
 from any surface, not just for this connection. This is the same change `/profile` makes in the
-REPL and `PATCH /v1/sessions/{id}` makes over HTTP. Switching mid-conversation is allowed and is
+screen and `PATCH /v1/sessions/{id}` makes over HTTP. Switching mid-conversation is allowed and is
 your call: a thinking block is tagged with the backend that produced it and is not replayed to a
 different one, so from the next turn the model no longer sees the reasoning recorded under the old
 profile.
@@ -234,14 +234,14 @@ it. It stays on the profile.
 
 Two kinds of slash command are advertised through `session/update: available_commands_update` (after `session/new` / `session/load` / `session/resume` / `session/fork`, and refreshed at the top of every `session/prompt` so a skill installed mid-session shows up without a reconnect):
 
-- **Built-in local commands**: `/status` (the permission level, then the REPL's block: profile, model, context usage, effort, thinking, compaction count, cumulative tokens), `/mcp` (configured MCP servers and their connection status) and `/usage` (the account's rate-limit windows, subscription backends only). They render text back as an `agent_message_chunk` and end the turn immediately, with no model call.
+- **Built-in local commands**: `/status` (the permission level, then the screen's block: profile, model, context usage, effort, thinking, compaction count, cumulative tokens), `/mcp` (configured MCP servers and their connection status) and `/usage` (the account's rate-limit windows, subscription backends only). They render text back as an `agent_message_chunk` and end the turn immediately, with no model call.
 - **Skills** (see [Skills](./skills.md)): each installed skill is a top-level command carrying a free-form input hint (`"additional context (optional)"`).
 
 When the user picks one from the palette, the client typically inserts `/<name> ` and lets the user type extra context. meka parses the prompt as follows:
 
 - A built-in local command (`/status`, `/mcp`, `/usage`): handled agent-side, output streamed back, turn ends with no model call. Checked first, so a skill can't shadow a built-in (a skill named `status`, `mcp` or `usage` is dropped from the palette).
 - Plain text (no leading slash): passes through to the model unchanged.
-- `/<skill-name>` matching an installed skill: loads the skill body via the same path as the REPL's `/skill` command and prepends any extra context the user typed.
+- `/<skill-name>` matching an installed skill: loads the skill body via the same path as the screen's `/skill` command and prepends any extra context the user typed.
 - Slash with a syntactically valid but unknown skill name (`/nonexistent`): passes through to the model unchanged, with a `debug` log. The filter false-positives on pasted text like `/usr local lib`, so a miss is read as "not a skill invocation after all" and the model can say it does not know the command. Only a skill that exists but cannot be read is an error (`InternalError`).
 - Slash with content that isn't a valid skill identifier (`/etc/hosts`, `//comment`): passes through to the model unchanged, so pasted paths and code comments don't get intercepted.
 

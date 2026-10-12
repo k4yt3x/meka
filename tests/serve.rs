@@ -610,8 +610,8 @@ fn fork_copies_the_conversation_into_a_new_session() {
 }
 
 /// The level and the approvals switch are the brake a person reaches for while the agent is
-/// working, so they land during the turn, as the REPL's Shift+Tab and ACP's `session/set_mode` do.
-/// The working directory is snapshotted when a turn opens, so a body naming it still waits.
+/// working, so they land during the turn, as the screen's Shift+Tab and ACP's `session/set_mode`
+/// do. The working directory is snapshotted when a turn opens, so a body naming it still waits.
 #[test]
 fn the_level_and_approvals_change_under_a_running_turn() {
     let script = serde_json::json!([
@@ -4859,7 +4859,7 @@ fn a_turn_naming_a_broken_skill_says_why_rather_than_unknown() {
 }
 
 /// A skill invoked with no message runs the skill body alone, the way `--skill` with no prompt and
-/// the REPL's `/skill` do, rather than being refused as an empty turn or sent under a blank line.
+/// the screen's `/skill` do, rather than being refused as an empty turn or sent under a blank line.
 #[test]
 fn a_turn_naming_a_skill_with_no_message_runs_the_skill_body_alone() {
     let harness =
@@ -15044,7 +15044,7 @@ fn a_relayed_upstream_body_is_size_bounded() {
 /// A due item on a session another process holds is put off, not asked about in a loop. The
 /// sweeper wakes itself whenever due items remain after a pass, so a driver that returned with
 /// them still due would be spawned again at once, probe the lock, and return, for as long as the
-/// holder kept the session: a REPL open beside `serve`, after a restart left items pending.
+/// holder kept the session: a screen open beside `serve`, after a restart left items pending.
 #[test]
 fn an_item_on_a_session_another_process_holds_waits_instead_of_spinning() {
     let harness = ServeTestHarness::spawn_with(
@@ -15188,7 +15188,7 @@ fn user_texts(harness: &ServeTestHarness, id: &str) -> Vec<String> {
         .collect()
 }
 
-/// A failed turn keeps the message that was sent, as the REPL keeps a prompt whose turn failed:
+/// A failed turn keeps the message that was sent, as the screen keeps a prompt whose turn failed:
 /// the person who typed it can see it and expects the agent to have it. A client that resends
 /// instead says so per turn, and then a turn that produced nothing leaves nothing for the resend to
 /// duplicate.

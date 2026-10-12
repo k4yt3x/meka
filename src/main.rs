@@ -2,7 +2,7 @@
 //! and an LLM-backed agent decides which tools to run.
 //!
 //! The binary wires together: a [`provider`] (Claude or OpenAI), a [`session`] store backed by
-//! SQLite, a [`tools`] registry, an MCP client manager, and a [`host::repl`] input loop. The
+//! SQLite, a [`tools`] registry, an MCP client manager, and a [`host::tui`] screen. The
 //! [`agent`] module owns the per-turn loop that streams provider output and dispatches tool calls.
 
 // A test panics on failure by design, so the `[lints.clippy]` panic lints in `Cargo.toml` are
@@ -95,15 +95,25 @@ fn main() -> anyhow::Result<()> {
         2 => "debug",
         _ => "trace",
     };
-    // Route tracing through `relay::RELAY` so the REPL can later install a reedline
-    // `ExternalPrinter` and have warnings printed *above* the live prompt instead of racing
-    // reedline's redraw. Without a printer installed (non-interactive subcommands, pre-REPL startup
-    // window) the relay falls back to plain stderr.
+    // Route tracing through `relay::RELAY` so the screen can later install its channel and show
+    // log lines as items rather than have them painted over. Without one installed
+    // (non-interactive subcommands, the startup window) the relay is a plain stderr writer; the
+    // screen's layer hands it each event's level and message instead of the formatted line.
     let rust_log = std::env::var("RUST_LOG").ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(build_log_filter(rust_log.as_deref(), log_level))
-        .with_writer(relay::RELAY.clone())
-        .init();
+    {
+        use tracing_subscriber::{Layer as _, layer::SubscriberExt, util::SubscriberInitExt};
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(relay::RELAY.clone())
+                    .with_filter(build_log_filter(rust_log.as_deref(), log_level)),
+            )
+            .with(
+                relay::ScreenLayer::new(build_log_filter(rust_log.as_deref(), log_level))
+                    .with_filter(build_screen_log_filter(rust_log.as_deref(), log_level)),
+            )
+            .init();
+    }
 
     // Multi-threaded, and one caller depends on that rather than merely preferring it:
     // `GateToolset::resolve` answers a scheduled gate's authority question synchronously and blocks
@@ -335,9 +345,10 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
     let mut config = ResolvedConfig::resolve(cli.overrides());
 
     // If --skill is set, validate and render the body upfront so an invalid name fails fast
-    // before any session/MCP setup. The combined string (extra + body, mirroring the REPL's `/skill
-    // <name> [extra...]`) then takes the place of cli.prompt as the first-turn input. Resolved
-    // config comes first because `[skills] extra_paths` decides which roots the lookup sees.
+    // before any session/MCP setup. The combined string (extra + body, mirroring the screen's
+    // `/skill <name> [extra...]`) then takes the place of cli.prompt as the first-turn input.
+    // Resolved config comes first because `[skills] extra_paths` decides which roots the lookup
+    // sees.
     let skill_prompt = runtime.block_on(host::build_skill_prompt(
         cli.skill.as_deref(),
         cli.prompt.as_deref(),
@@ -353,8 +364,9 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         config.request.serve_bind_override = Some(bind.clone());
     }
     // Before anything renders. The renderers read this rather than taking it as a parameter because
-    // the approval prompt sits several call sites below `run_repl`, which takes flat scalars; the
-    // functions that compose a line still take an explicit width, so tests never touch it.
+    // the one-shot's approval refusal sits several call sites below `run_oneshot`, which takes flat
+    // scalars; the functions that compose a line still take an explicit width, so tests never
+    // touch it.
     render::set_max_width(config.max_width);
     runtime.block_on(async_main(config, acp_mode, serve_mode))
 }
@@ -400,6 +412,26 @@ fn build_log_filter(rust_log: Option<&str>, log_level: &str) -> tracing_subscrib
         .add_directive(worker)
 }
 
+/// What the screen keeps for `/log`: everything the user asked to see, and at least `info` from
+/// everywhere and `debug` from meka's own modules, so the pane has the lines a `-v` would have
+/// shown without a restart. Added after the user's directives, so a more specific one of theirs
+/// still wins for its target.
+fn build_screen_log_filter(
+    rust_log: Option<&str>,
+    log_level: &str,
+) -> tracing_subscriber::EnvFilter {
+    let mut filter = build_log_filter(rust_log, log_level);
+    for directive in ["info", "meka=debug"] {
+        #[allow(
+            clippy::expect_used,
+            reason = "a compile-time literal in a known-good shape"
+        )]
+        let directive = directive.parse().expect("valid tracing directive");
+        filter = filter.add_directive(directive);
+    }
+    filter
+}
+
 async fn async_main(
     config: ResolvedConfig,
     acp_mode: bool,
@@ -420,7 +452,7 @@ async fn async_main(
     let token_store = store.token_store();
 
     // The long-lived hosts sweep here: neither resumes one particular session at startup, so there
-    // is no target to protect. The REPL and `--oneshot` sweep only once `resolve_session_resume`
+    // is no target to protect. The screen and `--oneshot` sweep only once `resolve_session_resume`
     // holds the lock on the session they were asked for; see `sweep_expired_sessions`.
     if serve_mode || acp_mode {
         host::sweep_expired_sessions(&config, &store).await?;
@@ -444,7 +476,7 @@ async fn async_main(
 
     // `meka acp` and `meka serve` reuse every step above (credential resolution, MCP setup,
     // session-manager housekeeping) and then enter their respective transport loops instead of
-    // the REPL.
+    // the screen.
     if serve_mode {
         #[cfg(feature = "serve")]
         return host::http::run_serve(config, store, mcp_manager).await;
@@ -468,7 +500,7 @@ async fn async_main(
     }
 
     let initial_prompt = config.request.prompt.clone();
-    host::repl::run_interactive(config, store, token_store, initial_prompt, mcp_manager).await
+    host::tui::run_interactive(config, store, token_store, initial_prompt, mcp_manager).await
 }
 
 #[cfg(test)]

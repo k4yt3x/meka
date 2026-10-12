@@ -3,7 +3,7 @@
 //! specification; this module owns the implementation.
 //!
 //! The HTTP transport is a third [`crate::frontend::Frontend`] impl alongside
-//! [`crate::host::repl::frontend::ReplFrontend`] and [`crate::host::acp::frontend::AcpFrontend`].
+//! [`crate::host::tui::frontend::TuiFrontend`] and [`crate::host::acp::frontend::AcpFrontend`].
 //! The agent core, MCP plumbing, session DB, permission model, and tool dispatch are all reused
 //! unchanged.
 

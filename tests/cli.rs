@@ -1159,7 +1159,7 @@ fn an_interrupted_oneshot_run_exits_130_and_keeps_what_streamed() {
     assert_eq!(
         status.code(),
         Some(130),
-        "an interrupted run exits like an interrupted REPL: {chrome}"
+        "an interrupted run exits like an interrupted screen: {chrome}"
     );
     assert!(chrome.contains("(interrupted)"), "{chrome}");
     assert!(
@@ -1329,7 +1329,7 @@ fn a_json_oneshot_run_prints_the_new_session_id_on_stderr_when_asked() {
     let id = only_session(&install);
     assert!(
         stderr.contains("Creating new session") && stderr.contains(&id),
-        "the id line is printed as the REPL prints it: {stderr:?}"
+        "the id line is printed as the screen shows it: {stderr:?}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
@@ -1850,7 +1850,7 @@ fn a_resumed_session_falls_back_when_its_recorded_directory_is_gone() {
 /// An interactive host that rendered the refusal and returned `Ok(())` would make `meka -r <id>;
 /// echo $?` say `0` for a session it refused to open, and every supervisor and wrapper script would
 /// read that as success. `--oneshot` on the same session, and a fresh session with an unresolvable
-/// `default_profile` in either host, exit 1; the resume path in the REPL host must too.
+/// `default_profile` in either host, exit 1; the resume path in the screen host must too.
 #[test]
 fn resuming_a_session_whose_profile_is_gone_exits_nonzero() {
     let install = Install::new();
@@ -2384,10 +2384,10 @@ fn a_sub_agent_bounded_by_writable_roots_writes_only_there() {
 /// `meka -r <worker-id>` refuses, on the CLI door the HTTP test cannot reach.
 ///
 /// The sibling of `tests/serve.rs`'s `a_worker_session_refuses_a_turn_posted_straight_at_it`, and
-/// not redundant with it: that one covers `build_session_agent`, while the REPL and `--oneshot` go
-/// through `create_agent_from_config`. Two call sites, and deleting the guard from *this* one left
-/// the whole suite green -- which is the untested-wiring shape the sub-agent refusal was added to
-/// close in the first place.
+/// not redundant with it: that one covers `build_session_agent`, while the screen and `--oneshot`
+/// go through `create_agent_from_config`. Two call sites, and deleting the guard from *this* one
+/// left the whole suite green -- which is the untested-wiring shape the sub-agent refusal was added
+/// to close in the first place.
 ///
 /// The worker is spawned for real, because the id has to come from where a user's would: a listing.
 /// Fabricating a row with a `parent_session_id` would test the predicate again rather than the
@@ -2451,7 +2451,7 @@ fn a_worker_session_refuses_a_resume_from_the_command_line() {
     let stderr = String::from_utf8_lossy(&interactive.stderr);
     assert!(
         stderr.contains("agent_followup"),
-        "the REPL host refuses a worker by the same rule: {stderr}"
+        "the screen host refuses a worker by the same rule: {stderr}"
     );
     assert!(
         !stderr.contains("meka profile add"),
@@ -2506,7 +2506,7 @@ fn a_worker_session_refuses_a_resume_from_the_command_line() {
     let repinned = run_scripted(&install, &["--profile", "second", "-r", &worker]);
     assert!(
         !repinned.status.success(),
-        "the REPL host refuses it too: {}",
+        "the screen host refuses it too: {}",
         String::from_utf8_lossy(&repinned.stderr)
     );
     assert_eq!(
@@ -2542,7 +2542,7 @@ fn a_worker_session_refuses_a_resume_from_the_command_line() {
 
 /// A one-shot run carries an outcome that was waiting, and prints one that lands during it.
 ///
-/// `--oneshot` is the fourth host and the one it is easiest to forget: it has no REPL loop, no
+/// `--oneshot` is the fourth host and the one it is easiest to forget: it has no screen loop, no
 /// poller and exactly one turn. A resume inherits whatever the last process left undelivered -- a
 /// cancellation, or a task the session-load sweep retires as `interrupted` -- and without the fold
 /// that report reached nobody until the run was already over.

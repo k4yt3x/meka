@@ -409,10 +409,11 @@ pub(crate) async fn run_acp(
                         return responder.respond_with_error(acp_error_for(&error, false));
                     }
 
-                    // The lock taken above, which a second `meka acp` process (or a REPL) needs to
-                    // be unable to take. `None` means the claim could not be made at all -- an
-                    // unwritable lock directory -- and an editor session that cannot be held alone
-                    // is one this host must not open.
+                    // The lock taken above, which a second `meka acp` process (or a screen) needs
+                    // to be unable to take. `None` means the claim could not be
+                    // made at all -- an unwritable lock directory -- and an
+                    // editor session that cannot be held alone is one this host
+                    // must not open.
                     let session_lock = match session_lock {
                         Ok(lock) => lock,
                         Err(error) => {
@@ -1070,7 +1071,7 @@ mod tests {
         assert!(matches!(blocks[0], ToolCallContent::Diff(_)));
     }
 
-    /// The title opens with the tool's name, the one the REPL's indicator and approval prompt
+    /// The title opens with the tool's name, the one the screen's indicator and approval prompt
     /// show, so a user reading both surfaces meets one vocabulary; the argument follows it.
     #[test]
     fn tool_call_title_per_tool() {

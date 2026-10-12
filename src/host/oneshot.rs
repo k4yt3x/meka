@@ -1,5 +1,7 @@
 //! The `--oneshot` host: one turn, printed, and out.
 
+pub(crate) mod frontend;
+
 use super::{terminal::*, *};
 
 /// The frontend a `--format json` run drives: nothing reaches stdout during the turn, and what the
@@ -18,7 +20,7 @@ struct JsonFrontend {
 #[async_trait::async_trait]
 impl crate::frontend::Frontend for JsonFrontend {
     async fn emit(&self, event: crate::frontend::FrontendEvent) {
-        // Printed as the REPL frontend prints it, on stderr through the console, so the setting
+        // Printed as the screen frontend prints it, on stderr through the console, so the setting
         // holds under `--format json` too and a run that never reaches its report has still said
         // which session it made. Stdout stays the report's alone.
         if let crate::frontend::FrontendEvent::SessionStarted { id } = &event
@@ -159,22 +161,20 @@ pub(crate) async fn run_oneshot(
     // created a session row, taken a lock or swept anything on the way to saying so. The outcomes
     // it carries ride on it once the session is known.
     let input = crate::agent::TurnInput::from_parts(prompt, Vec::new())?;
-    // Oneshot has no REPL, so approval requests can't reach a human. The channel below is
-    // intentionally disconnected on the receiver side: `ReplFrontend::request_permission`'s `send`
-    // will fail, the call is denied, and a notice on the console says which tool was refused.
-    let (noninteractive_sender, _) =
-        std::sync::mpsc::channel::<crate::host::repl::editor::AgentToReplEvent>();
     // One episode for the whole run. Oneshot draws no prompt, so there is no line above to space
     // away from and no prompt below to space towards: both blanks are configured off here rather
     // than left to a bracket that would have nothing to bracket against. What the console still
     // buys is the rest of it -- one owner for the streaming renderer, and the row-settling that
     // keeps a turn's last paragraph off an MCP progress line.
+    // Rendered for a terminal, the source as written for a pipe: a script wants the words, and
+    // the escapes a rendering carries would land in whatever reads them.
+    let render_mode = if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        crate::config::RenderMode::Termimad
+    } else {
+        crate::config::RenderMode::Raw
+    };
     let console = Arc::new(std::sync::Mutex::new(crate::console::Console::new(
-        crate::console::Spacing {
-            newline_before_prompt: false,
-            newline_after_prompt: false,
-        },
-        config.render_mode,
+        render_mode,
     )));
     // Before the first thing that logs. Off-prompt, `tracing` writes straight to stderr, and the
     // row it lands on may be one the console intends to erase; giving the relay this handle is what
@@ -195,14 +195,13 @@ pub(crate) async fn run_oneshot(
     });
     let oneshot_frontend: Arc<dyn crate::frontend::Frontend> = match &json_frontend {
         Some(frontend) => Arc::clone(frontend) as Arc<dyn crate::frontend::Frontend>,
-        None => Arc::new(crate::host::repl::frontend::ReplFrontend::new(
-            crate::host::repl::frontend::ReplFrontendConfig {
+        None => Arc::new(frontend::PlainFrontend::new(
+            frontend::PlainFrontendConfig {
                 console: Arc::clone(&console),
                 show_session_id_on_create: config.show_session_id_on_create,
                 show_token_usage: config.show_token_usage,
                 thinking_show_content: config.thinking_show_content,
                 tool_params: config.tool_params,
-                agent_event_sender: noninteractive_sender,
             },
         )),
     };
@@ -213,6 +212,10 @@ pub(crate) async fn run_oneshot(
     // Resolved before the agent is built, not after: which session this is decides which provider
     // profile the agent runs on, which level it runs at and which directory it opens in, and the
     // agent carries all three.
+    // A pick needs the screen; a scripted run has to say which session it means.
+    if config.request.session_resume == Some(crate::config::SessionResume::Pick) {
+        anyhow::bail!("`--oneshot` cannot pick a session; name one with `-r <SESSION>`");
+    }
     let ResumedSession {
         mut session_id,
         mut messages,
@@ -222,14 +225,19 @@ pub(crate) async fn run_oneshot(
         repin,
         permission_to_record,
         cwd: recorded_cwd,
-        follows,
-    } = resolve_session_resume(&store, &config, &console).await?;
-    // The run's one episode, opened after the resume for the reason the REPL's first is: what it
-    // follows is the banner when one printed.
+        announce,
+    } = resolve_session_resume(&store, &config).await?;
+    // The run's output starts after the resume, so the banner is its first block and what follows
+    // is set off from it like every block from the one above.
     with_console(&console, |console| {
-        console.open_episode(crate::console::RowState::Empty, follows)
+        console.start(crate::console::RowState::Empty)
     });
-    let _last_episode = LastEpisode(Arc::clone(&console));
+    let _finish = FinishConsole(Arc::clone(&console));
+    if let Some(id) = announce {
+        with_console(&console, |console| {
+            console.session_id("Resuming session", &id.to_string())
+        });
+    }
     // After the resume, whose lock is what spares the session this run was asked for.
     sweep_expired_sessions(&config, &store).await?;
 
@@ -287,7 +295,20 @@ pub(crate) async fn run_oneshot(
     // After the agent, so a start the builder refused leaves the row at the level it had.
     record_resume_permission(&store, session_id, permission_to_record).await;
     let cancel = crate::host::CancelCell::default();
-    install_interrupt_handler(cancel.clone(), &agent, Arc::clone(&console));
+    install_interrupt_handler(
+        cancel.clone(),
+        &agent,
+        {
+            let console = Arc::clone(&console);
+            move |note: &str| with_console(&console, |console| console.annotation(note))
+        },
+        || {
+            // Exits from inside the listener's task, so it never reaches the funnel in `main`
+            // and has to release the grants itself.
+            crate::sandbox::release_process_grants();
+            std::process::exit(130);
+        },
+    );
     // Admitted before the outcome claim below, which can wait on the MCP servers: a Ctrl+C in
     // that window has to reach the turn rather than be lost to an epoch sampled after it.
     let admission = cancel.admit();
@@ -336,9 +357,10 @@ pub(crate) async fn run_oneshot(
         Err(error) => (Some(error), None),
     };
     let interrupted = matches!(turn_error, Some(crate::error::MekaError::Interrupted));
-    // Closed whichever way the turn went, so a turn that streamed a partial answer and then failed
-    // still shows what it streamed. `TurnFinished` closes the happy path; nothing closed this one.
-    close_console_episode(&console);
+    // Finished whichever way the turn went, so a turn that streamed a partial answer and then
+    // failed still shows what it streamed. `TurnFinished` closes the happy path; nothing closed
+    // this one.
+    finish_console(&console);
     // The report goes out for a turn that ended, whichever way, an interrupt included: its
     // `stop_reason` says so, and the exit code says so again. A failed turn is reported on stderr
     // and by the exit code alone, because an object beside it would read as an answer.
@@ -366,9 +388,10 @@ pub(crate) async fn run_oneshot(
                 "waiting for {outstanding} background task(s) before exiting; a one-shot run has no \
                  later turn to report them in"
             );
-            // Raced against Ctrl+C: a one-shot has no REPL loop and no per-turn signal listener by
-            // this point, so an unbounded await would ignore the key for as long as a task ran. The
-            // outcomes collected just below still report whatever did finish.
+            // Raced against Ctrl+C: a one-shot has no screen loop and no per-turn signal listener
+            // by this point, so an unbounded await would ignore the key for as long as
+            // a task ran. The outcomes collected just below still report whatever did
+            // finish.
             let tasks = agent.background_tasks();
             tokio::select! {
                 _ = tasks.wait_for_session(id) => {}
@@ -393,14 +416,9 @@ pub(crate) async fn run_oneshot(
         if !outcomes.is_empty() {
             // Printed rather than delivered as a turn: the agent's answer has already been given
             // and the process is on its way out, so this is for the human reading the output.
-            //
-            // Through the console, which owns every row this run writes; spacing is off here, so
-            // the leading blank is this block's own. Nothing in a one-shot leaves a transient row
-            // to settle today (MCP progress is dropped for want of a REPL to draw it), so this is
-            // the module's one-owner rule rather than a fix for a reachable glitch.
+            // Through the console, which owns every row this run writes and the blank above each.
             with_console(&console, |console| {
                 console.chrome(|| {
-                    crate::streams::write_stderr_line("");
                     crate::streams::write_stderr(crate::background::render_outcomes(&outcomes));
                 })
             });
@@ -415,7 +433,7 @@ pub(crate) async fn run_oneshot(
         });
     }
 
-    // The release the REPL makes on its way out, on every exit here too: without it a Ctrl+C
+    // The release the screen makes on its way out, on every exit here too: without it a Ctrl+C
     // during the wait above leaves the tasks it was waiting on running untracked, with their rows
     // saying `running` until a later open sweeps them. It also detaches the registry this path
     // attached to the manager when the agent was built, rather than leaving the cycle for the
@@ -429,7 +447,7 @@ pub(crate) async fn run_oneshot(
                 if stopped == 1 { "" } else { "s" }
             ))
         });
-        // Waited for, not just signaled, for the reason the REPL gives: the process leaves
+        // Waited for, not just signaled, for the reason the screen gives: the process leaves
         // through `exit` right after this, which polls no task again, so a cancel alone would
         // kill nothing. Bounded, since canceling only asks.
         if let Some(id) = session_id
