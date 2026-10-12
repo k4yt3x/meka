@@ -1049,7 +1049,8 @@ fn esc_stops_a_running_shell_command() {
 
 /// The terminal going away is a hangup: the screen leaves the way it does on a key, so the
 /// `!command` it was running dies with it rather than being left behind, and the process ends on
-/// its own exit rather than aborting on the dead terminal.
+/// its own exit, the interrupted one, rather than aborting on the dead terminal; whichever of
+/// the signal and the dead read notices first.
 #[test]
 fn a_hangup_kills_the_running_command_and_leaves() {
     let install = screen_install("read", "", "");

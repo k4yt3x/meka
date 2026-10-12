@@ -3123,11 +3123,15 @@ pub(crate) async fn run_screen(launch: ScreenLaunch) -> anyhow::Result<()> {
                 Some(Ok(Event::Paste(text))) => screen.paste(text),
                 Some(Ok(Event::Resize(_, _))) => screen.dirty = true,
                 Some(Ok(_)) => {}
+                // The terminal is gone: a hangup noticed by the read rather than by the signal,
+                // which is how macOS reports a closed pty first. It leaves as the signal does,
+                // with the turn stopped and the interrupted status, so the two ways of noticing
+                // end the same way.
                 Some(Err(error)) => {
-                    tracing::error!("failed to read the terminal: {error}");
-                    screen.leave();
+                    tracing::debug!("failed to read the terminal: {error}");
+                    screen.leave_with(true);
                 }
-                None => screen.leave(),
+                None => screen.leave_with(true),
             },
             event = screen.launch.ui_receiver.recv() => match event {
                 Some(event) => screen.handle_ui(event),

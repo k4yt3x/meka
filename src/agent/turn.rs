@@ -4263,6 +4263,15 @@ mod tests {
     /// Hide the store's `messages` table under a live connection, and put it back. The eager save
     /// fails while it is hidden; every write after the restore succeeds, which is the sequence a
     /// transient `SQLITE_BUSY` on the first write produces.
+    /// Wait until the provider has been asked `rounds` times. A test that hides the table
+    /// mid-turn keys on this rather than on a timer: every round's rows are on disk before the
+    /// next round is asked for, and a timer reads a slow runner's first round as a later one.
+    async fn provider_asked(provider: &MockProvider, rounds: usize) {
+        while provider.streams().len() + provider.completions().len() < rounds {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     fn hide_messages_table(path: &std::path::Path, hidden: bool) {
         let statement = if hidden {
             "ALTER TABLE messages RENAME TO messages_hidden;"
@@ -4292,7 +4301,8 @@ mod tests {
                 message: "connection reset".to_string(),
             },
         ]]));
-        let (agent, store) = agent_at_for_test(provider as Arc<dyn Provider>, &path).await;
+        let (agent, store) =
+            agent_at_for_test(Arc::clone(&provider) as Arc<dyn Provider>, &path).await;
         let session_id = store
             .create_session(None, "test-profile".to_string())
             .await
@@ -4301,10 +4311,13 @@ mod tests {
         let mut messages = Conversation::new();
 
         hide_messages_table(&path, true);
+        // Back once the round has been asked for: the eager prompt save has failed by then, and
+        // the round's sleep holds the window open.
         let restore = tokio::spawn({
             let path = path.clone();
+            let provider = Arc::clone(&provider);
             async move {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                provider_asked(&provider, 1).await;
                 hide_messages_table(&path, false);
             }
         });
@@ -4369,7 +4382,8 @@ mod tests {
                 text: "the answer".to_string(),
             }],
         ]));
-        let (mut agent, store) = agent_at_for_test(provider as Arc<dyn Provider>, &path).await;
+        let (mut agent, store) =
+            agent_at_for_test(Arc::clone(&provider) as Arc<dyn Provider>, &path).await;
         agent.options.auto_compact = true;
         // Two prior messages of ~1000 estimated tokens each overrun 80% of this window, so the
         // proactive projection compacts before the first request.
@@ -4390,10 +4404,13 @@ mod tests {
         });
 
         hide_messages_table(&path, true);
+        // Back once the round has been asked for: the eager prompt save has failed by then, and
+        // the round's sleep holds the window open.
         let restore = tokio::spawn({
             let path = path.clone();
+            let provider = Arc::clone(&provider);
             async move {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                provider_asked(&provider, 1).await;
                 hide_messages_table(&path, false);
             }
         });
@@ -4918,7 +4935,8 @@ mod tests {
             ],
             text_round("carrying on"),
         ]));
-        let (agent, store) = agent_at_for_test(provider as Arc<dyn Provider>, &path).await;
+        let (agent, store) =
+            agent_at_for_test(Arc::clone(&provider) as Arc<dyn Provider>, &path).await;
         let session_id = store
             .create_session(None, "test-profile".to_string())
             .await
@@ -4926,12 +4944,13 @@ mod tests {
         agent.cells().session_id.set(session_id);
         let mut messages = Conversation::new();
 
-        // After the eager prompt save and before the round's own, which is the window the sleep
-        // above holds open.
+        // After the eager prompt save and before the round's own: the round is asked for once the
+        // prompt is on disk, and its sleep holds the window open.
         let hide = tokio::spawn({
             let path = path.clone();
+            let provider = Arc::clone(&provider);
             async move {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                provider_asked(&provider, 1).await;
                 hide_messages_table(&path, true);
             }
         });
@@ -5003,7 +5022,8 @@ mod tests {
                 stop_reason: MockStopReason::EndTurn,
             },
         ]]));
-        let (agent, store) = agent_at_for_test(provider as Arc<dyn Provider>, &path).await;
+        let (agent, store) =
+            agent_at_for_test(Arc::clone(&provider) as Arc<dyn Provider>, &path).await;
         let session_id = store
             .create_session(None, "test-profile".to_string())
             .await
@@ -5011,10 +5031,12 @@ mod tests {
         agent.cells().session_id.set(session_id);
         let mut messages = Conversation::new();
 
+        // After the eager prompt save and before the round's own, as above.
         let hide = tokio::spawn({
             let path = path.clone();
+            let provider = Arc::clone(&provider);
             async move {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                provider_asked(&provider, 1).await;
                 hide_messages_table(&path, true);
             }
         });
@@ -5063,7 +5085,8 @@ mod tests {
                 },
             ],
         ]));
-        let (agent, store) = agent_at_for_test(provider as Arc<dyn Provider>, &path).await;
+        let (agent, store) =
+            agent_at_for_test(Arc::clone(&provider) as Arc<dyn Provider>, &path).await;
         let session_id = store
             .create_session(None, "test-profile".to_string())
             .await
@@ -5074,10 +5097,12 @@ mod tests {
 
         let hide = tokio::spawn({
             let path = path.clone();
+            let provider = Arc::clone(&provider);
             async move {
-                // Inside the pause of the reply that would be nudged: the add's round is on disk,
-                // the reply and the nudge are not.
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                // Inside the pause of the reply that would be nudged: once the reply's round has
+                // been asked for, the add's round is on disk, and the reply and the nudge are not
+                // until the pause ends.
+                provider_asked(&provider, 2).await;
                 hide_messages_table(&path, true);
             }
         });
