@@ -85,10 +85,22 @@ fn drive_run(install: &Install, inputs: &[&str], kitty: bool) -> Run {
 /// [`drive_run`], with `args` on meka's command line in place of the `-c` every other test runs
 /// with.
 fn drive_run_with(install: &Install, args: &[&str], inputs: &[&str], kitty: bool) -> Run {
+    drive_run_sized(install, args, inputs, kitty, COLUMNS)
+}
+
+/// [`drive_run_with`] on a terminal `columns` wide, for what only shows at a width the default
+/// does not reach.
+fn drive_run_sized(
+    install: &Install,
+    args: &[&str],
+    inputs: &[&str],
+    kitty: bool,
+    columns: u16,
+) -> Run {
     let mut master: RawFd = -1;
     let size = libc::winsize {
         ws_row: ROWS,
-        ws_col: COLUMNS,
+        ws_col: columns,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
@@ -110,7 +122,7 @@ fn drive_run_with(install: &Install, args: &[&str], inputs: &[&str], kitty: bool
         unsafe { prepared.exec() }
     }
     keep_master_here(master);
-    let (screens, enhanced, clipboard) = pump(master, inputs, kitty);
+    let (screens, enhanced, clipboard) = pump(master, inputs, kitty, columns);
     // SAFETY: `master` is the fd `forkpty` handed back and is still open here, and `pid` is the
     // child it forked, reaped here and nowhere else.
     let exit = unsafe {
@@ -252,8 +264,13 @@ impl PreparedExec {
 /// input whenever the child falls quiet. Answers the child's keyboard protocol query the way a
 /// terminal would, since crossterm waits two seconds for the answer, and reports whether the
 /// child then asked for the protocol.
-fn pump(master: RawFd, inputs: &[&str], kitty: bool) -> (Screens, bool, Option<String>) {
-    let mut parser = vt100::Parser::new(ROWS, COLUMNS, 0);
+fn pump(
+    master: RawFd,
+    inputs: &[&str],
+    kitty: bool,
+    columns: u16,
+) -> (Screens, bool, Option<String>) {
+    let mut parser = vt100::Parser::new(ROWS, columns, 0);
     let mut screens = Vec::new();
     let mut enhanced = false;
     let mut raw: Vec<u8> = Vec::new();
@@ -350,7 +367,7 @@ fn last_clipboard_write(output: &[u8]) -> Option<String> {
 fn settled_rows(parser: &vt100::Parser) -> Vec<String> {
     parser
         .screen()
-        .rows(0, COLUMNS)
+        .rows(0, parser.screen().size().1)
         .take(usize::from(ROWS) - 1)
         .map(|row| row.trim_end().to_string())
         // The working row turns its spinner and counts its seconds for as long as the agent
@@ -378,7 +395,7 @@ fn is_working_row(row: &str) -> bool {
 fn rows_of(parser: &vt100::Parser) -> Vec<String> {
     let mut rows: Vec<String> = parser
         .screen()
-        .rows(0, COLUMNS)
+        .rows(0, parser.screen().size().1)
         .map(|row| row.trim_end().to_string())
         .collect();
     while rows.last().is_some_and(String::is_empty) {
@@ -1213,7 +1230,7 @@ fn terminal_taken_away(detached: bool) -> (Option<i32>, Vec<i32>, Screens) {
         }
     }
     keep_master_here(master);
-    let (screens, ..) = pump(master, &[&format!("!{marker}")], false);
+    let (screens, ..) = pump(master, &[&format!("!{marker}")], false, COLUMNS);
     assert!(
         !processes_running(marker).is_empty(),
         "the command runs before the terminal goes: {screens:#?}"
@@ -1448,6 +1465,98 @@ fn a_bare_resume_opens_the_picker_and_enter_attaches_the_pick() {
         "and the resume is announced: {rows:#?}"
     );
     assert_eq!(run.exit, Some(0), "{rows:#?}");
+}
+
+/// The picker is a table: the facts stand in columns of their own at the right edge, the same
+/// on every row, a directory past its column cut from its start so its tail stays, and the title
+/// has the rest of the row.
+#[test]
+fn a_picker_is_a_table_with_the_facts_in_their_columns() {
+    let install = screen_install("read", "", "");
+    install.write_script(TWO_TURNS);
+    let deep = install
+        .work_dir()
+        .join("a/directory/deep/enough/to/take/the/facts/share/of/a/row");
+    std::fs::create_dir_all(&deep).expect("a deep directory");
+    let long_topic = "a title long enough to be cut ".repeat(5);
+    for (topic, directory) in [("deep", deep), (long_topic.as_str(), install.work_dir())] {
+        let status = install
+            .meka(&["--oneshot", "-p", topic])
+            .current_dir(directory)
+            .status()
+            .expect("a scripted run");
+        assert!(status.success(), "seeding '{topic}'");
+    }
+    let run = drive_run_with(&install, &["-r"], &["\x1b", "/exit"], false);
+    let opening = &run.screens[0];
+    let row_of = |start: &str| {
+        opening
+            .iter()
+            .find(|row| row.starts_with(start))
+            .unwrap_or_else(|| panic!("a row opens with {start:?}: {opening:#?}"))
+    };
+    let cut = row_of("  a title long enough");
+    let deep_row = row_of("  deep");
+    let facts = "  default  just now";
+    let column = cut
+        .find(facts)
+        .unwrap_or_else(|| panic!("the profile and age columns: {cut:?}"));
+    assert_eq!(
+        deep_row.find(facts),
+        Some(column),
+        "the same columns on every row: {cut:?} {deep_row:?}"
+    );
+    assert!(
+        cut.contains("…  ~/work "),
+        "the title is cut two columns short of the directory column: {cut:?}"
+    );
+    assert!(
+        deep_row.contains("  …") && deep_row.contains("share/of/a/row  default"),
+        "a long directory is cut from its start and fills its column: {deep_row:?}"
+    );
+    for row in [cut, deep_row] {
+        assert_eq!(
+            row.chars().count(),
+            usize::from(COLUMNS) - 1,
+            "the age column ends one column short of the edge: {row:?}"
+        );
+    }
+    assert_eq!(run.exit, Some(0), "{opening:#?}");
+}
+
+/// On a terminal wider than the wire's title allows for, a picker row still fills: the title
+/// carries as much of the first message as the row holds, cut two columns short of its facts.
+#[test]
+fn an_ultrawide_picker_row_holds_more_of_a_title_than_the_wire_carries() {
+    const WIDE: u16 = 300;
+    let install = screen_install("read", "", "");
+    install.write_script(TWO_TURNS);
+    let topic = ["wide"; 65].join(" ");
+    let status = install
+        .meka(&["--oneshot", "-p", &topic])
+        .current_dir(install.work_dir())
+        .status()
+        .expect("a scripted run");
+    assert!(status.success(), "seeding the long topic");
+    let run = drive_run_sized(&install, &["-r"], &["\x1b", "/exit"], false, WIDE);
+    let opening = &run.screens[0];
+    let row = opening
+        .iter()
+        .find(|row| row.starts_with("  wide wide"))
+        .unwrap_or_else(|| panic!("the long title is listed: {opening:#?}"));
+    let (_, facts) = row
+        .split_once("…  ")
+        .unwrap_or_else(|| panic!("the title is cut two columns short of its facts: {row:?}"));
+    assert!(
+        !facts.starts_with(' ') && facts.ends_with("~/work  default  just now"),
+        "the facts follow the title at once: {row:?}"
+    );
+    assert_eq!(
+        row.chars().count(),
+        usize::from(WIDE) - 1,
+        "the facts end one column short of the edge: {row:?}"
+    );
+    assert_eq!(run.exit, Some(0), "{opening:#?}");
 }
 
 /// `/resume` from a running session switches the screen to the pick: the picked session's rows

@@ -82,8 +82,10 @@ pub(crate) use crate::image::RedactedImage;
 /// the ceiling.
 pub(crate) const IMAGE_REDACTION_PLACEHOLDER: &str = "[image redacted to fit request size budget]";
 
-/// Characters a session title keeps before it is cut.
-pub(crate) const TITLE_CHARS: usize = 80;
+/// Characters a session title keeps on every wire before it is cut, and the most a user may set,
+/// so a surface that fits one fits the other; the screen's session picker, which lays the title
+/// out itself, asks for as many as its row holds.
+pub(crate) const TITLE_CHARS: usize = 200;
 
 /// Append-only conversation: an event log, plus the materialized message view derived from it.
 #[derive(Debug, Default, Clone)]
@@ -151,6 +153,13 @@ impl Conversation {
     /// [`Self::prune_compacted_events`] starts at its last boundary and no longer holds the first
     /// turn; every surface that labels a stored session reads the store's rows, which do.
     pub(crate) fn title(&self) -> String {
+        self.title_within(TITLE_CHARS)
+    }
+
+    /// [`Self::title`] cut to `chars` rather than [`TITLE_CHARS`], for a surface that lays the
+    /// title out itself and has more room than the wire carries, as the screen's session picker
+    /// does on a wide terminal.
+    pub(crate) fn title_within(&self, chars: usize) -> String {
         self.events
             .iter()
             .filter_map(|event| match event {
@@ -169,10 +178,10 @@ impl Conversation {
                 _ => None,
             })
             .map(|words| {
-                if words.chars().count() <= TITLE_CHARS {
+                if words.chars().count() <= chars {
                     words
                 } else {
-                    let kept: String = words.chars().take(TITLE_CHARS).collect();
+                    let kept: String = words.chars().take(chars).collect();
                     format!("{}…", kept.trim_end())
                 }
             })

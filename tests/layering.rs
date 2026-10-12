@@ -524,6 +524,44 @@ fn production_code_reads_meka_variables_only_where_the_ledger_says() {
     );
 }
 
+/// `None` passed to `Store::open` is the user's own `meka.db`, not the absence of a path, so a
+/// test that spells it seeds sessions into the developer's store on every run and migrates it on
+/// the way in. Only `main` opens the store there; a test opens `Store::for_test()`.
+#[test]
+fn only_main_opens_the_store_at_its_default_path() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    source_files(&root.join("src"), &mut files);
+    source_files(&root.join("tests"), &mut files);
+    files.sort();
+    let mut violations = Vec::new();
+    for path in &files {
+        let relative = path
+            .strip_prefix(root)
+            .expect("a path under the manifest directory")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative == "src/main.rs" {
+            continue;
+        }
+        let source = fs::read_to_string(path).expect("read a source file");
+        let code: String = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(str::split_whitespace)
+            .collect();
+        // Spelled in two halves so this file does not match itself.
+        if code.contains(&["Store::open(", "None"].concat()) {
+            violations.push(relative);
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "the store is opened at its default path outside main:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
 /// A path to an item at the crate root is an edge to a name with no rank, and is seen as one.
 #[test]
 fn a_root_item_is_an_edge() {

@@ -24,8 +24,10 @@ This resumes the most recently updated session. `-c` takes no value; give an ope
 meka -r
 ```
 
-With nothing after `-r`, the screen opens on a picker: the fifty newest root sessions, each with
-its directory, its profile and when it was last touched at the right edge. `/` then typing filters the
+With nothing after `-r`, the screen opens on a picker: the fifty newest root sessions in a table,
+the title first, then the directory, the profile and when the session was last touched. A long
+directory is cut from its start so its tail stays, and a narrow terminal drops the directory
+column, then the profile. `/` then typing filters the
 list, j and k move the pick, Enter resumes the pick, and Esc leaves you in a new session. The same picker opens from a running session with
 `/resume`, and `/resume <id>` switches to a session by id or unique prefix; either way the lock
 moves with you and the session you left stays as it was.

@@ -318,8 +318,7 @@ fn search_rows(found: &[crate::store::SessionMatch], resolvable: &[String]) -> V
 /// The listing shortens an id to whatever distinguishes it, which is only safe because this prints
 /// the whole thing. It also carries what the table has no room for: the working directory and the
 /// permission the row records. Not the whole first message, which `session_info` has already cut to
-/// its title of 80 characters before this sees it; `meka session export` is the surface that has
-/// all of it.
+/// its title before this sees it; `meka session export` is the surface that has all of it.
 async fn show_session(
     store: &Store,
     session_id: uuid::Uuid,

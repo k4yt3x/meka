@@ -666,6 +666,30 @@ pub(crate) fn cut_text(text: &str, budget: usize) -> String {
         .collect()
 }
 
+/// Plain text cut the way [`cut_text`] cuts but from its start, `…` in the first column: for a
+/// path, whose tail is what tells it from the next.
+pub(crate) fn cut_text_start(text: &str, budget: usize) -> String {
+    if crate::text::display_width(text) <= budget {
+        return text.to_string();
+    }
+    format!("…{}", back_columns(text, budget.saturating_sub(1)))
+}
+
+/// The longest suffix of `text` within `columns`.
+fn back_columns(text: &str, columns: usize) -> &str {
+    let mut used = 0;
+    let mut start = text.len();
+    for (index, character) in text.char_indices().rev() {
+        let width = crate::text::char_width(character);
+        if used + width > columns {
+            break;
+        }
+        used += width;
+        start = index;
+    }
+    &text[start..]
+}
+
 /// How many lines a call added to a file and took from it, shown on its row as `+3 -1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DiffStat {
@@ -1575,5 +1599,15 @@ mod tests {
             vec!["• Checklist", "  └ › Review the", "      conflict section"],
             "a long item wraps under its marker rather than being cut: {narrow:?}"
         );
+    }
+
+    /// A cut from the start keeps the tail and marks the cut in the first column, by display
+    /// width, so a wide character that would straddle the budget goes with the start.
+    #[test]
+    fn a_cut_from_the_start_keeps_the_tail() {
+        assert_eq!(cut_text_start("~/.config/config", 20), "~/.config/config");
+        assert_eq!(cut_text_start("~/.config/config", 12), "…nfig/config");
+        assert_eq!(cut_text_start("ab漢字", 3), "…字");
+        assert_eq!(cut_text_start("abc", 1), "…");
     }
 }

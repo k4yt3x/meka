@@ -80,9 +80,9 @@ const WORK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_PICKER_ROWS: u32 = 50;
 /// The columns a session's title keeps on a picker row however wide what follows it is.
 const SESSION_TITLE_FLOOR: usize = 16;
-/// The share of a picker row the facts beside a title may take once the two cannot both fit; the
-/// directory, the first and longest of them, is cut to keep within it.
-const SESSION_FACTS_SHARE: usize = 2;
+/// The most of a picker row the directory column may take, as a share of its width; a longer
+/// directory is cut from its start, the end that repeats from row to row.
+const SESSION_DIRECTORY_SHARE: usize = 4;
 /// How long a finished `!command` is given to hand over the rest of its output: a process it
 /// started and left behind can hold the pipe open past its own exit.
 const SHELL_DRAIN_GRACE: Duration = Duration::from_secs(2);
@@ -606,16 +606,24 @@ impl Screen {
     }
 
     /// `/resume` with nothing after it: the sessions this screen can switch to, newest first,
-    /// filtered as text is typed; the pick runs `/resume <id>`. A title takes the room the row
-    /// has left after the widest of the facts beside it, so only one wider than that is cut.
+    /// filtered as text is typed; the pick runs `/resume <id>`. A table: the title, then the
+    /// directory, the profile and the age in columns of their own at the right edge, sized by
+    /// [`SessionColumns::fit`].
     async fn open_session_picker(&mut self) {
+        // Before the first frame the transcript has no width yet, as at `meka -r`; the terminal
+        // itself says how wide the picker can be, and so how much of a title a row can hold.
+        let width = match self.transcript_area.width {
+            0 => crossterm::terminal::size().map_or(80, |(columns, _)| columns),
+            width => width,
+        } as usize;
         let sessions = match self
             .launch
             .store
-            .list_sessions(
+            .list_sessions_titled_within(
                 SESSION_PICKER_ROWS,
                 None,
                 &crate::store::SessionFilter::default(),
+                width,
             )
             .await
         {
@@ -627,14 +635,6 @@ impl Screen {
         };
         let current = self.launch.agent.session_id();
         let now = chrono::Utc::now();
-        // Before the first frame the transcript has no width yet, as at `meka -r`; the terminal
-        // itself says how wide the picker can be.
-        let width = match self.transcript_area.width {
-            0 => crossterm::terminal::size().map_or(80, |(columns, _)| columns),
-            width => width,
-        } as usize;
-        // Nothing is cut while the longest title and the widest facts fit side by side; past
-        // that the facts keep their share and the titles the rest.
         let offered: Vec<(&crate::store::SessionSummary, String, String, String)> = sessions
             .iter()
             .filter(|session| Some(session.id) != current)
@@ -642,7 +642,6 @@ impl Screen {
                 let age = chrono::DateTime::parse_from_rfc3339(&session.updated_at)
                     .map(|at| crate::text::format_age(at.with_timezone(&chrono::Utc), now))
                     .unwrap_or_else(|_| session.updated_at.clone());
-                let tail = format!(" · {} · {age}", session.profile);
                 let directory = session
                     .cwd
                     .as_deref()
@@ -654,45 +653,33 @@ impl Screen {
                 } else {
                     title
                 };
-                (session, title, directory, tail)
+                (session, title, directory, age)
             })
             .collect();
-        let longest_title = offered
+        let longest_directory = offered
             .iter()
-            .map(|(_, title, ..)| crate::text::display_width(title))
+            .map(|(_, _, directory, _)| crate::text::display_width(directory))
             .max()
             .unwrap_or(0);
-        let widest_facts = offered
+        let longest_profile = offered
             .iter()
-            .map(|(_, _, directory, tail)| {
-                crate::text::display_width(directory) + crate::text::display_width(tail)
-            })
+            .map(|(session, ..)| crate::text::display_width(&session.profile))
             .max()
             .unwrap_or(0);
-        let facts_columns = if TEXT_EDGE + longest_title + 2 + widest_facts <= width {
-            widest_facts
-        } else {
-            width / SESSION_FACTS_SHARE
-        };
-        let title_columns = width
-            .saturating_sub(TEXT_EDGE + 2 + facts_columns)
-            .max(SESSION_TITLE_FLOOR);
+        let longest_age = offered
+            .iter()
+            .map(|(_, _, _, age)| crate::text::display_width(age))
+            .max()
+            .unwrap_or(0);
+        let columns = SessionColumns::fit(width, longest_directory, longest_profile, longest_age);
         let mut lines = Vec::new();
         let mut choices = Vec::new();
-        for (session, title, directory, tail) in offered {
-            let directory = draw::cut_text(
-                &directory,
-                facts_columns
-                    .saturating_sub(crate::text::display_width(&tail))
-                    .max(8),
-            );
-            let facts = format!("{directory}{tail}");
-            let title = draw::cut_text(&title, title_columns);
+        for (session, title, directory, age) in offered {
             lines.push(format!("/resume {}", session.id));
             choices.push(Choice {
-                label: title,
+                label: draw::cut_text(&title, columns.title),
                 key: None,
-                description: Some(facts),
+                description: Some(columns.facts(&directory, &session.profile, &age)),
             });
         }
         if choices.is_empty() {
@@ -2737,6 +2724,83 @@ impl Screen {
     }
 }
 
+/// The widths of the session picker's columns, the same on every row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionColumns {
+    /// The title's, the rest of the row after the facts.
+    title: usize,
+    /// The directory column's; 0 when no row has a directory or the row is too narrow for one.
+    directory: usize,
+    /// The profile column's; 0 on a row too narrow to carry one.
+    profile: usize,
+    /// The age column's, right-aligned on the edge.
+    age: usize,
+}
+
+impl SessionColumns {
+    /// The columns of a row `width` wide, from the longest value each fact column holds: the
+    /// directory column takes at most its share of the row, the profile column at most a name's
+    /// width, the age column what its longest needs, and the title the rest. A title under its
+    /// floor drops the directory column, then the profile; the age stays, so a row always says
+    /// when.
+    fn fit(
+        width: usize,
+        longest_directory: usize,
+        longest_profile: usize,
+        longest_age: usize,
+    ) -> Self {
+        let mut columns = Self {
+            title: 0,
+            directory: longest_directory.min(width / SESSION_DIRECTORY_SHARE),
+            profile: longest_profile.min(crate::text::NAME_WIDTH),
+            age: longest_age,
+        };
+        columns.title = columns.title_room(width);
+        if columns.title < SESSION_TITLE_FLOOR {
+            columns.directory = 0;
+            columns.title = columns.title_room(width);
+        }
+        if columns.title < SESSION_TITLE_FLOOR {
+            columns.profile = 0;
+            columns.title = columns.title_room(width).max(SESSION_TITLE_FLOOR);
+        }
+        columns
+    }
+
+    /// What the title has on a row `width` wide: the rest after the text edge, the two columns
+    /// the facts stand off by, and the one they keep clear of the right edge.
+    fn title_room(&self, width: usize) -> usize {
+        width.saturating_sub(TEXT_EDGE + 2 + self.facts_width() + 1)
+    }
+
+    /// The columns the facts take together: the ones present, two apart.
+    fn facts_width(&self) -> usize {
+        let present = [self.directory, self.profile, self.age]
+            .into_iter()
+            .filter(|columns| *columns > 0);
+        present.clone().sum::<usize>() + 2 * present.count().saturating_sub(1)
+    }
+
+    /// One row's facts in their columns: the directory padded to its column, or cut from its
+    /// start so its tail stays; the profile padded or cut at its end; the age right-aligned.
+    fn facts(&self, directory: &str, profile: &str, age: &str) -> String {
+        let blanks = |text: &str, columns: usize| {
+            " ".repeat(columns.saturating_sub(crate::text::display_width(text)))
+        };
+        let mut cells = Vec::new();
+        if self.directory > 0 {
+            let directory = draw::cut_text_start(directory, self.directory);
+            cells.push(format!("{directory}{}", blanks(&directory, self.directory)));
+        }
+        if self.profile > 0 {
+            let profile = draw::cut_text(profile, self.profile);
+            cells.push(format!("{profile}{}", blanks(&profile, self.profile)));
+        }
+        cells.push(format!("{}{age}", blanks(age, self.age)));
+        cells.join("  ")
+    }
+}
+
 /// What the empty composer says while a turn runs: what Enter does with the next message under
 /// the send class in force.
 fn send_class_placeholder(class: InboxClass) -> &'static str {
@@ -3212,6 +3276,55 @@ mod tests {
         let notes = temp.path().join("notes.txt");
         std::fs::write(&notes, "x").expect("write");
         assert_eq!(pasted_image_path(&notes.display().to_string()), None);
+    }
+
+    /// A picker's fact columns are as wide as their longest values, the directory capped at its
+    /// share of the row and the profile at a name's width, and the title has the rest; a row too
+    /// narrow for the title's floor drops the directory column, then the profile.
+    #[test]
+    fn a_picker_s_columns_fit_the_row() {
+        let columns = SessionColumns::fit(180, 20, 17, 6);
+        assert_eq!(
+            (columns.directory, columns.profile, columns.age),
+            (20, 17, 6)
+        );
+        assert_eq!(
+            columns.title,
+            180 - TEXT_EDGE - 2 - (20 + 2 + 17 + 2 + 6) - 1
+        );
+        assert_eq!(
+            SessionColumns::fit(180, 80, 17, 6).directory,
+            45,
+            "a long directory has a quarter of the row"
+        );
+        assert_eq!(
+            SessionColumns::fit(180, 20, 40, 6).profile,
+            crate::text::NAME_WIDTH
+        );
+        let narrow = SessionColumns::fit(60, 20, 17, 6);
+        assert_eq!(narrow.directory, 0, "too narrow for a directory column");
+        assert_eq!(narrow.title, 60 - TEXT_EDGE - 2 - (17 + 2 + 6) - 1);
+        let narrower = SessionColumns::fit(30, 20, 17, 6);
+        assert_eq!((narrower.directory, narrower.profile), (0, 0));
+        assert_eq!(narrower.title, 30 - TEXT_EDGE - 2 - 6 - 1);
+        assert_eq!(
+            columns.facts(
+                "~/.config/config/usr/local/bin/i3blocks",
+                "claude-opus-5-5",
+                "1w ago"
+            ),
+            "…/local/bin/i3blocks  claude-opus-5-5    1w ago"
+        );
+        assert_eq!(
+            narrow.facts("~/.config/config", "claude-opus-5-5", "1w ago"),
+            "claude-opus-5-5    1w ago",
+            "a dropped column leaves no blank behind"
+        );
+        assert_eq!(
+            columns.facts("", "default", "just now"),
+            format!("{:20}  {:17}  just now", "", "default"),
+            "a session without a directory keeps its column blank"
+        );
     }
 
     /// A selection copies the rows between its ends, the end rows cut at their columns, without

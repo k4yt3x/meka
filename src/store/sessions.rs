@@ -430,10 +430,9 @@ static TITLE_ROW_WHERE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
         block_words = is_words("json_extract(json_each.value, '$.text')"),
     )
 });
-/// Characters a title a user sets may hold. Generous next to the 80 a derived title is cut to,
-/// since this one is typed rather than lifted from a message, and the listing cuts it to fit
-/// anyway.
-const TITLE_MAX_CHARS: usize = 200;
+/// Characters a title a user sets may hold: what every wire keeps of a derived one, so a surface
+/// that fits the one fits the other.
+const TITLE_MAX_CHARS: usize = crate::conversation::TITLE_CHARS;
 
 /// A title as every door that sets one accepts it: control characters dropped, since a title
 /// reaches terminals and nothing in one is meant to be obeyed; whitespace runs collapsed to one
@@ -459,16 +458,27 @@ pub(crate) fn normalize_title(raw: &str) -> Result<Option<String>> {
     Ok(Some(title))
 }
 
-/// The title every surface shows: the one a user set, else the first words a user said, from the
-/// row [`TITLE_ROW_WHERE_SQL`] selected.
-fn effective_title(set: Option<String>, session: &str, kind: &str, content: String) -> String {
-    set.unwrap_or_else(|| title_of_first_user_row(session, kind, content))
+/// The title every surface shows: the one a user set, else the first words a user said, cut to
+/// `chars`, from the row [`TITLE_ROW_WHERE_SQL`] selected.
+fn effective_title(
+    set: Option<String>,
+    session: &str,
+    kind: &str,
+    content: String,
+    chars: usize,
+) -> String {
+    set.unwrap_or_else(|| title_of_first_user_row(session, kind, content, chars))
 }
 
-/// A session's title from the row [`TITLE_ROW_WHERE_SQL`] selects, through the one definition in
-/// [`crate::conversation::Conversation::title`]. A `user_blocks` row holds the message's blocks as
-/// JSON; a `user` row is the text itself.
-pub(super) fn title_of_first_user_row(session: &str, kind: &str, content: String) -> String {
+/// A session's title from the row [`TITLE_ROW_WHERE_SQL`] selects, cut to `chars`, through the
+/// one definition in [`crate::conversation::Conversation::title_within`]. A `user_blocks` row
+/// holds the message's blocks as JSON; a `user` row is the text itself.
+pub(super) fn title_of_first_user_row(
+    session: &str,
+    kind: &str,
+    content: String,
+    chars: usize,
+) -> String {
     use crate::conversation::{ContentBlock, Conversation, Event, Message, Role};
     let message = if kind == USER_BLOCKS_KIND {
         match serde_json::from_str::<Vec<ContentBlock>>(&content) {
@@ -487,7 +497,7 @@ pub(super) fn title_of_first_user_row(session: &str, kind: &str, content: String
     } else {
         Message::user(content)
     };
-    Conversation::from_events(vec![Event::Append(message)]).title()
+    Conversation::from_events(vec![Event::Append(message)]).title_within(chars)
 }
 /// An event as the `messages` table takes it: its images taken out into blobs and its references
 /// read. Built on the caller's thread rather than the database's, since decoding and hashing the
@@ -2684,6 +2694,20 @@ impl Store {
         cursor: Option<&str>,
         filter: &SessionFilter,
     ) -> Result<(Vec<SessionSummary>, Option<String>)> {
+        self.list_sessions_titled_within(limit, cursor, filter, crate::conversation::TITLE_CHARS)
+            .await
+    }
+
+    /// [`Self::list_sessions`] with each derived title cut to `title_chars` rather than the
+    /// [`crate::conversation::TITLE_CHARS`] every wire carries, for a surface that lays the title
+    /// out itself and has the room, as the screen's session picker does.
+    pub(crate) async fn list_sessions_titled_within(
+        &self,
+        limit: u32,
+        cursor: Option<&str>,
+        filter: &SessionFilter,
+        title_chars: usize,
+    ) -> Result<(Vec<SessionSummary>, Option<String>)> {
         let cursor_decoded = match cursor {
             Some(token) => Some(decode_list_cursor(token)?),
             None => None,
@@ -2814,7 +2838,13 @@ impl Store {
                     let set_title: Option<String> = row.get(11)?;
                     let pinned_at: Option<String> = row.get(12)?;
                     let title_kind: String = row.get(14)?;
-                    let title = effective_title(set_title, &id_str, &title_kind, row.get(13)?);
+                    let title = effective_title(
+                        set_title,
+                        &id_str,
+                        &title_kind,
+                        row.get(13)?,
+                        title_chars,
+                    );
                     let last_turn = turn_from_row(row, 15)?;
                     Ok((
                         id_str,
@@ -2934,7 +2964,13 @@ impl Store {
                     let set_title: Option<String> = row.get(11)?;
                     let pinned_at: Option<String> = row.get(12)?;
                     let title_kind: String = row.get(14)?;
-                    let title = effective_title(set_title, &id_str, &title_kind, row.get(13)?);
+                    let title = effective_title(
+                        set_title,
+                        &id_str,
+                        &title_kind,
+                        row.get(13)?,
+                        crate::conversation::TITLE_CHARS,
+                    );
                     let last_turn = turn_from_row(row, 15)?;
                     Ok((
                         id_str,
@@ -3552,9 +3588,7 @@ mod tests {
     /// up stops at the row it was bounded by.
     #[tokio::test]
     async fn the_log_is_read_in_pages_from_either_end() {
-        let store = Store::open(None, &migrations::Context::default())
-            .await
-            .expect("store");
+        let store = Store::for_test().await;
         let id = store
             .create_session(None, "test-profile".to_string())
             .await
@@ -7490,15 +7524,14 @@ mod tests {
 
     #[tokio::test]
     async fn list_sessions_title_truncates_long_prompt_with_ellipsis() {
-        // Long prompts are capped at 80 chars with a trailing ellipsis. The cap must apply to the
-        // user's prompt, not the wrapper.
+        // The cap must apply to the user's prompt, not the wrapper around it.
         let store = Store::for_test().await;
         let session_id = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("create_session");
 
-        let long_prompt = "a".repeat(150);
+        let long_prompt = "a".repeat(crate::conversation::TITLE_CHARS + 70);
         let stored = mock_run_turn_user_message(crate::permission::Permission::Read, &long_prompt);
         store
             .save_event(
@@ -7525,7 +7558,36 @@ mod tests {
             "a long title should end with an ellipsis: {:?}",
             summary.title
         );
-        assert!(summary.title.chars().count() <= 81);
+        assert_eq!(
+            summary.title.chars().count(),
+            crate::conversation::TITLE_CHARS + 1
+        );
+    }
+
+    /// A surface with the room names how much of a title it can hold, and the listing cuts to
+    /// that; the plain listing cuts to what every wire carries.
+    #[tokio::test]
+    async fn a_listing_sized_for_a_surface_keeps_the_title_to_its_room() {
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
+        let cap = crate::conversation::TITLE_CHARS;
+        store
+            .save_message(session_id, "user", &"a".repeat(cap + 150))
+            .await
+            .expect("save_message");
+        let (wire, _) = store
+            .list_sessions(10, None, &SessionFilter::default())
+            .await
+            .expect("list_sessions");
+        assert_eq!(wire[0].title.chars().count(), cap + 1);
+        let (sized, _) = store
+            .list_sessions_titled_within(10, None, &SessionFilter::default(), cap + 100)
+            .await
+            .expect("list_sessions_titled_within");
+        assert_eq!(sized[0].title.chars().count(), cap + 101);
     }
 
     #[tokio::test]
@@ -7852,7 +7914,8 @@ mod tests {
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
         assert_eq!(
             summary.title,
-            "[Conversation summary from session compaction] Summary text here [Post-compactio…",
+            "[Conversation summary from session compaction] Summary text here [Post-compaction \
+             context] …",
             "compacted session should surface the summary marker as its title"
         );
     }

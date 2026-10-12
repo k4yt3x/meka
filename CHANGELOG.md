@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** the screen draws the answers; stdout carries them only under `--oneshot`.
 - **Breaking:** the approval answers are picked, by cursor, key or number; `always` is `a`.
 - `-r` takes its session optionally: with nothing after it, meka asks which, from a list.
+- A session's title keeps 200 characters of the first message, up from 80; the picker fills its row.
 - A command the turn would have to wait on is refused while a turn runs; stop the turn first.
 - A command's answer opens in a panel over the composer; Esc closes it.
 - `!command` output is captured into the transcript rather than taking the terminal; Esc kills it.

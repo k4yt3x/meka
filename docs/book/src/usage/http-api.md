@@ -182,7 +182,7 @@ session this server holds; the feed's `checklist.updated` carries the same list 
 `created_at` is when the row was made; `updated_at` moves on a turn and on any change to what the
 session runs as (`permission`, `approvals`, `cwd`, `profile`), a `PATCH` included, but not on a
 title or a pin; `title` is the title a client set, else the first user message's words, whitespace
-collapsed and cut to 80 characters. A pinned session also carries `pinned_at`.
+collapsed and cut to 200 characters. A pinned session also carries `pinned_at`.
 
 `last_turn` is the session's latest turn, whatever host ran it: the same record [`GET
 /v1/sessions/{id}/turns`](#turns) lists, carried here because a list of sessions is rendered from
