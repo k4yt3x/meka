@@ -1605,6 +1605,14 @@ impl Screen {
         self.leave_with(false);
     }
 
+    /// The terminal is gone, noticed by a read or a write that failed rather than by the signal
+    /// the host listens for: macOS reports a closed pty to the write first, and a terminal held
+    /// through another process sends no signal at all. Every way of noticing ends the same way,
+    /// as the signal does: the turn stopped and the interrupted status.
+    fn hang_up(&mut self) {
+        self.leave_with(true);
+    }
+
     /// Leave, as an interrupt when the ladder's last press asked. A `!command` still running is
     /// killed too: nothing shows it once the screen is gone, and the process is about to exit.
     fn leave_with(&mut self, interrupted: bool) {
@@ -3123,15 +3131,11 @@ pub(crate) async fn run_screen(launch: ScreenLaunch) -> anyhow::Result<()> {
                 Some(Ok(Event::Paste(text))) => screen.paste(text),
                 Some(Ok(Event::Resize(_, _))) => screen.dirty = true,
                 Some(Ok(_)) => {}
-                // The terminal is gone: a hangup noticed by the read rather than by the signal,
-                // which is how macOS reports a closed pty first. It leaves as the signal does,
-                // with the turn stopped and the interrupted status, so the two ways of noticing
-                // end the same way.
                 Some(Err(error)) => {
-                    tracing::debug!("failed to read the terminal: {error}");
-                    screen.leave_with(true);
+                    tracing::error!("failed to read the terminal: {error}");
+                    screen.hang_up();
                 }
-                None => screen.leave_with(true),
+                None => screen.hang_up(),
             },
             event = screen.launch.ui_receiver.recv() => match event {
                 Some(event) => screen.handle_ui(event),
@@ -3163,7 +3167,7 @@ pub(crate) async fn run_screen(launch: ScreenLaunch) -> anyhow::Result<()> {
                     }
                     if let Err(error) = drawn {
                         tracing::error!("failed to draw the screen: {error}");
-                        screen.leave();
+                        screen.hang_up();
                     }
                     // After the draw, so the page asked for is the one the frame on screen is
                     // next to, not the one a stale layout would have named.

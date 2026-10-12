@@ -989,20 +989,38 @@ impl Composer {
 
 /// The directory as the status row shows it, with the home directory as `~`.
 pub(crate) fn shorten_path_with_tilde(path: &std::path::Path) -> String {
-    shorten_under_home(path, dirs::home_dir())
+    // Resolved once: the status row asks every frame, and the home does not move under a run.
+    static HOMES: std::sync::OnceLock<Option<HomeSpellings>> = std::sync::OnceLock::new();
+    let homes = HOMES.get_or_init(|| dirs::home_dir().map(HomeSpellings::of));
+    shorten_under_home(path, homes.as_ref())
 }
 
-/// [`shorten_path_with_tilde`] against `home` as given and in its canonical spelling, since a
+/// The home directory as given and, where it differs, in its canonical spelling.
+struct HomeSpellings {
+    given: PathBuf,
+    canonical: Option<PathBuf>,
+}
+
+impl HomeSpellings {
+    fn of(home: PathBuf) -> Self {
+        let canonical = std::fs::canonicalize(&home)
+            .ok()
+            .filter(|canonical| *canonical != home);
+        Self {
+            given: home,
+            canonical,
+        }
+    }
+}
+
+/// [`shorten_path_with_tilde`] against the home as given and in its canonical spelling, since a
 /// session's directory is recorded canonical and a home reached through a link (macOS keeps
 /// `/var` under `/private`) would otherwise never shorten.
-fn shorten_under_home(path: &std::path::Path, home: Option<PathBuf>) -> String {
-    let Some(home) = home else {
+fn shorten_under_home(path: &std::path::Path, homes: Option<&HomeSpellings>) -> String {
+    let Some(homes) = homes else {
         return path.display().to_string();
     };
-    let canonical = std::fs::canonicalize(&home)
-        .ok()
-        .filter(|canonical| *canonical != home);
-    for home in std::iter::once(&home).chain(canonical.as_ref()) {
+    for home in std::iter::once(&homes.given).chain(homes.canonical.as_ref()) {
         if path == home {
             return "~".to_string();
         }
@@ -1606,18 +1624,18 @@ mod tests {
         let real = std::fs::canonicalize(&real).expect("canonical");
         let link = temp.path().join("link");
         std::os::unix::fs::symlink(&real, &link).expect("link");
-        let home = Some(link.clone());
+        let homes = HomeSpellings::of(link.clone());
         assert_eq!(
-            shorten_under_home(&real.join("work"), home.clone()),
+            shorten_under_home(&real.join("work"), Some(&homes)),
             "~/work"
         );
         assert_eq!(
-            shorten_under_home(&link.join("work"), home.clone()),
+            shorten_under_home(&link.join("work"), Some(&homes)),
             "~/work"
         );
-        assert_eq!(shorten_under_home(&real, home.clone()), "~");
+        assert_eq!(shorten_under_home(&real, Some(&homes)), "~");
         assert_eq!(
-            shorten_under_home(&temp.path().join("elsewhere"), home),
+            shorten_under_home(&temp.path().join("elsewhere"), Some(&homes)),
             temp.path().join("elsewhere").display().to_string()
         );
     }

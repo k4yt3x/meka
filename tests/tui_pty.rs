@@ -16,7 +16,8 @@
 )]
 
 use std::{
-    os::fd::RawFd,
+    ffi::CString,
+    os::{fd::RawFd, unix::ffi::OsStrExt},
     time::{Duration, Instant},
 };
 
@@ -91,6 +92,7 @@ fn drive_run_with(install: &Install, args: &[&str], inputs: &[&str], kitty: bool
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    let prepared = PreparedExec::meka(install, args);
     // SAFETY: `forkpty` with a null termios and a sized window is the documented way to get a pty
     // pair plus a child. The child branch below does nothing but `exec`, which is the one thing
     // that is defined after `fork` in a threaded process.
@@ -104,10 +106,10 @@ fn drive_run_with(install: &Install, args: &[&str], inputs: &[&str], kitty: bool
     };
     assert!(pid >= 0, "forkpty failed");
     if pid == 0 {
-        let error = exec_meka(install, args);
-        eprintln!("exec failed: {error}");
-        std::process::exit(127);
+        // SAFETY: the child of a threaded process, so only what `PreparedExec::exec` promises.
+        unsafe { prepared.exec() }
     }
+    keep_master_here(master);
     let (screens, enhanced, clipboard) = pump(master, inputs, kitty);
     // SAFETY: `master` is the fd `forkpty` handed back and is still open here, and `pid` is the
     // child it forked, reaped here and nowhere else.
@@ -134,24 +136,116 @@ fn drive_run_with(install: &Install, args: &[&str], inputs: &[&str], kitty: bool
     }
 }
 
-fn exec_meka(install: &Install, args: &[&str]) -> std::io::Error {
-    use std::os::unix::process::CommandExt;
-    let mut command = support::meka();
-    command
-        .args(args)
-        .current_dir(install.work_dir())
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("TERM", "xterm-256color")
-        // The sandbox advisories are facts about the kernel the suite runs on, and would be rows of
-        // their own on the screen. The two `rmcp` directives are meka's defaults, restated because
-        // `RUST_LOG` replaces the filter outright.
-        .env(
-            "RUST_LOG",
-            "warn,meka::sandbox=error,rmcp::transport::common::client_side_sse=error,\
-             rmcp::transport::worker=off",
-        );
-    install.env(&mut command).exec()
+/// Keep the pty's master out of every child this process forks from here on: `forkpty` hands it
+/// back without close-on-exec, and tests fork in parallel, so another test's child would carry
+/// a copy of it and keep that terminal open past the close that is meant to hang it up.
+fn keep_master_here(master: RawFd) {
+    // SAFETY: `master` is the fd `forkpty` just handed back.
+    let flagged = unsafe { libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC) };
+    assert!(flagged == 0, "close-on-exec on the master");
+}
+
+/// A `meka` command line with everything its exec needs laid out ahead of the fork: the child of
+/// a threaded process may allocate nothing and take no lock between the fork and the exec, since
+/// a lock another thread held at the fork is held forever in the child. Two tests forking at the
+/// same instant are enough to hit that, and the child then hangs before `meka` ever runs.
+struct PreparedExec {
+    program: CString,
+    directory: CString,
+    /// One past the highest descriptor the child closes, read ahead of the fork since the child
+    /// may not ask: the soft limit, within bounds, as a test process holds a few hundred at most
+    /// and a limit in the millions would have the child closing for a while.
+    descriptors: libc::c_int,
+    /// Owned by the two vectors below the pointers, which point into them.
+    _arguments: Vec<CString>,
+    _environment: Vec<CString>,
+    argv: Vec<*const libc::c_char>,
+    envp: Vec<*const libc::c_char>,
+}
+
+impl PreparedExec {
+    fn meka(install: &Install, args: &[&str]) -> Self {
+        let mut command = support::meka();
+        command
+            .args(args)
+            .current_dir(install.work_dir())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "xterm-256color")
+            // The sandbox advisories are facts about the kernel the suite runs on, and would be
+            // rows of their own on the screen. The two `rmcp` directives are meka's defaults,
+            // restated because `RUST_LOG` replaces the filter outright.
+            .env(
+                "RUST_LOG",
+                "warn,meka::sandbox=error,rmcp::transport::common::client_side_sse=error,\
+                 rmcp::transport::worker=off",
+            );
+        install.env(&mut command);
+        let c_string = |text: &std::ffi::OsStr| CString::new(text.as_bytes()).expect("no NUL");
+        let arguments: Vec<CString> = std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(c_string)
+            .collect();
+        let environment: Vec<CString> = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                let mut pair = key.to_os_string();
+                pair.push("=");
+                pair.push(value?);
+                Some(c_string(&pair))
+            })
+            .collect();
+        let with_end = |strings: &[CString]| -> Vec<*const libc::c_char> {
+            strings
+                .iter()
+                .map(|string| string.as_ptr())
+                .chain(std::iter::once(std::ptr::null()))
+                .collect()
+        };
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` writes the struct it is given.
+        let read = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+        assert!(read == 0, "the descriptor limit");
+        Self {
+            descriptors: libc::c_int::try_from(limit.rlim_cur)
+                .unwrap_or(libc::c_int::MAX)
+                .clamp(1024, 65_536),
+            program: c_string(command.get_program()),
+            directory: c_string(install.work_dir().as_os_str()),
+            argv: with_end(&arguments),
+            envp: with_end(&environment),
+            _arguments: arguments,
+            _environment: environment,
+        }
+    }
+
+    /// Replace the process with the command. Only `close`, `chdir`, `execve` and `_exit`, each
+    /// async-signal-safe, which is what makes this callable in the child of a threaded process.
+    /// Every descriptor past the three standard ones is closed first: a master another test
+    /// opened between its `forkpty` and its close-on-exec flag would otherwise ride along.
+    ///
+    /// # Safety
+    ///
+    /// Call only in a child just forked from this process; it never returns.
+    unsafe fn exec(&self) -> ! {
+        // SAFETY: the strings and pointer arrays were laid out before the fork and are
+        // NUL-terminated; nothing here allocates.
+        unsafe {
+            for descriptor in 3..self.descriptors {
+                libc::close(descriptor);
+            }
+            libc::chdir(self.directory.as_ptr());
+            libc::execve(
+                self.program.as_ptr(),
+                self.argv.as_ptr(),
+                self.envp.as_ptr(),
+            );
+            libc::_exit(127)
+        }
+    }
 }
 
 /// Read the master side into a terminal emulator, snapshotting the screen and sending the next
@@ -1049,13 +1143,45 @@ fn esc_stops_a_running_shell_command() {
 
 /// The terminal going away is a hangup: the screen leaves the way it does on a key, so the
 /// `!command` it was running dies with it rather than being left behind, and the process ends on
-/// its own exit, the interrupted one, rather than aborting on the dead terminal; whichever of
-/// the signal and the dead read notices first.
+/// its own exit, the interrupted one, rather than aborting on the dead terminal.
 #[test]
 fn a_hangup_kills_the_running_command_and_leaves() {
+    let (exit, survivors, screens) = terminal_taken_away(false);
+    assert_eq!(
+        exit,
+        Some(130),
+        "the hangup is an interrupted leave: {screens:#?}"
+    );
+    assert!(survivors.is_empty(), "the command died with the screen");
+}
+
+/// The same end when no signal says the terminal is gone and only the reads and writes do, which
+/// is the order macOS notices a closed pty in, and what a terminal held through another process
+/// looks like anywhere.
+#[test]
+fn a_terminal_that_dies_without_a_signal_leaves_the_same_way() {
+    let (exit, survivors, screens) = terminal_taken_away(true);
+    assert_eq!(
+        exit,
+        Some(130),
+        "the dead terminal is an interrupted leave: {screens:#?}"
+    );
+    assert!(survivors.is_empty(), "the command died with the screen");
+}
+
+/// Run the screen with a `!command` going, then close the terminal under it: the exit status it
+/// ends with (`None` when it had to be killed), the command's surviving pids, and the screens.
+/// With `detached`, the child lets go of the terminal as its controlling one first, so closing
+/// it sends no hangup and only the failing reads and writes tell.
+fn terminal_taken_away(detached: bool) -> (Option<i32>, Vec<i32>, Screens) {
     let install = screen_install("read", "", "");
     install.write_script(TWO_TURNS);
-    let marker = "sleep 300.321";
+    // One marker per variant, so neither test reads the other's command as its own.
+    let marker = if detached {
+        "sleep 300.322"
+    } else {
+        "sleep 300.321"
+    };
     let mut master: RawFd = -1;
     let size = libc::winsize {
         ws_row: ROWS,
@@ -1063,6 +1189,7 @@ fn a_hangup_kills_the_running_command_and_leaves() {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    let prepared = PreparedExec::meka(&install, &["-c"]);
     // SAFETY: as in `drive_run`.
     let pid = unsafe {
         libc::forkpty(
@@ -1074,16 +1201,25 @@ fn a_hangup_kills_the_running_command_and_leaves() {
     };
     assert!(pid >= 0, "forkpty failed");
     if pid == 0 {
-        let error = exec_meka(&install, &["-c"]);
-        eprintln!("exec failed: {error}");
-        std::process::exit(127);
+        // SAFETY: the child of a threaded process: async-signal-safe calls only. A session leader
+        // letting go of its terminal is sent the hangup itself, so it is ignored for that moment.
+        unsafe {
+            if detached {
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                libc::ioctl(0, libc::TIOCNOTTY);
+                libc::signal(libc::SIGHUP, libc::SIG_DFL);
+            }
+            prepared.exec()
+        }
     }
+    keep_master_here(master);
     let (screens, ..) = pump(master, &[&format!("!{marker}")], false);
     assert!(
         !processes_running(marker).is_empty(),
-        "the command runs before the hangup: {screens:#?}"
+        "the command runs before the terminal goes: {screens:#?}"
     );
-    // SAFETY: closing the master is the hangup; the child is reaped here and nowhere else.
+    // SAFETY: closing the master takes the terminal away; the child is reaped here and nowhere
+    // else.
     let exit = unsafe {
         libc::close(master);
         let mut status = 0;
@@ -1111,12 +1247,7 @@ fn a_hangup_kills_the_running_command_and_leaves() {
             libc::kill(*survivor, libc::SIGKILL);
         }
     }
-    assert_eq!(
-        exit,
-        Some(130),
-        "the hangup is an interrupted leave: {screens:#?}"
-    );
-    assert!(survivors.is_empty(), "the command died with the screen");
+    (exit, survivors, screens)
 }
 
 /// The pids whose command line carries `marker`.
