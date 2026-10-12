@@ -345,7 +345,7 @@ pub(crate) enum SourceLock {
 ///
 /// A session expires as a tree. `parent_session_id` carries `ON DELETE CASCADE`, so deleting a
 /// root takes every sub-agent under it, and every other door that acts on a tree (the cascade of
-/// `session delete`, an export, `agent_delete`) treats root plus children as one unit; the sweep
+/// `session remove`, an export, `agent_delete`) treats root plus children as one unit; the sweep
 /// selects roots alone and lets the cascade do what the caller would read as one deletion. A
 /// sub-agent's `updated_at` moves only on its own turns, which run inside its root's, so the
 /// root's recency stands for the tree's: an old child under a kept root is kept, and a child
@@ -911,7 +911,7 @@ impl Store {
     /// nobody. [`Self::delete_all_sessions`] enumerates at delete time, so it lands inside that
     /// window, takes the lock legitimately, and cascades the conversation away underneath the
     /// process creating it: the turn ends `FOREIGN KEY constraint failed` with the user's prompt
-    /// gone. A targeted `meka session delete <id>` cannot, because its id list is gathered before
+    /// gone. A targeted `meka session remove <id>` cannot, because its id list is gathered before
     /// the creator exists, which is what identifies the window as belonging to creation rather
     /// than to deletion.
     ///
@@ -1203,7 +1203,7 @@ impl Store {
         // Locked before the row, like every other door that mints one, and the exposure here is
         // not the microsecond window the others have: an unlocked sub-agent row sits claimable for
         // the whole of the sub-agent's run, which is seconds to minutes. A concurrent
-        // `meka session delete --all` enumerates it, takes the lock nobody holds, and cascades it
+        // `meka session remove --all` enumerates it, takes the lock nobody holds, and cascades it
         // away; the sub-agent's next message insert then dies on `FOREIGN KEY constraint failed`
         // with its work gone.
         let lock = self.claim_a_fresh_id(session_id);
@@ -1367,7 +1367,7 @@ impl Store {
     /// session; that is refused as [`MekaError::SessionLocked`]. The copy's, taken before its row
     /// lands: committing first and locking after is the same commit-then-claim window
     /// [`Self::create_session_locked`] closes, in the same width, where a concurrent
-    /// `meka session delete --all` enumerates the copy, takes the lock nobody holds, and deletes
+    /// `meka session remove --all` enumerates the copy, takes the lock nobody holds, and deletes
     /// it, after which the fork locks the vanished id successfully and its next turn dies on a
     /// foreign-key violation. Under ACP it is quieter still: `load_events` returns empty and the
     /// editor is handed a silently blank fork.
@@ -1827,7 +1827,7 @@ impl Store {
         }
         // Each root of the tree is claimed before its row lands and released once it has, the
         // ordering every door that mints a session keeps (see `claim_a_fresh_id`): a row visible
-        // before its lock is one a concurrent `meka session delete --all` enumerates and sweeps.
+        // before its lock is one a concurrent `meka session remove --all` enumerates and sweeps.
         // Only the parentless rows, because a sub-agent's row is never opened on its own. Nothing
         // here keeps the claims afterwards: an import hands back an id, not a live session.
         //
@@ -3497,9 +3497,9 @@ impl Store {
 
     /// Delete a session, refusing with [`MekaError::SessionLocked`] if another meka process has it
     /// or a sub-agent under it open. The door for a caller acting on a session it does not hold:
-    /// `meka session delete`, and the servers' deletes of a session they have not loaded.
+    /// `meka session remove`, and the servers' deletes of a session they have not loaded.
     ///
-    /// Without it, `meka session delete <id>` against a live screen exits 0 having said nothing at
+    /// Without it, `meka session remove <id>` against a live screen exits 0 having said nothing at
     /// all (the count goes through `tracing::info!`, invisible at the default level) while the row
     /// and its messages cascade away underneath a conversation that carries on until its next turn
     /// fails on a foreign-key violation. The sub-agents are locked too, since the cascade takes
@@ -6470,7 +6470,7 @@ mod tests {
 
     /// A session another meka process has open is not one this process may delete.
     ///
-    /// `meka session delete <id>` against a live screen exited 0 having said nothing at all: the
+    /// `meka session remove <id>` against a live screen exited 0 having said nothing at all: the
     /// count goes through `tracing::info!`, invisible at the default level. The row and its
     /// messages cascaded away underneath a conversation that carried on as though nothing had
     /// happened, until its next turn ran against the provider and *then* failed on a foreign-key
@@ -6600,7 +6600,7 @@ mod tests {
 
     /// A session's lock is taken *before* its row is written, not after.
     ///
-    /// The window between the two is what `meka session delete --all` fell into: it enumerates
+    /// The window between the two is what `meka session remove --all` fell into: it enumerates
     /// `SELECT id FROM sessions` at delete time, so it saw a row committed microseconds earlier
     /// whose creator had not yet reached `flock`, took the lock nobody held, and cascaded the
     /// conversation away underneath the process creating it. A contention run measured **42 lost
@@ -6658,7 +6658,7 @@ mod tests {
     ///
     /// The copy's id is claimed before its row exists, for the reason
     /// [`Store::create_session_locked`] does it: a row committed ahead of its lock is one a
-    /// concurrent `meka session delete --all` enumerates and sweeps, after which the fork locks
+    /// concurrent `meka session remove --all` enumerates and sweeps, after which the fork locks
     /// the vanished id and hands its caller a session whose next turn dies on a foreign key.
     ///
     /// That ordering used to be read off the file the claim left behind when the insert failed,
@@ -7047,7 +7047,7 @@ mod tests {
         );
     }
 
-    /// `meka session delete --all` is the same rule with no window: everything except what someone
+    /// `meka session remove --all` is the same rule with no window: everything except what someone
     /// else is using.
     #[tokio::test]
     async fn delete_all_spares_a_session_that_is_open() {

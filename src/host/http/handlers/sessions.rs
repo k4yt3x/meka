@@ -335,7 +335,7 @@ pub(crate) async fn create_session(
             .to_string(),
     };
     // Created and locked in one step, the lock taken *before* the row exists. A row committed
-    // ahead of its lock is visible to `meka session delete --all`, which enumerates at delete
+    // ahead of its lock is visible to `meka session remove --all`, which enumerates at delete
     // time, takes the lock nobody holds yet, and cascades the session away underneath this
     // handler. See `Store::create_session_locked`.
     let (created, created_lock) = state
@@ -547,7 +547,7 @@ pub(crate) async fn fork_session(
     // The locked fork, as the screen's and ACP's: the copy's lock is taken before its row exists,
     // and handed to re-attach below, which cannot take a lock this process already holds (`flock`
     // is per open file description). Committing first and locking after left a window in which
-    // `meka session delete --all` enumerated the copy, took the lock nobody held, and deleted it,
+    // `meka session remove --all` enumerated the copy, took the lock nobody held, and deleted it,
     // after which re-attach built a runtime on a vanished row and the first turn died on a foreign
     // key.
     //

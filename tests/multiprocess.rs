@@ -479,7 +479,7 @@ fn a_session_is_locked_while_its_first_turn_runs() {
     );
 }
 
-/// `meka session delete` against a conversation another process is having.
+/// `meka session remove` against a conversation another process is having.
 ///
 /// The measured behavior: rc=0 with no output whatsoever -- the count goes through
 /// `tracing::info!`, invisible at the default level -- while the row and its messages cascaded away
@@ -497,7 +497,7 @@ fn a_second_process_cannot_delete_a_session_in_use() {
     });
     let session = cluster.only_session();
 
-    let deleted = cluster.run(&["session", "delete", &session]);
+    let deleted = cluster.run(&["session", "remove", &session]);
     let refusal = String::from_utf8_lossy(&deleted.stderr).to_string();
 
     assert!(
@@ -1047,7 +1047,7 @@ fn a_fresh_run_still_stops_when_no_default_can_be_picked() {
     );
 }
 
-/// `DELETE /v1/sessions/{id}` goes through the same locked door `meka session delete` does: a
+/// `DELETE /v1/sessions/{id}` goes through the same locked door `meka session remove` does: a
 /// session another process is mid-turn on is refused with 409 rather than cascaded away under it.
 #[test]
 fn an_http_delete_cannot_take_a_session_another_process_holds() {

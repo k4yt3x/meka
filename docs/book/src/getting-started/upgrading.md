@@ -10,6 +10,13 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.72 to 0.73
+
+**`meka session delete` is `meka session remove`.** The session command now uses the verb every
+other object command uses; its flags are unchanged. A script or a cron line that runs
+`meka session delete --older-than-days <DAYS>` changes the one word. Tool names such as
+`agent_delete`, the HTTP `DELETE` routes and `[serve].delete_on_idle` keep theirs.
+
 ## 0.71 to 0.72
 
 **The interactive terminal is a screen, not a line editor.** `meka` without `--oneshot` now takes

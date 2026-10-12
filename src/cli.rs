@@ -148,16 +148,16 @@ pub(crate) enum SessionAction {
         #[arg(long, default_value = "markdown")]
         format: SessionExportFormat,
     },
-    /// Delete sessions by id, by age, or all of them
-    Delete {
+    /// Remove sessions by id, by age, or all of them
+    Remove {
         /// Session ids, or any unique prefix of each
         session_ids: Vec<String>,
-        /// Delete all sessions
+        /// Remove all sessions
         // Conflicts with explicit ids: naming some sessions and then asking for every session is
         // two different requests, and running the wider one makes the narrower one look honored.
         #[arg(long, conflicts_with_all = ["older_than_days", "session_ids"])]
         all: bool,
-        /// Delete sessions not updated in this many days
+        /// Remove sessions not updated in this many days
         // Conflicts with explicit ids rather than ignoring them: a listed session younger than the
         // window would otherwise be silently spared.
         #[arg(
@@ -1595,45 +1595,45 @@ mod tests {
     }
 
     #[test]
-    fn cli_session_delete_all_subcommand() {
-        let cli = Cli::parse_from(["meka", "session", "delete", "--all"]);
+    fn cli_session_remove_all_subcommand() {
+        let cli = Cli::parse_from(["meka", "session", "remove", "--all"]);
         match cli.command {
             Some(Command::Session {
                 action:
-                    SessionAction::Delete {
+                    SessionAction::Remove {
                         session_ids, all, ..
                     },
             }) => {
                 assert!(session_ids.is_empty());
                 assert!(all);
             }
-            other => panic!("expected session delete, got {other:?}"),
+            other => panic!("expected session remove, got {other:?}"),
         }
     }
 
     /// Naming sessions and then asking for every session are two different requests.
     ///
-    /// Taking both and quietly honoring the wider one would let `meka session delete "$ID" --all`
+    /// Taking both and quietly honoring the wider one would let `meka session remove "$ID" --all`
     /// with `$ID` unset delete the store and report the empty id as a failure: a complete success
     /// reported as an error, over work nobody asked for. Same reasoning as the `--older-than-days`
     /// conflicts beside it.
     #[test]
-    fn cli_session_delete_all_conflicts_with_explicit_ids() {
+    fn cli_session_remove_all_conflicts_with_explicit_ids() {
         let id = "550e8400-e29b-41d4-a716-446655440000";
         assert!(
-            Cli::try_parse_from(["meka", "session", "delete", id, "--all"]).is_err(),
+            Cli::try_parse_from(["meka", "session", "remove", id, "--all"]).is_err(),
             "naming an id and asking for --all must be refused"
         );
     }
 
     /// The manual counterpart to `[session].retention`, so it has to actually parse.
     #[test]
-    fn cli_session_delete_older_than_days() {
-        let cli = Cli::parse_from(["meka", "session", "delete", "--older-than-days", "90"]);
+    fn cli_session_remove_older_than_days() {
+        let cli = Cli::parse_from(["meka", "session", "remove", "--older-than-days", "90"]);
         match cli.command {
             Some(Command::Session {
                 action:
-                    SessionAction::Delete {
+                    SessionAction::Remove {
                         session_ids,
                         all,
                         older_than_days,
@@ -1643,7 +1643,7 @@ mod tests {
                 assert!(!all);
                 assert_eq!(older_than_days, Some(90));
             }
-            other => panic!("expected session delete, got {other:?}"),
+            other => panic!("expected session remove, got {other:?}"),
         }
     }
 
@@ -1651,18 +1651,18 @@ mod tests {
     /// disagree, and explicit ids because a listed session younger than the window would be
     /// silently spared while the user watched a different count come back.
     #[test]
-    fn cli_session_delete_older_than_days_conflicts() {
+    fn cli_session_remove_older_than_days_conflicts() {
         let id = "550e8400-e29b-41d4-a716-446655440000";
         for arguments in [
             vec![
                 "meka",
                 "session",
-                "delete",
+                "remove",
                 "--older-than-days",
                 "90",
                 "--all",
             ],
-            vec!["meka", "session", "delete", "--older-than-days", "90", id],
+            vec!["meka", "session", "remove", "--older-than-days", "90", id],
         ] {
             assert!(
                 Cli::try_parse_from(&arguments).is_err(),

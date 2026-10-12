@@ -215,15 +215,15 @@ retention = "30d"   # delete sessions not updated in 30 days, at startup
 
 With that set, meka deletes matching sessions when the agent starts and says so at `warn` level, so a deletion you configured is still a deletion you see. A session another meka process has open is spared, and so is the one you are resuming with `-c` or `-r`, however old it is; so is a [pinned](#pinning-a-session) session, and one with a scheduled job ahead of it. Unset (the default) keeps everything forever.
 
-To prune on demand instead, delete on your own schedule:
+To prune on demand instead, remove on your own schedule:
 
 ```bash
-meka session delete --older-than-days 90   # same window, run when you choose
-meka session delete <id> [<id>…]           # specific sessions
-meka session delete --all                  # everything
+meka session remove --older-than-days 90   # same window, run when you choose
+meka session remove <id> [<id>…]           # specific sessions
+meka session remove --all                  # everything
 ```
 
-Deleting a session also removes its messages, scratchpad entries, and any sub-agent children.
+Removing a session takes its messages, scratchpad entries, and any sub-agent children with it.
 
 A session is locked from the moment it exists: the lock is taken before the row is written, so a sweep in another terminal cannot catch it in between. That holds for new sessions, for sub-agent sessions, for forks made from any surface, and for the root of an imported archive while it is written. Copying a conversation holds it still too: every fork door (`meka session fork`, `/fork`, `POST /v1/sessions/{id}/fork`, ACP `session/fork`) and `meka session export` refuse a session another process has open, because a copy taken mid-turn ends on a user message the model never answered and restores as an unusable session. `meka session rewind` has always done this.
 
@@ -356,7 +356,7 @@ a1b2c3d4  2026-03-13 09:30 +00:00  personal  Fix the login page CSS
 
 The `ID` column shows as much of each id as distinguishes it from the others on screen, widening only
 if two would otherwise read the same. Every command that takes a session id (`meka -r`, `export`,
-`show`, `fork`, `rewind`, `delete`) accepts any unique prefix, so what you see is normally what
+`show`, `fork`, `rewind`, `remove`) accepts any unique prefix, so what you see is normally what
 you retype. An ambiguous prefix is refused and every match listed, rather than acted on.
 
 Uniqueness is computed over the rows *on screen*, while the commands resolve against every session
@@ -441,10 +441,10 @@ does not reshuffle as you use them; unpin and pin again to move one to the top. 
 show` prints when a session was pinned, the JSON forms carry it as `pinned_at`, and the listing
 marks the title with `*`.
 
-A pin is also a keep: the `[session].retention` sweep and `meka session delete --older-than-days`
+A pin is also a keep: the `[session].retention` sweep and `meka session remove --older-than-days`
 leave a pinned session alone whatever its age. A session expires as a tree, by the age of its
 root: a pin or a scheduled job anywhere in the tree keeps the root and every sub-agent under it,
-and a root that expires takes its sub-agents with it. `meka session delete <id>` and `--all` still
+and a root that expires takes its sub-agents with it. `meka session remove <id>` and `--all` still
 do what they say. Like a title, a pin does not move `updated_at` and does not change which session `meka
 -c` continues. A fork is a new session and starts unpinned; an export carries the pin.
 
@@ -605,34 +605,34 @@ Nothing outside those two shapes degrades at all, because a degraded retry that 
 
 One cause of that refusal has its own fix. A session recorded by 0.41 can hold a `tool_result` whose content is a bare JSON string, a shape meka does not read: the row is dropped as the session loads, which leaves the `tool_use` it answered unanswered, and the provider rejects the next turn over the mismatch. Run the [one-shot upgrade script](../getting-started/upgrading.md), which converts those rows in place, rather than rewinding past a turn you wanted to keep.
 
-## Deleting sessions
+## Removing sessions
 
-Delete specific sessions by id:
+Remove specific sessions by id:
 
 ```bash
-meka session delete 550e8400-e29b-41d4-a716-446655440000
+meka session remove 550e8400-e29b-41d4-a716-446655440000
 ```
 
-Delete multiple sessions at once:
+Remove multiple sessions at once:
 
 ```bash
-meka session delete 550e8400-e29b-41d4-a716-446655440000 a1b2c3d4-e5f6-7890-abcd-ef1234567890
+meka session remove 550e8400-e29b-41d4-a716-446655440000 a1b2c3d4-e5f6-7890-abcd-ef1234567890
 ```
 
-Delete every session not updated in the last N days:
+Remove every session not updated in the last N days:
 
 ```bash
-meka session delete --older-than-days 90
+meka session remove --older-than-days 90
 ```
 
 This is the manual counterpart to [`retention`](#history-retention), and spares what the sweep
 spares: a pinned session, and one with a scheduled job ahead of it. It can't be combined with ids
 or `--all`, and `0` is refused: it would match everything.
 
-Delete all sessions:
+Remove all sessions:
 
 ```bash
-meka session delete --all
+meka session remove --all
 ```
 
 `--all` takes no ids of its own: naming some sessions and then asking for every session are two

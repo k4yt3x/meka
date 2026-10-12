@@ -77,7 +77,7 @@ pub(crate) async fn fork_and_lock(
     source: uuid::Uuid,
 ) -> anyhow::Result<ForkHandoff> {
     // Locked before the copy's row exists, not after: a row committed ahead of its lock is one a
-    // concurrent `session delete --all` enumerates and deletes, after which this function would
+    // concurrent `session remove --all` enumerates and deletes, after which this function would
     // lock the vanished id successfully and hand the screen a session whose next turn dies on a
     // foreign-key violation. See `Store::fork_session_locked`.
     // The screen holds the source it is forking, so the source stands still by construction and a

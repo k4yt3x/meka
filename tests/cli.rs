@@ -85,7 +85,7 @@ fn session_subcommand_help_lists_actions() {
         "meka session --help exited non-zero"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for expected in ["list", "export", "delete"] {
+    for expected in ["list", "export", "remove"] {
         assert!(
             stdout.contains(expected),
             "session --help missing action '{expected}':\n{stdout}"
@@ -194,7 +194,7 @@ fn a_session_id_that_names_nothing_is_refused_by_name_on_every_door() {
         vec!["session", "export", id, "-o", "-"],
         vec!["session", "rewind", id, "-n", "1"],
         vec!["session", "fork", id],
-        vec!["session", "delete", id],
+        vec!["session", "remove", id],
     ] {
         let output = run_isolated(&install, &arguments);
         assert!(

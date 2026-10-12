@@ -180,8 +180,8 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | What forgets the conversation's old shape when the log is rewritten | `Agent::reset_conversation_markers`: the accepted-prefix marker, the world snapshot, the read tracker, the schema advisories, the gauge and its row | compaction, screen `/rewind`, HTTP `POST /rewind` |
 | Whether a turn runs on the profile its row names | `host::apply_recorded_profile`, under the conversation lock | ACP `session/prompt` and its fires, HTTP `POST /turn`, `POST /compact` and its fires, through `HostHooks::prepare` |
 | Whether a session is a sub-agent's | `store::spawned_session_sql` in SQL; `SpawnTerms::describe` for the sentence every refusal starts with | every listing, `meka -c`, session search, the inbox driver; the refusals of the HTTP fork, the ACP fork, `POST /responses`, a job on it, and every builder |
-| What the retention sweep may take | `EXPIRABLE`: a root by its own age, spared while a pin or a job sits anywhere in its tree | the retention sweep, `meka session delete --older-than-days` |
-| What a delete locks | `Store::lock_tree`: the session and every sub-agent under it, since the cascade takes them | the sweep and `--all` (over roots, through `delete_the_unattached_among`), `session delete <id>`, `agent_delete`, the servers' deletes of a session they have not loaded |
+| What the retention sweep may take | `EXPIRABLE`: a root by its own age, spared while a pin or a job sits anywhere in its tree | the retention sweep, `meka session remove --older-than-days` |
+| What a delete locks | `Store::lock_tree`: the session and every sub-agent under it, since the cascade takes them | the sweep and `--all` (over roots, through `delete_the_unattached_among`), `session remove <id>`, `agent_delete`, the servers' deletes of a session they have not loaded |
 | What `${VAR}` means in `config.toml` | `config::expand_env_vars`, one grammar (`${VAR}`, `${VAR:-default}`; an unclosed `${`, an empty name or a nested default is reported as malformed and left as written); what a miss or a malformed reference costs is the caller's: `[serve]` refuses, an MCP server is refused when it sits in `args`, `env`, `url` or `headers`, and `mcp add` skips its probe | `[serve]` tokens and URLs, every MCP server field |
 | What a tool call's arguments are, and whether it detaches | `tools::admit_arguments` | dispatch, ahead of every tool |
 | Where a `MEKA_*` variable is read | `ResolvedConfig::resolve` in `config.rs`, with `paths.rs` for the two that locate the config file; `tests/layering.rs` keeps every other file out through its `ENVIRONMENT_READERS` ledger | every operational override: the permission level, the standing instructions, the sandbox backend, the render mode, the MCP tool timeout, and the debug-only mock switches |
@@ -262,7 +262,7 @@ with `--oneshot`.
 | New session | at launch | at launch | `session/new` | `POST /v1/sessions` | no |
 | Resume | `-c`, `-r` at launch | `-c`, `-r` at launch | `session/load`, `session/resume` | implicit re-attach of a dormant id on any request | no |
 | Fork | `/fork` | no | `session/fork` | `POST /{id}/fork` | `fork` |
-| Delete | no | no | no (`session/close` releases only) | `DELETE /{id}` | `delete` |
+| Delete | no | no | no (`session/close` releases only) | `DELETE /{id}` | `remove` |
 | Rewind | `/rewind` | no | no | `POST /{id}/rewind` | `rewind` |
 | Compact | `/compact` | automatic only | automatic only | `POST /{id}/compact` | no |
 | Export | `/export` (Markdown) | no | no | `GET /{id}/export` | `export` |

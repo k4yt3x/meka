@@ -373,7 +373,7 @@ impl Store {
     /// Merge the index's segments so the words of deleted messages leave its storage, for the
     /// doors that delete in bulk. FTS5 keeps a deleted row out of every query at once but keeps
     /// its postings in the segments until a merge, and a copy of the store taken meanwhile
-    /// carries them; the sweeps and `meka session delete` end with this so that copy does not.
+    /// carries them; the sweeps and `meka session remove` end with this so that copy does not.
     pub(crate) async fn optimize_search_index(&self) -> Result<()> {
         self.connection
             .call(|connection| {

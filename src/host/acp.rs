@@ -370,7 +370,7 @@ pub(crate) async fn run_acp(
                         }
                     };
                     // Created and locked in one step, the lock taken *before* the row exists: a
-                    // row committed ahead of its lock is one `meka session delete --all` can
+                    // row committed ahead of its lock is one `meka session remove --all` can
                     // enumerate and sweep out from under this handler. See
                     // `Store::create_session_locked`.
                     let (session_uuid, session_lock) = match state

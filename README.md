@@ -115,7 +115,7 @@ Conversations are persisted in the store, a local SQLite file, and can be resume
 
 - `meka -c` continues the last session
 - `meka -r <id>` resumes a session by id, or by any unique prefix of one
-- `meka session list` / `delete` / `export` manage and export past sessions
+- `meka session list` / `remove` / `export` manage and export past sessions
 - `/compact`, `/fork`, `/rewind`, `/export` act on the current session from the shell
 
 ## Shell escape

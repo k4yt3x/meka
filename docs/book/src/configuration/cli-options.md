@@ -56,9 +56,9 @@ meka session export <SESSION_ID> [-o <OUTPUT>] [--format <FORMAT>]   # markdown 
 meka session import <INPUT>                           # a JSON export; - reads stdin
 meka session fork <SESSION_ID>                        # prints the copy's id
 meka session rewind <SESSION_ID> [-n <TURNS>]         # default 1
-meka session delete <SESSION_IDS>...
-meka session delete --older-than-days <DAYS>
-meka session delete --all
+meka session remove <SESSION_IDS>...
+meka session remove --older-than-days <DAYS>
+meka session remove --all
 ```
 
 See [Sessions](../usage/sessions.md#exporting-a-session) for details.

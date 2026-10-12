@@ -719,7 +719,7 @@ impl Tool for AgentSpawnTool {
                 message: format!("failed to create sub-agent session: {error}"),
             })?;
         // Held for the whole of the worker's run, then released with this scope. Unlocked, a
-        // sub-agent's row can be taken by a concurrent `meka session delete --all` and its
+        // sub-agent's row can be taken by a concurrent `meka session remove --all` and its
         // conversation cascaded away mid-turn. A failure to claim is a warning rather than a
         // refusal, matching the root agent's own creation path: the id is one nobody else can be
         // holding, so the only way here is a filesystem problem, and refusing to spawn over that
@@ -1503,7 +1503,7 @@ impl Tool for AgentFollowupTool {
         };
         // Held for this turn, as `agent_spawn` holds it for the spawn. A follow-up runs a full turn
         // against a row nothing else claims, so without this the worker would sit unlocked for
-        // seconds to minutes and a concurrent `meka session delete --all` could take it and cascade
+        // seconds to minutes and a concurrent `meka session remove --all` could take it and cascade
         // the conversation away mid-run.
         //
         // Taken ahead of the build and the hydration below, so the conversation this turn loads is
@@ -3203,7 +3203,7 @@ mod tests {
 
     /// A follow-up holds the worker's session for the length of its turn: it runs a full turn
     /// against a row nothing else claims, for seconds to minutes, and unlocked, a concurrent `meka
-    /// session delete --all` would take the lock nobody holds and cascade the conversation away,
+    /// session remove --all` would take the lock nobody holds and cascade the conversation away,
     /// so the follow-up's next message insert would die on a foreign-key violation with the
     /// worker's output lost.
     ///

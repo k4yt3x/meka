@@ -1189,7 +1189,7 @@ Delete sessions not updated for longer than this, at agent startup. A duration s
 
 Three kinds of session are spared whatever their timestamp says. A session another meka process has open is skipped, and the sweep reports how many: only turns bump `updated_at`, and resuming does not, so an interactive session left open past the window looks expired while somebody is in front of it. A [pinned](../usage/sessions.md#pinning-a-session) session is never expired, nor is any parent of one: a pin is you saying keep this. And a session with a scheduled job still ahead of it is never expired, nor is any parent of one: a gated watcher that evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and deleting it would take the schedule with it.
 
-**Default: unset, meaning nothing is deleted.** `"0s"` is refused at startup, since it would delete everything on every launch. Conversation history isn't reproducible, so meka keeps it until told otherwise. Use `meka session delete --older-than-days <DAYS>` to prune manually instead.
+**Default: unset, meaning nothing is deleted.** `"0s"` is refused at startup, since it would delete everything on every launch. Conversation history isn't reproducible, so meka keeps it until told otherwise. Use `meka session remove --older-than-days <DAYS>` to prune manually instead.
 
 ```toml
 [session]

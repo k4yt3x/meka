@@ -125,7 +125,7 @@ pub(crate) async fn run_session_subcommand(
             export_session(store, session_id, output.as_deref(), *format).await?;
             Ok(())
         }
-        cli::SessionAction::Delete {
+        cli::SessionAction::Remove {
             session_ids,
             all,
             older_than_days,
@@ -146,7 +146,7 @@ pub(crate) async fn run_session_subcommand(
             }
             // A name that resolved to nothing is a refusal like any other, and has to reach the
             // exit code the same way: `delete_sessions` never learns these ids, so leaving it to
-            // report them exited 0 on `meka session delete <good> <typo>` and a script could not
+            // report them exited 0 on `meka session remove <good> <typo>` and a script could not
             // tell the typo from success. Clap cannot catch this, because a prefix is not a `Uuid`,
             // so the check lives here.
             //
@@ -604,7 +604,7 @@ pub(crate) async fn import_session(
     Ok(())
 }
 
-/// Delete the named sessions, every session, or those not updated for `older_than_days`.
+/// Remove the named sessions, every session, or those not updated for `older_than_days`.
 pub(crate) async fn delete_sessions(
     store: &Store,
     session_ids: &[uuid::Uuid],
@@ -613,7 +613,7 @@ pub(crate) async fn delete_sessions(
 ) -> anyhow::Result<()> {
     if all {
         let sweep = store.delete_all_sessions().await?;
-        tracing::info!("deleted {deleted} session(s)", deleted = sweep.deleted);
+        tracing::info!("removed {deleted} session(s)", deleted = sweep.deleted);
         report_sessions_left_open(sweep);
         return Ok(());
     }
@@ -625,13 +625,13 @@ pub(crate) async fn delete_sessions(
         // Zero would sweep everything, which is `--all` by another name and far too easy to type
         // by accident when you meant "today's".
         if days == 0 {
-            anyhow::bail!("`--older-than-days 0` would delete every session; use `--all` for that");
+            anyhow::bail!("`--older-than-days 0` would remove every session; use `--all` for that");
         }
         let sweep = store
             .delete_expired_sessions(std::time::Duration::from_secs(days.saturating_mul(86_400)))
             .await?;
         tracing::info!(
-            "deleted {deleted} session(s) not updated in {days} days",
+            "removed {deleted} session(s) not updated in {days} days",
             deleted = sweep.deleted
         );
         report_sessions_left_open(sweep);
@@ -664,7 +664,7 @@ pub(crate) async fn delete_sessions(
                 refused.push(*session_id);
             }
             Err(error) => {
-                crate::streams::write_stderr_line(format!("Cannot delete {session_id}: {error}"));
+                crate::streams::write_stderr_line(format!("Cannot remove {session_id}: {error}"));
                 refused.push(*session_id);
             }
         }
@@ -673,7 +673,7 @@ pub(crate) async fn delete_sessions(
     if deleted > 0 {
         store.optimize_search_index().await?;
     }
-    tracing::info!("deleted {deleted} session(s)");
+    tracing::info!("removed {deleted} session(s)");
     // A non-zero exit, because the user named these and a silent skip is indistinguishable from
     // success. The per-id reasons are already on stderr; this is what a script reads.
     if !refused.is_empty() {
@@ -682,7 +682,7 @@ pub(crate) async fn delete_sessions(
         // them open" would report a full disk as a busy session. The per-id lines above carry the
         // real reason; this is the summary a script reads.
         anyhow::bail!(
-            "{} of {} session(s) were not deleted; see the errors above",
+            "{} of {} session(s) were not removed; see the errors above",
             refused.len(),
             session_ids.len()
         );
