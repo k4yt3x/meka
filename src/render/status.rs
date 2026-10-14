@@ -7,29 +7,6 @@ use crate::streams::write_stderr_line;
 pub(crate) fn render_session_id(label: &str, id: &str) {
     write_stderr_line(format!("{label}: {id}").with(Color::DarkGrey));
 }
-/// The per-turn token-usage line, `[in 12.3k / cache hit 96% / out 1.2k]`, dimmed. `in` is the
-/// total of all three input-token tiers (live, cache-write, cache-read), and the hit rate is
-/// `cache_read / in`.
-pub(crate) fn render_token_usage(usage: &crate::stats::TokenUsage) {
-    let total_in = usage
-        .input_tokens
-        .saturating_add(usage.cache_creation_input_tokens)
-        .saturating_add(usage.cache_read_input_tokens);
-    let cache_hit_pct = if total_in == 0 {
-        0
-    } else {
-        ((usage.cache_read_input_tokens as f64) / (total_in as f64) * 100.0).round() as u64
-    };
-    write_stderr_line(
-        format!(
-            "[in {} / cache hit {}% / out {}]",
-            format_token_count(total_in),
-            cache_hit_pct,
-            format_token_count(usage.output_tokens),
-        )
-        .with(Color::DarkGrey),
-    );
-}
 /// The resolved model parameters shown at the top of the `/status` report, borrowed from the active
 /// config plus the provider's settled effort. All optional so a mis-selected profile still renders.
 pub(crate) struct ModelStatus<'a> {

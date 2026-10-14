@@ -346,9 +346,8 @@ arguments to scroll through, and that much to read is itself the signal to deny.
 When a call is too much to read, **denying costs nothing**: say no, inspect the file or the
 session with `meka session export`, and let the agent retry.
 
-This is deliberately unaffected by [`display.tool_params`](../configuration/config-file.md#displaytool_params),
-which controls the passive indicator. Turning that off for a quieter scrollback does not make your
-approval prompts show less.
+This is deliberately more than a call's row shows: the row is a notification, the prompt is a
+decision, and a collapsed row does not make your approval prompts show less.
 
 One consequence worth knowing: if the model passes a secret as a tool argument, an approval prompt
 puts it on screen. That is the correct trade at the moment you are authorizing the call, but it does

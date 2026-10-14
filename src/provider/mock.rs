@@ -49,7 +49,7 @@ pub(crate) enum MockEvent {
     ///
     /// Scriptable because the beta emits one of these from the *same* wire event that carries a
     /// visible delta, so the two alternate for the whole block. Nothing else can produce that
-    /// interleaving, and it is the shape `console::indicator_may_draw` exists for.
+    /// interleaving, which is the shape the screen's thinking row counts under.
     ThinkingProgress {
         /// `None` is the count the backend reports before the beta has one, and is the shape a
         /// script wants for "the block is running but nothing can be said about its size yet".

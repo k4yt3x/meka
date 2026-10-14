@@ -10,7 +10,6 @@ use uuid::Uuid;
 
 use crate::{
     checklist::ChecklistItem,
-    config::ToolParams,
     conversation::{ContentBlock, Role, ToolResultContent},
     frontend::{FrontendEvent, NoticeLevel},
     stats::TokenUsage,
@@ -28,10 +27,6 @@ const TOOL_TEXT_KEEP_BYTES: usize = 64 * 1024;
 pub(crate) struct Settings {
     pub(crate) show_session_id_on_create: bool,
     pub(crate) show_token_usage: bool,
-    /// `[thinking].show_content`: whether a thinking block starts expanded.
-    pub(crate) show_thinking: bool,
-    /// `[display].tool_params`: how much a collapsed tool call shows.
-    pub(crate) tool_params: ToolParams,
 }
 
 /// What a call changed on disk, as the tool reported it: the file, what it held before (`None`
@@ -246,17 +241,13 @@ impl Transcript {
             orphan_results: std::collections::HashMap::new(),
             tail: Vec::new(),
             settings,
-            thinking_shown: settings.show_thinking,
+            thinking_shown: false,
             tools_expanded: false,
             open_text: None,
             open_thinking: None,
             revision: 0,
             next_id: 0,
         }
-    }
-
-    pub(crate) fn settings(&self) -> Settings {
-        self.settings
     }
 
     /// The items on screen, oldest first: the window, then the tail while the window reaches it.
@@ -1238,8 +1229,6 @@ mod tests {
         Transcript::new(Settings {
             show_session_id_on_create: false,
             show_token_usage: false,
-            show_thinking: false,
-            tool_params: ToolParams::Summary,
         })
     }
 

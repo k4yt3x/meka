@@ -438,8 +438,8 @@ change meaning with `action` is a family that wants splitting.
 The tree reads top-down. `src/main.rs` dispatches to `host/` and `cli/`; the screen's slash commands
 run the `cli` handlers, so `host` sits above `cli`. Both call `agent`, which calls `tools`, which
 calls `provider` and `mcp`, which call `store`. `mcp` publishes its tools and never names a registry;
-`tools/mcp_adapter.rs` is where they become `Tool`s. `render` and `console` are reached only from
-`host`, `cli` and the frontend implementations; `streams` is the leaf that writes stderr for
+`tools/mcp_adapter.rs` is where they become `Tool`s. `render` is reached only from `host`, `cli`
+and the frontend implementations; `streams` is the leaf that writes stderr for
 everyone. `tests/layering.rs` ranks every top-level module and lets a `crate::<module>` edge point
 only at a strictly lower rank, so siblings cannot name each other. Its tolerated list is empty; one
 edge is by design, `tools/subagent` reaching up to `agent`, because a sub-agent is an agent. A new

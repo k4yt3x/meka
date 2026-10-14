@@ -108,9 +108,7 @@ highlighted and wrapped whole. Nothing in an expanded block is cut.
 - **Click** a block to toggle it. A block lights up under the mouse, which is the hint that it
   opens.
 - **Ctrl+T** shows or hides every thinking block at once; **Ctrl+O** expands or collapses every
-  tool call. [`thinking.show_content`](../configuration/config-file.md#thinkingshow_content) and
-  [`display.tool_params`](../configuration/config-file.md#displaytool_params) decide what a new
-  block starts as.
+  tool call.
 - **Alt+Up** and **Alt+Down** pick a block out from the keyboard, newest first; **Enter** or
   **Space** toggles the picked one, and **Esc** lets go of it.
 

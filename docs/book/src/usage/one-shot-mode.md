@@ -8,7 +8,7 @@ meka --oneshot -p "your prompt here"
 git diff | meka --oneshot -p -      # `-p -` reads the prompt from stdin
 ```
 
-The agent processes the prompt (including any tool calls), prints its response, and the process terminates. The session id is printed to stderr on exit. A run interrupted with Ctrl+C exits 130, whatever it had printed by then.
+The agent works through the prompt, tool calls included, and when the turn ends prints its answer: the last text block the model wrote, as markdown source, terminal or pipe alike, since the output is for the next tool rather than for reading. Nothing else is printed. The thinking, the tool calls and the rest of the process are logged, so `-v` shows them. A run interrupted with Ctrl+C exits 130, whatever it had printed by then.
 
 A prompt **without** `--oneshot` is not a one-shot run: it seeds the first turn and then leaves you on the screen, which is the right default when you are working interactively and the first thing you want is already in your shell history.
 
@@ -45,7 +45,7 @@ meka --oneshot --profile work -p "explain this codebase"
 # With workspace permission
 meka --oneshot --permission workspace -p "run 'cargo test' and summarize the results"
 
-# Disable streaming
+# Ask the provider for a whole reply rather than a stream
 meka --oneshot --no-stream -p "read README.md and summarize it"
 
 # Run one turn against an existing session
@@ -98,16 +98,11 @@ same flag and values, and `meka session export --format` takes `markdown` or `js
 
 One-shot mode creates a new session for each invocation, unless you point it at an existing one with `-c` (most recent) or `-r <SESSION>` (specific). Those run a single turn against that conversation and exit, which is the usual shape for scripting against a session built up earlier.
 
-The session id is printed to stderr when the run completes:
-
-```text
-Leaving session: 550e8400-e29b-41d4-a716-446655440000
-```
-
-You can resume this session later in interactive mode:
+No session id is printed. `--format json` carries it as `session_id`, `-v` logs it, and `-c`
+resumes the most recent session without naming it:
 
 ```bash
-meka -r 550e8400-e29b-41d4-a716-446655440000
+meka -c
 ```
 
 ## Piping

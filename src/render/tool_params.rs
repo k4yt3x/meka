@@ -1,295 +1,18 @@
-//! The tool indicator and the argument block under it: the name, the width budget, and the
-//! bounded rendering of a call's arguments for the indicator and for an approval prompt.
+//! A call's arguments as an indented block, every line of every argument wrapped to a width, for
+//! the approval prompt and the screen's expanded call.
 
 use super::*;
 
-/// Columns a tool name may occupy before it is elided.
-///
-/// The name is served first because it is the part that identifies the call. A truncated argument
-/// still conveys its gist (`Jane Street first mon...` is recognizably a search); a truncated name
-/// frequently conveys nothing, since MCP names share long prefixes. A genuine name is also not the
-/// model's to shape: a built-in's is one meka chose, and an MCP name is normalized at registration.
-/// This bound exists for the remaining case, a hallucinated name, which is unvalidated at render
-/// time and otherwise unbounded. No genuine name approaches it: built-ins stop at 25 columns
-/// (`mcp_resource_updates_list`) and `mcp__exa__web_search_exa` is 24.
-pub(super) const TOOL_NAME_MAX_WIDTH: usize = 64;
-
-/// Below this many columns for the argument there is nothing worth showing, so the indicator drops
-/// the parenthetical instead of printing an ellipsis in backticks.
+/// Below this many columns for the argument there is nothing worth showing, so the screen's call
+/// row drops the summary instead of printing an ellipsis.
 pub(super) const TOOL_ARGUMENT_FLOOR: usize = 8;
 
-/// Fixed chrome in `[tool NAME(`ARG`)]`.
-pub(super) const TOOL_INDICATOR_CHROME: usize = "[tool (``)]".len();
-
-/// Fixed chrome in `[tool NAME]`.
-pub(super) const TOOL_HEADER_CHROME: usize = "[tool ]".len();
-
-/// The bare `[tool X]` line, with no argument.
-///
-/// The name is sanitized like any other model-supplied string. It arrives verbatim off the provider
-/// stream, and while the registry is consulted just before the event is emitted, that lookup only
-/// fetches the schema: a name matching nothing still reaches here. (An MCP tool's name is
-/// separately normalized to `[A-Za-z0-9_-]` when its server is registered.)
-pub(super) fn tool_header(name: &str, width: usize) -> String {
-    let display_name = sanitize_to_line(name, usize::MAX);
-    format!(
-        "[tool {}]",
-        elide_to_width(
-            &display_name,
-            TOOL_NAME_MAX_WIDTH.min(width.saturating_sub(TOOL_HEADER_CHROME))
-        )
-    )
-}
-
-/// Compose the "[tool X(`arg`)]" indicator line.
-///
-/// The agent loop computes `display_summary` (via [`resolve_primary_param`] over the tool's JSON
-/// Schema) and passes it pre-resolved, so the frontend layer does not need the schema. See
-/// `FrontendEvent::ToolCallStarted` in `crate::frontend`.
-///
-/// Replayed history has no schemas to resolve against and passes `None`, which is why the fallback
-/// here exists: a built-in's primary parameter is known from its name alone, so a replayed
-/// `file_read` shows the path it showed live instead of a bare `[tool file_read]`. An MCP tool
-/// replayed from history does stay bare, which is the honest answer -- without its schema nothing
-/// says which of its arguments is the one worth showing.
-///
-/// The whole line is budgeted, not each part, so adjacent indicators that had to be cut end at the
-/// same column instead of wherever their own name happened to leave them. Within that budget the
-/// name is served first and the argument takes what is left; when what is left is not worth
-/// printing, the argument goes and the name stays whole.
-pub(super) fn tool_indicator_line(
-    name: &str,
-    input: &serde_json::Value,
-    display_summary: Option<&str>,
-    width: usize,
-) -> String {
-    let resolved = display_summary
-        .map(str::to_string)
-        .or_else(|| resolve_primary_param(name, input, None));
-    let Some(value) = resolved
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return tool_header(name, width);
-    };
-
-    let available = width.saturating_sub(TOOL_INDICATOR_CHROME);
-    // Sanitize before measuring, then truncate: the display width of the raw name is not the width
-    // of what gets printed once escapes and format characters are gone.
-    let display_name = sanitize_to_line(name, usize::MAX);
-    let display_name = elide_to_width(&display_name, TOOL_NAME_MAX_WIDTH.min(available));
-    let argument_budget = available.saturating_sub(display_width(&display_name));
-    if argument_budget < TOOL_ARGUMENT_FLOOR {
-        return tool_header(name, width);
-    }
-    format!(
-        "[tool {}(`{}`)]",
-        display_name,
-        // Elided from the middle, not the tail: the primary parameter is an identifier -- a path,
-        // a URL, a command -- and its end carries the filename or the destination.
-        elide_to_width(&sanitize_to_line(value, usize::MAX), argument_budget)
-    )
-}
-
-/// One level of nesting in a [`ToolParams::Full`] block.
+/// One level of nesting in an argument block.
 pub(super) const TOOL_PARAM_INDENT: &str = "  ";
 
-/// Columns a value keeps however long its key is, mirroring [`TOOL_NAME_MAX_WIDTH`]'s reasoning in
-/// the other direction: here the key is the label and the value is the substance.
+/// Columns a value keeps however long its key is: the key is the label and the value is the
+/// substance.
 pub(super) const TOOL_VALUE_MIN_WIDTH: usize = 16;
-
-/// How much of a call an argument block may show.
-///
-/// The same renderer serves two audiences with opposite needs. A tool indicator on a one-shot
-/// run's stream is a notification scrolling past, so it may trade completeness for brevity. The
-/// screen's expanded call and its approval prompt are there to be read whole, so they may not:
-/// what they hide is what you audit or authorize unseen.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct BlockLimits {
-    /// Source lines shown under one argument's key before the rest is summarized as a count.
-    ///
-    /// Counted in the value's own lines, so the `... N more lines` marker means what it says.
-    /// Capping rendered *rows* and reporting those as lines tells the reader of a 100-line file
-    /// that 108 lines were hidden.
-    pub(super) lines_per_argument: usize,
-    /// Rows one argument may occupy, however many lines or elements are under its key.
-    ///
-    /// [`lines_per_argument`](Self::lines_per_argument) does not bound this on its own. A
-    /// container has no lines to count and fans out one row per element; a wrapped string
-    /// turns one line into several. Without a separate bound the two caps composed by addition
-    /// and an argument could spend the whole block's budget by itself.
-    pub(super) rows_per_argument: usize,
-    /// Rows the block may already hold before the remaining arguments are dropped and named.
-    ///
-    /// Checked before an argument is rendered, never in the middle of one, so a block reaches at
-    /// most this plus [`rows_per_argument`](Self::rows_per_argument) plus the line that names what
-    /// went. That sum is the real ceiling, and it is the number the docs quote.
-    ///
-    /// Both audiences need a ceiling: "show everything" with none lets two hundred decoy arguments
-    /// push the real one off the top, which is the same outcome dropping was supposed to be worse
-    /// than, minus the marker that would have warned anybody.
-    pub(super) block_rows: usize,
-    /// Wrap a too-wide line onto the next row instead of cutting it.
-    pub(super) wrap: bool,
-}
-
-impl BlockLimits {
-    /// For `[display].tool_params = "full"`. A `file_write` carrying a whole source file has to be
-    /// readable as "this happened" without evicting the turn from scrollback; the untruncated text
-    /// is what `meka session export` is for.
-    ///
-    /// Worst case 93 rows: 59 already there, 33 for the argument that crossed the line, one naming
-    /// the rest.
-    pub(super) fn indicator() -> Self {
-        Self {
-            lines_per_argument: 30,
-            // One over `lines_per_argument`, plus the key line: enough that a string value capped
-            // by its own line budget is never cut again by this one, and its `... N
-            // more lines` marker survives to be read.
-            rows_per_argument: 32,
-            block_rows: 60,
-            wrap: false,
-        }
-    }
-
-    /// For the screen: an expanded call, and the approval prompt. Every argument, every line of
-    /// it, wrapped rather than cut, since a cut line hides the tail of the command being read or
-    /// approved. No ceiling, because the screen scrolls: a block that would have scrolled a
-    /// one-shot prompt off the terminal is a block the viewport or the panel pages through, and
-    /// a count in place of the rows is what hid a payload's tail before.
-    pub(super) fn whole() -> Self {
-        Self {
-            lines_per_argument: usize::MAX,
-            rows_per_argument: usize::MAX,
-            block_rows: usize::MAX,
-            wrap: true,
-        }
-    }
-}
-
-/// A width and the limits to render within it. They always travel together, so the `push_*` helpers
-/// take one value rather than two parameters.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct BlockContext {
-    pub(super) width: usize,
-    pub(super) limits: BlockLimits,
-}
-
-/// Render a tool call's whole input as an indented block, one line per element.
-///
-/// Deliberately not JSON. Quoting every key and escaping every newline turns the two tools whose
-/// arguments most need reading (`file_edit`, `file_write`) into a single unreadable line, which is
-/// the opposite of what asking for full parameters means. So: a value that fits on a line follows
-/// its key, a value that does not gets an indented block under a bare `key:`, and nesting is
-/// carried by indentation with `-` for array elements. The cost is that the string/number
-/// distinction is gone, which is why the exact JSON stays available through `meka session export`.
-pub(super) fn render_tool_params(
-    input: &serde_json::Value,
-    width: usize,
-    limits: BlockLimits,
-) -> Vec<String> {
-    let context = BlockContext { width, limits };
-    let serde_json::Value::Object(fields) = input else {
-        // A tool whose input is not an object at all. Nothing sensible to key it by, so it renders
-        // as a bare value rather than being dropped, which would read as "no arguments".
-        let mut lines = Vec::new();
-        match input {
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    push_item(&mut lines, 1, item, context);
-                }
-            }
-            other => push_value_body(&mut lines, 1, other, context),
-        }
-        // There is no key here to hang a per-argument cap on, and the block ceiling below is only
-        // reached through the object path, so without this an array input printed every element it
-        // had.
-        cap_rows(&mut lines, limits.block_rows, TOOL_PARAM_INDENT, width);
-        return lines;
-    };
-
-    let mut lines = Vec::new();
-    let mut omitted: Vec<String> = Vec::new();
-    for (key, value) in fields {
-        // Whole arguments are dropped at their own boundary rather than the block being cut
-        // wherever the last row happens to land. Cutting mid-argument loses that argument's own
-        // elision marker, and reports a count that bears no relation to how much was hidden.
-        // Dropping by argument lets the block say what is missing by name, which is what a reader
-        // needs: `path` disappearing entirely is worse than any amount of `content` being trimmed.
-        if !omitted.is_empty() || lines.len() >= limits.block_rows {
-            omitted.push(sanitize_to_line(key, width));
-            continue;
-        }
-        let mut param = Vec::new();
-        push_param(&mut param, 1, key, value, context);
-        // `lines_per_argument` bounds a *string* value, counted in its own lines by
-        // `push_value_body`. A container has no lines to count: it fans out one row per element and
-        // needs a row bound of its own, or a single array argument outruns the block on its own.
-        // The key line is never cut -- an argument whose name you can read, trimmed, beats one that
-        // vanished -- so the ceiling applies to what hangs off it.
-        cap_rows(
-            &mut param,
-            limits.rows_per_argument,
-            &TOOL_PARAM_INDENT.repeat(2),
-            width,
-        );
-        lines.append(&mut param);
-    }
-    if !omitted.is_empty() {
-        // Budgeted as one string. Cutting only the names left the count and the words around it
-        // unmeasured, and `  ... 240 more arguments: ` is twenty-six columns before a single name
-        // is added, so at the narrow end this line alone broke the width every other line
-        // here keeps.
-        lines.push(truncate_to_width(
-            &format!(
-                "{}... {} more argument{}: {}",
-                TOOL_PARAM_INDENT,
-                omitted.len(),
-                if omitted.len() == 1 { "" } else { "s" },
-                omitted.join(", ")
-            ),
-            width,
-        ));
-    }
-    lines
-}
-
-/// Cut `lines` to `max_rows`, saying how many rows went and **keeping the last one**.
-///
-/// Counted in rows rather than in the value's source lines, and the wording follows: this is the
-/// bound that keeps the block on the screen, and after wrapping a source line is not a row.
-///
-/// Keeping the last row is the same rule [`wrap_to_width`] and [`elide_to_width`] follow, for the
-/// same reason: what a reader most needs from a thing too big to show is its beginning and its end.
-/// Plain truncation also deleted whatever marker the row below had carried -- an argument that had
-/// already reported `... 480 more lines` lost that line to this cut, so the block ended up
-/// admitting to two dropped rows and nothing else.
-pub(super) fn cap_rows(lines: &mut Vec<String>, max_rows: usize, indent: &str, width: usize) {
-    if lines.len() <= max_rows || max_rows < 2 {
-        lines.truncate(lines.len().min(max_rows));
-        return;
-    }
-    let Some(last) = lines.last().cloned() else {
-        return;
-    };
-    // The marker and the kept row are two of the `max_rows`, so the head keeps the rest.
-    let elided = lines.len() - (max_rows - 1);
-    lines.truncate(max_rows - 2);
-    lines.push(format!(
-        "{}{}",
-        indent,
-        truncate_to_width(
-            &format!(
-                "... {} more row{}",
-                elided,
-                if elided == 1 { "" } else { "s" }
-            ),
-            width.saturating_sub(display_width(indent))
-        )
-    ));
-    lines.push(last);
-}
 
 /// Append one `key: value` pair at `depth`, recursing for containers.
 pub(super) fn push_param(
@@ -297,10 +20,10 @@ pub(super) fn push_param(
     depth: usize,
     key: &str,
     value: &serde_json::Value,
-    context: BlockContext,
+    width: usize,
 ) {
-    let indent = block_indent(depth, context.width);
-    let available = context.width.saturating_sub(display_width(&indent));
+    let indent = block_indent(depth, width);
+    let available = width.saturating_sub(display_width(&indent));
     // A key is model-supplied too: an MCP tool's arguments are whatever the model generated, and
     // nothing checks them against the schema before they are rendered. Its budget reserves room for
     // the value, for the reason on `TOOL_VALUE_MIN_WIDTH`.
@@ -316,31 +39,27 @@ pub(super) fn push_param(
         serde_json::Value::Object(fields) if !fields.is_empty() => {
             lines.push(format!("{indent}{key}:"));
             for (nested_key, nested) in fields {
-                push_param(lines, depth + 1, nested_key, nested, context);
+                push_param(lines, depth + 1, nested_key, nested, width);
             }
         }
         serde_json::Value::Array(items) if !items.is_empty() => {
             lines.push(format!("{indent}{key}:"));
             for item in items {
-                push_item(lines, depth + 1, item, context);
+                push_item(lines, depth + 1, item, width);
             }
         }
         serde_json::Value::String(text) if is_multi_line(text) => {
             lines.push(format!("{indent}{key}:"));
-            push_value_body(lines, depth + 1, value, context);
+            push_value_body(lines, depth + 1, value, width);
         }
         _ => {
             let value_budget = available.saturating_sub(display_width(&key) + ": ".len());
-            // When wrapping, a value too wide for the key line gets a block of its own rather than
-            // being cut on it. Otherwise the commonest approval of all -- a long `shell_execute`
-            // pipeline, which is one line and so never reached `push_value_body` -- would have its
-            // tail hidden, which is the whole failure this mode exists to avoid.
-            // `wrap` first: rendering the value at full width to measure it is a whole
-            // sanitization pass over a megabyte-sized argument, and the indicator never uses it.
-            if context.limits.wrap && display_width(&scalar_text(value, usize::MAX)) > value_budget
-            {
+            // A value too wide for the key line gets a block of its own rather than being cut on
+            // it: the commonest approval of all, a long `shell_execute` pipeline, is one line and
+            // would otherwise have its tail hidden.
+            if display_width(&scalar_text(value, usize::MAX)) > value_budget {
                 lines.push(format!("{indent}{key}:"));
-                push_value_body(lines, depth + 1, value, context);
+                push_value_body(lines, depth + 1, value, width);
             } else {
                 lines.push(format!(
                     "{}{}: {}",
@@ -373,15 +92,15 @@ pub(super) fn push_item(
     lines: &mut Vec<String>,
     depth: usize,
     item: &serde_json::Value,
-    context: BlockContext,
+    width: usize,
 ) {
     // Bounded like every other indent in the block. An array nests through this function rather
     // than through `push_param`, so leaving it proportional to depth put a bullet at column 40
     // of a 40-column line and pushed everything under it past the edge.
-    let indent = block_indent(depth, context.width);
+    let indent = block_indent(depth, width);
     match item {
         serde_json::Value::Object(fields) if !fields.is_empty() => {
-            let nested_indent = block_indent(depth + 1, context.width);
+            let nested_indent = block_indent(depth + 1, width);
             // The bullet replaces exactly the one indent level that `depth + 1` added, so the field
             // lands where it would have without the bullet and its siblings stay aligned with it.
             // Past the indent ceiling there is no such level: `depth + 1` indents no further, the
@@ -393,7 +112,7 @@ pub(super) fn push_item(
             }
             let first = lines.len();
             for (key, value) in fields {
-                push_param(lines, depth + 1, key, value, context);
+                push_param(lines, depth + 1, key, value, width);
             }
             if hoisted && let Some(line) = lines.get_mut(first) {
                 let body = line
@@ -406,26 +125,24 @@ pub(super) fn push_item(
         serde_json::Value::Array(nested) if !nested.is_empty() => {
             lines.push(format!("{indent}-"));
             for value in nested {
-                push_item(lines, depth + 1, value, context);
+                push_item(lines, depth + 1, value, width);
             }
         }
         // Mirrors `push_param`'s multi-line arm. Without it a bulleted string kept its newlines and
         // put every line after the first at column 0, which is both wrong to read and enough to
-        // forge a `[tool ...]` header outside the block.
+        // forge a row of meka's own outside the block.
         serde_json::Value::String(text) if is_multi_line(text) => {
             lines.push(format!("{indent}-"));
-            push_value_body(lines, depth + 1, item, context);
+            push_value_body(lines, depth + 1, item, width);
         }
         _ => {
-            let budget = context
-                .width
-                .saturating_sub(display_width(&indent) + "- ".len());
-            // Same promotion `push_param` makes: under wrapping, a value too wide for its own row
-            // gets a block rather than losing its tail. An MCP tool taking `["bash", "-lc", "<long
+            let budget = width.saturating_sub(display_width(&indent) + "- ".len());
+            // Same promotion `push_param` makes: a value too wide for its own row gets a block
+            // rather than losing its tail. An MCP tool taking `["bash", "-lc", "<long
             // command>"]` is the shape this exists for, and approvals gate MCP tools.
-            if context.limits.wrap && display_width(&scalar_text(item, usize::MAX)) > budget {
+            if display_width(&scalar_text(item, usize::MAX)) > budget {
                 lines.push(format!("{indent}-"));
-                push_value_body(lines, depth + 1, item, context);
+                push_value_body(lines, depth + 1, item, width);
             } else {
                 lines.push(format!("{}- {}", indent, scalar_text(item, budget)));
             }
@@ -433,66 +150,28 @@ pub(super) fn push_item(
     }
 }
 
-/// Append a value with no key of its own: the body of a multi-line string, or a non-object input.
+/// A value as an indented block of its own, every line wrapped to the width.
 pub(super) fn push_value_body(
     lines: &mut Vec<String>,
     depth: usize,
     value: &serde_json::Value,
-    context: BlockContext,
+    width: usize,
 ) {
-    let indent = block_indent(depth, context.width);
-    let budget = context.width.saturating_sub(display_width(&indent));
+    let indent = block_indent(depth, width);
+    let budget = width.saturating_sub(display_width(&indent));
     let text = match value {
         serde_json::Value::String(text) => text.clone(),
         other => scalar_text(other, budget),
     };
-    // Capped in the value's own lines, so the marker below counts what a reader would count.
-    let source_lines: Vec<&str> = text.lines().collect();
-    let shown = source_lines.len().min(context.limits.lines_per_argument);
-    // Rows are the other budget, and it has to be shared out here rather than left to the cap
-    // downstream. Handing every line the whole argument's budget let twenty lines claim twenty
-    // times it; the cap then cut the excess and, with it, this function's own `... N more
-    // lines` marker, so the block reported two dropped rows where a thousand had gone. One row
-    // is held back for that marker.
-    let rows_per_line = context
-        .limits
-        .rows_per_argument
-        .saturating_sub(1)
-        .checked_div(shown.max(1))
-        .unwrap_or(1)
-        .max(1);
-    for line in &source_lines[..shown] {
+    for line in text.lines() {
         // `str::lines` splits on `\n` and strips a trailing `\r`, but a lone `\r` mid-line survives
         // it; `sanitize_to_line` is what stops that returning the cursor over the indent. Flattened
-        // first either way, so wrapping only ever breaks text meka is choosing to spread over rows
-        // and a `\n` from the model never reaches the terminal.
+        // first, so wrapping only ever breaks text meka is choosing to spread over rows and a `\n`
+        // from the model never reaches the terminal.
         let flattened = sanitize_to_line(line, usize::MAX);
-        if context.limits.wrap {
-            for row in wrap_to_width(&flattened, budget, rows_per_line) {
-                lines.push(format!("{indent}{row}"));
-            }
-        } else {
-            lines.push(format!(
-                "{}{}",
-                indent,
-                truncate_to_width(&flattened, budget)
-            ));
+        for row in wrap_to_width(&flattened, budget, usize::MAX) {
+            lines.push(format!("{indent}{row}"));
         }
-    }
-    let elided = source_lines.len() - shown;
-    if elided > 0 {
-        lines.push(format!(
-            "{}{}",
-            indent,
-            truncate_to_width(
-                &format!(
-                    "... {} more line{}",
-                    elided,
-                    if elided == 1 { "" } else { "s" }
-                ),
-                budget
-            )
-        ));
     }
 }
 
@@ -552,55 +231,27 @@ pub(super) fn scalar_text(value: &serde_json::Value, budget: usize) -> String {
     }
 }
 
-/// The argument block as the screen shows it: every argument, every line, wrapped rather than
-/// cut. Separate entry point from the indicator's so the two sets of limits are named at their
-/// call sites rather than passed in from the screen, which has no business knowing them.
+/// A call's arguments as an indented block: one row per scalar argument, a bare `key:` over an
+/// indented block for a multi-line or over-wide value, and nested objects and arrays by
+/// indentation. Every row stays within `width` and nothing is cut, because the surfaces that draw
+/// one, the approval prompt and the screen's expanded call, are where a decision needs the whole of
+/// what is being written.
 pub(crate) fn render_whole_params(input: &serde_json::Value, width: usize) -> Vec<String> {
-    render_tool_params(input, width, BlockLimits::whole())
-}
-
-/// Split the indicator into its header line and its argument block, per `params`.
-///
-/// Separate from the printing so the mapping from setting to output is testable; the two are
-/// colored differently, which is why this is a pair rather than one list of lines.
-pub(super) fn tool_indicator_parts(
-    name: &str,
-    input: &serde_json::Value,
-    display_summary: Option<&str>,
-    params: ToolParams,
-    width: usize,
-) -> (String, Vec<String>) {
-    match params {
-        ToolParams::Off => (tool_header(name, width), Vec::new()),
-        ToolParams::Summary => (
-            tool_indicator_line(name, input, display_summary, width),
-            Vec::new(),
-        ),
-        // No `(arg)` on the header: the primary parameter is in the block two lines down, and
-        // showing it twice is the noise this layout exists to avoid.
-        ToolParams::Full => (
-            tool_header(name, width),
-            render_tool_params(input, width, BlockLimits::indicator()),
-        ),
+    let mut lines = Vec::new();
+    match input {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                push_param(&mut lines, 1, key, value, width);
+            }
+        }
+        // A tool whose input is not an object at all. Nothing sensible to key it by, so it renders
+        // as a bare value rather than being dropped, which would read as "no arguments".
+        serde_json::Value::Array(items) => {
+            for item in items {
+                push_item(&mut lines, 1, item, width);
+            }
+        }
+        other => push_value_body(&mut lines, 1, other, width),
     }
-}
-
-/// Render the tool indicator on stderr, at the detail `params` asks for.
-pub(crate) fn render_tool_indicator(
-    name: &str,
-    input: &serde_json::Value,
-    display_summary: Option<&str>,
-    params: ToolParams,
-) {
-    let (header, block) =
-        tool_indicator_parts(name, input, display_summary, params, output_width());
-    write_stderr_line(header.with(Color::Cyan));
-    for line in block {
-        // A different hue from the header rather than a dimmer shade of it. The normal and bright
-        // slots of one color (4 and 12, 6 and 14) are the same value in a good many terminal
-        // themes, so a header/argument split built on brightness renders as no split at all. Gray
-        // would separate them but is the color of a thinking block, which is the neighbor these
-        // most need to be told apart from.
-        write_stderr_line(line.with(Color::Blue));
-    }
+    lines
 }

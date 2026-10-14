@@ -1119,13 +1119,13 @@ fn format_ahead_of_a_subcommand_is_refused() {
 /// press in that gap leaves nothing to keep.
 #[cfg(unix)]
 #[test]
-fn an_interrupted_oneshot_run_exits_130_and_keeps_what_streamed() {
+fn an_interrupted_oneshot_run_exits_130_and_keeps_what_was_written() {
     use std::io::Read;
     let install = Install::new();
     write_provider_config(&install, "mock", &["mock"]);
     write_slow_script(&install);
     let mut child = install
-        .meka(&["--oneshot", "-p", "slow"])
+        .meka(&["-v", "--oneshot", "-p", "slow"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1134,7 +1134,8 @@ fn an_interrupted_oneshot_run_exits_130_and_keeps_what_streamed() {
     let mut stderr = child.stderr.take().expect("piped stderr");
     let mut chrome = Vec::new();
     let mut buffer = [0u8; 4096];
-    // A closed pipe here means the run ended on its own, which the status assertion reports.
+    // The notice is an `info!` line under `-v`, written once the text before it has arrived. A
+    // closed pipe here means the run ended on its own, which the status assertion reports.
     while !String::from_utf8_lossy(&chrome).contains("text-has-streamed") {
         let read = stderr.read(&mut buffer).expect("read stderr");
         if read == 0 {
@@ -1161,10 +1162,10 @@ fn an_interrupted_oneshot_run_exits_130_and_keeps_what_streamed() {
         Some(130),
         "an interrupted run exits like an interrupted screen: {chrome}"
     );
-    assert!(chrome.contains("(interrupted)"), "{chrome}");
+    assert!(chrome.contains("interrupted"), "{chrome}");
     assert!(
         answer.contains("starting") && !answer.contains("never reached"),
-        "what streamed before the press is kept, and nothing after it: {answer:?}"
+        "what the model had written before the press is kept, and nothing after it: {answer:?}"
     );
 }
 
@@ -1205,7 +1206,7 @@ fn an_interrupted_json_oneshot_run_still_reports() {
     let output = child.wait_with_output().expect("wait for meka");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(130), "{stderr}");
-    assert!(stderr.contains("(interrupted)"), "{stderr}");
+    assert!(stderr.contains("interrupted"), "{stderr}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let report: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|error| panic!("one object on stdout ({error}): {stdout:?}"));
@@ -1311,10 +1312,10 @@ fn write_slow_script(install: &Install) {
     );
 }
 
-/// `[display].show_session_id_on_create` holds under `--format json`: the id line goes to stderr,
-/// and stdout is still the one object.
+/// `[display].show_session_id_on_create` is the screen's: a one-shot run prints no id line
+/// whatever it says, and the report carries the id.
 #[test]
-fn a_json_oneshot_run_prints_the_new_session_id_on_stderr_when_asked() {
+fn a_json_oneshot_run_keeps_the_session_id_off_stderr_whatever_the_key_says() {
     let install = Install::new();
     write_provider_config(&install, "mock", &["mock"]);
     let config_path = install.config_dir().join("config.toml");
@@ -1328,8 +1329,8 @@ fn a_json_oneshot_run_prints_the_new_session_id_on_stderr_when_asked() {
     assert!(output.status.success(), "{stderr}");
     let id = only_session(&install);
     assert!(
-        stderr.contains("Creating new session") && stderr.contains(&id),
-        "the id line is printed as the screen shows it: {stderr:?}"
+        !stderr.contains(&id),
+        "the id reaches stderr only through the report: {stderr:?}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
@@ -1672,21 +1673,19 @@ fn instructions_show_and_path_read_the_listed_files_from_the_current_directory()
     );
 }
 
-/// Reasoning reaches the terminal whether or not the turn streamed.
-///
-/// The blocking path returns the message whole, with no event channel to have put its thinking on
-/// while it was being written, so `run_turn` has to re-emit each block by hand. A frontend renders
-/// reasoning from those events and from nothing else, which makes the loop that re-emits them the
-/// only thing standing between a `--no-stream` turn and no sign the model reasoned at all.
-///
-/// Asserted on stderr, which is where reasoning belongs: it is chrome, and a pipe reading stdout
-/// must see only the answer.
+/// A one-shot prints the last text block of the turn and nothing else: not the text before a
+/// tool call, not the call, not the reasoning, on either stream. The blocking path returns the
+/// message whole rather than as events, so `--no-stream` has to come out the same.
 #[test]
-fn reasoning_is_shown_on_a_turn_that_did_not_stream() {
-    const REASONED: &str = r#"[
+fn a_oneshot_prints_the_last_text_block_and_nothing_else() {
+    const WORKED: &str = r#"[
   [{"type":"thinking_delta","text":"weighing the options"},
    {"type":"thinking_complete"},
-   {"type":"text","text":"the answer"},
+   {"type":"text","text":"Let me check."},
+   {"type":"tool_use_start","id":"t1","name":"schedule_list"},
+   {"type":"tool_use_end","input":{}},
+   {"type":"message_end","stop_reason":"tool_use"}],
+  [{"type":"text","text":"Nothing is scheduled."},
    {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
     for extra in [vec![], vec!["--no-stream"]] {
@@ -1697,28 +1696,30 @@ fn reasoning_is_shown_on_a_turn_that_did_not_stream() {
             config_dir.join("config.toml"),
             "default_profile = \"mock\"\n\n[accounts.mock]\nbackend = \
              \"anthropic-messages\"\n\n[profiles.mock]\naccount = \"mock\"\nmodel = \
-             \"claude-sonnet-4-5\"\n\n[thinking]\nshow_content = true\n",
+             \"claude-sonnet-4-5\"\n",
         )
         .expect("write config.toml");
-
         let mut args = extra.clone();
-        args.extend(["--oneshot", "-p", "ponder"]);
-        let run = run_scripted_from(&install, install.root(), REASONED, &args);
+        args.extend(["--oneshot", "-p", "anything due?"]);
+        let run = run_scripted_from(&install, install.root(), WORKED, &args);
         let stderr = String::from_utf8_lossy(&run.stderr);
         let stdout = String::from_utf8_lossy(&run.stdout);
         assert!(run.status.success(), "run failed with {extra:?}: {stderr}");
-        assert!(
-            stderr.contains("weighing the options"),
-            "reasoning missing from stderr with {extra:?}:\n{stderr}"
+        assert_eq!(
+            stdout, "Nothing is scheduled.\n",
+            "stdout is the last text block alone with {extra:?}"
         );
-        assert!(
-            !stdout.contains("weighing the options"),
-            "reasoning must not reach stdout with {extra:?}:\n{stdout}"
-        );
-        assert!(
-            stdout.contains("the answer"),
-            "the answer belongs on stdout with {extra:?}:\n{stdout}"
-        );
+        for process in [
+            "weighing",
+            "Let me check",
+            "schedule_list",
+            "Leaving session",
+        ] {
+            assert!(
+                !stderr.contains(process),
+                "the process stays off stderr with {extra:?}: {process:?} in\n{stderr}"
+            );
+        }
     }
 }
 
@@ -2681,8 +2682,7 @@ fn a_reader_that_hangs_up_mid_answer_does_not_abort_the_run() {
 ///
 /// The counterpart to the broken pipe above, and the reason the two are told apart: a reader that
 /// hangs up chose to, but a full disk did not, and `meka -p … > out.txt` reporting success over an
-/// empty file is the worse failure of the two. Once, because `text_delta` runs per streamed delta
-/// and a real answer is hundreds of them.
+/// empty file is the worse failure of the two. Once, as the run's error, however long the answer.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_stdout_that_will_not_take_the_answer_fails_the_run_once() {
@@ -2717,15 +2717,13 @@ fn a_stdout_that_will_not_take_the_answer_fails_the_run_once() {
         !run.status.success(),
         "losing the answer to a full disk has to reach the exit code: {stderr}"
     );
-    // Counting the log line, not the phrase: the error report below it says the same thing, and a
-    // count that leaned on the two being worded differently would be a test choosing the wording.
     assert_eq!(
         stderr
             .lines()
-            .filter(|line| line.contains("WARN") && line.contains("did not reach stdout"))
+            .filter(|line| line.contains("did not reach stdout"))
             .count(),
         1,
-        "and it has to be said once, not once per delta: {stderr}"
+        "and it has to be said once: {stderr}"
     );
 }
 

@@ -19,9 +19,8 @@ rank  module          holds
  0    main            argument parsing; picks a host or a cli handler
  1    host            the layer between a host and the agent, and the four hosts under it
  2    cli             clap definitions and one handler file per subcommand group
- 2    relay           tracing output routed to the screen, or around a one-shot run's rows
- 3    console         a one-shot run's terminal: the blank between blocks, the transient row, notices
- 4    render          markdown, tool indicators, the checklist, status lines, for a stream and for the screen
+ 2    relay           tracing output routed to the screen, or to stderr
+ 4    render          the screen's rows and skins, the approval block, status lines, the one-shot's answer
  5    agent           the turn loop, tool dispatch, compaction, recovery
  5    view            the JSON record shapes --format json and the HTTP API share
  6    tools           the Tool trait, the registry, the built-ins, MCP tools as Tools
@@ -56,9 +55,8 @@ rank  module          holds
 20    text            pure text helpers: widths, columns, sizes, timestamps, unknown_name
 ```
 
-`relay` is installed by the two terminal hosts (`host/tui.rs`, `host/oneshot.rs`) and by
-`main.rs` as tracing's writer; the screen drains it, and a one-shot run writes it through `console`,
-which draws with `render`. `render` and `console` are reached only from `host`, `cli` and `relay`. `text` is the lowest leaf so that `error`
+`relay` is installed by `main.rs` as tracing's writer; the screen drains it, and every other
+run writes it to stderr. `render` is reached only from `host` and `cli`. `text` is the lowest leaf so that `error`
 can render `MekaError::ProfileNotConfigured` through `text::unknown_name`.
 
 Put new code where its callers already are: a type read by `store` and `host` belongs in `store` or
@@ -131,8 +129,9 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
    execution guidance. The world snapshot
    advances only after the replacement is saved. Finished background outcomes are not delivered
    again during this rebuild.
-5. **Output.** Text, thinking, tool indicators, approval prompts and elicitations all reach the
-   user through the session's `Frontend`. The screen, ACP and HTTP each implement it once; a
+5. **Output.** Text, thinking, tool calls, approval prompts and elicitations all reach the
+   user through the session's `Frontend`. The screen, the one-shot run, ACP and HTTP each
+   implement it once; a
    sub-agent's `PermissionForwardingFrontend` forwards its approval prompts and notices to its
    parent's; `SilentFrontend` answers a call with nobody behind it.
 

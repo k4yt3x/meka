@@ -729,7 +729,7 @@ fn a_resumed_session_replays_the_reasoning_it_recorded() {
   {"type":"text","text":"Here is the answer."},
   {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
-    let install = screen_install("read", "", "\n[thinking]\nshow_content = true\n");
+    let install = screen_install("read", "", "");
     let first = run_screen(&install, REASONED, &["think about it", "/exit"]);
     let rows = final_screen(&first);
     assert!(

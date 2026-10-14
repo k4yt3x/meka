@@ -8,20 +8,17 @@
 //! as items, fed by [`ScreenLayer`] with each event's level and message while the screen is up
 //! (from [`Relay::attach_screen`] until the [`ScreenLogs`] it returns is dropped). Otherwise the
 //! formatted line falls back to plain stderr, so the non-interactive paths (`meka session export`,
-//! `meka session list`, etc.) and the startup window before a screen exists still see logs, and a
-//! one-shot run settles the row the line lands on through its console first.
+//! `meka session list`, etc.) and the startup window before a screen exists still see logs.
 use std::{
     io::{self, Write},
     sync::{
-        Arc, LazyLock, Mutex, RwLock, Weak,
+        Arc, LazyLock, RwLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{SyncSender, TrySendError},
     },
 };
 
 use tracing_subscriber::fmt::MakeWriter;
-
-use crate::console::Console;
 
 /// Process-global relay. Tracing's `MakeWriter` clones this; the screen installs its sender at
 /// startup. Stays uninstalled for non-interactive commands, so they keep getting plain stderr
@@ -51,13 +48,6 @@ pub(crate) struct Relay {
     /// True only while the screen owns the terminal and drains the channel. Off it, the terminal
     /// is the shell's again and stderr is safe.
     screen_attached: Arc<AtomicBool>,
-    /// The host's console, so an off-prompt log line can settle the row before landing on it.
-    ///
-    /// Weak on purpose: this static outlives every screen, and an owning handle would keep a
-    /// console (and the renderer behind it) alive for the life of the process after the host
-    /// that made it has gone. A dead weak pointer answers the same as no console at all, which
-    /// is the non-interactive behavior.
-    console: Arc<RwLock<Weak<Mutex<Console>>>>,
 }
 
 impl Relay {
@@ -65,16 +55,7 @@ impl Relay {
         Self {
             sender: Arc::new(RwLock::new(None)),
             screen_attached: Arc::new(AtomicBool::new(false)),
-            console: Arc::new(RwLock::new(Weak::new())),
         }
-    }
-
-    /// Register the console a log line should settle the row through, when no screen is attached.
-    ///
-    /// The one-shot run installs one: it draws the thinking indicator on a row a log line would
-    /// otherwise be written over.
-    pub(crate) fn install_console(&self, console: &Arc<Mutex<Console>>) {
-        *crate::sync::write(&self.console) = Arc::downgrade(console);
     }
 
     /// Register the sending half of the screen's log channel, so subsequent log lines are shown
@@ -243,10 +224,8 @@ impl<'a> MakeWriter<'a> for Relay {
     type Writer = RelayWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
-        let console = self.console.read().ok().and_then(|guard| guard.upgrade());
         RelayWriter {
             screen_attached: Arc::clone(&self.screen_attached),
-            console,
         }
     }
 }
@@ -255,7 +234,6 @@ impl<'a> MakeWriter<'a> for Relay {
 /// so the routing reflects the live screen state, not whatever it was at `make_writer`.
 pub(crate) struct RelayWriter {
     screen_attached: Arc<AtomicBool>,
-    console: Option<Arc<Mutex<Console>>>,
 }
 
 impl Write for RelayWriter {
@@ -265,7 +243,6 @@ impl Write for RelayWriter {
         if self.screen_attached.load(Ordering::Relaxed) {
             return Ok(buffer.len());
         }
-        self.settle_the_row();
         io::stderr().write(buffer)
     }
 
@@ -274,49 +251,9 @@ impl Write for RelayWriter {
     }
 }
 
-impl RelayWriter {
-    /// Tell the console that a log line is about to land on the current row.
-    ///
-    /// Off-prompt is when the row may not be free: a turn draws the thinking indicator as a
-    /// [`crate::console::RowState::Transient`] line, and a `warn!` printed onto it is written
-    /// behind the indicator's text and left there when the indicator redraws below.
-    ///
-    /// `try_lock`, never `lock`: [`Console`] methods log through `render::report_lost_output`, so a
-    /// thread already inside one re-enters here holding the lock, and a blocking acquire would
-    /// deadlock the screen. Contention falls through to the raw stderr write.
-    ///
-    /// A poisoned mutex is recovered rather than treated as contention: `TryLockError` folds the
-    /// two together, and treating them alike would let one panic inside a console method stop
-    /// row-settling for the rest of the process.
-    ///
-    /// Idempotent, because a formatter may split one event across several `write` calls. The row
-    /// is left `Empty` on the strength of tracing's formatter terminating every event with a
-    /// newline.
-    fn settle_the_row(&self) {
-        let Some(console) = &self.console else {
-            return;
-        };
-        match console.try_lock() {
-            Ok(mut console) => console.announce_log_line(),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                poisoned.into_inner().announce_log_line()
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {}
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        config::RenderMode,
-        console::{Console, RowState},
-    };
-
-    fn console() -> Arc<Mutex<Console>> {
-        Arc::new(Mutex::new(Console::new(RenderMode::Raw)))
-    }
 
     /// A full queue does not block the layer. The queue is drained only by the screen's frame
     /// loop, so an offer that waited for room could wait on the very task doing the logging.
@@ -386,63 +323,10 @@ mod tests {
             .expect("a field of the test's set")
     }
 
-    /// An off-prompt log line settles the row instead of landing on it.
-    ///
-    /// The row is the thinking indicator's, and the line that lands on it is the retry path's
-    /// `warn!`, which fires at default verbosity. `force_row` because the drawing API cannot reach
-    /// `Transient` without a terminal: `thinking_indicator` returns early on
-    /// `!live_indicator_supported()`.
+    /// With no screen attached (every non-interactive command) the whole line reaches stderr, none
+    /// of it swallowed by a screen that is not there.
     #[test]
-    fn an_off_prompt_log_line_settles_the_row_it_would_have_landed_on() {
-        let console = console();
-        let relay = Relay::new();
-        relay.install_console(&console);
-        relay.set_screen_attached(false);
-        console.lock().expect("console").start(RowState::Empty);
-        console
-            .lock()
-            .expect("console")
-            .force_row(RowState::Transient);
-        relay
-            .make_writer()
-            .write_all(b"WARN provider stream failed transiently, retrying\n")
-            .expect("the stderr fall-through always succeeds");
-        let console = console.lock().expect("console");
-        assert_eq!(
-            console.row(),
-            RowState::Empty,
-            "the indicator's row has to be settled before the line lands, or the next \
-             `Settle::Erase` takes the line with it"
-        );
-    }
-
-    /// A console already locked by this thread is written past, not deadlocked on.
-    ///
-    /// `Console::text_delta`, `close_stream` and the stdout flush all report through
-    /// `render::report_lost_output` when their renderer fails, so a thread inside a console
-    /// method reaches this writer while holding the very lock it wants.
-    ///
-    /// The guard is held across the write, which is exactly the reentrant shape, and the test
-    /// completing at all is the assertion.
-    #[test]
-    fn a_log_line_from_inside_the_console_falls_through_rather_than_deadlocking() {
-        let console = console();
-        let relay = Relay::new();
-        relay.install_console(&console);
-        relay.set_screen_attached(false);
-        let mut held = console.lock().expect("console");
-        held.start(RowState::Empty);
-        relay
-            .make_writer()
-            .write_all(b"DEBUG console renderer push_delta failed\n")
-            .expect("the stderr fall-through always succeeds");
-        assert_eq!(held.row(), RowState::Empty);
-    }
-
-    /// With no console installed (every non-interactive command) nothing changes: the whole line
-    /// reaches stderr, none of it swallowed by a screen that is not there.
-    #[test]
-    fn a_host_with_no_console_still_writes_to_stderr() {
+    fn a_host_without_a_screen_writes_to_stderr() {
         let relay = Relay::new();
         relay.set_screen_attached(false);
         let line = b"WARN config.toml could not be read\n";

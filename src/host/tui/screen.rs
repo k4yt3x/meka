@@ -133,7 +133,6 @@ pub(crate) struct ScreenLaunch {
     pub(crate) cancel: crate::host::CancelCell,
     pub(crate) send_class: InboxClass,
     pub(crate) mouse: bool,
-    pub(crate) max_width: Option<usize>,
     /// Whether a turn is already running when the screen opens: a prompt given on the command
     /// line is the first turn's input.
     pub(crate) busy: bool,
@@ -2570,12 +2569,8 @@ impl Screen {
         };
         self.transcript_area = transcript_area;
 
-        self.viewport.draw(
-            frame,
-            transcript_area,
-            &self.launch.transcript,
-            self.launch.max_width,
-        );
+        self.viewport
+            .draw(frame, transcript_area, &self.launch.transcript);
         if let Some((line, _)) = self.viewport.sticky_prompt() {
             view::draw_sticky_prompt(
                 frame,

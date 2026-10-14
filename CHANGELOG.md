@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** a one-shot run prints only the model's last text block, as markdown source.
+- A tool call starts with its summary and a thinking block collapsed; both expand on demand.
+
+### Removed
+
+- **Breaking:** `[display].tool_params`, `[display].max_width` and `[thinking].show_content`.
+
 ### Fixed
 
 - A code line wider than the screen folds at the edge instead of being cut off there.

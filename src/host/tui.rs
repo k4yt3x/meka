@@ -100,8 +100,6 @@ pub(crate) async fn run_interactive(
     let mut transcript = model::Transcript::new(model::Settings {
         show_session_id_on_create: config.show_session_id_on_create,
         show_token_usage: config.show_token_usage,
-        show_thinking: config.thinking_show_content,
-        tool_params: config.tool_params,
     });
     if log_end.is_none() {
         let profile = crate::sync::read(&current_profile).clone();
@@ -339,7 +337,6 @@ pub(crate) async fn run_interactive(
         cancel: cancel.clone(),
         send_class: inbox_class(config.send_class),
         mouse: config.mouse,
-        max_width: config.max_width,
         busy: initial_turn_pending,
         pick_session: config.request.session_resume == Some(crate::config::SessionResume::Pick),
     }));

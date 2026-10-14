@@ -15,10 +15,9 @@ use ratatui::{
 
 use super::{
     input::COMPOSER_BACKGROUND,
-    model::{Entry, Item, Settings, ToolState, Transcript},
+    model::{Entry, Item, ToolState, Transcript},
 };
 use crate::{
-    config::ToolParams,
     frontend::FrontendEvent,
     render::tui::{self as draw, ACT_GLYPH, ERROR_GLYPH, TEXT_EDGE, WARNING_GLYPH, gray},
     store::inbox::InboxClass,
@@ -179,7 +178,7 @@ fn tool_body(item: &Item, expanded: bool, width: usize) -> Vec<Line<'static>> {
 }
 
 /// One item as the lines it occupies at `width`.
-pub(crate) fn entry_lines(entry: &Entry, width: usize, settings: Settings) -> Vec<Line<'static>> {
+pub(crate) fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let inner = width.saturating_sub(TEXT_EDGE).max(1);
     match &entry.item {
@@ -267,14 +266,11 @@ pub(crate) fn entry_lines(entry: &Entry, width: usize, settings: Settings) -> Ve
                 .as_ref()
                 .filter(|_| *state != ToolState::Done { is_error: true })
                 .map(|change| draw::diff_rows(change.old.as_deref(), &change.new, width).1);
-            // The arguments are shown in full under the row when the call is expanded or the
-            // setting asks for them; the row then carries no summary, which would say the same
-            // thing twice.
-            let with_arguments = entry.expanded || settings.tool_params == ToolParams::Full;
-            let summary = match (state, settings.tool_params) {
-                (ToolState::Composing, _) => Some("…".to_string()),
-                _ if with_arguments => None,
-                (_, ToolParams::Off) => None,
+            // The arguments are shown in full under the row when the call is expanded; the row
+            // then carries no summary, which would say the same thing twice.
+            let summary = match state {
+                ToolState::Composing => Some("…".to_string()),
+                _ if entry.expanded => None,
                 _ => draw::tool_summary(name, input, summary.as_deref()),
             };
             let mut lines = vec![draw::tool_row(
@@ -288,7 +284,7 @@ pub(crate) fn entry_lines(entry: &Entry, width: usize, settings: Settings) -> Ve
                 return lines;
             }
             let text_width = width.saturating_sub(draw::connector_indent()).max(1);
-            let (arguments, program_first) = if with_arguments {
+            let (arguments, program_first) = if entry.expanded {
                 // A change drawn as a diff says what the two texts were; their keys would say it
                 // again.
                 let omit: &[&str] = if stat.is_some() {
@@ -531,7 +527,7 @@ impl Viewport {
     }
 
     /// Lay `entry` out at `width` unless the cache already has it, and say how many rows it is.
-    fn lay_out(&mut self, entry: &Entry, width: usize, settings: Settings) -> usize {
+    fn lay_out(&mut self, entry: &Entry, width: usize) -> usize {
         let stale = self
             .cache
             .get(&entry.id)
@@ -540,7 +536,7 @@ impl Viewport {
             self.cache.insert(entry.id, Cached {
                 revision: entry.revision,
                 width,
-                lines: entry_lines(entry, width, settings),
+                lines: entry_lines(entry, width),
             });
         }
         self.cache
@@ -549,16 +545,9 @@ impl Viewport {
     }
 
     /// Draw the transcript into `area`.
-    pub(crate) fn draw(
-        &mut self,
-        frame: &mut Frame<'_>,
-        area: Rect,
-        transcript: &Transcript,
-        max_width: Option<usize>,
-    ) {
+    pub(crate) fn draw(&mut self, frame: &mut Frame<'_>, area: Rect, transcript: &Transcript) {
         self.height = area.height as usize;
-        let width = max_width.map_or(area.width as usize, |cap| cap.min(area.width as usize));
-        let settings = transcript.settings();
+        let width = area.width as usize;
 
         // Lay every item out first, so the scroll position is clamped against the whole.
         self.layout.clear();
@@ -567,7 +556,7 @@ impl Viewport {
         let mut total = 0;
         for entry in transcript.drawn() {
             ids.push(entry.id);
-            let len = self.lay_out(entry, width, settings);
+            let len = self.lay_out(entry, width);
             if len == 0 {
                 self.layout.push((total, 0));
                 continue;
@@ -1130,6 +1119,7 @@ pub(crate) fn draw_completions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::tui::model::Settings;
 
     fn plain(lines: &[Line<'static>]) -> Vec<String> {
         lines
@@ -1149,8 +1139,6 @@ mod tests {
         Settings {
             show_session_id_on_create: false,
             show_token_usage: false,
-            show_thinking: false,
-            tool_params: ToolParams::Summary,
         }
     }
 
@@ -1190,7 +1178,7 @@ mod tests {
             },
             false,
         );
-        let rows = plain(&entry_lines(&streaming, 40, settings()));
+        let rows = plain(&entry_lines(&streaming, 40));
         assert_eq!(
             rows.last().map(String::as_str),
             Some("  - item"),
@@ -1203,7 +1191,7 @@ mod tests {
             },
             false,
         );
-        let rows = plain(&entry_lines(&ended, 40, settings()));
+        let rows = plain(&entry_lines(&ended, 40));
         assert!(
             rows.last()
                 .is_some_and(|row| row.contains('•') && row.ends_with("item")),
@@ -1272,10 +1260,10 @@ mod tests {
             (Item::Image, "• image"),
         ];
         for (item, expected) in cases {
-            let rows = plain(&entry_lines(&entry(item.clone(), false), 60, settings()));
+            let rows = plain(&entry_lines(&entry(item.clone(), false), 60));
             assert_eq!(rows[0], expected, "{item:?}");
         }
-        let error = entry_lines(&entry(Item::Error("x".into()), false), 60, settings());
+        let error = entry_lines(&entry(Item::Error("x".into()), false), 60);
         assert_eq!(error[0].spans[0].style.fg, Some(Color::Red));
         let warning = entry_lines(
             &entry(
@@ -1286,7 +1274,6 @@ mod tests {
                 false,
             ),
             60,
-            settings(),
         );
         assert_eq!(warning[0].spans[0].style.fg, Some(Color::Yellow));
     }
@@ -1295,7 +1282,7 @@ mod tests {
     /// because the transcript clips what is wider: a token longer than the row, an address, a code
     /// row, a table cell, a command, a diff line, a checklist item, a path. And no row holds a tab,
     /// because the screen hands cells to the terminal and drops a tab with the indentation it
-    /// carried. Every kind, expanded and collapsed, with and without the arguments, at every width.
+    /// carried. Every kind, expanded and collapsed, at every width.
     #[test]
     fn no_item_lays_out_a_row_wider_than_its_width_or_holding_a_tab() {
         let token = "x".repeat(300);
@@ -1417,39 +1404,25 @@ mod tests {
                 directory: address.clone(),
             },
         ];
-        let full = || Settings {
-            show_session_id_on_create: true,
-            show_token_usage: true,
-            show_thinking: true,
-            tool_params: ToolParams::Full,
-        };
         let mut too_wide = Vec::new();
         for width in [24, 40, 80, 200] {
             for (index, item) in items.iter().enumerate() {
                 for expanded in [false, true] {
-                    for settings in [settings(), full()] {
-                        let lines = entry_lines(&entry(item.clone(), expanded), width, settings);
-                        for line in &lines {
-                            let text: String = line
-                                .spans
-                                .iter()
-                                .map(|span| span.content.as_ref())
-                                .collect();
-                            let head: String = text.chars().take(60).collect();
-                            let case = format!(
-                                "item {index} at {width} columns, expanded {expanded}, full \
-                                 arguments {}",
-                                settings.tool_params == ToolParams::Full
-                            );
-                            if display_width(&text) > width {
-                                too_wide.push(format!(
-                                    "{case}: {} wide: {head:?}",
-                                    display_width(&text)
-                                ));
-                            }
-                            if text.contains('\t') {
-                                too_wide.push(format!("{case}: holds a tab: {head:?}"));
-                            }
+                    let lines = entry_lines(&entry(item.clone(), expanded), width);
+                    for line in &lines {
+                        let text: String = line
+                            .spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect();
+                        let head: String = text.chars().take(60).collect();
+                        let case = format!("item {index} at {width} columns, expanded {expanded}");
+                        if display_width(&text) > width {
+                            too_wide
+                                .push(format!("{case}: {} wide: {head:?}", display_width(&text)));
+                        }
+                        if text.contains('\t') {
+                            too_wide.push(format!("{case}: holds a tab: {head:?}"));
                         }
                     }
                 }
@@ -1466,11 +1439,11 @@ mod tests {
             estimate: None,
             ended: true,
         };
-        let collapsed = plain(&entry_lines(&entry(item.clone(), false), 60, settings()));
+        let collapsed = plain(&entry_lines(&entry(item.clone(), false), 60));
         assert_eq!(collapsed, vec![
             "• Thinking · First line. Second paragraph."
         ]);
-        let expanded = plain(&entry_lines(&entry(item, true), 60, settings()));
+        let expanded = plain(&entry_lines(&entry(item, true), 60));
         assert_eq!(expanded[0], "• Thinking");
         assert_eq!(expanded[1], "  First line.", "{expanded:?}");
         assert_eq!(
@@ -1485,7 +1458,7 @@ mod tests {
     fn a_tool_call_expands_to_its_arguments_and_output() {
         let output: String = (1..=8).map(|n| format!("line {n}\n")).collect();
         let item = tool_call(ToolState::Done { is_error: false }, &output, None);
-        let collapsed = plain(&entry_lines(&entry(item.clone(), false), 60, settings()));
+        let collapsed = plain(&entry_lines(&entry(item.clone(), false), 60));
         assert_eq!(collapsed, vec![
             "• shell_execute ls -la",
             "  └ line 1",
@@ -1493,7 +1466,7 @@ mod tests {
             "    line 3",
             "    … +5 lines",
         ]);
-        let expanded = plain(&entry_lines(&entry(item, true), 60, settings()));
+        let expanded = plain(&entry_lines(&entry(item, true), 60));
         assert_eq!(
             expanded[0], "• shell_execute",
             "the row carries no summary once the arguments are under it"
@@ -1513,7 +1486,6 @@ mod tests {
         let running = plain(&entry_lines(
             &entry(tool_call(ToolState::Running, "", None), false),
             60,
-            settings(),
         ));
         assert_eq!(running, vec!["• shell_execute ls -la", "  └ running"]);
     }
@@ -1540,7 +1512,7 @@ mod tests {
             progress: None,
             change: None,
         };
-        let rows = plain(&entry_lines(&entry(item, true), 60, settings()));
+        let rows = plain(&entry_lines(&entry(item, true), 60));
         assert_eq!(rows[0], "• shell_execute", "{rows:?}");
         assert!(rows[1].starts_with("  $ seq 1 5000"), "{rows:?}");
         assert!(
@@ -1580,7 +1552,7 @@ mod tests {
             "dca8209a  completed  mcp__exa__web_search_exa  top news headlines for today"
         );
         let item = tool_call(ToolState::Done { is_error: false }, &output, None);
-        let collapsed = plain(&entry_lines(&entry(item.clone(), false), 40, settings()));
+        let collapsed = plain(&entry_lines(&entry(item.clone(), false), 40));
         assert_eq!(collapsed, vec![
             "• shell_execute ls -la",
             "  └ ID        Status     Tool          …",
@@ -1591,7 +1563,7 @@ mod tests {
             collapsed.iter().all(|row| display_width(row) <= 40),
             "{collapsed:?}"
         );
-        let expanded = plain(&entry_lines(&entry(item, true), 40, settings()));
+        let expanded = plain(&entry_lines(&entry(item, true), 40));
         assert!(
             expanded.iter().any(|row| row.ends_with("What"))
                 && expanded.iter().any(|row| row.contains("for today")),
@@ -1629,7 +1601,7 @@ mod tests {
                 new: "import sys\nprint(\"Hello, world!\")\nsys.exit(0)\n".into(),
             }),
         };
-        let collapsed = plain(&entry_lines(&entry(item.clone(), false), 60, settings()));
+        let collapsed = plain(&entry_lines(&entry(item.clone(), false), 60));
         assert_eq!(
             collapsed,
             vec![
@@ -1658,7 +1630,7 @@ mod tests {
                 new: (1..=60).map(|n| format!("line {n}\n")).collect(),
             }),
         };
-        let collapsed = plain(&entry_lines(&entry(rewrite, false), 60, settings()));
+        let collapsed = plain(&entry_lines(&entry(rewrite, false), 60));
         assert_eq!(
             collapsed.len(),
             1 + draw::DIFF_PREVIEW_ROWS + 1,
@@ -1668,7 +1640,7 @@ mod tests {
             collapsed.last().map(String::as_str),
             Some("    … +40 lines")
         );
-        let expanded = plain(&entry_lines(&entry(item, true), 60, settings()));
+        let expanded = plain(&entry_lines(&entry(item, true), 60));
         assert!(
             expanded.iter().any(|row| row == "    3   sys.exit(0)"),
             "expanded, the line after shows too: {expanded:?}"
@@ -1700,7 +1672,7 @@ mod tests {
             progress: None,
             change: None,
         };
-        let lines = entry_lines(&entry(item, false), 60, settings());
+        let lines = entry_lines(&entry(item, false), 60);
         assert_eq!(plain(&lines), vec![
             "• file_read /nope",
             "  └ failed: no such file"
@@ -1712,7 +1684,7 @@ mod tests {
         if let Item::ToolCall { result, .. } = &mut long {
             *result = Some(format!("{} {}", "a".repeat(20), "b".repeat(20)));
         }
-        let expanded = plain(&entry_lines(&entry(long, true), 40, settings()));
+        let expanded = plain(&entry_lines(&entry(long, true), 40));
         assert_eq!(
             expanded,
             vec![
@@ -1753,7 +1725,7 @@ mod tests {
             model: Some("hf:zai-org/GLM-5.3".into()),
             directory: "~/projects/something".into(),
         };
-        let lines = entry_lines(&entry(item, false), 80, settings());
+        let lines = entry_lines(&entry(item, false), 80);
         assert_eq!(plain(&lines), vec![
             "",
             "  █▄ ▄█  meka v0.72.0",
@@ -1803,7 +1775,6 @@ mod tests {
                 false,
             ),
             60,
-            settings(),
         );
         assert_eq!(plain(&bare)[2], "  █ ▀ █  work");
     }
@@ -1822,7 +1793,7 @@ mod tests {
             },
             false,
         );
-        let lines = entry_lines(&sent, 60, settings());
+        let lines = entry_lines(&sent, 60);
         assert_eq!(lines[0].spans[1].content.as_ref(), format!("look {family}"));
     }
 
@@ -1838,7 +1809,7 @@ mod tests {
             },
             false,
         );
-        let lines = entry_lines(&waiting, 60, settings());
+        let lines = entry_lines(&waiting, 60);
         let rows = plain(&lines);
         assert_eq!(rows, vec!["> also check the logs", "  (steer, waiting)"]);
         assert!(
@@ -1856,24 +1827,6 @@ mod tests {
                 && !words.style.add_modifier.contains(Modifier::BOLD),
             "the words are white, not bold: {words:?}"
         );
-    }
-
-    /// The viewport maps a row of the last frame back to the item drawn there, gaps excluded.
-    #[test]
-    fn a_row_maps_back_to_the_item_drawn_on_it() {
-        let mut transcript = Transcript::new(settings());
-        transcript.push(Item::note("one"));
-        transcript.push(Item::note("two"));
-        let mut viewport = Viewport::new();
-        let backend = ratatui::backend::TestBackend::new(40, 10);
-        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
-        terminal
-            .draw(|frame| viewport.draw(frame, frame.area(), &transcript, None))
-            .expect("a frame");
-        assert_eq!(viewport.item_at_row(0), Some(0));
-        assert_eq!(viewport.item_at_row(1), None, "the gap belongs to nobody");
-        assert_eq!(viewport.item_at_row(2), Some(1));
-        assert_eq!(viewport.item_at_row(3), None);
     }
 
     /// The list shows at most `COMPLETION_ROWS`, keeps the pick on screen, and lines the
@@ -1933,55 +1886,6 @@ mod tests {
         );
     }
 
-    /// The prompt nearest above the top row sticks as a bar; a jump puts it just under the bar,
-    /// which then holds the prompt before it, and the first prompt at the very top sticks nothing.
-    #[test]
-    fn the_last_prompt_above_the_view_sticks_and_a_jump_walks_back() {
-        let mut transcript = Transcript::new(settings());
-        let prompt = |text: &str| Item::Prompt {
-            text: text.into(),
-            class: None,
-            inbox_id: None,
-            delivered: true,
-        };
-        transcript.push(prompt("first"));
-        transcript.push(Item::Text {
-            text: (1..=8).map(|n| format!("a{n}\n\n")).collect(),
-            streaming: false,
-        });
-        transcript.push(prompt("second"));
-        transcript.push(Item::Text {
-            text: (1..=8).map(|n| format!("b{n}\n\n")).collect(),
-            streaming: false,
-        });
-        let mut viewport = Viewport::new();
-        let backend = ratatui::backend::TestBackend::new(40, 6);
-        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
-        let mut draw = |viewport: &mut Viewport| {
-            terminal
-                .draw(|frame| viewport.draw(frame, frame.area(), &transcript, None))
-                .expect("a frame");
-        };
-        draw(&mut viewport);
-        let (line, start) = viewport
-            .sticky_prompt()
-            .expect("the second prompt is above");
-        assert_eq!(plain(&[line])[0], "> second");
-        viewport.scroll_to(start.saturating_sub(1));
-        draw(&mut viewport);
-        let (line, start) = viewport
-            .sticky_prompt()
-            .expect("with the second at the top, the first sticks");
-        assert_eq!(plain(&[line])[0], "> first");
-        assert!(!viewport.is_following());
-        viewport.scroll_to(start.saturating_sub(1));
-        draw(&mut viewport);
-        assert!(
-            viewport.sticky_prompt().is_none(),
-            "the first prompt is on screen, nothing is above it"
-        );
-    }
-
     /// The bar is dim, so it reads as a reminder rather than the prompt, and lights under the
     /// mouse.
     #[test]
@@ -2012,157 +1916,6 @@ mod tests {
                 Some(super::super::input::COMPOSER_BACKGROUND)
             );
         }
-    }
-
-    /// Following the bottom holds as items arrive; scrolling up releases it and reaching the
-    /// bottom again takes it back.
-    #[test]
-    fn following_releases_on_scroll_up_and_resumes_at_the_bottom() {
-        let mut transcript = Transcript::new(settings());
-        for index in 0..20 {
-            transcript.push(Item::note(format!("row {index}")));
-        }
-        let mut viewport = Viewport::new();
-        let backend = ratatui::backend::TestBackend::new(40, 6);
-        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
-        let mut frame = |viewport: &mut Viewport| {
-            terminal
-                .draw(|frame| viewport.draw(frame, frame.area(), &transcript, None))
-                .expect("a frame");
-        };
-        frame(&mut viewport);
-        assert!(viewport.is_following());
-        viewport.scroll_by(-3);
-        assert!(!viewport.is_following());
-        frame(&mut viewport);
-        viewport.scroll_by(3);
-        assert!(viewport.is_following(), "the bottom resumes following");
-    }
-
-    /// A page loaded above the view leaves what is on screen where it is: the view is anchored
-    /// to the item at its top, not to a line number.
-    #[test]
-    fn a_page_loaded_above_leaves_the_view_where_it_was() {
-        use crate::{
-            conversation::{ContentBlock, Event, Message, Role},
-            store::{LogPage, LogRow},
-        };
-        let page = |first: i64, words: &[&str], more: bool| LogPage {
-            rows: words
-                .iter()
-                .enumerate()
-                .map(|(offset, text)| LogRow {
-                    id: first + offset as i64,
-                    event: Event::Append(Message {
-                        role: Role::Assistant,
-                        content: vec![ContentBlock::Text {
-                            text: (*text).to_string(),
-                        }],
-                    }),
-                })
-                .collect(),
-            more,
-        };
-        let mut transcript = Transcript::new(settings());
-        transcript.set_log_end(Some(20));
-        transcript.load_page_above(page(
-            11,
-            &[
-                "r11", "r12", "r13", "r14", "r15", "r16", "r17", "r18", "r19", "r20",
-            ],
-            true,
-        ));
-        let mut viewport = Viewport::new();
-        let backend = ratatui::backend::TestBackend::new(20, 6);
-        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
-        let top_row = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
-            let buffer = terminal.backend().buffer();
-            (0..buffer.area.width)
-                .map(|x| buffer[(x, 0)].symbol().to_string())
-                .collect::<String>()
-                .trim_end()
-                .to_string()
-        };
-        terminal
-            .draw(|frame| viewport.draw(frame, frame.area(), &transcript, None))
-            .expect("a frame");
-        viewport.scroll_by(-7);
-        terminal
-            .draw(|frame| viewport.draw(frame, frame.area(), &transcript, None))
-            .expect("a frame");
-        let held = top_row(&terminal);
-        assert!(
-            held.starts_with("  r1"),
-            "scrolled up into the page: {held:?}"
-        );
-        transcript.load_page_above(page(1, &["r1", "r2", "r3", "r4", "r5"], false));
-        terminal
-            .draw(|frame| viewport.draw(frame, frame.area(), &transcript, None))
-            .expect("a frame");
-        assert_eq!(
-            top_row(&terminal),
-            held,
-            "the rows loaded above did not move what was on screen"
-        );
-    }
-
-    /// A collapsible item lights up under the mouse: its dimmed text turns white while the
-    /// pointer is on one of its rows, and goes back to gray when the pointer leaves. An item
-    /// that cannot expand does not answer.
-    #[test]
-    fn a_collapsible_item_lights_up_under_the_mouse() {
-        let mut transcript = Transcript::new(settings());
-        transcript.push(Item::note("outcome"));
-        transcript.push(Item::Thinking {
-            text: "Hmm.".into(),
-            estimate: None,
-            ended: true,
-        });
-        let mut viewport = Viewport::new();
-        let backend = ratatui::backend::TestBackend::new(40, 6);
-        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
-        let glyph_fg = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>, row: u16| {
-            terminal.backend().buffer()[(0, row)].fg
-        };
-        terminal
-            .draw(|frame| viewport.draw(frame, frame.area(), &transcript, None))
-            .expect("a frame");
-        assert_eq!(
-            glyph_fg(&terminal, 2),
-            Color::DarkGray,
-            "the thinking row starts dim"
-        );
-        assert!(
-            viewport.set_hover_row(Some(2)),
-            "the light moved onto the item"
-        );
-        terminal
-            .draw(|frame| viewport.draw(frame, frame.area(), &transcript, None))
-            .expect("a frame");
-        assert_eq!(
-            glyph_fg(&terminal, 2),
-            draw::WHITE,
-            "and lights up under the mouse"
-        );
-        assert_eq!(
-            glyph_fg(&terminal, 0),
-            Color::DarkGray,
-            "the row above is untouched"
-        );
-        assert!(viewport.set_hover_row(Some(0)), "the light moved off it");
-        terminal
-            .draw(|frame| viewport.draw(frame, frame.area(), &transcript, None))
-            .expect("a frame");
-        assert_eq!(
-            glyph_fg(&terminal, 2),
-            Color::DarkGray,
-            "it goes back to gray"
-        );
-        assert_eq!(
-            glyph_fg(&terminal, 0),
-            Color::DarkGray,
-            "an outcome row cannot expand, so it does not answer"
-        );
     }
 
     /// The pill sits centered in the row it is given, on the composer's gray; on a working row
@@ -2437,6 +2190,224 @@ mod tests {
             label.style.fg,
             Some(Color::Red),
             "the mode is red, as the composer's glyph is"
+        );
+    }
+
+    /// A collapsible item lights up under the mouse: its dimmed text turns white while the
+    /// pointer is on one of its rows, and goes back to gray when the pointer leaves. An item
+    /// that cannot expand does not answer.
+    #[test]
+    fn a_collapsible_item_lights_up_under_the_mouse() {
+        let mut transcript = Transcript::new(settings());
+        transcript.push(Item::note("outcome"));
+        transcript.push(Item::Thinking {
+            text: "Hmm.".into(),
+            estimate: None,
+            ended: true,
+        });
+        let mut viewport = Viewport::new();
+        let backend = ratatui::backend::TestBackend::new(40, 6);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+        let glyph_fg = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>, row: u16| {
+            terminal.backend().buffer()[(0, row)].fg
+        };
+        terminal
+            .draw(|frame| viewport.draw(frame, frame.area(), &transcript))
+            .expect("a frame");
+        assert_eq!(
+            glyph_fg(&terminal, 2),
+            Color::DarkGray,
+            "the thinking row starts dim"
+        );
+        assert!(
+            viewport.set_hover_row(Some(2)),
+            "the light moved onto the item"
+        );
+        terminal
+            .draw(|frame| viewport.draw(frame, frame.area(), &transcript))
+            .expect("a frame");
+        assert_eq!(
+            glyph_fg(&terminal, 2),
+            draw::WHITE,
+            "and lights up under the mouse"
+        );
+        assert_eq!(
+            glyph_fg(&terminal, 0),
+            Color::DarkGray,
+            "the row above is untouched"
+        );
+        assert!(viewport.set_hover_row(Some(0)), "the light moved off it");
+        terminal
+            .draw(|frame| viewport.draw(frame, frame.area(), &transcript))
+            .expect("a frame");
+        assert_eq!(
+            glyph_fg(&terminal, 2),
+            Color::DarkGray,
+            "it goes back to gray"
+        );
+        assert_eq!(
+            glyph_fg(&terminal, 0),
+            Color::DarkGray,
+            "an outcome row cannot expand, so it does not answer"
+        );
+    }
+
+    /// A page loaded above the view leaves what is on screen where it is: the view is anchored
+    /// to the item at its top, not to a line number.
+    #[test]
+    fn a_page_loaded_above_leaves_the_view_where_it_was() {
+        use crate::{
+            conversation::{ContentBlock, Event, Message, Role},
+            store::{LogPage, LogRow},
+        };
+        let page = |first: i64, words: &[&str], more: bool| LogPage {
+            rows: words
+                .iter()
+                .enumerate()
+                .map(|(offset, text)| LogRow {
+                    id: first + offset as i64,
+                    event: Event::Append(Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: (*text).to_string(),
+                        }],
+                    }),
+                })
+                .collect(),
+            more,
+        };
+        let mut transcript = Transcript::new(settings());
+        transcript.set_log_end(Some(20));
+        transcript.load_page_above(page(
+            11,
+            &[
+                "r11", "r12", "r13", "r14", "r15", "r16", "r17", "r18", "r19", "r20",
+            ],
+            true,
+        ));
+        let mut viewport = Viewport::new();
+        let backend = ratatui::backend::TestBackend::new(20, 6);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+        let top_row = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, 0)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        terminal
+            .draw(|frame| viewport.draw(frame, frame.area(), &transcript))
+            .expect("a frame");
+        viewport.scroll_by(-7);
+        terminal
+            .draw(|frame| viewport.draw(frame, frame.area(), &transcript))
+            .expect("a frame");
+        let held = top_row(&terminal);
+        assert!(
+            held.starts_with("  r1"),
+            "scrolled up into the page: {held:?}"
+        );
+        transcript.load_page_above(page(1, &["r1", "r2", "r3", "r4", "r5"], false));
+        terminal
+            .draw(|frame| viewport.draw(frame, frame.area(), &transcript))
+            .expect("a frame");
+        assert_eq!(
+            top_row(&terminal),
+            held,
+            "the rows loaded above did not move what was on screen"
+        );
+    }
+
+    /// The viewport maps a row of the last frame back to the item drawn there, gaps excluded.
+    #[test]
+    fn a_row_maps_back_to_the_item_drawn_on_it() {
+        let mut transcript = Transcript::new(settings());
+        transcript.push(Item::note("one"));
+        transcript.push(Item::note("two"));
+        let mut viewport = Viewport::new();
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+        terminal
+            .draw(|frame| viewport.draw(frame, frame.area(), &transcript))
+            .expect("a frame");
+        assert_eq!(viewport.item_at_row(0), Some(0));
+        assert_eq!(viewport.item_at_row(1), None, "the gap belongs to nobody");
+        assert_eq!(viewport.item_at_row(2), Some(1));
+        assert_eq!(viewport.item_at_row(3), None);
+    }
+
+    /// Following the bottom holds as items arrive; scrolling up releases it and reaching the
+    /// bottom again takes it back.
+    #[test]
+    fn following_releases_on_scroll_up_and_resumes_at_the_bottom() {
+        let mut transcript = Transcript::new(settings());
+        for index in 0..20 {
+            transcript.push(Item::note(format!("row {index}")));
+        }
+        let mut viewport = Viewport::new();
+        let backend = ratatui::backend::TestBackend::new(40, 6);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+        let mut frame = |viewport: &mut Viewport| {
+            terminal
+                .draw(|frame| viewport.draw(frame, frame.area(), &transcript))
+                .expect("a frame");
+        };
+        frame(&mut viewport);
+        assert!(viewport.is_following());
+        viewport.scroll_by(-3);
+        assert!(!viewport.is_following());
+        frame(&mut viewport);
+        viewport.scroll_by(3);
+        assert!(viewport.is_following(), "the bottom resumes following");
+    }
+
+    /// The prompt nearest above the top row sticks as a bar; a jump puts it just under the bar,
+    /// which then holds the prompt before it, and the first prompt at the very top sticks nothing.
+    #[test]
+    fn the_last_prompt_above_the_view_sticks_and_a_jump_walks_back() {
+        let mut transcript = Transcript::new(settings());
+        let prompt = |text: &str| Item::Prompt {
+            text: text.into(),
+            class: None,
+            inbox_id: None,
+            delivered: true,
+        };
+        transcript.push(prompt("first"));
+        transcript.push(Item::Text {
+            text: (1..=8).map(|n| format!("a{n}\n\n")).collect(),
+            streaming: false,
+        });
+        transcript.push(prompt("second"));
+        transcript.push(Item::Text {
+            text: (1..=8).map(|n| format!("b{n}\n\n")).collect(),
+            streaming: false,
+        });
+        let mut viewport = Viewport::new();
+        let backend = ratatui::backend::TestBackend::new(40, 6);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+        let mut draw = |viewport: &mut Viewport| {
+            terminal
+                .draw(|frame| viewport.draw(frame, frame.area(), &transcript))
+                .expect("a frame");
+        };
+        draw(&mut viewport);
+        let (line, start) = viewport
+            .sticky_prompt()
+            .expect("the second prompt is above");
+        assert_eq!(plain(&[line])[0], "> second");
+        viewport.scroll_to(start.saturating_sub(1));
+        draw(&mut viewport);
+        let (line, start) = viewport
+            .sticky_prompt()
+            .expect("with the second at the top, the first sticks");
+        assert_eq!(plain(&[line])[0], "> first");
+        assert!(!viewport.is_following());
+        viewport.scroll_to(start.saturating_sub(1));
+        draw(&mut viewport);
+        assert!(
+            viewport.sticky_prompt().is_none(),
+            "the first prompt is on screen, nothing is above it"
         );
     }
 }

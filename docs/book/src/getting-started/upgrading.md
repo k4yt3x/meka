@@ -10,6 +10,22 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.73 to 0.74
+
+**A one-shot run prints the answer alone, as markdown.** `meka --oneshot` writes the last text
+block the model wrote to stdout when the turn ends, as source rather than rendered, terminal or
+pipe alike, and nothing else: no tool indicators, no thinking, no session id line and no usage
+line, on either stream. `--format json` is unchanged and carries the session
+id, the calls and the usage; `-v` logs the process. A script that read the session id from stderr
+reads it from the JSON report instead.
+
+**Three keys are gone, and the file refuses them by name.** `[display].tool_params` and
+`[thinking].show_content` chose what a tool call or a thinking block showed before you expanded it.
+The screen expands and collapses either on a click or a key, so a call starts with its summary and
+a thinking block collapsed, and a one-shot run shows neither. `[display].max_width` capped the width
+meka laid text out at; the screen uses its window and a one-shot run its terminal. Delete the three
+from `config.toml`.
+
 ## 0.72 to 0.73
 
 **`meka session delete` is `meka session remove`.** The session command now uses the verb every

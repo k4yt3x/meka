@@ -114,9 +114,9 @@ pub(crate) trait Frontend: Send + Sync {
     ///
     /// Answers the one thing `content_started` needs to know about a
     /// [`FrontendEvent::ThinkingDelta`] and the agent cannot: would retrying the attempt
-    /// deliver the same reasoning twice. Only the frontend knows -- the screen renders deltas
-    /// under `[thinking].show_content` and drops them otherwise, and the SSE stream forwards
-    /// them only for a session that asked for reasoning.
+    /// deliver the same reasoning twice. Only the frontend knows -- the screen keeps deltas in
+    /// its thinking block, and the SSE stream forwards them only for a session that asked for
+    /// reasoning.
     ///
     /// It matters more here than it would for the answer, because reasoning is the *first* thing a
     /// turn produces. Marking every turn that reasoned would refuse the retry for almost any
@@ -356,9 +356,6 @@ pub(crate) enum FrontendEvent {
     /// A new session was created. Carries the session UUID.
     SessionStarted { id: Uuid },
     /// The agent is about to start a turn, under the id its row and every event about it carry.
-    /// Carries no spacing duty: the `[display]` blanks bracket the *episode* between two prompts,
-    /// which is `crate::console`'s to own, and a turn is only one of the things an episode may
-    /// contain.
     TurnStarted { turn_id: Uuid },
     /// The turn ended, however it ended, with what its row records. Emitted for every turn that
     /// began, after `TurnFinished` on a turn that succeeded; a frontend that renders a turn's
@@ -420,8 +417,8 @@ pub(crate) enum FrontendEvent {
     /// stream event, and always preceded by the [`Self::ThinkingDelta`]s carrying the same text.
     ///
     /// Still emitted for a consumer that wants reasoning whole -- ACP thought chunks, the blocking
-    /// HTTP response, the one-line preview under `show_content = false` -- and as the end-of-block
-    /// marker for one that streamed it.
+    /// HTTP response, the screen's collapsed thinking row -- and as the end-of-block marker for
+    /// one that streamed it.
     ///
     /// Deliberately carries no opaque half. No `signature` against a future replay: replay reads
     /// the conversation log, where the block keeps its provider-tagged

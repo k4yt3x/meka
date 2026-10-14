@@ -383,12 +383,12 @@ cache_control = false
 display modes:
 
 - `summarized` (the default): the server streams a short summary of the reasoning, shown as
-  thinking text (one dimmed preview line, or the whole summary under
-  [`thinking.show_content`](#thinkingshow_content)). Sent as `thinking.display = "summarized"`,
+  thinking text (a dimmed preview row, the whole summary when expanded). Sent as
+  `thinking.display = "summarized"`,
   which is what Claude Code sends with its `showThinkingSummaries` setting on.
 - `updates` (Claude Code's own default): the server streams a running token count in place of the
-  text, and the screen draws `• Thinking · 150 tokens` from it (a one-shot run `Thinking... (150
-  tokens)`), redrawn as the count climbs and left on screen when the phase ends. Sent as `thinking.display = "updates"` under the
+  text, and the screen draws `• Thinking · 150 tokens` from it, redrawn as the count climbs and
+  left on screen when the phase ends. Sent as `thinking.display = "updates"` under the
   `thinking-display-updates-2026-08-18` beta.
 - `redacted`: the server withholds the text and may return opaque `redacted_thinking` blocks. Sent
   as the `redact-thinking-2026-02-12` beta with no display field.
@@ -1278,37 +1278,15 @@ send_class = "followup"
 
 Presentation and budget settings for extended thinking (`anthropic-messages` and `claude-subscription` backends). Whether thinking is on, and which wire encoding it uses, is the per-profile [`thinking`](#thinking) key, not a setting here.
 
-While the model is thinking, the screen draws a live `• Thinking` row (a one-shot run a `Thinking...` line) so a long pause reads as work rather than as a hang. On `claude-subscription` it carries the server's own running estimate (`• Thinking · 150 tokens`), redrawn in place as the count climbs; `anthropic-messages` does not report one, so the row stays bare. The count is coarse: a progress signal, not an accounting figure.
+While the model is thinking, the screen draws a live `• Thinking` row so a long pause reads as work rather than as a hang. On `claude-subscription` it carries the server's own running estimate (`• Thinking · 150 tokens`), redrawn in place as the count climbs; `anthropic-messages` does not report one, so the row stays bare. The count is coarse: a progress signal, not an accounting figure.
 
-When the block ends the line stays on screen as a record that the phase happened; if the model returned readable reasoning, that text replaces the line instead. Nothing is drawn when output is piped or redirected, since there is no terminal to redraw on.
+When the block ends the line stays on screen as a record that the phase happened; if the model returned readable reasoning, that text replaces the line instead.
 
 ### `thinking.budget`
 
 Maximum number of tokens the model can use for thinking. Read only under [`thinking = "budgeted"`](#thinking); the adaptive encoding lets the model set its own budget and sends no cap. A per-profile [`[profiles.<name>].thinking_budget`](#thinking_budget) takes precedence over this.
 
 Default: `16000`
-
-### `thinking.show_content`
-
-Whether a thinking block starts expanded. When `false`, a block carrying readable reasoning shows as a single dimmed row, `• Thinking · …` on the screen and `Thinking... …` in a one-shot run, with its first words flattened across line breaks and cut to fit [`display.max_width`](#displaymax_width); while the block still streams the screen shows its latest line instead. Emphasis on that row is styling rather than text, so a summary's `**Bold header**` reads as a bold header there too.
-
-When `true`, the block shows whole under the same dimmed label, every line at the text edge, as it streams. There is no height limit: asking to see the reasoning is asking to see all of it. On a model that streams its whole chain of thought this is the difference between a token counter and the text.
-
-On the interactive screen this is only where a block starts: a click, or Ctrl+T for every block at once, shows or hides the reasoning after the fact, whatever this says. See [Expanding and collapsing](../usage/interactive-mode.md#expanding-and-collapsing). In a one-shot run it decides what is printed, and the block is written to stderr as it arrives.
-
-Reasoning is painted entirely in dark gray, so emphasis carries as bold or italic rather than as color. That is what keeps a thinking block readable as a footnote rather than as the reply. The markdown is rendered, so a reasoning summary's `**Bold header**` arrives as a bold header instead of as asterisks; fenced code keeps the same gray and is not syntax-highlighted, for the same reason.
-
-Either way the block is still sent on subsequent turns, for reasoning continuity.
-
-One cost to know about: a turn that has streamed you reasoning will not retry a transient provider failure. meka retries only while nothing the model produced has reached you, since a second attempt would repeat it, and reasoning is the first thing a turn produces. The interactive screen keeps the reasoning whether or not it is shown, so there every turn that reasoned is in that position; in a one-shot run under the default the deltas are discarded and the one-line preview is built from the completed block, so nothing is repeatable and retries behave as they always have.
-
-Default: `false`
-
-```toml
-[thinking]
-budget = 20000
-show_content = true
-```
 
 ## `[web]`
 
@@ -1359,158 +1337,28 @@ max_redirects = 0
 
 ## `[display]`
 
-Settings for output formatting.
-
-### `display.max_width`
-
-Widest line meka composes from model output, in terminal columns.
-
-Default: unset, meaning the terminal's own width, so nothing ever wraps.
-
-Set it to pin the width instead:
-
-```toml
-[display]
-max_width = 120
-```
-
-A set value is honored exactly rather than clamped to the terminal, because pinning it is how you
-get identical output across machines and a silent clamp would take that away on the narrow one. The
-cost is that a value wider than your terminal wraps, and a wrapped row starts at column zero, where
-meka's own output lives. Below 40 columns the value is clamped up and a warning is logged: every
-budget subtracts fixed chrome first, and below roughly that the subtraction leaves nothing. Above
-1000 it is clamped down, also with a warning, since no terminal is that wide and the value is far
-more likely to be a typo than a request.
-
-This covers meka's own output: tool indicators and their argument block, thinking previews, the
-checklist, and the approval prompt. On the interactive screen it also caps the width the answer's
-markdown wraps to, for a reader who finds a wide window hard to follow. With a one-shot run's output
-piped there is no terminal to measure, so an unset width falls back to 100 columns and a captured
-run stays byte-stable.
-
-A terminal narrower than 20 columns is treated as 20. That is not a legibility judgment: the
-thinking block's own prefix is twelve columns, so below roughly that meka's chrome no longer fits and
-the width stops meaning anything. Such a terminal wraps meka's output whatever the number says.
-
-### `display.tool_params`
-
-How much of a tool call's input its row shows: on the screen `• shell_execute cargo test`, in a
-one-shot run the `[tool ...]` indicator. On the interactive screen this is what a collapsed call
-shows; an expanded one shows every argument and the output whatever this is set to, and the
-setting decides what a new call starts as. See
-[Expanding and collapsing](../usage/interactive-mode.md#expanding-and-collapsing).
-
-This setting covers the call's row only. With approvals on, the approval prompt always shows every
-argument, whatever this is set to: the row is a notification, the prompt is a decision, and
-setting `off` for a quiet transcript must not leave you approving calls you cannot see.
-
-| Value | Description |
-|-------|-------------|
-| `off` | Name only: `• shell_execute`, `[tool shell_execute]`. No argument reaches your terminal |
-| `summary` | Name plus the one argument that identifies the call: `• shell_execute cargo test`, ``[tool shell_execute(`cargo test`)]`` (default) |
-| `full` | Every argument, as an indented block under the name |
-
-Default: `summary`
-
-`full` writes each parameter on its own line. A value that fits on a line follows its key; one that
-does not gets an indented block under a bare `key:`, so a multi-line `file_edit` argument stays
-readable instead of collapsing into escaped newlines. Nesting is carried by indentation, with `-`
-for array elements:
-
-```
-[tool file_edit]
-  path: src/render.rs
-  old_string:
-    let first_line = thinking.lines().next().unwrap_or("");
-    let truncated = truncate_display(first_line, 80);
-
-[tool agent_spawn]
-  prompt: Audit the scheduler for missed-occurrence bugs
-  tools:
-    - file_read
-    - file_search
-```
-
-Consecutive calls are separated by a blank line under `full`, since each one is a block and running
-them together reads as a single call with too many parameters. Under `summary` they stay flush, which
-is what makes a run of them read as a list of steps.
-
-This is a reading format, not a data format: quotes are dropped, so `timeout: 300` doesn't say
-whether the model sent `300` or `"300"`. Four caps keep one call from filling the screen, and each
-says what it hid:
-
-| Cap | Limit | Marker |
-|-----|-------|--------|
-| One argument's value | 30 lines | `... N more lines`, indented under that argument |
-| One argument's rows | 32 rows | `... N more rows`, indented under that argument |
-| The block | 60 rows, checked at an argument boundary | `... N more arguments: name, name` |
-| One line | [`display.max_width`](#displaymax_width) | `...` at the cut |
-
-The first two caps look redundant and are not. A string value has lines to count, so it is trimmed
-by line and the marker counts lines. An array or an object has none: it fans out one row per element,
-so it needs a bound counted in rows, and the marker says rows rather than pretending they were lines.
-
-The line cap is exact, brackets and indentation included. The block cap is not: it is checked before
-an argument is rendered rather than after, so the block reaches at most the block cap plus one
-argument's own budget plus the line naming what went: 93 rows.
-
-The block cap drops whole arguments and names them rather than cutting wherever row 60 lands.
-Knowing that `path` was passed but not shown beats seeing 60 rows of `content` and never learning
-which file it was written to.
-
-**A cut keeps the end.** Where a whole argument is dropped it is named; where rows are dropped the
-last one is kept, so a long array still shows its final element and a trimmed value still shows how
-it finishes. The reasoning is the same one that elides a long path from its middle rather than its
-tail: the end of a thing too big to show is usually the half that identifies it.
-
-When you need the exact JSON a tool was called with, `meka session export` has it, untruncated and
-unflattened.
-
-**`full` puts every argument on screen, secrets included.** `summary` shows only the one argument
-that identifies a call (`file_write`'s path, `web_fetch`'s URL), so a request header carrying a token
-or a file body carrying a key stays off screen until a call is expanded. `full` shows all of them
-from the start, and a replay shows them on every resume and every page of history. meka never puts its
-own credentials into tool arguments, so what appears is what the model itself passed, but that is
-worth knowing before turning this on where somebody can read over your shoulder.
-
-Values are escape-stripped, their newlines and carriage returns flattened, and Unicode format
-characters (bidi overrides, soft hyphens, zero-width joiners) removed, so an argument cannot move
-your cursor, reorder what you read, or place text at column zero where meka's own output lives.
-
-No line exceeds [`display.max_width`](#displaymax_width), so by default nothing wraps and no row ever
-begins with model text. Setting `max_width` wider than your terminal gives that up, which is the one
-case where a long argument can still produce a row starting flush left.
-
-One residual caveat: the `... N more lines`, `... N more rows` and `... N more arguments` markers are
-ordinary text, so an argument whose content mimics one is indistinguishable from a real elision. That
-does not let an argument run anything, but it can mislead a reader who is not expecting it.
-
-Applies to the interactive screen, to one-shot runs (`meka --oneshot`), and to the history the
-screen reads back. ACP sends structured tool-call fields to the editor and the HTTP API's SSE
-events already carry the raw input, so neither is affected.
-
-```toml
-[display]
-tool_params = "full"
-```
+Settings for the interactive screen; `stream` also decides how a one-shot run asks the provider.
 
 ### `display.show_session_id_on_create`
 
-Whether to display the session id when a new session is created.
+Whether the screen shows the session id when a new session is created.
 
 Default: `false`
 
 ### `display.show_session_id_on_resume`
 
-Whether to display the session id when a session is resumed with `-c` or `-r`.
+Whether the screen shows the session id when a session is resumed with `-c` or `-r`.
 
 Default: `true`
 
 ### `display.show_session_id_on_exit`
 
-Whether to display the session id when meka exits.
+Whether the screen shows the session id when meka exits.
 
 Default: `true`
+
+A one-shot run prints no session id whatever these say: `--format json` carries it as
+`session_id`, and `-v` logs it.
 
 ```toml
 [display]
@@ -1560,13 +1408,13 @@ mouse = false
 
 ### `display.show_token_usage`
 
-When `true`, meka shows a one-line per-turn token-usage summary after each turn, on the screen as
-a dim row and in a one-shot run as a bracketed line:
+When `true`, the screen shows a dim one-row token-usage summary after each turn:
 
 ```
 • 12.3k in · 96% cached · 1.2k out
-[in 12.3k / cache hit 96% / out 1.2k]
 ```
+
+A one-shot run prints none; `--format json` carries the turn's usage.
 
 The `in` column is the total of all three Anthropic input tiers (live, cache-write, cache-read); `cache hit %` is `cache_read / total_in`. Useful for monitoring caching effectiveness during long sessions. The `/status` slash command surfaces cumulative session stats in the same vein.
 
@@ -1574,9 +1422,10 @@ Default: `false`
 
 ### `display.stream`
 
-Whether the answer streams to the terminal as it arrives, or lands whole when the turn ends. The
-`--no-stream` flag turns streaming off for one run; this key is the standing preference, and it
-applies to sub-agents as well.
+Whether the provider is asked to stream its reply or to return it whole. On the screen a streamed
+answer is drawn as it arrives and a whole one lands when the turn ends; a one-shot run prints its
+answer when the turn ends either way. The `--no-stream` flag turns streaming off for one run; this
+key is the standing preference, and it applies to sub-agents as well.
 
 Default: `true`
 

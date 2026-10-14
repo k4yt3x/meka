@@ -579,7 +579,7 @@ pub(crate) fn thinking_row(
     // The runs whole, then cut here at the edge, so the one marker on the screen is the
     // screen's own.
     let mut preview = Vec::new();
-    for run in thinking_preview_runs_within(thinking, usize::MAX) {
+    for run in thinking_preview_runs(thinking) {
         let mut style = gray();
         if run.bold {
             style = style.add_modifier(Modifier::BOLD);
@@ -1671,5 +1671,63 @@ mod tests {
         assert_eq!(cut_text_start("~/.config/config", 12), "…nfig/config");
         assert_eq!(cut_text_start("ab漢字", 3), "…字");
         assert_eq!(cut_text_start("abc", 1), "…");
+    }
+
+    /// A call's row shows the one argument that identifies it: a supplied summary first, else
+    /// the primary parameter the built-in declares, joined when it is a list; an MCP tool has no
+    /// declared parameter and stays bare, and a blank summary is no summary.
+    #[test]
+    fn a_call_s_summary_is_the_argument_that_identifies_it() {
+        let cases: [(&str, serde_json::Value, Option<&str>, Option<&str>); 6] = [
+            (
+                "memory_search",
+                serde_json::json!({"queries": ["window size", "context window"]}),
+                None,
+                Some("window size, context window"),
+            ),
+            (
+                "file_read",
+                serde_json::json!({"path": "/etc/hosts"}),
+                None,
+                Some("/etc/hosts"),
+            ),
+            (
+                "schedule_cancel",
+                serde_json::json!({"id": "7f3a1c22"}),
+                None,
+                Some("7f3a1c22"),
+            ),
+            (
+                "mcp__ida__decompile",
+                serde_json::json!({"address": "0x1400"}),
+                None,
+                None,
+            ),
+            (
+                "file_read",
+                serde_json::json!({"path": "/etc/hosts"}),
+                Some("/resolved/by/the/agent"),
+                Some("/resolved/by/the/agent"),
+            ),
+            ("checklist_read", serde_json::json!({}), Some("   "), None),
+        ];
+        for (name, input, supplied, expected) in cases {
+            assert_eq!(
+                tool_summary(name, &input, supplied).as_deref(),
+                expected,
+                "{name} with {supplied:?}"
+            );
+        }
+    }
+
+    /// A tool name is model-supplied too, by way of an MCP server: an escape in it never reaches
+    /// the row, and the row stays one row.
+    #[test]
+    fn a_forged_tool_name_cannot_leave_its_row() {
+        let forged = "file_read\u{1b}[2J\u{1b}[1;1H";
+        let rows = plain(&[tool_row(forged, None, None, None, 80)]);
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].contains('\u{1b}'), "{rows:?}");
+        assert!(rows[0].contains("file_read"), "{rows:?}");
     }
 }

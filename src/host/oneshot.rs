@@ -12,24 +12,11 @@ use super::{terminal::*, *};
 /// path prints, so the report's `notices` says why a call the model made did not run.
 struct JsonFrontend {
     events: std::sync::Mutex<Vec<crate::frontend::FrontendEvent>>,
-    /// Where the one line the report does not carry goes; see `emit`.
-    console: Arc<std::sync::Mutex<crate::console::Console>>,
-    show_session_id_on_create: bool,
 }
 
 #[async_trait::async_trait]
 impl crate::frontend::Frontend for JsonFrontend {
     async fn emit(&self, event: crate::frontend::FrontendEvent) {
-        // Printed as the screen frontend prints it, on stderr through the console, so the setting
-        // holds under `--format json` too and a run that never reaches its report has still said
-        // which session it made. Stdout stays the report's alone.
-        if let crate::frontend::FrontendEvent::SessionStarted { id } = &event
-            && self.show_session_id_on_create
-        {
-            with_console(&self.console, |console| {
-                console.session_id("Creating new session", &id.to_string())
-            });
-        }
         crate::sync::lock(&self.events).push(event);
     }
 
@@ -150,6 +137,25 @@ fn assemble_report(
     }
 }
 
+/// The answer on stdout, as the model wrote it: markdown source with one newline at the end,
+/// terminal or pipe alike, because a one-shot is what gets piped into the next tool and a rendering
+/// would hand that tool escapes. Nothing for a turn that wrote none.
+///
+/// A stdout that would not take the answer reaches the exit code, or `meka -p … > out.txt` against
+/// a full disk reports success over an empty file. A reader that hung up is excluded: it stopped
+/// reading on purpose, and every tool in a pipeline is entitled to do that.
+fn print_answer(answer: &str) -> anyhow::Result<()> {
+    let answer = answer.trim_end_matches('\n');
+    if answer.trim().is_empty() {
+        return Ok(());
+    }
+    match crate::render::write_stdout_line(answer) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(anyhow::Error::new(error).context("the answer did not reach stdout")),
+    }
+}
+
 pub(crate) async fn run_oneshot(
     config: ResolvedConfig,
     store: Store,
@@ -161,25 +167,6 @@ pub(crate) async fn run_oneshot(
     // created a session row, taken a lock or swept anything on the way to saying so. The outcomes
     // it carries ride on it once the session is known.
     let input = crate::agent::TurnInput::from_parts(prompt, Vec::new())?;
-    // One episode for the whole run. Oneshot draws no prompt, so there is no line above to space
-    // away from and no prompt below to space towards: both blanks are configured off here rather
-    // than left to a bracket that would have nothing to bracket against. What the console still
-    // buys is the rest of it -- one owner for the streaming renderer, and the row-settling that
-    // keeps a turn's last paragraph off an MCP progress line.
-    // Rendered for a terminal, the source as written for a pipe: a script wants the words, and
-    // the escapes a rendering carries would land in whatever reads them.
-    let render_mode = if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-        crate::config::RenderMode::Termimad
-    } else {
-        crate::config::RenderMode::Raw
-    };
-    let console = Arc::new(std::sync::Mutex::new(crate::console::Console::new(
-        render_mode,
-    )));
-    // Before the first thing that logs. Off-prompt, `tracing` writes straight to stderr, and the
-    // row it lands on may be one the console intends to erase; giving the relay this handle is what
-    // lets a mid-turn `warn!` settle that row first instead of being wiped with it.
-    crate::relay::RELAY.install_console(&console);
     // `--format json` records the turn instead of rendering it: stdout carries one object at the
     // end and nothing before it, so `meka -p … --format json | jq` sees only the object.
     let json_frontend = matches!(
@@ -189,21 +176,12 @@ pub(crate) async fn run_oneshot(
     .then(|| {
         Arc::new(JsonFrontend {
             events: std::sync::Mutex::new(Vec::new()),
-            console: Arc::clone(&console),
-            show_session_id_on_create: config.show_session_id_on_create,
         })
     });
+    let plain_frontend = Arc::new(frontend::PlainFrontend::new());
     let oneshot_frontend: Arc<dyn crate::frontend::Frontend> = match &json_frontend {
         Some(frontend) => Arc::clone(frontend) as Arc<dyn crate::frontend::Frontend>,
-        None => Arc::new(frontend::PlainFrontend::new(
-            frontend::PlainFrontendConfig {
-                console: Arc::clone(&console),
-                show_session_id_on_create: config.show_session_id_on_create,
-                show_token_usage: config.show_token_usage,
-                thinking_show_content: config.thinking_show_content,
-                tool_params: config.tool_params,
-            },
-        )),
+        None => Arc::clone(&plain_frontend) as Arc<dyn crate::frontend::Frontend>,
     };
     let launch_cwd = std::env::current_dir().unwrap_or_else(|error| {
         tracing::warn!("failed to read the process working directory at startup: {error}");
@@ -229,14 +207,8 @@ pub(crate) async fn run_oneshot(
     } = resolve_session_resume(&store, &config).await?;
     // The run's output starts after the resume, so the banner is its first block and what follows
     // is set off from it like every block from the one above.
-    with_console(&console, |console| {
-        console.start(crate::console::RowState::Empty)
-    });
-    let _finish = FinishConsole(Arc::clone(&console));
     if let Some(id) = announce {
-        with_console(&console, |console| {
-            console.session_id("Resuming session", &id.to_string())
-        });
+        tracing::info!("resuming session {id}");
     }
     // After the resume, whose lock is what spares the session this run was asked for.
     sweep_expired_sessions(&config, &store).await?;
@@ -298,10 +270,7 @@ pub(crate) async fn run_oneshot(
     install_interrupt_handler(
         cancel.clone(),
         &agent,
-        {
-            let console = Arc::clone(&console);
-            move |note: &str| with_console(&console, |console| console.annotation(note))
-        },
+        |note: &str| tracing::warn!("{note}"),
         || {
             // Exits from inside the listener's task, so it never reaches the funnel in `main`
             // and has to release the grants itself.
@@ -351,16 +320,19 @@ pub(crate) async fn run_oneshot(
         // Kept as the run's error, so the process leaves with 130 the way every host does on a
         // Ctrl+C, rather than with 0 over a partial answer. The report below still goes out for it.
         Err(error @ crate::error::MekaError::Interrupted) => {
-            with_console(&console, |console| console.annotation("interrupted"));
+            tracing::warn!("interrupted");
             (Some(error), None)
         }
         Err(error) => (Some(error), None),
     };
     let interrupted = matches!(turn_error, Some(crate::error::MekaError::Interrupted));
-    // Finished whichever way the turn went, so a turn that streamed a partial answer and then
-    // failed still shows what it streamed. `TurnFinished` closes the happy path; nothing closed
-    // this one.
-    finish_console(&console);
+    // The answer goes out for a turn that ended, whichever way, an interrupt included: what the
+    // model had written by then is still its answer, and the exit code says the rest. A failed
+    // turn is reported on stderr and by the exit code alone, because an answer beside it would
+    // read as one.
+    if json_frontend.is_none() && (turn_error.is_none() || interrupted) {
+        print_answer(&plain_frontend.answer())?;
+    }
     // The report goes out for a turn that ended, whichever way, an interrupt included: its
     // `stop_reason` says so, and the exit code says so again. A failed turn is reported on stderr
     // and by the exit code alone, because an object beside it would read as an answer.
@@ -395,11 +367,7 @@ pub(crate) async fn run_oneshot(
             let tasks = agent.background_tasks();
             tokio::select! {
                 _ = tasks.wait_for_session(id) => {}
-                _ = &mut pressed => {
-                    with_console(&console, |console| {
-                        console.annotation("stopped waiting for background tasks")
-                    });
-                }
+                _ = &mut pressed => tracing::warn!("stopped waiting for background tasks"),
             }
         }
         // Collected unconditionally, not only when this process started something. Resuming a
@@ -416,21 +384,12 @@ pub(crate) async fn run_oneshot(
         if !outcomes.is_empty() {
             // Printed rather than delivered as a turn: the agent's answer has already been given
             // and the process is on its way out, so this is for the human reading the output.
-            // Through the console, which owns every row this run writes and the blank above each.
-            with_console(&console, |console| {
-                console.chrome(|| {
-                    crate::streams::write_stderr(crate::background::render_outcomes(&outcomes));
-                })
-            });
+            crate::streams::write_stderr(crate::background::render_outcomes(&outcomes));
         }
     }
 
-    if let Some(id) = session_id
-        && config.show_session_id_on_exit
-    {
-        with_console(&console, |console| {
-            console.session_id("Leaving session", &id.to_string())
-        });
+    if let Some(id) = session_id {
+        tracing::info!("leaving session {id}");
     }
 
     // The release the screen makes on its way out, on every exit here too: without it a Ctrl+C
@@ -440,13 +399,11 @@ pub(crate) async fn run_oneshot(
     // process teardown.
     let stopped = crate::host::release_agent(&agent, &cancel, mcp_manager.as_ref()).await;
     if stopped > 0 {
-        with_console(&console, |console| {
-            console.annotation(&format!(
-                "stopping {} background task{}",
-                stopped,
-                if stopped == 1 { "" } else { "s" }
-            ))
-        });
+        // A warning, not a signpost: the tasks were stopped short and their results are not coming.
+        tracing::warn!(
+            "stopping {stopped} background task{}",
+            if stopped == 1 { "" } else { "s" }
+        );
         // Waited for, not just signaled, for the reason the screen gives: the process leaves
         // through `exit` right after this, which polls no task again, so a cancel alone would
         // kill nothing. Bounded, since canceling only asks.
@@ -471,16 +428,6 @@ pub(crate) async fn run_oneshot(
 
     if let Some(error) = turn_error {
         return Err(error.into());
-    }
-
-    // A one-shot run is the host that gets scripted, and its answer is the whole point of invoking
-    // it. A stdout that would not take that answer has to reach the exit code, or `meka -p … >
-    // out.txt` against a full disk reports success over an empty file. A reader that hung up is
-    // excluded upstream: it stopped reading on purpose, and every tool in a pipeline is entitled to
-    // do that. Reported here rather than at the write, so the turn still finishes and the session
-    // still records what the model said.
-    if let Some(error) = with_console(&console, |console| console.take_lost_output()) {
-        return Err(anyhow::Error::new(error).context("the answer did not reach stdout"));
     }
 
     Ok(())

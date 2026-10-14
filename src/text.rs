@@ -1341,4 +1341,114 @@ mod tests {
             "just now"
         );
     }
+
+    /// Measuring a flood of zero-width characters stays linear and the fitted line stays inside
+    /// the budget.
+    #[test]
+    fn fitting_text_to_a_budget_is_bounded_by_the_budget() {
+        let zalgo = format!("{}{}", "\u{0301}".repeat(40_000), "A".repeat(300));
+        let started = std::time::Instant::now();
+        let fitted = super::sanitize_to_line(&zalgo, 60);
+        assert!(super::display_width(&fitted) <= 60);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// An elision keeps both ends and never exceeds the budget, whatever the text is made of.
+    #[test]
+    fn keeping_both_ends_never_exceeds_the_budget() {
+        let probes = [
+            "e\u{0301}".repeat(60),
+            "\u{1F1E6}\u{1F1E7}".repeat(40),
+            "a\u{0300}\u{0301}\u{0302}b".repeat(30),
+            "漢".repeat(60),
+            "😀".repeat(40),
+        ];
+        for probe in &probes {
+            for budget in 1..40usize {
+                let elided = super::elide_to_width(probe, budget);
+                assert!(
+                    super::display_width(&elided) <= budget,
+                    "budget {} gave {} columns",
+                    budget,
+                    super::display_width(&elided)
+                );
+            }
+        }
+        let path = "/home/you/projects/meka/docs/book/src/configuration/config-file.md";
+        for budget in 6..40usize {
+            let elided = super::elide_to_width(path, budget);
+            assert!(
+                elided.starts_with('/'),
+                "lost the head at {budget}: {elided}"
+            );
+            assert!(
+                elided.ends_with(|last: char| last != '.'),
+                "lost the tail at {budget}: {elided}"
+            );
+        }
+    }
+
+    /// Two names that differ only in the middle stay distinguishable once elided.
+    #[test]
+    fn two_mcp_names_stay_distinguishable_when_elided() {
+        let search = super::elide_to_width("mcp__exa__web_search_exa", 20);
+        let fetch = super::elide_to_width("mcp__exa__web_fetch_exa", 20);
+        assert_ne!(search, fetch, "elided to the same string");
+        assert!(search.starts_with("mcp__exa"), "{search}");
+        assert!(search.ends_with("exa"), "{search}");
+    }
+
+    /// A cut always says it was cut, even at a budget too small for the whole marker.
+    #[test]
+    fn a_cut_always_says_it_was_cut() {
+        for budget in 1..=4 {
+            let cut = super::truncate_to_width("mcp__exa__web_search_exa", budget);
+            assert!(
+                cut.ends_with(
+                    &super::TRUNCATION_MARKER[..super::TRUNCATION_MARKER.len().min(budget)]
+                ),
+                "budget {budget} produced {cut:?}"
+            );
+            assert!(
+                super::display_width(&cut) <= budget,
+                "budget {budget} produced {cut:?}"
+            );
+        }
+    }
+
+    /// A tail of modifier-bearing emoji is measured as it is printed, not by its character count.
+    #[test]
+    fn a_tail_is_measured_in_the_order_it_is_printed() {
+        let payload = "\u{1F3FB}\u{1F44D}a".repeat(400);
+        for budget in [20usize, 40, 80, 160] {
+            let elided = super::elide_to_width(&payload, budget);
+            assert!(
+                super::display_width(&elided) <= budget,
+                "budget {} gave {} columns",
+                budget,
+                super::display_width(&elided)
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrapped_row_never_exceeds_its_budget() {
+        for budget in 1..12usize {
+            for rows in [1usize, 3, 10] {
+                for text in ["漢字漢字漢字", "  漢字漢字", "aaa bbb ccc", "😀😀😀", ""]
+                {
+                    for row in super::wrap_to_width(text, budget, rows) {
+                        assert!(
+                            super::display_width(&row) <= budget,
+                            "budget {budget} gave {row:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

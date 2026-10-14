@@ -2,15 +2,15 @@
 //! notices.
 
 use super::*;
-use crate::streams::{write_stderr, write_stderr_line};
+use crate::streams::write_stderr_line;
 
 /// Write to stdout, returning a failure rather than panicking on it.
 ///
 /// `print!` and `println!` panic when the write fails, which is the wrong answer for the one stream
 /// a caller is meant to pipe: `meka --oneshot … | head` closes it mid-answer, and where every other
-/// tool exits, meka crashes. Every write in [`StreamingRenderer`] goes through this or
-/// [`write_stdout_line`], which is what makes the `io::Result` its methods already return the truth
-/// about what reached the terminal rather than a formality.
+/// tool exits, meka crashes. Every write of an answer goes through this or [`write_stdout_line`],
+/// which is what makes the `io::Result` the truth about what reached the terminal rather than a
+/// formality.
 pub(crate) fn write_stdout(text: impl std::fmt::Display) -> io::Result<()> {
     if crate::streams::captured(&text.to_string()) {
         return Ok(());
@@ -85,155 +85,22 @@ impl std::fmt::Display for ReaderHungUp {
 impl std::error::Error for ReaderHungUp {}
 /// Tag a stdout failure that was the reader hanging up, leaving every other failure alone.
 ///
-/// The kind stays `BrokenPipe`, so [`report_lost_output`] and `Console::lost_output` keep reading
-/// it the way they always have; only the payload is added.
+/// The kind stays `BrokenPipe`, so a caller reading the kind sees what it always did; only the
+/// payload is added.
 pub(super) fn reader_hung_up(error: io::Error) -> io::Error {
     if error.kind() == io::ErrorKind::BrokenPipe {
         return io::Error::new(io::ErrorKind::BrokenPipe, ReaderHungUp);
     }
     error
 }
-/// Whether the terminal has already been told that output is not arriving.
-///
-/// Global rather than per-`Console` because the writers are: `Console::text_delta` asks once per
-/// streamed delta and history replay once per replayed message, and the replay path has no console
-/// to hang a flag on. Without this the correction is hundreds of identical lines, which buries the
-/// one that matters.
-///
-/// Cleared by [`reset_lost_output_report`] when an episode opens, so a screen that runs for hours
-/// says it once per prompt rather than once ever.
-pub(super) static LOST_OUTPUT_REPORTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-/// Let the next episode speak again. See [`LOST_OUTPUT_REPORTED`].
-pub(crate) fn reset_lost_output_report() {
-    LOST_OUTPUT_REPORTED.store(false, std::sync::atomic::Ordering::Relaxed);
-}
-/// Whether this is the first report since the last reset, claiming the right to be it.
-///
-/// Split from the static so a test can drive it with a latch of its own. The global one is cleared
-/// by `Console::start`, which several other tests in this binary call, and a clear landing
-/// between two reports made a test that used it flaky roughly once in four hundred runs.
-pub(super) fn claim_first_report(latch: &std::sync::atomic::AtomicBool) -> bool {
-    !latch.swap(true, std::sync::atomic::Ordering::Relaxed)
-}
-/// Report output that did not reach stdout, at the level the failure deserves, once.
-///
-/// A broken pipe is the reader's own decision -- `meka … | head` -- so saying so by default would
-/// put a line on stderr about something the user did on purpose. Any other failure lost the model's
-/// answer to something they did not choose, and a full disk that reports at `debug!` is a silent
-/// one.
-pub(crate) fn report_lost_output(what: &str, error: &io::Error) {
-    if !claim_first_report(&LOST_OUTPUT_REPORTED) {
-        return;
-    }
-    if error.kind() == io::ErrorKind::BrokenPipe {
-        tracing::debug!("{what}: {error}");
-    } else {
-        tracing::warn!("{what}: {error}");
-    }
-}
-/// Which stream a [`StreamingRenderer`] writes to, and therefore whose width it measures.
-///
-/// The two streams differ in what a failure means, so one enum decides both: `Stdout` hands
-/// failures back, because a scripted host has to fail on a lost answer, and `Stderr` swallows them,
-/// because a report would go to the stream that just refused it (see [`write_stderr`]).
-///
-/// It also picks which stream is asked for the terminal width. One field for both is what stops the
-/// two from disagreeing: a renderer measuring a stream it does not write to wraps to a width its
-/// own output never had.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Sink {
-    Stdout,
-    Stderr,
-}
-impl Sink {
-    pub(super) fn write(self, text: &str) -> io::Result<()> {
-        match self {
-            Sink::Stdout => write_stdout(text),
-            Sink::Stderr => {
-                write_stderr(text);
-                Ok(())
-            }
-        }
-    }
-
-    pub(super) fn is_terminal(self) -> bool {
-        match self {
-            Sink::Stdout => std::io::IsTerminal::is_terminal(&io::stdout()),
-            Sink::Stderr => std::io::IsTerminal::is_terminal(&io::stderr()),
-        }
-    }
-
-    pub(super) fn flush(self) -> io::Result<()> {
-        match self {
-            Sink::Stdout => io::stdout().flush(),
-            Sink::Stderr => Ok(()),
-        }
-    }
-}
-/// Split `text` into what to write now and how many row endings to hold back.
-///
-/// The last byte is not always the row ending: syntect closes a highlighted line with a reset
-/// *after* its newline, so a plain `trim_end_matches('\n')` finds nothing to hold on that path.
-/// Trailing escapes are stepped over and rejoin the text they belong to, which puts the reset ahead
-/// of the row ending rather than behind it: an attribute left open across one is what `ESC[K` then
-/// erases with (see [`write_own_line_prelude`]).
-pub(super) fn split_held_newlines(text: &str) -> (String, usize) {
-    let escapes: Vec<(usize, usize)> = CSI_PATTERN
-        .find_iter(text)
-        .map(|found| (found.start(), found.end()))
-        .collect();
-    let mut end = text.len();
-    let mut unread = escapes.len();
-    let mut newlines = 0;
-    let mut peeled = String::new();
-    // Newlines and escapes *alternate* at the end, so both have to be walked. A highlighted code
-    // block is emitted one styled line at a time, so its trailing blank rows arrive as
-    // `\n <reset> \n <color> \n <reset>` -- stepping over one final run of escapes leaves the
-    // earlier newlines inside the body, where they print as the blank rows the caller is trying to
-    // decide about.
-    loop {
-        if let Some(&(start, stop)) = unread.checked_sub(1).and_then(|last| escapes.get(last))
-            && stop == end
-        {
-            unread -= 1;
-            peeled.insert_str(0, text.get(start..stop).unwrap_or_default());
-            end = start;
-            continue;
-        }
-        if end
-            .checked_sub(1)
-            .and_then(|last| text.as_bytes().get(last))
-            == Some(&b'\n')
-        {
-            newlines += 1;
-            end -= 1;
-            continue;
-        }
-        break;
-    }
-    (
-        format!("{}{}", text.get(..end).unwrap_or(text), peeled),
-        newlines,
-    )
-}
 pub(crate) fn render_hint(message: &str) {
     write_stderr_line(rows_of(message).with(Color::DarkGrey));
 }
 
-/// A block's text, ending where its last row does. The console's block machine owns the blank
-/// between two blocks, and a trailing newline in the text would print an empty row of its own
-/// under the block, doubling the blank, or standing in for one the machine did not decide on.
+/// A message's text, ending where its last row does: a trailing newline would print an empty row of
+/// its own under it.
 fn rows_of(message: &str) -> &str {
     message.trim_end_matches('\n')
-}
-/// A warn-level notice: something recoverable the user should see without `-v`.
-///
-/// Yellow, for the reason [`render_annotation`] gives: nothing has failed, so this is not
-/// [`render_error`]'s red, and it must not recede into the gray a hint or a thinking block uses, or
-/// a refused approval reads as one more line of the model's musings.
-pub(crate) fn render_warning(message: &str) {
-    write_stderr_line(rows_of(message).with(Color::Yellow));
 }
 /// Print a single-line CLI error to stderr in the project's standard format.
 pub(crate) fn render_error(error: &dyn std::fmt::Display) {
@@ -398,34 +265,6 @@ mod tests {
         assert!(
             log_capture::infos().contains("held over"),
             "which is where it does belong"
-        );
-    }
-
-    /// A stdout that stopped taking writes is named once, and named again after a reset.
-    ///
-    /// Once per process is right for a one-shot run and wrong for a shell left open all day, where
-    /// the first lost answer would otherwise be the only one mentioned. The repetition is real:
-    /// `Console::text_delta` asks per streamed delta and history replay per replayed message.
-    ///
-    /// Driven through a latch of this test's own, not the global. `Console::start` clears that
-    /// one, several tests in this binary call it, and they run in parallel; asserting across two
-    /// reports on a shared flag is a race. What that leaves untested is the wiring -- that
-    /// `report_lost_output` reads the global and `start` clears it -- which is two lines.
-    #[test]
-    fn a_lost_answer_is_named_once_until_the_next_run() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let latch = AtomicBool::new(false);
-        assert!(
-            claim_first_report(&latch),
-            "the first report is the one that speaks"
-        );
-        assert!(!claim_first_report(&latch), "and every later one is silent");
-
-        latch.store(false, Ordering::Relaxed);
-        assert!(
-            claim_first_report(&latch),
-            "until an episode opens, which lets the next lost answer be named too"
         );
     }
 }

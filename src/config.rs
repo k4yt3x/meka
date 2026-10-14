@@ -456,7 +456,6 @@ pub(crate) struct ThinkingConfig {
     /// The installation-wide fallback, which `[profiles.<name>].thinking_budget` takes precedence
     /// over: one number for every profile that does not state its own.
     pub(crate) budget: Option<u64>,
-    pub(crate) show_content: Option<bool>,
 }
 
 /// One fact the status row can show after the permission level, which always opens it.
@@ -554,14 +553,8 @@ pub(crate) struct DisplayConfig {
     /// [`StatusFact::DEFAULT_ROW`].
     pub(crate) status_row: Option<Vec<StatusFact>>,
     pub(crate) show_token_usage: Option<bool>,
-    /// How much of a collapsed tool call shows: `off`, `summary` (default), or `full`.
-    pub(crate) tool_params: Option<ToolParams>,
-    /// Widest line meka composes from model output, in terminal columns. Unset follows the
-    /// terminal, which is what keeps a line from ever wrapping; a set value is honored exactly,
-    /// so one wider than the terminal will wrap.
-    pub(crate) max_width: Option<usize>,
-    /// Whether answers stream as they arrive. `false` is what `--no-stream` asks for one run; a
-    /// preference belongs in the file, like every other display setting.
+    /// Whether the provider is asked to stream its reply or to return it whole. `false` is what
+    /// `--no-stream` asks for one run; a preference belongs in the file.
     pub(crate) stream: Option<bool>,
     /// Whether the interactive screen captures the mouse: the wheel scrolls and a click expands a
     /// block, at the cost of the terminal's own click-and-drag selection, which then needs its
@@ -752,41 +745,6 @@ pub(crate) const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 16_000;
 pub(crate) const DEFAULT_CONTEXT_CEILING_PERCENT: u64 = 85;
 /// Default maximum sub-agent recursion depth (root spawns down to grandchild).
 const DEFAULT_SUBAGENT_MAX_DEPTH: usize = 3;
-
-/// Narrowest `[display].max_width` that still leaves room for anything.
-///
-/// Every budget derived from it subtracts fixed chrome first (`[tool ` and its brackets, the
-/// `Thinking... ` prefix, a block's indent), so below roughly this the subtraction leaves nothing
-/// and output degrades to punctuation. Clamped rather than rejected: a too-narrow width is a
-/// preference stated badly, not a broken config, and refusing to start over it would be
-/// disproportionate.
-const MIN_CONFIGURED_WIDTH: usize = 40;
-
-/// Widest `[display].max_width` worth honoring.
-///
-/// Not a taste judgment about long lines. Fitting text to a column budget re-measures a growing
-/// prefix, so the work to compose one line grows with the square of the width: a stray `max_width =
-/// 100000` turns each elided line into billions of width computations and hangs the renderer. No
-/// terminal is this wide, so nothing legitimate is refused.
-const MAX_CONFIGURED_WIDTH: usize = 1000;
-
-fn clamp_max_width(configured: usize) -> usize {
-    if configured < MIN_CONFIGURED_WIDTH {
-        tracing::warn!(
-            "[display].max_width = {configured} is below the {MIN_CONFIGURED_WIDTH}-column \
-             minimum; using {MIN_CONFIGURED_WIDTH}"
-        );
-        return MIN_CONFIGURED_WIDTH;
-    }
-    if configured > MAX_CONFIGURED_WIDTH {
-        tracing::warn!(
-            "[display].max_width = {configured} is above the {MAX_CONFIGURED_WIDTH}-column \
-             maximum; using {MAX_CONFIGURED_WIDTH}"
-        );
-        return MAX_CONFIGURED_WIDTH;
-    }
-    configured
-}
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -1360,9 +1318,6 @@ pub(crate) struct ResolvedConfig {
     /// the host resolves and probes it at startup ([`crate::sandbox::resolve_backend`]) because
     /// the pick depends on what the machine has.
     pub(crate) sandbox_backend: Option<SandboxBackend>,
-    pub(crate) tool_params: ToolParams,
-    /// Resolved `[display].max_width`. `None`, the default, follows the terminal.
-    pub(crate) max_width: Option<usize>,
     /// Resolved `[session].retention`. `None`, the default, disables startup cleanup.
     pub(crate) retention: Option<std::time::Duration>,
     pub(crate) thinking: crate::config::ThinkingMode,
@@ -1371,7 +1326,6 @@ pub(crate) struct ResolvedConfig {
     /// what [`ResolvedConfig::validate_default_profile`] needs to check the pair against each
     /// other. Not the seed: that is [`Self::default_thinking_budget`].
     pub(crate) thinking_budget: u64,
-    pub(crate) thinking_show_content: bool,
     pub(crate) auto_compact: bool,
     /// `[session].context_ceiling_percent`, or [`DEFAULT_CONTEXT_CEILING_PERCENT`]; validated to 1
     /// through 100 by [`Self::validate`].
@@ -2276,13 +2230,10 @@ impl ResolvedConfig {
             show_token_usage: file_display.show_token_usage.unwrap_or(false),
             status_row: file_display
                 .status_row
-                .clone()
                 .unwrap_or_else(|| StatusFact::DEFAULT_ROW.to_vec()),
             web_client: WebClientConfig::from_file(&file_web),
             sandbox: file_shell.sandbox.unwrap_or(true),
             sandbox_backend,
-            tool_params: file_display.tool_params.unwrap_or_default(),
-            max_width: file_display.max_width.map(clamp_max_width),
             retention: file_session.retention,
             thinking: active_settings
                 .as_ref()
@@ -2293,7 +2244,6 @@ impl ResolvedConfig {
                 .map(|settings| settings.thinking_budget)
                 .or(default_thinking_budget)
                 .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS),
-            thinking_show_content: file_thinking.show_content.unwrap_or(false),
             auto_compact: file_session.auto_compact.unwrap_or(true),
             context_ceiling_percent: file_session
                 .context_ceiling_percent
@@ -2595,40 +2545,6 @@ impl BuiltinToolFilter {
         self.disabled.contains(name)
     }
 }
-/// How the write-once renderer lays markdown out: rendered for a terminal, or the source as
-/// written for a pipe. Not a setting: a one-shot run decides by whether stdout is a terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum RenderMode {
-    /// Rendered CommonMark, reflowed to the terminal.
-    #[default]
-    Termimad,
-    /// The markdown as the model wrote it, reflowing nothing, for a reader that is not a terminal.
-    Raw,
-}
-/// How much of a tool call's input the tool indicator shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum ToolParams {
-    /// Name only: `[tool shell_execute]`. The only setting under which a model-supplied string
-    /// never reaches the terminal at all.
-    Off,
-    /// Name plus the one argument [`crate::tools::resolve_primary_param`] picks out, on one line
-    /// (default).
-    #[default]
-    Summary,
-    /// Every argument, as an indented block under the name. See `render_tool_params` in `render`.
-    Full,
-}
-impl std::fmt::Display for ToolParams {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ToolParams::Off => write!(formatter, "off"),
-            ToolParams::Summary => write!(formatter, "summary"),
-            ToolParams::Full => write!(formatter, "full"),
-        }
-    }
-}
-
 /// Whether a Claude request asks for extended thinking, and which wire encoding it uses.
 ///
 /// One knob rather than two. Stated rather than inferred from the model name: `anthropic-messages`
@@ -2998,83 +2914,6 @@ mod tests {
         ];
         apply_cli_eager_load_overrides(&raw, &mut servers);
         assert!(servers[0].eager_load_tools.is_none());
-    }
-
-    /// `DisplayConfig` denies unknown fields, so a name or spelling that does not match is a
-    /// startup error rather than a silently ignored line. Worth pinning both the key and the three
-    /// values, since the config file is the only way to reach this setting.
-    #[test]
-    fn display_tool_params_parses_each_value() {
-        for (written, expected) in [
-            ("off", ToolParams::Off),
-            ("summary", ToolParams::Summary),
-            ("full", ToolParams::Full),
-        ] {
-            let toml_str = format!("[display]\ntool_params = \"{written}\"\n");
-            let config: ConfigFile = toml::from_str(&toml_str).expect("parse toml");
-            let display = config.display.expect("display present");
-            assert_eq!(display.tool_params, Some(expected));
-        }
-    }
-
-    /// Omitting it leaves today's one-line indicator, so an existing config keeps its output.
-    #[test]
-    fn display_tool_params_defaults_to_summary() {
-        assert_eq!(ToolParams::default(), ToolParams::Summary);
-    }
-
-    /// Deserializing `DisplayConfig` is not the same as the setting working: a key that parses but
-    /// never reaches `ResolvedConfig` is a dead feature that every test on either side still
-    /// passes. This is the one that fails if the resolution line is dropped.
-    ///
-    /// Unset means "follow the terminal", so the resolved value stays `None` rather than becoming a
-    /// number that would then be honored exactly and pin output to a guess.
-    #[test]
-    fn display_max_width_reaches_the_resolved_config() {
-        assert_eq!(
-            resolve_with_config("[display]\nmax_width = 120\n").max_width,
-            Some(120)
-        );
-        assert_eq!(resolve_with_config("[display]\n").max_width, None);
-    }
-
-    /// Every budget subtracts fixed chrome first, so below the floor the subtraction leaves nothing
-    /// and output degrades to punctuation. Above the ceiling the cost of composing a line grows
-    /// quadratically and the renderer stalls. Clamped rather than rejected at both ends: a width
-    /// stated badly is a preference, not a broken config.
-    #[test]
-    fn display_max_width_is_clamped_to_what_can_be_rendered() {
-        assert_eq!(
-            resolve_with_config("[display]\nmax_width = 5\n").max_width,
-            Some(MIN_CONFIGURED_WIDTH)
-        );
-        assert_eq!(
-            resolve_with_config(&format!("[display]\nmax_width = {MIN_CONFIGURED_WIDTH}\n"))
-                .max_width,
-            Some(MIN_CONFIGURED_WIDTH)
-        );
-        assert_eq!(
-            resolve_with_config("[display]\nmax_width = 100000\n").max_width,
-            Some(MAX_CONFIGURED_WIDTH)
-        );
-        assert_eq!(
-            resolve_with_config("[display]\nmax_width = 120\n").max_width,
-            Some(120)
-        );
-    }
-
-    /// The same resolution check for `tool_params`, whose default is a value rather than an
-    /// absence: unset must land on `summary`, not on whatever `ToolParams` derives.
-    #[test]
-    fn display_tool_params_reaches_the_resolved_config() {
-        assert_eq!(
-            resolve_with_config("[display]\ntool_params = \"full\"\n").tool_params,
-            ToolParams::Full
-        );
-        assert_eq!(
-            resolve_with_config("[display]\n").tool_params,
-            ToolParams::Summary
-        );
     }
 
     #[test]
@@ -3514,11 +3353,9 @@ thinking_display = "redacted"
 
     #[test]
     fn the_thinking_block_parses_its_keys() {
-        let config: ConfigFile =
-            toml::from_str("[thinking]\nbudget = 10000\nshow_content = true\n").expect("parse");
+        let config: ConfigFile = toml::from_str("[thinking]\nbudget = 10000\n").expect("parse");
         let thinking = config.thinking.expect("[thinking] present");
         assert_eq!(thinking.budget, Some(10_000));
-        assert_eq!(thinking.show_content, Some(true));
     }
 
     #[test]
@@ -3998,7 +3835,12 @@ command = "ida-mcp"
                 .contains("'badge' is not a status row fact"),
             "{unknown}"
         );
-        for retired in ["show_path_in_prompt", "show_context_in_prompt"] {
+        for retired in [
+            "show_path_in_prompt",
+            "show_context_in_prompt",
+            "tool_params",
+            "max_width",
+        ] {
             let error = toml::from_str::<ConfigFile>(&format!("[display]\n{retired} = true\n"))
                 .expect_err("the retired key must not parse");
             assert!(error.to_string().contains(retired), "{error}");

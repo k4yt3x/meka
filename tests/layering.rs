@@ -34,10 +34,8 @@ const RANKS: &[(&str, u32)] = &[
     // the subcommands and run their handlers, so `host` sits above `cli`.
     ("host", 1),
     ("cli", 2),
-    // Presentation, reached only from the layers that own a terminal. The relay writes through
-    // the console, which draws with the renderer.
+    // Presentation, reached only from the layers that own a terminal.
     ("relay", 2),
-    ("console", 3),
     ("render", 4),
     ("agent", 5),
     // The JSON shapes both hosts print, converted from the domain types below them.

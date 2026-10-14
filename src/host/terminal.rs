@@ -1,5 +1,5 @@
-//! What the screen and the one-shot host share: the interrupt relay behind Ctrl+C, the turn
-//! wrappers that race a turn against an interrupt, and the one-shot console's finishing.
+//! What the screen and the one-shot host share: the interrupt relay behind Ctrl+C and the turn
+//! wrappers that race a turn against an interrupt.
 
 use super::*;
 
@@ -96,9 +96,8 @@ pub(crate) fn escalation_for(press: usize) -> Escalation {
 }
 /// What to tell the user about the tasks a second Ctrl+C stopped, or `None` when it stopped none.
 ///
-/// `None` rather than an empty string, because the difference is whether the console is written to
-/// at all: announcing "stopping 0 background tasks" would be both false and an episode's worth of
-/// spacing spent on nothing.
+/// `None` rather than an empty string, because the difference is whether anything is said at all:
+/// announcing "stopping 0 background tasks" would be false.
 pub(crate) fn background_cancellation_notice(signaled: usize) -> Option<String> {
     (signaled > 0).then(|| {
         format!(
@@ -265,8 +264,8 @@ pub(crate) async fn run_turn_interruptible(
     let _published = publish_for_interrupts(cancel, admission, cancellation.clone());
     // The screen does not surface a stop reason; `--oneshot --format json` reports it.
     let outcome = agent.run_turn(messages, input, cancellation).await;
-    // The screen keeps its own copy for the loop that owns the console; the agent's cell is the
-    // authority, and a first turn has just filled it.
+    // The screen keeps its own copy for its loop; the agent's cell is the authority, and a first
+    // turn has just filled it.
     *session_id = agent.session_id();
     outcome
 }
@@ -276,39 +275,6 @@ pub(crate) async fn run_turn_interruptible(
 /// one row -- and short enough that a task ignoring its token cannot hold the terminal. Whatever
 /// overruns it is swept to `interrupted` when the session is next opened.
 pub(crate) const BACKGROUND_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-/// Borrow the shared console for one synchronous run of writes.
-///
-/// A poisoned lock is recovered from rather than propagated: the console holds the terminal's
-/// layout, and losing that is a worse outcome than continuing from a state one panicking writer may
-/// have left mid-transition. No `.await` may appear inside `act` -- `clippy::await_holding_lock` is
-/// deny-level and would catch it, but the reason is that the agent's frontend writes through the
-/// same lock.
-pub(crate) fn with_console<T>(
-    console: &std::sync::Mutex<crate::console::Console>,
-    act: impl FnOnce(&mut crate::console::Console) -> T,
-) -> T {
-    act(&mut crate::sync::lock(console))
-}
-/// Close an episode that no meka prompt follows.
-///
-/// Finish the console's output: flush the open block and erase a status line left drawn. Every
-/// caller is on the way out of the process, and a caller can still have a line to print after
-/// it (the shutdown notice, an outcome a one-shot run waited for), which prints as any block does.
-pub(crate) fn finish_console(console: &std::sync::Mutex<crate::console::Console>) {
-    with_console(console, |console| console.finish());
-}
-/// Finishes the console however its host leaves, on the failing paths as much as the ordinary
-/// one.
-///
-/// A `Drop` where the early exits converge rather than a finish at each of them, because a finish
-/// written at a door is a finish the next `return Err` forgets. Finishing twice is finishing
-/// once, so this composes with the explicit finishes rather than replacing them.
-pub(crate) struct FinishConsole(pub(crate) Arc<std::sync::Mutex<crate::console::Console>>);
-impl Drop for FinishConsole {
-    fn drop(&mut self) {
-        finish_console(&self.0);
-    }
-}
 /// Move a lock into the slot the agent and its host share, replacing whatever was there.
 ///
 /// The replacement is what `/fork` depends on: the new lock is already held by the time this is
@@ -370,45 +336,6 @@ mod tests {
             relay.count_press(&cancel),
             1,
             "publishing a turn starts the count over, whatever the wait before it counted"
-        );
-    }
-
-    /// A host that leaves through one of its early `?` paths still flushes what it had streamed and
-    /// still settles the row.
-    ///
-    /// Both halves of what the guard is for: the streamed text and the row.
-    ///
-    /// Only the mechanism is pinned here. Reaching those paths for real needs a failing provider
-    /// registry, and an assertion the guard's absence cannot fail is not coverage.
-    #[test]
-    fn the_console_is_finished_however_the_host_leaves() {
-        let console = std::sync::Arc::new(std::sync::Mutex::new(crate::console::Console::new(
-            crate::config::RenderMode::Raw,
-        )));
-        with_console(&console, |console| {
-            console.start(crate::console::RowState::Empty)
-        });
-        {
-            let _finish = FinishConsole(std::sync::Arc::clone(&console));
-            with_console(&console, |console| {
-                console.text_delta("half an answer");
-                // The drawing API cannot reach a status line without a terminal, so this pairs one
-                // with an open block to exercise both halves of the close at once.
-                console.force_row(crate::console::RowState::Transient);
-            });
-            assert!(
-                with_console(&console, |console| console.has_open_text()),
-                "the block has to be open, or the guard has nothing to close"
-            );
-        }
-        assert!(
-            !with_console(&console, |console| console.has_open_text()),
-            "leaving the host's scope closes it, whether or not the host reached its own close"
-        );
-        assert_eq!(
-            with_console(&console, |console| console.row()),
-            crate::console::RowState::Empty,
-            "and the stale status line goes with it, rather than sitting under the shell's"
         );
     }
 

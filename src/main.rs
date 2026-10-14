@@ -29,7 +29,6 @@ mod background;
 mod checklist;
 mod cli;
 mod config;
-mod console;
 mod conversation;
 mod entry;
 mod error;
@@ -367,7 +366,6 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
     // the one-shot's approval refusal sits several call sites below `run_oneshot`, which takes flat
     // scalars; the functions that compose a line still take an explicit width, so tests never
     // touch it.
-    render::set_max_width(config.max_width);
     runtime.block_on(async_main(config, acp_mode, serve_mode))
 }
 
