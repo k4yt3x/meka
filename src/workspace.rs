@@ -290,7 +290,7 @@ fn private_read_refusal_with(
         confined: None,
         named: Vec::new(),
     }
-    .refusal_of_canonical(target)
+    .refusal_shown(target, target)
 }
 
 /// Whether `target` lies under a process's own directory in `/proc`: `/proc/<pid>`, or `self` and
@@ -360,48 +360,51 @@ impl ReadFence {
         self.refusal(path).is_some()
     }
 
-    /// Why `path`, resolved through any symlinks, may not be read, or `None` when it may: it lies
-    /// inside a private directory and outside the readable part of it, it is a process's own
-    /// `/proc` entry, or reads are confined and it lies outside the readable roots. A path that
-    /// cannot be resolved is not inside anything meka owns and is not judged against the roots,
-    /// since a read of it fails on its own; an empty fence costs no resolution at all.
+    /// Why `path` may not be read, or `None` when it may: it lies inside a private directory and
+    /// outside the readable part of it, it is a process's own `/proc` entry, or reads are confined
+    /// and it lies outside the readable roots. The path is judged with every component that exists
+    /// resolved and the rest as spelled ([`resolve_existing_prefix`]), so one outside the roots is
+    /// refused the same way whether or not it exists, and the refusal names the path as spelled
+    /// rather than where a link leads: the boundary keeps names as well as contents. A path that
+    /// does not exist inside the roots is admitted, and the read of it fails on its own. An empty
+    /// fence costs no resolution at all.
     pub(crate) fn refusal(&self, path: &Path) -> Option<String> {
         if self.private.is_empty() && self.confined.is_none() {
             return None;
         }
-        let real = std::fs::canonicalize(path).map(strip_verbatim).ok()?;
-        self.refusal_of_canonical(&real)
+        self.refusal_shown(path, &resolve_existing_prefix(path))
     }
 
-    /// [`Self::refusal`] for a path the caller has already resolved.
-    pub(crate) fn refusal_of_canonical(&self, real: &Path) -> Option<String> {
+    /// [`Self::refusal`] for a path the caller has already resolved to `judged`, worded with
+    /// `shown`, the spelling the caller used.
+    pub(crate) fn refusal_shown(&self, shown: &Path, judged: &Path) -> Option<String> {
         if self
             .readable
             .iter()
-            .any(|directory| real.starts_with(directory))
+            .any(|directory| judged.starts_with(directory))
         {
             return None;
         }
-        if is_process_proc_entry(real) {
+        if is_process_proc_entry(judged) {
             return Some(format!(
                 "'{}' is a process's `/proc` entry, which only `unrestricted` reads: `environ`, \
                  `cmdline`, `fd` and `mem` carry what the process was given.",
-                real.display()
+                shown.display()
             ));
         }
         if let Some(directory) = self
             .private
             .iter()
-            .find(|directory| real.starts_with(directory))
+            .find(|directory| judged.starts_with(directory))
         {
             return Some(format!(
                 "'{}' is inside meka's own directory {}, which only `unrestricted` reads.",
-                real.display(),
+                shown.display(),
                 directory.display()
             ));
         }
         let roots = self.confined.as_deref()?;
-        if is_within_roots(real, roots) {
+        if is_within_roots(judged, roots) {
             return None;
         }
         // Names the roots, as the write fence does: the model cannot see the boundary from the
@@ -422,7 +425,7 @@ impl ReadFence {
         Some(format!(
             "'{}' is outside the readable roots: below `unrestricted` {where_to}. Ask the user to \
              add the directory as a root if the task needs it.",
-            real.display()
+            shown.display()
         ))
     }
 }
@@ -708,17 +711,20 @@ impl ReadScope {
     /// Judge a directory a sub-agent would hold against this scope's reach at `level`: inside
     /// the readable roots when reads are confined, anywhere when they are not. The one rule for a
     /// worker's directory, whichever door hands it over, so a sub-agent's reach never exceeds its
-    /// parent's.
+    /// parent's. `directory` is judged with every component that exists resolved and the rest as
+    /// spelled, so one outside the reach is refused the same way whether or not it exists, and the
+    /// refusal names `shown`, the spelling the caller used, rather than where a link leads.
     pub(crate) fn admit_within_reach(
         &self,
         level: crate::permission::Permission,
         cwd: &SharedCwd,
-        canonical: &Path,
+        shown: &Path,
+        directory: &Path,
     ) -> Result<(), String> {
         let Some(reach) = self.confined_to_at(level, cwd) else {
             return Ok(());
         };
-        if is_within_roots(canonical, &reach) {
+        if is_within_roots(&resolve_existing_prefix(directory), &reach) {
             return Ok(());
         }
         let where_to = if reach.is_empty() {
@@ -736,13 +742,15 @@ impl ReadScope {
         Err(format!(
             "'{}' is outside this session's readable roots: {where_to}, and a sub-agent's reach \
              cannot exceed its parent's",
-            canonical.display()
+            shown.display()
         ))
     }
 
-    /// Judge one read of `canonical`, returning the refusal sentence when it is refused.
-    pub(crate) fn admit(&self, cwd: &SharedCwd, canonical: &Path) -> Result<(), String> {
-        match self.fence(cwd).refusal_of_canonical(canonical) {
+    /// Judge one read of `path`, as [`ReadFence::refusal`] judges it, returning the refusal
+    /// sentence when it is refused. The tools ask the fence directly; this is the tests' shorthand.
+    #[cfg(test)]
+    pub(crate) fn admit(&self, cwd: &SharedCwd, path: &Path) -> Result<(), String> {
+        match self.fence(cwd).refusal(path) {
             Some(refusal) => Err(refusal),
             None => Ok(()),
         }
@@ -971,9 +979,10 @@ impl BoundedWorkspace {
 /// working directory when relative and then admitted as a working directory is ([`accept_cwd`]),
 /// since the first one becomes exactly that, and refused when it is a directory no root may name
 /// ([`is_system_root`]), since a boundary the sandbox masks holds nothing. At `workspace` every
-/// entry must also lie inside the parent's own boundary, [`writable_roots`], compared canonical to
-/// canonical and component-wise, so a sub-agent's reach is never wider than its parent's; at
-/// `unrestricted` the parent may write anywhere, and so may name anywhere.
+/// entry must also lie inside the parent's own boundary, [`writable_roots`], judged component-wise
+/// with what exists resolved before its existence is checked and again once canonical, so a
+/// sub-agent's reach is never wider than its parent's and a refusal does not say whether the
+/// directory is there; at `unrestricted` the parent may write anywhere, and so may name anywhere.
 pub(crate) fn accept_writable_roots(
     parent_level: crate::permission::Permission,
     parent_cwd: &SharedCwd,
@@ -994,23 +1003,32 @@ pub(crate) fn accept_writable_roots(
     }
     let mut accepted = Vec::with_capacity(requested.len());
     for entry in requested {
-        let canonical = accept_cwd(&resolve_against_cwd(parent_cwd, entry))
+        let resolved = resolve_against_cwd(parent_cwd, entry);
+        // Reach before existence, so an entry outside it is refused the same way whether or not
+        // it is there; then once more on the canonical directory, which is what the worker
+        // holds, so a link swapped between the two resolutions lands where it is judged.
+        let within_reach = |directory: &Path| {
+            admit_within_parent_reach(
+                parent_level,
+                parent_cwd,
+                parent_roots,
+                parent_reads,
+                &resolved,
+                directory,
+            )
+            .map_err(|error| MekaError::Usage(format!("writable_roots: {error}")))
+        };
+        within_reach(&resolved)?;
+        let canonical = accept_cwd(&resolved)
             .map_err(|error| MekaError::Usage(format!("writable_roots: {error}")))?;
+        within_reach(&canonical)?;
         if is_system_root(&canonical) {
             return Err(MekaError::Usage(format!(
                 "writable_roots: '{}' is a system directory the sandbox masks, so it cannot be a \
                  workspace root",
-                canonical.display()
+                resolved.display()
             )));
         }
-        admit_within_parent_reach(
-            parent_level,
-            parent_cwd,
-            parent_roots,
-            parent_reads,
-            &canonical,
-        )
-        .map_err(|error| MekaError::Usage(format!("writable_roots: {error}")))?;
         accepted.push(canonical);
     }
     // The one place an empty list is refused: a bounded worker with no working directory cannot
@@ -1036,16 +1054,25 @@ pub(crate) fn accept_writable_roots(
 /// before either door has written anything. Each entry is resolved against the parent's working
 /// directory when relative and admitted as a working directory is ([`accept_cwd`]), and refused
 /// when it is a directory no root may name ([`is_system_root`]). When the parent's own reads are
-/// confined, every entry must lie inside the parent's readable roots, compared canonical to
-/// canonical and component-wise, so a sub-agent's reach is never wider than its parent's; a parent
+/// confined, every entry must lie inside the parent's readable roots, judged component-wise with
+/// what exists resolved before its existence is checked and again once canonical, so a sub-agent's
+/// reach is never wider than its parent's and a refusal does not say whether the directory is
+/// there; a parent
 /// that reads everywhere may name anywhere, and the list then confines a worker whose reads were
 /// confined by nothing ([`ReadBoundary::for_worker`]). An empty list is refused, as an empty
 /// `writable_roots` is: a present list is accepted whole or refused whole, so `[]` never carries
 /// a meaning of its own beside "omitted", which a model emits for "nothing to add".
+///
+/// Every entry must also lie outside `workspace`, the worker's own workspace as [`writable_roots`]
+/// computes it, whether shared with the parent or set by `writable_roots`. The workspace is
+/// readable at every level, so an entry inside it confines nothing, and a parent that names a
+/// subdirectory of its workspace wants the worker confined to it, which only `writable_roots` does.
+/// The refusal names that remedy rather than accepting a list that reads as a boundary it is not.
 pub(crate) fn accept_readable_roots(
     parent_level: crate::permission::Permission,
     parent_cwd: &SharedCwd,
     parent_reads: &ReadScope,
+    workspace: &[PathBuf],
     requested: &[PathBuf],
 ) -> crate::error::Result<Vec<PathBuf>> {
     use crate::error::MekaError;
@@ -1058,18 +1085,35 @@ pub(crate) fn accept_readable_roots(
     }
     let mut accepted = Vec::with_capacity(requested.len());
     for entry in requested {
-        let canonical = accept_cwd(&resolve_against_cwd(parent_cwd, entry))
+        let resolved = resolve_against_cwd(parent_cwd, entry);
+        // Reach before existence, so an entry outside it is refused the same way whether or not
+        // it is there; then once more on the canonical directory, which is what the worker
+        // holds, so a link swapped between the two resolutions lands where it is judged.
+        let within_reach = |directory: &Path| {
+            parent_reads
+                .admit_within_reach(parent_level, parent_cwd, &resolved, directory)
+                .map_err(|error| MekaError::Usage(format!("readable_roots: {error}")))
+        };
+        within_reach(&resolved)?;
+        let canonical = accept_cwd(&resolved)
             .map_err(|error| MekaError::Usage(format!("readable_roots: {error}")))?;
+        within_reach(&canonical)?;
         if is_system_root(&canonical) {
             return Err(MekaError::Usage(format!(
                 "readable_roots: '{}' is a system directory the sandbox masks, so it cannot be a \
                  root",
-                canonical.display()
+                resolved.display()
             )));
         }
-        parent_reads
-            .admit_within_reach(parent_level, parent_cwd, &canonical)
-            .map_err(|error| MekaError::Usage(format!("readable_roots: {error}")))?;
+        if let Some(root) = workspace.iter().find(|root| canonical.starts_with(root)) {
+            return Err(MekaError::Usage(format!(
+                "readable_roots: '{}' is inside the sub-agent's workspace at '{}', which it reads \
+                 already; to confine the sub-agent to it, name the directory in `writable_roots` \
+                 instead, with `permission: \"read\"` for one that writes nothing",
+                resolved.display(),
+                root.display()
+            )));
+        }
         if !accepted.contains(&canonical) {
             accepted.push(canonical);
         }
@@ -1085,28 +1129,27 @@ pub(crate) fn accept_readable_roots(
 /// follow-up and which is judged here once the parent may have moved. Two doors deciding this
 /// separately is how one of them came to resume a writer under a directory the other refused.
 ///
-/// At `workspace` the directory must lie within [`writable_roots`], compared canonical to canonical
-/// and component-wise, so a sub-agent's reach is never wider than its parent's. `unrestricted`
+/// At `workspace` the directory must lie within [`writable_roots`], judged component-wise, so a
+/// sub-agent's reach is never wider than its parent's. `unrestricted`
 /// reaches everywhere and bounds nothing. Below `workspace` the parent has no write reach and a
 /// worker under it is narrowed to none, so there is nothing to compare. When the parent's reads
 /// are confined the directory must also lie within its readable roots, at every level below
 /// `unrestricted`: a worker reads its own directory, so one the parent can no longer read is a
-/// reader the parent could not spawn today. The directory is canonicalized when it still
-/// resolves; one that does not is compared as recorded, and the fence then refuses every access
-/// under it as it always has.
+/// reader the parent could not spawn today. The directory is judged with every component that
+/// exists resolved and the rest as spelled ([`resolve_existing_prefix`]), so one outside the reach
+/// is refused the same way whether or not it exists, and a refusal names `shown`, the spelling the
+/// caller used, rather than where a link leads.
 pub(crate) fn admit_within_parent_reach(
     parent_level: crate::permission::Permission,
     parent_cwd: &SharedCwd,
     parent_roots: &SharedRoots,
     parent_reads: &ReadScope,
+    shown: &Path,
     directory: &Path,
 ) -> Result<(), String> {
-    let canonical = std::fs::canonicalize(directory)
-        .map(strip_verbatim)
-        .unwrap_or_else(|_| directory.to_path_buf());
     if parent_level == crate::permission::Permission::Workspace {
         let reach = writable_roots(parent_cwd, parent_roots);
-        if !is_within_roots(&canonical, &reach) {
+        if !is_within_roots(&resolve_existing_prefix(directory), &reach) {
             let where_to = if reach.is_empty() {
                 "no root of this session's workspace currently resolves".to_string()
             } else {
@@ -1122,11 +1165,11 @@ pub(crate) fn admit_within_parent_reach(
             return Err(format!(
                 "'{}' is outside this session's workspace: {where_to}, and a sub-agent's reach \
                  cannot exceed its parent's",
-                canonical.display()
+                shown.display()
             ));
         }
     }
-    parent_reads.admit_within_reach(parent_level, parent_cwd, &canonical)
+    parent_reads.admit_within_reach(parent_level, parent_cwd, shown, directory)
 }
 
 /// Whether `path` lies within one of `roots`.
@@ -1143,6 +1186,62 @@ pub(crate) fn is_within_roots(path: &std::path::Path, roots: &[PathBuf]) -> bool
     roots
         .iter()
         .any(|root| path.starts_with(strip_verbatim(root.clone())))
+}
+
+/// Resolve every component of `path` that already exists, leaving the rest as spelled.
+///
+/// This is what the kernel does when the path is finally opened, computed ahead of time so a
+/// boundary check and the syscall agree about which file is meant. Walking forward rather than
+/// canonicalizing the whole path matters because the target often does not exist, and
+/// `canonicalize` fails outright on a missing tail. Every boundary judges a path through this, the
+/// read fence and the spawn acceptors included, so a path outside a boundary is refused the same
+/// way whether or not it exists: `canonicalize` alone answers "not found" for a missing one and
+/// "outside" for one that is there, and a confined session could learn from the difference which
+/// paths exist.
+///
+/// `..` pops the *resolved* accumulator, not the spelling, which is the whole point: `<root>/L/..`
+/// where `L` is a symlink lands where the kernel lands, not where the text suggests.
+///
+/// What this closes is the deterministic escape: a symlink already planted on the path resolves
+/// here and is caught by the boundary check that follows. What it does not close is the race, since
+/// a component verified here can be swapped for a symlink before the open; closing that needs the
+/// walk to hold a directory descriptor and write through `openat`/`renameat`. The sandbox is
+/// documented as defense against an agent damaging user data by accident rather than as an
+/// adversarial boundary, and winning this race requires a concurrent writer deliberately planting
+/// the symlink mid-call, so the residual is accepted.
+///
+/// `path` is absolute, as every caller's is after [`resolve_against_cwd`]: `canonicalize` resolves
+/// a relative one against the process's directory, which is not the session's.
+pub(crate) fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    // A path that exists in full resolves in one call, and that is what a walk asks for every
+    // entry it visits; the component walk below is for a path with a missing tail.
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return strip_verbatim(resolved);
+    }
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(part) => {
+                out.push(part);
+                // A component that does not exist cannot be a symlink, so a failure here means the
+                // rest of the path is a pure spelling and needs no further resolution.
+                if let Ok(resolved) = std::fs::canonicalize(&out) {
+                    // Stripped, or the accumulator switches spelling mid-walk: the first existing
+                    // component turns `C:\ws` into `\\?\C:\ws` and every component after it is
+                    // pushed onto the verbatim form.
+                    out = strip_verbatim(resolved);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Normalize `.` and `..` textually, without consulting the filesystem.
@@ -1283,29 +1382,46 @@ impl WriteScope {
     ///
     /// `target` should be canonical where the caller can manage it and lexically normalized where
     /// it cannot (a path being created). Both are checked the same way; the difference is only in
-    /// how much the caller has been able to resolve.
+    /// how much the caller has been able to resolve. The refusal names `target`; every door
+    /// words it with the spelling its caller used through [`Self::admit_shown`], so this is the
+    /// tests' shorthand.
+    #[cfg(test)]
     pub(crate) fn admit(&self, cwd: &SharedCwd, target: &std::path::Path) -> Result<(), String> {
-        self.admit_at(self.permission.get(), cwd, target)
+        self.admit_shown(cwd, target, target)
     }
 
-    /// [`Self::admit`] at a level the caller has already read. The approval door asks this with the
-    /// level it admitted the call at, so the refusal it reports ahead of the prompt is the one the
-    /// write would meet, not one read off the handle a moment later.
-    pub(crate) fn admit_at(
+    /// Judge one write target, worded with `shown`, the spelling the caller used, rather than
+    /// with the resolved `target`: a refusal that named where a link leads would give away a name
+    /// the boundary keeps.
+    pub(crate) fn admit_shown(
+        &self,
+        cwd: &SharedCwd,
+        shown: &std::path::Path,
+        target: &std::path::Path,
+    ) -> Result<(), String> {
+        self.admit_shown_at(self.permission.get(), cwd, shown, target)
+    }
+
+    /// [`Self::admit_shown`] at a level the caller has already read. The approval door asks this
+    /// with the level it admitted the call at, so the refusal it reports ahead of the prompt is
+    /// the one the write would meet, not one read off the handle a moment later.
+    pub(crate) fn admit_shown_at(
         &self,
         level: crate::permission::Permission,
         cwd: &SharedCwd,
+        shown: &std::path::Path,
         target: &std::path::Path,
     ) -> Result<(), String> {
-        self.admit_with_private(level, cwd, target, &private_directories())
+        self.admit_with_private(level, cwd, shown, target, &private_directories())
     }
 
-    /// [`Self::admit_at`] with meka's private directories taken as a parameter, so the refusal can
-    /// be tested without the environment deciding where those are.
+    /// [`Self::admit_shown_at`] with meka's private directories taken as a parameter, so the
+    /// refusal can be tested without the environment deciding where those are.
     fn admit_with_private(
         &self,
         level: crate::permission::Permission,
         cwd: &SharedCwd,
+        shown: &std::path::Path,
         target: &std::path::Path,
         private: &[PathBuf],
     ) -> Result<(), String> {
@@ -1324,7 +1440,7 @@ impl WriteScope {
             return Err(format!(
                 "'{}' is inside meka's own directory {}, which no workspace root reaches. Only \
                  `unrestricted` writes there.",
-                target.display(),
+                shown.display(),
                 directory.display()
             ));
         }
@@ -1349,7 +1465,7 @@ impl WriteScope {
         Err(format!(
             "'{}' is outside the workspace: below `unrestricted` {}. Pick a path inside, or \
              ask the user for `unrestricted` if it genuinely belongs elsewhere.",
-            target.display(),
+            shown.display(),
             where_to
         ))
     }
@@ -1616,6 +1732,43 @@ mod tests {
                 && refusal.contains("outside this session's workspace"),
             "the refusal must name the entry and the rule: {refusal}"
         );
+        assert_eq!(
+            accept_writable_roots(
+                Permission::Workspace,
+                &parent_cwd,
+                &parent_roots,
+                &reads_for_test(),
+                &[work.join("sub"), base.join("missing")],
+            )
+            .expect_err("outside the workspace, whether or not it exists")
+            .to_string(),
+            refusal.replace(
+                &base.join("work2").display().to_string(),
+                &base.join("missing").display().to_string()
+            ),
+            "a missing directory outside the workspace is refused in the same words as one that \
+             is there, so the refusal does not say which it is"
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(base.join("work2"), work.join("link")).expect("symlink");
+            let through_link = accept_writable_roots(
+                Permission::Workspace,
+                &parent_cwd,
+                &parent_roots,
+                &reads_for_test(),
+                &[PathBuf::from("link/missing")],
+            )
+            .expect_err("a missing name behind a link out of the workspace is outside it")
+            .to_string();
+            assert!(
+                through_link.contains("outside this session's workspace")
+                    && through_link.contains(&work.join("link/missing").display().to_string())
+                    && !through_link.contains(&base.join("work2").display().to_string()),
+                "judged where the link leads, ahead of whether it exists, and named as spelled: \
+                 {through_link}"
+            );
+        }
 
         let accepted = accept_writable_roots(
             Permission::Unrestricted,
@@ -1861,17 +2014,24 @@ mod tests {
         let level = crate::permission::Permission::Workspace;
         assert!(
             scope
-                .admit_with_private(level, &cwd, &root.join("notes.txt"), &private)
+                .admit_with_private(
+                    level,
+                    &cwd,
+                    &root.join("notes.txt"),
+                    &root.join("notes.txt"),
+                    &private
+                )
                 .is_ok(),
             "a path beside the store is still inside the workspace"
         );
+        let config = store.join("config.toml");
         let refusal = scope
-            .admit_with_private(level, &cwd, &store.join("config.toml"), &private)
+            .admit_with_private(level, &cwd, &config, &config, &private)
             .expect_err("a path inside the store is refused although the root contains it");
         assert!(refusal.contains("meka's own directory"), "{refusal}");
         assert!(
             scope
-                .admit_with_private(level, &cwd, &store.join("config.toml"), &[])
+                .admit_with_private(level, &cwd, &config, &config, &[])
                 .is_ok(),
             "the refusal is the private list's doing, not the root's"
         );
@@ -2514,11 +2674,34 @@ mod tests {
             vec![],
         );
         let fence = scope.fence(&cwd);
-        assert!(fence.hides(&work.join("link")), "the link lands outside");
+        let through_link = fence
+            .refusal(&work.join("link"))
+            .expect("the link lands outside");
+        assert!(
+            through_link.contains(&work.join("link").display().to_string())
+                && !through_link.contains(&elsewhere.display().to_string()),
+            "the refusal names the link as spelled, not where it leads: {through_link}"
+        );
         assert!(!fence.hides(&work), "the root itself is inside");
         assert!(
             !fence.hides(&work.join("missing")),
-            "a path that does not resolve is not judged; the read of it fails on its own"
+            "a path that does not exist inside the roots is admitted; the read of it fails on \
+             its own"
+        );
+        assert_eq!(
+            fence.refusal(&elsewhere.join("missing")),
+            fence
+                .refusal(&elsewhere.join("secret"))
+                .map(|refusal| refusal.replace(
+                    &elsewhere.join("secret").display().to_string(),
+                    &elsewhere.join("missing").display().to_string()
+                )),
+            "a path outside the roots is refused in the same words whether or not it exists"
+        );
+        std::os::unix::fs::symlink(&elsewhere, work.join("door")).expect("link");
+        assert!(
+            fence.hides(&work.join("door").join("missing")),
+            "a missing name behind a link out of the roots is judged where the link leads"
         );
     }
 
@@ -2629,42 +2812,52 @@ mod tests {
         let roots = SharedRoots::default();
         let at = |level| SharedPermission::new(level, EnabledPermissions::ALL);
 
+        let admit = |level, scope: &ReadScope, directory: &Path| {
+            admit_within_parent_reach(level, &cwd, &roots, scope, directory, directory)
+        };
+
         let confined = ReadScope::confined(at(Permission::Read), vec![], vec![]);
-        assert!(
-            admit_within_parent_reach(Permission::Read, &cwd, &roots, &confined, &work.join("sub"))
-                .is_ok()
-        );
+        assert!(admit(Permission::Read, &confined, &work.join("sub")).is_ok());
         let refusal =
-            admit_within_parent_reach(Permission::Read, &cwd, &roots, &confined, &elsewhere)
-                .expect_err("outside the readable reach");
+            admit(Permission::Read, &confined, &elsewhere).expect_err("outside the readable reach");
         assert!(
             refusal.contains("outside this session's readable roots")
                 && refusal.contains(&work.display().to_string()),
             "{refusal}"
         );
+        assert_eq!(
+            admit(Permission::Read, &confined, &elsewhere.join("missing"))
+                .expect_err("outside the readable reach, whether or not it exists"),
+            refusal.replace(
+                &elsewhere.display().to_string(),
+                &elsewhere.join("missing").display().to_string()
+            ),
+            "a missing directory outside the reach is refused in the same words as one that is \
+             there, so the refusal does not say which it is"
+        );
         assert!(
-            admit_within_parent_reach(
-                Permission::Unrestricted,
-                &cwd,
-                &roots,
-                &confined,
-                &elsewhere
-            )
-            .is_ok(),
+            admit(Permission::Unrestricted, &confined, &elsewhere).is_ok(),
             "`unrestricted` reaches everywhere"
         );
 
         let open = ReadScope::unconfined(at(Permission::Read));
         assert!(
-            admit_within_parent_reach(Permission::Read, &cwd, &roots, &open, &elsewhere).is_ok(),
+            admit(Permission::Read, &open, &elsewhere).is_ok(),
             "a parent reading everywhere bounds nothing at `read`"
         );
         let refusal =
-            admit_within_parent_reach(Permission::Workspace, &cwd, &roots, &open, &elsewhere)
-                .expect_err("outside the write reach");
+            admit(Permission::Workspace, &open, &elsewhere).expect_err("outside the write reach");
         assert!(
             refusal.contains("outside this session's workspace"),
             "{refusal}"
+        );
+        assert_eq!(
+            admit(Permission::Workspace, &open, &elsewhere.join("missing"))
+                .expect_err("outside the write reach, whether or not it exists"),
+            refusal.replace(
+                &elsewhere.display().to_string(),
+                &elsewhere.join("missing").display().to_string()
+            )
         );
     }
 
@@ -2699,16 +2892,20 @@ mod tests {
         let base = canonical_for_test(temp.path());
         let work = base.join("work");
         let docs = work.join("docs");
+        let inner = docs.join("inner");
         let elsewhere = base.join("elsewhere");
-        for directory in [&docs, &elsewhere] {
+        let own = base.join("own");
+        for directory in [&inner, &elsewhere, &own] {
             std::fs::create_dir_all(directory).expect("mkdir");
         }
         let cwd = SharedCwd::new(work.clone());
         let at = |level| SharedPermission::new(level, EnabledPermissions::ALL);
+        // A bounded worker's workspace, beside everything the list names.
+        let bounded = vec![own.clone()];
 
         let confined = ReadScope::confined(at(Permission::Read), vec![], vec![]);
         assert_eq!(
-            accept_readable_roots(Permission::Read, &cwd, &confined, &[
+            accept_readable_roots(Permission::Read, &cwd, &confined, &bounded, &[
                 PathBuf::from("docs"),
                 docs.clone()
             ])
@@ -2720,6 +2917,7 @@ mod tests {
             Permission::Read,
             &cwd,
             &confined,
+            &bounded,
             std::slice::from_ref(&elsewhere),
         )
         .expect_err("outside the reach");
@@ -2729,15 +2927,54 @@ mod tests {
                 .contains("outside this session's readable roots"),
             "{refusal}"
         );
+        assert_eq!(
+            accept_readable_roots(Permission::Read, &cwd, &confined, &bounded, &[
+                elsewhere.join("missing")
+            ])
+            .expect_err("outside the reach, whether or not it exists")
+            .to_string(),
+            refusal.to_string().replace(
+                &elsewhere.display().to_string(),
+                &elsewhere.join("missing").display().to_string()
+            ),
+            "a missing directory outside the reach is refused in the same words as one that is \
+             there, so the refusal does not say which it is"
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&elsewhere, work.join("link")).expect("symlink");
+            let through_link =
+                accept_readable_roots(Permission::Read, &cwd, &confined, &bounded, &[
+                    PathBuf::from("link"),
+                ])
+                .expect_err("the link lands outside the reach")
+                .to_string();
+            assert!(
+                through_link.contains(&work.join("link").display().to_string())
+                    && !through_link.contains(&elsewhere.display().to_string()),
+                "the refusal names the link as spelled, not where it leads: {through_link}"
+            );
+            assert!(
+                accept_readable_roots(Permission::Read, &cwd, &confined, &bounded, &[
+                    PathBuf::from("link/missing")
+                ])
+                .expect_err("a missing name behind the link is outside the reach")
+                .to_string()
+                .contains("outside this session's readable roots"),
+                "judged where the link leads, ahead of whether it exists"
+            );
+        }
         assert!(
-            accept_readable_roots(Permission::Read, &cwd, &confined, &[])
+            accept_readable_roots(Permission::Read, &cwd, &confined, &bounded, &[])
                 .expect_err("an empty list is refused, as an empty writable_roots is")
                 .to_string()
                 .contains("names no directory")
         );
         assert!(
-            accept_readable_roots(Permission::Read, &cwd, &confined, &[work.join("missing")])
-                .is_err(),
+            accept_readable_roots(Permission::Read, &cwd, &confined, &bounded, &[
+                work.join("missing")
+            ])
+            .is_err(),
             "a directory that is not there grants nothing"
         );
 
@@ -2747,6 +2984,7 @@ mod tests {
                 Permission::Read,
                 &cwd,
                 &open,
+                &bounded,
                 std::slice::from_ref(&elsewhere)
             )
             .expect("a parent reading everywhere may name anywhere"),
@@ -2754,10 +2992,65 @@ mod tests {
         );
         #[cfg(unix)]
         assert!(
-            accept_readable_roots(Permission::Read, &cwd, &open, &[PathBuf::from("/tmp")])
-                .expect_err("a masked system directory")
+            accept_readable_roots(Permission::Read, &cwd, &open, &bounded, &[PathBuf::from(
+                "/tmp"
+            )])
+            .expect_err("a masked system directory")
+            .to_string()
+            .contains("system directory")
+        );
+
+        // The worker's workspace is readable already, so an entry inside it, the workspace
+        // itself included, is refused with the spelling that confines a worker to a directory;
+        // one that contains the workspace widens the worker's reads and is accepted.
+        let shared = vec![work.clone()];
+        let refusal = accept_readable_roots(
+            Permission::Read,
+            &cwd,
+            &open,
+            &shared,
+            std::slice::from_ref(&docs),
+        )
+        .expect_err("inside the shared workspace");
+        assert!(
+            refusal
                 .to_string()
-                .contains("system directory")
+                .contains("inside the sub-agent's workspace at")
+                && refusal.to_string().contains("`writable_roots`"),
+            "{refusal}"
+        );
+        assert!(
+            accept_readable_roots(
+                Permission::Read,
+                &cwd,
+                &open,
+                &shared,
+                std::slice::from_ref(&work)
+            )
+            .is_err(),
+            "the workspace itself"
+        );
+        assert!(
+            accept_readable_roots(
+                Permission::Read,
+                &cwd,
+                &open,
+                std::slice::from_ref(&docs),
+                std::slice::from_ref(&inner)
+            )
+            .is_err(),
+            "inside a bounded worker's own root"
+        );
+        assert_eq!(
+            accept_readable_roots(
+                Permission::Read,
+                &cwd,
+                &open,
+                &shared,
+                std::slice::from_ref(&base)
+            )
+            .expect("a directory containing the workspace widens it"),
+            vec![base.clone()]
         );
     }
 }

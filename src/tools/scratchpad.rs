@@ -1220,12 +1220,7 @@ impl Tool for ScratchpadLoadFileTool {
 
         let session_id = resolve_session_id(&self.site.session_id, "scratchpad_load_file")?;
 
-        // Resolve a relative path against the session cwd before canonicalizing, so `/cd` is
-        // honored (canonicalize alone would resolve relative to the process cwd).
-        let resolved = crate::workspace::resolve_against_cwd(&self.site.cwd, &path);
-        let canonical =
-            super::util::canonicalize_for_tool("scratchpad_load_file", &resolved).await?;
-        super::util::admit_read("scratchpad_load_file", &self.site, &canonical)?;
+        let canonical = super::util::admit_read("scratchpad_load_file", &self.site, &path).await?;
 
         // Raw bytes rather than a `String`, so a UTF-8 failure can be sniffed once and the model
         // told what kind of binary it tried to load. The happy path pays one extra allocation,
@@ -1333,7 +1328,6 @@ impl Tool for ScratchpadSaveFileTool {
             level,
             input,
         )
-        .await
     }
 
     async fn execute(

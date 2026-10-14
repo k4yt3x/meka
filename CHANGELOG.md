@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.75.1] - 2026-10-14
+
+### Changed
+
+- `agent_spawn` refuses a `readable_roots` entry the sub-agent's workspace already covers.
+- A confined read refuses a path outside the roots the same way whether or not it exists.
+- A boundary refusal names the path as given, never the target of a symlink on it.
+
+### Security
+
+- RUSTSEC-2026-0346 through 0349: `rustls` moves to 0.23.46, past four TLS advisories.
+
 ## [0.75.0] - 2026-10-14
 
 ### Added
@@ -2688,7 +2700,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.75.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.75.1...HEAD
+[0.75.1]: https://github.com/k4yt3x/meka/compare/0.75.0...0.75.1
 [0.75.0]: https://github.com/k4yt3x/meka/compare/0.74.0...0.75.0
 [0.74.0]: https://github.com/k4yt3x/meka/compare/0.73.0...0.74.0
 [0.73.0]: https://github.com/k4yt3x/meka/compare/0.72.0...0.73.0

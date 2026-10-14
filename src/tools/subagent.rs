@@ -335,15 +335,18 @@ pub(crate) fn agent_spawn_definition(
                 "type": "array",
                 "items": { "type": "string" },
                 "description": format!(
-                    "{read_policy}Given, the sub-agent's reads are confined to its writable \
-                     roots, these directories and the system directories, and nothing else, \
-                     whether or not yours are, and it runs at `workspace` unless `permission` \
-                     asks for less; its writable roots are always readable, so a list naming \
-                     only one of them confines it to those alone. Each must be an existing \
-                     directory (relative entries resolve against your working directory) and, \
-                     when your own reads are confined, must lie inside your readable roots: a \
-                     sub-agent's reach never exceeds yours. An empty list is refused, and so is \
-                     `permission: \"unrestricted\"` alongside it, which bounds nothing."
+                    "{read_policy}Given, the sub-agent reads its workspace (yours, or \
+                     `writable_roots` when given), these directories and the system \
+                     directories, and nothing else, whether or not yours are, and it runs at \
+                     `workspace` unless `permission` asks for less. Each must be an existing \
+                     directory outside that workspace (relative entries resolve against your \
+                     working directory): one inside it is refused, since the workspace is \
+                     readable already, so to confine the sub-agent to a directory name it in \
+                     `writable_roots` instead, with `permission: \"read\"` when it should write \
+                     nothing. When your own reads are confined each must also lie inside your \
+                     readable roots: a sub-agent's reach never exceeds yours. An empty list is \
+                     refused, and so is `permission: \"unrestricted\"` alongside it, which \
+                     bounds nothing."
                 )
             },
             "memory": {
@@ -596,11 +599,19 @@ impl Tool for AgentSpawnTool {
                     .map(PathBuf::from)
                     .collect();
                 let cells = &self.tool_builder_params.cells;
+                // The workspace the worker's cells will hold, judged before those cells exist:
+                // the accepted write list for a bounded worker, this agent's own for one sharing
+                // it.
+                let workspace = match &bounded {
+                    Some(workspace) => crate::workspace::usable_roots(workspace.roots()),
+                    None => crate::workspace::writable_roots(&cells.cwd, &cells.roots),
+                };
                 Some(
                     crate::workspace::accept_readable_roots(
                         parent_level,
                         &cells.cwd,
                         &cells.site().read_scope(),
+                        &workspace,
                         &entries,
                     )
                     .map_err(|error| MekaError::ToolExecution {
@@ -1618,6 +1629,7 @@ impl Tool for AgentFollowupTool {
                 &cells.roots,
                 &cells.site().read_scope(),
                 &cwd,
+                &cwd,
             )
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "agent_followup".to_string(),
@@ -1658,6 +1670,7 @@ impl Tool for AgentFollowupTool {
         // the writable ones do, so a parent whose own reads have narrowed since the spawn cannot
         // resume a reader it could not spawn today. A spec that gave none reads as the spawn
         // read it, and one that gave some confines the worker as the spawn did.
+        let worker_workspace = crate::workspace::writable_roots(&workspace.cwd, &workspace.roots);
         let workspace = WorkerWorkspace {
             read_boundary: cells
                 .read_boundary
@@ -1668,6 +1681,7 @@ impl Tool for AgentFollowupTool {
                         ceiling,
                         &cells.cwd,
                         &cells.site().read_scope(),
+                        &worker_workspace,
                         roots,
                     )
                     .map_err(|error| MekaError::ToolExecution {
@@ -7814,7 +7828,7 @@ mod tests {
             dirs.work.clone(),
         );
         confine_reads(&mut params);
-        let secret = dirs.elsewhere.join("secret.txt");
+        let secret = dirs.work.parent().expect("base").join("secret.txt");
         std::fs::write(&secret, "SECRET-WORDS").expect("write");
         let spawn = spawn_tool_for(
             params,
@@ -7824,7 +7838,7 @@ mod tests {
             .execute(
                 serde_json::json!({
                     "prompt": "read",
-                    "readable_roots": [dirs.extra.to_string_lossy()],
+                    "readable_roots": [dirs.elsewhere.to_string_lossy()],
                 }),
                 crate::tools::ToolContext::detached(CancellationToken::new()),
             )
@@ -7991,6 +8005,103 @@ mod tests {
             !transcript.contains("BESIDE-WORDS")
                 && transcript.contains("outside the readable roots"),
             "{transcript}"
+        );
+    }
+
+    /// An entry of `readable_roots` inside the workspace the worker shares is refused, since the
+    /// workspace is readable already, with the spelling that confines a worker to a directory as
+    /// the remedy, and leaves no row behind.
+    #[tokio::test]
+    async fn a_readable_root_inside_the_shared_workspace_is_refused() {
+        let dirs = workspaces();
+        let refusal = refused_spawn(
+            Permission::Workspace,
+            dirs.work.clone(),
+            serde_json::json!({
+                "prompt": "read",
+                "readable_roots": [dirs.sub.to_string_lossy()],
+            }),
+        )
+        .await;
+        assert!(
+            refusal.contains("inside the sub-agent's workspace at")
+                && refusal.contains(&dirs.work.display().to_string())
+                && refusal.contains("`writable_roots`"),
+            "{refusal}"
+        );
+    }
+
+    /// The same for a bounded worker: an entry inside one of its `writable_roots` is refused,
+    /// naming that root as the workspace it lies in.
+    #[tokio::test]
+    async fn a_readable_root_inside_the_writable_roots_is_refused() {
+        let dirs = workspaces();
+        let inner = dirs.sub.join("inner");
+        std::fs::create_dir_all(&inner).expect("mkdir");
+        let refusal = refused_spawn(
+            Permission::Workspace,
+            dirs.work.clone(),
+            serde_json::json!({
+                "prompt": "read",
+                "writable_roots": [dirs.sub.to_string_lossy()],
+                "readable_roots": [inner.to_string_lossy()],
+            }),
+        )
+        .await;
+        assert!(
+            refusal.contains("inside the sub-agent's workspace at")
+                && refusal.contains(&dirs.sub.display().to_string()),
+            "{refusal}"
+        );
+    }
+
+    /// A follow-up judges the recorded grant against the worker's workspace as it stands now: a
+    /// root this session's workspace has since grown to cover is refused, as a spawn would refuse
+    /// it.
+    #[tokio::test]
+    async fn a_followup_refuses_a_readable_root_the_workspace_has_since_covered() {
+        let dirs = workspaces();
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let params = params_at(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Permission::Workspace,
+            dirs.work.clone(),
+        );
+        let spawn = spawn_tool_for(params.clone(), mock(vec![text_round("spawned")]));
+        let output = spawn
+            .execute(
+                serde_json::json!({
+                    "prompt": "wait",
+                    "readable_roots": [dirs.elsewhere.to_string_lossy()],
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        let agent_id = agent_id_in(&output.text_content());
+
+        let mut widened = params;
+        widened.cells.roots =
+            SharedRoots::new(vec![dirs.work.parent().expect("base").to_path_buf()]);
+        let followup = followup_tool_for(widened, mock(vec![text_round("never runs")]));
+        let error = followup
+            .execute(
+                serde_json::json!({ "id": agent_id.to_string(), "prompt": "carry on" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("the follow-up must be refused");
+        assert!(
+            error.to_string().contains("can no longer grant")
+                && error
+                    .to_string()
+                    .contains("inside the sub-agent's workspace at"),
+            "{error}"
         );
     }
 }

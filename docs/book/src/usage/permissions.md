@@ -102,17 +102,21 @@ protects.
 
 The switch is the deployment's default, not the only way in. With it off, a parent still confines
 a sub-agent's reads by naming `readable_roots`: that sub-agent, and anything it spawns, reads its
-writable roots, the list and the system directories, the way `writable_roots` hands a
-sub-agent a write boundary from a parent that has none. A spawn turns confinement on, never off.
-A sub-agent's reach never exceeds its parent's here either: `readable_roots` are admitted against
+workspace, the list and the system directories, the way `writable_roots` hands a sub-agent a
+write boundary from a parent that has none. A spawn turns confinement on, never off. An entry
+inside the sub-agent's workspace is refused, since the workspace is readable already; the
+refusal names `writable_roots`, which is how a sub-agent is confined to a directory. A
+sub-agent's reach never exceeds its parent's here either: `readable_roots` are admitted against
 the parent's own readable roots when the parent's reads are confined, a parent reading everywhere
 may name anywhere, and a follow-up re-admits the worker's directory and roots against the parent's
 reach at that moment. A sub-agent whose call names nothing holds its parent's boundary, and one
 handed a list runs at `workspace` unless its call asks for less.
 
-The file tools answer "not found" for a path that is missing and refuse one that exists outside the
-roots, so a confined session can learn which paths exist, though not what they hold. The same is
-true of a command under Landlock alone and under macOS, as above.
+The file tools refuse a path outside the roots in the same words whether or not it exists, and
+name it as it was given rather than where a symlink leads, so a confined session learns neither
+which paths exist beyond its roots nor what its links point at. `agent_spawn` judges
+`writable_roots` and `readable_roots` the same way. A command under Landlock alone and under
+macOS can still tell a missing path from a denied one, as above.
 
 On Windows the shell cannot hold this boundary: neither token mechanism confines reads. The file
 tools keep it, a command does not, the agent is told so in its environment block, and startup logs

@@ -149,50 +149,6 @@ async fn open_read_nofollow(path: &Path) -> std::io::Result<tokio::fs::File> {
     }
 }
 
-/// Resolve every component of `path` that already exists, leaving the rest as spelled.
-///
-/// This is what the kernel will do when the path is finally opened, computed ahead of time so the
-/// boundary check and the syscall agree about which file is meant. Walking forward rather than
-/// canonicalizing the whole path matters because the target usually does not exist yet, and
-/// `canonicalize` fails outright on a missing tail.
-///
-/// `..` pops the *resolved* accumulator, not the spelling, which is the whole point: `<root>/L/..`
-/// where `L` is a symlink lands where the kernel lands, not where the text suggests.
-///
-/// What this closes is the deterministic escape: a symlink already planted on the path resolves
-/// here and is caught by the boundary check that follows. What it does not close is the race, since
-/// a component verified here can be swapped for a symlink before the open; closing that needs the
-/// walk to hold a directory descriptor and write through `openat`/`renameat`. The sandbox is
-/// documented as defense against an agent damaging user data by accident rather than as an
-/// adversarial boundary, and winning this race requires a concurrent writer deliberately planting
-/// the symlink mid-call, so the residual is accepted.
-async fn resolve_existing_prefix(path: &Path) -> std::path::PathBuf {
-    use std::path::Component;
-
-    let mut out = std::path::PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir => out.push(component),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::Normal(part) => {
-                out.push(part);
-                // A component that does not exist cannot be a symlink, so a failure here means the
-                // rest of the path is a pure spelling and needs no further resolution.
-                if let Ok(resolved) = tokio::fs::canonicalize(&out).await {
-                    // Stripped, or the accumulator switches spelling mid-walk: the first existing
-                    // component turns `C:\ws` into `\\?\C:\ws` and every component after it is
-                    // pushed onto the verbatim form.
-                    out = crate::workspace::strip_verbatim(resolved);
-                }
-            }
-        }
-    }
-    out
-}
-
 /// The spelling of `path` the write fence judges: resolved against `cwd`, with every component
 /// that exists canonicalized.
 ///
@@ -202,8 +158,8 @@ async fn resolve_existing_prefix(path: &Path) -> std::path::PathBuf {
 /// would pass and create that entire directory chain at the real `/home/you/...` before the
 /// canonical `admit` refused the file. After this, the existing prefix contains no unresolved
 /// symlink, and the components that do not exist yet cannot contain one either.
-async fn resolve_for_fence(cwd: &crate::workspace::SharedCwd, path: &str) -> std::path::PathBuf {
-    resolve_existing_prefix(&crate::workspace::resolve_against_cwd(cwd, path)).await
+fn resolve_for_fence(cwd: &crate::workspace::SharedCwd, path: &str) -> std::path::PathBuf {
+    crate::workspace::resolve_existing_prefix(&crate::workspace::resolve_against_cwd(cwd, path))
 }
 
 /// The refusal the write fence would give a create-or-overwrite of `input["path"]` at `level`,
@@ -214,7 +170,7 @@ async fn resolve_for_fence(cwd: &crate::workspace::SharedCwd, path: &str) -> std
 /// that resolve through `resolve_write_target`, so the approval door never asks about a write the
 /// fence refuses however the user answers: an approved call runs at the level, and below
 /// `unrestricted` the fence confines it to the workspace roots.
-pub(super) async fn write_fence_refusal(
+pub(super) fn write_fence_refusal(
     tool_name: &str,
     cwd: &crate::workspace::SharedCwd,
     scope: &crate::workspace::WriteScope,
@@ -222,8 +178,11 @@ pub(super) async fn write_fence_refusal(
     input: &serde_json::Value,
 ) -> Option<ToolOutput> {
     let path = input["path"].as_str()?;
-    let file_path = resolve_for_fence(cwd, path).await;
-    let refusal = scope.admit_at(level, cwd, &file_path).err()?;
+    let file_path = resolve_for_fence(cwd, path);
+    let spelled = crate::workspace::resolve_against_cwd(cwd, path);
+    let refusal = scope
+        .admit_shown_at(level, cwd, &spelled, &file_path)
+        .err()?;
     Some(ToolOutput::from_error(&MekaError::ToolExecution {
         tool_name: tool_name.to_string(),
         message: refusal,
@@ -250,11 +209,14 @@ pub(super) async fn resolve_write_target(
     scope: &crate::workspace::WriteScope,
     path: &str,
 ) -> Result<(std::path::PathBuf, tokio::sync::OwnedMutexGuard<()>)> {
-    let file_path = resolve_for_fence(cwd, path).await;
+    let file_path = resolve_for_fence(cwd, path);
+    // Every refusal is worded with the path as the model spelled it: one that named where a link
+    // leads would give away a name the boundary keeps.
+    let spelled = crate::workspace::resolve_against_cwd(cwd, path);
 
     // Judged before `create_dir_all` below. Left until after canonicalization, a refused write to
     // `/etc/foo/bar/baz.txt` would already have created `/etc/foo/bar` on its way to being refused.
-    if let Err(refusal) = scope.admit(cwd, &file_path) {
+    if let Err(refusal) = scope.admit_shown(cwd, &spelled, &file_path) {
         return Err(MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
             message: refusal,
@@ -301,7 +263,7 @@ pub(super) async fn resolve_write_target(
     // resolved it and before the write, which no deterministic test can stage. The same `target`
     // is what the caller writes to and what the lock is keyed on, so there is no window between
     // what this judged and what is used.
-    if let Err(refusal) = scope.admit(cwd, &target) {
+    if let Err(refusal) = scope.admit_shown(cwd, &spelled, &target) {
         return Err(MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
             message: refusal,
@@ -1055,9 +1017,7 @@ impl Tool for ReadFileTool {
             })?
             .to_string();
 
-        let resolved = crate::workspace::resolve_against_cwd(&self.site.cwd, &path);
-        let canonical = canonicalize_for_tool("file_read", &resolved).await?;
-        super::util::admit_read("file_read", &self.site, &canonical)?;
+        let canonical = super::util::admit_read("file_read", &self.site, &path).await?;
 
         // Detect image files and return multimodal content, converting non-native formats (TIFF,
         // ICO, etc.) to PNG along the way.
@@ -1367,8 +1327,9 @@ impl Tool for EditFileTool {
         Permission::Workspace
     }
 
-    /// The fence below judges the canonical target, so the answer here is the same one: a file
-    /// that does not resolve is left for `execute` to report, since that is not the level's doing.
+    /// The first of the two judgments `execute` makes, so the answer here is the one the edit
+    /// would meet: the path as spelled, with the components that exist resolved, so a target
+    /// outside the workspace is refused whether or not it exists.
     async fn refusal_at_level(
         &self,
         level: Permission,
@@ -1376,10 +1337,14 @@ impl Tool for EditFileTool {
     ) -> Option<ToolOutput> {
         let path = input["path"].as_str()?;
         let resolved = crate::workspace::resolve_against_cwd(&self.site.cwd, path);
-        let canonical = canonicalize_for_tool("file_edit", &resolved).await.ok()?;
         let refusal = self
             .scope
-            .admit_at(level, &self.site.cwd, &canonical)
+            .admit_shown_at(
+                level,
+                &self.site.cwd,
+                &resolved,
+                &crate::workspace::resolve_existing_prefix(&resolved),
+            )
             .err()?;
         Some(ToolOutput::text(refusal, true))
     }
@@ -1431,16 +1396,30 @@ impl Tool for EditFileTool {
             format!("{}{}", old_string, insert_after_opt.unwrap_or(""))
         };
 
+        // Judged as spelled first, with the components that exist resolved, ahead of the
+        // canonicalization that fails on a missing file: a target outside the workspace is then
+        // refused the same way whether or not it exists, and the refusal names the spelling the
+        // model used rather than where a link leads.
+        let resolved = crate::workspace::resolve_against_cwd(&self.site.cwd, &path);
+        if let Err(refusal) = self.scope.admit_shown(
+            &self.site.cwd,
+            &resolved,
+            &crate::workspace::resolve_existing_prefix(&resolved),
+        ) {
+            return Ok(ToolOutput::text(refusal, true));
+        }
+
         // Canonicalize once. All subsequent I/O goes through this path so a symlink swap between
         // the tracker check and the actual read/write can't redirect us onto a different file.
-        let resolved = crate::workspace::resolve_against_cwd(&self.site.cwd, &path);
         let canonical = canonicalize_for_tool("file_edit", &resolved).await?;
 
-        // On the canonical path, which is also the one every branch below reads and writes, so a
-        // symlink out of the workspace is judged by where it lands rather than where it is named.
-        // `file_edit` needs no lexical pre-pass: the target must already exist, so canonicalization
-        // cannot fail open the way it would for a create.
-        if let Err(refusal) = self.scope.admit(&self.site.cwd, &canonical) {
+        // Judged again on the canonical path, which is also the one every branch below reads and
+        // writes, so a symlink out of the workspace is judged by where it lands rather than where
+        // it is named.
+        if let Err(refusal) = self
+            .scope
+            .admit_shown(&self.site.cwd, &resolved, &canonical)
+        {
             return Ok(ToolOutput::text(refusal, true));
         }
 
@@ -1714,7 +1693,7 @@ impl Tool for WriteFileTool {
         level: Permission,
         input: &serde_json::Value,
     ) -> Option<ToolOutput> {
-        write_fence_refusal("file_write", &self.site.cwd, &self.scope, level, input).await
+        write_fence_refusal("file_write", &self.site.cwd, &self.scope, level, input)
     }
 
     async fn execute(
@@ -5391,7 +5370,13 @@ mod tests {
         )
         .await
         .expect_err("a symlink resolving outside the root must be refused");
-        assert!(refused.to_string().contains("outside the workspace"));
+        let refused = refused.to_string();
+        assert!(refused.contains("outside the workspace"), "{refused}");
+        assert!(
+            refused.contains(&work.join("link/f.txt").display().to_string())
+                && !refused.contains(&outside.join("f.txt").display().to_string()),
+            "the refusal names the path as spelled, not where the link leads: {refused}"
+        );
         assert!(!outside.join("f.txt").exists());
     }
 
@@ -5676,8 +5661,9 @@ mod tests {
         );
     }
 
-    /// The same for `file_edit`, whose fence judges the canonical existing target. A target that
-    /// does not resolve is not the level's refusal to make, so the tool says nothing about it.
+    /// The same for `file_edit`, judged as spelled with what exists resolved: a target outside
+    /// every root is refused in the same words whether or not it exists, and a missing target
+    /// inside the workspace is `execute`'s to report, since that is not the level's doing.
     #[tokio::test]
     async fn an_edit_the_fence_refuses_at_the_level_is_stated_ahead_of_the_prompt() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -5712,11 +5698,23 @@ mod tests {
                 .await
                 .is_none()
         );
+        let missing_outside = tool
+            .refusal_at_level(Permission::Read, &edit(&base.join("missing.txt")))
+            .await
+            .expect("a missing file outside every root is refused like one that is there");
+        assert_eq!(
+            missing_outside.text_content(),
+            refusal.text_content().replace(
+                &outside.display().to_string(),
+                &base.join("missing.txt").display().to_string()
+            ),
+            "the refusal does not say whether the file exists"
+        );
         assert!(
-            tool.refusal_at_level(Permission::Read, &edit(&base.join("missing.txt")))
+            tool.refusal_at_level(Permission::Read, &edit(&work.join("missing.txt")))
                 .await
                 .is_none(),
-            "a missing file is `execute`'s to report"
+            "a missing file inside the workspace is `execute`'s to report"
         );
         assert_eq!(
             std::fs::read_to_string(&outside).expect("read outside"),
@@ -5728,10 +5726,10 @@ mod tests {
     /// `file_edit` is fenced too, and its target already exists.
     ///
     /// Every other test here drives `resolve_write_target`, which `file_edit` does **not** use: it
-    /// resolves through `canonicalize_for_tool` and calls `scope.admit` itself. So the whole fence
-    /// could be deleted from `file_edit` without any of them noticing. The file has to exist and
-    /// have been read for the edit to get as far as the boundary check, which is what makes this
-    /// worth driving through the tool rather than the helper.
+    /// resolves through `canonicalize_for_tool` and calls `scope.admit_shown` itself. So the whole
+    /// fence could be deleted from `file_edit` without any of them noticing. The file has to
+    /// exist and have been read for the edit to get as far as the boundary check, which is what
+    /// makes this worth driving through the tool rather than the helper.
     #[tokio::test]
     async fn an_edit_outside_the_workspace_is_refused() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -5769,6 +5767,27 @@ mod tests {
             std::fs::read_to_string(&outside).expect("read outside"),
             "alpha\n",
             "a refused edit must not have touched the file"
+        );
+        // A file that is not there is refused in the very words one that is there gets, ahead of
+        // the resolution that would have answered "not found" instead.
+        let missing = tool
+            .execute(
+                serde_json::json!({
+                    "path": base.join("missing.txt").to_str().expect("path"),
+                    "old_string": "alpha",
+                    "new_string": "BETA",
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("outside the workspace, whether or not it exists");
+        assert!(missing.is_error);
+        assert_eq!(
+            missing.text_content(),
+            refused.text_content().replace(
+                &outside.display().to_string(),
+                &base.join("missing.txt").display().to_string()
+            )
         );
 
         let accepted = tool
@@ -5829,6 +5848,43 @@ mod tests {
                 && message.contains(&work.display().to_string()),
             "{message}"
         );
+        // A file that is not there is refused in the very words one that is there gets, so the
+        // refusal does not say which: that is the only thing a confined session could learn
+        // about a path outside its roots.
+        let missing = tool
+            .execute(
+                serde_json::json!({"path": elsewhere.join("missing.txt")}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("outside the roots, whether or not it exists");
+        assert_eq!(
+            missing.to_string(),
+            message.replace(
+                &elsewhere.join("secret.txt").display().to_string(),
+                &elsewhere.join("missing.txt").display().to_string()
+            )
+        );
+        // A link out of the roots is refused by where it lands and named by where it was spelled:
+        // the target's name is as much the boundary's as its contents.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(elsewhere.join("secret.txt"), work.join("link"))
+                .expect("symlink");
+            let through_link = tool
+                .execute(
+                    serde_json::json!({"path": "link"}),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
+                .await
+                .expect_err("the link lands outside the roots")
+                .to_string();
+            assert!(
+                through_link.contains(&work.join("link").display().to_string())
+                    && !through_link.contains(&elsewhere.join("secret.txt").display().to_string()),
+                "{through_link}"
+            );
+        }
         let allowed = tool
             .execute(
                 serde_json::json!({"path": "inside.txt"}),

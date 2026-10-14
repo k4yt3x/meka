@@ -139,20 +139,36 @@ pub(super) fn compile_user_regex(pattern: &str, tool_name: &str) -> Result<regex
         })
 }
 
-/// Admit one read of `canonical` against the session's read boundary: meka's own directories are
-/// refused below `unrestricted`, and with reads confined so is anything outside the readable
-/// roots. `canonical` must be canonical, which every caller has from [`canonicalize_for_tool`].
-pub(super) fn admit_read(
+/// Admit one read of `path`, as the model spelled it, against the session's read boundary, and
+/// hand back the canonical path every later I/O uses: meka's own directories are refused below
+/// `unrestricted`, and with reads confined so is anything outside the readable roots.
+///
+/// Judged twice. First as spelled, with the components that exist resolved, ahead of any step that
+/// depends on the path existing: a path outside the boundary is then refused the same way whether
+/// or not it exists, where resolving it first would answer "not found" for a missing one and
+/// "outside" for one that is there, and the refusal names the spelling the model used rather than
+/// where a link leads. Then on the canonical path, the one the I/O opens, so a link swapped in
+/// between the two resolutions is judged where it lands; worded with the same spelling for the same
+/// reason.
+pub(super) async fn admit_read(
     tool_name: &str,
     site: &crate::session::ToolSite,
-    canonical: &Path,
-) -> Result<()> {
-    site.read_scope()
-        .admit(&site.cwd, canonical)
-        .map_err(|message| MekaError::ToolExecution {
-            tool_name: tool_name.to_string(),
-            message,
-        })
+    path: &str,
+) -> Result<PathBuf> {
+    let resolved = crate::workspace::resolve_against_cwd(&site.cwd, path);
+    let fence = site.read_scope().fence(&site.cwd);
+    let refuse = |message: String| MekaError::ToolExecution {
+        tool_name: tool_name.to_string(),
+        message,
+    };
+    if let Some(message) = fence.refusal(&resolved) {
+        return Err(refuse(message));
+    }
+    let canonical = canonicalize_for_tool(tool_name, &resolved).await?;
+    if let Some(message) = fence.refusal_shown(&resolved, &canonical) {
+        return Err(refuse(message));
+    }
+    Ok(canonical)
 }
 
 /// Resolve the path the model provided to a canonical absolute path, with every symlink component
