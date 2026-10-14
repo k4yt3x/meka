@@ -543,23 +543,94 @@ impl From<StatusFact> for String {
     }
 }
 
+/// One fact the row that closes a turn can state, in the order configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum TurnEndFact {
+    /// When the turn ended.
+    Time,
+    /// How long it ran.
+    Duration,
+    /// The tokens it used.
+    Usage,
+}
+
+impl TurnEndFact {
+    /// Every fact, in the order the documentation lists them.
+    pub(crate) const ALL: [TurnEndFact; 3] = [Self::Time, Self::Duration, Self::Usage];
+    /// What a file that does not set `[display].turn_end_summary` gets.
+    pub(crate) const DEFAULT_SUMMARY: [TurnEndFact; 2] = [Self::Time, Self::Duration];
+
+    /// The word the config file and the docs use for the fact.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Time => "time",
+            Self::Duration => "duration",
+            Self::Usage => "usage",
+        }
+    }
+}
+
+impl std::fmt::Display for TurnEndFact {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for TurnEndFact {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|fact| fact.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a turn end summary fact. Supported: {}",
+                    Self::ALL
+                        .iter()
+                        .map(|fact| fact.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for TurnEndFact {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, String> {
+        value.parse()
+    }
+}
+
+impl From<TurnEndFact> for String {
+    fn from(fact: TurnEndFact) -> Self {
+        fact.name().to_string()
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DisplayConfig {
-    pub(crate) show_session_id_on_create: Option<bool>,
-    pub(crate) show_session_id_on_resume: Option<bool>,
-    pub(crate) show_session_id_on_exit: Option<bool>,
     /// What the status row under the composer shows, in order. Unset shows
     /// [`StatusFact::DEFAULT_ROW`].
     pub(crate) status_row: Option<Vec<StatusFact>>,
-    pub(crate) show_token_usage: Option<bool>,
-    /// Whether the provider is asked to stream its reply or to return it whole. `false` is what
-    /// `--no-stream` asks for one run; a preference belongs in the file.
-    pub(crate) stream: Option<bool>,
+    /// What the row that closes a turn states, in order. Unset shows
+    /// [`TurnEndFact::DEFAULT_SUMMARY`]; an empty list draws no row.
+    pub(crate) turn_end_summary: Option<Vec<TurnEndFact>>,
+    pub(crate) show_session_id_on_create: Option<bool>,
+    pub(crate) show_session_id_on_resume: Option<bool>,
+    pub(crate) show_session_id_on_exit: Option<bool>,
     /// Whether the interactive screen captures the mouse: the wheel scrolls and a click expands a
     /// block, at the cost of the terminal's own click-and-drag selection, which then needs its
     /// modifier key. Default `true`.
     pub(crate) mouse: Option<bool>,
+    /// Whether the provider is asked to stream its reply or to return it whole. `false` is what
+    /// `--no-stream` asks for one run; a preference belongs in the file.
+    pub(crate) stream: Option<bool>,
 }
 
 /// Whether answers stream: the flag turns it off for one run, the file is the standing preference,
@@ -1311,7 +1382,9 @@ pub(crate) struct ResolvedConfig {
     pub(crate) send_class: SendClass,
     /// Resolved `[display].status_row`: what the status row shows, in order.
     pub(crate) status_row: Vec<StatusFact>,
-    pub(crate) show_token_usage: bool,
+    /// Resolved `[display].turn_end_summary`: the facts the row that closes a turn states, in
+    /// order; empty for no row.
+    pub(crate) turn_end_summary: Vec<TurnEndFact>,
     pub(crate) web_client: WebClientConfig,
     pub(crate) sandbox: bool,
     /// `[shell].sandbox_backend` (or its flag and variable), before any auto-pick. Linux-only;
@@ -2227,7 +2300,9 @@ impl ResolvedConfig {
             show_session_id_on_exit: file_display.show_session_id_on_exit.unwrap_or(true),
             mouse: file_display.mouse.unwrap_or(true),
             send_class: file_session.send_class.unwrap_or_default(),
-            show_token_usage: file_display.show_token_usage.unwrap_or(false),
+            turn_end_summary: file_display
+                .turn_end_summary
+                .unwrap_or_else(|| TurnEndFact::DEFAULT_SUMMARY.to_vec()),
             status_row: file_display
                 .status_row
                 .unwrap_or_else(|| StatusFact::DEFAULT_ROW.to_vec()),
@@ -3819,6 +3894,49 @@ command = "ida-mcp"
     /// The status row's facts come from the list, in its order; a word that is not a fact is
     /// refused by name, and so are the two booleans the list replaced.
     #[test]
+    fn the_turn_end_summary_is_a_list_of_facts_in_order() {
+        let parsed = toml::from_str::<ConfigFile>(
+            "[display]\nturn_end_summary = [\"usage\", \"time\", \"duration\"]\n",
+        )
+        .expect("a list of facts parses");
+        assert_eq!(
+            parsed.display.and_then(|display| display.turn_end_summary),
+            Some(vec![
+                TurnEndFact::Usage,
+                TurnEndFact::Time,
+                TurnEndFact::Duration
+            ])
+        );
+        let empty = toml::from_str::<ConfigFile>("[display]\nturn_end_summary = []\n")
+            .expect("an empty list parses");
+        assert_eq!(
+            empty.display.and_then(|display| display.turn_end_summary),
+            Some(Vec::new())
+        );
+        let unknown = toml::from_str::<ConfigFile>("[display]\nturn_end_summary = [\"cost\"]\n")
+            .expect_err("a word that is not a fact must not parse");
+        assert!(
+            unknown
+                .to_string()
+                .contains("'cost' is not a turn end summary fact"),
+            "{unknown}"
+        );
+        assert_eq!(
+            resolve_with_config("[display]\n").turn_end_summary,
+            TurnEndFact::DEFAULT_SUMMARY.to_vec()
+        );
+        assert_eq!(
+            TurnEndFact::DEFAULT_SUMMARY.to_vec(),
+            TurnEndFact::ALL
+                .iter()
+                .copied()
+                .filter(|fact| *fact != TurnEndFact::Usage)
+                .collect::<Vec<_>>(),
+            "the default is every fact but the usage, which stays opt-in"
+        );
+    }
+
+    #[test]
     fn the_status_row_is_a_list_of_facts_in_order() {
         let parsed =
             toml::from_str::<ConfigFile>("[display]\nstatus_row = [\"profile\", \"path\"]\n")
@@ -3840,6 +3958,7 @@ command = "ida-mcp"
             "show_context_in_prompt",
             "tool_params",
             "max_width",
+            "show_token_usage",
         ] {
             let error = toml::from_str::<ConfigFile>(&format!("[display]\n{retired} = true\n"))
                 .expect_err("the retired key must not parse");

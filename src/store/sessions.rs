@@ -28,6 +28,9 @@ pub(crate) struct EventStamp {
 #[derive(Debug, Clone)]
 pub(crate) struct LogRow {
     pub(crate) id: i64,
+    /// The turn the row was written in, for a surface that marks where turns end; `None` for a row
+    /// written before turns were recorded.
+    pub(crate) turn_id: Option<Uuid>,
     pub(crate) event: crate::conversation::Event,
 }
 
@@ -718,7 +721,14 @@ fn log_page(
     let rows = stored
         .into_iter()
         .filter_map(|(id, row)| match decode_event_from_row(&row) {
-            Ok(Some(event)) => Some(LogRow { id, event }),
+            Ok(Some(event)) => Some(LogRow {
+                id,
+                turn_id: row
+                    .turn_id
+                    .as_deref()
+                    .and_then(|id| Uuid::parse_str(id).ok()),
+                event,
+            }),
             Ok(None) => {
                 warn_once_about_row(warned, id, &row.kind, None);
                 None

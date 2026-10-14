@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The screen closes each turn with a row saying when it ended and how long it took.
+- `[display].turn_end_summary` picks that row's facts: the time, the duration, the tokens used.
+
 ### Changed
 
 - **Breaking:** a one-shot run prints only the model's last text block, as markdown source.
@@ -15,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 - **Breaking:** `[display].tool_params`, `[display].max_width` and `[thinking].show_content`.
+- **Breaking:** `[display].show_token_usage`; list `usage` in `turn_end_summary` instead.
 
 ### Fixed
 

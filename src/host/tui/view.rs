@@ -323,7 +323,7 @@ pub(crate) fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
         Item::SessionId { label, id } => {
             draw::glyph_text_rows(ACT_GLYPH, gray(), &format!("{label} {id}"), gray(), width)
         }
-        Item::Usage(usage) => vec![draw::cut_line(draw::usage_row(usage), width)],
+        Item::TurnEnd(text) => draw::glyph_text_rows(ACT_GLYPH, gray(), text, gray(), width),
         Item::Image => draw::glyph_text_rows(ACT_GLYPH, gray(), "image", gray(), width),
         // The mark in the terminal's cyan beside three lines, on no background: a box of the
         // composer's gray was painted short by tmux under Alacritty, which drops the background
@@ -1138,7 +1138,7 @@ mod tests {
     fn settings() -> Settings {
         Settings {
             show_session_id_on_create: false,
-            show_token_usage: false,
+            turn_end_summary: crate::config::TurnEndFact::DEFAULT_SUMMARY.to_vec(),
         }
     }
 
@@ -1391,11 +1391,9 @@ mod tests {
                 label: token.clone(),
                 id: address.clone(),
             },
-            Item::Usage(crate::stats::TokenUsage {
-                input_tokens: u64::MAX,
-                output_tokens: u64::MAX,
-                ..crate::stats::TokenUsage::default()
-            }),
+            Item::TurnEnd(format!(
+                "Finished at 19:28 after 19m 19s with {token} tokens in"
+            )),
             Item::Image,
             Item::Banner {
                 version: token.clone(),
@@ -2265,6 +2263,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(offset, text)| LogRow {
+                    turn_id: None,
                     id: first + offset as i64,
                     event: Event::Append(Message {
                         role: Role::Assistant,

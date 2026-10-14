@@ -842,6 +842,19 @@ pub(crate) fn format_token_count(n: u64) -> String {
 }
 /// Format a non-negative duration in seconds compactly, e.g. `2d 3h`, `4h 12m`, `45m`, `30s`. Used
 /// by `meka account whoami` for the token time-to-expiry.
+/// A duration as the row that closes a turn states it: seconds under a minute, minutes and seconds
+/// under an hour, then [`format_duration_short`]'s hours and days.
+pub(crate) fn format_elapsed(duration: std::time::Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format_duration_short(i64::try_from(seconds).unwrap_or(i64::MAX))
+    }
+}
+
 pub(crate) fn format_duration_short(seconds: i64) -> String {
     let seconds = seconds.max(0);
     let minutes = seconds / 60;
@@ -1450,5 +1463,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// An elapsed time keeps its seconds under an hour, where they are what a reader watches, and
+    /// drops them past it.
+    #[test]
+    fn an_elapsed_time_keeps_its_seconds_under_an_hour() {
+        use std::time::Duration;
+        assert_eq!(super::format_elapsed(Duration::from_secs(14)), "14s");
+        assert_eq!(
+            super::format_elapsed(Duration::from_secs(19 * 60 + 19)),
+            "19m 19s"
+        );
+        assert_eq!(
+            super::format_elapsed(Duration::from_secs(3600 + 120)),
+            "1h 2m"
+        );
+        assert_eq!(super::format_elapsed(Duration::from_secs(0)), "0s");
     }
 }

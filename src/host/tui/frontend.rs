@@ -72,6 +72,8 @@ pub(crate) enum UiEvent {
     Reloaded {
         log_end: Option<i64>,
         page: crate::store::LogPage,
+        /// The session's recorded turns, which close each turn's rows on the replay.
+        turns: Vec<crate::store::turns::TurnRecord>,
         /// The window it was read for; the screen drops a read for a window it has let go of.
         generation: u64,
     },

@@ -26,6 +26,11 @@ a thinking block collapsed, and a one-shot run shows neither. `[display].max_wid
 meka laid text out at; the screen uses its window and a one-shot run its terminal. Delete the three
 from `config.toml`.
 
+**`[display].show_token_usage` is a fact of `turn_end_summary`.** The screen now closes every turn
+with a row saying when it ended and how long it took, and the tokens used are one of the facts
+that row can state. `show_token_usage = true` becomes
+`turn_end_summary = ["time", "duration", "usage"]`; the old key is refused by name.
+
 ## 0.72 to 0.73
 
 **`meka session delete` is `meka session remove`.** The session command now uses the verb every

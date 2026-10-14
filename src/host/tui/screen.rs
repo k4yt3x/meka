@@ -534,9 +534,18 @@ impl Screen {
                     (None, crate::store::LogPage::default())
                 }
             };
+            let turns = store
+                .turn_store()
+                .load_turns(session_id)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!("failed to read the session's turns: {error}");
+                    Vec::new()
+                });
             ui.send(UiEvent::Reloaded {
                 log_end,
                 page,
+                turns,
                 generation,
             });
         });
@@ -898,6 +907,7 @@ impl Screen {
             }
             UiEvent::Panel(body) => self.open_panel(Panel::with_text(&body), PanelKind::Info),
             UiEvent::Done => {
+                self.launch.transcript.flush_turn_end();
                 self.busy = None;
                 self.activity = view::Activity::Working;
                 if self.wake_pending {
@@ -933,6 +943,7 @@ impl Screen {
             UiEvent::Reloaded {
                 log_end,
                 page,
+                turns,
                 generation,
             } => {
                 if generation != self.history_generation {
@@ -940,6 +951,7 @@ impl Screen {
                 }
                 self.history_loading = false;
                 self.launch.transcript.reset(log_end);
+                self.launch.transcript.set_turn_records(turns);
                 self.launch.transcript.load_page_above(page);
                 self.viewport.scroll_to_bottom();
             }

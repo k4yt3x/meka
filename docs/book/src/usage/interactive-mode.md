@@ -85,6 +85,17 @@ A slash command that would have to wait on the turn is refused while one runs; s
 The steer and interrupt classes are the inbox the HTTP API exposes; see
 [the inbox](./http-api.md#the-inbox) for what each one does inside the turn.
 
+When the turn ends, a row closes it, in the same dim register as the other stage directions:
+
+```
+• Finished at 19:28 after 19m 19s
+```
+
+The first word says how the turn ended (`Finished`, `Interrupted`, `Failed`), and
+[`display.turn_end_summary`](../configuration/config-file.md#displayturn_end_summary) picks the
+facts after it: the time, the duration, the tokens used. A resumed session closes every recorded
+turn the same way, so the scrollback says when each one ended.
+
 ## Expanding and collapsing
 
 Reasoning shows as one dimmed `• Thinking · …` row: the first words of the block once it has

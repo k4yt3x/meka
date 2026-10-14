@@ -99,8 +99,14 @@ pub(crate) async fn run_interactive(
     // then the conversation as far back as the log goes.
     let mut transcript = model::Transcript::new(model::Settings {
         show_session_id_on_create: config.show_session_id_on_create,
-        show_token_usage: config.show_token_usage,
+        turn_end_summary: config.turn_end_summary.clone(),
     });
+    if let Some(id) = session_id {
+        match store.turn_store().load_turns(id).await {
+            Ok(turns) => transcript.set_turn_records(turns),
+            Err(error) => tracing::warn!("failed to read the session's turns: {error}"),
+        }
+    }
     if log_end.is_none() {
         let profile = crate::sync::read(&current_profile).clone();
         let model = config

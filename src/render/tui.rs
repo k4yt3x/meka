@@ -993,30 +993,6 @@ pub(crate) fn approval_rows(
     tree_rows(arguments, program_first, Vec::new())
 }
 
-/// The per-turn usage row, `• 12.3k in · 96% cached · 1.2k out`, dimmed.
-pub(crate) fn usage_row(usage: &crate::stats::TokenUsage) -> Line<'static> {
-    let total_in = usage
-        .input_tokens
-        .saturating_add(usage.cache_creation_input_tokens)
-        .saturating_add(usage.cache_read_input_tokens);
-    let cache_hit_pct = if total_in == 0 {
-        0
-    } else {
-        ((usage.cache_read_input_tokens as f64) / (total_in as f64) * 100.0).round() as u64
-    };
-    Line::from(vec![
-        Span::styled(format!("{ACT_GLYPH:<TEXT_EDGE$}"), gray()),
-        Span::styled(
-            format!(
-                "{} in · {cache_hit_pct}% cached · {} out",
-                format_token_count(total_in),
-                format_token_count(usage.output_tokens),
-            ),
-            gray(),
-        ),
-    ])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

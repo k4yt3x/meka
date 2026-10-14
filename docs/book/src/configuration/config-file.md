@@ -1337,7 +1337,64 @@ max_redirects = 0
 
 ## `[display]`
 
-Settings for the interactive screen; `stream` also decides how a one-shot run asks the provider.
+Settings for the interactive screen: the two rows it composes, the session id lines, the mouse,
+and `stream`, which also decides how a one-shot run asks the provider.
+
+### `display.status_row`
+
+What the status row under the composer shows after the permission level, which always opens it,
+in the order listed:
+
+- `path`: the session's working directory, shortened with `~`
+- `profile`: the profile the session runs on, with its model
+- `context`: the live context-window gauge, e.g. `128.4k/1.0M 13%` (tokens in context / model
+  window / percent used), the same value `/status` shows on its `Context:` line; hidden until the
+  first turn produces a measurement
+- `tasks`: `2 background tasks`, while any run
+- `subagents`: `1 sub-agent`, while any run
+
+A hint (`copied 3 rows`, `the question was withdrawn`) sits at the right edge whatever the
+list says, and an empty list leaves the row to the hints. A word that is not one of these is
+refused by name.
+
+```toml
+[display]
+status_row = ["profile", "context"]
+```
+
+Default: `["path", "profile", "tasks", "subagents"]`
+
+### `display.turn_end_summary`
+
+What the row that closes a turn states, in the order listed:
+
+- `time`: when the turn ended, as a time of day today and with the date otherwise
+- `duration`: how long it ran
+- `usage`: the tokens it used, with the share of the input that came from the cache
+
+The row reads as one sentence whose first word says how the turn ended:
+
+```
+• Finished at 19:28 after 19m 19s
+• Interrupted at 19:30 after 2m 3s
+• Finished at 19:28 after 19m 19s with 12.3k tokens in, 1.2k out, 96% cached
+```
+
+A fact with nothing to say is left out. An empty list draws no row. A word that is not one of
+these is refused by name. On a resumed session every recorded turn closes with the same row, read
+from the store, so a scrollback says when each turn ended. A one-shot run prints none; `--format
+json` carries the turn's usage.
+
+The usage's `in` count is the total of all three Anthropic input tiers (live, cache-write,
+cache-read); the cached share is `cache_read / in`. The `/status` slash command surfaces the
+session's cumulative numbers in the same vein.
+
+```toml
+[display]
+turn_end_summary = ["time", "duration", "usage"]
+```
+
+Default: `["time", "duration"]`
 
 ### `display.show_session_id_on_create`
 
@@ -1367,30 +1424,6 @@ show_session_id_on_resume = false
 show_session_id_on_exit = false
 ```
 
-### `display.status_row`
-
-What the status row under the composer shows after the permission level, which always opens it,
-in the order listed:
-
-- `path`: the session's working directory, shortened with `~`
-- `profile`: the profile the session runs on, with its model
-- `context`: the live context-window gauge, e.g. `128.4k/1.0M 13%` (tokens in context / model
-  window / percent used), the same value `/status` shows on its `Context:` line; hidden until the
-  first turn produces a measurement
-- `tasks`: `2 background tasks`, while any run
-- `subagents`: `1 sub-agent`, while any run
-
-A hint (`copied 3 rows`, `the question was withdrawn`) sits at the right edge whatever the
-list says, and an empty list leaves the row to the hints. A word that is not one of these is
-refused by name.
-
-```toml
-[display]
-status_row = ["profile", "context"]
-```
-
-Default: `["path", "profile", "tasks", "subagents"]`
-
 ### `display.mouse`
 
 Whether the interactive screen captures the mouse. With it on, the wheel scrolls the transcript and
@@ -1405,20 +1438,6 @@ Default: `true`
 [display]
 mouse = false
 ```
-
-### `display.show_token_usage`
-
-When `true`, the screen shows a dim one-row token-usage summary after each turn:
-
-```
-• 12.3k in · 96% cached · 1.2k out
-```
-
-A one-shot run prints none; `--format json` carries the turn's usage.
-
-The `in` column is the total of all three Anthropic input tiers (live, cache-write, cache-read); `cache hit %` is `cache_read / total_in`. Useful for monitoring caching effectiveness during long sessions. The `/status` slash command surfaces cumulative session stats in the same vein.
-
-Default: `false`
 
 ### `display.stream`
 

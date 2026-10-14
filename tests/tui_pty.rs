@@ -478,6 +478,14 @@ fn a_turn_draws_the_prompt_and_its_answer_above_the_composer() {
         prompt < answer,
         "the answer sits under the prompt: {rows:#?}"
     );
+    let closed = rows
+        .iter()
+        .position(|row| row.starts_with("• Finished at ") && row.contains(" after "))
+        .unwrap_or_else(|| panic!("the row that closes the turn: {rows:#?}"));
+    assert!(
+        answer < closed,
+        "the turn closes under its answer: {rows:#?}"
+    );
     assert!(
         rows.last().is_some_and(|row| row.starts_with("  read ")),
         "the status row under the composer names the permission level: {rows:#?}"
@@ -743,6 +751,11 @@ fn a_resumed_session_replays_the_reasoning_it_recorded() {
         rows.iter()
             .any(|row| row.contains("Weighing it then deciding")),
         "the resumed session dropped the reasoning it recorded: {rows:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("• Finished ") && row.contains(" after ")),
+        "the recorded turn closes on the replay as it did live: {rows:#?}"
     );
     assert!(
         !rows.iter().any(|row| row.contains("**")),

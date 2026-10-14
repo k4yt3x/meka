@@ -49,8 +49,6 @@ use uuid::Uuid;
 use self::backup::*;
 // The lock vocabulary is the store's own; only the list below leaves the module.
 use self::locks::*;
-#[cfg(test)]
-pub(crate) use self::sessions::LogRow;
 pub(crate) use self::{
     credentials::{
         AuthCredential, CredentialWrite, McpCredentialKind, StoredCredential, TokenStore,
@@ -59,8 +57,8 @@ pub(crate) use self::{
     scratchpad::{RenameOutcome, ScratchpadEntry},
     search::SessionMatch,
     sessions::{
-        ForkOverrides, ImportSessionRecord, LogPage, SessionFilter, SessionMetaRow, SessionPatch,
-        SessionSummary, SessionSweep, SourceLock, SpawnTerms, normalize_title,
+        ForkOverrides, ImportSessionRecord, LogPage, LogRow, SessionFilter, SessionMetaRow,
+        SessionPatch, SessionSummary, SessionSweep, SourceLock, SpawnTerms, normalize_title,
     },
 };
 use crate::error::{MekaError, Result};

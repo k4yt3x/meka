@@ -265,6 +265,75 @@ pub(crate) fn render_profile_setup_hint(missing: Option<MissingSessionProfile<'_
     }
 }
 
+/// The row that closes a turn: how it ended, then the facts `facts` lists, in their order. `None`
+/// when nothing is listed. A fact with nothing to say, a duration with no start or a usage of
+/// nothing, is left out rather than stated as zero.
+pub(crate) fn turn_end_summary(
+    facts: &[crate::config::TurnEndFact],
+    status: crate::store::turns::TurnStatus,
+    ended_at: chrono::DateTime<chrono::Utc>,
+    elapsed: Option<std::time::Duration>,
+    usage: &crate::store::turns::TurnUsage,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    use crate::{config::TurnEndFact, store::turns::TurnStatus};
+    if facts.is_empty() {
+        return None;
+    }
+    let mut sentence = match status {
+        TurnStatus::Succeeded => "Finished",
+        TurnStatus::Failed => "Failed",
+        TurnStatus::Canceled => "Interrupted",
+    }
+    .to_string();
+    for fact in facts {
+        let segment = match fact {
+            TurnEndFact::Time => {
+                let local = ended_at.with_timezone(&chrono::Local);
+                let today = local.date_naive() == now.with_timezone(&chrono::Local).date_naive();
+                Some(if today {
+                    format!("at {}", local.format("%H:%M"))
+                } else {
+                    format!(
+                        "on {} at {}",
+                        local.format("%Y-%m-%d"),
+                        local.format("%H:%M")
+                    )
+                })
+            }
+            TurnEndFact::Duration => {
+                elapsed.map(|elapsed| format!("after {}", crate::text::format_elapsed(elapsed)))
+            }
+            TurnEndFact::Usage => {
+                let total_in = usage
+                    .input_tokens
+                    .saturating_add(usage.cache_creation_input_tokens)
+                    .saturating_add(usage.cache_read_input_tokens);
+                if total_in == 0 && usage.output_tokens == 0 {
+                    None
+                } else {
+                    let cached = if total_in == 0 {
+                        0
+                    } else {
+                        ((usage.cache_read_input_tokens as f64) / (total_in as f64) * 100.0).round()
+                            as u64
+                    };
+                    Some(format!(
+                        "with {} tokens in, {} out, {cached}% cached",
+                        format_token_count(total_in),
+                        format_token_count(usage.output_tokens)
+                    ))
+                }
+            }
+        };
+        if let Some(segment) = segment {
+            sentence.push(' ');
+            sentence.push_str(&segment);
+        }
+    }
+    Some(sentence)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +520,95 @@ mod tests {
         assert!(
             out.contains("Extra usage: enabled · 70% used · $3.50 spent · $5.00 balance"),
             "got: {out:?}"
+        );
+    }
+
+    /// The row that closes a turn reads as one sentence: how it ended, then the facts listed in
+    /// their order, each left out when it has nothing to say.
+    #[test]
+    fn the_turn_end_summary_is_one_sentence_in_the_listed_order() {
+        use chrono::TimeZone;
+
+        use crate::{config::TurnEndFact, store::turns::TurnStatus};
+        let ended = chrono::Local
+            .with_ymd_and_hms(2026, 10, 12, 19, 28, 5)
+            .single()
+            .expect("a local time")
+            .with_timezone(&chrono::Utc);
+        let same_day = ended + chrono::Duration::hours(2);
+        let elapsed = Some(std::time::Duration::from_secs(19 * 60 + 19));
+        let usage = crate::store::turns::TurnUsage {
+            input_tokens: 1000,
+            output_tokens: 1200,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 11_300,
+        };
+        let summary = |facts: &[TurnEndFact], status, elapsed, usage, now| {
+            turn_end_summary(facts, status, ended, elapsed, usage, now)
+        };
+        assert_eq!(
+            summary(
+                &TurnEndFact::DEFAULT_SUMMARY,
+                TurnStatus::Succeeded,
+                elapsed,
+                &usage,
+                same_day
+            )
+            .as_deref(),
+            Some("Finished at 19:28 after 19m 19s")
+        );
+        assert_eq!(
+            summary(
+                &TurnEndFact::ALL,
+                TurnStatus::Canceled,
+                elapsed,
+                &usage,
+                same_day
+            )
+            .as_deref(),
+            Some("Interrupted at 19:28 after 19m 19s with 12.3k tokens in, 1.2k out, 92% cached")
+        );
+        assert_eq!(
+            summary(
+                &[TurnEndFact::Duration, TurnEndFact::Time],
+                TurnStatus::Failed,
+                elapsed,
+                &usage,
+                same_day
+            )
+            .as_deref(),
+            Some("Failed after 19m 19s at 19:28"),
+            "the facts come in the order listed"
+        );
+        assert_eq!(
+            summary(
+                &TurnEndFact::DEFAULT_SUMMARY,
+                TurnStatus::Succeeded,
+                elapsed,
+                &usage,
+                ended + chrono::Duration::days(3)
+            )
+            .as_deref(),
+            Some("Finished on 2026-10-12 at 19:28 after 19m 19s"),
+            "a turn from another day says which"
+        );
+        let nothing = crate::store::turns::TurnUsage::default();
+        assert_eq!(
+            summary(
+                &TurnEndFact::ALL,
+                TurnStatus::Succeeded,
+                None,
+                &nothing,
+                same_day
+            )
+            .as_deref(),
+            Some("Finished at 19:28"),
+            "a duration with no start and a usage of nothing are left out"
+        );
+        assert_eq!(
+            summary(&[], TurnStatus::Succeeded, elapsed, &usage, same_day),
+            None,
+            "nothing listed is no row"
         );
     }
 }

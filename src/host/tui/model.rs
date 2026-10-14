@@ -6,14 +6,19 @@
 //! expanded is view state, kept beside the item rather than in it, so the two global toggles and
 //! a click share one place to read and write.
 
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::{
     checklist::ChecklistItem,
+    config::TurnEndFact,
     conversation::{ContentBlock, Role, ToolResultContent},
     frontend::{FrontendEvent, NoticeLevel},
-    stats::TokenUsage,
-    store::inbox::InboxClass,
+    store::{
+        LogRow,
+        inbox::InboxClass,
+        turns::{TurnRecord, TurnStatus},
+    },
     text::sanitize_stream_text,
 };
 
@@ -23,10 +28,12 @@ use crate::{
 const TOOL_TEXT_KEEP_BYTES: usize = 64 * 1024;
 
 /// What the UI starts from, taken from the config once.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct Settings {
     pub(crate) show_session_id_on_create: bool,
-    pub(crate) show_token_usage: bool,
+    /// `[display].turn_end_summary`: the facts the row that closes a turn states, in order; empty
+    /// for no row.
+    pub(crate) turn_end_summary: Vec<TurnEndFact>,
 }
 
 /// What a call changed on disk, as the tool reported it: the file, what it held before (`None`
@@ -111,7 +118,8 @@ pub(crate) enum Item {
         label: String,
         id: String,
     },
-    Usage(TokenUsage),
+    /// The row that closes a turn: how it ended and the facts `[display].turn_end_summary` lists.
+    TurnEnd(String),
     /// An input image, which the terminal cannot draw.
     Image,
     /// What a session with nothing in its log opens on: meka's version, the profile the session
@@ -187,6 +195,15 @@ struct Page {
     first_row: i64,
     last_row: i64,
     entries: usize,
+    /// The turns of the page's first and last rows, for the turn-end row a join between two pages
+    /// owes when the turn changes there.
+    first_turn: Option<Uuid>,
+    last_turn: Option<Uuid>,
+    /// Whether the page's entries open with the row closing the turn above it, or end with the
+    /// row closing its own last turn: the join between two pages owes one such row, and whichever
+    /// page loads second draws it unless the first already has.
+    starts_with_turn_end: bool,
+    ends_with_turn_end: bool,
 }
 
 /// A tool result a page held without its call, kept for the older page the call is on.
@@ -217,6 +234,13 @@ pub(crate) struct Transcript {
     orphan_results: std::collections::HashMap<String, OrphanResult>,
     tail: Vec<Entry>,
     settings: Settings,
+    /// The recorded turns of the session, by id, for the row that closes each turn on a replay.
+    turn_records: std::collections::HashMap<Uuid, TurnRecord>,
+    /// When the running turn started, for the duration its closing row states.
+    turn_started: Option<DateTime<Utc>>,
+    /// The closing row of a turn that failed or was interrupted, held until the row that says so
+    /// has been drawn, so the two read in that order.
+    pending_turn_end: Option<Item>,
     /// What the thinking toggle last set, and what a new thinking item starts as.
     thinking_shown: bool,
     /// What the tool toggle last set, and what a new tool call starts as.
@@ -241,6 +265,9 @@ impl Transcript {
             orphan_results: std::collections::HashMap::new(),
             tail: Vec::new(),
             settings,
+            turn_records: std::collections::HashMap::new(),
+            turn_started: None,
+            pending_turn_end: None,
             thinking_shown: false,
             tools_expanded: false,
             open_text: None,
@@ -337,7 +364,48 @@ impl Transcript {
     /// positions move when a reload keeps only part of it.
     pub(crate) fn push(&mut self, item: Item) -> u64 {
         let index = self.push_entry(item);
-        self.tail[index].id
+        let id = self.tail[index].id;
+        self.flush_turn_end();
+        id
+    }
+
+    /// Draw the closing row of a turn that failed or was interrupted, if one is still held: after
+    /// the row that says what went wrong, or when the host says the turn is over.
+    pub(crate) fn flush_turn_end(&mut self) {
+        if let Some(item) = self.pending_turn_end.take() {
+            self.close_streams();
+            self.push_entry(item);
+        }
+    }
+
+    /// The session's recorded turns, which close each turn's rows on a replay.
+    pub(crate) fn set_turn_records(&mut self, records: Vec<TurnRecord>) {
+        self.turn_records = records
+            .into_iter()
+            .map(|record| (record.id, record))
+            .collect();
+    }
+
+    /// The row that closes the recorded turn `turn`, or `None` while the turn is still open, when
+    /// its record is unknown, or when the summary is switched off.
+    fn turn_end_entry(&mut self, turn: Uuid) -> Option<Entry> {
+        let record = self.turn_records.get(&turn)?;
+        let status = record.status?;
+        let ended_at = DateTime::parse_from_rfc3339(record.ended_at.as_deref()?)
+            .ok()?
+            .with_timezone(&Utc);
+        let elapsed = DateTime::parse_from_rfc3339(&record.started_at)
+            .ok()
+            .and_then(|started| (ended_at - started.with_timezone(&Utc)).to_std().ok());
+        let text = crate::render::turn_end_summary(
+            &self.settings.turn_end_summary,
+            status,
+            ended_at,
+            elapsed,
+            &record.usage,
+            Utc::now(),
+        )?;
+        Some(self.entry(Item::TurnEnd(text)))
     }
 
     /// Add an item to the tail and return where in the tail it landed, for the streams that
@@ -380,6 +448,9 @@ impl Transcript {
         self.attached = true;
         self.log_end = log_end;
         self.orphan_results.clear();
+        self.turn_records.clear();
+        self.turn_started = None;
+        self.pending_turn_end = None;
         self.tail.retain(|entry| {
             matches!(
                 entry.item,
@@ -420,14 +491,31 @@ impl Transcript {
         let Some((first_row, last_row)) = page_span(&page) else {
             return;
         };
-        let events: Vec<&crate::conversation::Event> =
-            page.rows.iter().map(|row| &row.event).collect();
-        let mut entries = self.build_entries(&events, false);
+        // The first page after a reset is the newest, so its last turn ends with the log.
+        let closes_log = self.pages.is_empty() && self.window.is_empty();
+        let (mut entries, mut ends_with_turn_end) =
+            self.build_entries(&page.rows, false, closes_log);
         self.attach_orphans(&mut entries);
+        let (first_turn, last_turn) = edge_turns(&page);
+        // The join with the page below: a turn that ends where the next page begins closes here,
+        // unless that page already opens with the row.
+        if let Some(below) = self.pages.front()
+            && !below.starts_with_turn_end
+            && let (Some(ended), Some(next)) = (last_turn, below.first_turn)
+            && ended != next
+            && let Some(entry) = self.turn_end_entry(ended)
+        {
+            entries.push(entry);
+            ends_with_turn_end = true;
+        }
         self.pages.push_front(Page {
             first_row,
             last_row,
             entries: entries.len(),
+            first_turn,
+            last_turn,
+            starts_with_turn_end: false,
+            ends_with_turn_end,
         });
         entries.append(&mut self.window);
         self.window = entries;
@@ -450,13 +538,28 @@ impl Transcript {
             self.attached = true;
             return;
         };
-        let events: Vec<&crate::conversation::Event> =
-            page.rows.iter().map(|row| &row.event).collect();
-        let entries = self.build_entries(&events, true);
+        let (mut entries, ends_with_turn_end) = self.build_entries(&page.rows, true, !page.more);
+        let (first_turn, last_turn) = edge_turns(&page);
+        // The join with the page above: the turn its last row belongs to ends here when this
+        // page opens another, unless that page already closes it.
+        let mut starts_with_turn_end = false;
+        if let Some(above) = self.pages.back()
+            && !above.ends_with_turn_end
+            && let (Some(ended), Some(next)) = (above.last_turn, first_turn)
+            && ended != next
+            && let Some(entry) = self.turn_end_entry(ended)
+        {
+            entries.insert(0, entry);
+            starts_with_turn_end = true;
+        }
         self.pages.push_back(Page {
             first_row,
             last_row,
             entries: entries.len(),
+            first_turn,
+            last_turn,
+            starts_with_turn_end,
+            ends_with_turn_end,
         });
         self.window.extend(entries);
         if !page.more {
@@ -721,12 +824,36 @@ impl Transcript {
                     });
                 }
             }
-            FrontendEvent::TurnStarted { .. } | FrontendEvent::TurnFinished => {
+            FrontendEvent::TurnStarted { .. } => {
+                self.flush_turn_end();
+                self.turn_started = Some(Utc::now());
                 self.close_streams();
             }
-            // The host reports how a turn ended from the result it holds; the event is for a
-            // frontend with no result in hand.
-            FrontendEvent::TurnEnded { .. } => {}
+            FrontendEvent::TurnFinished => self.close_streams(),
+            // The turn's closing row. A turn that succeeded closes at once; one that failed or was
+            // interrupted waits for the host's row saying so, which follows this event.
+            FrontendEvent::TurnEnded { ending, .. } => {
+                let ended_at = Utc::now();
+                let elapsed = self
+                    .turn_started
+                    .take()
+                    .and_then(|started| (ended_at - started).to_std().ok());
+                if let Some(text) = crate::render::turn_end_summary(
+                    &self.settings.turn_end_summary,
+                    ending.status,
+                    ended_at,
+                    elapsed,
+                    &ending.usage,
+                    ended_at,
+                ) {
+                    if matches!(ending.status, TurnStatus::Succeeded) {
+                        self.close_streams();
+                        self.push_entry(Item::TurnEnd(text));
+                    } else {
+                        self.pending_turn_end = Some(Item::TurnEnd(text));
+                    }
+                }
+            }
             // A typed prompt is never withdrawn here, and a scheduled fire's withdrawal is the
             // schedule's own bookkeeping.
             FrontendEvent::PromptWithdrawn => {}
@@ -922,12 +1049,8 @@ impl Transcript {
                     self.touch(index);
                 }
             }
-            FrontendEvent::TokenUsage(usage) => {
-                if self.settings.show_token_usage && !usage.is_empty() {
-                    self.close_streams();
-                    self.push(Item::Usage(usage));
-                }
-            }
+            // The turn's usage reaches the screen with its ending.
+            FrontendEvent::TokenUsage(_) => {}
             // A stage direction and an advisory are one register on the screen; the level is
             // what tells a warning from a note.
             FrontendEvent::Notice(notice) => {
@@ -986,17 +1109,32 @@ impl Transcript {
     /// window cannot owe one to it, and a repeated call id must not take a newer call's result.
     fn build_entries(
         &mut self,
-        events: &[&crate::conversation::Event],
+        rows: &[LogRow],
         window_holds_older: bool,
-    ) -> Vec<Entry> {
+        closes_log: bool,
+    ) -> (Vec<Entry>, bool) {
         use crate::conversation::Event;
         let mut out: Vec<Entry> = Vec::new();
+        // The turn of the last row that named one: a turn ends where the next row names another,
+        // and the last turn of the log ends with the log. A row naming no turn, written before
+        // turns were recorded, changes nothing.
+        let mut turn: Option<Uuid> = None;
         let find_call = |out: &[Entry], id: &str| {
             out.iter().rposition(
                 |entry| matches!(&entry.item, Item::ToolCall { id: call, .. } if call == id),
             )
         };
-        for event in events {
+        for row in rows {
+            if let (Some(ended), Some(next)) = (turn, row.turn_id)
+                && ended != next
+                && let Some(entry) = self.turn_end_entry(ended)
+            {
+                out.push(entry);
+            }
+            if row.turn_id.is_some() {
+                turn = row.turn_id;
+            }
+            let event = &row.event;
             let message = match event {
                 Event::Append(message) => message,
                 Event::CompactBoundary { .. } => {
@@ -1161,13 +1299,29 @@ impl Transcript {
                 }
             }
         }
-        out
+        let mut ends_with_turn_end = false;
+        if closes_log
+            && let Some(ended) = turn
+            && let Some(entry) = self.turn_end_entry(ended)
+        {
+            out.push(entry);
+            ends_with_turn_end = true;
+        }
+        (out, ends_with_turn_end)
     }
 }
 
 /// The rows a page spans, or `None` for an empty one.
 fn page_span(page: &crate::store::LogPage) -> Option<(i64, i64)> {
     Some((page.rows.first()?.id, page.rows.last()?.id))
+}
+
+/// The turns of a page's first and last rows that name one.
+fn edge_turns(page: &crate::store::LogPage) -> (Option<Uuid>, Option<Uuid>) {
+    (
+        page.rows.iter().find_map(|row| row.turn_id),
+        page.rows.iter().rev().find_map(|row| row.turn_id),
+    )
 }
 
 /// The readable part of a tool result, tail-capped, and how many images it carried.
@@ -1228,7 +1382,7 @@ mod tests {
     fn transcript() -> Transcript {
         Transcript::new(Settings {
             show_session_id_on_create: false,
-            show_token_usage: false,
+            turn_end_summary: TurnEndFact::DEFAULT_SUMMARY.to_vec(),
         })
     }
 
@@ -1243,6 +1397,7 @@ mod tests {
                 .enumerate()
                 .map(|(offset, event)| LogRow {
                     id: first_row + offset as i64,
+                    turn_id: None,
                     event,
                 })
                 .collect(),
@@ -1783,6 +1938,303 @@ mod tests {
                 .any(|item| matches!(item, Item::Banner { .. })),
             "a page of the log is a conversation: {:#?}",
             items(&resumed)
+        );
+    }
+
+    fn with_summary(facts: Vec<TurnEndFact>) -> Transcript {
+        Transcript::new(Settings {
+            show_session_id_on_create: false,
+            turn_end_summary: facts,
+        })
+    }
+
+    fn asked(words: &str) -> Event {
+        Event::Append(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: words.to_string(),
+            }],
+        })
+    }
+
+    /// A page whose rows name their turns, with the ids `ids` gives them.
+    fn in_turns(rows: Vec<(Uuid, Event)>, ids: &[i64], more: bool) -> LogPage {
+        LogPage {
+            rows: rows
+                .into_iter()
+                .zip(ids)
+                .map(|((turn, event), id)| LogRow {
+                    id: *id,
+                    turn_id: Some(turn),
+                    event,
+                })
+                .collect(),
+            more,
+        }
+    }
+
+    fn closed_turn(id: Uuid, status: TurnStatus) -> TurnRecord {
+        TurnRecord {
+            id,
+            source: "screen".to_string(),
+            started_at: "2026-10-12T12:00:00+00:00".to_string(),
+            ended_at: Some("2026-10-12T12:19:19+00:00".to_string()),
+            status: Some(status),
+            stop_reason: None,
+            error: None,
+            usage: crate::store::turns::TurnUsage::default(),
+        }
+    }
+
+    fn kinds(transcript: &Transcript) -> Vec<&'static str> {
+        transcript
+            .drawn()
+            .map(|entry| match &entry.item {
+                Item::Prompt { .. } => "prompt",
+                Item::Text { .. } => "text",
+                Item::TurnEnd(_) => "end",
+                Item::Notice { .. } => "note",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    fn turn_end_texts(transcript: &Transcript) -> Vec<String> {
+        transcript
+            .drawn()
+            .filter_map(|entry| match &entry.item {
+                Item::TurnEnd(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A turn that succeeded closes at once with the facts the summary lists, in their order.
+    #[test]
+    fn a_turn_closes_with_the_row_its_summary_lists() {
+        let mut transcript = with_summary(TurnEndFact::ALL.to_vec());
+        let turn = Uuid::new_v4();
+        transcript.apply(FrontendEvent::TurnStarted { turn_id: turn });
+        transcript.apply(FrontendEvent::AssistantTextDelta("Done.".into()));
+        transcript.apply(FrontendEvent::TurnFinished);
+        transcript.apply(FrontendEvent::TurnEnded {
+            turn_id: turn,
+            ending: crate::store::turns::TurnEnding::succeeded(
+                "end_turn",
+                crate::store::turns::TurnUsage {
+                    input_tokens: 1000,
+                    output_tokens: 200,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 500,
+                },
+            ),
+        });
+        assert_eq!(kinds(&transcript), vec!["text", "end"]);
+        let text = &turn_end_texts(&transcript)[0];
+        assert!(text.starts_with("Finished at "), "{text}");
+        assert!(text.contains(" after "), "{text}");
+        assert!(text.ends_with("tokens in, 200 out, 33% cached"), "{text}");
+    }
+
+    /// A turn that was interrupted or failed closes after the row that says so, which the host
+    /// draws once the agent has returned, or when the host says the turn is over.
+    #[test]
+    fn an_interrupted_turn_s_row_follows_the_one_that_says_so() {
+        let mut transcript = with_summary(TurnEndFact::DEFAULT_SUMMARY.to_vec());
+        let turn = Uuid::new_v4();
+        transcript.apply(FrontendEvent::TurnStarted { turn_id: turn });
+        transcript.apply(FrontendEvent::AssistantTextDelta("Half an".into()));
+        transcript.apply(FrontendEvent::TurnEnded {
+            turn_id: turn,
+            ending: crate::store::turns::TurnEnding::canceled(
+                crate::store::turns::TurnUsage::default(),
+            ),
+        });
+        assert_eq!(
+            kinds(&transcript),
+            vec!["text"],
+            "held until the host has spoken"
+        );
+        transcript.push(Item::interrupted());
+        assert_eq!(kinds(&transcript), vec!["text", "note", "end"]);
+        assert!(
+            turn_end_texts(&transcript)[0].starts_with("Interrupted at "),
+            "{:?}",
+            turn_end_texts(&transcript)
+        );
+
+        let mut quiet = with_summary(TurnEndFact::DEFAULT_SUMMARY.to_vec());
+        quiet.apply(FrontendEvent::TurnStarted { turn_id: turn });
+        quiet.apply(FrontendEvent::TurnEnded {
+            turn_id: turn,
+            ending: crate::store::turns::TurnEnding::failed(
+                &crate::error::MekaError::Interrupted,
+                crate::store::turns::TurnUsage::default(),
+            ),
+        });
+        quiet.flush_turn_end();
+        assert_eq!(kinds(&quiet), vec!["end"]);
+        assert!(turn_end_texts(&quiet)[0].starts_with("Failed at "));
+        quiet.flush_turn_end();
+        assert_eq!(kinds(&quiet), vec!["end"], "flushing twice draws once");
+    }
+
+    #[test]
+    fn no_summary_listed_is_no_row() {
+        let mut transcript = with_summary(Vec::new());
+        let turn = Uuid::new_v4();
+        transcript.apply(FrontendEvent::TurnStarted { turn_id: turn });
+        transcript.apply(FrontendEvent::AssistantTextDelta("Done.".into()));
+        transcript.apply(FrontendEvent::TurnEnded {
+            turn_id: turn,
+            ending: crate::store::turns::TurnEnding::succeeded(
+                "end_turn",
+                crate::store::turns::TurnUsage::default(),
+            ),
+        });
+        assert_eq!(kinds(&transcript), vec!["text"]);
+    }
+
+    /// On a replay each recorded turn closes where its rows end: inside a page where the next
+    /// turn's rows begin, and at the log's end for the last one. A turn still open or unknown
+    /// closes nothing.
+    #[test]
+    fn a_replayed_turn_closes_where_its_rows_end() {
+        let (first, second, open, unknown) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let mut transcript = with_summary(TurnEndFact::DEFAULT_SUMMARY.to_vec());
+        let mut never_closed = closed_turn(open, TurnStatus::Succeeded);
+        never_closed.ended_at = None;
+        never_closed.status = None;
+        transcript.set_turn_records(vec![
+            closed_turn(first, TurnStatus::Succeeded),
+            closed_turn(second, TurnStatus::Canceled),
+            never_closed,
+        ]);
+        transcript.load_page_above(in_turns(
+            vec![
+                (first, asked("one?")),
+                (first, said("One.")),
+                (second, asked("two?")),
+                (second, said("Tw")),
+                (open, asked("three?")),
+                (open, said("Three.")),
+                (unknown, asked("four?")),
+                (unknown, said("Four.")),
+            ],
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            false,
+        ));
+        assert_eq!(kinds(&transcript), vec![
+            "prompt", "text", "end", "prompt", "text", "end", "prompt", "text", "prompt", "text"
+        ]);
+        let texts = turn_end_texts(&transcript);
+        assert!(
+            texts[0].starts_with("Finished on 2026-10-1") && texts[0].ends_with("after 19m 19s"),
+            "{texts:?}"
+        );
+        assert!(
+            texts[1].starts_with("Interrupted on 2026-10-1"),
+            "{texts:?}"
+        );
+    }
+
+    /// A turn whose rows cross a page boundary closes once, where its rows end, whichever page
+    /// loads first; a turn that ends exactly at a boundary closes at the join.
+    #[test]
+    fn a_turn_across_two_pages_closes_once() {
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let records = || {
+            vec![
+                closed_turn(first, TurnStatus::Succeeded),
+                closed_turn(second, TurnStatus::Succeeded),
+            ]
+        };
+        // The second turn's rows straddle the pages.
+        let mut straddling = with_summary(TurnEndFact::DEFAULT_SUMMARY.to_vec());
+        straddling.set_turn_records(records());
+        straddling.load_page_above(in_turns(vec![(second, said("rest."))], &[5], true));
+        straddling.load_page_above(in_turns(
+            vec![
+                (first, asked("one?")),
+                (first, said("One.")),
+                (second, asked("two?")),
+                (second, said("The first part and the ")),
+            ],
+            &[1, 2, 3, 4],
+            false,
+        ));
+        assert_eq!(kinds(&straddling), vec![
+            "prompt", "text", "end", "prompt", "text", "text", "end"
+        ]);
+        // The first turn ends exactly where the newer page begins.
+        let mut at_the_join = with_summary(TurnEndFact::DEFAULT_SUMMARY.to_vec());
+        at_the_join.set_turn_records(records());
+        at_the_join.load_page_above(in_turns(
+            vec![(second, asked("two?")), (second, said("Two."))],
+            &[3, 4],
+            true,
+        ));
+        at_the_join.load_page_above(in_turns(
+            vec![(first, asked("one?")), (first, said("One."))],
+            &[1, 2],
+            false,
+        ));
+        assert_eq!(kinds(&at_the_join), vec![
+            "prompt", "text", "end", "prompt", "text", "end"
+        ]);
+    }
+
+    /// A page dropped from the window's end and read back below it finds the join's closing row
+    /// already drawn by the page above, and draws it no second time. Three pages, because two
+    /// that do not fit the window together can never meet in it.
+    #[test]
+    fn a_page_read_back_below_the_window_does_not_close_a_turn_twice() {
+        let (zero, first, second) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut transcript = with_summary(TurnEndFact::DEFAULT_SUMMARY.to_vec());
+        transcript.set_turn_records(vec![
+            closed_turn(zero, TurnStatus::Succeeded),
+            closed_turn(first, TurnStatus::Succeeded),
+            closed_turn(second, TurnStatus::Canceled),
+        ]);
+        let newest = || {
+            in_turns(
+                vec![(second, asked("two?")), (second, said("Two."))],
+                &[1500, 1501],
+                true,
+            )
+        };
+        transcript.load_page_above(newest());
+        transcript.load_page_above(in_turns(
+            vec![(first, asked("one?")), (first, said("One."))],
+            &[1000, 1001],
+            true,
+        ));
+        // Wide enough in row ids to push the newest page out of the window.
+        transcript.load_page_above(in_turns(
+            vec![(zero, asked("zero?")), (zero, said("Zero."))],
+            &[1, 1998],
+            false,
+        ));
+        assert_eq!(
+            kinds(&transcript),
+            vec!["prompt", "text", "end", "prompt", "text", "end"],
+            "the newest page is out and the middle one still closes its turn at the join"
+        );
+        let mut back = newest();
+        back.more = false;
+        transcript.load_page_below(back);
+        assert_eq!(kinds(&transcript), vec![
+            "prompt", "text", "end", "prompt", "text", "end"
+        ]);
+        let texts = turn_end_texts(&transcript);
+        assert!(
+            texts[0].starts_with("Finished") && texts[1].starts_with("Interrupted"),
+            "the oldest page went, the middle one kept its row and the newest closed itself: {texts:?}"
         );
     }
 }
