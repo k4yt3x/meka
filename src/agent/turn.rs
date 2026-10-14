@@ -611,7 +611,7 @@ impl Agent {
                 manager
                     .server_instructions()
                     .into_iter()
-                    .filter(|(server, _)| !self.tool_registry.denials().denies_server(server))
+                    .filter(|(server, _)| self.tool_registry.tool_scope().admits_server(server))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();

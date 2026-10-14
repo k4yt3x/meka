@@ -69,7 +69,7 @@ pub(crate) fn warn_on_stale_tool_config(
 ) {
     crate::tools::warn_on_stale_builtin_tool_config(builtin_filter);
     crate::tools::warn_on_stale_subagent_config(
-        &crate::tools::ToolDenials::new(
+        &crate::tools::ToolScope::new(
             config.subagents.disabled_servers.clone(),
             config.subagents.disabled_tools.clone(),
         ),

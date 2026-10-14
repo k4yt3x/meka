@@ -418,8 +418,9 @@ every existing session. Prefer getting it right at introduction. When renaming a
 `**Breaking:**` changelog line and update `BUILTIN_TOOL_NAMES` (sorted), `MCP_META_TOOL_NAMES`, and
 `builtin_primary_param` in `src/tools.rs`. A tool is shown by its real name on every surface, the
 way MCP tools are; there is no display alias to update. A rename also reaches stored data: the
-calls in every session's history, the `denied_tools` of every sub-agent spec, the tool on every
-background task row, and every archive an older build wrote. Each takes a ledger step and an entry
+calls in every session's history, the `denied_tools` and `allowed_tools` of every sub-agent spec,
+the tool on every background task row, and every archive an older build wrote. Each takes a ledger
+step and an entry
 in the migration module's archive conversion (`bring_archive_forward`), the one place that may know
 an older name; the active tool set is recovered by scanning history for `tool_load` calls by name,
 so that step is what keeps a resumed session's loaded tools. One

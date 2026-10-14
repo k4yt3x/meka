@@ -137,8 +137,8 @@ pub(crate) async fn install_on_worker_registry(
         // Skip the round trip entirely rather than discovering and then filtering: a denied
         // server should not even be listed, and `list_all_tools` on a server the worker cannot
         // use is latency the spawn pays for nothing.
-        if registry.denials().denies_server(&name) {
-            tracing::info!("MCP server '{name}' denied for sub-agent registry");
+        if !registry.tool_scope().admits_server(&name) {
+            tracing::info!("MCP server '{name}' is outside the sub-agent's tool scope");
             continue;
         }
         let tools = match manager.discover_server_tools(&name).await {

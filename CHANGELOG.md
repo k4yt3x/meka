@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `agent_spawn` takes `readable_roots`: directories a sub-agent may read but not write.
 - `readable_roots` confines a sub-agent's reads even with `confine_reads` off; `[]` is refused.
 - A sub-agent handed `readable_roots` runs at `workspace` unless its call asks for less.
+- `agent_spawn` takes `allow_servers` and `allow_tools`: the sub-agent sees only those; deny wins.
 - Skill roots from `[skills].extra_paths` stay readable where reads are confined.
 - The context block names the readable roots when reads are confined.
 

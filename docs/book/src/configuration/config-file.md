@@ -1056,7 +1056,7 @@ disabled_tools = ["mcp__notion__create_page"]
 
 An entry matching nothing emits a `warn!` at startup, the same way `[tools]` does. A typo here denies nothing while reading as a restriction, which is worse than writing no config at all.
 
-These are floors. An orchestrator can restrict a particular sub-agent further with `agent_spawn`'s `deny_servers` / `deny_tools` parameters, and each level of nesting inherits everything above it, but nothing can grant back what this block took away. There is deliberately no call-site allow-list for that reason.
+These are floors. An orchestrator can restrict a particular sub-agent further with `agent_spawn`'s `allow_servers`, `allow_tools`, `deny_servers` and `deny_tools` parameters, and each level of nesting inherits everything above it, but nothing can grant back what this block took away: a call-site allow-list only narrows, and a tool named here is withheld whatever an allow-list says.
 
 `agent_chosen_profile = true` lets an orchestrator run a sub-agent on a profile other than its own: `agent_spawn` gains a `profile` parameter whose choices are every configured profile, so a mid-tier model can dispatch hard tasks to an expensive one and trivial ones to a cheap one. It is off by default because a sub-agent then bills whatever account the chosen profile names, and that is a decision to make once, in the config, rather than one the model makes on every spawn. The agent only sees profile names, so say in your [standing instructions](../usage/instructions.md) what each profile is for. A sub-agent spawned with a `profile` keeps it on every follow-up; one spawned without follows its parent's profile.
 

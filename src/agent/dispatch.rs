@@ -194,7 +194,7 @@ impl Agent {
             // Denied names are excluded: the explanation names the server and its state, so
             // offering it to a worker whose denial is meant to make that server invisible would
             // confirm the server exists and let the worker enumerate the rest by guessing.
-            if !self.tool_registry.denials().denies_tool(name)
+            if self.tool_registry.tool_scope().admits_tool(name)
                 && let Some(manager) = self.tool_registry.mcp_manager()
                 && let Some(reason) = manager.unavailable_tool_reason(name).await
             {

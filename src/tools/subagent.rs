@@ -6,7 +6,7 @@ use std::{path::PathBuf, sync::Arc};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use super::{Tool, ToolDenials, ToolOutput, ToolRegistry};
+use super::{Tool, ToolOutput, ToolRegistry, ToolScope};
 use crate::{
     agent::Agent,
     config::{BuiltinToolFilter, InstructionAccess, MemoryAccess},
@@ -52,7 +52,7 @@ pub(crate) struct ToolBuilderParams {
     /// a denial and resumes a session would find their existing workers still reaching what
     /// they just took away. Restrictions are combined, never replaced, so this can only ever
     /// narrow.
-    pub(crate) config_denials: ToolDenials,
+    pub(crate) config_scope: ToolScope,
     /// The spawning agent's options, from which a worker inherits `sandboxed_shell` and the
     /// auto-compaction settings inside [`Agent::new_subagent`]. `user_instructions` is
     /// deliberately *not* among them; see [`build_subagent_system_prompt`].
@@ -90,6 +90,13 @@ pub(crate) struct SubagentSpec {
     pub(crate) denied_servers: Vec<String>,
     #[serde(default)]
     pub(crate) denied_tools: Vec<String>,
+    /// The allow-lists in force, sorted, or `None` for a side the spawn left unrestricted: the
+    /// one reading of an absent field that does not strip every worker spawned before the field
+    /// existed, and safe because an allow-list only ever narrows what the deny lists leave.
+    #[serde(default)]
+    pub(crate) allowed_servers: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) allowed_tools: Option<Vec<String>>,
     /// A spec that somehow lacks the field costs the worker its memory tools rather than handing
     /// it the store. [`MemoryAccess`] has no `Default` for the same reason: the only sensible one
     /// would be `Write`, which is the root agent's level and the wrong answer everywhere else.
@@ -141,8 +148,9 @@ impl SubagentSpec {
         self.profile.is_some()
     }
 
-    fn denials(&self) -> ToolDenials {
-        ToolDenials::new(self.denied_servers.clone(), self.denied_tools.clone())
+    fn tool_scope(&self) -> ToolScope {
+        ToolScope::new(self.denied_servers.clone(), self.denied_tools.clone())
+            .allowing(self.allowed_servers.clone(), self.allowed_tools.clone())
     }
 
     /// The worker's `SharedPermission`, clamped to `ceiling` on top of what the spec recorded.
@@ -230,7 +238,7 @@ pub(crate) struct AgentSpawnTool {
     /// Carried on the tool rather than looked up per call because it has to accumulate: a worker
     /// that could spawn a grandchild free of its own denials would make every restriction one
     /// `agent_spawn` deep.
-    pub(crate) inherited_denials: ToolDenials,
+    pub(crate) inherited_scope: ToolScope,
     /// Soft, agent-tunable recursion budget for sub-agents spawned by this tool. The root tool is
     /// seeded from `session.subagent_max_depth`; each level hands the child `remaining_depth - 1`
     /// unless the caller overrides it via the `max_depth` param. A nested `agent_spawn` is granted
@@ -349,6 +357,27 @@ pub(crate) fn agent_spawn_definition(
                 "enum": ["none", "inherit"],
                 "default": "none",
                 "description": "Pass `inherit` when the task needs the installation's standing rules. Default: none; task-specific constraints still belong in `prompt`."
+            },
+            "allow_servers": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "MCP server names the sub-agent may see, and no other: a \
+                                server outside the list is withheld whole, its tools, its \
+                                resources and its prompts. Built-in tools are unaffected. \
+                                A server `deny_servers` names is withheld even if listed \
+                                here. An empty list is refused; omit it to withhold no \
+                                server."
+            },
+            "allow_tools": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Exactly the tools the sub-agent sees, by name as they appear \
+                                in your own tool list (e.g. \"file_read\", \
+                                \"mcp__notion__search\"); every other tool, built-in or MCP, \
+                                is withheld. Prefer it to a long `deny_tools` when the task \
+                                needs a few tools. A tool `deny_tools` names, or one from a \
+                                server outside `allow_servers`, is withheld even if listed \
+                                here. An empty list is refused; omit it to withhold no tool."
             },
             "deny_servers": {
                 "type": "array",
@@ -590,31 +619,77 @@ impl Tool for AgentSpawnTool {
             parent_level,
         );
 
-        // Union, never replace: the call site adds to what config (and, when nested, this agent's
-        // own parent) already denied. There is deliberately no allow-list parameter, because one
-        // would let a parent hand a worker something the installation took away.
-        let call_site_denials = ToolDenials::new(
-            string_array(&input, "deny_servers", "agent_spawn")?,
-            string_array(&input, "deny_tools", "agent_spawn")?,
-        );
-        // A name that matches nothing denies nothing, and the model gets no signal either way: it
-        // asked for a sandboxed worker and would receive an unsandboxed one believing otherwise.
-        // Warned rather than refused, because "deny it if it is there" is a legitimate thing to
-        // write against a server list that varies by machine.
-        if let Some(weak) = self.tool_builder_params.materials.mcp_manager.as_ref()
-            && let Some(manager) = weak.upgrade()
-        {
-            let configured = manager.server_names();
-            for name in call_site_denials.server_list() {
-                if !configured.contains(&name) {
-                    tracing::warn!(
-                        "agent_spawn deny_servers entry '{name}' matches no configured MCP server, so \
-                         it denies nothing"
-                    );
+        // Narrow, never replace: the call site's allow-lists intersect with, and its deny lists
+        // add to, what config (and, when nested, this agent's own parent) already set, so neither
+        // kind of list can hand a worker something the installation or an ancestor took away. An
+        // allow-list is a present list accepted whole or refused whole: `[]` is refused rather
+        // than read as "everything", which is what config reads an empty one as, or as "nothing",
+        // which a model emitting `[]` for "nothing to add" never meant.
+        let allow_list = |key: &'static str, noun: &str| -> Result<Option<Vec<String>>> {
+            match input.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(_) => {
+                    let names = string_array(&input, key, "agent_spawn")?;
+                    if names.is_empty() {
+                        return Err(MekaError::ToolExecution {
+                            tool_name: "agent_spawn".to_string(),
+                            message: format!(
+                                "{key} names no {noun}; leave it out to withhold none"
+                            ),
+                        });
+                    }
+                    Ok(Some(names))
                 }
             }
+        };
+        let call_site_scope = ToolScope::new(
+            string_array(&input, "deny_servers", "agent_spawn")?,
+            string_array(&input, "deny_tools", "agent_spawn")?,
+        )
+        .allowing(
+            allow_list("allow_servers", "server")?,
+            allow_list("allow_tools", "tool")?,
+        );
+        // A name that matches nothing restricts nothing, and the model gets no signal either way:
+        // it asked for a narrowed worker and would receive a wider one believing otherwise. Warned
+        // rather than refused, because "deny it if it is there" is a legitimate thing to write
+        // against a server list that varies by machine.
+        // With no MCP manager attached no server is configured, so every namespaced name is stale
+        // and a built-in name is still checked against the built-ins.
+        let configured_servers = self
+            .tool_builder_params
+            .materials
+            .mcp_manager
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .map(|manager| manager.server_names())
+            .unwrap_or_default();
+        {
+            for (list, name) in
+                super::registry::stale_scope_entries(&call_site_scope, &configured_servers)
+            {
+                let (key, what) = match list {
+                    super::registry::ScopeList::AllowedServers => {
+                        ("allow_servers", "no configured MCP server")
+                    }
+                    super::registry::ScopeList::DeniedServers => {
+                        ("deny_servers", "no configured MCP server")
+                    }
+                    super::registry::ScopeList::AllowedTools => (
+                        "allow_tools",
+                        "no built-in tool and no configured MCP server",
+                    ),
+                    super::registry::ScopeList::DeniedTools => (
+                        "deny_tools",
+                        "no built-in tool and no configured MCP server",
+                    ),
+                };
+                tracing::warn!(
+                    "agent_spawn {key} entry '{name}' matches {what}, so it restricts nothing"
+                );
+            }
         }
-        let effective_denials = self.inherited_denials.union(&call_site_denials);
+        let effective_scope = self.inherited_scope.narrow(&call_site_scope);
 
         // Context grants. Both default to nothing and are clamped against what this agent itself
         // holds, so a worker can never hand a grandchild more than it was given. Unlike the deny
@@ -766,8 +841,10 @@ impl Tool for AgentSpawnTool {
             )
             .iter()
             .collect(),
-            denied_servers: effective_denials.server_list(),
-            denied_tools: effective_denials.tool_list(),
+            denied_servers: effective_scope.denied_server_list(),
+            denied_tools: effective_scope.denied_tool_list(),
+            allowed_servers: effective_scope.allowed_server_list(),
+            allowed_tools: effective_scope.allowed_tool_list(),
             memory: memory_access,
             instructions,
             inherited_scratchpad: inherited_scratchpad.clone(),
@@ -1393,12 +1470,15 @@ impl Drop for FollowupGuard {
 /// carries everything config has no opinion about.
 fn combined_for_followup(
     spec: SubagentSpec,
-    config_denials: &ToolDenials,
+    config_scope: &ToolScope,
     memory_access: MemoryAccess,
 ) -> SubagentSpec {
+    let scope = spec.tool_scope().narrow(config_scope);
     SubagentSpec {
-        denied_servers: spec.denials().union(config_denials).server_list(),
-        denied_tools: spec.denials().union(config_denials).tool_list(),
+        denied_servers: scope.denied_server_list(),
+        denied_tools: scope.denied_tool_list(),
+        allowed_servers: scope.allowed_server_list(),
+        allowed_tools: scope.allowed_tool_list(),
         memory: spec.memory.min(memory_access),
         ..spec
     }
@@ -1511,7 +1591,7 @@ impl Tool for AgentFollowupTool {
         // Both combines take the more restrictive side, so neither can widen the worker.
         let spec = combined_for_followup(
             spec,
-            &self.tool_builder_params.config_denials,
+            &self.tool_builder_params.config_scope,
             self.tool_builder_params.memory_access,
         );
 
@@ -1954,7 +2034,7 @@ async fn build_subagent(
     // worker talk to a 32k profile while auto-compacting against the 1M one the session had left.
     let parent_options = params.parent_options.clone();
     let sub_shared_perm = spec.shared_permission_bounded(parent_permission);
-    let denials = spec.denials();
+    let tool_scope = spec.tool_scope();
     // Resolved once: it feeds both this worker's system prompt and what its own children can be
     // given. `None` here is what makes nesting self-enforcing: a worker that was not granted the
     // instructions has no copy to pass on, so the restriction propagates through the data rather
@@ -2013,7 +2093,7 @@ async fn build_subagent(
         &params.materials,
         &sub_cells,
         super::registry::RegistryScope {
-            denials: denials.clone(),
+            tool_scope: tool_scope.clone(),
             memory_access,
             parent_session_id: if spec.inherited_scratchpad.is_empty() {
                 None
@@ -2073,7 +2153,7 @@ async fn build_subagent(
             // children up to its parent's level rather than its own, reaching through a child
             // what it was denied directly. The deny lists come from `spec` for the same reason.
             memory_access,
-            config_denials: params.config_denials.clone(),
+            config_scope: params.config_scope.clone(),
             // Both ceilings for whatever this worker spawns in turn. `parent_options` carries the
             // instruction text, so overwriting it with the grant is what stops a worker handing a
             // grandchild something it was not given itself.
@@ -2087,7 +2167,7 @@ async fn build_subagent(
             // so a downgrade the parent made reaches the whole subtree.
             parent_permission: sub_shared_perm.clone(),
             tool_builder_params: child_params,
-            inherited_denials: denials,
+            inherited_scope: tool_scope,
             remaining_depth: spec.remaining_depth,
             absolute_depth: spec.absolute_depth,
         })?;
@@ -2416,6 +2496,8 @@ mod tests {
             enabled_permissions: Vec::new(),
             denied_servers: Vec::new(),
             denied_tools: Vec::new(),
+            allowed_servers: None,
+            allowed_tools: None,
             memory: MemoryAccess::None,
             instructions: InstructionAccess::None,
             inherited_scratchpad: Vec::new(),
@@ -2490,6 +2572,8 @@ mod tests {
                     .collect(),
                 denied_servers: Vec::new(),
                 denied_tools: Vec::new(),
+                allowed_servers: None,
+                allowed_tools: None,
                 memory: MemoryAccess::None,
                 instructions: InstructionAccess::None,
                 inherited_scratchpad: Vec::new(),
@@ -2754,7 +2838,7 @@ mod tests {
                 )
             },
             crate::tools::registry::RegistryScope {
-                denials: ToolDenials::default(),
+                tool_scope: ToolScope::default(),
                 memory_access: MemoryAccess::Write,
                 parent_session_id: None,
                 inherited_scratchpad_names: Vec::new(),
@@ -2819,7 +2903,7 @@ mod tests {
                 Arc::new(crate::frontend::SilentFrontend),
             ),
             crate::tools::registry::RegistryScope {
-                denials: ToolDenials::default(),
+                tool_scope: ToolScope::default(),
                 memory_access: MemoryAccess::Write,
                 parent_session_id: None,
                 inherited_scratchpad_names: Vec::new(),
@@ -2847,6 +2931,8 @@ mod tests {
             enabled_permissions: vec![Permission::None, permission],
             denied_servers: vec!["mekabridge".to_string()],
             denied_tools: vec!["file_write".to_string()],
+            allowed_servers: None,
+            allowed_tools: None,
             memory: MemoryAccess::None,
             instructions: InstructionAccess::Inherit,
             inherited_scratchpad: vec!["build_log".to_string()],
@@ -3053,11 +3139,19 @@ mod tests {
 
     #[test]
     fn spec_denials_reconstruct_both_lists() {
-        let denials = spec_for_test(Permission::Read).denials();
-        assert!(denials.denies_server("mekabridge"));
-        assert!(denials.denies_tool("mcp__mekabridge__send_message"));
-        assert!(denials.denies_tool("file_write"));
-        assert!(!denials.denies_tool("file_read"));
+        let tool_scope = spec_for_test(Permission::Read).tool_scope();
+        assert!(!tool_scope.admits_server("mekabridge"));
+        assert!(!tool_scope.admits_tool("mcp__mekabridge__send_message"));
+        assert!(!tool_scope.admits_tool("file_write"));
+        assert!(tool_scope.admits_tool("file_read"));
+        let allowed = SubagentSpec {
+            allowed_servers: Some(vec!["notion".to_string()]),
+            allowed_tools: Some(vec!["file_read".to_string()]),
+            ..spec_for_test(Permission::Read)
+        }
+        .tool_scope();
+        assert!(allowed.admits_tool("file_read") && !allowed.admits_tool("file_find"));
+        assert!(allowed.admits_server("notion") && !allowed.admits_server("linear"));
     }
 
     /// A published profile wrapping one provider, for a test that does not care about the profile.
@@ -3114,7 +3208,7 @@ mod tests {
             cells,
             // A root agent: holds the whole store, and has instructions it could pass on.
             memory_access: MemoryAccess::Write,
-            config_denials: ToolDenials::default(),
+            config_scope: ToolScope::default(),
             parent_options: AgentOptions {
                 one_shot: false,
                 streaming: false,
@@ -3230,7 +3324,7 @@ mod tests {
                 EnabledPermissions::ALL,
             ),
             tool_builder_params: params.clone().on_provider(Arc::clone(&provider)),
-            inherited_denials: ToolDenials::default(),
+            inherited_scope: ToolScope::default(),
             remaining_depth: 1,
             absolute_depth: 0,
         };
@@ -3389,6 +3483,8 @@ mod tests {
             enabled_permissions: vec![Permission::Read],
             denied_servers: Vec::new(),
             denied_tools: Vec::new(),
+            allowed_servers: None,
+            allowed_tools: None,
             memory: MemoryAccess::None,
             instructions: InstructionAccess::None,
             inherited_scratchpad: Vec::new(),
@@ -3454,6 +3550,8 @@ mod tests {
             enabled_permissions: vec![Permission::Read],
             denied_servers: Vec::new(),
             denied_tools: Vec::new(),
+            allowed_servers: None,
+            allowed_tools: None,
             memory: MemoryAccess::None,
             instructions: InstructionAccess::None,
             inherited_scratchpad: Vec::new(),
@@ -3554,6 +3652,8 @@ mod tests {
             enabled_permissions: vec![Permission::Read, Permission::Unrestricted],
             denied_servers: Vec::new(),
             denied_tools: Vec::new(),
+            allowed_servers: None,
+            allowed_tools: None,
             memory: MemoryAccess::Write,
             instructions: InstructionAccess::None,
             inherited_scratchpad: Vec::new(),
@@ -3635,7 +3735,7 @@ mod tests {
             crate::session::SharedSessionId::new(Some(parent_sid)),
         );
         // Config now denies a server and all memory access; the spec predates both.
-        params.config_denials = ToolDenials::new(vec!["mekabridge".to_string()], Vec::new());
+        params.config_scope = ToolScope::new(vec!["mekabridge".to_string()], Vec::new());
         params.memory_access = MemoryAccess::None;
 
         let spec = SubagentSpec {
@@ -3643,6 +3743,8 @@ mod tests {
             enabled_permissions: vec![Permission::Read],
             denied_servers: Vec::new(),
             denied_tools: Vec::new(),
+            allowed_servers: None,
+            allowed_tools: None,
             memory: MemoryAccess::Write,
             instructions: InstructionAccess::None,
             inherited_scratchpad: Vec::new(),
@@ -3706,6 +3808,8 @@ mod tests {
             enabled_permissions: vec![Permission::Read],
             denied_servers: Vec::new(),
             denied_tools: Vec::new(),
+            allowed_servers: None,
+            allowed_tools: None,
             memory: MemoryAccess::Write,
             instructions: InstructionAccess::None,
             inherited_scratchpad: Vec::new(),
@@ -3715,7 +3819,7 @@ mod tests {
             readable_roots: None,
             profile: None,
         };
-        let config = ToolDenials::new(vec!["mekabridge".to_string()], vec![
+        let config = ToolScope::new(vec!["mekabridge".to_string()], vec![
             "web_search".to_string(),
         ]);
 
@@ -3739,7 +3843,7 @@ mod tests {
         // Never the other direction: config cannot hand back what the spawn call withheld.
         assert_eq!(combined.permission, Permission::Read);
         assert_eq!(
-            combined_for_followup(spec, &ToolDenials::default(), MemoryAccess::Write).memory,
+            combined_for_followup(spec, &ToolScope::default(), MemoryAccess::Write).memory,
             MemoryAccess::Write,
             "an empty config leaves the recorded grant exactly as it was"
         );
@@ -3758,7 +3862,7 @@ mod tests {
             tool_builder_params: params.on_provider(Arc::new(
                 crate::provider::mock::MockProvider::from_rounds(vec![text_round("done")]),
             )),
-            inherited_denials: ToolDenials::default(),
+            inherited_scope: ToolScope::default(),
             remaining_depth: 1,
             absolute_depth: 0,
         };
@@ -3819,7 +3923,7 @@ mod tests {
         let spawn = AgentSpawnTool {
             parent_permission: SharedPermission::new(Permission::Read, EnabledPermissions::ALL),
             tool_builder_params: params,
-            inherited_denials: ToolDenials::default(),
+            inherited_scope: ToolScope::default(),
             remaining_depth: 1,
             absolute_depth: 0,
         };
@@ -3887,7 +3991,7 @@ mod tests {
         let spawn = AgentSpawnTool {
             parent_permission: SharedPermission::new(Permission::Read, EnabledPermissions::ALL),
             tool_builder_params: params.clone(),
-            inherited_denials: ToolDenials::default(),
+            inherited_scope: ToolScope::default(),
             remaining_depth: 1,
             absolute_depth: 0,
         };
@@ -4111,7 +4215,7 @@ mod tests {
                 EnabledPermissions::ALL,
             ),
             tool_builder_params: params.on_provider(provider),
-            inherited_denials: ToolDenials::default(),
+            inherited_scope: ToolScope::default(),
             // Deep enough that the worker gets its own `agent_spawn`.
             remaining_depth: 2,
             absolute_depth: 0,
@@ -4183,7 +4287,7 @@ mod tests {
                     text_round("the findings"),
                 ]),
             )),
-            inherited_denials: ToolDenials::default(),
+            inherited_scope: ToolScope::default(),
             remaining_depth: 1,
             absolute_depth: 0,
         };
@@ -4305,7 +4409,7 @@ mod tests {
             tool_builder_params: params.on_provider(Arc::new(
                 crate::provider::mock::MockProvider::from_rounds(Vec::new()),
             )),
-            inherited_denials: ToolDenials::default(),
+            inherited_scope: ToolScope::default(),
             remaining_depth: 1,
             absolute_depth: 0,
         };
@@ -4365,7 +4469,7 @@ mod tests {
             tool_builder_params: params.on_provider(Arc::new(
                 crate::provider::mock::MockProvider::from_rounds(Vec::new()),
             )),
-            inherited_denials: ToolDenials::default(),
+            inherited_scope: ToolScope::default(),
             remaining_depth: 1,
             absolute_depth: 0,
         })
@@ -4705,7 +4809,7 @@ mod tests {
             tool_builder_params: params.on_provider(Arc::new(
                 crate::provider::mock::MockProvider::from_rounds(vec![text_round("never runs")]),
             )),
-            inherited_denials: ToolDenials::default(),
+            inherited_scope: ToolScope::default(),
             remaining_depth: 0,
             absolute_depth: 0,
         };
@@ -4776,7 +4880,7 @@ mod tests {
             tool_builder_params: params.on_provider(Arc::new(
                 crate::provider::mock::MockProvider::from_rounds(vec![text_round("never runs")]),
             )),
-            inherited_denials: ToolDenials::default(),
+            inherited_scope: ToolScope::default(),
             remaining_depth: 1,
             absolute_depth: 0,
         };
@@ -4850,7 +4954,7 @@ mod tests {
         let spawn = AgentSpawnTool {
             parent_permission: permission.clone(),
             tool_builder_params: params.clone().on_provider(Arc::clone(&provider)),
-            inherited_denials: ToolDenials::default(),
+            inherited_scope: ToolScope::default(),
             remaining_depth: 1,
             absolute_depth: 0,
         };
@@ -4963,7 +5067,7 @@ mod tests {
                 EnabledPermissions::ALL,
             ),
             tool_builder_params: params.clone().on_provider(Arc::clone(&provider)),
-            inherited_denials: ToolDenials::default(),
+            inherited_scope: ToolScope::default(),
             remaining_depth: 1,
             absolute_depth: 0,
         };
@@ -5063,7 +5167,7 @@ mod tests {
                 EnabledPermissions::ALL,
             ),
             tool_builder_params: params.clone().on_provider(Arc::clone(&provider)),
-            inherited_denials: ToolDenials::default(),
+            inherited_scope: ToolScope::default(),
             remaining_depth: 1,
             absolute_depth: 0,
         };
@@ -5486,7 +5590,7 @@ mod tests {
         AgentSpawnTool {
             parent_permission: params.cells.permission.clone(),
             tool_builder_params: params.on_provider(provider),
-            inherited_denials: ToolDenials::default(),
+            inherited_scope: ToolScope::default(),
             remaining_depth: 1,
             absolute_depth: 0,
         }
@@ -7287,7 +7391,7 @@ mod tests {
         let spawn = AgentSpawnTool {
             parent_permission: params.cells.permission.clone(),
             tool_builder_params: params.on_provider(mock.clone()),
-            inherited_denials: ToolDenials::default(),
+            inherited_scope: ToolScope::default(),
             remaining_depth: 1,
             absolute_depth: 0,
         };
@@ -7539,6 +7643,157 @@ mod tests {
                 platform.display()
             );
         }
+    }
+
+    /// The tool names a worker's first request carried, sorted: what its registry held.
+    fn tools_sent(provider: &crate::provider::mock::MockProvider) -> Vec<String> {
+        let mut names: Vec<String> = provider.streams()[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// `allow_tools` gives the worker exactly the tools it names, and a `deny_tools` entry among
+    /// them still wins; both lists are recorded with the spawn terms.
+    #[tokio::test]
+    async fn an_allow_list_gives_the_worker_exactly_those_tools_less_any_denied() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let mut params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+        );
+        // Streamed, since only a streamed request records the tools it carried.
+        params.parent_options.streaming = true;
+        let provider = mock(vec![text_round("done")]);
+        let spawn = spawn_tool_for(params, Arc::clone(&provider) as Arc<dyn Provider>);
+        let output = spawn
+            .execute(
+                serde_json::json!({
+                    "prompt": "look",
+                    "allow_tools": ["file_read", "file_write"],
+                    "deny_tools": ["file_write"],
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        assert_eq!(tools_sent(&provider), vec!["file_read"]);
+        let agent_id = agent_id_in(&output.text_content());
+        let spec: SubagentSpec = serde_json::from_str(
+            &store
+                .load_subagent_spec(agent_id)
+                .await
+                .expect("load")
+                .expect("spec"),
+        )
+        .expect("decode");
+        assert_eq!(
+            spec.allowed_tools,
+            Some(vec!["file_read".to_string(), "file_write".to_string()])
+        );
+        assert_eq!(spec.denied_tools, vec!["file_write".to_string()]);
+        assert_eq!(spec.allowed_servers, None);
+    }
+
+    /// An empty allow-list is refused before any row, as an empty `writable_roots` is.
+    #[tokio::test]
+    async fn an_empty_allow_list_is_refused() {
+        let dirs = workspaces();
+        for key in ["allow_tools", "allow_servers"] {
+            let refusal = refused_spawn(
+                Permission::Read,
+                dirs.work.clone(),
+                serde_json::json!({ "prompt": "x", key: [] }),
+            )
+            .await;
+            assert!(refusal.contains("names no"), "{key}: {refusal}");
+        }
+    }
+
+    /// A nested spawn's allow-list intersects with what its parent holds: a worker allowed two
+    /// tools can hand a child one of them, never a third.
+    #[tokio::test]
+    async fn a_nested_spawn_cannot_widen_its_parents_allow_list() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let mut params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+        );
+        // Streamed, since only a streamed request records the tools it carried.
+        params.parent_options.streaming = true;
+        let provider = mock(vec![text_round("done")]);
+        let mut spawn = spawn_tool_for(params, Arc::clone(&provider) as Arc<dyn Provider>);
+        spawn.inherited_scope = ToolScope::default().allowing(
+            None::<Vec<String>>,
+            Some(vec!["file_read".to_string(), "file_find".to_string()]),
+        );
+        let output = spawn
+            .execute(
+                serde_json::json!({
+                    "prompt": "look",
+                    "allow_tools": ["file_read", "file_write"],
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        assert_eq!(tools_sent(&provider), vec!["file_read"]);
+        let agent_id = agent_id_in(&output.text_content());
+        let spec: SubagentSpec = serde_json::from_str(
+            &store
+                .load_subagent_spec(agent_id)
+                .await
+                .expect("load")
+                .expect("spec"),
+        )
+        .expect("decode");
+        assert_eq!(spec.allowed_tools, Some(vec!["file_read".to_string()]));
+    }
+
+    /// A follow-up rebuilds the worker under its recorded allow-list.
+    #[tokio::test]
+    async fn a_followup_keeps_a_workers_allow_lists() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let mut params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+        );
+        // Streamed, since only a streamed request records the tools it carried.
+        params.parent_options.streaming = true;
+        let spawn = spawn_tool_for(params.clone(), mock(vec![text_round("spawned")]));
+        let output = spawn
+            .execute(
+                serde_json::json!({ "prompt": "wait", "allow_tools": ["file_read"] }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        let agent_id = agent_id_in(&output.text_content());
+        let provider = mock(vec![text_round("resumed")]);
+        let followup = followup_tool_for(params, Arc::clone(&provider) as Arc<dyn Provider>);
+        followup
+            .execute(
+                serde_json::json!({ "id": agent_id.to_string(), "prompt": "carry on" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("follow-up succeeds");
+        assert_eq!(tools_sent(&provider), vec!["file_read"]);
     }
 
     /// A read grant alone drops the worker to `workspace`, as a write boundary does: a parent at

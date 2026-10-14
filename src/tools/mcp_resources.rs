@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{Tool, ToolDenials, ToolOutput, util::require_str};
+use super::{Tool, ToolOutput, ToolScope, util::require_str};
 use crate::{
     error::{MekaError, Result},
     mcp::{MAX_MCP_DESCRIPTION_CHARS, McpClientManager, truncate},
@@ -35,11 +35,11 @@ fn no_such_server(tool_name: &str, server: &str, available: &[String]) -> MekaEr
 /// a server by name and never consult the registry, so a worker denied `mekabridge` could still
 /// read its resources and render its prompts. A denial that covers only one of the three surfaces a
 /// server exposes is not a denial.
-fn visible_servers(manager: &McpClientManager, denials: &ToolDenials) -> Vec<String> {
+fn visible_servers(manager: &McpClientManager, tool_scope: &ToolScope) -> Vec<String> {
     manager
         .server_names()
         .into_iter()
-        .filter(|name| !denials.denies_server(name))
+        .filter(|name| tool_scope.admits_server(name))
         .collect()
 }
 
@@ -49,24 +49,24 @@ fn visible_servers(manager: &McpClientManager, denials: &ToolDenials) -> Vec<Str
 fn visible_server_entry(
     tool_name: &str,
     manager: &McpClientManager,
-    denials: &ToolDenials,
+    tool_scope: &ToolScope,
     server: &str,
 ) -> Result<Arc<crate::mcp::ServerEntry>> {
-    if denials.denies_server(server) {
+    if !tool_scope.admits_server(server) {
         return Err(no_such_server(
             tool_name,
             server,
-            &visible_servers(manager, denials),
+            &visible_servers(manager, tool_scope),
         ));
     }
     manager
         .server_entry(server)
-        .ok_or_else(|| no_such_server(tool_name, server, &visible_servers(manager, denials)))
+        .ok_or_else(|| no_such_server(tool_name, server, &visible_servers(manager, tool_scope)))
 }
 
 pub(crate) struct ListMcpResourcesTool {
     pub(crate) manager: Arc<McpClientManager>,
-    pub(crate) denials: Arc<ToolDenials>,
+    pub(crate) tool_scope: Arc<ToolScope>,
 }
 
 #[async_trait]
@@ -107,10 +107,10 @@ impl Tool for ListMcpResourcesTool {
             .map(String::from);
 
         let names: Vec<String> = if let Some(name) = &server_filter {
-            visible_server_entry("mcp_resource_list", &self.manager, &self.denials, name)?;
+            visible_server_entry("mcp_resource_list", &self.manager, &self.tool_scope, name)?;
             vec![name.clone()]
         } else {
-            visible_servers(&self.manager, &self.denials)
+            visible_servers(&self.manager, &self.tool_scope)
         };
 
         if names.is_empty() {
@@ -165,7 +165,7 @@ impl Tool for ListMcpResourcesTool {
 
 pub(crate) struct ReadMcpResourceTool {
     pub(crate) manager: Arc<McpClientManager>,
-    pub(crate) denials: Arc<ToolDenials>,
+    pub(crate) tool_scope: Arc<ToolScope>,
 }
 
 #[async_trait]
@@ -208,8 +208,12 @@ impl Tool for ReadMcpResourceTool {
         let server = require_str(&input, "server", "mcp_resource_read")?;
         let uri = require_str(&input, "uri", "mcp_resource_read")?;
 
-        let entry =
-            visible_server_entry("mcp_resource_read", &self.manager, &self.denials, &server)?;
+        let entry = visible_server_entry(
+            "mcp_resource_read",
+            &self.manager,
+            &self.tool_scope,
+            &server,
+        )?;
 
         let result = crate::mcp::read_resource(&entry, uri.clone(), &cancellation).await?;
 
@@ -297,7 +301,7 @@ fn format_resource_contents(
 
 pub(crate) struct ListMcpPromptsTool {
     pub(crate) manager: Arc<McpClientManager>,
-    pub(crate) denials: Arc<ToolDenials>,
+    pub(crate) tool_scope: Arc<ToolScope>,
 }
 
 #[async_trait]
@@ -338,10 +342,10 @@ impl Tool for ListMcpPromptsTool {
             .map(String::from);
 
         let names: Vec<String> = if let Some(name) = &server_filter {
-            visible_server_entry("mcp_prompt_list", &self.manager, &self.denials, name)?;
+            visible_server_entry("mcp_prompt_list", &self.manager, &self.tool_scope, name)?;
             vec![name.clone()]
         } else {
-            visible_servers(&self.manager, &self.denials)
+            visible_servers(&self.manager, &self.tool_scope)
         };
 
         if names.is_empty() {
@@ -407,7 +411,7 @@ impl Tool for ListMcpPromptsTool {
 
 pub(crate) struct GetMcpPromptTool {
     pub(crate) manager: Arc<McpClientManager>,
-    pub(crate) denials: Arc<ToolDenials>,
+    pub(crate) tool_scope: Arc<ToolScope>,
 }
 
 #[async_trait]
@@ -459,7 +463,8 @@ impl Tool for GetMcpPromptTool {
 
         let arguments = input.get("arguments").and_then(|v| v.as_object()).cloned();
 
-        let entry = visible_server_entry("mcp_prompt_get", &self.manager, &self.denials, &server)?;
+        let entry =
+            visible_server_entry("mcp_prompt_get", &self.manager, &self.tool_scope, &server)?;
 
         let result = crate::mcp::get_prompt(&entry, name.clone(), arguments, &cancellation).await?;
 
@@ -528,8 +533,8 @@ pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClien
     // nothing useful to do without at least one. A sub-agent denied every configured server is in
     // exactly that position, so it takes the same exit: seven tools that can only answer "unknown
     // server" are worse than no tools, because the model spends turns discovering that.
-    let denials = Arc::new(registry.denials().clone());
-    if visible_servers(&manager, &denials).is_empty() {
+    let tool_scope = Arc::new(registry.tool_scope().clone());
+    if visible_servers(&manager, &tool_scope).is_empty() {
         return;
     }
     // These seven are registered directly rather than through `register_builtin`, so they honor
@@ -558,38 +563,38 @@ pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClien
     }
     register_meta!("mcp_resource_list", ListMcpResourcesTool {
         manager: Arc::clone(&manager),
-        denials: Arc::clone(&denials),
+        tool_scope: Arc::clone(&tool_scope),
     });
     register_meta!("mcp_resource_read", ReadMcpResourceTool {
         manager: Arc::clone(&manager),
-        denials: Arc::clone(&denials),
+        tool_scope: Arc::clone(&tool_scope),
     });
     register_meta!("mcp_prompt_list", ListMcpPromptsTool {
         manager: Arc::clone(&manager),
-        denials: Arc::clone(&denials),
+        tool_scope: Arc::clone(&tool_scope),
     });
     register_meta!("mcp_prompt_get", GetMcpPromptTool {
         manager: Arc::clone(&manager),
-        denials: Arc::clone(&denials),
+        tool_scope: Arc::clone(&tool_scope),
     });
     register_meta!("mcp_resource_subscribe", SubscribeMcpResourceTool {
         manager: Arc::clone(&manager),
-        denials: Arc::clone(&denials),
+        tool_scope: Arc::clone(&tool_scope),
     });
     register_meta!("mcp_resource_unsubscribe", UnsubscribeMcpResourceTool {
         manager: Arc::clone(&manager),
-        denials: Arc::clone(&denials),
+        tool_scope: Arc::clone(&tool_scope),
     });
     register_meta!("mcp_resource_updates_list", ListMcpResourceUpdatesTool {
         manager: Arc::clone(&manager),
-        denials
+        tool_scope
     });
     drop(manager);
 }
 
 pub(crate) struct SubscribeMcpResourceTool {
     pub(crate) manager: Arc<McpClientManager>,
-    pub(crate) denials: Arc<ToolDenials>,
+    pub(crate) tool_scope: Arc<ToolScope>,
 }
 
 #[async_trait]
@@ -628,7 +633,7 @@ impl Tool for SubscribeMcpResourceTool {
         let entry = visible_server_entry(
             "mcp_resource_subscribe",
             &self.manager,
-            &self.denials,
+            &self.tool_scope,
             &server,
         )?;
         crate::mcp::subscribe_resource(&entry, uri.clone(), &cancellation)
@@ -646,7 +651,7 @@ impl Tool for SubscribeMcpResourceTool {
 
 pub(crate) struct UnsubscribeMcpResourceTool {
     pub(crate) manager: Arc<McpClientManager>,
-    pub(crate) denials: Arc<ToolDenials>,
+    pub(crate) tool_scope: Arc<ToolScope>,
 }
 
 #[async_trait]
@@ -682,7 +687,7 @@ impl Tool for UnsubscribeMcpResourceTool {
         let entry = visible_server_entry(
             "mcp_resource_unsubscribe",
             &self.manager,
-            &self.denials,
+            &self.tool_scope,
             &server,
         )?;
         crate::mcp::unsubscribe_resource(&entry, uri.clone(), &cancellation)
@@ -700,7 +705,7 @@ impl Tool for UnsubscribeMcpResourceTool {
 
 pub(crate) struct ListMcpResourceUpdatesTool {
     pub(crate) manager: Arc<McpClientManager>,
-    pub(crate) denials: Arc<ToolDenials>,
+    pub(crate) tool_scope: Arc<ToolScope>,
 }
 
 #[async_trait]
@@ -733,7 +738,7 @@ impl Tool for ListMcpResourceUpdatesTool {
             .resource_updates
             .snapshot()
             .into_iter()
-            .filter(|(server, _uri, _stamp)| !self.denials.denies_server(server))
+            .filter(|(server, _uri, _stamp)| self.tool_scope.admits_server(server))
             .collect();
         if updates.is_empty() {
             return Ok(ToolOutput::text(
