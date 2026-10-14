@@ -453,7 +453,7 @@ async fn async_main(
     // is no target to protect. The screen and `--oneshot` sweep only once `resolve_session_resume`
     // holds the lock on the session they were asked for; see `sweep_expired_sessions`.
     if serve_mode || acp_mode {
-        host::sweep_expired_sessions(&config, &store).await?;
+        host::sweep_expired(host::RetentionWindows::from_config(&config), &store).await?;
     }
 
     let mcp_context = mcp::McpClientContext::new();

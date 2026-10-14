@@ -61,7 +61,10 @@ pub(crate) async fn run_interactive(
         announce,
     } = resolve_session_resume(&store, &config).await?;
     // After the resume, whose lock is what spares the session this run was asked for.
-    sweep_expired_sessions(&config, &store).await?;
+    let windows = RetentionWindows::from_config(&config);
+    sweep_expired(windows, &store).await?;
+    // A screen left open for months is a host that stays up.
+    let expiry_sweeper = spawn_expiry_sweeper(windows, store.clone());
 
     // Where the log ends as the screen opens: the screen reads the pages below this as the view
     // scrolls up, and this run's items go after it. Read before the agent runs anything, so a
@@ -596,6 +599,7 @@ pub(crate) async fn run_interactive(
     }
 
     schedule_watcher.abort();
+    expiry_sweeper.abort();
     // The screen gives the terminal back before anything below prints to it, and hands the log
     // queue back to stderr as it goes.
     ui.send(UiEvent::Leave);

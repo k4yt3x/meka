@@ -390,6 +390,9 @@ impl Agent {
             // mattered. It reaches its own memory only if the spawn granted it any, so a worker
             // with no memory access still gets the better summary and simply has nowhere to write.
             compact_checkpoint: parent_options.compact_checkpoint,
+            // Inherited because the sweep is store-wide and reads every session the same way; a
+            // worker that outlived the window would otherwise carry turns the rule says are gone.
+            turn_retention: parent_options.turn_retention,
             mcp_grace: std::time::Duration::ZERO,
             system_prompt_override: Some(sub_system_prompt),
         };
@@ -459,8 +462,10 @@ impl Agent {
             }),
             scheduling: self.tool_registry.get("schedule_create").is_some(),
             auto_compact: self.options.auto_compact,
+            turn_retention: self.options.turn_retention,
             conversation_search: self.tool_registry.get("conversation_search").is_some(),
             conversation_read: self.tool_registry.get("conversation_read").is_some(),
+            memory_write: self.tool_registry.get("memory_write").is_some(),
         }
     }
 
@@ -753,6 +758,7 @@ mod tests {
             context_ceiling_percent: 80,
             auto_compact: false,
             compact_checkpoint: false,
+            turn_retention: None,
             user_instructions: None,
             mcp_grace: std::time::Duration::from_secs(0),
             system_prompt_override: Some("test".to_string()),

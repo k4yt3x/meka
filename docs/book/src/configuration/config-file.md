@@ -1185,7 +1185,7 @@ Settings for session history retention and context window management.
 
 ### `session.retention`
 
-Delete sessions not updated for longer than this, at agent startup. A duration string like `"30d"` or `"12h"`. Uses `updated_at`, so an actively-resumed session is preserved even if created long ago. Deletions are reported at `warn` level.
+Delete sessions not updated for longer than this, at startup and then hourly for as long as `meka serve`, `meka acp` or the screen stays up. A duration string like `"30d"` or `"12h"`. Uses `updated_at`, so an actively-resumed session is preserved even if created long ago. Deletions are reported at `warn` level.
 
 Three kinds of session are spared whatever their timestamp says. A session another meka process has open is skipped, and the sweep reports how many: only turns bump `updated_at`, and resuming does not, so an interactive session left open past the window looks expired while somebody is in front of it. A [pinned](../usage/sessions.md#pinning-a-session) session is never expired, nor is any parent of one: a pin is you saying keep this. And a session with a scheduled job still ahead of it is never expired, nor is any parent of one: a gated watcher that evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and deleting it would take the schedule with it.
 
@@ -1194,6 +1194,21 @@ Three kinds of session are spared whatever their timestamp says. A session anoth
 ```toml
 [session]
 retention = "30d"
+```
+
+### `session.turn_retention`
+
+Delete the turns of every session that ended longer ago than this, once a compaction has summarized them. A duration string like `"90d"` or `"36h"`. The sweep runs at startup, at the start of each turn for that turn's session, and hourly for as long as `meka serve`, `meka acp` or the screen stays up.
+
+Only turns before a session's latest compaction can go, since the summary is what stands in for them: the turns the model still works from are never deleted out from under it. When one of those is older than the window, the next turn compacts first, keeping no rounds verbatim and quoting none, and the sweep takes it afterward. Needs `auto_compact = true` for that reason. A turn goes whole: its messages, its record, its words in the search index and the images only it carried. Inbox items and background outcomes go once they have been delivered or withdrawn for longer than the window. Scratchpad entries and memories are the agent's own and stay.
+
+The model is told the window in its system prompt, and every turn's context block names the date nothing precedes, so it knows how far back `conversation_search` reaches and to keep in memory what must outlive the window. See [What the agent sees](../usage/sessions.md#what-the-agent-sees).
+
+**Default: unset, meaning every turn is kept for the life of its session.** `"0s"` is refused at startup, since it would compact and delete the conversation on every turn. Deletions are reported at `warn` level.
+
+```toml
+[session]
+turn_retention = "90d"
 ```
 
 ### `session.auto_compact`

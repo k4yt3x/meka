@@ -922,11 +922,17 @@ impl From<SandboxBackend> for String {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionConfig {
-    /// Delete sessions whose `updated_at` is older than this, at agent startup. Unset means keep
-    /// everything: conversation history is not reproducible, so meka never discards it unasked.
-    /// `"0s"` is refused at startup, since it would delete every session on each launch.
+    /// Delete sessions whose `updated_at` is older than this, at startup and hourly while a host
+    /// stays up. Unset means keep everything: conversation history is not reproducible, so meka
+    /// never discards it unasked. `"0s"` is refused at startup, since it would delete every
+    /// session on each launch.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub(crate) retention: Option<std::time::Duration>,
+    /// Delete the turns of every session that ended longer ago than this, once a compaction has
+    /// summarized them. Unset keeps every turn for the life of its session. `"0s"` is refused at
+    /// startup, since it would compact and delete the conversation on every turn.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub(crate) turn_retention: Option<std::time::Duration>,
     pub(crate) auto_compact: Option<bool>,
     /// The share of the context window meka lets the conversation fill on its own: `auto_compact`
     /// fires past it, and a whole `scratchpad_read` is cut at it. Default
@@ -1391,8 +1397,11 @@ pub(crate) struct ResolvedConfig {
     /// the host resolves and probes it at startup ([`crate::sandbox::resolve_backend`]) because
     /// the pick depends on what the machine has.
     pub(crate) sandbox_backend: Option<SandboxBackend>,
-    /// Resolved `[session].retention`. `None`, the default, disables startup cleanup.
+    /// Resolved `[session].retention`. `None`, the default, disables the session sweep.
     pub(crate) retention: Option<std::time::Duration>,
+    /// Resolved `[session].turn_retention`. `None`, the default, keeps every turn for the life of
+    /// its session.
+    pub(crate) turn_retention: Option<std::time::Duration>,
     pub(crate) thinking: crate::config::ThinkingMode,
     /// The selected profile's resolved thinking budget, the sibling of [`Self::thinking`] and
     /// [`Self::max_output_tokens`]. Answers "what would a brand-new session get", which is exactly
@@ -2310,6 +2319,7 @@ impl ResolvedConfig {
             sandbox: file_shell.sandbox.unwrap_or(true),
             sandbox_backend,
             retention: file_session.retention,
+            turn_retention: file_session.turn_retention,
             thinking: active_settings
                 .as_ref()
                 .map(|settings| settings.thinking)
@@ -2420,6 +2430,25 @@ impl ResolvedConfig {
             return Err(crate::error::MekaError::Config(
                 "`[session].retention = \"0s\"` would delete every session on each startup; remove \
                  the key to keep sessions"
+                    .to_string(),
+            ));
+        }
+        // The same reading: a turn is older than zero the moment it ends, so every turn would
+        // compact the conversation and delete what the summary replaced.
+        if self.turn_retention.is_some_and(|window| window.is_zero()) {
+            return Err(crate::error::MekaError::Config(
+                "`[session].turn_retention = \"0s\"` would compact and delete the conversation on \
+                 every turn; remove the key to keep turns"
+                    .to_string(),
+            ));
+        }
+        // The sweep takes only what a compaction has summarized, and a turn still in the model's
+        // view is summarized by compacting unasked, which is what `auto_compact = false` forbids.
+        // Without it the window is a promise nothing keeps.
+        if self.turn_retention.is_some() && !self.auto_compact {
+            return Err(crate::error::MekaError::Config(
+                "`[session].turn_retention` needs `auto_compact = true`, which summarizes a turn \
+                 before the sweep deletes it; remove one of the two"
                     .to_string(),
             ));
         }
@@ -3889,6 +3918,10 @@ command = "ida-mcp"
         );
         assert_eq!(resolved.mcp_servers[0].required, Some(false));
         assert!(resolved.retention.is_none(), "no cleanup by default");
+        assert!(
+            resolved.turn_retention.is_none(),
+            "no turn cleanup by default"
+        );
     }
 
     /// The status row's facts come from the list, in its order; a word that is not a fact is
@@ -4167,6 +4200,80 @@ retention = "0s"
         assert!(error.to_string().contains("[session].retention"), "{error}");
     }
 
+    #[test]
+    fn a_zero_turn_retention_is_refused() {
+        let resolved = resolve_with_config(
+            r#"
+default_profile = "p"
+
+[accounts.p]
+backend = "openai-chat-completions"
+
+[profiles.p]
+account = "p"
+model = "m"
+
+[session]
+turn_retention = "0s"
+"#,
+        );
+        assert_eq!(
+            resolved.turn_retention,
+            Some(std::time::Duration::ZERO),
+            "fixture must actually set it"
+        );
+        let error = resolved
+            .validate()
+            .expect_err("turn_retention = \"0s\" must not be accepted");
+        assert!(
+            error.to_string().contains("[session].turn_retention"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn turn_retention_needs_auto_compaction() {
+        let resolved = resolve_with_config(
+            r#"
+default_profile = "p"
+
+[accounts.p]
+backend = "openai-chat-completions"
+
+[profiles.p]
+account = "p"
+model = "m"
+
+[session]
+turn_retention = "90d"
+auto_compact = false
+"#,
+        );
+        let error = resolved
+            .validate()
+            .expect_err("a window nothing can keep must not be accepted");
+        assert!(error.to_string().contains("auto_compact = true"), "{error}");
+
+        let resolved = resolve_with_config(
+            r#"
+default_profile = "p"
+
+[accounts.p]
+backend = "openai-chat-completions"
+
+[profiles.p]
+account = "p"
+model = "m"
+
+[session]
+turn_retention = "90d"
+"#,
+        );
+        resolved
+            .validate()
+            .expect("the default auto_compact keeps the window");
+    }
+
     /// `tokio::time::interval` panics on a zero period, so without this check a config value takes
     /// the whole process down at scheduler startup rather than merely behaving oddly.
     #[test]
@@ -4392,6 +4499,7 @@ permission = "workspace"
 [session]
 context_ceiling_percent = 50
 retention = "30d"
+turn_retention = "36h"
 subagent_max_depth = 5
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
@@ -4402,6 +4510,11 @@ subagent_max_depth = 5
         assert_eq!(
             file_session.retention,
             Some(std::time::Duration::from_secs(30 * 86_400))
+        );
+        // The same grammar as `retention`, so a window shorter than a day is a plain string too.
+        assert_eq!(
+            file_session.turn_retention,
+            Some(std::time::Duration::from_secs(36 * 3_600))
         );
         assert_eq!(subagent_max_depth, 5);
     }

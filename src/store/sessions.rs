@@ -231,6 +231,32 @@ pub(crate) struct SessionSweep {
     /// because their lock could not be established either way.
     pub(crate) attached_elsewhere: u64,
 }
+/// What a turn sweep deleted, so its caller can say so at the level a configured deletion is
+/// reported at.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TurnSweep {
+    /// Turn records removed: turns now gone whole.
+    pub(crate) turns: u64,
+    /// Message rows removed: those turns' rows, and rows no turn names.
+    pub(crate) rows: u64,
+}
+
+impl TurnSweep {
+    /// Whether the sweep found nothing to take, and so has nothing to report.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.turns == 0 && self.rows == 0
+    }
+
+    /// The one sentence every door logs for a sweep that deleted something.
+    pub(crate) fn describe(&self, window: std::time::Duration) -> String {
+        let TurnSweep { turns, rows } = self;
+        let window = crate::text::format_duration_words(window);
+        format!(
+            "deleted {rows} row(s) of {turns} turn(s) older than {window} \
+             (`[session].turn_retention`)"
+        )
+    }
+}
 /// What [`Store::list_sessions`] keeps. Every field narrows the listing, and none by default.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SessionFilter {
@@ -670,6 +696,13 @@ pub(super) enum RowRange {
 /// stops at the first boundary it meets, so the lookup costs the rows since it, not the log.
 const VIEW_FLOOR_SQL: &str =
     "AND id >= COALESCE((SELECT MAX(id) FROM messages WHERE session_id = ?1 AND kind = ?2), 0)";
+
+/// How old a row of `messages m` is, for the turn sweep and the check that decides whether one
+/// could take anything: its turn's end, its turn's start for a turn no process closed, or its own
+/// stamp for a row no turn names, which is how an older boundary, a repair, or a row written
+/// before turns were recorded is dated.
+const ROW_AGE_SQL: &str = "COALESCE((SELECT COALESCE(t.ended_at, t.started_at) FROM turns t WHERE \
+                           t.id = m.turn_id), m.created_at)";
 
 fn stored_row_with_id(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, StoredMessage)> {
     Ok((row.get(0)?, StoredMessage {
@@ -3196,6 +3229,212 @@ impl Store {
 
         self.delete_the_unattached_among(&expired, EXPIRABLE, Some(cutoff_for_delete.as_str()))
             .await
+    }
+
+    /// Delete every turn that ended before `cutoff` and that a compaction has since summarized,
+    /// in one session or in every session: its rows, its record, and the blobs nothing references
+    /// afterward. The search index follows the rows through its delete trigger. Inbox items and
+    /// background outcomes go once they have been delivered or withdrawn for longer than the
+    /// window, since that is when a turn consumed their words.
+    ///
+    /// Only rows before a session's latest `compact_boundary` row can go, because the model's view
+    /// is that row and everything after it, so a deletion there would take words out of the
+    /// context the model works from. A session never compacted loses nothing: its whole log is the
+    /// view. Within that bound a row is dated as [`ROW_AGE_SQL`] dates it.
+    ///
+    /// A turn's record goes once none of its rows remain, so a turn split by a compaction inside
+    /// it keeps its record while its rows after the boundary stand. No lock is taken: nothing a
+    /// running process holds reads below its view, and a screen paging its history reads by id
+    /// and tolerates a gap.
+    ///
+    /// The rows are chosen once and deleted in short transactions: a first sweep over a long
+    /// archive takes seconds, and one transaction that long would hold the write lock past the
+    /// busy timeout of a second process mid-turn. A session's rows are read only when its oldest
+    /// row below the boundary is itself expired: rows are appended in time order, so when that
+    /// one is inside the window nothing below the boundary is out of it, to within a boundary a
+    /// compaction wrote inside a turn, which goes with that turn's rows once its end has aged.
+    /// That is what keeps the sweep at the start of every turn, and the hourly one over every
+    /// session, at a few indexed reads when there is nothing to take.
+    pub(crate) async fn delete_expired_turns(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        scope: Option<Uuid>,
+    ) -> Result<TurnSweep> {
+        /// Rows deleted per transaction: a few milliseconds each with the index trigger, so a
+        /// writer in another process waits for one chunk, not for the sweep.
+        const ROWS_PER_TRANSACTION: usize = 2_000;
+
+        let cutoff = cutoff.to_rfc3339();
+        let scope_id = scope.map(|id| id.to_string());
+        // The scope is spliced in as text rather than bound as a nullable parameter: an `?3 IS
+        // NULL OR session_id = ?3` is planned without knowing which, and the turn start sweep of
+        // one session must not scan every session's rows.
+        let scope_clause = if scope_id.is_some() {
+            "WHERE s.id = ?3"
+        } else {
+            ""
+        };
+        let parameters: Vec<String> = [cutoff.clone(), COMPACT_BOUNDARY_KIND.to_string()]
+            .into_iter()
+            .chain(scope_id.clone())
+            .collect();
+        // Each session's latest boundary, found once per statement by walking the sessions and
+        // taking each one's through the `(session_id, kind)` index, rather than by scanning every
+        // row for the kind. A session with none is absent, and the join is what spares it.
+        let latest_boundaries = format!(
+            "latest AS (SELECT session_id, boundary FROM (SELECT s.id AS session_id, (SELECT \
+             MAX(b.id) FROM messages b WHERE b.session_id = s.id AND b.kind = ?2) AS boundary \
+             FROM sessions s {scope_clause}) WHERE boundary IS NOT NULL)"
+        );
+        // The sessions whose oldest row below the boundary is expired: the only ones with rows
+        // to read, by the order rows are appended in.
+        let due_sessions = format!(
+            "due AS (SELECT session_id, boundary FROM latest WHERE (SELECT {ROW_AGE_SQL} < ?1 \
+             FROM messages m WHERE m.session_id = latest.session_id AND m.id < latest.boundary \
+             ORDER BY m.id LIMIT 1))"
+        );
+        let failed = |error: tokio_rusqlite::Error| {
+            MekaError::Database(format!("failed to delete expired turns: {error}"))
+        };
+
+        let expired_rows: Vec<i64> = self
+            .connection
+            .call({
+                let parameters = parameters.clone();
+                let latest_boundaries = latest_boundaries.clone();
+                move |connection| -> rusqlite::Result<_> {
+                    // `CROSS JOIN` pins the loop order: the due sessions outside, their rows
+                    // inside. Left to itself the planner scans every message row and dates each
+                    // before probing `due`, which is the whole archive on every empty sweep.
+                    let mut statement = connection.prepare(&format!(
+                        "WITH {latest_boundaries}, {due_sessions}
+                         SELECT m.id FROM due
+                         CROSS JOIN messages m
+                           ON m.session_id = due.session_id AND m.id < due.boundary
+                         WHERE {ROW_AGE_SQL} < ?1
+                         ORDER BY m.id"
+                    ))?;
+                    let ids = statement
+                        .query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
+                            row.get(0)
+                        })?
+                        .collect::<rusqlite::Result<Vec<i64>>>()?;
+                    Ok(ids)
+                }
+            })
+            .await
+            .map_err(failed)?;
+
+        let mut rows = 0_u64;
+        for chunk in expired_rows.chunks(ROWS_PER_TRANSACTION) {
+            let chunk = chunk.to_vec();
+            rows += self
+                .connection
+                .call(move |connection| -> rusqlite::Result<u64> {
+                    // Immediate, so a second process mid-write makes this wait rather than fail
+                    // on the upgrade from a read to the delete.
+                    let transaction = connection
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    let placeholders = vec!["?"; chunk.len()].join(",");
+                    let deleted = transaction.execute(
+                        &format!("DELETE FROM messages WHERE id IN ({placeholders})"),
+                        rusqlite::params_from_iter(chunk.iter()),
+                    )?;
+                    transaction.commit()?;
+                    Ok(deleted as u64)
+                })
+                .await
+                .map_err(failed)?;
+        }
+
+        let turns = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<u64> {
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                // A turn's age is its rows' age, so an expired turn in a compacted session has no
+                // rows left below the boundary; one with none above it either is gone whole. The
+                // turns still named above the boundary are gathered once, not once per turn.
+                let turns = transaction.execute(
+                    &format!(
+                        "WITH {latest_boundaries}
+                         DELETE FROM turns WHERE id IN (
+                             SELECT t.id FROM turns t
+                             JOIN latest ON latest.session_id = t.session_id
+                             WHERE COALESCE(t.ended_at, t.started_at) < ?1
+                               AND t.id NOT IN (
+                                   SELECT m.turn_id FROM messages m
+                                   JOIN latest ON latest.session_id = m.session_id
+                                   WHERE m.id >= latest.boundary AND m.turn_id IS NOT NULL))"
+                    ),
+                    rusqlite::params_from_iter(parameters.iter()),
+                )?;
+                // An item or an outcome is dated by when it left the pending state: that is when
+                // a turn consumed it. One still pending is a turn's to deliver, however old.
+                let scope_clause = if scope_id.is_some() {
+                    "AND session_id = ?2"
+                } else {
+                    ""
+                };
+                let parameters: Vec<&str> = std::iter::once(cutoff.as_str())
+                    .chain(scope_id.as_deref())
+                    .collect();
+                transaction.execute(
+                    &format!(
+                        "DELETE FROM inbox_items
+                         WHERE (delivered_at < ?1 OR withdrawn_at < ?1) {scope_clause}"
+                    ),
+                    rusqlite::params_from_iter(parameters.iter()),
+                )?;
+                transaction.execute(
+                    &format!("DELETE FROM background_tasks WHERE delivered_at < ?1 {scope_clause}"),
+                    rusqlite::params_from_iter(parameters.iter()),
+                )?;
+                if rows > 0 {
+                    super::blobs::sweep_unreferenced_blobs(&transaction)?;
+                }
+                transaction.commit()?;
+                Ok(turns as u64)
+            })
+            .await
+            .map_err(failed)?;
+        let sweep = TurnSweep { turns, rows };
+        // A session's own sweep runs at the start of its every turn; the merge is left to the
+        // store-wide sweep, whose caller is not waiting to send a request.
+        if sweep.rows > 0 && scope.is_none() {
+            self.optimize_search_index().await?;
+        }
+        Ok(sweep)
+    }
+
+    /// Whether the model's view of a session holds a turn that ended before `cutoff`: the
+    /// condition under which a sweep could delete nothing and a compaction has to run first. The
+    /// boundary row itself is never a reason, or a session compacted once would compact on every
+    /// turn after its summary aged. A row's age is the sweep's reading of it.
+    pub(crate) async fn view_holds_a_turn_older_than(
+        &self,
+        session_id: Uuid,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        let cutoff = cutoff.to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<bool> {
+                connection.query_row(
+                    &format!(
+                        "SELECT EXISTS (
+                             SELECT 1 FROM messages m
+                             WHERE m.session_id = ?1 {VIEW_FLOOR_SQL}
+                               AND m.kind <> ?2
+                               AND {ROW_AGE_SQL} < ?3)"
+                    ),
+                    rusqlite::params![session_id.to_string(), COMPACT_BOUNDARY_KIND, cutoff],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to read the view's oldest turn: {error}"))
+            })
     }
 
     /// Delete every one of `candidates` whose lock this process can take, and report what it left.
@@ -7434,6 +7673,7 @@ mod tests {
                 compact_at_percent: Some(80),
                 generation: 0,
             }),
+            turn_retention: None,
             background: &[],
             outcomes: None,
             resumed: true,
@@ -8288,6 +8528,675 @@ mod tests {
                 .expect("load")
                 .is_none(),
             "child's tool_output should be gone"
+        );
+    }
+
+    /// A session with no rows, for tests that assert on exactly the rows they wrote.
+    async fn bare_session(store: &Store) -> Uuid {
+        store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session")
+    }
+
+    /// The stamps the turn sweep reads, set by hand: `UPDATE <table> SET <column> = ?1 WHERE id
+    /// = ?2`, so a test dates a row rather than waiting for it to age.
+    async fn stamp(store: &Store, sql: &'static str, at: String, id: String) {
+        store
+            .connection
+            .call(move |connection| -> rusqlite::Result<()> {
+                let changed = connection.execute(sql, rusqlite::params![at, id])?;
+                assert_eq!(changed, 1, "{sql} must hit one row");
+                Ok(())
+            })
+            .await
+            .expect("stamp");
+    }
+
+    fn days_ago(days: i64) -> String {
+        (chrono::Utc::now() - chrono::TimeDelta::days(days)).to_rfc3339()
+    }
+
+    fn thirty_days_ago() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() - chrono::TimeDelta::days(30)
+    }
+
+    /// A closed turn of one exchange, whose end is `ended_at`; the ids of its two rows.
+    async fn closed_turn(
+        store: &Store,
+        session: Uuid,
+        words: &str,
+        ended_at: String,
+    ) -> (Uuid, Vec<i64>) {
+        use crate::conversation::{Event, Message};
+        let turn = Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(session, turn, "client", &ended_at)
+            .await
+            .expect("open");
+        let mut rows = Vec::new();
+        for event in [
+            Event::Append(Message::user(words)),
+            Event::Append(Message::assistant_text(format!("about {words}"))),
+        ] {
+            store
+                .save_event(session, &event, Some(turn))
+                .await
+                .expect("save");
+            rows.push(
+                store
+                    .last_log_row(session)
+                    .await
+                    .expect("last row")
+                    .expect("a row"),
+            );
+        }
+        store
+            .turn_store()
+            .close_turn(
+                turn,
+                &super::super::turns::TurnEnding::succeeded(
+                    "end_turn",
+                    super::super::turns::TurnUsage::default(),
+                ),
+            )
+            .await
+            .expect("close");
+        stamp(
+            store,
+            "UPDATE turns SET ended_at = ?1 WHERE id = ?2",
+            ended_at,
+            turn.to_string(),
+        )
+        .await;
+        (turn, rows)
+    }
+
+    /// A boundary row written between turns; its id.
+    async fn boundary(store: &Store, session: Uuid) -> i64 {
+        use crate::conversation::{Event, Message};
+        store
+            .save_event(
+                session,
+                &Event::CompactBoundary {
+                    summary: Message::user("summary"),
+                    replaced_count: 2,
+                    loaded_tools_snapshot: Default::default(),
+                    checklist_snapshot: Default::default(),
+                },
+                None,
+            )
+            .await
+            .expect("boundary");
+        store
+            .last_log_row(session)
+            .await
+            .expect("last row")
+            .expect("a row")
+    }
+
+    async fn row_ids(store: &Store, session: Uuid) -> Vec<i64> {
+        store
+            .connection
+            .call(move |connection| -> rusqlite::Result<Vec<i64>> {
+                let mut statement = connection
+                    .prepare("SELECT id FROM messages WHERE session_id = ?1 ORDER BY id")?;
+                let ids = statement
+                    .query_map([session.to_string()], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<i64>>>()?;
+                Ok(ids)
+            })
+            .await
+            .expect("rows")
+    }
+
+    async fn turn_ids(store: &Store, session: Uuid) -> Vec<Uuid> {
+        store
+            .turn_store()
+            .load_turns(session)
+            .await
+            .expect("turns")
+            .into_iter()
+            .map(|turn| turn.id)
+            .collect()
+    }
+
+    /// The sweep takes a turn that ended before the cutoff and lies before the latest boundary,
+    /// rows and record, and leaves a turn that ended inside the window where it is, so the model's
+    /// view and the recent history both read as before.
+    #[tokio::test]
+    async fn an_expired_turn_before_the_latest_boundary_goes_whole() {
+        let store = Store::for_test().await;
+        let session = bare_session(&store).await;
+        let (old, old_rows) = closed_turn(&store, session, "old", days_ago(100)).await;
+        let (recent, recent_rows) = closed_turn(&store, session, "recent", days_ago(1)).await;
+        let boundary = boundary(&store, session).await;
+        let (live, live_rows) = closed_turn(&store, session, "live", days_ago(1)).await;
+        let view_before = format!("{:?}", store.load_view_events(session).await.expect("view"));
+
+        let sweep = store
+            .delete_expired_turns(thirty_days_ago(), None)
+            .await
+            .expect("sweep");
+
+        assert_eq!(sweep, TurnSweep { turns: 1, rows: 2 });
+        let mut expected = recent_rows.clone();
+        expected.push(boundary);
+        expected.extend(live_rows);
+        assert_eq!(row_ids(&store, session).await, expected);
+        assert!(
+            !row_ids(&store, session)
+                .await
+                .iter()
+                .any(|id| old_rows.contains(id))
+        );
+        assert_eq!(turn_ids(&store, session).await, vec![recent, live]);
+        assert!(!turn_ids(&store, session).await.contains(&old));
+        assert_eq!(
+            format!("{:?}", store.load_view_events(session).await.expect("view")),
+            view_before,
+            "the model's view is not the sweep's to touch"
+        );
+    }
+
+    /// Without a boundary the whole log is the model's view, so a session that was never compacted
+    /// keeps every turn however old it is.
+    #[tokio::test]
+    async fn a_session_never_compacted_keeps_every_turn_however_old() {
+        let store = Store::for_test().await;
+        let session = bare_session(&store).await;
+        let (_, rows) = closed_turn(&store, session, "old", days_ago(100)).await;
+
+        let sweep = store
+            .delete_expired_turns(thirty_days_ago(), None)
+            .await
+            .expect("sweep");
+
+        assert_eq!(sweep, TurnSweep::default());
+        assert!(row_ids(&store, session).await.ends_with(&rows));
+        assert_eq!(turn_ids(&store, session).await.len(), 1);
+    }
+
+    /// The latest boundary and everything after it are the view, whatever their age; an older
+    /// boundary before it is a row like any other and goes by its own stamp.
+    #[tokio::test]
+    async fn the_latest_boundary_and_the_view_after_it_stay_whatever_their_age() {
+        let store = Store::for_test().await;
+        let session = bare_session(&store).await;
+        let first_boundary = boundary(&store, session).await;
+        stamp(
+            &store,
+            "UPDATE messages SET created_at = ?1 WHERE id = ?2",
+            days_ago(100),
+            first_boundary.to_string(),
+        )
+        .await;
+        let latest_boundary = boundary(&store, session).await;
+        stamp(
+            &store,
+            "UPDATE messages SET created_at = ?1 WHERE id = ?2",
+            days_ago(100),
+            latest_boundary.to_string(),
+        )
+        .await;
+        let (live, live_rows) = closed_turn(&store, session, "live", days_ago(100)).await;
+
+        let sweep = store
+            .delete_expired_turns(thirty_days_ago(), None)
+            .await
+            .expect("sweep");
+
+        assert_eq!(sweep, TurnSweep { turns: 0, rows: 1 });
+        let mut expected = vec![latest_boundary];
+        expected.extend(live_rows);
+        assert_eq!(row_ids(&store, session).await, expected);
+        assert_eq!(turn_ids(&store, session).await, vec![live]);
+    }
+
+    /// A compaction between two rounds of one turn puts a boundary inside it. The rows before the
+    /// boundary go when the turn is old enough; the rows after it are the view and stay, and the
+    /// record stays with them.
+    #[tokio::test]
+    async fn a_turn_split_by_a_compaction_inside_it_keeps_its_rows_after_the_boundary() {
+        use crate::conversation::{Event, Message};
+        let store = Store::for_test().await;
+        let session = bare_session(&store).await;
+        let (turn, early_rows) = closed_turn(&store, session, "early", days_ago(100)).await;
+        let boundary = boundary(&store, session).await;
+        store
+            .save_event(
+                session,
+                &Event::Append(Message::assistant_text("after the boundary")),
+                Some(turn),
+            )
+            .await
+            .expect("save");
+        let late_row = store
+            .last_log_row(session)
+            .await
+            .expect("last row")
+            .expect("a row");
+
+        let sweep = store
+            .delete_expired_turns(thirty_days_ago(), None)
+            .await
+            .expect("sweep");
+
+        assert_eq!(sweep, TurnSweep { turns: 0, rows: 2 });
+        assert_eq!(row_ids(&store, session).await, vec![boundary, late_row]);
+        assert!(
+            !row_ids(&store, session)
+                .await
+                .iter()
+                .any(|id| early_rows.contains(id))
+        );
+        assert_eq!(turn_ids(&store, session).await, vec![turn]);
+    }
+
+    /// A row no turn names (one written before turns were recorded, or whose turn record is
+    /// gone) is dated by its own stamp; a turn that no process closed is dated by its start.
+    #[tokio::test]
+    async fn rows_no_turn_names_and_turns_nobody_closed_go_by_the_stamp_they_have() {
+        use crate::conversation::{Event, Message};
+        let store = Store::for_test().await;
+        let session = bare_session(&store).await;
+        let mut ids = Vec::new();
+        for (words, turn) in [("untracked", None), ("dangling", Some(Uuid::new_v4()))] {
+            store
+                .save_event(session, &Event::Append(Message::user(words)), turn)
+                .await
+                .expect("save");
+            let id = store
+                .last_log_row(session)
+                .await
+                .expect("last row")
+                .expect("a row");
+            stamp(
+                &store,
+                "UPDATE messages SET created_at = ?1 WHERE id = ?2",
+                days_ago(100),
+                id.to_string(),
+            )
+            .await;
+            ids.push(id);
+        }
+        store
+            .save_event(
+                session,
+                &Event::Append(Message::user("untracked but recent")),
+                None,
+            )
+            .await
+            .expect("save");
+        let recent_untracked = store
+            .last_log_row(session)
+            .await
+            .expect("last row")
+            .expect("a row");
+        // Opened a hundred days ago and never closed: the process died under it.
+        let crashed = Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(session, crashed, "client", &days_ago(100))
+            .await
+            .expect("open");
+        store
+            .save_event(
+                session,
+                &Event::Append(Message::user("crashed")),
+                Some(crashed),
+            )
+            .await
+            .expect("save");
+        let boundary = boundary(&store, session).await;
+
+        let sweep = store
+            .delete_expired_turns(thirty_days_ago(), None)
+            .await
+            .expect("sweep");
+
+        assert_eq!(sweep, TurnSweep { turns: 1, rows: 3 });
+        assert_eq!(row_ids(&store, session).await, vec![
+            recent_untracked,
+            boundary
+        ]);
+        assert!(turn_ids(&store, session).await.is_empty());
+    }
+
+    /// Scoped to one session, the sweep is that session's turn-start housekeeping and leaves
+    /// every other session as the store-wide sweep will find it.
+    #[tokio::test]
+    async fn a_scoped_sweep_leaves_other_sessions_alone() {
+        let store = Store::for_test().await;
+        let swept = bare_session(&store).await;
+        let other = bare_session(&store).await;
+        for session in [swept, other] {
+            closed_turn(&store, session, "old", days_ago(100)).await;
+            boundary(&store, session).await;
+        }
+        let other_rows = row_ids(&store, other).await;
+
+        let sweep = store
+            .delete_expired_turns(thirty_days_ago(), Some(swept))
+            .await
+            .expect("sweep");
+
+        assert_eq!(sweep, TurnSweep { turns: 1, rows: 2 });
+        assert_eq!(row_ids(&store, swept).await.len(), 1, "the boundary alone");
+        assert_eq!(row_ids(&store, other).await, other_rows);
+        assert_eq!(turn_ids(&store, other).await.len(), 1);
+    }
+
+    /// A sweep reads a session's rows only once its oldest row below the boundary is expired,
+    /// since rows are appended in time order. The one row that can be older than an earlier one,
+    /// a boundary a compaction wrote inside a turn, waits for that turn's end to age and goes with
+    /// its rows. Pinned so the slack stays deliberate.
+    #[tokio::test]
+    async fn a_sweep_reads_nothing_while_the_oldest_row_is_inside_the_window() {
+        use crate::conversation::{Event, Message};
+        let store = Store::for_test().await;
+        let session = bare_session(&store).await;
+        let (turn, turn_rows) = closed_turn(&store, session, "fresh", days_ago(1)).await;
+        let inner_boundary = boundary(&store, session).await;
+        stamp(
+            &store,
+            "UPDATE messages SET created_at = ?1 WHERE id = ?2",
+            days_ago(100),
+            inner_boundary.to_string(),
+        )
+        .await;
+        store
+            .save_event(
+                session,
+                &Event::Append(Message::assistant_text("more")),
+                Some(turn),
+            )
+            .await
+            .expect("save");
+        let latest = boundary(&store, session).await;
+
+        for scope in [Some(session), None] {
+            let sweep = store
+                .delete_expired_turns(thirty_days_ago(), scope)
+                .await
+                .expect("sweep");
+            assert_eq!(sweep, TurnSweep::default(), "the oldest row is a day old");
+        }
+        assert!(row_ids(&store, session).await.contains(&inner_boundary));
+
+        stamp(
+            &store,
+            "UPDATE turns SET ended_at = ?1 WHERE id = ?2",
+            days_ago(100),
+            turn.to_string(),
+        )
+        .await;
+        let sweep = store
+            .delete_expired_turns(thirty_days_ago(), Some(session))
+            .await
+            .expect("sweep");
+        // The turn's three rows and the boundary inside it, all below the latest boundary.
+        assert_eq!(sweep, TurnSweep { turns: 1, rows: 4 }, "{turn_rows:?}");
+        assert_eq!(row_ids(&store, session).await, vec![latest]);
+    }
+
+    /// An inbox item or a background outcome is dated by when it left the pending state, since
+    /// that is when a turn consumed its words; one still pending is a turn's to deliver.
+    #[tokio::test]
+    async fn what_a_deleted_turn_consumed_goes_with_it_and_what_waits_stays() {
+        use crate::{
+            conversation::{Event, Message},
+            store::{
+                background::{BackgroundTask, TaskStatus},
+                inbox::{InboxClass, NewInboxItem},
+            },
+        };
+        let store = Store::for_test().await;
+        let session = bare_session(&store).await;
+        let inbox = store.inbox_store();
+        let mut items = Vec::new();
+        for body in [
+            "delivered long ago",
+            "withdrawn long ago",
+            "pending",
+            "delivered today",
+        ] {
+            let item = NewInboxItem::from_parts(session, InboxClass::Followup, None, body)
+                .expect("a body");
+            items.push(inbox.enqueue(item).await.expect("enqueue").id);
+        }
+        let (delivered_old, withdrawn_old, pending_old, delivered_new) =
+            (items[0], items[1], items[2], items[3]);
+        store
+            .save_event_marking_inbox(
+                session,
+                &Event::Append(Message::user("carrying two")),
+                &[delivered_old, delivered_new],
+                None,
+            )
+            .await
+            .expect("append");
+        inbox.mark_delivered(session).await.expect("deliver");
+        inbox.withdraw(withdrawn_old, None).await.expect("withdraw");
+        for (column, id) in [
+            ("delivered_at", delivered_old),
+            ("withdrawn_at", withdrawn_old),
+            ("created_at", pending_old),
+        ] {
+            let sql = match column {
+                "delivered_at" => "UPDATE inbox_items SET delivered_at = ?1 WHERE id = ?2",
+                "withdrawn_at" => "UPDATE inbox_items SET withdrawn_at = ?1 WHERE id = ?2",
+                _ => "UPDATE inbox_items SET created_at = ?1 WHERE id = ?2",
+            };
+            stamp(&store, sql, days_ago(100), id.to_string()).await;
+        }
+        let background = store.background_store();
+        let task = |id: &str| BackgroundTask {
+            id: id.to_string(),
+            session_id: session,
+            tool: "shell_execute".to_string(),
+            label: id.to_string(),
+            status: TaskStatus::Running,
+            outcome: None,
+            scratchpad_entry: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            announced_at: None,
+            delivered_at: None,
+            subagent_id: None,
+        };
+        for id in ["delivered-old", "finished-undelivered", "running"] {
+            background
+                .start_background_task(&task(id))
+                .await
+                .expect("start");
+        }
+        for id in ["delivered-old", "finished-undelivered"] {
+            background
+                .finish_background_task(id, TaskStatus::Completed, Some("out".to_string()), None)
+                .await
+                .expect("finish");
+        }
+        background
+            .mark_background_tasks_delivered(&["delivered-old".to_string()])
+            .await
+            .expect("deliver");
+        stamp(
+            &store,
+            "UPDATE background_tasks SET delivered_at = ?1 WHERE id = ?2",
+            days_ago(100),
+            "delivered-old".to_string(),
+        )
+        .await;
+        stamp(
+            &store,
+            "UPDATE background_tasks SET finished_at = ?1 WHERE id = ?2",
+            days_ago(100),
+            "finished-undelivered".to_string(),
+        )
+        .await;
+
+        store
+            .delete_expired_turns(thirty_days_ago(), None)
+            .await
+            .expect("sweep");
+
+        assert!(inbox.get(delivered_old).await.expect("get").is_none());
+        assert!(inbox.get(withdrawn_old).await.expect("get").is_none());
+        assert!(inbox.get(pending_old).await.expect("get").is_some());
+        assert!(inbox.get(delivered_new).await.expect("get").is_some());
+        let mut remaining: Vec<String> = background
+            .list_background_tasks(session)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|task| task.id)
+            .collect();
+        remaining.sort();
+        assert_eq!(remaining, vec!["finished-undelivered", "running"]);
+    }
+
+    /// The words of a deleted turn leave the search index with its rows, and an image only it
+    /// carried leaves the blob table.
+    #[tokio::test]
+    async fn the_search_index_and_the_blobs_forget_a_deleted_turn() {
+        use crate::{
+            conversation::{Event, Message},
+            image::ImageSource,
+        };
+        let store = Store::for_test().await;
+        let session = bare_session(&store).await;
+        let turn = Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(session, turn, "client", &days_ago(100))
+            .await
+            .expect("open");
+        store
+            .save_event(
+                session,
+                &Event::Append(Message::user_with_images("xylophone marmalade", vec![
+                    ImageSource::Base64 {
+                        media_type: "image/png".to_string(),
+                        data: "aGVsbG8=".to_string(),
+                    },
+                ])),
+                Some(turn),
+            )
+            .await
+            .expect("save");
+        let hash = blobs::content_hash(b"hello");
+        boundary(&store, session).await;
+        assert_eq!(
+            store
+                .search_sessions("xylophone", 10, false)
+                .await
+                .expect("search")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .load_blobs(vec![hash.clone()])
+                .await
+                .expect("blobs")
+                .len(),
+            1
+        );
+
+        store
+            .delete_expired_turns(thirty_days_ago(), None)
+            .await
+            .expect("sweep");
+
+        assert!(
+            store
+                .search_sessions("xylophone", 10, false)
+                .await
+                .expect("search")
+                .is_empty()
+        );
+        assert!(
+            store
+                .load_blobs(vec![hash])
+                .await
+                .expect("blobs")
+                .is_empty()
+        );
+    }
+
+    /// The check that decides whether a compaction has to run first: true for an expired turn in
+    /// the view, whether closed or crashed; never for the boundary row, the open turn, or turns
+    /// below the view, which the sweep can take as they are.
+    #[tokio::test]
+    async fn the_view_holds_an_expired_turn_only_when_one_lies_at_or_after_the_boundary() {
+        use crate::conversation::{Event, Message};
+        let store = Store::for_test().await;
+        let cutoff = thirty_days_ago();
+        let holds = |session| {
+            let store = store.clone();
+            async move {
+                store
+                    .view_holds_a_turn_older_than(session, cutoff)
+                    .await
+                    .expect("check")
+            }
+        };
+
+        let never_compacted = bare_session(&store).await;
+        closed_turn(&store, never_compacted, "old", days_ago(100)).await;
+        assert!(holds(never_compacted).await, "the whole log is the view");
+
+        let compacted = bare_session(&store).await;
+        closed_turn(&store, compacted, "old", days_ago(100)).await;
+        let boundary_row = boundary(&store, compacted).await;
+        stamp(
+            &store,
+            "UPDATE messages SET created_at = ?1 WHERE id = ?2",
+            days_ago(100),
+            boundary_row.to_string(),
+        )
+        .await;
+        assert!(
+            !holds(compacted).await,
+            "an old turn below the view and an old boundary heading it are not reasons"
+        );
+        closed_turn(&store, compacted, "fresh", days_ago(1)).await;
+        assert!(!holds(compacted).await);
+        let open = Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(compacted, open, "client", &chrono::Utc::now().to_rfc3339())
+            .await
+            .expect("open");
+        store
+            .save_event(compacted, &Event::Append(Message::user("now")), Some(open))
+            .await
+            .expect("save");
+        assert!(!holds(compacted).await, "the turn in flight is not old");
+        closed_turn(&store, compacted, "aged in the view", days_ago(100)).await;
+        assert!(holds(compacted).await);
+
+        let crashed_in_view = bare_session(&store).await;
+        boundary(&store, crashed_in_view).await;
+        let crashed = Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(crashed_in_view, crashed, "client", &days_ago(100))
+            .await
+            .expect("open");
+        store
+            .save_event(
+                crashed_in_view,
+                &Event::Append(Message::user("x")),
+                Some(crashed),
+            )
+            .await
+            .expect("save");
+        assert!(
+            holds(crashed_in_view).await,
+            "a turn nobody closed is dated by its start"
         );
     }
 }

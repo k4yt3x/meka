@@ -210,10 +210,10 @@ If you do want a time window, set it explicitly:
 
 ```toml
 [session]
-retention = "30d"   # delete sessions not updated in 30 days, at startup
+retention = "30d"   # delete sessions not updated in 30 days
 ```
 
-With that set, meka deletes matching sessions when the agent starts and says so at `warn` level, so a deletion you configured is still a deletion you see. A session another meka process has open is spared, and so is the one you are resuming with `-c` or `-r`, however old it is; so is a [pinned](#pinning-a-session) session, and one with a scheduled job ahead of it. Unset (the default) keeps everything forever.
+With that set, meka deletes matching sessions when the agent starts, and then every hour for as long as `meka serve`, `meka acp` or the screen stays up, and says so at `warn` level, so a deletion you configured is still a deletion you see. A session another meka process has open is spared, and so is the one you are resuming with `-c` or `-r`, however old it is; so is a [pinned](#pinning-a-session) session, and one with a scheduled job ahead of it. Unset (the default) keeps everything forever.
 
 To prune on demand instead, remove on your own schedule:
 
@@ -229,13 +229,26 @@ A session is locked from the moment it exists: the lock is taken before the row 
 
 No deletion touches a session another meka process has open. Naming one by id fails and says so; `--all`, `--older-than-days` and the startup sweep skip it and report how many they left behind. This matters most for the startup sweep, because only turns bump a session's timestamp (resuming does not), so a screen left at its prompt past the window looks expired while somebody is sitting in front of it.
 
+### Turn retention
+
+A session that is used for months, an assistant behind `meka serve` say, keeps every conversation it ever had unless told otherwise. `turn_retention` sets a window on the turns inside a session, where `retention` sets one on sessions:
+
+```toml
+[session]
+turn_retention = "90d"   # delete turns that ended over 90 days ago, once summarized
+```
+
+The sweep takes only what a compaction has summarized: the turns before the session's latest compaction, since the summary is what stands in for them, and never the turns the model is still working from. When one of those is older than the window, the next turn compacts first, keeping no rounds verbatim and quoting none, and the sweep takes it afterward; `turn_retention` therefore needs `auto_compact` on. It runs at startup, at the start of each turn for that turn's session, and hourly while a long-lived host stays up, and reports what it took at `warn` level.
+
+A turn goes whole: its messages, its record, its words in the search index and the images only it carried. Inbox items and background outcomes go once they have been delivered or withdrawn for longer than the window. Scratchpad entries and memories stay, since they are the agent's own notes rather than the conversation. A fork copies what has survived, and an import brings in turns the next sweep will date like any other. What remains of a deleted turn is whatever the compaction summary said about it, which is the model's memory and the only thing retention cannot take.
+
 See [Config file](../configuration/config-file.md#session) for details.
 
 ## Context management
 
 Every request carries the whole conversation as it stands, tool calls and their results included. Nothing is dropped by count: the context ceiling and compaction are the only bound. Once the occupancy the provider last reported passes `context_ceiling_percent` of the profile's `context_window` (85% by default), auto-compaction summarizes the older turns and keeps the recent ones verbatim, between turns and between the tool rounds of one turn. See [`[session]`](../configuration/config-file.md#session) for the switch and the percent.
 
-The full history stays in the store either way. After a compaction a request carries the summary and the kept tail, and the tool catalog, skill list and MCP server instructions are restated in full on the next turn.
+The full history stays in the store either way, unless [`turn_retention`](#turn-retention) is set. After a compaction a request carries the summary and the kept tail, and the tool catalog, skill list and MCP server instructions are restated in full on the next turn.
 
 With `auto_compact = false` the conversation grows until the provider rejects a request for exceeding its window, which fails that turn; `/compact` summarizes on demand.
 
@@ -269,7 +282,7 @@ Note that an *automatic* compaction runs a checkpoint too, unattended, and can w
 
 Compaction preserves scratchpad entries, copies the open [checklist](checklist.md) into the summary verbatim, and re-injects environment context so the agent isn't disoriented afterwards. The tool catalog, skill list, and MCP server instructions are restated in full on the next turn, since the messages that carried them may have been summarized away. Tools loaded via `tool_load` stay loaded; the deferred-tool active set is snapshotted into the compaction boundary. If a detail was dropped, the model can `conversation_search` / `conversation_read` the full pre-compaction history, which stays on disk.
 
-Internally, compaction does not delete pre-compaction rows from the store. It appends a `compact_boundary` row to the `messages` table; the materialized view is reconstructed from the event log, so the persisted log itself stays append-only. A resume reads that log from its last `compact_boundary` row: nothing before it can reach the view, so opening a session costs the same however long its history is. `conversation_search`, `conversation_read`, `GET /messages`, a rewind and an export still read the whole log.
+Internally, compaction does not delete pre-compaction rows from the store. It appends a `compact_boundary` row to the `messages` table; the materialized view is reconstructed from the event log, so the persisted log itself stays append-only until [turn retention](#turn-retention), if set, takes the rows a boundary has superseded. A resume reads that log from its last `compact_boundary` row: nothing before it can reach the view, so opening a session costs the same however long its history is. `conversation_search`, `conversation_read`, `GET /messages`, a rewind and an export still read the whole log.
 
 #### When the summarizer runs instead
 
@@ -318,7 +331,14 @@ Once a turn has been measured, the per-turn context block carries a `[Context bu
 Using ~84k of 200k tokens (42%). Auto-compaction at 85%.
 ```
 
-What happens at the ceiling (a summary between turns or between two tool rounds, which loses detail while recent rounds may be kept verbatim, and what it omits stays reachable through `conversation_search` and `conversation_read`) is stated once in the system prompt rather than on every turn.
+What happens at the ceiling (a summary between turns or between two tool rounds, which loses detail while recent rounds may be kept verbatim, and what it omits stays reachable through `conversation_search` and `conversation_read`) is stated once in the system prompt rather than on every turn. With `turn_retention` set, that sentence bounds the reach by the window, and says that older turns are deleted and that what must outlive them belongs in memory. The context block then carries the date the record starts at, which moves every turn:
+
+```text
+[Retention]
+Turns older than 90 days are deleted; nothing before Thu, 16 Jul 2026 09:12:34 +0800 is on record.
+```
+
+The date is in the same zone and form as the block's own `Date:` line, so the two read against each other.
 
 The agent is expected to budget its own reading and to decide when a task will fit, so it needs the same number the harness uses. Without it, those are guesses. The line is suppressed when the window is unknown, and on the first turn of a session, when there is no measurement yet rather than a genuine zero.
 
@@ -593,7 +613,7 @@ meka repairs a rejection caused by content added since the last request the prov
 
 Neither step changes the shape of the conversation: a tool call stays a tool call and its result stays its result, marked as an error. That is deliberate. Removing one half of a pair is the one thing every provider refuses outright, so a repair that could do it might turn a recoverable rejection into a permanent one. The model sees a failed tool call, which it already knows how to read, with the arguments it sent quoted in the failure so it can tell which call not to repeat.
 
-Nothing a repair removes is deleted. The log is append-only, so the superseded messages stay on disk and [`meka session export`](#exporting-a-session) renders them above a marker saying what replaced them. Use `--format json` to get a removed attachment back: the markdown export writes each message as its text and leaves image blocks out. Only the conversation the model sees is changed.
+Nothing a repair removes is deleted. The log is append-only (within [turn retention](#turn-retention), when set), so the superseded messages stay on disk and [`meka session export`](#exporting-a-session) renders them above a marker saying what replaced them. Use `--format json` to get a removed attachment back: the markdown export writes each message as its text and leaves image blocks out. Only the conversation the model sees is changed.
 
 Whatever is removed is restored untouched if the retry carrying it is refused too. That restore is what bounds the risk, and it bounds it only in that direction: each step spends a fresh retry sequence rather than a single request, and a step whose retry *succeeds* keeps the loss, so the trigger is deliberately narrow. The words you typed are never rewritten by either step, though an image you attached to that prompt is exactly what the first one removes, replacing it with a note. Notes meka inserts into a conversation are prefixed `[meka harness]`.
 

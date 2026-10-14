@@ -478,6 +478,12 @@ pub(crate) struct AgentOptions {
     /// unconditional path for [`crate::session::CompactOrigin::Emergency`] regardless of
     /// this flag.
     pub(crate) compact_checkpoint: bool,
+    /// How long a turn is kept once it has ended (`[session].turn_retention`), or `None` to keep
+    /// every turn for the life of its session. A turn older than this in the model's view is
+    /// compacted at the next turn's start so the sweep that follows can take it; the configuration
+    /// refuses the window with [`Self::auto_compact`] off, since that is a compaction nobody asked
+    /// for.
+    pub(crate) turn_retention: Option<std::time::Duration>,
     /// User-authored instructions, surfaced in the system prompt and to sub-agents. Per-run
     /// `--instructions` overrides the config-file value; a session's copy carries the files
     /// `[instructions].files` names after it.
@@ -563,13 +569,18 @@ pub(crate) enum CompactOrigin {
     Requested,
     /// The provider refused the request as too large.
     Emergency,
+    /// A turn in the model's view is older than `[session].turn_retention`, so the sweep that
+    /// deletes it needs a summary to stand in for it first.
+    Retention,
 }
 impl CompactOrigin {
     /// The kind Claude Code's compaction headers report for this origin.
     pub(crate) fn kind(self) -> crate::provider::CompactionKind {
         match self {
             Self::Manual | Self::Requested => crate::provider::CompactionKind::Manual,
-            Self::Reactive | Self::Proactive => crate::provider::CompactionKind::Auto,
+            Self::Reactive | Self::Proactive | Self::Retention => {
+                crate::provider::CompactionKind::Auto
+            }
             Self::Emergency => crate::provider::CompactionKind::Reactive,
         }
     }
@@ -626,6 +637,7 @@ impl AgentOptions {
             context_ceiling_percent: config.context_ceiling_percent,
             auto_compact: config.auto_compact,
             compact_checkpoint: config.compact_checkpoint,
+            turn_retention: config.turn_retention,
             user_instructions,
             mcp_grace: config.mcp_grace,
             system_prompt_override: None,
@@ -643,6 +655,7 @@ impl AgentOptions {
             context_ceiling_percent: crate::config::DEFAULT_CONTEXT_CEILING_PERCENT,
             auto_compact: false,
             compact_checkpoint: false,
+            turn_retention: None,
             user_instructions: None,
             mcp_grace: std::time::Duration::ZERO,
             system_prompt_override: None,

@@ -847,10 +847,17 @@ pub(crate) struct SystemPromptInputs<'a> {
     /// Whether the conversation is compacted once past the ceiling `[Context budget]` names. Off,
     /// a request past the window fails the turn.
     pub(crate) auto_compact: bool,
+    /// `[session].turn_retention`: how long a turn stays on record, or `None` for the life of the
+    /// session. Stated here, where the policy is, while `[Retention]` in the context block carries
+    /// the date the window reaches back to.
+    pub(crate) turn_retention: Option<std::time::Duration>,
     /// Whether `conversation_search` and `conversation_read` are registered, so the prompt can say
     /// that a summary's omissions stay readable only where they do.
     pub(crate) conversation_search: bool,
     pub(crate) conversation_read: bool,
+    /// Whether `memory_write` is registered, so the retention sentence can send what must outlive
+    /// the window somewhere that exists.
+    pub(crate) memory_write: bool,
 }
 
 impl<'a> SystemPromptInputs<'a> {
@@ -864,8 +871,10 @@ impl<'a> SystemPromptInputs<'a> {
             background: None,
             scheduling: false,
             auto_compact: false,
+            turn_retention: None,
             conversation_search: false,
             conversation_read: false,
+            memory_write: false,
         }
     }
 }
@@ -889,8 +898,10 @@ pub(crate) fn build_system_prompt(inputs: SystemPromptInputs<'_>) -> String {
         background,
         scheduling,
         auto_compact,
+        turn_retention,
         conversation_search,
         conversation_read,
+        memory_write,
     } = inputs;
     let mut prompt = String::from(
         "meka is the harness this conversation runs in: it runs the tools, enforces the \
@@ -981,17 +992,42 @@ pub(crate) fn build_system_prompt(inputs: SystemPromptInputs<'_>) -> String {
     } else {
         "Auto-compaction is off, so a request past the window fails the turn."
     });
-    prompt.push_str(match (conversation_search, conversation_read) {
-        (true, true) => {
-            " What a summary omits stays readable: `conversation_search` finds it and \
-             `conversation_read` reads it by message index."
+    // The window rides the tool sentence when there is one, since it bounds exactly what those
+    // tools reach; without one the retention sentence names the window itself.
+    let window = turn_retention.map(crate::text::format_duration_words);
+    let readable_for = window
+        .as_deref()
+        .map(|window| format!(" for {window}"))
+        .unwrap_or_default();
+    let reach = match (conversation_search, conversation_read) {
+        (true, true) => format!(
+            " What a summary omits stays readable{readable_for}: `conversation_search` finds it \
+             and `conversation_read` reads it by message index."
+        ),
+        (true, false) => {
+            format!(
+                " What a summary omits stays findable{readable_for} with `conversation_search`."
+            )
         }
-        (true, false) => " What a summary omits stays findable with `conversation_search`.",
-        (false, true) => {
-            " What a summary omits stays readable with `conversation_read`, by message index."
+        (false, true) => format!(
+            " What a summary omits stays readable{readable_for} with `conversation_read`, by \
+             message index."
+        ),
+        (false, false) => String::new(),
+    };
+    prompt.push_str(&reach);
+    if let Some(window) = window {
+        if reach.is_empty() {
+            prompt.push_str(&format!(" Turns older than {window} are deleted"));
+        } else {
+            prompt.push_str(" Older turns are deleted");
         }
-        (false, false) => "",
-    });
+        prompt.push_str(if memory_write {
+            "; save what must outlive them to memory."
+        } else {
+            "."
+        });
+    }
     prompt.push_str("\n\n");
 
     prompt.push_str("## Environment\n\n");
@@ -1250,6 +1286,9 @@ pub(crate) struct TurnContext<'a> {
     pub(crate) roots: &'a [std::path::PathBuf],
     pub(crate) world_state: &'a str,
     pub(crate) budget: Option<ContextBudget>,
+    /// `[session].turn_retention`, for the `[Retention]` section that dates where the record
+    /// starts; `None` renders no section.
+    pub(crate) turn_retention: Option<std::time::Duration>,
     pub(crate) background: &'a [crate::store::background::BackgroundTask],
     /// Finished background work delivered by this turn, already rendered, or `None`.
     pub(crate) outcomes: Option<&'a str>,
@@ -1273,6 +1312,7 @@ pub(crate) fn build_turn_context(context: TurnContext<'_>) -> String {
         roots,
         world_state,
         budget,
+        turn_retention,
         background,
         outcomes,
         resumed,
@@ -1301,6 +1341,12 @@ pub(crate) fn build_turn_context(context: TurnContext<'_>) -> String {
         sections.push(rendered);
     }
 
+    // After the budget, with which it describes what the model can reach, and apart from it,
+    // since the budget line is suppressed while the window is unmeasured and the sweep is not.
+    if let Some(window) = turn_retention {
+        sections.push(render_retention(window, chrono::Local::now()));
+    }
+
     if !background.is_empty() {
         sections.push(render_background_section(background));
     }
@@ -1321,6 +1367,18 @@ pub(crate) fn build_turn_context(context: TurnContext<'_>) -> String {
     }
 
     format!("<context>\n{}</context>", sections.join("\n"))
+}
+
+/// The `[Retention]` section: the window, and the instant it reaches back to from `now`, in the
+/// zone and form the environment's `Date:` line uses, so the two read against each other. The
+/// horizon rather than the oldest surviving turn, which would cost a query per turn to say the
+/// same thing to within the sweep's lag.
+fn render_retention(window: std::time::Duration, now: chrono::DateTime<chrono::Local>) -> String {
+    let horizon = crate::text::horizon_before(now, window).to_rfc2822();
+    let window = crate::text::format_duration_words(window);
+    format!(
+        "[Retention]\nTurns older than {window} are deleted; nothing before {horizon} is on record.\n"
+    )
 }
 
 /// Shown on the first turn after a conversation is restored from disk, and then never again.
@@ -3939,6 +3997,7 @@ mod tests {
             roots: &[],
             world_state: "",
             budget: None,
+            turn_retention: None,
             background: &[running_task("7f3a1c22", "cargo test --all")],
             outcomes: None,
             resumed: false,
@@ -3959,6 +4018,7 @@ mod tests {
             roots: &[],
             world_state: "",
             budget: None,
+            turn_retention: None,
             background: &[],
             outcomes: None,
             resumed: false,
@@ -3982,6 +4042,7 @@ mod tests {
             roots: &[],
             world_state: "",
             budget: None,
+            turn_retention: None,
             background: &[finished],
             outcomes: None,
             resumed: false,
@@ -4116,8 +4177,10 @@ mod tests {
             }),
             scheduling: true,
             auto_compact: true,
+            turn_retention: None,
             conversation_search: true,
             conversation_read: true,
+            memory_write: false,
         });
         assert!(full.contains("## Background work"), "{full}");
         assert!(
@@ -4157,8 +4220,10 @@ mod tests {
             }),
             scheduling: true,
             auto_compact: true,
+            turn_retention: None,
             conversation_search: false,
             conversation_read: false,
+            memory_write: false,
         });
         assert!(
             one_shot.contains("This run ends after your answer"),
@@ -4202,6 +4267,84 @@ mod tests {
             "{read_only}"
         );
         assert!(!read_only.contains("conversation_search"), "{read_only}");
+    }
+
+    /// The policy sits in the system prompt, once, in the sentence that already bounds what the
+    /// conversation tools reach; the context block carries the moving date and nothing else.
+    #[test]
+    fn the_prompt_states_the_turn_window_and_the_block_dates_the_record() {
+        let window = std::time::Duration::from_secs(90 * 86_400);
+        let with_tools = build_system_prompt(SystemPromptInputs {
+            turn_retention: Some(window),
+            conversation_search: true,
+            conversation_read: true,
+            memory_write: true,
+            ..SystemPromptInputs::for_test(true, None)
+        });
+        assert!(
+            with_tools.contains(
+                "What a summary omits stays readable for 90 days: `conversation_search` finds it \
+                 and `conversation_read` reads it by message index. Older turns are deleted; save \
+                 what must outlive them to memory."
+            ),
+            "{with_tools}"
+        );
+        let bare = build_system_prompt(SystemPromptInputs {
+            turn_retention: Some(std::time::Duration::from_secs(36 * 3_600)),
+            ..SystemPromptInputs::for_test(true, None)
+        });
+        assert!(
+            bare.contains("Turns older than 36 hours are deleted.\n\n"),
+            "{bare}"
+        );
+        assert!(!bare.contains("outlive them to memory"), "{bare}");
+        let unset = build_system_prompt(SystemPromptInputs::for_test(true, None));
+        assert!(!unset.contains("deleted"), "{unset}");
+
+        let now = chrono::Local::now();
+        let section = render_retention(window, now);
+        let expected_horizon = (now - chrono::TimeDelta::days(90)).to_rfc2822();
+        assert_eq!(
+            section,
+            format!(
+                "[Retention]\nTurns older than 90 days are deleted; nothing before \
+                 {expected_horizon} is on record.\n"
+            )
+        );
+        let block = build_turn_context(TurnContext {
+            permission: Permission::Read,
+            approvals: false,
+            vision: false,
+            one_shot: false,
+            cwd: std::path::Path::new("."),
+            roots: &[],
+            world_state: "",
+            budget: None,
+            turn_retention: Some(window),
+            background: &[],
+            outcomes: None,
+            resumed: false,
+        });
+        let retention = block.find("[Retention]").expect("the section");
+        let date = block.find("Date: ").expect("the environment's date line");
+        assert!(retention < date, "{block}");
+        assert!(
+            !build_turn_context(TurnContext {
+                permission: Permission::Read,
+                approvals: false,
+                vision: false,
+                one_shot: false,
+                cwd: std::path::Path::new("."),
+                roots: &[],
+                world_state: "",
+                budget: None,
+                turn_retention: None,
+                background: &[],
+                outcomes: None,
+                resumed: false,
+            })
+            .contains("[Retention]")
+        );
     }
 
     #[test]
@@ -4334,6 +4477,7 @@ mod tests {
             roots: &[],
             world_state: "",
             budget: None,
+            turn_retention: None,
             background: &[],
             outcomes: None,
             resumed: false,
@@ -4360,6 +4504,7 @@ mod tests {
             roots: &[],
             world_state: "",
             budget: None,
+            turn_retention: None,
             background: &[],
             outcomes: None,
             resumed: true,
@@ -4478,6 +4623,7 @@ mod tests {
             roots: &[],
             world_state: "[Skills]\nnone",
             budget: None,
+            turn_retention: None,
             background: &[],
             outcomes: Some("[Background task reporting]\n7f3a1c22 finished."),
             resumed: false,
@@ -4506,6 +4652,7 @@ mod tests {
                 compact_at_percent: Some(80),
                 generation: 0,
             }),
+            turn_retention: None,
             background: &[],
             outcomes: None,
             resumed: false,
@@ -4524,6 +4671,7 @@ mod tests {
             roots: &[],
             world_state: "",
             budget: None,
+            turn_retention: None,
             background: &[],
             outcomes: None,
             resumed: false,
@@ -4543,6 +4691,7 @@ mod tests {
             roots: &[],
             world_state: "",
             budget: None,
+            turn_retention: None,
             background: &[],
             outcomes: None,
             resumed: false,

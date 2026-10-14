@@ -109,8 +109,9 @@ next opened, which it was not before.
 
 An outcome that rides a turn is part of that turn's message, so `/rewind` over that exchange takes
 the report with it. The task row is already stamped as reported and is not handed out again, so the
-outcome is gone rather than redelivered. `meka session export` still has it: the log is append-only,
-and a rewind changes what the model sees rather than what was recorded.
+outcome is gone rather than redelivered. `meka session export` still has it: the log is append-only
+(within `[session].turn_retention`, when set), and a rewind changes what the model sees rather than
+what was recorded.
 
 ## Esc and Ctrl+C
 

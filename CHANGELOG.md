@@ -7,15 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.74.0] - 2026-10-14
+
 ### Added
 
 - The screen closes each turn with a row saying when it ended and how long it took.
 - `[display].turn_end_summary` picks that row's facts: the time, the duration, the tokens used.
+- `[session].turn_retention` deletes turns past a window once compaction has summarized them.
+- The model is told the turn window; each turn's context block dates where its record starts.
 
 ### Changed
 
 - **Breaking:** a one-shot run prints only the model's last text block, as markdown source.
 - A tool call starts with its summary and a thinking block collapsed; both expand on demand.
+- `[session].retention` also runs hourly while `meka serve`, `meka acp` or the screen stays up.
 
 ### Removed
 
@@ -2664,7 +2669,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.73.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.74.0...HEAD
+[0.74.0]: https://github.com/k4yt3x/meka/compare/0.73.0...0.74.0
 [0.73.0]: https://github.com/k4yt3x/meka/compare/0.72.0...0.73.0
 [0.72.0]: https://github.com/k4yt3x/meka/compare/0.71.0...0.72.0
 [0.71.0]: https://github.com/k4yt3x/meka/compare/0.70.0...0.71.0

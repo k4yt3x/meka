@@ -270,9 +270,14 @@ fn quote_lines(text: &str) -> String {
 /// prompt, and cutting their tail for an empty section would keep fewer rounds for nothing. The
 /// first split spends the whole budget on the tail; only when that head holds received messages
 /// is the tail cut to its share and the copy taken from the wider head.
+///
+/// `quote_received` is off for a retention compaction: the copy takes the newest messages that
+/// fit whatever their date, and its section says the archive holds the rest, both of which the
+/// sweep that follows would make untrue.
 fn split_and_retain(
     view: &[Message],
     keep_recent: bool,
+    quote_received: bool,
     request: Option<&str>,
     context_window: u64,
 ) -> (Vec<Message>, Vec<Message>, Vec<String>) {
@@ -283,10 +288,17 @@ fn split_and_retain(
         // conversation; the summarizer is handed the head alone and would drop the rest on the
         // floor. Honored on the summarizer path anyway by widening what it summarizes.
         let head = view.to_vec();
-        let retained = retained_messages(&head, request, copy_budget);
+        let retained = if quote_received {
+            retained_messages(&head, request, copy_budget)
+        } else {
+            Vec::new()
+        };
         return (head, Vec::new(), retained);
     }
     let full = compute_compaction_split(view, compaction_verbatim_budget(context_window));
+    if !quote_received {
+        return (full.0, full.1, Vec::new());
+    }
     let retained = retained_messages(&full.0, request, copy_budget);
     if retained.is_empty() {
         return (full.0, full.1, retained);
@@ -500,6 +512,11 @@ impl Agent {
                 .as_slice()
                 .last()
                 .is_some_and(|last| last.is_prompt());
+        // A retention compaction exists so the sweep after it can take the turns the summary
+        // stands in for. A tail kept verbatim is re-appended under this turn's id and dated today,
+        // which would carry the oldest rounds past the window for one more cycle, so none is
+        // kept, whatever the checkpoint answered; the split still quotes an unanswered prompt.
+        let keep_recent = keep_recent && request.origin != CompactOrigin::Retention;
 
         // Split into a head to summarize and a recent tail to keep verbatim, and copy the
         // messages received from the head alone: the tail is carried as it is, so a message there
@@ -510,6 +527,7 @@ impl Agent {
         let (to_summarize, to_keep, retained) = split_and_retain(
             messages.as_slice(),
             keep_recent,
+            request.origin != CompactOrigin::Retention,
             request.request_in_flight.as_deref(),
             self.context_window(),
         );
@@ -653,7 +671,8 @@ impl Agent {
         );
 
         // Persist the new compaction-boundary event and the re-appended tail. Pre-compaction rows
-        // stay in the DB unchanged; the event log on disk grows append-only.
+        // stay in the DB unchanged: the log on disk grows append-only until the turn sweep of
+        // `[session].turn_retention` takes what a boundary has superseded.
         let boundary_event = messages
             .events()
             .iter()
@@ -2251,6 +2270,7 @@ mod tests {
             CompactOrigin::Proactive,
             CompactOrigin::Manual,
             CompactOrigin::Requested,
+            CompactOrigin::Retention,
         ] {
             let provider = Arc::new(MockProvider::from_rounds(vec![text_round("plain summary")]));
             let (agent, store) = agent_with_checkpoint(provider, false).await;
@@ -2282,6 +2302,47 @@ mod tests {
 
         assert!(!outcome.kept_recent);
         assert_eq!(messages.len(), 1, "only the summary should remain");
+    }
+
+    /// A retention compaction keeps nothing verbatim whatever the checkpoint answers, and quotes
+    /// no received message, where the same answer on any other origin keeps both.
+    #[tokio::test]
+    async fn a_retention_compaction_keeps_no_tail_and_no_quotes_whatever_the_checkpoint_says() {
+        let mut outcomes = Vec::new();
+        for origin in [CompactOrigin::Retention, CompactOrigin::Requested] {
+            let provider = Arc::new(MockProvider::from_rounds(vec![replace_round(
+                "the whole day",
+                Some(true),
+            )]));
+            let (agent, store) = agent_with_checkpoint(provider, true).await;
+            let mut messages = conversation();
+            let outcome = compact(&agent, &store, &mut messages, CompactRequest {
+                origin,
+                instructions: None,
+                keep_recent: Some(true),
+                request_in_flight: None,
+            })
+            .await;
+            assert_eq!(outcome.source, CompactSource::Checkpoint, "{origin:?}");
+            let summary = messages.as_slice()[0].text_content();
+            outcomes.push((
+                outcome.kept_recent,
+                messages.len(),
+                summary.contains("[Messages received"),
+            ));
+        }
+        let [retention, requested] = outcomes[..] else {
+            unreachable!("two origins");
+        };
+        assert_eq!(
+            retention,
+            (false, 1, false),
+            "summary alone, nothing quoted"
+        );
+        assert!(
+            requested.0 && requested.1 > 1 && requested.2,
+            "{requested:?}"
+        );
     }
 
     /// The first request after a compaction says what set it going, and only that one: Claude
@@ -2660,7 +2721,7 @@ mod tests {
         );
 
         let (head, tail, retained) =
-            split_and_retain(view, true, Some("the trailing prompt"), window);
+            split_and_retain(view, true, true, Some("the trailing prompt"), window);
 
         assert_eq!(retained, vec!["> a rule stated late".to_string()]);
         assert_eq!(tail.len(), 1, "everything but the prompt is summarized");
@@ -2868,7 +2929,7 @@ mod tests {
         let view = messages.as_slice();
         let window = 40_000;
 
-        let (head, tail, retained) = split_and_retain(view, true, Some(prompt), window);
+        let (head, tail, retained) = split_and_retain(view, true, true, Some(prompt), window);
 
         assert!(retained.is_empty(), "{retained:?}");
         let (_, full_tail) =
@@ -2889,7 +2950,7 @@ mod tests {
         let view = messages.as_slice();
         let window = 40_000;
 
-        let (head, tail, retained) = split_and_retain(view, true, None, window);
+        let (head, tail, retained) = split_and_retain(view, true, true, None, window);
 
         assert!(!retained.is_empty());
         let (_, cut_tail) = compute_compaction_split(view, compaction_tail_budget(window));

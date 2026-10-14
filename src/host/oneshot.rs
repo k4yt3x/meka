@@ -211,7 +211,7 @@ pub(crate) async fn run_oneshot(
         tracing::info!("resuming session {id}");
     }
     // After the resume, whose lock is what spares the session this run was asked for.
-    sweep_expired_sessions(&config, &store).await?;
+    sweep_expired(RetentionWindows::from_config(&config), &store).await?;
 
     // The same deps the long-lived hosts build, so all four hosts assemble a session identically.
     let mut shared =

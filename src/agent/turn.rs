@@ -684,6 +684,7 @@ impl Agent {
             roots: &roots,
             world_state,
             budget,
+            turn_retention: self.options.turn_retention,
             background: &background_tasks,
             outcomes,
             resumed,
@@ -848,6 +849,10 @@ impl Agent {
 
         let mut compacted_before_the_loop =
             self.compact_before_the_loop(messages, &cancellation).await;
+        compacted_before_the_loop |= self
+            .compact_for_retention(messages, session_id, &cancellation)
+            .await;
+        self.sweep_expired_turns(session_id).await;
 
         let mut opening = self
             .open_turn(messages, session_id, TurnMaterials {
@@ -982,6 +987,77 @@ impl Agent {
             tracing::warn!("auto-compact failed: {error}");
         }
         true
+    }
+
+    /// Compact first when a turn in the model's view ended longer ago than
+    /// `[session].turn_retention`, so the sweep that follows has a summary to leave in the turn's
+    /// place; whether a compaction was attempted. Runs after the ceiling check, whose compaction
+    /// re-dates what it keeps under this turn, so the two cannot both fire on one start.
+    async fn compact_for_retention(
+        &self,
+        messages: &mut Conversation,
+        session_id: Uuid,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        let Some(window) = self.options.turn_retention else {
+            return false;
+        };
+        if messages.len() <= 1 {
+            return false;
+        }
+        let cutoff = crate::text::horizon_before(chrono::Utc::now(), window);
+        match self
+            .store
+            .view_holds_a_turn_older_than(session_id, cutoff)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                tracing::warn!("failed to read the context's oldest turn for retention: {error}");
+                return false;
+            }
+        }
+        let window = crate::text::format_duration_words(window);
+        tracing::info!("compacting for turn retention: a turn in context ended over {window} ago");
+        let request = CompactRequest {
+            origin: CompactOrigin::Retention,
+            instructions: Some(format!(
+                "Turns older than {window} are deleted once this summary stands in for them; \
+                 cover what still matters from them."
+            )),
+            keep_recent: Some(false),
+            request_in_flight: None,
+        };
+        if let Err(error) = self
+            .compact_session(messages, request, cancellation.clone())
+            .await
+        {
+            tracing::warn!("retention compaction failed: {error}");
+        }
+        true
+    }
+
+    /// Delete this session's turns past `[session].turn_retention`, so the `[Retention]` line this
+    /// turn is about to carry is true as the model reads it. A deletion the user configured is
+    /// reported at the level the session sweep reports at.
+    async fn sweep_expired_turns(&self, session_id: Uuid) {
+        let Some(window) = self.options.turn_retention else {
+            return;
+        };
+        let cutoff = crate::text::horizon_before(chrono::Utc::now(), window);
+        match self
+            .store
+            .delete_expired_turns(cutoff, Some(session_id))
+            .await
+        {
+            Ok(sweep) if !sweep.is_empty() => {
+                let line = sweep.describe(window);
+                tracing::warn!("{line}");
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!("failed to sweep expired turns: {error}"),
+        }
     }
 
     /// Open the turn: render the world state, read what arrived in the inbox, build the user
@@ -5813,6 +5889,112 @@ mod tests {
             provider.completions().len(),
             0,
             "a one-message conversation has no summary to make, whatever the occupancy says"
+        );
+    }
+
+    /// `[session].turn_retention`, end to end: a turn in the model's view that ended before the
+    /// window is compacted at the next turn's start with no tail kept, the sweep that follows
+    /// takes it whole, and the context block the model then reads dates the record.
+    #[tokio::test]
+    async fn a_turn_past_the_retention_window_is_summarized_and_then_deleted() {
+        use crate::{
+            conversation::Event,
+            provider::mock::{MockProvider, text_round},
+            store::turns::{TurnEnding, TurnUsage},
+        };
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            text_round("the summary"),
+            text_round("the answer"),
+        ]));
+        let (mut agent, store) =
+            agent_that_compacts_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        agent.options.turn_retention = Some(std::time::Duration::from_secs(30 * 86_400));
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session_id);
+        let old = Uuid::new_v4();
+        let a_hundred_days_ago = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
+        store
+            .turn_store()
+            .open_turn(session_id, old, "client", &a_hundred_days_ago)
+            .await
+            .expect("open");
+        // Enough rounds, and long enough, that a compaction keeping its usual tail would leave
+        // some of them standing: on this window the verbatim budget is sixteen thousand tokens,
+        // and the splitter summarizes everything when fewer than four messages would be left to.
+        for exchange in ["xylophone", "marmalade", "quince", "damson"] {
+            let long = format!("{exchange} ").repeat(2_500);
+            for event in [
+                Event::Append(Message::user(&long)),
+                Event::Append(Message::assistant_text(&long)),
+            ] {
+                store
+                    .save_event(session_id, &event, Some(old))
+                    .await
+                    .expect("save");
+            }
+        }
+        store
+            .turn_store()
+            .close_turn(
+                old,
+                &TurnEnding::succeeded("end_turn", TurnUsage::default()),
+            )
+            .await
+            .expect("close");
+        store
+            .run_sql_for_test(&format!(
+                "UPDATE turns SET ended_at = '{a_hundred_days_ago}' WHERE id = '{old}'"
+            ))
+            .await;
+        let mut messages =
+            Conversation::from_events(store.load_view_events(session_id).await.expect("view"));
+
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+
+        assert_eq!(
+            provider.completions().len(),
+            1,
+            "the summarizer ran once, before the turn's own request"
+        );
+        let stored = store.load_events(session_id).await.expect("load");
+        let rendered = format!("{stored:?}");
+        for word in ["xylophone", "marmalade", "quince", "damson"] {
+            assert!(!rendered.contains(word), "the old turn is gone: {rendered}");
+        }
+        assert!(
+            matches!(stored.first(), Some(Event::CompactBoundary { .. })),
+            "the summary heads what is left: {rendered}"
+        );
+        assert_eq!(
+            stored.len(),
+            3,
+            "the boundary, this turn's prompt and its answer, with no tail kept: {rendered}"
+        );
+        assert!(
+            rendered
+                .contains("[Retention]\\nTurns older than 30 days are deleted; nothing before "),
+            "the block the model read dates the record: {rendered}"
+        );
+        let turns = store
+            .turn_store()
+            .load_turns(session_id)
+            .await
+            .expect("turns");
+        assert!(
+            turns.iter().all(|turn| turn.id != old),
+            "the record went with the rows: {turns:?}"
         );
     }
 

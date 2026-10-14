@@ -260,6 +260,13 @@ pub(crate) async fn run_acp(
     let idle_handle = spawn_idle_session_sweep(Arc::clone(&state));
     let _idle_guard = AbortOnDrop(idle_handle);
 
+    // Re-applies the retention windows while the editor keeps the connection up.
+    let expiry_handle = crate::host::spawn_expiry_sweeper(
+        crate::host::RetentionWindows::from_config(&shared.config),
+        shared.store.clone(),
+    );
+    let _expiry_guard = AbortOnDrop(expiry_handle);
+
     // Observe stdin EOF so the connection shuts down when the client disconnects (or the parent
     // dies). The connection future does not resolve on idle EOF by itself, so wrap the incoming
     // side; `acp_run_until_disconnect` (the `connect_with` closure below) waits on this token.

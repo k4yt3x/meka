@@ -72,10 +72,10 @@ pub(crate) async fn build_skill_prompt(
 /// before it, the sweep deleted the very session `meka -r <id>` was about to open, and the run then
 /// failed on "no session matches" for a conversation the user had just listed.
 pub(crate) async fn sweep_expired_sessions(
-    config: &ResolvedConfig,
+    retention: Option<std::time::Duration>,
     store: &Store,
 ) -> anyhow::Result<()> {
-    let Some(retention) = config.retention else {
+    let Some(retention) = retention else {
         return Ok(());
     };
     let sweep = store.delete_expired_sessions(retention).await?;
@@ -95,6 +95,91 @@ pub(crate) async fn sweep_expired_sessions(
         tracing::info!("spared {spared} session(s) another meka process has open");
     }
     Ok(())
+}
+
+/// Delete, in every session, the turns `[session].turn_retention` has expired and a compaction
+/// has summarized. No session is spared for being open: the sweep takes nothing from the view a
+/// process works from. Reported at `warn` for the reason the session sweep is.
+pub(crate) async fn sweep_expired_turns(
+    turn_retention: Option<std::time::Duration>,
+    store: &Store,
+) -> anyhow::Result<()> {
+    let Some(window) = turn_retention else {
+        return Ok(());
+    };
+    let cutoff = crate::text::horizon_before(chrono::Utc::now(), window);
+    let sweep = store.delete_expired_turns(cutoff, None).await?;
+    if !sweep.is_empty() {
+        let line = sweep.describe(window);
+        tracing::warn!("{line}");
+    }
+    Ok(())
+}
+
+/// The two retention windows of `[session]`, read off the configuration once so the sweeps and
+/// the task that repeats them take values rather than the configuration.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RetentionWindows {
+    /// `[session].retention`: how long an untouched session is kept.
+    pub(crate) sessions: Option<std::time::Duration>,
+    /// `[session].turn_retention`: how long an ended turn is kept.
+    pub(crate) turns: Option<std::time::Duration>,
+}
+
+impl RetentionWindows {
+    pub(crate) fn from_config(config: &ResolvedConfig) -> Self {
+        Self {
+            sessions: config.retention,
+            turns: config.turn_retention,
+        }
+    }
+
+    fn is_unset(self) -> bool {
+        self.sessions.is_none() && self.turns.is_none()
+    }
+}
+
+/// Both retention sweeps, in the order that leaves the second the least to read: a session gone
+/// whole has no turns to date.
+pub(crate) async fn sweep_expired(windows: RetentionWindows, store: &Store) -> anyhow::Result<()> {
+    sweep_expired_sessions(windows.sessions, store).await?;
+    sweep_expired_turns(windows.turns, store).await
+}
+
+/// How often a host that stays up re-runs the retention sweeps. A window is written in days or
+/// hours, so an hour bounds how long anything outlives it while a process runs.
+const EXPIRY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Re-run [`sweep_expired`] every [`EXPIRY_SWEEP_INTERVAL`] for as long as the task lives, which
+/// is the caller's to end. A host that stays up for months would otherwise apply a retention
+/// window once, at startup, and never again. Finished at once when neither window is set.
+pub(crate) fn spawn_expiry_sweeper(
+    windows: RetentionWindows,
+    store: Store,
+) -> tokio::task::JoinHandle<()> {
+    if windows.is_unset() {
+        return tokio::spawn(async {});
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(EXPIRY_SWEEP_INTERVAL);
+        // A machine back from sleep owes one sweep, not one per hour missed.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The startup sweep has just run; the first tick fires immediately and would repeat it.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            // Unguarded, one panicking sweep ends retention for the life of the process, silently.
+            let sweep = std::panic::AssertUnwindSafe(sweep_expired(windows, &store));
+            match futures::FutureExt::catch_unwind(sweep).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!("retention sweep failed: {error}"),
+                Err(panic) => {
+                    let panic = crate::error::panic_message(&*panic);
+                    tracing::warn!("retention sweep panicked ({panic}); continuing");
+                }
+            }
+        }
+    })
 }
 
 /// Wait for a termination signal: SIGTERM or Ctrl+C on Unix, Ctrl+C elsewhere. The one watch both
@@ -419,5 +504,89 @@ impl LiveOutput {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A host that stays up re-applies the windows on the hour; what aged since startup goes at
+    /// the next tick. The one path the startup sweep does not cover, so the wiring is the test.
+    #[tokio::test(start_paused = true)]
+    async fn the_hourly_sweeper_takes_what_aged_since_startup() {
+        use crate::{
+            conversation::{Event, Message},
+            store::turns::{TurnEnding, TurnUsage},
+        };
+
+        let store = Store::for_test().await;
+        let session = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        let turn = uuid::Uuid::new_v4();
+        let long_ago = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
+        store
+            .turn_store()
+            .open_turn(session, turn, "client", &long_ago)
+            .await
+            .expect("open");
+        store
+            .save_event(session, &Event::Append(Message::user("old")), Some(turn))
+            .await
+            .expect("save");
+        store
+            .turn_store()
+            .close_turn(
+                turn,
+                &TurnEnding::succeeded("end_turn", TurnUsage::default()),
+            )
+            .await
+            .expect("close");
+        store
+            .run_sql_for_test(&format!(
+                "UPDATE turns SET ended_at = '{long_ago}' WHERE id = '{turn}'"
+            ))
+            .await;
+        store
+            .save_event(
+                session,
+                &Event::CompactBoundary {
+                    summary: Message::user("summary"),
+                    replaced_count: 1,
+                    loaded_tools_snapshot: Default::default(),
+                    checklist_snapshot: Default::default(),
+                },
+                None,
+            )
+            .await
+            .expect("boundary");
+        assert_eq!(store.load_events(session).await.expect("load").len(), 2);
+
+        let unset = spawn_expiry_sweeper(RetentionWindows::default(), store.clone());
+        unset
+            .await
+            .expect("a sweeper with no window finishes at once");
+
+        let sweeper = spawn_expiry_sweeper(
+            RetentionWindows {
+                sessions: None,
+                turns: Some(std::time::Duration::from_secs(30 * 86_400)),
+            },
+            store.clone(),
+        );
+        tokio::time::advance(EXPIRY_SWEEP_INTERVAL).await;
+        // The sweep runs on the store's own thread, so give the task a few turns to finish it.
+        let mut remaining = 2;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            remaining = store.load_events(session).await.expect("load").len();
+            if remaining == 1 {
+                break;
+            }
+        }
+        sweeper.abort();
+        assert_eq!(remaining, 1, "the boundary alone is left");
     }
 }

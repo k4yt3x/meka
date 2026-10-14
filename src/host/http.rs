@@ -101,6 +101,10 @@ pub(crate) async fn run_serve(
     let state = ServerState::new(shared, serve_arc, idempotency_cache.clone());
 
     let gc_handle = gc::spawn(state.clone());
+    let expiry_sweeper = crate::host::spawn_expiry_sweeper(
+        crate::host::RetentionWindows::from_config(&state.shared.config),
+        state.shared.store.clone(),
+    );
     let scheduler_handle = schedule::spawn(state.clone());
     let background_handle = schedule::spawn_background_poller(state.clone());
     let inbox_handle = inbox::spawn_inbox_driver(state.clone());
@@ -156,6 +160,7 @@ pub(crate) async fn run_serve(
     })
     .await;
     gc_handle.abort();
+    expiry_sweeper.abort();
     scheduler_handle.abort();
     background_handle.abort();
     inbox_handle.abort();

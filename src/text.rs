@@ -840,8 +840,6 @@ pub(crate) fn format_token_count(n: u64) -> String {
         format!("{:.1}M", (n as f64) / 1_000_000.0)
     }
 }
-/// Format a non-negative duration in seconds compactly, e.g. `2d 3h`, `4h 12m`, `45m`, `30s`. Used
-/// by `meka account whoami` for the token time-to-expiry.
 /// A duration as the row that closes a turn states it: seconds under a minute, minutes and seconds
 /// under an hour, then [`format_duration_short`]'s hours and days.
 pub(crate) fn format_elapsed(duration: std::time::Duration) -> String {
@@ -855,6 +853,8 @@ pub(crate) fn format_elapsed(duration: std::time::Duration) -> String {
     }
 }
 
+/// Format a non-negative duration in seconds compactly, e.g. `2d 3h`, `4h 12m`, `45m`, `30s`. Used
+/// by `meka account whoami` for the token time-to-expiry.
 pub(crate) fn format_duration_short(seconds: i64) -> String {
     let seconds = seconds.max(0);
     let minutes = seconds / 60;
@@ -867,6 +867,44 @@ pub(crate) fn format_duration_short(seconds: i64) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+/// A duration in full words, in the largest unit that divides it exactly: `"90 days"`, `"36 hours"`
+/// rather than `"1 day 12 hours"`, `"90 minutes"`, and seconds for anything else. For a window the
+/// user wrote in one unit, which is how the model and the log read it back.
+pub(crate) fn format_duration_words(duration: std::time::Duration) -> String {
+    const UNITS: [(u64, &str); 4] = [
+        (86_400, "day"),
+        (3_600, "hour"),
+        (60, "minute"),
+        (1, "second"),
+    ];
+    let seconds = duration.as_secs();
+    let (count, unit) = UNITS
+        .iter()
+        .find(|(size, _)| seconds > 0 && seconds.is_multiple_of(*size))
+        .map_or((seconds, "second"), |(size, unit)| (seconds / size, *unit));
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {unit}{plural}")
+}
+
+/// The instant `window` before `now`: what a retention sweep deletes before and the model is told
+/// nothing precedes. A window too long for the calendar is clamped to a century, which matches
+/// nothing in any store, so an absurd value keeps everything rather than panicking. Every way the
+/// arithmetic can fail lands on the earliest representable instant, for the same reason: a
+/// horizon that fell back to `now` would be a deletion of everything.
+pub(crate) fn horizon_before<Zone: chrono::TimeZone>(
+    now: DateTime<Zone>,
+    window: std::time::Duration,
+) -> DateTime<Zone> {
+    const CENTURY: chrono::TimeDelta = chrono::TimeDelta::days(36_500);
+    let window = chrono::TimeDelta::from_std(window)
+        .ok()
+        .filter(|window| *window <= CENTURY)
+        .unwrap_or(CENTURY);
+    now.clone()
+        .checked_sub_signed(window)
+        .unwrap_or_else(|| DateTime::<Utc>::MIN_UTC.with_timezone(&now.timezone()))
 }
 
 /// Binary units, because every size meka caps or reports is a memory or body size: a provider's
@@ -1467,6 +1505,53 @@ mod tests {
 
     /// An elapsed time keeps its seconds under an hour, where they are what a reader watches, and
     /// drops them past it.
+    #[test]
+    fn a_window_is_spelled_in_the_one_unit_that_divides_it() {
+        use std::time::Duration;
+        assert_eq!(
+            super::format_duration_words(Duration::from_secs(90 * 86_400)),
+            "90 days"
+        );
+        assert_eq!(
+            super::format_duration_words(Duration::from_secs(36 * 3_600)),
+            "36 hours"
+        );
+        assert_eq!(
+            super::format_duration_words(Duration::from_secs(90 * 60)),
+            "90 minutes"
+        );
+        assert_eq!(
+            super::format_duration_words(Duration::from_secs(86_400)),
+            "1 day"
+        );
+        assert_eq!(
+            super::format_duration_words(Duration::from_secs(61)),
+            "61 seconds"
+        );
+        assert_eq!(super::format_duration_words(Duration::ZERO), "0 seconds");
+    }
+
+    #[test]
+    fn a_horizon_is_the_window_before_now_and_never_panics() {
+        use std::time::Duration;
+
+        use chrono::TimeZone as _;
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 14, 9, 12, 34)
+            .single()
+            .expect("a fixed instant");
+        assert_eq!(
+            super::horizon_before(now, Duration::from_secs(90 * 86_400)),
+            chrono::Utc
+                .with_ymd_and_hms(2026, 7, 16, 9, 12, 34)
+                .single()
+                .expect("a fixed instant")
+        );
+        // Longer than the calendar: a century back, which matches nothing.
+        let absurd = super::horizon_before(now, Duration::from_secs(u64::MAX));
+        assert!(absurd < now - chrono::TimeDelta::days(36_000), "{absurd}");
+    }
+
     #[test]
     fn an_elapsed_time_keeps_its_seconds_under_an_hour() {
         use std::time::Duration;
