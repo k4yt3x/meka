@@ -150,6 +150,12 @@ pub(crate) fn char_width(character: char) -> usize {
 /// Columns a tab advances to. Four rather than eight because these lines already carry a block
 /// indent, and eight pushes nested code past the width budget for no extra clarity.
 pub(crate) const TAB_WIDTH: usize = 4;
+/// `text` with each tab as [`TAB_WIDTH`] spaces, for a surface that draws cells rather than writing
+/// to a terminal: the screen's widget drops a control character, so a tab left in a row is the
+/// indentation it carried, lost.
+pub(crate) fn expand_tabs(text: &str) -> String {
+    text.replace('\t', &" ".repeat(TAB_WIDTH))
+}
 /// Make a model-supplied string safe to place on one line of meka's own UI.
 ///
 /// [`sanitize_for_display`] drops escapes and control characters but deliberately keeps `\n`, `\r`

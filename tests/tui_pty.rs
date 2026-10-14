@@ -2018,3 +2018,40 @@ fn a_run_without_a_terminal_is_refused_and_names_oneshot() {
         "{stderr}"
     );
 }
+
+/// A code row wider than the screen folds at the edge, the way the terminal folds a one-shot's
+/// output, rather than being clipped there with its tail unreachable: every character of a fenced
+/// block is on screen, and a row's indentation stays on its first row.
+#[test]
+fn a_code_row_wider_than_the_screen_folds_at_the_edge() {
+    let install = screen_install("read", "", "");
+    let token = format!("{}TAIL_OF_THE_ROW", "x".repeat(60));
+    let script = format!(
+        r#"[[{{"type":"text","text":"Run this:\n\n```bash\nkubectl oidc-login setup \\\n    --oidc-issuer-url=https://example.invalid/sso/oidc/{token} \\\n    --oidc-extra-scope=email\n\tindented\n```\n"}},{{"type":"message_end","stop_reason":"end_turn"}}]]"#
+    );
+    let screens = run_screen(&install, &script, &["hi", "/exit"]);
+    let rows = final_screen(&screens);
+    let head = rows
+        .iter()
+        .position(|row| row.starts_with("      --oidc-issuer-url=https://example.invalid/"))
+        .unwrap_or_else(|| panic!("the long row starts where its indentation puts it: {rows:#?}"));
+    assert_eq!(
+        rows[head].chars().count(),
+        usize::from(COLUMNS),
+        "the first row is full to the edge: {rows:#?}"
+    );
+    assert!(
+        rows[head + 1].starts_with("  x") && rows[head + 1].contains("TAIL_OF_THE_ROW \\"),
+        "the rest of the row follows on the next row, at the text edge: {rows:#?}"
+    );
+    assert_eq!(
+        rows.get(head + 2).map(String::as_str),
+        Some("      --oidc-extra-scope=email"),
+        "the next code line keeps its own indentation: {rows:#?}"
+    );
+    assert_eq!(
+        rows.get(head + 3).map(String::as_str),
+        Some("      indented"),
+        "a tab is drawn as columns, not dropped: {rows:#?}"
+    );
+}

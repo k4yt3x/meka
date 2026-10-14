@@ -35,7 +35,8 @@ bold, headings are bold), the terminal's cyan names things (inline code, a tool 
 checklist), structure (bullets, rules, the quote bar) is gray, and red and yellow mean an error
 and a warning, nothing else. Fenced code is
 highlighted from the same palette: comments gray, keywords blue, strings green, numbers yellow,
-names of functions and types cyan. Every color is the terminal's own, so the screen follows your
+names of functions and types cyan. A code line wider than the screen folds at the edge, and a tab
+is drawn as four columns. Every color is the terminal's own, so the screen follows your
 terminal's theme.
 
 ```text

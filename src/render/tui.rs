@@ -240,8 +240,9 @@ fn lay_out(
     highlight: bool,
 ) -> Vec<Line<'static>> {
     let width = width.max(MIN_OUTPUT_WIDTH);
+    let markdown = crate::text::expand_tabs(markdown);
     let mut lines = Vec::new();
-    for segment in segments(markdown) {
+    for segment in segments(&markdown) {
         // A fence is a block of its own: exactly one blank row sets it off from the prose on either
         // side, whether or not termimad ended the prose on one.
         if !lines.is_empty() {
@@ -264,15 +265,18 @@ fn lay_out(
                 lines.extend(laid_out);
             }
             Segment::Fence { language, body } => {
-                if highlight {
-                    lines.extend(code_lines(&body, language.as_deref()));
+                let rows = if highlight {
+                    code_lines(&body, language.as_deref())
                 } else {
                     let style = gray();
-                    lines.extend(
-                        body.into_iter()
-                            .map(|row| Line::from(Span::styled(row, style))),
-                    );
-                }
+                    body.into_iter()
+                        .map(|row| Line::from(Span::styled(row, style)))
+                        .collect()
+                };
+                // Folded at the edge rather than clipped there, as the terminal folds a one-shot's
+                // output: at a column, never at a space, because a code row's spaces are content
+                // and its indentation is where a break at a space would land.
+                lines.extend(rows.iter().flat_map(|row| wrap_line_at_columns(row, width)));
             }
         }
     }
@@ -288,8 +292,8 @@ pub(crate) fn is_blank(line: &Line<'static>) -> bool {
     line.spans.iter().all(|span| span.content.trim().is_empty())
 }
 
-/// A fenced block's body, highlighted for `language` in the screen's code theme. Rows are not
-/// wrapped, because a code line's whitespace is content.
+/// A fenced block's body, highlighted for `language` in the screen's code theme, one row per source
+/// line, left for the caller to fold at its width.
 pub(crate) fn code_lines(body: &[String], language: Option<&str>) -> Vec<Line<'static>> {
     let highlighter = highlighter();
     let syntax = syntax_for_language(language);
@@ -350,6 +354,7 @@ pub(crate) fn ansi_lines(text: &str, width: usize) -> Vec<Line<'static>> {
 /// lays out text inside an area the caller has already sized, with no chrome of its own to fit.
 pub(crate) fn plain_lines(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
     let width = width.max(1);
+    let text = crate::text::expand_tabs(text);
     let mut lines = Vec::new();
     for source in text.split('\n') {
         if source.is_empty() {
@@ -367,14 +372,27 @@ pub(crate) fn plain_lines(text: &str, width: usize, style: Style) -> Vec<Line<'s
 /// inside a word otherwise, every character keeping the style it came with. What the terminal
 /// would otherwise clip at the right edge is what this keeps.
 pub(crate) fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    fold_line(line, width, true)
+}
+
+/// [`wrap_line`] breaking at a column only, every space kept: for text whose spaces are content,
+/// such as a code row, where a break at a space would land on its indentation.
+pub(crate) fn wrap_line_at_columns(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    fold_line(line, width, false)
+}
+
+/// The rows of `line` within `width`, broken at the last space in a row when `at_spaces` and at the
+/// column otherwise.
+fn fold_line(line: &Line<'static>, width: usize, at_spaces: bool) -> Vec<Line<'static>> {
     let width = width.max(1);
     let characters: Vec<(char, Style)> = line
         .spans
         .iter()
         .flat_map(|span| {
-            span.content
+            crate::text::expand_tabs(&span.content)
                 .chars()
-                .map(move |character| (character, span.style))
+                .map(|character| (character, span.style))
+                .collect::<Vec<_>>()
         })
         .collect();
     if characters.is_empty() {
@@ -391,7 +409,7 @@ pub(crate) fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>
             if columns + advance > width && end > start {
                 break;
             }
-            if characters[end].0 == ' ' {
+            if at_spaces && characters[end].0 == ' ' {
                 last_space = Some(end);
             }
             columns += advance;
@@ -1084,6 +1102,50 @@ mod tests {
 
     /// A fenced block is highlighted by its language rather than painted flat, and the fence lines
     /// themselves are not shown as text.
+    /// A fenced row wider than the width folds at the width with every character kept: a code
+    /// line's spaces are content, so the fold is at a column and never at a space, and the
+    /// indentation stays on the first row.
+    #[test]
+    fn a_fenced_row_wider_than_the_width_folds_at_a_column() {
+        let source = format!("```bash\n    --flag={}\n```\n", "x".repeat(100));
+        for lines in [markdown_lines(&source, 60), thinking_lines(&source, 60)] {
+            let rows = plain(&lines);
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            assert_eq!(rows[0].chars().count(), 60, "{rows:?}");
+            assert!(rows[0].starts_with("    --flag=xxx"), "{rows:?}");
+            assert_eq!(rows.concat(), format!("    --flag={}", "x".repeat(100)));
+        }
+    }
+
+    /// A tab is four columns on every surface the screen draws, since the screen hands cells to
+    /// the terminal and a tab among them is dropped with the indentation it carried: a fenced
+    /// row, prose, a command, shell output, a diff line and plain text.
+    #[test]
+    fn a_tab_is_four_columns_on_every_surface() {
+        assert_eq!(plain(&markdown_lines("```go\n\tx := 1\n```\n", 60)), vec![
+            "    x := 1"
+        ]);
+        assert_eq!(plain(&thinking_lines("```\n\ty\n```\n", 60)), vec!["    y"]);
+        let prose = plain(&markdown_lines("a\tb\n", 60));
+        assert!(
+            prose.iter().all(|row| !row.contains('\t')) && prose[0].contains("a    b"),
+            "{prose:?}"
+        );
+        assert_eq!(plain(&ansi_lines("\x1b[31m\tout\x1b[0m", 60)), vec![
+            "    out"
+        ]);
+        assert_eq!(plain(&plain_lines("\tp", 60, Style::default())), vec![
+            "    p"
+        ]);
+        assert_eq!(plain(&command_rows("\tmake", "bash", 60)), vec!["    make"]);
+        let (diff, _) = diff_rows(None, "\tnew\n", 60);
+        let diff = plain(&diff);
+        assert!(
+            diff.iter().any(|row| row.ends_with("+     new")) && !diff.concat().contains('\t'),
+            "{diff:?}"
+        );
+    }
+
     #[test]
     fn a_fenced_block_is_highlighted_and_its_fences_are_not_text() {
         let lines = markdown_lines("Before.\n\n```rust\nlet x = 1;\n```\n\nAfter.\n", 60);

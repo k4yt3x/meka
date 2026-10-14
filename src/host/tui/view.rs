@@ -92,7 +92,7 @@ fn tool_body(item: &Item, expanded: bool, width: usize) -> Vec<Line<'static>> {
     let wrap = if expanded { inner } else { usize::MAX };
     let mut rows = Vec::new();
     if let Some(progress) = progress {
-        rows.push(Line::from(Span::styled(progress.to_string(), gray())));
+        rows.extend(draw::plain_lines(progress, wrap, gray()));
     }
     if !activity.is_empty() {
         rows.extend(draw::plain_lines(activity.trim_end(), wrap, gray()));
@@ -113,16 +113,32 @@ fn tool_body(item: &Item, expanded: bool, width: usize) -> Vec<Line<'static>> {
             }
         }
         Some(text) if failed || !result_is_its_own_item(name) => {
-            let mut lines = draw::ansi_lines(text.trim_end_matches('\n'), wrap);
-            if failed && let Some(first) = lines.first_mut() {
-                first.spans.insert(
-                    0,
-                    Span::styled("failed: ".to_string(), Style::default().fg(Color::Red)),
-                );
-                for span in first.spans.iter_mut().skip(1) {
-                    span.style = span.style.fg(Color::Red);
+            let text = text.trim_end_matches('\n');
+            let mut lines = if failed {
+                // The label shares the first row, so the text is wrapped with the label's columns
+                // spent and its later rows hang under the text; wrapped at the full width, the
+                // first row would overrun the edge by the label.
+                let label = "failed: ";
+                let hang = display_width(label);
+                let mut lines = draw::ansi_lines(text, wrap.saturating_sub(hang).max(1));
+                for (index, line) in lines.iter_mut().enumerate() {
+                    if index == 0 {
+                        for span in &mut line.spans {
+                            span.style = span.style.fg(Color::Red);
+                        }
+                        line.spans.insert(
+                            0,
+                            Span::styled(label.to_string(), Style::default().fg(Color::Red)),
+                        );
+                    } else {
+                        line.spans.insert(0, Span::raw(" ".repeat(hang)));
+                    }
                 }
+                lines
             } else {
+                draw::ansi_lines(text, wrap)
+            };
+            if !failed {
                 for line in &mut lines {
                     for span in &mut line.spans {
                         if span.style.fg.is_none() {
@@ -196,8 +212,7 @@ pub(crate) fn entry_lines(entry: &Entry, width: usize, settings: Settings) -> Ve
                 // The user's own words, sanitized as an answer is: the joiners that build an
                 // emoji or a conjunct stay, where the one-row sanitizer for a server's strings
                 // would drop them.
-                let source = crate::text::sanitize_stream_text(source)
-                    .replace('\t', &" ".repeat(crate::text::TAB_WIDTH));
+                let source = crate::text::expand_tabs(&crate::text::sanitize_stream_text(source));
                 for row in wrap_to_width(&source, inner, usize::MAX) {
                     let first = lines.is_empty();
                     lines.push(padded(row, block, first));
@@ -312,7 +327,7 @@ pub(crate) fn entry_lines(entry: &Entry, width: usize, settings: Settings) -> Ve
         Item::SessionId { label, id } => {
             draw::glyph_text_rows(ACT_GLYPH, gray(), &format!("{label} {id}"), gray(), width)
         }
-        Item::Usage(usage) => vec![draw::usage_row(usage)],
+        Item::Usage(usage) => vec![draw::cut_line(draw::usage_row(usage), width)],
         Item::Image => draw::glyph_text_rows(ACT_GLYPH, gray(), "image", gray(), width),
         // The mark in the terminal's cyan beside three lines, on no background: a box of the
         // composer's gray was painted short by tmux under Alacritty, which drops the background
@@ -1276,6 +1291,173 @@ mod tests {
         assert_eq!(warning[0].spans[0].style.fg, Some(Color::Yellow));
     }
 
+    /// No row an item lays out is wider than the width it was laid out at, whatever the content,
+    /// because the transcript clips what is wider: a token longer than the row, an address, a code
+    /// row, a table cell, a command, a diff line, a checklist item, a path. And no row holds a tab,
+    /// because the screen hands cells to the terminal and drops a tab with the indentation it
+    /// carried. Every kind, expanded and collapsed, with and without the arguments, at every width.
+    #[test]
+    fn no_item_lays_out_a_row_wider_than_its_width_or_holding_a_tab() {
+        let token = "x".repeat(300);
+        let address = format!("https://example.invalid/{}", "p/".repeat(150));
+        let markdown = format!(
+            "# Heading {token}\n\nProse {address} end.\n\nInline `{token}` code.\n\n> Quote \
+             {token}\n\n- Bullet {token}\n1. Numbered {address}\n\n| Column {token} | Other |\n\
+             |---|---|\n| cell {address} | {token} |\n\n```bash\n    --flag={token}\n\tindented\n```\n\n\
+             Tail\there."
+        );
+        let call =
+            |name: &str, input: serde_json::Value, state: ToolState, change| Item::ToolCall {
+                id: "1".into(),
+                name: name.into(),
+                input: Some(input),
+                summary: Some(token.clone()),
+                state,
+                output: format!("\x1b[31m{token}\x1b[0m {address}\n\tindented\n"),
+                result: Some(format!("{address}\tend")),
+                result_images: 0,
+                activity: format!("{token}\tnow"),
+                progress: Some(format!("{address}\tstep")),
+                change,
+            };
+        let command = serde_json::json!({ "command": format!("\trun --flag={token} {address}") });
+        let edit = serde_json::json!({ "path": format!("{token}.rs"), "old_string": "a", "new_string": "b" });
+        let change = super::super::model::FileChange {
+            path: format!("{token}.rs"),
+            old: Some(format!("old {token}\n")),
+            new: format!("new {address}\n\tsecond {token}\n"),
+        };
+        let items = vec![
+            Item::Prompt {
+                text: format!("{token} {address}\n\tindented {token}"),
+                class: Some(InboxClass::Steer),
+                inbox_id: None,
+                delivered: false,
+            },
+            Item::Text {
+                text: markdown.clone(),
+                streaming: false,
+            },
+            Item::Text {
+                text: markdown.clone(),
+                streaming: true,
+            },
+            Item::Thinking {
+                text: markdown.clone(),
+                estimate: Some(12),
+                ended: true,
+            },
+            Item::Thinking {
+                text: markdown.clone(),
+                estimate: None,
+                ended: false,
+            },
+            call(
+                "shell_execute",
+                command.clone(),
+                ToolState::Done { is_error: false },
+                None,
+            ),
+            call(
+                "shell_execute",
+                command.clone(),
+                ToolState::Done { is_error: true },
+                None,
+            ),
+            call("shell_execute", command.clone(), ToolState::Running, None),
+            call("shell_execute", command, ToolState::Composing, None),
+            call(
+                "file_edit",
+                edit,
+                ToolState::Done { is_error: false },
+                Some(change),
+            ),
+            Item::Checklist {
+                items: vec![
+                    crate::checklist::ChecklistItem {
+                        id: 1,
+                        text: format!("{token}\tnow"),
+                        status: crate::checklist::ChecklistStatus::InProgress,
+                        reason: None,
+                        task: None,
+                    },
+                    crate::checklist::ChecklistItem {
+                        id: 2,
+                        text: address.clone(),
+                        status: crate::checklist::ChecklistStatus::Deferred,
+                        reason: Some(token.clone()),
+                        task: Some(address.clone()),
+                    },
+                ],
+            },
+            Item::Notice {
+                level: crate::frontend::NoticeLevel::Info,
+                text: address.clone(),
+            },
+            Item::Notice {
+                level: crate::frontend::NoticeLevel::Warn,
+                text: format!("{token}\t!"),
+            },
+            Item::Error(format!("{token}\t{address}")),
+            Item::ShellOutput(format!("\x1b[32m{token}\x1b[0m\n\t{address}")),
+            Item::SessionId {
+                label: token.clone(),
+                id: address.clone(),
+            },
+            Item::Usage(crate::stats::TokenUsage {
+                input_tokens: u64::MAX,
+                output_tokens: u64::MAX,
+                ..crate::stats::TokenUsage::default()
+            }),
+            Item::Image,
+            Item::Banner {
+                version: token.clone(),
+                profile: token.clone(),
+                model: Some(address.clone()),
+                directory: address.clone(),
+            },
+        ];
+        let full = || Settings {
+            show_session_id_on_create: true,
+            show_token_usage: true,
+            show_thinking: true,
+            tool_params: ToolParams::Full,
+        };
+        let mut too_wide = Vec::new();
+        for width in [24, 40, 80, 200] {
+            for (index, item) in items.iter().enumerate() {
+                for expanded in [false, true] {
+                    for settings in [settings(), full()] {
+                        let lines = entry_lines(&entry(item.clone(), expanded), width, settings);
+                        for line in &lines {
+                            let text: String = line
+                                .spans
+                                .iter()
+                                .map(|span| span.content.as_ref())
+                                .collect();
+                            let head: String = text.chars().take(60).collect();
+                            let case = format!(
+                                "item {index} at {width} columns, expanded {expanded}, full \
+                                 arguments {}",
+                                settings.tool_params == ToolParams::Full
+                            );
+                            if display_width(&text) > width {
+                                too_wide.push(format!(
+                                    "{case}: {} wide: {head:?}",
+                                    display_width(&text)
+                                ));
+                            }
+                            if text.contains('\t') {
+                                too_wide.push(format!("{case}: holds a tab: {head:?}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(too_wide.is_empty(), "{too_wide:#?}");
+    }
+
     /// A collapsed thinking block is one row; expanded it is the label and the text under it.
     #[test]
     fn a_thinking_block_collapses_to_one_row() {
@@ -1526,6 +1708,37 @@ mod tests {
         let failed = &lines[1].spans[1];
         assert_eq!(failed.content.as_ref(), "failed: ");
         assert_eq!(failed.style.fg, Some(Color::Red));
+        let mut long = item_with_a_failure();
+        if let Item::ToolCall { result, .. } = &mut long {
+            *result = Some(format!("{} {}", "a".repeat(20), "b".repeat(20)));
+        }
+        let expanded = plain(&entry_lines(&entry(long, true), 40, settings()));
+        assert_eq!(
+            expanded,
+            vec![
+                "• file_read",
+                "  │ path: /nope",
+                &format!("  └ failed: {}", "a".repeat(20)),
+                &format!("            {}", "b".repeat(20)),
+            ],
+            "the label shares the first row and the rest hangs under the text"
+        );
+    }
+
+    fn item_with_a_failure() -> Item {
+        Item::ToolCall {
+            id: "1".into(),
+            name: "file_read".into(),
+            input: Some(serde_json::json!({"path": "/nope"})),
+            summary: None,
+            state: ToolState::Done { is_error: true },
+            output: String::new(),
+            result: Some("no such file".into()),
+            result_images: 0,
+            activity: String::new(),
+            progress: None,
+            change: None,
+        }
     }
 
     /// The banner is meka's mark in cyan beside three lines on no background, two columns in

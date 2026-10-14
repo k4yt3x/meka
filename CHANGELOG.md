@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A code line wider than the screen folds at the edge instead of being cut off there.
+- A tab in a code block, a command or a tool's output is drawn as four columns, not dropped.
+- A failed call's label, a call's progress line and the usage row stay within the screen's width.
+
 ## [0.73.0] - 2026-10-12
 
 ### Changed
