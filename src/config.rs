@@ -470,9 +470,12 @@ pub(crate) struct ThinkingConfig {
 pub(crate) enum StatusFact {
     /// The session's working directory, shortened with `~`.
     Path,
-    /// The profile the session runs on, with its model.
+    /// The profile the session runs on, by name.
     Profile,
-    /// The live context-window gauge, once a turn has measured it.
+    /// The model the profile runs, when the config names one. Its own fact rather than part of
+    /// the profile's, so a profile named for its model is not shown twice.
+    Model,
+    /// The live context-window gauge, from the first frame.
     Context,
     /// `2 background tasks`, while any run.
     Tasks,
@@ -482,23 +485,32 @@ pub(crate) enum StatusFact {
 
 impl StatusFact {
     /// Every value, in the order a refusal lists them.
-    pub(crate) const ALL: [StatusFact; 5] = [
+    pub(crate) const ALL: [StatusFact; 6] = [
+        Self::Path,
+        Self::Profile,
+        Self::Model,
+        Self::Context,
+        Self::Tasks,
+        Self::Subagents,
+    ];
+    /// What the row shows when the config does not say: every fact but the model, in the order
+    /// above. The gauge sits after the profile because the window is the model's, so the number
+    /// reads beside what runs it; the model itself is opted into, since a profile's name usually
+    /// says it already.
+    pub(crate) const DEFAULT_ROW: [StatusFact; 5] = [
         Self::Path,
         Self::Profile,
         Self::Context,
         Self::Tasks,
         Self::Subagents,
     ];
-    /// What the row shows when the config does not say: everything but the gauge, which is
-    /// opted into, since it is one more number to read on every frame.
-    pub(crate) const DEFAULT_ROW: [StatusFact; 4] =
-        [Self::Path, Self::Profile, Self::Tasks, Self::Subagents];
 
     /// The value's one spelling, in the config.
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Path => "path",
             Self::Profile => "profile",
+            Self::Model => "model",
             Self::Context => "context",
             Self::Tasks => "tasks",
             Self::Subagents => "subagents",
@@ -4013,12 +4025,20 @@ command = "ida-mcp"
             assert!(error.to_string().contains(retired), "{error}");
         }
         assert_eq!(
-            StatusFact::DEFAULT_ROW.to_vec(),
-            StatusFact::ALL
-                .into_iter()
-                .filter(|fact| *fact != StatusFact::Context)
-                .collect::<Vec<_>>(),
-            "the default is everything but the gauge"
+            StatusFact::DEFAULT_ROW,
+            [
+                StatusFact::Path,
+                StatusFact::Profile,
+                StatusFact::Context,
+                StatusFact::Tasks,
+                StatusFact::Subagents
+            ],
+            "the default is every fact but the model, the gauge after the profile"
+        );
+        assert_eq!(
+            "model".parse::<StatusFact>(),
+            Ok(StatusFact::Model),
+            "the model is a fact of its own"
         );
     }
 

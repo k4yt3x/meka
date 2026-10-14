@@ -771,37 +771,27 @@ impl Screen {
 
     fn context_gauge(&self) -> Option<String> {
         let (tokens, window) = self.launch.context.as_ref()?;
-        let tokens = tokens.load(std::sync::atomic::Ordering::Relaxed);
-        let window = window.load(std::sync::atomic::Ordering::Relaxed);
-        if tokens == 0 || window == 0 {
-            return None;
-        }
-        let percent = ((tokens as f64 / window as f64) * 100.0).round() as u64;
-        Some(format!(
-            "{}/{} {}%",
-            crate::text::format_token_count(tokens),
-            crate::text::format_token_count(window),
-            percent
-        ))
+        super::view::context_gauge_text(
+            tokens.load(std::sync::atomic::Ordering::Relaxed),
+            window.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
-    /// The profile the session runs on and its model, for the status row: `work (claude-opus)`,
-    /// or the name alone for a profile whose model the config leaves to the backend.
+    /// The profile the session runs on, by name, for the status row.
     fn profile_fact(&self) -> Option<String> {
         let name = crate::sync::read(&self.launch.current_profile).clone();
-        if name.is_empty() {
-            return None;
-        }
-        let model = self
-            .launch
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// The model the session's profile runs, for the status row; `None` for a profile whose
+    /// model the config leaves to the backend.
+    fn model_fact(&self) -> Option<String> {
+        let name = crate::sync::read(&self.launch.current_profile).clone();
+        self.launch
             .configured_profiles
             .iter()
             .find(|profile| profile.name == name)
-            .and_then(|profile| profile.model.clone());
-        Some(match model {
-            Some(model) => format!("{name} ({model})"),
-            None => name,
-        })
+            .and_then(|profile| profile.model.clone())
     }
 
     fn focus(&self) -> Focus {
@@ -2710,6 +2700,7 @@ impl Screen {
                     permission: self.launch.shared_permission.get(),
                     path: Some(shorten_path_with_tilde(&self.launch.cwd.get())),
                     profile: self.profile_fact(),
+                    model: self.model_fact(),
                     context: self.context_gauge(),
                     work: self.work,
                     hint: self.hint.as_ref().map(|(hint, _)| hint.as_str()),

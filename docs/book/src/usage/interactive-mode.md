@@ -13,10 +13,11 @@ nothing but a warning stands with it, and goes with the first prompt. The
 conversation fills the screen from the top;
 the composer sits at the bottom, a gray block behind a `>`; and a status row under the composer
 opens with the permission level, a cell of the level's color and its name in the same color, then
-names the session's working directory (shortened with `~`), the profile the session runs on with
-its model, and `2 background tasks` and `1 sub-agent` while any run.
+names the session's working directory (shortened with `~`), the profile the session runs on, the
+context gauge (`128.4k/1.0M 13%`: tokens in context, the model's window, the share used), and
+`2 background tasks` and `1 sub-agent` while any run.
 [`display.status_row`](../configuration/config-file.md#displaystatus_row) picks the
-facts after the level and their order, and can add the context gauge. Type and press **Enter**. What you sent stays on the transcript behind the same `>` in the same gray
+facts after the level and their order, and can add the profile's model. Type and press **Enter**. What you sent stays on the transcript behind the same `>` in the same gray
 block, in white, and the answer streams in under it as it arrives, word by word, settling into
 rendered markdown as each line completes.
 
@@ -300,7 +301,7 @@ fields, so the two can be read side by side: the `Profile` with its account and 
 provider applies its own default; `claude-subscription` sends `high` when the profile sets none),
 and the `Thinking` mode. The rest are cumulative counters for the session.
 
-`Context` is the live context-window occupancy: the total tokens of the most recent exchange (all input tiers plus output, i.e. what the next request re-sends minus your new prompt), against the active model's context window, with the percent used and tokens remaining. Use it to decide whether to `/compact` before continuing; after `/compact` it drops to the compacted size immediately. It reflects this session only; sub-agents spawned via `agent_spawn` have their own context and are not counted (a sub-agent's returned result is counted only once it lands in this session as a tool result). It is shown from the start, at `0 / <window>` before the first turn, since the window is your `context_window` setting (or the documented default) and this is where you confirm it took effect; it is omitted only when the window is unknown. Add `context` to [`display.status_row`](../configuration/config-file.md#displaystatus_row) to show the same gauge in the status row.
+`Context` is the live context-window occupancy: the total tokens of the most recent exchange (all input tiers plus output, i.e. what the next request re-sends minus your new prompt), against the active model's context window, with the percent used and tokens remaining. Use it to decide whether to `/compact` before continuing; after `/compact` it drops to the compacted size immediately. It reflects this session only; sub-agents spawned via `agent_spawn` have their own context and are not counted (a sub-agent's returned result is counted only once it lands in this session as a tool result). It is shown from the start, at `0 / <window>` before the first turn, since the window is your `context_window` setting (or the documented default) and this is where you confirm it took effect; it is omitted only when the window is unknown. The status row shows the same gauge after the profile; [`display.status_row`](../configuration/config-file.md#displaystatus_row) drops or moves it.
 
 `Input tokens` (and the other cumulative counters) is the total billed across every turn of the whole session. These totals are persisted, so resuming a session with `meka -c` continues them rather than restarting at zero.
 

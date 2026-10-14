@@ -7,9 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.75.0] - 2026-10-14
+
 ### Added
 
 - `[permissions].confine_reads` confines reads below `unrestricted` to the roots, as writes are.
+- On Windows `confine_reads` holds for the file tools only, and startup says so.
 - `[shell].readable_paths` names what a confined command may read beyond the system directories.
 - `agent_spawn` takes `readable_roots`: directories a sub-agent may read but not write.
 - `readable_roots` confines a sub-agent's reads even with `confine_reads` off; `[]` is refused.
@@ -17,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `agent_spawn` takes `allow_servers` and `allow_tools`: the sub-agent sees only those; deny wins.
 - Skill roots from `[skills].extra_paths` stay readable where reads are confined.
 - The context block names the readable roots when reads are confined.
+
+### Changed
+
+- The status row shows the context gauge by default, after the profile, from the first frame.
+- The status row's `profile` fact is the name alone; `model` is its own fact, off by default.
 
 ## [0.74.0] - 2026-10-14
 
@@ -2680,7 +2688,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.74.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.75.0...HEAD
+[0.75.0]: https://github.com/k4yt3x/meka/compare/0.74.0...0.75.0
 [0.74.0]: https://github.com/k4yt3x/meka/compare/0.73.0...0.74.0
 [0.73.0]: https://github.com/k4yt3x/meka/compare/0.72.0...0.73.0
 [0.72.0]: https://github.com/k4yt3x/meka/compare/0.71.0...0.72.0

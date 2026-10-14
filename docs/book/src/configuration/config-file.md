@@ -1374,10 +1374,12 @@ What the status row under the composer shows after the permission level, which a
 in the order listed:
 
 - `path`: the session's working directory, shortened with `~`
-- `profile`: the profile the session runs on, with its model
+- `profile`: the profile the session runs on, by name
+- `model`: the model the profile runs, when the config names one; off by default, since a profile
+  named for its model would show it twice
 - `context`: the live context-window gauge, e.g. `128.4k/1.0M 13%` (tokens in context / model
-  window / percent used), the same value `/status` shows on its `Context:` line; hidden until the
-  first turn produces a measurement
+  window / percent used), the same value `/status` shows on its `Context:` line; shown from the
+  start at `0/<window> 0%`, omitted only while the window is unknown
 - `tasks`: `2 background tasks`, while any run
 - `subagents`: `1 sub-agent`, while any run
 
@@ -1390,7 +1392,7 @@ refused by name.
 status_row = ["profile", "context"]
 ```
 
-Default: `["path", "profile", "tasks", "subagents"]`
+Default: `["path", "profile", "context", "tasks", "subagents"]`
 
 ### `display.turn_end_summary`
 

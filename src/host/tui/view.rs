@@ -751,14 +751,33 @@ pub(crate) struct RunningWork {
     pub(crate) subagents: usize,
 }
 
+/// The status row's context gauge: tokens in context, the model's window and the share used, as
+/// `128.4k/1.0M 13%`. Shown from the first frame, at zero occupancy, since the window is known at
+/// launch and a fact in the default row that appears only after the first turn reads as missing;
+/// `None` only while the window is unknown, as `/status` omits its line then.
+pub(crate) fn context_gauge_text(tokens: u64, window: u64) -> Option<String> {
+    if window == 0 {
+        return None;
+    }
+    let percent = ((tokens as f64 / window as f64) * 100.0).round() as u64;
+    Some(format!(
+        "{}/{} {}%",
+        crate::text::format_token_count(tokens),
+        crate::text::format_token_count(window),
+        percent
+    ))
+}
+
 /// The facts the status row can show, and which of them it shows, in order.
 pub(crate) struct StatusFacts<'a> {
     /// `[display].status_row`.
     pub(crate) shown: &'a [crate::config::StatusFact],
     pub(crate) permission: crate::permission::Permission,
     pub(crate) path: Option<String>,
-    /// The profile the session runs on and its model, as `name (model)`.
+    /// The profile the session runs on, by name.
     pub(crate) profile: Option<String>,
+    /// The model the profile runs, when the config names one.
+    pub(crate) model: Option<String>,
     pub(crate) context: Option<String>,
     /// Background tasks and sub-agents, shown while any run.
     pub(crate) work: RunningWork,
@@ -810,6 +829,7 @@ pub(crate) fn status_line(facts: &StatusFacts<'_>, width: usize) -> Line<'static
         let text = match fact {
             StatusFact::Path => facts.path.clone(),
             StatusFact::Profile => facts.profile.clone(),
+            StatusFact::Model => facts.model.clone(),
             StatusFact::Context => facts.context.clone(),
             StatusFact::Tasks => {
                 (facts.work.tasks > 0).then(|| counted(facts.work.tasks, "background task"))
@@ -2060,7 +2080,8 @@ mod tests {
                 shown: &crate::config::StatusFact::ALL,
                 permission: crate::permission::Permission::Workspace,
                 path: Some("~/projects".into()),
-                profile: Some("work (claude-opus-4-8)".into()),
+                profile: Some("work".into()),
+                model: Some("claude-opus-4-8".into()),
                 context: Some("34%".into()),
                 work: RunningWork::default(),
                 hint: None,
@@ -2070,7 +2091,7 @@ mod tests {
         );
         assert_eq!(
             text(idle.clone()),
-            "  workspace · ~/projects · work (claude-opus-4-8) · 34%"
+            "  workspace · ~/projects · work · claude-opus-4-8 · 34%"
         );
         let level = color(crate::permission::Permission::Workspace.indicator_color());
         let cell = &idle.spans[0];
@@ -2092,6 +2113,7 @@ mod tests {
                 permission: crate::permission::Permission::Workspace,
                 path: None,
                 profile: None,
+                model: None,
                 context: None,
                 work: RunningWork {
                     tasks: 2,
@@ -2119,6 +2141,7 @@ mod tests {
                 permission: crate::permission::Permission::Read,
                 path: None,
                 profile: None,
+                model: None,
                 context: None,
                 work: RunningWork {
                     tasks: 1,
@@ -2130,6 +2153,21 @@ mod tests {
             60,
         );
         assert_eq!(text(one), "  read · 1 background task");
+    }
+
+    /// The gauge shows from the first frame at zero occupancy, and only an unknown window hides it.
+    #[test]
+    fn the_context_gauge_shows_from_the_first_frame() {
+        assert_eq!(
+            context_gauge_text(0, 1_000_000).as_deref(),
+            Some("0/1.0M 0%")
+        );
+        assert_eq!(
+            context_gauge_text(128_400, 1_000_000).as_deref(),
+            Some("128.4k/1.0M 13%")
+        );
+        assert_eq!(context_gauge_text(0, 0), None);
+        assert_eq!(context_gauge_text(5, 0), None);
     }
 
     /// The row opens with the level whatever the list says, then shows the facts the config
@@ -2147,7 +2185,8 @@ mod tests {
             shown,
             permission: crate::permission::Permission::Read,
             path: Some("~/x".into()),
-            profile: Some("work (m)".into()),
+            profile: Some("work".into()),
+            model: Some("m".into()),
             context: Some("34%".into()),
             work: RunningWork {
                 tasks: 1,
@@ -2161,7 +2200,16 @@ mod tests {
                 &facts(&[StatusFact::Profile, StatusFact::Path], None),
                 60
             )),
-            "  read · work (m) · ~/x"
+            "  read · work · ~/x",
+            "the profile is its name alone"
+        );
+        assert_eq!(
+            text(status_line(
+                &facts(&[StatusFact::Profile, StatusFact::Model], None),
+                60
+            )),
+            "  read · work · m",
+            "the model is a fact of its own"
         );
         assert_eq!(
             text(status_line(&facts(&[StatusFact::Context], None), 60)),

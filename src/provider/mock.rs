@@ -481,8 +481,12 @@ impl Provider for MockProvider {
             rounds.pop_front().unwrap_or_default()
         };
         for event in events {
+            // A stop that has already landed is answered the way `sse::drive` answers one, as the
+            // interrupt it is: `Ok(())` with nothing streamed reads to the agent as a reply the
+            // provider accepted and ended, since a real driver never returns it without a 2xx, and
+            // a repair riding the request would be booked as vindicated.
             if cancellation.is_cancelled() {
-                return Ok(());
+                return Err(crate::error::MekaError::Interrupted);
             }
             match event {
                 // Each failure sends `StreamEvent::Error` before returning its typed error, the
