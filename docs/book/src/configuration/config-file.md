@@ -939,6 +939,7 @@ Controls which permission levels are reachable at runtime and which level the se
 | `default` | No | Level the session starts at. One of `"none"`, `"read"`, `"workspace"`, `"unrestricted"`. Default `"read"`. Overridden by `--permission` and `MEKA_PERMISSION`. |
 | `enabled` | No | List of levels that can be reached at runtime via `/permission` and Shift+Tab. Default `["none", "read", "workspace", "unrestricted"]`. Disabled levels are skipped during Shift+Tab cycling and refused by `/permission` with an error. |
 | `approvals` | No | Whether a new session starts with [approvals](../usage/permissions.md#approvals) on: a tool call needing more than the session's level is put to you rather than refused. Default `false`. A session records its own switch afterwards, moved by `/approvals`, `PATCH /v1/sessions/{id}` or the ACP `approvals` config option. |
+| `confine_reads` | No | Whether reads below `unrestricted` are confined to the session's roots and the directories a command needs to run, the way writes are confined to the roots at `workspace`. Default `false`. Instance-wide, read at startup: every session this process runs is bound by it, and `unrestricted` is the per-session escape. With it off, a parent can still confine a sub-agent's reads through `agent_spawn`'s `readable_roots`. See [The read boundary](../usage/permissions.md#the-read-boundary). |
 
 A level meka does not have is refused at parse, with the line. An `enabled` list that names nothing falls back to `read` alone, with a warning, rather than to the default set, so an empty list cannot widen authority. If `default` is not in `enabled`, meka logs a warning and falls back to `read` if it's enabled, otherwise the lowest enabled level (in `none → read → workspace → unrestricted` order). Same behavior if `--permission` or `MEKA_PERMISSION` selects a disabled level: meka warns and starts at the configured default rather than refusing to launch.
 
@@ -946,7 +947,8 @@ A level meka does not have is refused at parse, with the line. An `enabled` list
 [permissions]
 default = "read"
 enabled = ["none", "read", "workspace", "unrestricted"]
-approvals = true   # ask me about anything above the level instead of refusing it
+approvals = true     # ask me about anything above the level instead of refusing it
+confine_reads = true # reads stay within the roots, as writes do at workspace
 ```
 
 ## `[shell]`
@@ -987,6 +989,17 @@ Default: unset (auto-detect). Ignored on macOS and Windows.
 [shell]
 sandbox = true
 sandbox_backend = "bubblewrap"  # or "landlock", or "bubblewrap-landlock" to require the layer
+```
+
+### `shell.readable_paths`
+
+Directories every confined command may read beyond the system directories, wherever reads are confined: with [`permissions.confine_reads`](#permissions) on, and for a sub-agent whose spawn confined them. The system directories are where the operating system keeps the programs, libraries and configuration a command needs to run at all, and the list is deliberately system-level: on Linux `/bin`, `/sbin`, `/usr`, `/lib`, `/lib32`, `/lib64`, `/etc`, `/proc`, `/dev`, `/nix/store` and `/run/current-system/sw`; on macOS `/bin`, `/sbin`, `/usr`, `/etc`, `/System`, `/Library/Apple`, `/Library/Preferences`, `/Library/Filesystems/NetFSPlugins`, `/var/db`, `/opt/homebrew`, `/Library/Developer` and `/dev`, plus the active developer directory `xcode-select` records, since the developer commands in `/usr/bin` are stubs that run the real binaries from there. Each is taken only where it exists. The skill roots [`[skills].extra_paths`](#skills) names are readable too. Add here what else this machine keeps system software under: `/opt`, `/snap`, a toolchain outside the home directory. An entry is warned about and dropped when it does not resolve, when it is relative, or when it is a directory the sandbox masks (`/tmp`, `/run`, the runtime directory, the filesystem root, meka's own directories), since Bubblewrap binds the readable paths after its masks and `/run` named here would hand the session bus back to a confined command. Never in effect on Windows, where the shell's reads are not confined.
+
+Default: `[]`
+
+```toml
+[shell]
+readable_paths = ["/opt", "/snap"]
 ```
 
 ## `[tools]`: built-in tool filters
@@ -1091,7 +1104,7 @@ Setting `enabled = false` keeps every skill tool's schema out of every request a
 
 `agent_managed = true` lets the agent author its own skills. It is off by default because you normally curate that store yourself; it exists for a long-running agent that dispatches sub-agents, where a skill is the only artifact that both survives the session and can be handed to a sub-agent as its task. Sub-agents never receive the authoring tools whatever this is set to. See [Letting the agent manage skills](../usage/skills.md#letting-the-agent-manage-skills).
 
-`extra_paths` adds directories to the scan. They are strictly read-only: meka never creates them and never writes into them, so an entry that does not exist is simply skipped and leaves nothing behind. A leading `~` is expanded.
+`extra_paths` adds directories to the scan. They are strictly read-only: meka never creates them and never writes into them, so an entry that does not exist is simply skipped and leaves nothing behind. A leading `~` is expanded. Where reads are confined, these directories stay readable, as meka's own skills store does, so a skill's bundled files can be read; see [the read boundary](../usage/permissions.md#the-read-boundary).
 
 ```toml
 [skills]

@@ -139,20 +139,20 @@ pub(super) fn compile_user_regex(pattern: &str, tool_name: &str) -> Result<regex
         })
 }
 
-/// Refuse a read inside meka's own directories below `unrestricted`. `canonical` must be
-/// canonical, which every caller has from [`canonicalize_for_tool`].
-pub(super) fn refuse_private_read(
+/// Admit one read of `canonical` against the session's read boundary: meka's own directories are
+/// refused below `unrestricted`, and with reads confined so is anything outside the readable
+/// roots. `canonical` must be canonical, which every caller has from [`canonicalize_for_tool`].
+pub(super) fn admit_read(
     tool_name: &str,
     site: &crate::session::ToolSite,
     canonical: &Path,
 ) -> Result<()> {
-    match crate::workspace::private_read_refusal(site.permission.get(), canonical) {
-        Some(message) => Err(MekaError::ToolExecution {
+    site.read_scope()
+        .admit(&site.cwd, canonical)
+        .map_err(|message| MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
             message,
-        }),
-        None => Ok(()),
-    }
+        })
 }
 
 /// Resolve the path the model provided to a canonical absolute path, with every symlink component

@@ -209,6 +209,13 @@ pub(crate) struct SessionCells {
     pub(crate) permission: crate::permission::SharedPermission,
     pub(crate) cwd: crate::workspace::SharedCwd,
     pub(crate) roots: crate::workspace::SharedRoots,
+    /// Directories the session may read but not write, beyond its roots: what a parent's
+    /// `readable_roots` handed a sub-agent. Empty on every other session.
+    pub(crate) read_only_roots: crate::workspace::SharedRoots,
+    /// Whether this session's reads are confined, and to what beyond its roots: the process's
+    /// boundary from the configuration, or one a spawn switched on for a sub-agent
+    /// ([`crate::workspace::ReadBoundary::for_worker`]).
+    pub(crate) read_boundary: crate::workspace::ReadBoundary,
     pub(crate) session_id: SharedSessionId,
     pub(crate) checklist: crate::checklist::SharedChecklist,
     /// What the session runs on, published so a switch reaches everything holding this.
@@ -249,6 +256,8 @@ impl SessionCells {
             permission,
             cwd,
             roots,
+            read_only_roots: crate::workspace::SharedRoots::default(),
+            read_boundary: crate::workspace::ReadBoundary::unconfined(),
             session_id: SharedSessionId::default(),
             checklist: crate::checklist::SharedChecklist::default(),
             profile,
@@ -329,6 +338,8 @@ impl SessionCells {
             permission: self.permission.clone(),
             cwd: self.cwd.clone(),
             roots: self.roots.clone(),
+            read_only_roots: self.read_only_roots.clone(),
+            read_boundary: self.read_boundary.clone(),
             session_id: self.session_id.clone(),
         }
     }
@@ -344,6 +355,10 @@ pub(crate) struct ToolSite {
     pub(crate) permission: crate::permission::SharedPermission,
     pub(crate) cwd: crate::workspace::SharedCwd,
     pub(crate) roots: crate::workspace::SharedRoots,
+    /// See [`SessionCells::read_only_roots`].
+    pub(crate) read_only_roots: crate::workspace::SharedRoots,
+    /// See [`SessionCells::read_boundary`].
+    pub(crate) read_boundary: crate::workspace::ReadBoundary,
     pub(crate) session_id: SharedSessionId,
 }
 
@@ -358,8 +373,21 @@ impl ToolSite {
             permission,
             cwd,
             roots: crate::workspace::SharedRoots::default(),
+            read_only_roots: crate::workspace::SharedRoots::default(),
+            read_boundary: crate::workspace::ReadBoundary::unconfined(),
             session_id: SharedSessionId::default(),
         }
+    }
+
+    /// The read boundary of the session this site serves, as one scope: the one definition every
+    /// in-process read and every sandbox dialect judge a read by.
+    pub(crate) fn read_scope(&self) -> crate::workspace::ReadScope {
+        crate::workspace::ReadScope::new(
+            self.permission.clone(),
+            self.roots.clone(),
+            self.read_only_roots.clone(),
+            self.read_boundary.clone(),
+        )
     }
 }
 
@@ -392,6 +420,11 @@ impl ToolSite {
 
     pub(crate) fn with_roots(mut self, roots: crate::workspace::SharedRoots) -> Self {
         self.roots = roots;
+        self
+    }
+
+    pub(crate) fn with_read_boundary(mut self, boundary: crate::workspace::ReadBoundary) -> Self {
+        self.read_boundary = boundary;
         self
     }
 

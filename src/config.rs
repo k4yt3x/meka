@@ -307,6 +307,10 @@ pub(crate) struct PermissionsConfig {
     /// Whether a tool call needing more than the session's level is submitted to the user for
     /// approval rather than refused. Off unless set; a session records its own afterwards.
     pub(crate) approvals: Option<bool>,
+    /// Whether reads below `unrestricted` are confined to the session's roots and the paths a
+    /// command needs to run, the way writes are confined to the roots at `workspace`. Off unless
+    /// set: a boundary on reads is the stronger promise, and one the user states.
+    pub(crate) confine_reads: Option<bool>,
 }
 
 /// Built-in tool filters, mirroring the per-server knobs on [`McpServerConfig`]. Applied at
@@ -821,6 +825,10 @@ const DEFAULT_SUBAGENT_MAX_DEPTH: usize = 3;
 #[serde(deny_unknown_fields)]
 pub(crate) struct ShellConfig {
     pub(crate) sandbox: Option<bool>,
+    /// Directories every confined command may read beyond the system directories, when
+    /// `[permissions].confine_reads` is on: where this machine keeps system software that the
+    /// platform list does not name.
+    pub(crate) readable_paths: Option<Vec<PathBuf>>,
     /// Linux-only choice between `"landlock"` and `"bubblewrap"`. When omitted, the resolver
     /// auto-picks bubblewrap if available and falls back to landlock with a one-shot warning (see
     /// `src/sandbox.rs` and `Warn 2` in `warn_if_sandbox_issues`).
@@ -1378,6 +1386,9 @@ pub(crate) struct ResolvedConfig {
     pub(crate) enabled_permissions: EnabledPermissions,
     /// What a new session's approvals switch starts as. A resumed session brings its own.
     pub(crate) approvals: bool,
+    /// Resolved `[permissions].confine_reads`: whether reads below `unrestricted` stay within the
+    /// session's roots.
+    pub(crate) confine_reads: bool,
     pub(crate) streaming: bool,
     pub(crate) show_session_id_on_create: bool,
     pub(crate) show_session_id_on_resume: bool,
@@ -1393,6 +1404,8 @@ pub(crate) struct ResolvedConfig {
     pub(crate) turn_end_summary: Vec<TurnEndFact>,
     pub(crate) web_client: WebClientConfig,
     pub(crate) sandbox: bool,
+    /// Resolved `[shell].readable_paths`, as written: canonicalized where they are used.
+    pub(crate) readable_paths: Vec<PathBuf>,
     /// `[shell].sandbox_backend` (or its flag and variable), before any auto-pick. Linux-only;
     /// the host resolves and probes it at startup ([`crate::sandbox::resolve_backend`]) because
     /// the pick depends on what the machine has.
@@ -2303,6 +2316,7 @@ impl ResolvedConfig {
             permission,
             enabled_permissions,
             approvals: file_permissions.approvals.unwrap_or(false),
+            confine_reads: file_permissions.confine_reads.unwrap_or(false),
             streaming: streaming_enabled(overrides.no_stream, file_display.stream),
             show_session_id_on_create: file_display.show_session_id_on_create.unwrap_or(false),
             show_session_id_on_resume: file_display.show_session_id_on_resume.unwrap_or(true),
@@ -2317,6 +2331,7 @@ impl ResolvedConfig {
                 .unwrap_or_else(|| StatusFact::DEFAULT_ROW.to_vec()),
             web_client: WebClientConfig::from_file(&file_web),
             sandbox: file_shell.sandbox.unwrap_or(true),
+            readable_paths: file_shell.readable_paths.unwrap_or_default(),
             sandbox_backend,
             retention: file_session.retention,
             turn_retention: file_session.turn_retention,
@@ -5484,6 +5499,33 @@ enabled = ["read", "workspace"]
             permissions.enabled,
             Some(vec![Permission::Read, Permission::Workspace])
         );
+        assert_eq!(permissions.confine_reads, None, "off unless stated");
+    }
+
+    /// The read boundary is two keys in two sections: the switch is policy and sits with the
+    /// level; the extra paths are a fact about the machine and sit with the sandbox.
+    #[test]
+    fn the_read_boundary_is_a_permissions_switch_and_a_shell_path_list() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[permissions]
+confine_reads = true
+
+[shell]
+readable_paths = ["/opt/tools", "/snap"]
+"#,
+        )
+        .expect("parse toml");
+        assert_eq!(
+            config.permissions.expect("permissions").confine_reads,
+            Some(true)
+        );
+        assert_eq!(
+            config.shell.expect("shell").readable_paths,
+            Some(vec![PathBuf::from("/opt/tools"), PathBuf::from("/snap")])
+        );
+        let bare: ConfigFile = toml::from_str("").expect("parse toml");
+        assert!(bare.permissions.is_none() && bare.shell.is_none());
     }
 
     /// `sandbox_backend = "bubblewrap"` and `"landlock"` deserialize cleanly. Any other value,

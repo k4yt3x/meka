@@ -52,7 +52,7 @@ pub(crate) fn run_tool_subcommand(
             // warning is the one a session start gives, and it explains an `unrestricted` row.
             let sandbox = crate::sandbox::resolve_backend(config.sandbox_backend, config.sandbox);
             crate::sandbox::warn_if_sandbox_issues(
-                &crate::sandbox::SandboxState::new(config.sandbox, &sandbox),
+                &crate::sandbox::SandboxState::new(config.sandbox, config.confine_reads, &sandbox),
                 crate::sandbox::WarnContext::ToolListing,
             );
             let materials = crate::session::SessionMaterials {

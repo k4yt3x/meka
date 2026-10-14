@@ -1076,6 +1076,7 @@ fn build_environment_context(
     permission: Permission,
     cwd: &std::path::Path,
     roots: &[std::path::PathBuf],
+    readable: Option<&[std::path::PathBuf]>,
 ) -> String {
     if permission == Permission::None {
         return String::new();
@@ -1124,8 +1125,37 @@ fn build_environment_context(
             // Deliberately not "the sandbox refuses it": whether one exists is a per-platform,
             // per-config question this function cannot answer, and when the answer is no the shell
             // is refused outright rather than run unconfined. Stating the outcome covers both.
+            if readable.is_none() {
+                context.push_str(
+                    "Reads may reach outside these roots, except meka's private directories.\n",
+                );
+            }
+        }
+    }
+
+    // Stated at every level that confines, since `read` reads and the boundary binds it as much
+    // as `workspace`. The system directories are named in a word rather than listed: they are the
+    // same on every turn, and the roots are what the model has to keep to.
+    if let Some(readable) = readable {
+        if readable.is_empty() {
             context.push_str(
-                "Reads may reach outside these roots, except meka's private directories.\n",
+                "No readable root currently resolves: file and shell reads reach only the \
+                 system directories until one does.\n",
+            );
+        } else {
+            context.push_str(
+                "File and shell reads are confined to these roots, and to the system \
+                 directories (`/usr`, `/etc` and the like):\n",
+            );
+            for root in readable {
+                context.push_str(&format!("  {}\n", root.display()));
+            }
+        }
+        // The one platform whose shell cannot hold the boundary; the model is told rather than
+        // left to find out from a command that read what a tool refused.
+        if cfg!(windows) {
+            context.push_str(
+                "On this platform the shell's reads are not confined; the file tools' are.\n",
             );
         }
     }
@@ -1284,6 +1314,9 @@ pub(crate) struct TurnContext<'a> {
     pub(crate) one_shot: bool,
     pub(crate) cwd: &'a std::path::Path,
     pub(crate) roots: &'a [std::path::PathBuf],
+    /// The roots reads are confined to at this level, the session's own without the platform's
+    /// paths, or `None` when reads reach everywhere.
+    pub(crate) readable: Option<&'a [std::path::PathBuf]>,
     pub(crate) world_state: &'a str,
     pub(crate) budget: Option<ContextBudget>,
     /// `[session].turn_retention`, for the `[Retention]` section that dates where the record
@@ -1310,6 +1343,7 @@ pub(crate) fn build_turn_context(context: TurnContext<'_>) -> String {
         one_shot,
         cwd,
         roots,
+        readable,
         world_state,
         budget,
         turn_retention,
@@ -1351,7 +1385,7 @@ pub(crate) fn build_turn_context(context: TurnContext<'_>) -> String {
         sections.push(render_background_section(background));
     }
 
-    let environment_context = build_environment_context(permission, cwd, roots);
+    let environment_context = build_environment_context(permission, cwd, roots, readable);
     if !environment_context.is_empty() {
         sections.push(environment_context);
     }
@@ -3995,6 +4029,7 @@ mod tests {
             approvals: false,
             cwd: std::path::Path::new("."),
             roots: &[],
+            readable: None,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -4016,6 +4051,7 @@ mod tests {
             approvals: false,
             cwd: std::path::Path::new("."),
             roots: &[],
+            readable: None,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -4040,6 +4076,7 @@ mod tests {
             approvals: false,
             cwd: std::path::Path::new("."),
             roots: &[],
+            readable: None,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -4318,6 +4355,7 @@ mod tests {
             one_shot: false,
             cwd: std::path::Path::new("."),
             roots: &[],
+            readable: None,
             world_state: "",
             budget: None,
             turn_retention: Some(window),
@@ -4336,6 +4374,7 @@ mod tests {
                 one_shot: false,
                 cwd: std::path::Path::new("."),
                 roots: &[],
+                readable: None,
                 world_state: "",
                 budget: None,
                 turn_retention: None,
@@ -4344,6 +4383,44 @@ mod tests {
                 resumed: false,
             })
             .contains("[Retention]")
+        );
+    }
+
+    /// With reads confined the block names the readable roots at every level that reads, says
+    /// nothing about reads reaching outside, and says when no root resolves.
+    #[test]
+    fn the_environment_block_names_the_readable_roots_when_reads_are_confined() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = crate::workspace::canonical_for_test(temp.path());
+        let roots: Vec<std::path::PathBuf> = vec![];
+        let readable = vec![cwd.clone()];
+        for level in [Permission::Read, Permission::Workspace] {
+            let context = build_environment_context(level, &cwd, &roots, Some(&readable));
+            assert!(
+                context.contains("File and shell reads are confined to these roots"),
+                "{level}: {context}"
+            );
+            assert!(
+                context.contains(&format!("  {}\n", cwd.display())),
+                "{context}"
+            );
+            assert!(!context.contains("Reads may reach outside"), "{context}");
+            assert_eq!(
+                context.contains("the shell's reads are not confined"),
+                cfg!(windows),
+                "{context}"
+            );
+        }
+        let open = build_environment_context(Permission::Workspace, &cwd, &roots, None);
+        assert!(
+            open.contains("Reads may reach outside these roots"),
+            "{open}"
+        );
+        assert!(!open.contains("reads are confined"), "{open}");
+        let none = build_environment_context(Permission::Read, &cwd, &roots, Some(&[]));
+        assert!(
+            none.contains("No readable root currently resolves"),
+            "{none}"
         );
     }
 
@@ -4377,7 +4454,8 @@ mod tests {
 
     #[test]
     fn environment_context_names_the_working_directory_and_the_date() {
-        let context = build_environment_context(Permission::Read, std::path::Path::new("."), &[]);
+        let context =
+            build_environment_context(Permission::Read, std::path::Path::new("."), &[], None);
         assert!(context.contains("[Environment context]"));
         assert!(context.contains("Working directory:"));
         assert!(context.contains("Date:"));
@@ -4385,7 +4463,8 @@ mod tests {
 
     #[test]
     fn environment_context_none_mode() {
-        let context = build_environment_context(Permission::None, std::path::Path::new("."), &[]);
+        let context =
+            build_environment_context(Permission::None, std::path::Path::new("."), &[], None);
         assert!(context.is_empty());
     }
 
@@ -4394,7 +4473,7 @@ mod tests {
     #[test]
     fn environment_context_omits_roots_when_empty() {
         let context =
-            build_environment_context(Permission::Read, std::path::Path::new("/work"), &[]);
+            build_environment_context(Permission::Read, std::path::Path::new("/work"), &[], None);
         assert!(context.contains("Working directory: /work"));
         assert!(!context.contains("Additional workspace roots"));
     }
@@ -4407,8 +4486,12 @@ mod tests {
             std::path::PathBuf::from("/work/shared"),
             std::path::PathBuf::from("/work/docs"),
         ];
-        let context =
-            build_environment_context(Permission::Read, std::path::Path::new("/work/main"), &roots);
+        let context = build_environment_context(
+            Permission::Read,
+            std::path::Path::new("/work/main"),
+            &roots,
+            None,
+        );
         assert!(context.contains("Working directory: /work/main"));
         assert!(context.contains("Additional workspace roots"));
         assert!(context.contains("/work/shared"));
@@ -4431,7 +4514,7 @@ mod tests {
         let missing = cwd.join("was-deleted");
 
         let roots = vec![nested.clone(), missing.clone()];
-        let context = build_environment_context(Permission::Workspace, &cwd, &roots);
+        let context = build_environment_context(Permission::Workspace, &cwd, &roots, None);
 
         let confined = context
             .split_once("File and shell writes are confined to these roots")
@@ -4458,7 +4541,7 @@ mod tests {
         // Every other level leaves the boundary unstated, which is what keeps the prompt identical
         // for the sessions that have no boundary to describe.
         for quiet in [Permission::Read, Permission::Unrestricted, Permission::None] {
-            let context = build_environment_context(quiet, &cwd, &roots);
+            let context = build_environment_context(quiet, &cwd, &roots, None);
             assert!(
                 !context.contains("Writes are confined"),
                 "{quiet} must not describe a write boundary"
@@ -4475,6 +4558,7 @@ mod tests {
             approvals: false,
             cwd: std::path::Path::new("."),
             roots: &[],
+            readable: None,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -4502,6 +4586,7 @@ mod tests {
             approvals: false,
             cwd: std::path::Path::new("."),
             roots: &[],
+            readable: None,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -4621,6 +4706,7 @@ mod tests {
             approvals: false,
             cwd: std::path::Path::new("."),
             roots: &[],
+            readable: None,
             world_state: "[Skills]\nnone",
             budget: None,
             turn_retention: None,
@@ -4645,6 +4731,7 @@ mod tests {
             approvals: false,
             cwd: std::path::Path::new("."),
             roots: &[],
+            readable: None,
             world_state: "",
             budget: Some(ContextBudget {
                 used: 42_000,
@@ -4669,6 +4756,7 @@ mod tests {
             approvals: false,
             cwd: std::path::Path::new("."),
             roots: &[],
+            readable: None,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -4689,6 +4777,7 @@ mod tests {
             approvals: false,
             cwd: std::path::Path::new("."),
             roots: &[],
+            readable: None,
             world_state: "",
             budget: None,
             turn_retention: None,

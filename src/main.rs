@@ -76,11 +76,15 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     if let Some(cli::Command::Confine {
         writable,
+        readable,
         scratch,
         command,
     }) = &cli.command
     {
-        let error = crate::sandbox::run_confined(writable, scratch, command);
+        // A list is the boundary; none is reading everywhere. A confined set is never empty, since
+        // it always holds the system directories.
+        let readable = (!readable.is_empty()).then_some(readable.as_slice());
+        let error = crate::sandbox::run_confined(writable, readable, scratch, command);
         eprintln!("meka confine: failed to run the command inside the sandbox: {error}");
         std::process::exit(126);
     }

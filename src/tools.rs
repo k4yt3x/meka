@@ -1314,7 +1314,7 @@ mod tests {
         }
 
         for definition in [
-            subagent::agent_spawn_definition(&[]),
+            subagent::agent_spawn_definition(&[], false),
             subagent::agent_list_definition(),
             subagent::agent_followup_definition(),
             subagent::agent_steer_definition(),

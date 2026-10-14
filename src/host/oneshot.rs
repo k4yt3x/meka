@@ -231,7 +231,11 @@ pub(crate) async fn run_oneshot(
         .with_approvals(start_approvals);
     if start_permission == crate::permission::Permission::Read {
         crate::sandbox::warn_if_sandbox_issues(
-            &crate::sandbox::SandboxState::new(config.sandbox, &shared.sandbox),
+            &crate::sandbox::SandboxState::new(
+                config.sandbox,
+                config.confine_reads,
+                &shared.sandbox,
+            ),
             crate::sandbox::WarnContext::InitialReadLevel,
         );
     }

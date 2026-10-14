@@ -1057,7 +1057,7 @@ impl Tool for ReadFileTool {
 
         let resolved = crate::workspace::resolve_against_cwd(&self.site.cwd, &path);
         let canonical = canonicalize_for_tool("file_read", &resolved).await?;
-        super::util::refuse_private_read("file_read", &self.site, &canonical)?;
+        super::util::admit_read("file_read", &self.site, &canonical)?;
 
         // Detect image files and return multimodal content, converting non-native formats (TIFF,
         // ICO, etc.) to PNG along the way.
@@ -5790,5 +5790,52 @@ mod tests {
             std::fs::read_to_string(&inside).expect("read inside"),
             "BETA\n"
         );
+    }
+
+    /// With reads confined, `file_read` refuses a file outside the roots and names them, and reads
+    /// one inside as before.
+    #[tokio::test]
+    async fn a_confined_read_refuses_a_file_outside_the_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let work = crate::workspace::canonical_for_test(temp.path()).join("work");
+        let elsewhere = crate::workspace::canonical_for_test(temp.path()).join("elsewhere");
+        std::fs::create_dir_all(&work).expect("mkdir");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir");
+        std::fs::write(work.join("inside.txt"), "inside").expect("write");
+        std::fs::write(elsewhere.join("secret.txt"), "secret").expect("write");
+        let tool = ReadFileTool {
+            read_tracker: tracker_for_test(),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::SharedCwd::new(work.clone()))
+                .with_permission(crate::permission::SharedPermission::new(
+                    crate::permission::Permission::Read,
+                    crate::permission::EnabledPermissions::ALL,
+                ))
+                .with_read_boundary(crate::workspace::ReadBoundary {
+                    confined: true,
+                    base: Vec::new(),
+                }),
+        };
+        let refused = tool
+            .execute(
+                serde_json::json!({"path": elsewhere.join("secret.txt")}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("outside the roots");
+        let message = refused.to_string();
+        assert!(
+            message.contains("outside the readable roots")
+                && message.contains(&work.display().to_string()),
+            "{message}"
+        );
+        let allowed = tool
+            .execute(
+                serde_json::json!({"path": "inside.txt"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("inside the roots");
+        assert!(allowed.text_content().contains("inside"));
     }
 }

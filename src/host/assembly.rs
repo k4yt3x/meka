@@ -29,6 +29,9 @@ pub(crate) struct SharedDeps {
     pub(crate) agent_options: AgentOptions,
     /// What the sandbox probe found at startup; every session's materials are built from it.
     pub(crate) sandbox: crate::sandbox::SandboxResolution,
+    /// What `[permissions].confine_reads` and `[shell].readable_paths` resolve to, once: every
+    /// session this host builds reads within it.
+    pub(crate) read_boundary: crate::workspace::ReadBoundary,
     /// The dispatcher a scheduled gate's tool probe resolves against.
     pub(crate) gate_tools: Option<Arc<dyn crate::schedule::GateTools>>,
     /// The standing instructions, resolved once at startup, and where they came from. The text
@@ -210,10 +213,13 @@ pub(crate) async fn build_shared_deps(
     // the startup warning about an unusable or improvable sandbox is given from the same answer.
     let sandbox = crate::sandbox::resolve_backend(config.sandbox_backend, config.sandbox);
     crate::sandbox::warn_if_sandbox_issues(
-        &crate::sandbox::SandboxState::new(config.sandbox, &sandbox),
+        &crate::sandbox::SandboxState::new(config.sandbox, config.confine_reads, &sandbox),
         crate::sandbox::WarnContext::Startup,
     );
     let sandbox_capability = crate::sandbox::capability_from_probe(&sandbox.probe);
+    // Resolved once: the base paths are canonicalized here, and an extra that does not resolve
+    // is warned about once rather than per session.
+    let read_boundary = crate::workspace::ReadBoundary::from_config(&config);
     let sandboxed_shell = config.sandbox
         && !matches!(
             sandbox_capability,
@@ -275,6 +281,7 @@ pub(crate) async fn build_shared_deps(
     Ok(SharedDeps {
         config,
         sandbox,
+        read_boundary,
         gate_tools,
         user_instructions,
         user_instructions_source,
@@ -398,6 +405,8 @@ pub(crate) async fn build_session_agent(
     );
     cells.context_tokens = context_tokens;
     cells.context_overhead = context_overhead;
+    // The process's read boundary, before the tools that judge by it are registered.
+    cells.read_boundary = shared.read_boundary.clone();
     if let Some(id) = session_id {
         cells.seed_context_tokens(&shared.store, id).await;
     }

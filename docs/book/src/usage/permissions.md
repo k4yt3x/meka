@@ -67,6 +67,57 @@ A sub-agent can be handed a narrower boundary than its parent's: [`agent_spawn`'
 `writable_roots`](../tools/overview.md#agent_spawn) names the directories it may write under, each
 of which must lie inside the parent's own.
 
+## The read boundary
+
+Reads are not confined by default: the workspace boundary says "this cannot change things outside
+the workspace", not "this cannot see them". `[permissions].confine_reads = true` adds the second
+promise. Below `unrestricted`, a read, by a file tool or by a command, may then land only under:
+
+- the session's roots, the same list writes are confined to: the working directory, an ACP client's
+  additional directories, each `--writable-root`;
+- the read-only roots a parent handed a sub-agent through [`agent_spawn`'s
+  `readable_roots`](../tools/overview.md#agent_spawn);
+- the system directories, where the operating system keeps the programs, libraries and
+  configuration a command needs to run at all, and anything [`[shell].readable_paths`](../configuration/config-file.md#shellreadable_paths) adds. The home directory is not among them: that is the point;
+- the skill roots [`[skills].extra_paths`](../configuration/config-file.md#skills) names, so a
+  skill's bundled files stay readable, as meka's own skills store does.
+
+The switch is instance-wide and read at startup, so every session the process runs is bound by it;
+`unrestricted` remains the per-session way out, since it disclaims every boundary. The same set
+governs both halves, derived once: `file_read`, `file_find`, `file_search` and
+`scratchpad_load_file` refuse a path outside it and name the roots, `file_find` and `file_search`
+step around what a symlink reaches outside it, and the shell sandbox is built from it. The
+environment block the agent reads each turn names the readable roots and the fact that the
+system directories are readable too.
+
+What a command no longer sees, it mostly does not see at all: under Bubblewrap the root of the
+sandbox is an empty filesystem with only the readable paths bound into it, so a path outside them
+is absent rather than refused, and a symlink out of the roots points at nothing. Two consequences
+worth knowing. Anything a tool reads from the home directory is gone, which covers `~/.cargo/bin`,
+`~/.local/bin`, version-manager shims, the global git configuration and every package cache; a
+directory among them comes back by being named as a root, and nothing else does. And a path's
+existence, name and size may still be visible under Landlock alone and under macOS, where `stat`
+is not mediated so that paths resolve through their ancestors; the bytes are what the boundary
+protects.
+
+The switch is the deployment's default, not the only way in. With it off, a parent still confines
+a sub-agent's reads by naming `readable_roots`: that sub-agent, and anything it spawns, reads its
+writable roots, the list and the system directories, the way `writable_roots` hands a
+sub-agent a write boundary from a parent that has none. A spawn turns confinement on, never off.
+A sub-agent's reach never exceeds its parent's here either: `readable_roots` are admitted against
+the parent's own readable roots when the parent's reads are confined, a parent reading everywhere
+may name anywhere, and a follow-up re-admits the worker's directory and roots against the parent's
+reach at that moment. A sub-agent whose call names nothing holds its parent's boundary, and one
+handed a list runs at `workspace` unless its call asks for less.
+
+The file tools answer "not found" for a path that is missing and refuse one that exists outside the
+roots, so a confined session can learn which paths exist, though not what they hold. The same is
+true of a command under Landlock alone and under macOS, as above.
+
+On Windows the shell cannot hold this boundary: neither token mechanism confines reads. The file
+tools keep it, a command does not, the agent is told so in its environment block, and startup logs
+one warning when `confine_reads` is on.
+
 If `[shell].sandbox = false`, `shell_execute` is refused at `workspace` rather than run
 unconfined. Nothing else would be holding the boundary, and half a boundary reported as a whole one
 is worse than an error that says so. Use `unrestricted` for those turns.
@@ -85,8 +136,9 @@ Four limits, stated plainly because none of them is visible from the inside:
 - **meka's own stores are outside the boundary and always writable**: the store under
   `MEKA_DATA_DIR`, memories included, and skills under `MEKA_CONFIG_DIR`. They are governed by their own
   config keys, not by this one.
-- **Reads are never confined**, at any level. The boundary is "this cannot change things outside
-  the workspace", not "this cannot see them".
+- **Reads are not confined unless `[permissions].confine_reads` is on.** The boundary alone is
+  "this cannot change things outside the workspace", not "this cannot see them"; the switch adds
+  the second half, as [the read boundary](#the-read-boundary) describes.
 - **The in-process fence resolves paths, it does not pin them.** `file_write` and `file_edit`
   resolve every existing component of a target before judging it, so a symlink already planted on
   the path is caught. What is left open is the race: a directory checked and then swapped for a
@@ -97,12 +149,12 @@ Four limits, stated plainly because none of them is visible from the inside:
 
 ### Per-platform enforcement
 
-| Platform | Backend | Confines the shell |
-|----------|---------|--------------------|
-| Linux | Bubblewrap (preferred) | Yes: read-only root bind, plus a writable bind per root, with the Landlock ruleset inside where the kernel has one |
-| Linux | Landlock (fallback) | Yes: one path-beneath rule per root, or one per sibling where the root contains meka's directories |
-| macOS | `sandbox-exec` | Yes: writable subpath per root |
-| Windows | `WRITE_RESTRICTED` token + per-root ACE | Yes: writes are permitted only where a workspace capability has an ACE |
+| Platform | Backend | Confines the shell's writes | Confines the shell's reads, with `confine_reads` on |
+|----------|---------|-----------------------------|-----------------------------------------------------|
+| Linux | Bubblewrap (preferred) | Yes: read-only root bind, plus a writable bind per root, with the Landlock ruleset inside where the kernel has one | Yes: an empty root with only the readable paths bound into it, read-only, the roots read-write; what is not bound is absent |
+| Linux | Landlock (fallback) | Yes: one path-beneath rule per root, or one per sibling where the root contains meka's directories | Yes: read and execute rules on the readable paths instead of on `/`; names and sizes outside stay visible to `stat` |
+| macOS | `sandbox-exec` | Yes: writable subpath per root | Yes: data reads and executable mappings per readable path instead of everywhere; existence and metadata stay global so paths resolve |
+| Windows | `WRITE_RESTRICTED` token + per-root ACE | Yes: writes are permitted only where a workspace capability has an ACE | No: the file tools hold the boundary, a command reads anywhere, and startup warns once |
 
 Under Bubblewrap, `/tmp`, `/run` and `/var/tmp` are masked with a tmpfs, so paths there are not
 merely unwritable but invisible. A workspace root under `/tmp` is bound after the mask and stays
@@ -420,7 +472,7 @@ Commands like `ls`, `cat`, `git log`, `df`, `ps`, and `uname` work normally. Com
 
 Two things the sandbox deliberately does **not** restrict, on every backend:
 
-- **Reads.** A sandboxed command can read anything your user can, including `~/.ssh`, `~/.aws/credentials` and meka's own store. `read` protects the machine from being *changed*, not from being *read*.
+- **Reads**, unless [`[permissions].confine_reads`](#the-read-boundary) is on. A sandboxed command can otherwise read anything your user can, including `~/.ssh` and `~/.aws/credentials`, and on Windows meka's own store. `read` protects the machine from being *changed*, not from being *read*.
 - **The network.** Outbound connections are left open, so a command at `read` can still send what it read. Provider API keys are scrubbed from the child's environment, but that is one vector, not a boundary.
 
 On Windows, `workspace` extends that first point to meka's own process. Its `WRITE_RESTRICTED` token restricts writes only, and unlike `read` it deliberately leaves the integrity label at the parent's level, so a confined command can open meka with `PROCESS_VM_READ` and read its memory. Measured on Windows 11: `OpenProcess` succeeds and `ReadProcessMemory` returns data. This is the one respect in which `workspace` confines less than `read`, whose Low-integrity token Windows blocks from opening a medium-integrity process at all. It grants nothing that reading `meka.db` would not, which a command at either level can already do, but it is worth knowing if you were treating `workspace` as strictly wider than `read` in every direction. They are not ordered that way; see the ladder note above.

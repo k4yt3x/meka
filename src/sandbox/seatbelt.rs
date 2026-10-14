@@ -17,11 +17,10 @@ pub(crate) const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 ///   `user-preference-write`) are NOT in the allow-list.
 /// - Network allowed: outbound BSD sockets, DNS resolution, TLS trust evaluation, and proxy/network
 ///   configuration reads are explicitly permitted.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(dead_code, reason = "read only on macOS; the tests run everywhere")
-)]
-pub(crate) const SANDBOX_PROFILE_READONLY: &str = r#"
+pub(crate) static SANDBOX_PROFILE_READONLY: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{PROFILE_PRELUDE}{READ_ANYWHERE_RULES}{PROFILE_BODY}"));
+/// The profile's opening: closed by default, so every allow below is a deliberate grant.
+const PROFILE_PRELUDE: &str = r#"
 ; Vendored from Codex (Apache 2.0 License):
 ;   github.com/openai/codex/blob/main/codex-rs/sandboxing/src/seatbelt_base_policy.sbpl
 ;   github.com/openai/codex/blob/main/codex-rs/sandboxing/src/seatbelt_network_policy.sbpl
@@ -32,14 +31,28 @@ pub(crate) const SANDBOX_PROFILE_READONLY: &str = r#"
 
 ; start with closed-by-default
 (deny default)
-
+"#;
+/// Reading everywhere: what a confinement allows when the read boundary is off.
+const READ_ANYWHERE_RULES: &str = r#"
 ; broad filesystem read: agent needs to read arbitrary files at the read level
 (allow file-read*)
 (allow file-test-existence)
 (allow file-ioctl)
 (allow file-map-executable)
 (allow file-read-metadata)
-
+"#;
+/// Reading within a boundary: existence, metadata and ioctl stay global, as `stat(2)` is under
+/// Landlock, so a path resolves through its ancestors and a tool can tell a missing file from a
+/// refused one; the data reads and the executable mappings are granted per readable path by
+/// [`sandbox_profile_for`]. Names and sizes outside the roots are what this leaves visible.
+const READ_CONFINED_RULES: &str = r#"
+; existence and metadata everywhere; data reads only beneath the readable paths appended below
+(allow file-test-existence)
+(allow file-ioctl)
+(allow file-read-metadata)
+"#;
+/// Everything after the read rules: processes, sysctls, IPC and the network.
+const PROFILE_BODY: &str = r#"
 ; child processes inherit the policy of their parent
 (allow process-exec)
 (allow process-fork)
@@ -176,11 +189,13 @@ pub(crate) const SANDBOX_PROFILE_READONLY: &str = r#"
 "#;
 /// Build the SBPL profile and the `-D` parameter arguments for one confinement.
 ///
-/// The read-only profile is used verbatim when `writable` is empty. Otherwise one `(allow
-/// file-write* (subpath (param "MEKA_WRITABLE_n")))` clause is appended per root. After those, one
-/// `(deny ...)` clause per directory in `private` hides meka's own config and store from the
-/// command; SBPL takes the last matching rule, so a deny appended last beats both the global read
-/// allow and a write allow for a root that happens to contain it.
+/// The read-only profile is used verbatim when `writable` is empty and reads are unconfined. With
+/// `readable` given, the profile reads nothing by default and one `(allow file-read*
+/// file-map-executable (subpath (param "MEKA_READABLE_n")))` clause is appended per readable path.
+/// Then one `(allow file-write* (subpath (param "MEKA_WRITABLE_n")))` clause per writable root.
+/// After those, one `(deny ...)` clause per directory in `private` hides meka's own config and
+/// store from the command; SBPL takes the last matching rule, so a deny appended last beats both
+/// a read allow and a write allow for a root that happens to contain it.
 ///
 /// Roots travel as **parameters** rather than interpolated into the profile text, which is what
 /// Codex does and for the same reason: SBPL string literals need escaping, and a path containing a
@@ -196,10 +211,25 @@ pub(crate) const SANDBOX_PROFILE_READONLY: &str = r#"
 )]
 pub(crate) fn sandbox_profile_for(
     writable: &[std::path::PathBuf],
+    readable: Option<&[std::path::PathBuf]>,
     private: &[std::path::PathBuf],
 ) -> (String, Vec<std::ffi::OsString>) {
-    let mut profile = String::from(SANDBOX_PROFILE_READONLY);
+    let mut profile = match readable {
+        None => SANDBOX_PROFILE_READONLY.clone(),
+        Some(_) => format!("{PROFILE_PRELUDE}{READ_CONFINED_RULES}{PROFILE_BODY}"),
+    };
     let mut params = Vec::new();
+    for (index, path) in readable.unwrap_or_default().iter().enumerate() {
+        let key = format!("MEKA_READABLE_{index}");
+        profile.push_str(&format!(
+            "\n(allow file-read* file-map-executable (subpath (param \"{key}\")))\n"
+        ));
+        let mut param = std::ffi::OsString::from(&key);
+        param.push("=");
+        param.push(path.as_os_str());
+        params.push(std::ffi::OsString::from("-D"));
+        params.push(param);
+    }
     for (index, root) in writable.iter().enumerate() {
         let key = format!("MEKA_WRITABLE_{index}");
         profile.push_str(&format!(

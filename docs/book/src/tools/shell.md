@@ -40,7 +40,8 @@ At **`read`**, commands run inside a sandbox that blocks writes to the user's re
 | Filesystem writes outside tmp / Low-integrity paths | ✓ | |
 | File metadata changes (mode, owner, timestamps, extended attributes) | Bubblewrap / macOS / Windows | Landlock alone, on every kernel |
 | Filesystem reads of meka's config directory and store | Bubblewrap / Landlock / macOS | Windows |
-| Filesystem reads elsewhere | | ✓ |
+| Filesystem reads outside the session's roots and the system directories, with [`[permissions].confine_reads`](../usage/permissions.md#the-read-boundary) on | Bubblewrap / Landlock / macOS | Windows |
+| Filesystem reads elsewhere, with `confine_reads` off | | ✓ |
 | Unix sockets the Bubblewrap masks do not cover (`$HOME`, `/var/lib`, the abstract namespace) | Landlock, and Bubblewrap on kernel 7.1+ (6.12+ for the abstract namespace) | Bubblewrap on older kernels / Windows |
 | Program execution | | ✓ |
 | Outbound network (TCP/UDP) | | ✓ |
@@ -105,7 +106,7 @@ sandbox_backend = "bubblewrap"       # or "landlock" or "bubblewrap-landlock"; u
 
 Low integrity is not a total write-denial: the child can still write to the small residual Low-integrity-writable surface (`%LOCALAPPDATA%\Low`, `%TEMP%\Low`, any path with an explicit Low-integrity write ACE) and to files it creates itself.
 
-Low integrity does not restrict reads at all: integrity levels stop a Low-integrity process writing up, not reading up. A command at `read` can therefore read meka's config directory and store, account credentials included, which the Bubblewrap, Landlock and macOS backends hide. No setting changes this. On Windows, treat every credential in the store as readable by any sandboxed command, and keep meka's directories outside every workspace root, because a root's write grant covers everything under it.
+Low integrity does not restrict reads at all, and neither does the `workspace` token below, so [`[permissions].confine_reads`](../usage/permissions.md#the-read-boundary) holds for the file tools alone on Windows; startup warns once when it is on. Integrity levels stop a Low-integrity process writing up, not reading up. A command at `read` can therefore read meka's config directory and store, account credentials included, which the Bubblewrap, Landlock and macOS backends hide. No setting changes this. On Windows, treat every credential in the store as readable by any sandboxed command, and keep meka's directories outside every workspace root, because a root's write grant covers everything under it.
 
 #### Windows at `workspace`
 

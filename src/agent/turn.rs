@@ -675,13 +675,20 @@ impl Agent {
         };
         let cwd = self.cells.cwd.get();
         let roots = self.cells.roots.get();
+        let permission = self.cells.permission.get();
+        let readable = self
+            .cells
+            .site()
+            .read_scope()
+            .session_roots_at(permission, &self.cells.cwd);
         prompt::build_turn_context(prompt::TurnContext {
             vision: self.cells.profile.current().vision,
             one_shot: self.options.one_shot,
-            permission: self.cells.permission.get(),
+            permission,
             approvals: self.cells.permission.approvals(),
             cwd: &cwd,
             roots: &roots,
+            readable: readable.as_deref(),
             world_state,
             budget,
             turn_retention: self.options.turn_retention,

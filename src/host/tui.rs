@@ -147,7 +147,8 @@ pub(crate) async fn run_interactive(
 
     let shared_permission = SharedPermission::new(start_permission, config.enabled_permissions)
         .with_approvals(start_approvals);
-    let sandbox_state = crate::sandbox::SandboxState::new(config.sandbox, &shared.sandbox);
+    let sandbox_state =
+        crate::sandbox::SandboxState::new(config.sandbox, config.confine_reads, &shared.sandbox);
     if start_permission == crate::permission::Permission::Read {
         crate::sandbox::warn_if_sandbox_issues(
             &sandbox_state,

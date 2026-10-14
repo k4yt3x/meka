@@ -7666,6 +7666,7 @@ mod tests {
             approvals: false,
             cwd: std::path::Path::new("."),
             roots: &[],
+            readable: None,
             world_state: "",
             budget: Some(crate::prompt::ContextBudget {
                 used: 42_000,

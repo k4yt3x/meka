@@ -37,7 +37,8 @@ fn bwrap_masks() -> Vec<std::path::PathBuf> {
     masks
 }
 
-/// Every bwrap argument up to the `--` separator, for `writable` roots.
+/// Every bwrap argument up to the `--` separator, for `writable` roots, reading everywhere or only
+/// beneath `readable`.
 ///
 /// Factored out of the spawn so the ordering rule below is testable without a live child. Order is
 /// the whole correctness argument here and it is invisible in the resulting mount namespace: bwrap
@@ -49,37 +50,55 @@ fn bwrap_masks() -> Vec<std::path::PathBuf> {
 #[cfg(target_os = "linux")]
 fn bwrap_args(
     writable: &[std::path::PathBuf],
+    readable: Option<&[std::path::PathBuf]>,
     cwd: &std::path::Path,
     private: &[std::path::PathBuf],
 ) -> Vec<std::ffi::OsString> {
-    // `--ro-bind /` enforces "no writes", `--unshare-*` cuts off PID / user / UTS / IPC views, and
-    // the tmpfs masks over `/run`, `/tmp`, `/var/tmp` and `$XDG_RUNTIME_DIR` make the dbus and
-    // systemd-user sockets unreachable so the agent cannot `dbus-send` state-changing methods.
-    // `--unshare-net` is intentionally absent; network must stay open for `curl | pdftotext` and
-    // similar pipelines.
-    let mut args: Vec<std::ffi::OsString> = [
-        "--new-session",
-        "--die-with-parent",
-        "--ro-bind",
-        "/",
-        "/",
-        "--dev",
-        "/dev",
-        "--proc",
-        "/proc",
-        "--unshare-user",
-        "--unshare-pid",
-        "--unshare-uts",
-        "--unshare-ipc",
-        "--unshare-cgroup-try",
-    ]
-    .iter()
-    .map(std::ffi::OsString::from)
-    .collect();
+    // Reading everywhere, `--ro-bind /` enforces "no writes". Reading within a boundary, the root
+    // is an empty tmpfs instead and only the readable paths are bound into it, read-only: what is
+    // not bound is absent rather than refused, so a confined command sees no name outside its
+    // roots and a symlink out of them points at nothing. `--unshare-*` cuts off PID / user / UTS /
+    // IPC views, and the tmpfs masks over `/run`, `/tmp`, `/var/tmp` and `$XDG_RUNTIME_DIR` make
+    // the dbus and systemd-user sockets unreachable so the agent cannot `dbus-send` state-changing
+    // methods. `--unshare-net` is intentionally absent; network must stay open for `curl |
+    // pdftotext` and similar pipelines.
+    let root: &[&str] = match readable {
+        Some(_) => &["--tmpfs", "/"],
+        None => &["--ro-bind", "/", "/"],
+    };
+    let mut args: Vec<std::ffi::OsString> = ["--new-session", "--die-with-parent"]
+        .iter()
+        .chain(root)
+        .chain(&[
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-uts",
+            "--unshare-ipc",
+            "--unshare-cgroup-try",
+        ])
+        .map(std::ffi::OsString::from)
+        .collect();
 
     for mask in bwrap_masks() {
         args.push("--tmpfs".into());
         args.push(mask.into());
+    }
+
+    // The readable paths, after the masks so a root under one is bound back in, and before the
+    // writable binds, whose later mount makes a root read-write. `/dev` and `/proc` are the two
+    // mounts above, and binding the host's over them would hand back every device and every
+    // process.
+    for path in readable.unwrap_or_default() {
+        if path == std::path::Path::new("/dev") || path == std::path::Path::new("/proc") {
+            continue;
+        }
+        args.push("--ro-bind-try".into());
+        args.push(path.into());
+        args.push(path.into());
     }
 
     // The working directory, read-only, after the masks and before the writable binds.
@@ -149,11 +168,16 @@ fn bwrap_args(
 fn inner_confinement_argv(
     program: &std::path::Path,
     writable: &[std::path::PathBuf],
+    readable: Option<&[std::path::PathBuf]>,
 ) -> Vec<std::ffi::OsString> {
     let mut argv: Vec<std::ffi::OsString> = vec![program.into(), "confine".into()];
     for root in writable {
         argv.push("--writable".into());
         argv.push(root.into());
+    }
+    for path in readable.unwrap_or_default() {
+        argv.push("--readable".into());
+        argv.push(path.into());
     }
     let mut scratch = bwrap_masks();
     scratch.push("/dev".into());
@@ -356,6 +380,7 @@ impl Tool for ExecuteCommandTool {
             self.sandbox_enabled,
             level,
             &self.scope,
+            &self.site.read_scope(),
             &self.site.cwd,
         );
         self.admit_confinement(level, confinement.is_sandboxed())
@@ -382,6 +407,7 @@ impl Tool for ExecuteCommandTool {
             self.sandbox_enabled,
             permission,
             &self.scope,
+            &self.site.read_scope(),
             &self.site.cwd,
         );
         let sandboxed = confinement.is_sandboxed();
@@ -481,6 +507,7 @@ impl Tool for ExecuteCommandTool {
             ) {
             let (profile, params) = crate::sandbox::seatbelt::sandbox_profile_for(
                 confinement.writable(),
+                confinement.readable(),
                 &crate::workspace::private_directories(),
             );
             let mut cmd = tokio::process::Command::new(crate::sandbox::seatbelt::SANDBOX_EXEC_PATH);
@@ -529,6 +556,7 @@ impl Tool for ExecuteCommandTool {
             let mut cmd = tokio::process::Command::new(bwrap_path);
             cmd.args(bwrap_args(
                 confinement.writable(),
+                confinement.readable(),
                 &self.site.cwd.get(),
                 &crate::workspace::private_directories(),
             ));
@@ -541,6 +569,7 @@ impl Tool for ExecuteCommandTool {
                 cmd.args(inner_confinement_argv(
                     std::path::Path::new(&program),
                     confinement.writable(),
+                    confinement.readable(),
                 ));
             }
             cmd.arg("sh").arg("-c").arg(&command);
@@ -590,6 +619,7 @@ impl Tool for ExecuteCommandTool {
                 Some(abi) => crate::sandbox::landlock_grants(
                     abi,
                     confinement.writable(),
+                    confinement.readable(),
                     &[],
                     &crate::workspace::private_directories(),
                 ),
@@ -2729,6 +2759,129 @@ mod tests {
     mod bubblewrap_boundary {
         use std::path::PathBuf;
 
+        /// With reads confined the root is an empty tmpfs and only the readable paths are bound,
+        /// read-only, after the masks and before the writable binds; `/dev` and `/proc` stay the
+        /// sandbox's own rather than the host's.
+        #[test]
+        fn a_confined_read_set_starts_from_an_empty_root_and_binds_only_what_it_names() {
+            let work = PathBuf::from("/tmp/work");
+            let readable = vec![
+                PathBuf::from("/usr"),
+                PathBuf::from("/etc"),
+                PathBuf::from("/dev"),
+                PathBuf::from("/proc"),
+                work.clone(),
+            ];
+            let text: Vec<String> =
+                super::bwrap_args(std::slice::from_ref(&work), Some(&readable), &work, &[])
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect();
+            let at = |pair: [&str; 2]| text.windows(2).position(|w| w == pair);
+            assert_eq!(at(["--tmpfs", "/"]), Some(2), "the root is empty: {text:?}");
+            assert!(
+                !text.windows(3).any(|w| w == ["--ro-bind", "/", "/"]),
+                "the host's root is not bound: {text:?}"
+            );
+            let bound = |path: &str| at(["--ro-bind-try", path]);
+            assert!(
+                bound("/usr").is_some() && bound("/etc").is_some(),
+                "{text:?}"
+            );
+            assert!(
+                bound("/dev").is_none() && bound("/proc").is_none(),
+                "the host's /dev and /proc must not replace the sandbox's: {text:?}"
+            );
+            let last_mask = at(["--tmpfs", "/var/tmp"]).expect("a mask");
+            let first_bind = bound("/usr").expect("a bind");
+            let rw = at(["--bind-try", "/tmp/work"]).expect("the writable root");
+            assert!(last_mask < first_bind && first_bind < rw, "{text:?}");
+        }
+
+        /// The inner layer is told the readable paths too, so the Landlock ruleset inside bwrap
+        /// confines reads as the mounts do.
+        #[test]
+        fn the_inner_layer_is_told_the_readable_paths() {
+            let readable = vec![PathBuf::from("/usr"), PathBuf::from("/home/someone/work")];
+            let text: Vec<String> = super::inner_confinement_argv(
+                std::path::Path::new("/proc/self/fd/7"),
+                &[PathBuf::from("/home/someone/work")],
+                Some(&readable),
+            )
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+            let after = |flag: &str| -> Vec<&str> {
+                text.windows(2)
+                    .filter(|w| w[0] == flag)
+                    .map(|w| w[1].as_str())
+                    .collect()
+            };
+            assert_eq!(after("--readable"), ["/usr", "/home/someone/work"]);
+            assert_eq!(after("--writable"), ["/home/someone/work"]);
+            let unconfined =
+                super::inner_confinement_argv(std::path::Path::new("/proc/self/fd/7"), &[], None);
+            assert!(
+                !unconfined.iter().any(|arg| arg == "--readable"),
+                "reading everywhere names no readable path"
+            );
+        }
+
+        /// End-to-end through a real bwrap: a confined command reads its root and the platform's
+        /// own directories, and nothing else exists for it, the home directory included.
+        #[test]
+        fn a_bubblewrapped_shell_with_confined_reads_sees_nothing_outside_its_roots() {
+            let Some(bwrap) = which_bwrap() else {
+                return;
+            };
+            let temp = tempfile::tempdir().expect("tempdir");
+            let base = crate::workspace::canonical_for_test(temp.path());
+            let work = base.join("work");
+            let outside = base.join("outside");
+            std::fs::create_dir(&work).expect("work");
+            std::fs::create_dir(&outside).expect("outside");
+            std::fs::write(work.join("inside.txt"), "inside\n").expect("write");
+            std::fs::write(outside.join("secret.txt"), "secret\n").expect("write");
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let boundary = crate::workspace::ReadBoundary::new(true, &[], &[]);
+            let readable: Vec<PathBuf> = std::iter::once(work.clone())
+                .chain(boundary.base.iter().cloned())
+                .collect();
+
+            let script = format!(
+                "cat {work}/inside.txt >/dev/null 2>&1 || exit 3\n\
+                 ls /usr/bin >/dev/null 2>&1 || exit 5\n\
+                 if cat {outside}/secret.txt >/dev/null 2>&1; then exit 4; fi\n\
+                 if [ -e {outside} ]; then exit 6; fi\n\
+                 {home_check}\n\
+                 exit 0",
+                work = work.display(),
+                outside = outside.display(),
+                home_check = match &home {
+                    Some(home) =>
+                        format!("if ls {} >/dev/null 2>&1; then exit 7; fi", home.display()),
+                    None => String::new(),
+                },
+            );
+            let status = std::process::Command::new(bwrap)
+                .args(super::bwrap_args(&[], Some(&readable), &work, &[]))
+                .arg("--")
+                .arg("sh")
+                .arg("-c")
+                .arg(&script)
+                .status()
+                .expect("spawn bwrap");
+            match status.code() {
+                Some(0) => {}
+                Some(3) => panic!("the read inside the root was refused"),
+                Some(4) => panic!("the read outside every root was permitted"),
+                Some(5) => panic!("the system directories were not readable"),
+                Some(6) => panic!("a directory outside the roots was visible"),
+                Some(7) => panic!("the home directory was visible"),
+                other => panic!("bwrap did not run the command: exit {other:?}"),
+            }
+        }
+
         /// The level `shell_execute` needs depends on whether a sandbox can actually confine it.
         ///
         /// `read` only when the sandbox is both enabled *and* backed by a working backend;
@@ -2806,7 +2959,7 @@ mod tests {
                 std::path::PathBuf::from("/"),
             ];
             for cwd in masked {
-                let text: Vec<String> = super::bwrap_args(&[], &cwd, &[])
+                let text: Vec<String> = super::bwrap_args(&[], None, &cwd, &[])
                     .iter()
                     .map(|arg| arg.to_string_lossy().into_owned())
                     .collect();
@@ -2854,7 +3007,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         fn the_child_is_given_a_working_directory_it_can_reach() {
             let cwd = PathBuf::from("/tmp/session-cwd");
-            let args = super::bwrap_args(&[], &cwd, &[]);
+            let args = super::bwrap_args(&[], None, &cwd, &[]);
             let text: Vec<String> = args
                 .iter()
                 .map(|arg| arg.to_string_lossy().into_owned())
@@ -2886,7 +3039,7 @@ mod tests {
 
             // A cwd that is also a writable root ends up read-write, because the rw bind comes
             // later.
-            let rw = super::bwrap_args(std::slice::from_ref(&cwd), &cwd, &[]);
+            let rw = super::bwrap_args(std::slice::from_ref(&cwd), None, &cwd, &[]);
             let rw: Vec<String> = rw
                 .iter()
                 .map(|arg| arg.to_string_lossy().into_owned())
@@ -2903,6 +3056,7 @@ mod tests {
         fn every_workspace_bind_comes_after_every_mask() {
             let args = super::bwrap_args(
                 &[PathBuf::from("/tmp/work")],
+                None,
                 std::path::Path::new("/tmp/work"),
                 &[],
             );
@@ -2961,7 +3115,12 @@ mod tests {
             );
 
             let status = std::process::Command::new(bwrap)
-                .args(super::bwrap_args(std::slice::from_ref(&work), &work, &[]))
+                .args(super::bwrap_args(
+                    std::slice::from_ref(&work),
+                    None,
+                    &work,
+                    &[],
+                ))
                 .arg("--")
                 .arg("sh")
                 .arg("-c")
@@ -2997,6 +3156,7 @@ mod tests {
             let store = root.join(".local/share/meka");
             let text: Vec<String> = super::bwrap_args(
                 std::slice::from_ref(&root),
+                None,
                 &root,
                 std::slice::from_ref(&store),
             )
@@ -3050,6 +3210,7 @@ mod tests {
             let status = std::process::Command::new(bwrap)
                 .args(super::bwrap_args(
                     std::slice::from_ref(&root),
+                    None,
                     &work,
                     std::slice::from_ref(&store),
                 ))
@@ -3080,6 +3241,7 @@ mod tests {
             let text = strings(&super::inner_confinement_argv(
                 std::path::Path::new("/proc/self/fd/7"),
                 &[PathBuf::from("/home/someone/work")],
+                None,
             ));
             assert_eq!(&text[..2], ["/proc/self/fd/7", "confine"]);
             let after = |flag: &str| -> Vec<&str> {
@@ -3235,6 +3397,76 @@ mod tests {
                 .await
                 .expect("the shell itself must run");
             super::text_of(&result)
+        }
+
+        /// Through the tool, under every layer this host has: with reads confined, a `read` call
+        /// reads its working directory and the system directories and is refused a file
+        /// outside them, whichever layer refuses first. The same call with reads unconfined
+        /// reads the file, which is what shows the refusal is the boundary's.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_tool_call_with_confined_reads_is_refused_outside_its_roots() {
+            let Some(capability) = a_backend_detect_does_not_name() else {
+                eprintln!("skipping: bwrap is needed");
+                return;
+            };
+            let temp = tempfile::tempdir().expect("tempdir");
+            let base = crate::workspace::canonical_for_test(temp.path());
+            let work = base.join("work");
+            // Outside the roots and outside the masks: a target under `/tmp` is invisible to
+            // every bwrap confinement, so the control read below would be refused for a reason
+            // that is not the boundary's.
+            let outside = crate::workspace::canonical_for_test(
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir),
+            )
+            .join(format!("meka-read-probe-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&work).expect("work");
+            std::fs::create_dir(&outside).expect("outside");
+            std::fs::write(work.join("inside.txt"), "INSIDE\n").expect("write");
+            std::fs::write(outside.join("secret.txt"), "SECRET\n").expect("write");
+            let probe = format!(
+                "cat {}/inside.txt; ls /usr/bin >/dev/null && echo USR; cat {}/secret.txt || \
+                 echo REFUSED",
+                work.display(),
+                outside.display()
+            );
+            let confined = {
+                let mut tool = super::tool_for_test(
+                    crate::permission::SharedPermission::new(
+                        Permission::Read,
+                        crate::permission::EnabledPermissions::ALL,
+                    ),
+                    true,
+                );
+                tool.backend_probe = crate::sandbox::BackendProbe::Ok(capability.clone());
+                tool.sandbox_capability = capability.clone();
+                tool.site.cwd = crate::workspace::SharedCwd::new(work.clone());
+                tool.site.read_boundary = crate::workspace::ReadBoundary::new(true, &[], &[]);
+                let result = tool
+                    .execute(
+                        serde_json::json!({"command": probe}),
+                        crate::tools::ToolContext::detached(CancellationToken::new()),
+                    )
+                    .await
+                    .expect("the shell itself must run");
+                super::text_of(&result)
+            };
+            assert!(
+                confined.contains("INSIDE") && confined.contains("USR"),
+                "the root and the platform's directories stay readable: {confined}"
+            );
+            assert!(
+                confined.contains("REFUSED") && !confined.contains("SECRET"),
+                "the file outside the roots must be refused: {confined}"
+            );
+            let open = read_shell_text(capability, &work, &probe).await;
+            std::fs::remove_dir_all(&outside).expect("remove the probe");
+            assert!(
+                open.contains("SECRET"),
+                "unconfined, the same call reads it, so the refusal above is the boundary's: {open}"
+            );
         }
 
         /// The layer reaches the tool's own spawn, not only the argv helpers: a `read` call under

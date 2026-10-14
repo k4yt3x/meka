@@ -90,19 +90,16 @@ impl Tool for FindFilesTool {
             Some(raw) => vec![crate::workspace::resolve_against_cwd(&self.site.cwd, raw)],
             None => crate::workspace::glob_roots(&self.site.cwd, &self.site.roots),
         };
-        let fence = crate::workspace::ReadFence::at(self.site.permission.get());
+        let fence = self.site.read_scope().fence(&self.site.cwd);
         let mut full_patterns: Vec<String> = Vec::with_capacity(base_paths.len());
         for base in &base_paths {
-            // A root the caller named inside meka's own directories is refused, as
-            // `file_search` refuses it; a walk that reaches them from above skips what it finds
-            // there in `run_walk`.
-            if fence.hides(base) {
+            // A root the caller named inside meka's own directories, or outside the readable
+            // roots, is refused, as `file_search` refuses it; a walk that reaches either from
+            // above skips what it finds there in `run_walk`.
+            if let Some(message) = fence.refusal(base) {
                 return Err(MekaError::ToolExecution {
                     tool_name: "file_find".to_string(),
-                    message: format!(
-                        "'{}' is inside meka's own directories, which only `unrestricted` reads.",
-                        base.display()
-                    ),
+                    message,
                 });
             }
             // Normalized through the type rather than by trimming a character:
@@ -765,6 +762,58 @@ mod tests {
         assert_eq!(
             render_outcome(&outcome, DEFAULT_INLINE_RESULTS),
             "/tmp/a.txt"
+        );
+    }
+
+    /// With reads confined, a base outside the roots is refused by name, and a walk inside them
+    /// lists nothing a symlink reaches outside.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_confined_find_refuses_a_base_outside_the_roots_and_hides_a_link_out() {
+        use crate::permission::{EnabledPermissions, Permission, SharedPermission};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let work = crate::workspace::canonical_for_test(temp.path()).join("work");
+        let elsewhere = crate::workspace::canonical_for_test(temp.path()).join("elsewhere");
+        std::fs::create_dir_all(work.join("sub")).expect("mkdir");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir");
+        std::fs::write(work.join("sub/inside.txt"), "").expect("write");
+        std::fs::write(elsewhere.join("secret.txt"), "").expect("write");
+        std::os::unix::fs::symlink(&elsewhere, work.join("link")).expect("link");
+        let tool = FindFilesTool {
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::SharedCwd::new(work.clone()))
+                .with_permission(SharedPermission::new(
+                    Permission::Read,
+                    EnabledPermissions::ALL,
+                ))
+                .with_read_boundary(crate::workspace::ReadBoundary {
+                    confined: true,
+                    base: Vec::new(),
+                }),
+        };
+        let refused = tool
+            .execute(
+                serde_json::json!({"glob": "*.txt", "path": elsewhere.to_str().expect("path")}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a base outside the roots");
+        assert!(
+            refused.to_string().contains("outside the readable roots"),
+            "{refused}"
+        );
+        let listed = tool
+            .execute(
+                serde_json::json!({"glob": "**/*.txt"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("a walk inside the roots")
+            .text_content();
+        assert!(listed.contains("inside.txt"), "{listed}");
+        assert!(
+            !listed.contains("secret.txt"),
+            "the link out is stepped around: {listed}"
         );
     }
 }

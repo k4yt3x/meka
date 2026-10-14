@@ -106,7 +106,7 @@ impl Tool for SearchContentsTool {
         // One budget for the whole call, not one per root: `WalkBudget::new` stamps its deadline at
         // construction, so a per-root budget would silently multiply the ceiling by the root count.
         let budget = WalkBudget::new(cancellation.clone());
-        let fence = crate::workspace::ReadFence::at(self.site.permission.get());
+        let fence = self.site.read_scope().fence(&self.site.cwd);
         let search = tokio::task::spawn_blocking(move || {
             search_with_grep(
                 &pattern,
@@ -206,14 +206,12 @@ fn search_with_grep(
         }
 
         // A root the caller named is refused outright rather than stepped around: pointing `path`
-        // at the store is the question, and a silent empty answer would read as "nothing there".
-        if fence.hides(path) {
+        // at the store, or outside the readable roots, is the question, and a silent empty answer
+        // would read as "nothing there".
+        if let Some(message) = fence.refusal(path) {
             return Err(MekaError::ToolExecution {
                 tool_name: "file_search".to_string(),
-                message: format!(
-                    "'{}' is inside meka's own directories, which only `unrestricted` reads.",
-                    path.display()
-                ),
+                message,
             });
         }
 
@@ -1040,6 +1038,59 @@ mod tests {
             results.len(),
             11,
             "expected the cap plus the one entry that proves more exist"
+        );
+    }
+
+    /// With reads confined, a search rooted outside the roots is refused by name, and one inside
+    /// them finds nothing a symlink reaches outside.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_confined_search_refuses_a_base_outside_the_roots_and_skips_a_link_out() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let work = crate::workspace::canonical_for_test(temp.path()).join("work");
+        let elsewhere = crate::workspace::canonical_for_test(temp.path()).join("elsewhere");
+        std::fs::create_dir_all(&work).expect("mkdir");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir");
+        std::fs::write(work.join("inside.txt"), "needle here").expect("write");
+        std::fs::write(elsewhere.join("secret.txt"), "needle there").expect("write");
+        std::os::unix::fs::symlink(elsewhere.join("secret.txt"), work.join("link.txt"))
+            .expect("link");
+        let tool = SearchContentsTool {
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::SharedCwd::new(work.clone()))
+                .with_roots(crate::workspace::roots_for_test())
+                .with_permission(crate::permission::SharedPermission::new(
+                    crate::permission::Permission::Read,
+                    crate::permission::EnabledPermissions::ALL,
+                ))
+                .with_read_boundary(crate::workspace::ReadBoundary {
+                    confined: true,
+                    base: Vec::new(),
+                }),
+        };
+        let refused = tool
+            .execute(
+                serde_json::json!({"pattern": "needle", "path": elsewhere.to_str().expect("path")}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a base outside the roots");
+        assert!(
+            refused.to_string().contains("outside the readable roots"),
+            "{refused}"
+        );
+        let found = tool
+            .execute(
+                serde_json::json!({"pattern": "needle"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("a search inside the roots")
+            .text_content();
+        assert!(found.contains("inside.txt"), "{found}");
+        assert!(
+            !found.contains("link.txt") && !found.contains("there"),
+            "{found}"
         );
     }
 }

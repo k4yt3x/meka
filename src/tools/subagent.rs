@@ -117,6 +117,14 @@ pub(crate) struct SubagentSpec {
     /// is reachable from the absence.
     #[serde(default)]
     pub(crate) writable_roots: Vec<PathBuf>,
+    /// The read-only roots the spawn call set through `readable_roots`, canonical, which also
+    /// confined the worker's reads whether or not the parent's were; `None` for a call that gave
+    /// none, which a follow-up reads as the spawn did: reads as the parent's are now, what the
+    /// parent reads for a worker sharing the workspace and nothing beyond its own roots for a
+    /// bounded one. The restrictive reading of a spec that lost the field, since `None` grants
+    /// nothing of its own.
+    #[serde(default)]
+    pub(crate) readable_roots: Option<Vec<PathBuf>>,
     /// The profile the spawn call chose, when it chose one. Absent for a worker that runs on what
     /// its parent runs on now and follows it across a switch; named, it pins the worker to that
     /// profile on every follow-up. Absent on the wire too, so the document does not say whether
@@ -247,7 +255,21 @@ pub(crate) fn profile_choices(materials: &crate::session::SessionMaterials) -> V
 
 /// `agent_spawn`'s schema, as a free function so a caller holding no tool can still name it.
 /// `profile_choices` is what the `profile` parameter offers; empty, the parameter is absent.
-pub(crate) fn agent_spawn_definition(profile_choices: &[String]) -> ToolDefinition {
+/// `reads_confined` is whether the calling session's reads are, which decides what a sub-agent
+/// reads when the call says nothing: stated in the schema, where the model decides, so a parent
+/// that relied on the process confining every sub-agent is told when that is no longer so.
+pub(crate) fn agent_spawn_definition(
+    profile_choices: &[String],
+    reads_confined: bool,
+) -> ToolDefinition {
+    let read_policy = if reads_confined {
+        "Reads here are confined below `unrestricted`, so a sub-agent below that level reads \
+         your roots, or only its writable roots when `writable_roots` bounds it, plus the \
+         system directories, whatever this list says. "
+    } else {
+        "Reads here are not confined, so a sub-agent's are not either unless this list is given: \
+         omitted, it reads everywhere its level allows. "
+    };
     let mut description = "Assign a self-contained task to a sub-agent and receive its report. \
         It has a private conversation, checklist, and scratchpad; filesystem changes are shared. \
         Supply `prompt`, `skill`, or both. Grant needed context explicitly with `inherit_scratchpad`, \
@@ -300,6 +322,21 @@ pub(crate) fn agent_spawn_definition(profile_choices: &[String]) -> ToolDefiniti
                                 `permission: \"unrestricted\"` is refused alongside it since \
                                 the list would then bound nothing. Omit it to share your \
                                 workspace; an empty list is refused."
+            },
+            "readable_roots": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": format!(
+                    "{read_policy}Given, the sub-agent's reads are confined to its writable \
+                     roots, these directories and the system directories, and nothing else, \
+                     whether or not yours are, and it runs at `workspace` unless `permission` \
+                     asks for less; its writable roots are always readable, so a list naming \
+                     only one of them confines it to those alone. Each must be an existing \
+                     directory (relative entries resolve against your working directory) and, \
+                     when your own reads are confined, must lie inside your readable roots: a \
+                     sub-agent's reach never exceeds yours. An empty list is refused, and so is \
+                     `permission: \"unrestricted\"` alongside it, which bounds nothing."
+                )
             },
             "memory": {
                 "type": "string",
@@ -363,7 +400,10 @@ pub(crate) fn agent_spawn_definition(profile_choices: &[String]) -> ToolDefiniti
 #[async_trait]
 impl Tool for AgentSpawnTool {
     fn definition(&self) -> ToolDefinition {
-        agent_spawn_definition(&profile_choices(&self.tool_builder_params.materials))
+        agent_spawn_definition(
+            &profile_choices(&self.tool_builder_params.materials),
+            self.tool_builder_params.cells.read_boundary.confined,
+        )
     }
 
     fn required_permission(&self) -> Permission {
@@ -492,18 +532,61 @@ impl Tool for AgentSpawnTool {
                     .collect();
                 let cells = &self.tool_builder_params.cells;
                 Some(
-                    accept_writable_roots(parent_level, &cells.cwd, &cells.roots, &entries)
-                        .map_err(|error| MekaError::ToolExecution {
-                            tool_name: "agent_spawn".to_string(),
-                            message: error.to_string(),
-                        })?,
+                    accept_writable_roots(
+                        parent_level,
+                        &cells.cwd,
+                        &cells.roots,
+                        &cells.site().read_scope(),
+                        &entries,
+                    )
+                    .map_err(|error| MekaError::ToolExecution {
+                        tool_name: "agent_spawn".to_string(),
+                        message: error.to_string(),
+                    })?,
                 )
             }
         };
-        // A bounded worker runs at `workspace` unless the call asked for less: the list is a
-        // boundary, and `workspace` is the level that has one.
+        // `readable_roots`: an optional list that confines what the worker reads to its writable
+        // roots and these, whether or not this agent's own reads are confined. Judged here, ahead
+        // of every side effect, by the one acceptor `agent_followup` also uses, against this
+        // agent's own readable reach. Absent and null mean "reads as mine are": what I read for
+        // a worker sharing the workspace, its own roots for a bounded one.
+        let readable = match input.get("readable_roots") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(_) => {
+                if requested_permission == Some(Permission::Unrestricted) {
+                    return Err(MekaError::ToolExecution {
+                        tool_name: "agent_spawn".to_string(),
+                        message: "readable_roots bounds reads, and a sub-agent at `unrestricted` \
+                                  has no boundary for it to bound. Drop one or the other."
+                            .to_string(),
+                    });
+                }
+                let entries: Vec<PathBuf> = string_array(&input, "readable_roots", "agent_spawn")?
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect();
+                let cells = &self.tool_builder_params.cells;
+                Some(
+                    crate::workspace::accept_readable_roots(
+                        parent_level,
+                        &cells.cwd,
+                        &cells.site().read_scope(),
+                        &entries,
+                    )
+                    .map_err(|error| MekaError::ToolExecution {
+                        tool_name: "agent_spawn".to_string(),
+                        message: error.to_string(),
+                    })?,
+                )
+            }
+        };
+        // A worker handed either boundary runs at `workspace` unless the call asked for less: a
+        // list is a boundary, and `workspace` is the highest level that has one, so a grant from
+        // a parent at `unrestricted` bounds something rather than a worker that disclaims it.
         let sub_perm = resolve_subagent_permission(
-            requested_permission.or(bounded.as_ref().map(|_| Permission::Workspace)),
+            requested_permission
+                .or((bounded.is_some() || readable.is_some()).then_some(Permission::Workspace)),
             parent_level,
         );
 
@@ -656,9 +739,23 @@ impl Tool for AgentSpawnTool {
                 self.tool_builder_params.cells.roots.clone(),
             ),
         };
+        // What the worker reads beyond what it writes: the list when the call gave one; else, a
+        // worker sharing the workspace reads what this agent reads, and a bounded one only what
+        // it writes, since a boundary of its own is what `writable_roots` means.
+        let sub_read_only_roots = match (&readable, &bounded) {
+            (Some(roots), _) => SharedRoots::new(roots.clone()),
+            (None, Some(_)) => SharedRoots::default(),
+            (None, None) => self.tool_builder_params.cells.read_only_roots.clone(),
+        };
         let workspace = WorkerWorkspace {
             cwd: SharedCwd::new(sub_cwd_snapshot.clone()),
             roots: sub_roots,
+            read_only_roots: sub_read_only_roots,
+            read_boundary: self
+                .tool_builder_params
+                .cells
+                .read_boundary
+                .for_worker(readable.is_some()),
         };
 
         let spec = SubagentSpec {
@@ -680,6 +777,7 @@ impl Tool for AgentSpawnTool {
                 .as_ref()
                 .map(BoundedWorkspace::roots)
                 .unwrap_or_default(),
+            readable_roots: readable,
             profile: chosen_profile,
         };
         // Resolved before the row is written, so a name this installation does not configure, or a
@@ -1434,33 +1532,76 @@ impl Tool for AgentFollowupTool {
                 .as_deref()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| cells.cwd.get());
-            admit_within_parent_reach(ceiling, &cells.cwd, &cells.roots, &cwd).map_err(
-                |error| MekaError::ToolExecution {
-                    tool_name: "agent_followup".to_string(),
-                    message: format!(
-                        "sub-agent '{agent_id}' works in a directory this session can no longer \
-                         grant: {error}"
-                    ),
-                },
-            )?;
+            admit_within_parent_reach(
+                ceiling,
+                &cells.cwd,
+                &cells.roots,
+                &cells.site().read_scope(),
+                &cwd,
+            )
+            .map_err(|error| MekaError::ToolExecution {
+                tool_name: "agent_followup".to_string(),
+                message: format!(
+                    "sub-agent '{agent_id}' works in a directory this session can no longer \
+                     grant: {error}"
+                ),
+            })?;
             WorkerWorkspace {
                 cwd: SharedCwd::new(cwd),
                 roots: cells.roots.clone(),
+                read_only_roots: SharedRoots::default(),
+                read_boundary: cells.read_boundary.clone(),
             }
         } else {
-            let bounded =
-                accept_writable_roots(ceiling, &cells.cwd, &cells.roots, &spec.writable_roots)
-                    .map_err(|error| MekaError::ToolExecution {
-                        tool_name: "agent_followup".to_string(),
-                        message: format!(
-                            "sub-agent '{agent_id}' was spawned with writable_roots this session \
-                             can no longer grant: {error}"
-                        ),
-                    })?;
+            let bounded = accept_writable_roots(
+                ceiling,
+                &cells.cwd,
+                &cells.roots,
+                &cells.site().read_scope(),
+                &spec.writable_roots,
+            )
+            .map_err(|error| MekaError::ToolExecution {
+                tool_name: "agent_followup".to_string(),
+                message: format!(
+                    "sub-agent '{agent_id}' was spawned with writable_roots this session can no \
+                     longer grant: {error}"
+                ),
+            })?;
             WorkerWorkspace {
                 cwd: SharedCwd::new(bounded.cwd),
                 roots: SharedRoots::new(bounded.additional_roots),
+                read_only_roots: SharedRoots::default(),
+                read_boundary: cells.read_boundary.clone(),
             }
+        };
+        // The read-only roots go back through the acceptor against this agent's reach *now*, as
+        // the writable ones do, so a parent whose own reads have narrowed since the spawn cannot
+        // resume a reader it could not spawn today. A spec that gave none reads as the spawn
+        // read it, and one that gave some confines the worker as the spawn did.
+        let workspace = WorkerWorkspace {
+            read_boundary: cells
+                .read_boundary
+                .for_worker(spec.readable_roots.is_some()),
+            read_only_roots: match (&spec.readable_roots, spec.writable_roots.is_empty()) {
+                (Some(roots), _) => SharedRoots::new(
+                    crate::workspace::accept_readable_roots(
+                        ceiling,
+                        &cells.cwd,
+                        &cells.site().read_scope(),
+                        roots,
+                    )
+                    .map_err(|error| MekaError::ToolExecution {
+                        tool_name: "agent_followup".to_string(),
+                        message: format!(
+                            "sub-agent '{agent_id}' was spawned with readable_roots this session \
+                             can no longer grant: {error}"
+                        ),
+                    })?,
+                ),
+                (None, true) => cells.read_only_roots.clone(),
+                (None, false) => SharedRoots::default(),
+            },
+            ..workspace
         };
         let effective_permission = spec.effective_permission(ceiling);
         // `!=`, not `<`. The derived `Ord` is display order, which the enum doc says must not
@@ -1736,6 +1877,11 @@ impl Tool for AgentDeleteTool {
 struct WorkerWorkspace {
     cwd: SharedCwd,
     roots: SharedRoots,
+    /// What the worker reads beyond `roots`; see [`SubagentSpec::readable_roots`].
+    read_only_roots: SharedRoots,
+    /// Whether the worker's reads are confined, and to what beyond its roots: the parent's
+    /// boundary, or one switched on by the grant ([`crate::workspace::ReadBoundary::for_worker`]).
+    read_boundary: crate::workspace::ReadBoundary,
 }
 
 /// Where a worker runs: the workspace its door resolved and the profile it is bound to, from
@@ -1841,6 +1987,8 @@ async fn build_subagent(
         permission: sub_shared_perm.clone(),
         cwd: workspace.cwd,
         roots: workspace.roots,
+        read_only_roots: workspace.read_only_roots,
+        read_boundary: workspace.read_boundary,
         session_id: sub_shared_session_id,
         checklist: sub_checklist,
         profile: crate::provider::PublishedProfile::detached(&binding),
@@ -2274,6 +2422,7 @@ mod tests {
             remaining_depth: 2,
             absolute_depth: 1,
             writable_roots: Vec::new(),
+            readable_roots: None,
             profile: None,
         };
 
@@ -2347,6 +2496,7 @@ mod tests {
                 remaining_depth: 2,
                 absolute_depth: 1,
                 writable_roots: Vec::new(),
+                readable_roots: None,
                 profile: None,
             }
         }
@@ -2703,6 +2853,7 @@ mod tests {
             remaining_depth: 2,
             absolute_depth: 1,
             writable_roots: Vec::new(),
+            readable_roots: None,
             profile: None,
         }
     }
@@ -2736,6 +2887,8 @@ mod tests {
                 workspace: WorkerWorkspace {
                     cwd: crate::workspace::cwd_for_test(),
                     roots: crate::workspace::roots_for_test(),
+                    read_only_roots: crate::workspace::SharedRoots::default(),
+                    read_boundary: crate::workspace::ReadBoundary::unconfined(),
                 },
                 binding: params.cells.profile.current(),
             },
@@ -3242,6 +3395,7 @@ mod tests {
             remaining_depth: 0,
             absolute_depth: 1,
             writable_roots: Vec::new(),
+            readable_roots: None,
             profile: None,
         };
         let (worker, held) = store
@@ -3306,6 +3460,7 @@ mod tests {
             remaining_depth: 0,
             absolute_depth: 1,
             writable_roots: Vec::new(),
+            readable_roots: None,
             profile: None,
         };
         // On a profile the parent is not on, so a write that should not happen is visible.
@@ -3405,6 +3560,7 @@ mod tests {
             remaining_depth: 0,
             absolute_depth: 1,
             writable_roots: Vec::new(),
+            readable_roots: None,
             profile: None,
         };
         let child = store
@@ -3493,6 +3649,7 @@ mod tests {
             remaining_depth: 0,
             absolute_depth: 1,
             writable_roots: Vec::new(),
+            readable_roots: None,
             profile: None,
         };
         let child = store
@@ -3555,6 +3712,7 @@ mod tests {
             remaining_depth: 0,
             absolute_depth: 1,
             writable_roots: Vec::new(),
+            readable_roots: None,
             profile: None,
         };
         let config = ToolDenials::new(vec!["mekabridge".to_string()], vec![
@@ -5422,7 +5580,7 @@ mod tests {
     /// names when it is open.
     #[test]
     fn the_schema_offers_profile_only_when_the_choice_is_open() {
-        let closed = agent_spawn_definition(&[]);
+        let closed = agent_spawn_definition(&[], false);
         assert!(
             closed.parameters["properties"].get("profile").is_none(),
             "{closed:?}"
@@ -5433,7 +5591,7 @@ mod tests {
             closed.description
         );
 
-        let open = agent_spawn_definition(&["deep".to_string(), "fast".to_string()]);
+        let open = agent_spawn_definition(&["deep".to_string(), "fast".to_string()], false);
         assert_eq!(
             open.parameters["properties"]["profile"]["enum"],
             serde_json::json!(["deep", "fast"]),
@@ -6148,6 +6306,8 @@ mod tests {
                 workspace: WorkerWorkspace {
                     cwd: crate::workspace::cwd_for_test(),
                     roots: crate::workspace::roots_for_test(),
+                    read_only_roots: crate::workspace::SharedRoots::default(),
+                    read_boundary: crate::workspace::ReadBoundary::unconfined(),
                 },
                 binding: params.cells.profile.current(),
             },
@@ -6205,6 +6365,30 @@ mod tests {
                 stop_reason: crate::provider::mock::MockStopReason::ToolUse,
             },
         ]
+    }
+
+    fn read_file_round(id: &str, path: &std::path::Path) -> Vec<crate::provider::mock::MockEvent> {
+        vec![
+            crate::provider::mock::MockEvent::ToolUseStart {
+                id: id.to_string(),
+                name: "file_read".to_string(),
+            },
+            crate::provider::mock::MockEvent::ToolUseEnd {
+                input: serde_json::json!({ "path": path.to_string_lossy() }),
+            },
+            crate::provider::mock::MockEvent::MessageEnd {
+                stop_reason: crate::provider::mock::MockStopReason::ToolUse,
+            },
+        ]
+    }
+
+    /// The parent's params with its reads confined to its own roots, which every worker it
+    /// spawns inherits.
+    fn confine_reads(params: &mut ToolBuilderParams) {
+        params.cells.read_boundary = crate::workspace::ReadBoundary {
+            confined: true,
+            base: Vec::new(),
+        };
     }
 
     fn agent_id_in(text: &str) -> Uuid {
@@ -7163,5 +7347,395 @@ mod tests {
                 .expect("read tool");
             assert!(!request.system_prompt.contains(&read.description));
         }
+    }
+
+    /// A worker bounded by `writable_roots` and granted `readable_roots` reads the granted
+    /// directory and is refused one the parent reads but did not pass on; the grant is recorded
+    /// with the spawn terms.
+    #[tokio::test]
+    async fn a_worker_reads_its_readable_roots_and_nothing_beyond() {
+        let dirs = workspaces();
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let mut params = params_at(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Permission::Workspace,
+            dirs.work.clone(),
+        );
+        confine_reads(&mut params);
+        let granted = dirs.extra.join("granted.txt");
+        let beside = dirs.work.join("beside.txt");
+        std::fs::write(&granted, "GRANTED-WORDS").expect("write");
+        std::fs::write(&beside, "BESIDE-WORDS").expect("write");
+        let provider = mock(vec![
+            read_file_round("call-1", &granted),
+            read_file_round("call-2", &beside),
+            text_round("done"),
+        ]);
+        let spawn = spawn_tool_for(params, Arc::clone(&provider) as Arc<dyn Provider>);
+        let output = spawn
+            .execute(
+                serde_json::json!({
+                    "prompt": "read",
+                    "writable_roots": [dirs.sub.to_string_lossy()],
+                    "readable_roots": [dirs.extra.to_string_lossy()],
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        let agent_id = agent_id_in(&output.text_content());
+
+        let transcript = format!("{:?}", store.load_events(agent_id).await.expect("events"));
+        assert!(
+            transcript.contains("GRANTED-WORDS"),
+            "the granted root is readable: {transcript}"
+        );
+        assert!(
+            !transcript.contains("BESIDE-WORDS")
+                && transcript.contains("outside the readable roots"),
+            "a directory the parent reads but did not grant is refused: {transcript}"
+        );
+        let row = store
+            .load_session_tree(parent_sid)
+            .await
+            .expect("tree")
+            .into_iter()
+            .find(|row| row.id == agent_id)
+            .expect("the worker's row");
+        let spec: SubagentSpec =
+            serde_json::from_str(row.subagent_spec_json.as_deref().expect("spec")).expect("decode");
+        assert_eq!(spec.readable_roots, Some(vec![dirs.extra.clone()]));
+        assert_eq!(spec.writable_roots, vec![dirs.sub.clone()]);
+    }
+
+    /// A parent whose reads are confined cannot grant a worker a directory outside its own
+    /// readable roots, and the refusal leaves no row behind.
+    #[tokio::test]
+    async fn readable_roots_outside_the_parents_reach_are_refused() {
+        let dirs = workspaces();
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let mut params = params_at(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Permission::Read,
+            dirs.work.clone(),
+        );
+        confine_reads(&mut params);
+        let spawn = spawn_tool_for(params, mock(vec![text_round("never runs")]));
+        let error = spawn
+            .execute(
+                serde_json::json!({
+                    "prompt": "read",
+                    "readable_roots": [dirs.elsewhere.to_string_lossy()],
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("the spawn must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("outside this session's readable roots"),
+            "{error}"
+        );
+        assert!(only_the_parent(&store, parent_sid).await);
+    }
+
+    /// `readable_roots` with `permission: "unrestricted"` is refused for the reason
+    /// `writable_roots` is: the list would bound nothing.
+    #[tokio::test]
+    async fn readable_roots_alongside_an_unrestricted_level_are_refused() {
+        let dirs = workspaces();
+        let refusal = refused_spawn(
+            Permission::Unrestricted,
+            dirs.work.clone(),
+            serde_json::json!({
+                "prompt": "read",
+                "permission": "unrestricted",
+                "readable_roots": [dirs.sub.to_string_lossy()],
+            }),
+        )
+        .await;
+        assert!(refusal.contains("readable_roots bounds reads"), "{refusal}");
+    }
+
+    /// With the process's reads unconfined, a grant confines the worker on its own: a parent at
+    /// `unrestricted` hands a worker a read boundary the way it hands one a write boundary. The
+    /// worker reads the granted directory and the system directories, and is refused beside them.
+    #[tokio::test]
+    async fn a_grant_confines_a_workers_reads_when_the_process_does_not() {
+        let dirs = workspaces();
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let mut params = params_at(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Permission::Unrestricted,
+            dirs.work.clone(),
+        );
+        // The real base, resolved with the switch off, so the platform's paths come along.
+        params.cells.read_boundary = crate::workspace::ReadBoundary::new(false, &[], &[]);
+        assert!(!params.cells.read_boundary.confined);
+        let granted = dirs.extra.join("granted.txt");
+        let beside = dirs.work.join("beside.txt");
+        std::fs::write(&granted, "GRANTED-WORDS").expect("write");
+        std::fs::write(&beside, "BESIDE-WORDS").expect("write");
+        let platform = crate::workspace::SYSTEM_READ_PATHS
+            .iter()
+            .map(std::path::Path::new)
+            .find_map(|path| {
+                std::fs::read_dir(path).ok()?.flatten().find_map(|entry| {
+                    let path = entry.path();
+                    (path.is_file() && std::fs::read(&path).is_ok()).then_some(path)
+                })
+            });
+        let mut rounds = vec![
+            read_file_round("call-1", &granted),
+            read_file_round("call-2", &beside),
+        ];
+        if let Some(platform) = &platform {
+            rounds.push(read_file_round("call-3", platform));
+        }
+        rounds.push(text_round("done"));
+        let provider = mock(rounds);
+        let spawn = spawn_tool_for(params, Arc::clone(&provider) as Arc<dyn Provider>);
+        let output = spawn
+            .execute(
+                serde_json::json!({
+                    "prompt": "read",
+                    "writable_roots": [dirs.sub.to_string_lossy()],
+                    "readable_roots": [dirs.extra.to_string_lossy()],
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        let agent_id = agent_id_in(&output.text_content());
+
+        let transcript = format!("{:?}", store.load_events(agent_id).await.expect("events"));
+        assert!(transcript.contains("GRANTED-WORDS"), "{transcript}");
+        assert!(
+            !transcript.contains("BESIDE-WORDS")
+                && transcript.contains("outside the readable roots"),
+            "the grant alone confines the worker: {transcript}"
+        );
+        if let Some(platform) = &platform {
+            let refused_platform = transcript.matches("outside the readable roots").count() > 1;
+            assert!(
+                !refused_platform,
+                "the system file {} stays readable: {transcript}",
+                platform.display()
+            );
+        }
+    }
+
+    /// A read grant alone drops the worker to `workspace`, as a write boundary does: a parent at
+    /// `unrestricted` that names `readable_roots` without a level gets a worker the list bounds,
+    /// not one that inherits `unrestricted` and disclaims it.
+    #[tokio::test]
+    async fn a_read_grant_alone_runs_the_worker_at_workspace() {
+        let dirs = workspaces();
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let mut params = params_at(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Permission::Unrestricted,
+            dirs.work.clone(),
+        );
+        confine_reads(&mut params);
+        let secret = dirs.elsewhere.join("secret.txt");
+        std::fs::write(&secret, "SECRET-WORDS").expect("write");
+        let spawn = spawn_tool_for(
+            params,
+            mock(vec![read_file_round("call-1", &secret), text_round("done")]),
+        );
+        let output = spawn
+            .execute(
+                serde_json::json!({
+                    "prompt": "read",
+                    "readable_roots": [dirs.extra.to_string_lossy()],
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        let agent_id = agent_id_in(&output.text_content());
+        let row = store
+            .load_session_tree(parent_sid)
+            .await
+            .expect("tree")
+            .into_iter()
+            .find(|row| row.id == agent_id)
+            .expect("the worker's row");
+        let spec: SubagentSpec =
+            serde_json::from_str(row.subagent_spec_json.as_deref().expect("spec")).expect("decode");
+        assert_eq!(spec.permission, Permission::Workspace);
+        let transcript = format!("{:?}", store.load_events(agent_id).await.expect("events"));
+        assert!(
+            !transcript.contains("SECRET-WORDS")
+                && transcript.contains("outside the readable roots"),
+            "the grant bounds the worker: {transcript}"
+        );
+    }
+
+    /// An empty `readable_roots` is refused as an empty `writable_roots` is, before any row.
+    #[tokio::test]
+    async fn an_empty_readable_roots_list_is_refused() {
+        let dirs = workspaces();
+        let refusal = refused_spawn(
+            Permission::Read,
+            dirs.work.clone(),
+            serde_json::json!({ "prompt": "read", "readable_roots": [] }),
+        )
+        .await;
+        assert!(refusal.contains("names no directory"), "{refusal}");
+    }
+
+    /// A plain worker's recorded directory is judged against the parent's readable reach on a
+    /// follow-up, as a bounded worker's roots are against its write reach: a parent at `read`
+    /// whose reads are confined and that has moved elsewhere cannot resume a reader it could not
+    /// spawn today.
+    #[tokio::test]
+    async fn a_followup_refuses_a_workers_directory_the_parent_can_no_longer_read() {
+        let dirs = workspaces();
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let mut params = params_at(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Permission::Read,
+            dirs.work.clone(),
+        );
+        confine_reads(&mut params);
+        let spawn = spawn_tool_for(params.clone(), mock(vec![text_round("spawned")]));
+        let output = spawn
+            .execute(
+                serde_json::json!({ "prompt": "wait" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        let agent_id = agent_id_in(&output.text_content());
+
+        // The parent `/cd`s to a directory that does not contain the worker's.
+        params.cells.cwd.set(dirs.elsewhere.clone());
+        let followup = followup_tool_for(params, mock(vec![text_round("never runs")]));
+        let refusal = followup
+            .execute(
+                serde_json::json!({ "id": agent_id.to_string(), "prompt": "carry on" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a parent that can no longer read the worker's directory cannot resume it")
+            .to_string();
+        assert!(
+            refusal.contains("can no longer grant")
+                && refusal.contains("outside this session's readable roots"),
+            "{refusal}"
+        );
+    }
+
+    /// The schema tells the parent what a sub-agent reads when the call says nothing, which is
+    /// the one fact that changes under it when the process's switch does.
+    #[test]
+    fn the_schema_states_whether_reads_are_confined() {
+        let text = |confined: bool| {
+            agent_spawn_definition(&[], confined).parameters["properties"]["readable_roots"]
+                ["description"]
+                .as_str()
+                .expect("description")
+                .to_string()
+        };
+        assert!(
+            text(true).starts_with("Reads here are confined"),
+            "{}",
+            text(true)
+        );
+        assert!(
+            text(false).starts_with("Reads here are not confined"),
+            "{}",
+            text(false)
+        );
+        for confined in [true, false] {
+            assert!(text(confined).contains("An empty list is refused"));
+        }
+    }
+
+    /// A follow-up replays the recorded grant: the worker still reads the granted directory and
+    /// is still refused beside it.
+    #[tokio::test]
+    async fn a_followup_keeps_a_workers_readable_roots() {
+        let dirs = workspaces();
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let mut params = params_at(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Permission::Workspace,
+            dirs.work.clone(),
+        );
+        confine_reads(&mut params);
+        let granted = dirs.extra.join("granted.txt");
+        let beside = dirs.work.join("beside.txt");
+        std::fs::write(&granted, "GRANTED-WORDS").expect("write");
+        std::fs::write(&beside, "BESIDE-WORDS").expect("write");
+        let spawn = spawn_tool_for(params.clone(), mock(vec![text_round("spawned")]));
+        let output = spawn
+            .execute(
+                serde_json::json!({
+                    "prompt": "wait",
+                    "writable_roots": [dirs.sub.to_string_lossy()],
+                    "readable_roots": [dirs.extra.to_string_lossy()],
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        let agent_id = agent_id_in(&output.text_content());
+
+        let followup = followup_tool_for(
+            params,
+            mock(vec![
+                read_file_round("call-1", &granted),
+                read_file_round("call-2", &beside),
+                text_round("read both"),
+            ]),
+        );
+        followup
+            .execute(
+                serde_json::json!({ "id": agent_id.to_string(), "prompt": "read both" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("follow-up succeeds");
+        let transcript = format!("{:?}", store.load_events(agent_id).await.expect("events"));
+        assert!(transcript.contains("GRANTED-WORDS"), "{transcript}");
+        assert!(
+            !transcript.contains("BESIDE-WORDS")
+                && transcript.contains("outside the readable roots"),
+            "{transcript}"
+        );
     }
 }

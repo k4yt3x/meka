@@ -108,26 +108,30 @@ pub(super) const ACCESS_FILE: u64 = LANDLOCK_ACCESS_FS_EXECUTE
     | LANDLOCK_ACCESS_FS_TRUNCATE
     | LANDLOCK_ACCESS_FS_IOCTL_DEV
     | LANDLOCK_ACCESS_FS_RESOLVE_UNIX;
-/// The rules for a confinement: read and execute everywhere but inside meka's own directories,
-/// every handled right beneath each writable root, every right but socket resolution beneath each
-/// scratch directory, and `/dev/null` writable in every confinement.
+/// The rules for a confinement: read and execute everywhere, or beneath each readable path alone,
+/// but never inside meka's own directories; every handled right beneath each writable root, every
+/// right but socket resolution beneath each scratch directory, and `/dev/null` writable in every
+/// confinement.
 ///
-/// `writable` holds the canonical workspace roots (empty for a read-only confinement), `scratch`
-/// the throwaway space a command may fill (its temporary directory, or Bubblewrap's masks), and
-/// `private` the canonical directories to hide. Scratch space gets no `RESOLVE_UNIX`: a socket a
-/// command creates there is reachable by the domain rule regardless, so the right would only ever
-/// reach a socket from outside that a bind put there, such as one in a working directory under
-/// `/tmp` bound back through Bubblewrap's mask. Landlock rules only ever add access, so a directory
-/// is hidden by never being covered by a rule: the read grant on `/` keeps only listing and
-/// execution, and reading files is granted per sibling along the way down to each private
+/// `writable` holds the canonical workspace roots (empty for a read-only confinement), `readable`
+/// the canonical paths reads are confined to when they are (the roots and the system directories
+/// paths), `scratch` the throwaway space a command may fill (its temporary directory, or
+/// Bubblewrap's masks), and `private` the canonical directories to hide. Scratch space gets no
+/// `RESOLVE_UNIX`: a socket a command creates there is reachable by the domain rule regardless, so
+/// the right would only ever reach a socket from outside that a bind put there, such as one in a
+/// working directory under `/tmp` bound back through Bubblewrap's mask. Landlock rules only ever
+/// add access, so a directory is hidden by never being covered by a rule: the read grant on `/`,
+/// or on a readable path, keeps only listing and execution where a private directory lies
+/// beneath it, and reading files is granted per sibling along the way down to each private
 /// directory, on everything except the private directory and the directories leading to it. A
 /// workspace root above a private directory is split the same way, or the root's own rule would
 /// hand the store back; the cost is that a file can then be created directly in such a root only by
 /// a rule on the root itself, which is the rule being withheld, so new files land in its
-/// subdirectories while its existing files stay writable. Listing stays global because `READ_DIR`
-/// on a directory covers everything beneath it, so granting it per sibling would refuse `ls ~` at
-/// `read`; the store's file names and sizes are visible either way, since `stat(2)` is unmediated,
-/// and its bytes are what the walk protects.
+/// subdirectories while its existing files stay writable. Listing stays whole on the path because
+/// `READ_DIR` on a directory covers everything beneath it, so granting it per sibling would refuse
+/// `ls ~` at `read`; the store's file names and sizes are visible either way, since `stat(2)` is
+/// unmediated, and its bytes are what the walk protects. With reads confined, nothing outside the
+/// readable paths is covered at all, so a listing there is refused with its contents.
 ///
 /// Each grant is a path rather than a descriptor because the roots can go away: a concurrent
 /// `rm -rf` on one between planning and the spawn makes [`apply_landlock`] skip it, which is the
@@ -135,6 +139,7 @@ pub(super) const ACCESS_FILE: u64 = LANDLOCK_ACCESS_FS_EXECUTE
 pub(crate) fn landlock_grants(
     abi_version: i32,
     writable: &[PathBuf],
+    readable: Option<&[PathBuf]>,
     scratch: &[PathBuf],
     private: &[PathBuf],
 ) -> Vec<LandlockGrant> {
@@ -158,24 +163,13 @@ pub(crate) fn landlock_grants(
         &std::fs::canonicalize(dev_null).unwrap_or_else(|_| dev_null.to_path_buf()),
         LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE,
     );
-    if private.is_empty() {
-        push_grant(
-            &mut grants,
-            Path::new("/"),
-            LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR,
-        );
-    } else {
-        push_grant(
-            &mut grants,
-            Path::new("/"),
-            LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_DIR,
-        );
-        sibling_grants(
-            &mut grants,
-            Path::new("/"),
-            private,
-            LANDLOCK_ACCESS_FS_READ_FILE,
-        );
+    match readable {
+        None => read_grants(&mut grants, Path::new("/"), private),
+        Some(paths) => {
+            for path in paths {
+                read_grants(&mut grants, path, private);
+            }
+        }
     }
     // Every right the ruleset handles beneath each root. "Writable" means the full set rather than
     // just `WRITE_FILE`: creating, removing, renaming and truncating are all separate rights, and
@@ -188,6 +182,45 @@ pub(crate) fn landlock_grants(
         }
     }
     grants
+}
+/// Grant reading and execution beneath `top`: whole when no private directory lies under it, and
+/// otherwise listing and execution on `top` with file reads granted per sibling on the way down
+/// to each private directory, so the directory itself is never covered.
+///
+/// A symlink gets nothing, for the reason [`sibling_grants`] skips one: the rule would land on
+/// the link's own inode, which carries no directory right, and the kernel refuses the rule with
+/// `EINVAL`, taking the spawn down. The readable set carries each path's target beside its
+/// name, so the target's own rule is what reads through the link. A regular file takes the
+/// rights a file may carry, and a path that is gone grants nothing.
+fn read_grants(grants: &mut Vec<LandlockGrant>, top: &Path, private: &[PathBuf]) {
+    let Ok(metadata) = std::fs::symlink_metadata(top) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    if !metadata.is_dir() {
+        push_grant(
+            grants,
+            top,
+            (LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE) & ACCESS_FILE,
+        );
+        return;
+    }
+    if private.iter().any(|directory| directory.starts_with(top)) {
+        push_grant(
+            grants,
+            top,
+            LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_DIR,
+        );
+        sibling_grants(grants, top, private, LANDLOCK_ACCESS_FS_READ_FILE);
+    } else {
+        push_grant(
+            grants,
+            top,
+            LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR,
+        );
+    }
 }
 /// Grant `rights` on every entry beneath `top` that is neither a private directory nor on the way
 /// to one, walking only the directories on those ways. `top` itself gets no rule.
@@ -344,6 +377,7 @@ pub(crate) unsafe fn apply_landlock(abi_version: i32, grants: &[LandlockGrant]) 
 /// empty masks.
 pub(crate) fn run_confined(
     writable: &[PathBuf],
+    readable: Option<&[PathBuf]>,
     scratch: &[PathBuf],
     command: &[std::ffi::OsString],
 ) -> std::io::Error {
@@ -355,7 +389,7 @@ pub(crate) fn run_confined(
     let Some((program, arguments)) = command.split_first() else {
         return std::io::Error::other("no command to run");
     };
-    let grants = landlock_grants(abi_version, writable, scratch, &[]);
+    let grants = landlock_grants(abi_version, writable, readable, scratch, &[]);
     // SAFETY: called from the top of `main`, before tracing or the runtime has started a thread,
     // so the process is single-threaded; the no-allocation half of the contract exists for the
     // `pre_exec` caller and is not what this call site relies on.
@@ -492,6 +526,113 @@ mod tests {
             .collect()
     }
 
+    /// With reads confined, nothing is granted on `/`: each readable path gets read and
+    /// execution whole, or listing and execution with reads per sibling where meka's directories
+    /// lie beneath it, and the writable roots keep every right.
+    #[test]
+    fn a_confined_read_set_grants_nothing_on_the_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = crate::workspace::canonical_for_test(temp.path());
+        let home = base.join("home");
+        let private = home.join(".config/meka");
+        let system = base.join("usr");
+        let work = home.join("work");
+        for directory in [&private, &system, &work] {
+            std::fs::create_dir_all(directory).expect("mkdir");
+        }
+        let read = super::LANDLOCK_ACCESS_FS_EXECUTE
+            | super::LANDLOCK_ACCESS_FS_READ_FILE
+            | super::LANDLOCK_ACCESS_FS_READ_DIR;
+        let grants = by_path(&super::landlock_grants(
+            9,
+            std::slice::from_ref(&work),
+            Some(&[system.clone(), home.clone()]),
+            &[],
+            std::slice::from_ref(&private),
+        ));
+        assert!(
+            !grants.contains_key(std::path::Path::new("/")),
+            "{grants:?}"
+        );
+        assert_eq!(grants.get(&system), Some(&read));
+        assert_eq!(
+            grants.get(&home),
+            Some(&(super::LANDLOCK_ACCESS_FS_EXECUTE | super::LANDLOCK_ACCESS_FS_READ_DIR)),
+            "a readable path above meka's directory lists but reads per sibling"
+        );
+        assert_eq!(
+            grants.get(&home.join(".config")),
+            None,
+            "the directory on the way to the private one gets no rule of its own"
+        );
+        assert!(!grants.contains_key(&private), "{grants:?}");
+        assert_eq!(
+            grants.get(&work),
+            Some(&super::handled_access_for_abi(9)),
+            "the writable root keeps every right"
+        );
+
+        // A readable entry that is a symlink, as `/lib64` is on a merged-`/usr` system, gets no
+        // rule: one on the link inode would be refused by the kernel and take the spawn down.
+        let link = base.join("lib64");
+        std::os::unix::fs::symlink(&system, &link).expect("link");
+        let file = base.join("release");
+        std::fs::write(&file, "x").expect("write");
+        let grants = by_path(&super::landlock_grants(
+            9,
+            &[],
+            Some(&[link.clone(), file.clone(), base.join("gone")]),
+            &[],
+            &[],
+        ));
+        assert!(!grants.contains_key(&link), "{grants:?}");
+        assert!(!grants.contains_key(&base.join("gone")), "{grants:?}");
+        assert_eq!(
+            grants.get(&file),
+            Some(&(super::LANDLOCK_ACCESS_FS_EXECUTE | super::LANDLOCK_ACCESS_FS_READ_FILE)),
+            "a file takes the rights a file may carry"
+        );
+    }
+
+    /// End-to-end through the kernel: a confined `sh` reads its root and the system paths it was
+    /// granted, and is refused everything else.
+    #[test]
+    fn a_confined_read_set_is_honored_by_the_kernel() {
+        let Some(abi) = usable_abi() else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = crate::workspace::canonical_for_test(temp.path());
+        let work = base.join("work");
+        let outside = base.join("outside");
+        std::fs::create_dir(&work).expect("work");
+        std::fs::create_dir(&outside).expect("outside");
+        std::fs::write(work.join("inside.txt"), "inside\n").expect("write");
+        std::fs::write(outside.join("secret.txt"), "secret\n").expect("write");
+        let boundary = crate::workspace::ReadBoundary::new(true, &[], &[]);
+        let readable: Vec<PathBuf> = std::iter::once(work.clone())
+            .chain(boundary.base.iter().cloned())
+            .collect();
+        let grants = super::landlock_grants(abi, &[], Some(&readable), &[], &[]);
+        let script = format!(
+            "cat {work}/inside.txt >/dev/null 2>&1 || exit 3\n\
+             ls /usr/bin >/dev/null 2>&1 || exit 5\n\
+             if cat {outside}/secret.txt >/dev/null 2>&1; then exit 4; fi\n\
+             if ls {outside} >/dev/null 2>&1; then exit 6; fi\n\
+             exit 0",
+            work = work.display(),
+            outside = outside.display(),
+        );
+        match confined_exit(abi, grants, &script) {
+            Some(0) => {}
+            Some(3) => panic!("the read inside the root was refused"),
+            Some(4) => panic!("the read outside every root was permitted"),
+            Some(5) => panic!("the system directories were not readable"),
+            Some(6) => panic!("a listing outside the roots was permitted"),
+            other => panic!("the confined shell did not run: exit {other:?}"),
+        }
+    }
+
     /// End-to-end proof that the kernel honors the workspace boundary, not just that meka computed
     /// it: a real `sh` under a real Landlock ruleset, checked by what lands on disk.
     #[test]
@@ -507,7 +648,7 @@ mod tests {
         std::fs::create_dir(&work).expect("work");
         std::fs::create_dir(&outside).expect("outside");
 
-        let grants = super::landlock_grants(abi, std::slice::from_ref(&work), &[], &[]);
+        let grants = super::landlock_grants(abi, std::slice::from_ref(&work), None, &[], &[]);
         let script = format!(
             "echo in > {}/inside.txt 2>/dev/null || exit 3\n\
              if echo out > {}/escaped.txt 2>/dev/null; then exit 4; fi\n\
@@ -543,7 +684,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let base = crate::workspace::canonical_for_test(temp.path());
         let script = format!("echo x > {}/nope.txt 2>/dev/null; true", base.display());
-        confined_exit(abi, super::landlock_grants(abi, &[], &[], &[]), &script);
+        confined_exit(
+            abi,
+            super::landlock_grants(abi, &[], None, &[], &[]),
+            &script,
+        );
 
         assert!(
             !base.join("nope.txt").exists(),
@@ -564,7 +709,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = crate::workspace::canonical_for_test(temp.path());
         for (label, writable) in [("read level", vec![]), ("workspace", vec![root])] {
-            let grants = super::landlock_grants(abi, &writable, &[], &[]);
+            let grants = super::landlock_grants(abi, &writable, None, &[], &[]);
             assert_eq!(
                 confined_exit(abi, grants, "echo discarded > /dev/null"),
                 Some(0),
@@ -614,6 +759,7 @@ mod tests {
         let grants = by_path(&super::landlock_grants(
             9,
             std::slice::from_ref(&base.join("a")),
+            None,
             &[],
             std::slice::from_ref(&private),
         ));
@@ -646,6 +792,7 @@ mod tests {
         let plain = by_path(&super::landlock_grants(
             9,
             std::slice::from_ref(&base.join("a")),
+            None,
             &[],
             &[],
         ));
@@ -660,6 +807,7 @@ mod tests {
         let scratch = by_path(&super::landlock_grants(
             9,
             &[],
+            None,
             std::slice::from_ref(&base.join("open")),
             &[],
         ));
@@ -686,7 +834,7 @@ mod tests {
         std::fs::write(private.join("secret.txt"), "s").expect("secret");
         std::fs::write(open.join("file.txt"), "f").expect("file");
 
-        let grants = super::landlock_grants(abi, &[], &[], std::slice::from_ref(&private));
+        let grants = super::landlock_grants(abi, &[], None, &[], std::slice::from_ref(&private));
         let script = format!(
             "cat {open}/file.txt >/dev/null 2>&1 || exit 3\n\
              ls {private} >/dev/null 2>&1 || exit 5\n\
@@ -726,6 +874,7 @@ mod tests {
         let grants = super::landlock_grants(
             abi,
             std::slice::from_ref(&base),
+            None,
             &[],
             std::slice::from_ref(&private),
         );

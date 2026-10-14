@@ -96,6 +96,9 @@ pub(crate) enum Command {
         /// Directory the command may write beneath (repeatable)
         #[arg(long = "writable", value_name = "PATH")]
         writable: Vec<std::path::PathBuf>,
+        /// Directory the command may read beneath (repeatable); given, reads elsewhere are refused
+        #[arg(long = "readable", value_name = "PATH")]
+        readable: Vec<std::path::PathBuf>,
         /// Throwaway space the command may fill, without reaching a socket in it (repeatable)
         #[arg(long = "scratch", value_name = "PATH")]
         scratch: Vec<std::path::PathBuf>,

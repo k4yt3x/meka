@@ -59,13 +59,21 @@ pub(crate) fn capability_from_probe(probe: &BackendProbe) -> SandboxCapability {
 pub(crate) enum Confinement {
     /// No sandbox. `unrestricted`, or sandboxing turned off in config.
     Unconfined,
-    /// Reads everywhere, writes nowhere. `none` and `read`.
-    ReadOnly,
-    /// Reads everywhere, writes only beneath these canonical roots. `workspace`.
+    /// Writes nowhere. `none` and `read`. Reads everywhere, or only beneath `readable` when the
+    /// read boundary is on.
+    ReadOnly {
+        readable: Option<Vec<std::path::PathBuf>>,
+    },
+    /// Writes only beneath the canonical `writable` roots. `workspace`. Reads everywhere, or only
+    /// beneath `readable`, which then holds the writable roots too, and the paths a command needs
+    /// to run.
     ///
-    /// An empty list is meaningful and behaves as [`Self::ReadOnly`]: it means no root resolved,
-    /// which happens when the working directory was deleted under a running session.
-    Workspace(Vec<std::path::PathBuf>),
+    /// An empty `writable` is meaningful and behaves as [`Self::ReadOnly`]: it means no root
+    /// resolved, which happens when the working directory was deleted under a running session.
+    Workspace {
+        writable: Vec<std::path::PathBuf>,
+        readable: Option<Vec<std::path::PathBuf>>,
+    },
 }
 
 impl Confinement {
@@ -80,6 +88,7 @@ impl Confinement {
         sandbox_enabled: bool,
         permission: crate::permission::Permission,
         scope: &crate::workspace::WriteScope,
+        reads: &crate::workspace::ReadScope,
         cwd: &crate::workspace::SharedCwd,
     ) -> Self {
         if !sandbox_enabled {
@@ -89,10 +98,13 @@ impl Confinement {
             // Only the level that promises no boundary runs the shell without one. An approved
             // command at any other level runs confined at that level, like an approved write.
             crate::permission::Permission::Unrestricted => Self::Unconfined,
-            crate::permission::Permission::Workspace => {
-                Self::Workspace(scope.confined_to_at(permission, cwd).unwrap_or_default())
-            }
-            _ => Self::ReadOnly,
+            crate::permission::Permission::Workspace => Self::Workspace {
+                writable: scope.confined_to_at(permission, cwd).unwrap_or_default(),
+                readable: reads.confined_to_at(permission, cwd),
+            },
+            _ => Self::ReadOnly {
+                readable: reads.confined_to_at(permission, cwd),
+            },
         }
     }
 
@@ -104,8 +116,23 @@ impl Confinement {
     /// The roots this call may write beneath. Empty for every state but [`Self::Workspace`].
     pub(crate) fn writable(&self) -> &[std::path::PathBuf] {
         match self {
-            Self::Workspace(roots) => roots,
+            Self::Workspace { writable, .. } => writable,
             _ => &[],
+        }
+    }
+
+    /// The roots this call may read beneath, or `None` when it reads everywhere.
+    #[cfg_attr(
+        windows,
+        allow(
+            dead_code,
+            reason = "the Windows spawn cannot confine reads; `warn_if_sandbox_issues` says so"
+        )
+    )]
+    pub(crate) fn readable(&self) -> Option<&[std::path::PathBuf]> {
+        match self {
+            Self::Unconfined => None,
+            Self::ReadOnly { readable } | Self::Workspace { readable, .. } => readable.as_deref(),
         }
     }
 }
@@ -312,15 +339,22 @@ pub(crate) enum BackendProbe {
 )]
 pub(crate) struct SandboxState {
     pub(crate) enabled: bool,
+    /// `[permissions].confine_reads`, for the one platform whose shell cannot hold it.
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "read only on the Windows warning path")
+    )]
+    pub(crate) confine_reads: bool,
     pub(crate) backend: crate::config::SandboxBackend,
     pub(crate) auto_resolved: bool,
     pub(crate) probe: BackendProbe,
 }
 
 impl SandboxState {
-    pub(crate) fn new(enabled: bool, resolution: &SandboxResolution) -> Self {
+    pub(crate) fn new(enabled: bool, confine_reads: bool, resolution: &SandboxResolution) -> Self {
         Self {
             enabled,
+            confine_reads,
             backend: resolution.backend,
             auto_resolved: resolution.auto_resolved,
             probe: resolution.probe.clone(),
@@ -377,6 +411,14 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
     #[cfg(windows)]
     if context == WarnContext::Startup {
         tracing::info!("the Windows sandbox cannot hide meka's config and credential store");
+        // A warning, once, because the user asked for a boundary this platform's shell cannot
+        // hold: the file tools keep it, a command does not, and the permissions page says so.
+        if state.confine_reads {
+            tracing::warn!(
+                "`[permissions].confine_reads` holds for the file tools only: the Windows sandbox \
+                 cannot confine a command's reads"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1051,6 +1093,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn landlock_state(auto_resolved: bool) -> super::SandboxState {
         super::SandboxState {
+            confine_reads: false,
             enabled: true,
             backend: crate::config::SandboxBackend::Landlock,
             auto_resolved,
@@ -1295,6 +1338,59 @@ mod tests {
         assert!(kept, "XDG_* prefix var was dropped from sandbox env");
     }
 
+    /// With reads confined the profile grants no blanket read: data reads and executable mappings
+    /// are allowed per readable path, as parameters, with existence and metadata still global so
+    /// a path resolves; the private denies still come last.
+    #[test]
+    fn a_confined_read_profile_grants_reads_per_readable_path_only() {
+        let root = std::path::PathBuf::from("/Users/someone/work");
+        let system = std::path::PathBuf::from("/usr");
+        let store = std::path::PathBuf::from("/Users/someone/Library/Application Support/meka");
+        let readable = vec![root.clone(), system.clone()];
+        let (profile, params) = sandbox_profile_for(
+            std::slice::from_ref(&root),
+            Some(&readable),
+            std::slice::from_ref(&store),
+        );
+        assert!(!profile.contains("(allow file-read*)\n"), "{profile}");
+        assert!(
+            !profile.contains("(allow file-map-executable)\n"),
+            "{profile}"
+        );
+        assert!(
+            profile.contains("(allow file-read-metadata)\n"),
+            "{profile}"
+        );
+        assert!(
+            profile.contains("(allow file-test-existence)\n"),
+            "{profile}"
+        );
+        for key in ["MEKA_READABLE_0", "MEKA_READABLE_1"] {
+            assert!(
+                profile.contains(&format!(
+                    "(allow file-read* file-map-executable (subpath (param \"{key}\")))"
+                )),
+                "{profile}"
+            );
+        }
+        let read_at = profile.find("MEKA_READABLE_0").expect("read rule");
+        let write_at = profile.find("MEKA_WRITABLE_0").expect("write rule");
+        let deny_at = profile.find("MEKA_PRIVATE_0").expect("deny rule");
+        assert!(read_at < write_at && write_at < deny_at, "{profile}");
+        let params: Vec<String> = params
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(params.contains(&format!("MEKA_READABLE_0={}", root.display())));
+        assert!(params.contains(&format!("MEKA_READABLE_1={}", system.display())));
+        assert!(
+            !profile.contains("/Users/someone"),
+            "paths travel out of band: {profile}"
+        );
+        let (anywhere, _) = sandbox_profile_for(std::slice::from_ref(&root), None, &[]);
+        assert!(anywhere.contains("(allow file-read*)\n"), "{anywhere}");
+    }
+
     /// The seatbelt profile names each root as a `-D` parameter, never inside the profile text.
     ///
     /// This is the whole reason roots travel out of band: a directory called `it's "here"` or one
@@ -1308,8 +1404,11 @@ mod tests {
     fn the_profile_denies_meka_s_own_directories_after_the_write_allows() {
         let root = std::path::PathBuf::from("/Users/someone");
         let store = root.join("Library/Application Support/meka");
-        let (profile, params) =
-            sandbox_profile_for(std::slice::from_ref(&root), std::slice::from_ref(&store));
+        let (profile, params) = sandbox_profile_for(
+            std::slice::from_ref(&root),
+            None,
+            std::slice::from_ref(&store),
+        );
         let allow = profile
             .find("(allow file-write* (subpath (param \"MEKA_WRITABLE_0\")))")
             .expect("the root is allowed");
@@ -1339,7 +1438,7 @@ mod tests {
             std::path::PathBuf::from(r#"/tmp/it's "quoted""#),
             std::path::PathBuf::from(r"/tmp/trailing\"),
         ];
-        let (profile, params) = sandbox_profile_for(&roots, &[]);
+        let (profile, params) = sandbox_profile_for(&roots, None, &[]);
 
         assert_eq!(params, vec![
             std::ffi::OsString::from("-D"),
@@ -1360,7 +1459,7 @@ mod tests {
             );
         }
         assert!(
-            profile.starts_with(SANDBOX_PROFILE_READONLY),
+            profile.starts_with(SANDBOX_PROFILE_READONLY.as_str()),
             "the writable rules must be appended to the read-only base, not replace it"
         );
     }
@@ -1379,7 +1478,7 @@ mod tests {
         let root = std::path::PathBuf::from(OsStr::from_bytes(b"/tmp/work\xff"));
         assert!(root.to_str().is_none(), "precondition: not valid UTF-8");
 
-        let (profile, params) = sandbox_profile_for(std::slice::from_ref(&root), &[]);
+        let (profile, params) = sandbox_profile_for(std::slice::from_ref(&root), None, &[]);
         assert_eq!(params.len(), 2, "the root must not be dropped: {params:?}");
 
         let mut expected = std::ffi::OsString::from("MEKA_WRITABLE_0=");
@@ -1704,23 +1803,62 @@ mod tests {
         let base = crate::workspace::canonical_for_test(temp.path());
         let cwd = workspace::SharedCwd::new(base.clone());
         let scope = workspace::WriteScope::confined(vec![base.clone()]);
+        let reads = workspace::ReadScope::unconfined(crate::permission::SharedPermission::new(
+            Permission::Workspace,
+            crate::permission::EnabledPermissions::ALL,
+        ));
 
         for level in [Permission::None, Permission::Read] {
             assert_eq!(
-                Confinement::resolve(true, level, &scope, &cwd),
-                Confinement::ReadOnly,
+                Confinement::resolve(true, level, &scope, &reads, &cwd),
+                Confinement::ReadOnly { readable: None },
                 "{level} must confine the shell read-only"
             );
         }
         assert_eq!(
-            Confinement::resolve(true, Permission::Workspace, &scope, &cwd),
-            Confinement::Workspace(vec![base]),
+            Confinement::resolve(true, Permission::Workspace, &scope, &reads, &cwd),
+            Confinement::Workspace {
+                writable: vec![base],
+                readable: None
+            },
             "workspace must hand the shell the same roots the file tools fence against"
         );
         assert_eq!(
-            Confinement::resolve(true, Permission::Unrestricted, &scope, &cwd),
+            Confinement::resolve(true, Permission::Unrestricted, &scope, &reads, &cwd),
             Confinement::Unconfined,
             "unrestricted runs the shell unsandboxed"
+        );
+    }
+
+    /// With the read boundary on, every confined level carries the readable roots: the writable
+    /// roots, the base set, and nothing else; `unrestricted` carries none.
+    #[test]
+    fn the_read_boundary_reaches_every_confined_level_and_not_unrestricted() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = crate::workspace::canonical_for_test(temp.path());
+        let system_dir = tempfile::tempdir().expect("tempdir");
+        let system = crate::workspace::canonical_for_test(system_dir.path());
+        let cwd = workspace::SharedCwd::new(base.clone());
+        let scope = workspace::WriteScope::confined(vec![base.clone()]);
+        let reads = workspace::ReadScope::confined(
+            crate::permission::SharedPermission::new(
+                Permission::Workspace,
+                crate::permission::EnabledPermissions::ALL,
+            ),
+            vec![base.clone()],
+            vec![system.clone()],
+        );
+
+        for level in [Permission::None, Permission::Read, Permission::Workspace] {
+            let confinement = Confinement::resolve(true, level, &scope, &reads, &cwd);
+            let readable = confinement
+                .readable()
+                .unwrap_or_else(|| panic!("{level} must confine reads"));
+            assert_eq!(readable, [base.clone(), system.clone()], "{level}");
+        }
+        assert_eq!(
+            Confinement::resolve(true, Permission::Unrestricted, &scope, &reads, &cwd).readable(),
+            None
         );
     }
 
@@ -1729,6 +1867,10 @@ mod tests {
     fn disabling_the_sandbox_unconfines_every_level() {
         let cwd = workspace::cwd_for_test();
         let scope = workspace::WriteScope::confined(vec![]);
+        let reads = workspace::ReadScope::unconfined(crate::permission::SharedPermission::new(
+            Permission::Workspace,
+            crate::permission::EnabledPermissions::ALL,
+        ));
         for level in [
             Permission::None,
             Permission::Read,
@@ -1736,7 +1878,7 @@ mod tests {
             Permission::Unrestricted,
         ] {
             assert_eq!(
-                Confinement::resolve(false, level, &scope, &cwd),
+                Confinement::resolve(false, level, &scope, &reads, &cwd),
                 Confinement::Unconfined
             );
         }
@@ -1749,8 +1891,12 @@ mod tests {
         let missing = temp.path().join("deleted-under-us");
         let cwd = workspace::SharedCwd::new(missing);
         let scope = workspace::WriteScope::confined(vec![]);
+        let reads = workspace::ReadScope::unconfined(crate::permission::SharedPermission::new(
+            Permission::Workspace,
+            crate::permission::EnabledPermissions::ALL,
+        ));
 
-        let confinement = Confinement::resolve(true, Permission::Workspace, &scope, &cwd);
+        let confinement = Confinement::resolve(true, Permission::Workspace, &scope, &reads, &cwd);
         assert!(confinement.is_sandboxed(), "it must still be sandboxed");
         assert!(
             // Not `is_sandboxed()`, which holds by construction for any `Workspace(_)` and so

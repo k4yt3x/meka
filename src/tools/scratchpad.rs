@@ -1225,7 +1225,7 @@ impl Tool for ScratchpadLoadFileTool {
         let resolved = crate::workspace::resolve_against_cwd(&self.site.cwd, &path);
         let canonical =
             super::util::canonicalize_for_tool("scratchpad_load_file", &resolved).await?;
-        super::util::refuse_private_read("scratchpad_load_file", &self.site, &canonical)?;
+        super::util::admit_read("scratchpad_load_file", &self.site, &canonical)?;
 
         // Raw bytes rather than a `String`, so a UTF-8 failure can be sniffed once and the model
         // told what kind of binary it tried to load. The happy path pays one extra allocation,
