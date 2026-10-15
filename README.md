@@ -2,13 +2,10 @@
 
 A general-purpose AI agent harness.
 
-> [!CAUTION]
-> Agents can perform potentially destructive actions. Exercise caution when granting a permission level that can modify files or run commands.
-
 > [!IMPORTANT]
-> meka is opinionated software and has not stabilized. Defaults, configuration keys, tool names, and stored formats may change between releases. Read the changelog before upgrading.
+> meka is opinionated software and does not keep a stable interface. It favors the better design over compatibility, so anything may change between releases. Read the changelog before upgrading.
 
-![meka Screenshot](https://github.com/user-attachments/assets/e43c6691-155d-4a1f-aa39-e82d6834684c)
+![meka Screenshot](https://github.com/user-attachments/assets/287e5609-97f8-4a23-837c-6f97e67f3b5a)
 
 ## Features
 
