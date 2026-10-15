@@ -18,9 +18,9 @@ meka account list [--format <FORMAT>]
 meka account login anthropic
 meka account remove anthropic
 meka account rename anthropic claude
-meka account usage [--profile <NAME>] [--format <FORMAT>]    # session / weekly windows
-meka account whoami [--profile <NAME>] [--format <FORMAT>]   # plan, tier, org, role and local auth status
-meka account stats [--profile <NAME>] [--format <FORMAT>]    # lifetime tokens, streaks, per-day counts
+meka account usage [NAME] [--format <FORMAT>]    # session / weekly windows
+meka account whoami [NAME] [--format <FORMAT>]   # plan, tier, org, role and local auth status
+meka account stats [NAME] [--format <FORMAT>]    # lifetime tokens, streaks, per-day counts
 ```
 
 See the [`meka account` CLI reference](./config-file.md#meka-account-cli) for the full flag list.

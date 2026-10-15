@@ -58,6 +58,13 @@ impl ProviderBuilder {
         }
     }
 
+    /// A builder for the account's own provider, with no model: what the account views ask, since
+    /// `fetch_usage`, `fetch_identity` and `fetch_history` ask the account and never the model.
+    /// Built by [`ProviderRegistry::resolve_account`] alone; a request through it names no model.
+    fn for_account(backend: Backend, credential: AuthCredential) -> Self {
+        Self::new(backend, credential, "")
+    }
+
     /// Override the HTTP endpoint. Applies to every provider variant; defaults to the Claude or
     /// OpenAI production URL.
     pub(crate) fn base_url(mut self, value: Option<String>) -> Self {
@@ -552,6 +559,43 @@ impl ProviderRegistry {
         Ok((provider, settings))
     }
 
+    /// The account's own provider, for the read-only account views: built from the account's
+    /// settings and its stored credential, with no profile and no model, since the views ask the
+    /// account and never a model. A name no account is configured under is refused naming the
+    /// accounts. Not cached: the cache is keyed by profile, and a view is asked once by a command
+    /// that then exits.
+    pub(crate) async fn resolve_account(&self, name: &str) -> Result<(Arc<dyn Provider>, Backend)> {
+        let account = self.accounts.get(name).ok_or_else(|| {
+            MekaError::Config(crate::text::unknown_name(
+                "account",
+                name,
+                self.accounts.keys(),
+            ))
+        })?;
+        let backend = account
+            .backend
+            .parse::<Backend>()
+            .map_err(|error| MekaError::Config(format!("account '{name}': {error}")))?;
+
+        #[cfg(any(debug_assertions, feature = "mock-provider"))]
+        if let Some(scripted) = crate::sync::lock(&self.scripted).as_ref() {
+            return Ok((Arc::clone(scripted), backend));
+        }
+
+        let credential = self.credential_for(name).await?;
+        let needs_token_store = matches!(credential, AuthCredential::OAuthToken { .. });
+        let provider = ProviderBuilder::for_account(backend, credential)
+            .base_url(account.base_url.clone())
+            .interleaved_thinking(account.interleaved_thinking.unwrap_or(true))
+            .client_id(account.client_id.clone())
+            .credential_key(Some(name.to_string()))
+            .oauth_token_url(account.oauth_token_url.clone())
+            .token_store(needs_token_store.then(|| Arc::clone(&self.token_store)))
+            .device_id(self.device_id_for(name, account))
+            .build()?;
+        Ok((provider, backend))
+    }
+
     pub(super) async fn credential_for(&self, account: &str) -> Result<AuthCredential> {
         match self.token_store.load_account_credential(account).await? {
             Some(credential) => Ok(credential),
@@ -941,5 +985,48 @@ mod tests {
             panic!("a missing default is a configuration error: {error}");
         };
         assert_eq!(message, ambiguous);
+    }
+
+    /// The account views ask the account's own provider, built with no profile and no model: an
+    /// account no profile names answers, and a name no account is configured under is refused
+    /// naming the accounts.
+    #[tokio::test]
+    async fn an_account_resolves_its_own_provider_without_a_profile() {
+        let store = crate::store::Store::for_test().await;
+        store
+            .token_store()
+            .save_account_credential(
+                "work",
+                &crate::store::AuthCredential::ApiKey("sk-test".to_string()),
+            )
+            .await
+            .expect("save");
+        let registry = crate::provider::ProviderRegistry::for_test_over(
+            [("work".to_string(), crate::config::AccountConfig {
+                backend: "anthropic-messages".to_string(),
+                ..Default::default()
+            })]
+            .into_iter()
+            .collect(),
+            std::collections::BTreeMap::new(),
+            store.token_store(),
+        );
+        let (provider, backend) = registry
+            .resolve_account("work")
+            .await
+            .expect("the account's provider");
+        assert_eq!(backend, crate::provider::Backend::AnthropicMessages);
+        assert!(
+            provider.fetch_usage().await.expect("asked").is_none(),
+            "an API-key account has no usage to report"
+        );
+        let Err(refused) = registry.resolve_account("nope").await else {
+            panic!("a name no account is configured under must be refused");
+        };
+        let message = refused.to_string();
+        assert!(
+            message.contains("'nope'") && message.contains("work"),
+            "the refusal names the accounts: {message}"
+        );
     }
 }

@@ -3575,3 +3575,71 @@ fn confine_refuses_writes_outside_the_roots_and_allows_them_inside() {
         "the verb says what went wrong: {stderr}"
     );
 }
+
+/// The account views take the account by name and need no profile: an account alone, logged in,
+/// answers `meka account usage` with its backend's note; named nothing, the one account is asked;
+/// a name no account is configured under is refused naming the accounts; `--profile` is gone.
+#[test]
+fn the_account_views_ask_an_account_without_a_profile() {
+    let install = Install::new();
+    install.write_config("[accounts.work]\nbackend = \"anthropic-messages\"\n");
+    let mut login = install
+        .meka(&["account", "login", "work", "--api-key-stdin"])
+        .env("MEKA_MOCK_PROVIDER", "0")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn login");
+    {
+        use std::io::Write;
+        login
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(b"sk-test\n")
+            .expect("write the key");
+    }
+    let login = login.wait_with_output().expect("login");
+    assert!(
+        login.status.success(),
+        "login: {}",
+        String::from_utf8_lossy(&login.stderr)
+    );
+
+    let output = run_isolated(&install, &["account", "usage", "work"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("not available for account 'work'."),
+        "an API-key account answers with its note, no profile needed: {stderr}"
+    );
+
+    let output = run_isolated(&install, &["account", "usage"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not available for account 'work'."),
+        "the one account is asked unnamed: {stderr}"
+    );
+
+    let output = run_isolated(&install, &["account", "stats", "nope"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("'nope'") && stderr.contains("work"),
+        "the refusal names the accounts: {stderr}"
+    );
+
+    let output = run_isolated(&install, &["account", "whoami", "--profile", "work"]);
+    assert!(
+        !output.status.success(),
+        "`--profile` is gone from the views"
+    );
+
+    let output = run_isolated(&install, &["--profile", "nope", "account", "usage"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success()
+            && stderr.contains("nope")
+            && !stderr.contains("for account 'work'"),
+        "a top-level `--profile` that selects nothing is refused, not ignored: {stderr}"
+    );
+}

@@ -1651,7 +1651,6 @@ impl AuthStatus {
 
 #[derive(serde::Serialize)]
 struct UsageOutput<'a> {
-    profile: &'a str,
     account: &'a str,
     #[serde(flatten)]
     usage: &'a crate::provider::AccountUsage,
@@ -1659,7 +1658,6 @@ struct UsageOutput<'a> {
 
 #[derive(serde::Serialize)]
 struct WhoamiOutput<'a> {
-    profile: &'a str,
     account: &'a str,
     backend: &'a str,
     auth: AuthStatus,
@@ -1675,23 +1673,17 @@ enum View {
     Stats,
 }
 
-/// The read-only account views. Each builds a provider through a profile, because a request needs
-/// a model, and reports on the account that profile bills.
+/// The read-only account views, each over the account's own provider: they ask the account and
+/// never a model, so no profile is needed.
 async fn run_introspection(
     store: &crate::store::Store,
     action: &crate::cli::AccountAction,
     cli_args: &crate::cli::Cli,
 ) -> anyhow::Result<()> {
-    let (view, profile_arg, format) = match action {
-        crate::cli::AccountAction::Usage { profile, format } => {
-            (View::Usage, profile.clone(), *format)
-        }
-        crate::cli::AccountAction::Whoami { profile, format } => {
-            (View::Whoami, profile.clone(), *format)
-        }
-        crate::cli::AccountAction::Stats { profile, format } => {
-            (View::Stats, profile.clone(), *format)
-        }
+    let (view, named, format) = match action {
+        crate::cli::AccountAction::Usage { name, format } => (View::Usage, name.clone(), *format),
+        crate::cli::AccountAction::Whoami { name, format } => (View::Whoami, name.clone(), *format),
+        crate::cli::AccountAction::Stats { name, format } => (View::Stats, name.clone(), *format),
         crate::cli::AccountAction::Add { .. }
         | crate::cli::AccountAction::List { .. }
         | crate::cli::AccountAction::Login { .. }
@@ -1701,27 +1693,28 @@ async fn run_introspection(
         }
     };
 
-    // `--profile` selects the way it does for a run, and the provider is built the way a run
-    // builds one: through the registry, so the account view is of exactly the provider a session
-    // on this profile would talk to, credential rotation and all.
-    let mut overrides = cli_args.overrides();
-    if let Some(name) = profile_arg {
-        overrides.profile = Some(name);
-    }
-    let config = config::ResolvedConfig::resolve(overrides);
-    // A parse error leaves `profiles` empty, and the refusal below would then blame a missing
-    // profile for a typo in the file; every sibling subcommand fails on the parse error instead.
+    let config = config::ResolvedConfig::resolve(cli_args.overrides());
+    // A parse error leaves `accounts` empty, and the refusal below would then blame a missing
+    // account for a typo in the file; every sibling subcommand fails on the parse error instead.
     config.require_readable_config()?;
-    let name = config.default_profile.clone().ok_or_else(|| {
-        anyhow::anyhow!(
+    // An explicit `--profile` that selects nothing is refused as a run refuses it, rather than
+    // falling silently to the one account.
+    if cli_args.overrides().profile.is_some() && config.default_profile.is_none() {
+        anyhow::bail!(
             config
                 .provider_error
                 .clone()
                 .unwrap_or_else(|| "no profile configured".to_string())
-        )
-    })?;
+        );
+    }
+    let account = account_to_ask(
+        named,
+        config.default_profile.as_deref(),
+        &config.accounts,
+        &config.profiles,
+    )?;
     let registry = crate::provider::ProviderRegistry::new(&config, store.token_store());
-    let (provider, settings) = registry.resolve(&name).await?;
+    let (provider, backend) = registry.resolve_account(&account).await?;
 
     match view {
         View::Usage => match provider.fetch_usage().await? {
@@ -1731,16 +1724,14 @@ async fn run_introspection(
                 }
                 crate::cli::OutputFormat::Json => {
                     crate::cli::write_json(&UsageOutput {
-                        profile: &name,
-                        account: &settings.account,
+                        account: &account,
                         usage: &usage,
                     })?;
                 }
             },
             None => {
                 crate::streams::write_stderr_line(format!(
-                    "Account usage is not available for account '{}'.",
-                    settings.account
+                    "Account usage is not available for account '{account}'."
                 ));
                 return Err(crate::error::AlreadyReported.into());
             }
@@ -1752,13 +1743,12 @@ async fn run_introspection(
             let identity = provider.fetch_identity().await;
             let fresh = store
                 .token_store()
-                .load_account_credential(&settings.account)
+                .load_account_credential(&account)
                 .await?
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "no stored credential for account '{0}'; log in with `meka account login \
-                         {0}`",
-                        settings.account
+                        "no stored credential for account '{account}'; log in with `meka account \
+                         login {account}`"
                     )
                 })?;
             let auth = AuthStatus::from_credential(&fresh);
@@ -1770,9 +1760,8 @@ async fn run_introspection(
                 }
             };
             let out = WhoamiOutput {
-                profile: &name,
-                account: &settings.account,
-                backend: settings.backend.name(),
+                account: &account,
+                backend: backend.name(),
                 auth,
                 identity,
             };
@@ -1794,8 +1783,7 @@ async fn run_introspection(
         View::Stats => match provider.fetch_history().await? {
             Some(history) => {
                 let out = StatsOutput {
-                    profile: &name,
-                    account: &settings.account,
+                    account: &account,
                     history: &history,
                 };
                 match format {
@@ -1807,8 +1795,7 @@ async fn run_introspection(
             }
             None => {
                 crate::streams::write_stderr_line(format!(
-                    "Account history is not available for account '{}'.",
-                    settings.account
+                    "Account history is not available for account '{account}'."
                 ));
                 return Err(crate::error::AlreadyReported.into());
             }
@@ -1817,9 +1804,39 @@ async fn run_introspection(
     Ok(())
 }
 
+/// The account a view asks: the one named, else the account the default profile bills, which is
+/// what a run reaches, else the one account when there is exactly one. Refused otherwise, naming
+/// the accounts, since choosing among several would report on an account nobody chose.
+fn account_to_ask(
+    named: Option<String>,
+    default_profile: Option<&str>,
+    accounts: &std::collections::BTreeMap<String, crate::config::AccountConfig>,
+    profiles: &std::collections::BTreeMap<String, crate::config::ProfileConfig>,
+) -> anyhow::Result<String> {
+    if let Some(name) = named {
+        if !accounts.contains_key(&name) {
+            anyhow::bail!(crate::text::unknown_name("account", &name, accounts.keys()));
+        }
+        return Ok(name);
+    }
+    if let Some(profile) = default_profile.and_then(|profile| profiles.get(profile)) {
+        return Ok(profile.account.clone());
+    }
+    let mut names = accounts.keys();
+    match (names.next(), names.next()) {
+        (Some(only), None) => Ok(only.clone()),
+        (None, _) => {
+            anyhow::bail!("no accounts configured; create one with `meka account add <name>`")
+        }
+        (Some(_), Some(_)) => anyhow::bail!(
+            "name the account to ask (configured: {})",
+            accounts.keys().cloned().collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct StatsOutput<'a> {
-    profile: &'a str,
     account: &'a str,
     #[serde(flatten)]
     history: &'a crate::provider::UsageHistory,
@@ -1833,10 +1850,7 @@ fn format_stats_plain(out: &StatsOutput<'_>) -> String {
         value.map(|value| crate::text::format_token_count(value.max(0) as u64))
     };
     let days = |value: Option<i64>| value.map(|value| format!("{value} days"));
-    let mut fields = vec![
-        ("account", out.account.to_string()),
-        ("profile", out.profile.to_string()),
-    ];
+    let mut fields = vec![("account", out.account.to_string())];
     if let Some(first) = &history.first_used {
         // An RFC 3339 timestamp trimmed to its date: the time of day says nothing here.
         fields.push((
@@ -1883,7 +1897,6 @@ fn format_whoami_plain(out: &WhoamiOutput<'_>) -> String {
     let mut fields = vec![
         ("account", out.account.to_string()),
         ("backend", out.backend.to_string()),
-        ("profile", out.profile.to_string()),
         ("auth", auth),
     ];
     if let Some(identity) = &out.identity {
@@ -1937,19 +1950,72 @@ mod tests {
             }],
         };
         let text = format_stats_plain(&StatsOutput {
-            profile: "work",
             account: "codex",
             history: &history,
         });
         assert_eq!(
             text,
             "account:          codex\n\
-             profile:          work\n\
              first used:       2026-04-01\n\
              lifetime tokens:  1.2M\n\
              current streak:   3 days\n\
              recent:\n\
              \x20 2026-09-10  950\n"
+        );
+    }
+
+    /// A view asks the account named; named nothing, the account the default profile bills, else
+    /// the one account; several with no default are refused by name, as is a name not configured.
+    #[test]
+    fn a_view_asks_the_named_account_else_the_default_profiles_else_the_only_one() {
+        let account = |backend: &str| crate::config::AccountConfig {
+            backend: backend.to_string(),
+            ..Default::default()
+        };
+        let accounts: std::collections::BTreeMap<String, crate::config::AccountConfig> = [
+            ("claude".to_string(), account("claude-subscription")),
+            ("work".to_string(), account("anthropic-messages")),
+        ]
+        .into_iter()
+        .collect();
+        let profiles: std::collections::BTreeMap<String, crate::config::ProfileConfig> =
+            [("daily".to_string(), crate::config::ProfileConfig {
+                account: "claude".to_string(),
+                ..Default::default()
+            })]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            account_to_ask(
+                Some("work".to_string()),
+                Some("daily"),
+                &accounts,
+                &profiles
+            )
+            .expect("named"),
+            "work"
+        );
+        assert_eq!(
+            account_to_ask(None, Some("daily"), &accounts, &profiles)
+                .expect("the default profile's"),
+            "claude"
+        );
+        let refused = account_to_ask(None, None, &accounts, &profiles)
+            .expect_err("two accounts and no default");
+        assert!(
+            refused.to_string().contains("(configured: claude, work)"),
+            "{refused}"
+        );
+        let unknown = account_to_ask(Some("nope".to_string()), None, &accounts, &profiles)
+            .expect_err("not configured");
+        assert!(unknown.to_string().contains("'nope'"), "{unknown}");
+        let only: std::collections::BTreeMap<String, crate::config::AccountConfig> =
+            [("work".to_string(), account("anthropic-messages"))]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            account_to_ask(None, None, &only, &profiles).expect("the only one"),
+            "work"
         );
     }
 
@@ -2489,15 +2555,15 @@ mod tests {
     }
 
     /// The read-only views fail on an unreadable `config.toml` the way every sibling does, rather
-    /// than reading its empty parse as "no profile configured" and sending the user to add one.
+    /// than reading its empty parse as "no accounts configured" and sending the user to add one.
     #[tokio::test]
-    async fn an_introspection_command_reports_an_unreadable_config_rather_than_a_missing_profile() {
+    async fn an_introspection_command_reports_an_unreadable_config_rather_than_a_missing_account() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("config.toml"), "bogus = 1\n").expect("write config");
         let store = crate::store::Store::for_test().await;
         let cli = <crate::cli::Cli as clap::Parser>::parse_from(["meka"]);
         let action = crate::cli::AccountAction::Whoami {
-            profile: None,
+            name: None,
             format: crate::cli::OutputFormat::Plain,
         };
 

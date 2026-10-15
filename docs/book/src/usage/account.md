@@ -2,9 +2,10 @@
 
 `meka account usage`, `whoami` and `stats` expose read-only account information obtained through a
 provider's OAuth API, so you can script things that aren't otherwise reachable (a status bar, a cron
-alert). Each takes an optional `--profile <name>` (defaults to the active profile, the way a run
-does) and a `--format plain|json`, and reports on the account that profile bills: a request needs
-a model, which is the profile's. The requested data goes to **stdout**; notes and errors go to
+alert). Each takes the account by name, the way `login` and `remove` do (`meka account usage
+claude`), and a `--format plain|json`. Named nothing, it asks the account the default profile
+bills, or the one account when there is exactly one. No profile is needed: the views ask the
+account, never a model. The requested data goes to **stdout**; notes and errors go to
 **stderr**, so `meka account … 2>/dev/null | jq` stays clean. The rest of the `meka account` suite
 (`add`, `login`, `list`, `remove`) is documented under [Config file](../configuration/config-file.md#meka-account-cli).
 
@@ -23,9 +24,8 @@ Account usage
   5-hour (session)   [##--------]  23% used  (resets in 1h 58m, 2026-07-02 02:10)
   Weekly             [----------]   4% used  (resets in 12h 48m, 2026-07-02 13:00)
 
-$ meka account usage --format json
+$ meka account usage claude-max --format json
 {
-  "profile": "work",
   "account": "claude-max",
   "windows": [
     { "label": "5-hour (session)", "used_percent": 23.0, "resets_at": 1782958200 },
@@ -52,7 +52,6 @@ credential (no network), so even when the identity call fails because the token 
 $ meka account whoami
 account:       claude-max
 backend:       claude-subscription
-profile:       work
 auth:          valid (5h 45m)
 plan:          claude_max
 tier:          default_claude_max_20x
@@ -61,7 +60,6 @@ role:          admin
 
 $ meka account whoami --format json
 {
-  "profile": "work",
   "account": "claude-max",
   "backend": "claude-subscription",
   "auth": { "valid": true, "expires_at": "2026-06-29T12:37:09+00:00", "expires_in_seconds": 20709 },
@@ -82,11 +80,10 @@ counts); `claude-subscription` reports only a first-used date:
 ```console
 $ meka account stats
 account:     claude-max
-profile:     work
 first used:  2026-04-01
 
 $ meka account stats --format json
-{ "profile": "work", "account": "claude-max", "lifetime_tokens": null, "peak_daily_tokens": null,
+{ "account": "claude-max", "lifetime_tokens": null, "peak_daily_tokens": null,
   "current_streak_days": null, "longest_streak_days": null,
   "first_used": "2026-04-01T17:36:16.996974Z", "daily": [] }
 ```
@@ -100,7 +97,7 @@ A block that shows the Claude 5-hour and weekly usage, refreshed every 5 minutes
 ```sh
 #!/bin/sh
 # ~/.config/i3blocks/meka-usage   (set interval=300)
-u=$(meka account usage --profile work --format json 2>/dev/null) || { echo "claude ?"; exit 0; }
+u=$(meka account usage claude-max --format json 2>/dev/null) || { echo "claude ?"; exit 0; }
 echo "$u" | jq -r '
   (.windows[] | select(.label|startswith("5-hour")).used_percent) as $s |
   (.windows[] | select(.label=="Weekly").used_percent) as $w |

@@ -377,9 +377,8 @@ pub(crate) enum AccountAction {
     ///
     /// The session and weekly windows, with their reset times.
     Usage {
-        /// Profile to reach the account through (default: the profile a new session runs on)
-        #[arg(long, value_name = "NAME")]
-        profile: Option<String>,
+        /// Account name (default: the account the default profile bills, or the one account)
+        name: Option<String>,
         /// Output format: plain or json
         #[arg(long, default_value = "plain")]
         format: OutputFormat,
@@ -389,9 +388,8 @@ pub(crate) enum AccountAction {
     /// The plan, tier, organization and role the backend reports, and the state of the stored
     /// credential.
     Whoami {
-        /// Profile to reach the account through (default: the profile a new session runs on)
-        #[arg(long, value_name = "NAME")]
-        profile: Option<String>,
+        /// Account name (default: the account the default profile bills, or the one account)
+        name: Option<String>,
         /// Output format: plain or json
         #[arg(long, default_value = "plain")]
         format: OutputFormat,
@@ -400,9 +398,8 @@ pub(crate) enum AccountAction {
     ///
     /// Lifetime tokens, streaks and per-day counts, as the backend reports them.
     Stats {
-        /// Profile to reach the account through (default: the profile a new session runs on)
-        #[arg(long, value_name = "NAME")]
-        profile: Option<String>,
+        /// Account name (default: the account the default profile bills, or the one account)
+        name: Option<String>,
         /// Output format: plain or json
         #[arg(long, default_value = "plain")]
         format: OutputFormat,

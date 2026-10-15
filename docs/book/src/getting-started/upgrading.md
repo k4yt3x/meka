@@ -64,6 +64,11 @@ facts a client labels it by. The store converts what it holds on the first open,
 screen shows an item as the labeled prompt it was and a fire or a report as the stage direction
 the live screen said, where it used to show meka's header as something you typed.
 
+**The account views take the account.** `meka account usage`, `whoami` and `stats` take the
+account by name, as `login` does, and lose `--profile`; named nothing, they ask the account the
+default profile bills, or the one account. An account with no profile answers. `profile` leaves
+their output, plain and JSON.
+
 The two config keys are refused by name, with their line, until renamed. An archive of version 10
 or older is converted on import. The store's columns are renamed on the first open, behind the usual
 backup; a hand-written query names the new ones. ACP's `additionalDirectories` keeps its protocol

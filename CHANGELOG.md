@@ -7,14 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.76.0] - 2026-10-14
+## [0.76.0] - 2026-10-15
 
 ### Added
 
 - `agent_spawn` takes `working_directory`: where a sub-agent works and where its paths resolve.
 - `agent_spawn` takes `additional_workspace_directories` and `additional_readable_directories`.
-- A spawn or follow-up result opens with `Agent:`, `Permission:` and the scope the sub-agent holds.
-- The context block states the additional workspace and readable directories at every level.
+- A spawn result and the context block state a sub-agent's scope: its directories and permission.
 - `--additional-readable-directory` names what a run reads beyond its workspace, repeatable.
 - `[permissions].network = "none"` cuts confined commands and `web_fetch` off the network.
 - `agent_spawn` takes `network`: `none` narrows a sub-agent, and its scope lines say so.
@@ -35,19 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** session JSON and the HTTP API name `working_directory`, not `cwd`.
 - **Breaking:** `additional_roots` is `additional_workspace_directories` in the export archive.
 - **Breaking:** the session export format is 11; an older archive is converted on import.
-- **Breaking:** the store's `sessions` table names the two columns the same way, renamed on open.
-- A directory list beside no `working_directory` is refused; an empty list counts as absent.
-- An `agent_spawn` refusal names every directory it refuses; a non-string list entry is refused.
-- A readable directory inside the workspace, a repeat, or a directory in both lists is merged.
+- **Breaking:** the store's `sessions` table renames `cwd` and `additional_roots_json` on open.
+- **Breaking:** `meka account usage`, `whoami` and `stats` name the account; `--profile` is gone.
+- **Breaking:** the three account views no longer print `profile`, and need no profile at all.
+- An `agent_spawn` list needs `working_directory`; refusals name every directory; repeats merge.
 - A sub-agent spawned with a list runs at its parent's level unless `permission` lowers it.
-- A confined read refuses a path outside the boundary the same way whether or not it exists.
-- A boundary refusal names the path as given, never the target of a symlink on it.
-- A dangling symlink inside the boundary is judged where it leads, as the open would be.
-- Tool descriptions, refusals and the context block say directory and workspace, never root.
 - Every line the screen says in its own voice is capitalized; a replay uses the live wording.
 
 ### Fixed
 
+- A confined read refuses a path outside the boundary the same way whether or not it exists.
+- A boundary refusal names the path as given; a symlink is judged where it leads, as an open is.
 - A `scratchpad` redirect leaves a refusal or an error inline; a command's output is still saved.
 - A resumed screen shows an inbox item as the labeled prompt it was, never meka's header as typed.
 - A resumed screen says a scheduled fire or a background report as a stage direction, not a prompt.
