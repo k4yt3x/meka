@@ -156,6 +156,16 @@ pub(crate) const TAB_WIDTH: usize = 4;
 pub(crate) fn expand_tabs(text: &str) -> String {
     text.replace('\t', &" ".repeat(TAB_WIDTH))
 }
+/// `text` with its first letter lowercased: a line said in the screen's voice, which opens with
+/// a capital, as the log convention wants it when a host logs it instead.
+pub(crate) fn as_log_line(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// Make a model-supplied string safe to place on one line of meka's own UI.
 ///
 /// [`sanitize_for_display`] drops escapes and control characters but deliberately keeps `\n`, `\r`

@@ -487,7 +487,7 @@ impl Frontend for AcpFrontend {
                 replaced_count,
                 generation,
             } => notice_update(&crate::frontend::Notice::info(format!(
-                "compacted the conversation: {replaced_count} messages replaced by a summary \
+                "Compacted the conversation: {replaced_count} messages replaced by a summary \
                  ({source}, compaction {generation})"
             ))),
             FrontendEvent::McpProgress(update) => {
@@ -544,6 +544,11 @@ impl Frontend for AcpFrontend {
                 // clean up.
                 self.live_output().clear();
                 return;
+            }
+            // The report the model reads, shown as the user turn it is, as one delivered by a
+            // turn of its own is.
+            FrontendEvent::BackgroundReported { text, .. } => {
+                super::schedule::out_of_band_prompt_update(&text)
             }
             // Screen signage. The editor named the session it created, and the `session/prompt`
             // response is what tells it the turn is over. A withdrawn prompt is a scheduled fire's,
@@ -1195,6 +1200,23 @@ pub(super) fn replay_session_updates(
                                     )),
                                 );
                             }
+                        }
+                        // What arrived for the model, as it read it: the editor showed it as the
+                        // user turn it is while the run was live, and the replay says the same.
+                        MekaContentBlock::Inbox { text, .. }
+                        | MekaContentBlock::Scheduled { text, .. }
+                        | MekaContentBlock::BackgroundReport { text, .. } => {
+                            send_session_update(
+                                connection,
+                                session_id,
+                                SessionUpdate::UserMessageChunk(ContentChunk::new(
+                                    ContentBlock::Text(
+                                        agent_client_protocol::schema::v1::TextContent::new(
+                                            text.clone(),
+                                        ),
+                                    ),
+                                )),
+                            );
                         }
                         MekaContentBlock::ToolResult {
                             tool_use_id,

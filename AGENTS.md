@@ -231,9 +231,14 @@ One word per concept, everywhere it is written or read:
 - Quoting in a message: backticks for keys, commands and code (`` `[permissions].default` ``,
   `` `meka profile use` ``); single quotes for values and names (`'work'`). An unknown name is
   reported through `text::unknown_name`, never a per-door sentence.
-- An empty list says "No <nouns>." on stderr. A status line that is a full sentence ends in a
-  period ("Connected to 'exa'."); one that ends in a value, id or path does not ("Profile set
-  to: work").
+- An empty list says "No <nouns>." on stderr. Every line meka says in its own voice, a status
+  line, a notice, a stage direction, a turn's end row, a note printed on the way out, starts
+  with a capital letter whatever its shape ("Background task 7f3a1c22 finished after 6s",
+  "Checklist: 2 open items, continuing, nudge 1 of 3", "Interrupted"); a line that opens with a
+  number or an acronym keeps that. One that is a full sentence ends in a period ("Connected to
+  'exa'."); one that is a fragment, or ends in a value, id, path or time, does not ("Profile set
+  to: work", "Finished at 14:43 after 1m 13s"). One wording per event, live and on a replay of
+  the log, so a resumed session reads as the live one did.
 - A message the user reads (error, warning, notice, hint, help) says what happened and, when there
   is exactly one, the remedy: no examples, no alternatives, no explanation of internals, no
   second sentence that restates the first. One sentence where one suffices. A printed line stays

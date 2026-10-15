@@ -356,6 +356,22 @@ const MIGRATIONS: &[Migration] = &[
         name: "subagent_specs_name_their_network",
         step: Step::Rust(subagent_specs_name_their_network),
     },
+    // 0.76 gives the text meka wrote into a user message on another's behalf its own block, as a
+    // nudge took one in 0.70: an inbox item, a scheduled job's fire and a background report.
+    Migration {
+        name: "inbox_items_fires_and_reports_are_blocks",
+        step: Step::Rust(inbox_items_fires_and_reports_are_blocks),
+    },
+    // A repair's replacement messages hold the same blocks as the rows they replaced, and a
+    // report names its tasks by their id lines alone.
+    Migration {
+        name: "repairs_take_the_relayed_blocks",
+        step: Step::Rust(repairs_take_the_relayed_blocks),
+    },
+    Migration {
+        name: "background_reports_name_only_their_tasks",
+        step: Step::Rust(background_reports_name_only_their_tasks),
+    },
 ];
 
 /// The position of the last turn a session opened, beside the eight cumulative counters: `NULL`
@@ -2765,6 +2781,510 @@ const ARCHIVE_FORMAT_0_70_DEVELOPMENT_2: u64 = 8;
 /// The archive `format_version` 0.70 through 0.75 wrote, naming a session's `cwd` and
 /// `additional_roots` and a spec's `writable_roots` and `readable_roots`.
 const ARCHIVE_FORMAT_0_75: u64 = 9;
+/// The archive `format_version` 0.76's development builds wrote, with an inbox item, a scheduled
+/// job's fire and a background report as `text` blocks, or the report as a section of the
+/// context block.
+const ARCHIVE_FORMAT_0_76_DEVELOPMENT: u64 = 10;
+
+/// How the text meka wrote into a user message on another's behalf began before 0.76 typed it,
+/// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
+/// without one, above a scheduled job's fire, and above a report of one task and of several.
+/// Frozen here, since the renderers may move on and this step converts what they wrote then.
+const INBOX_HEADER_0_76: &str = "[Message from ";
+const UNNAMED_INBOX_HEADER_0_76: &str = "[Message arrived ";
+const SCHEDULED_HEADER_0_76: &str = "[Scheduled job ";
+const REPORT_HEADER_0_76: &str = "[Background task reporting at ";
+const REPORTS_HEADER_0_76: &str = "[Background tasks (";
+/// What a scheduled fire's text put between its header and the job's words, and before the
+/// gate's output.
+const SCHEDULED_WORDS_SEPARATOR_0_76: &str = "\n\n";
+const GATE_OUTPUT_HEADER_0_76: &str = "\n\n[Gate output]\n";
+/// The id a row names is resolved from the short one a text carried: the table and the prefix
+/// in, the one full id that starts with it out, or `None` where the store holds none or several,
+/// and always `None` for an archive, which has no rows to ask.
+type IdResolver<'a> = dyn FnMut(&str, &str) -> Option<String> + 'a;
+
+/// A `text` block of a user message as 0.76 types it, or `None` for words a person typed: an
+/// inbox item by its header, with the source the header names and the words under it, and
+/// neither the item's id nor its class, which the text never held; a scheduled job's fire by its
+/// header, with the job's short id resolved where the store still has the job and its words
+/// taken from between the header and the gate's output; a background report by its header, with
+/// every task the bold markers name.
+fn typed_block_0_76(text: &str, resolve: &mut IdResolver<'_>) -> Option<serde_json::Value> {
+    if let Some(rest) = text.strip_prefix(INBOX_HEADER_0_76) {
+        let (header, body) = rest.split_once("]\n")?;
+        let source = header.split_once(", arrived ").map(|(source, _)| source)?;
+        return Some(serde_json::json!({
+            "type": "inbox",
+            "source": source,
+            "body": body,
+            "text": text,
+        }));
+    }
+    if let Some(rest) = text.strip_prefix(UNNAMED_INBOX_HEADER_0_76) {
+        let (_, body) = rest.split_once("]\n")?;
+        return Some(serde_json::json!({ "type": "inbox", "body": body, "text": text }));
+    }
+    if let Some(rest) = text.strip_prefix(SCHEDULED_HEADER_0_76) {
+        let short_id = rest.split_once(' ').map(|(short_id, _)| short_id)?;
+        let (_, after_header) = text.split_once(SCHEDULED_WORDS_SEPARATOR_0_76)?;
+        let prompt = after_header
+            .split_once(GATE_OUTPUT_HEADER_0_76)
+            .map_or(after_header, |(prompt, _)| prompt);
+        let job_id = resolve("scheduled_jobs", short_id).unwrap_or_else(|| short_id.to_string());
+        return Some(serde_json::json!({
+            "type": "scheduled",
+            "job_id": job_id,
+            "prompt": prompt,
+            "text": text,
+        }));
+    }
+    if text.starts_with(REPORT_HEADER_0_76) || text.starts_with(REPORTS_HEADER_0_76) {
+        return Some(report_block_0_76(text, resolve));
+    }
+    None
+}
+
+/// A report's text as 0.76's block: the tasks named by the `**<short id>**` each task's line
+/// opens with, resolved where the store still has the row.
+fn report_block_0_76(text: &str, resolve: &mut IdResolver<'_>) -> serde_json::Value {
+    let task_ids: Vec<String> = text
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("**")?;
+            let (short_id, _) = rest.split_once("**")?;
+            Some(resolve("background_tasks", short_id).unwrap_or_else(|| short_id.to_string()))
+        })
+        .collect();
+    serde_json::json!({ "type": "background_report", "task_ids": task_ids, "text": text })
+}
+
+/// A context block's text without the report 0.76's development builds wrote as its last
+/// section, and that report, or `None` for a context carrying none. The section begins at the
+/// newline the context's sections were joined with and runs to the block's closing tag, so what
+/// is left is the context as a turn without a report wrote it.
+fn report_in_context_0_76(context: &str) -> Option<(String, String)> {
+    let start = [REPORT_HEADER_0_76, REPORTS_HEADER_0_76]
+        .iter()
+        .filter_map(|header| context.find(&format!("\n{header}")))
+        .min()?;
+    let end = context.rfind("</context>")?;
+    if end <= start {
+        return None;
+    }
+    Some((
+        format!("{}</context>", &context[..start]),
+        context[start + 1..end].to_string(),
+    ))
+}
+
+/// Give the blocks of a user message their 0.76 kinds, reporting whether any changed: a `text`
+/// block meka wrote on another's behalf becomes its own kind, and a context block carrying a
+/// report has the report moved out behind it. A block already typed matches nothing, so a replay
+/// changes nothing.
+fn type_user_blocks_0_76(
+    blocks: &mut Vec<serde_json::Value>,
+    resolve: &mut IdResolver<'_>,
+) -> bool {
+    let mut changed = false;
+    let mut index = 0;
+    while index < blocks.len() {
+        let kind = blocks[index]
+            .get("type")
+            .and_then(|kind| kind.as_str())
+            .map(str::to_string);
+        let text = blocks[index]
+            .get("text")
+            .and_then(|text| text.as_str())
+            .map(str::to_string);
+        match (kind.as_deref(), text) {
+            (Some("text"), Some(text)) => {
+                if let Some(block) = typed_block_0_76(&text, resolve) {
+                    blocks[index] = block;
+                    changed = true;
+                }
+            }
+            (Some("turn_context"), Some(text)) => {
+                if let Some((context, report)) = report_in_context_0_76(&text) {
+                    blocks[index] = serde_json::json!({ "type": "turn_context", "text": context });
+                    blocks.insert(index + 1, report_block_0_76(&report, resolve));
+                    changed = true;
+                    index += 1;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    changed
+}
+
+/// [`type_user_blocks_0_76`] over an `Append` event's user message, as the archive holds one.
+fn type_user_event_0_76(event: &mut serde_json::Value, resolve: &mut IdResolver<'_>) -> bool {
+    let Some(message) = event
+        .get_mut("Append")
+        .and_then(|message| message.as_object_mut())
+    else {
+        return false;
+    };
+    if message.get("role").and_then(|role| role.as_str()) != Some("user") {
+        return false;
+    }
+    let Some(blocks) = message
+        .get_mut("content")
+        .and_then(|content| content.as_array_mut())
+    else {
+        return false;
+    };
+    type_user_blocks_0_76(blocks, resolve)
+}
+
+/// [`type_user_event_0_76`] over every event of an archive, with no store to resolve a short id
+/// against: a converted block names a task or a job by the short id the text carried.
+fn type_user_events_0_76(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    let mut unresolved = |_: &str, _: &str| None;
+    for session in sessions {
+        if let Some(events) = session
+            .get_mut("events")
+            .and_then(|events| events.as_array_mut())
+        {
+            for event in events {
+                if let Some(event) = event.get_mut("event") {
+                    type_user_event_0_76(event, &mut unresolved);
+                }
+            }
+        }
+    }
+}
+
+/// Every user row holding text meka wrote on another's behalf takes 0.76's blocks: a `user` row
+/// that is such a text becomes a `user_blocks` row holding the one block, and a `user_blocks` or
+/// `tool_results` row has each such `text` block typed and a report moved out of its context
+/// block. A short id the text carried is resolved against the session's own rows where one row
+/// starts with it.
+fn inbox_items_fires_and_reports_are_blocks(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, String, String, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT id, session_id, kind, content FROM messages WHERE kind IN ('user', \
+             'user_blocks', 'tool_results') AND (content LIKE ?1 OR content LIKE ?2 OR content \
+             LIKE ?3 OR content LIKE ?4 OR content LIKE ?5)",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                format!("%{INBOX_HEADER_0_76}%"),
+                format!("%{UNNAMED_INBOX_HEADER_0_76}%"),
+                format!("%{SCHEDULED_HEADER_0_76}%"),
+                format!("%{REPORT_HEADER_0_76}%"),
+                format!("%{REPORTS_HEADER_0_76}%"),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, session_id, kind, content) in rows {
+        let mut resolve = |table: &str, prefix: &str| -> Option<String> {
+            let mut statement = transaction
+                .prepare(&format!(
+                    "SELECT id FROM {table} WHERE session_id = ?1 AND id LIKE ?2"
+                ))
+                .ok()?;
+            let mut ids: Vec<String> = statement
+                .query_map(rusqlite::params![session_id, format!("{prefix}%")], |row| {
+                    row.get::<_, String>(0)
+                })
+                .ok()?
+                .filter_map(|id| id.ok())
+                .collect();
+            (ids.len() == 1).then(|| ids.remove(0))
+        };
+        let encoded = if kind == "user" {
+            let Some(block) = typed_block_0_76(&content, &mut resolve) else {
+                continue;
+            };
+            serde_json::to_string(&serde_json::Value::Array(vec![block]))
+        } else {
+            let Ok(mut blocks) = serde_json::from_str::<Vec<serde_json::Value>>(&content) else {
+                continue;
+            };
+            if !type_user_blocks_0_76(&mut blocks, &mut resolve) {
+                continue;
+            }
+            serde_json::to_string(&blocks)
+        };
+        let encoded = match encoded {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+            }
+        };
+        transaction.execute(
+            "UPDATE messages SET kind = 'user_blocks', content = ?1 WHERE id = ?2 AND kind = \
+             'user'",
+            rusqlite::params![encoded, id],
+        )?;
+        transaction.execute(
+            "UPDATE messages SET content = ?1 WHERE id = ?2 AND kind != 'user'",
+            rusqlite::params![encoded, id],
+        )?;
+    }
+    Ok(())
+}
+
+/// The id a row names, resolved from the short one a text carried: the one row of `table` in
+/// `session_id` whose id starts with `prefix`, or `None` where there is none or several.
+fn resolve_id_0_76(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    table: &str,
+    prefix: &str,
+) -> Option<String> {
+    let mut statement = transaction
+        .prepare(&format!(
+            "SELECT id FROM {table} WHERE session_id = ?1 AND id LIKE ?2"
+        ))
+        .ok()?;
+    let mut ids: Vec<String> = statement
+        .query_map(rusqlite::params![session_id, format!("{prefix}%")], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()?
+        .filter_map(|id| id.ok())
+        .collect();
+    (ids.len() == 1).then(|| ids.remove(0))
+}
+
+/// The user messages an event holds, as an archive and a `repair` row hold one: an `Append`'s
+/// one message, a `Repair`'s replacements for the messages it replaced; none for another event.
+fn user_messages_0_76(event: &mut serde_json::Value) -> Vec<&mut serde_json::Value> {
+    let messages: Vec<&mut serde_json::Value> = if event.get("Append").is_some() {
+        event.get_mut("Append").into_iter().collect()
+    } else {
+        event
+            .get_mut("Repair")
+            .and_then(|repair| repair.get_mut("messages"))
+            .and_then(|messages| messages.as_array_mut())
+            .map(|messages| messages.iter_mut().collect())
+            .unwrap_or_default()
+    };
+    messages
+        .into_iter()
+        .filter(|message| message.get("role").and_then(|role| role.as_str()) == Some("user"))
+        .collect()
+}
+
+/// [`type_user_blocks_0_76`] over each user message a `Repair` event holds in place of the ones
+/// it replaced, reporting whether any changed; an `Append` is [`type_user_event_0_76`]'s.
+fn type_repair_event_0_76(event: &mut serde_json::Value, resolve: &mut IdResolver<'_>) -> bool {
+    if event.get("Repair").is_none() {
+        return false;
+    }
+    let mut changed = false;
+    for message in user_messages_0_76(event) {
+        if let Some(blocks) = message
+            .get_mut("content")
+            .and_then(|content| content.as_array_mut())
+        {
+            changed |= type_user_blocks_0_76(blocks, resolve);
+        }
+    }
+    changed
+}
+
+/// The task ids a report's text names: the `**<short id>** (` each task's line opens with, eight
+/// hex digits, which a bold line of a task's own output is not. An id the block holds for the
+/// line is kept, since a live write names the row in full and the row may be swept since; a line
+/// the block holds none for takes the store's row where it has one, the short id where not.
+fn report_task_ids_0_76(text: &str, held: &[String], resolve: &mut IdResolver<'_>) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let (short_id, _) = line.strip_prefix("**")?.split_once("** (")?;
+            let is_short_id =
+                short_id.len() == 8 && short_id.chars().all(|c| c.is_ascii_hexdigit());
+            if !is_short_id {
+                return None;
+            }
+            Some(
+                held.iter()
+                    .find(|id| id.starts_with(short_id))
+                    .cloned()
+                    .or_else(|| resolve("background_tasks", short_id))
+                    .unwrap_or_else(|| short_id.to_string()),
+            )
+        })
+        .collect()
+}
+
+/// Give every `background_report` block among `blocks` the task ids its text names, reporting
+/// whether any changed.
+fn name_report_tasks_0_76(blocks: &mut [serde_json::Value], resolve: &mut IdResolver<'_>) -> bool {
+    let mut changed = false;
+    for block in blocks.iter_mut() {
+        if block.get("type").and_then(|kind| kind.as_str()) != Some("background_report") {
+            continue;
+        }
+        let Some(text) = block
+            .get("text")
+            .and_then(|text| text.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let held: Vec<String> = block
+            .get("task_ids")
+            .and_then(|ids| ids.as_array())
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| id.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let task_ids = serde_json::Value::from(report_task_ids_0_76(&text, &held, resolve));
+        if block.get("task_ids") != Some(&task_ids) {
+            block["task_ids"] = task_ids;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// [`name_report_tasks_0_76`] over each user message an event holds.
+fn name_report_tasks_in_event_0_76(
+    event: &mut serde_json::Value,
+    resolve: &mut IdResolver<'_>,
+) -> bool {
+    let mut changed = false;
+    for message in user_messages_0_76(event) {
+        if let Some(blocks) = message
+            .get_mut("content")
+            .and_then(|content| content.as_array_mut())
+        {
+            changed |= name_report_tasks_0_76(blocks, resolve);
+        }
+    }
+    changed
+}
+
+/// [`type_repair_event_0_76`] and [`name_report_tasks_in_event_0_76`] over every event of an
+/// archive, with no store to resolve a short id against.
+fn type_repairs_and_name_report_tasks_0_76(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    let mut unresolved = |_: &str, _: &str| None;
+    for session in sessions {
+        if let Some(events) = session
+            .get_mut("events")
+            .and_then(|events| events.as_array_mut())
+        {
+            for event in events {
+                if let Some(event) = event.get_mut("event") {
+                    type_repair_event_0_76(event, &mut unresolved);
+                    name_report_tasks_in_event_0_76(event, &mut unresolved);
+                }
+            }
+        }
+    }
+}
+
+/// Every `repair` row holding text meka wrote on another's behalf takes 0.76's blocks in the
+/// messages it holds in place of the ones it replaced, as those rows took them: the view a
+/// replay reads is the repair's, so a block typed in the row it superseded and not in the repair
+/// would still be shown as words a person typed.
+fn repairs_take_the_relayed_blocks(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, String, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT id, session_id, content FROM messages WHERE kind = 'repair' AND (content \
+             LIKE ?1 OR content LIKE ?2 OR content LIKE ?3 OR content LIKE ?4 OR content LIKE \
+             ?5)",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                format!("%{INBOX_HEADER_0_76}%"),
+                format!("%{UNNAMED_INBOX_HEADER_0_76}%"),
+                format!("%{SCHEDULED_HEADER_0_76}%"),
+                format!("%{REPORT_HEADER_0_76}%"),
+                format!("%{REPORTS_HEADER_0_76}%"),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, session_id, content) in rows {
+        let Ok(mut event) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let mut resolve = |table: &str, prefix: &str| -> Option<String> {
+            resolve_id_0_76(transaction, &session_id, table, prefix)
+        };
+        if !type_repair_event_0_76(&mut event, &mut resolve) {
+            continue;
+        }
+        let encoded = serde_json::to_string(&event)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        transaction.execute(
+            "UPDATE messages SET content = ?1 WHERE id = ?2",
+            rusqlite::params![encoded, id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Every `background_report` block names the tasks its text names and nothing else, in a
+/// `user_blocks` and a `tool_results` row and in the messages a `repair` row holds: the ids are
+/// read from the `**<short id>** (` each task's line opens with, so a bold line of a task's own
+/// output names no task.
+fn background_reports_name_only_their_tasks(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, String, String, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT id, session_id, kind, content FROM messages WHERE kind IN ('user_blocks', \
+             'tool_results', 'repair') AND content LIKE '%background_report%'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, session_id, kind, content) in rows {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let mut resolve = |table: &str, prefix: &str| -> Option<String> {
+            resolve_id_0_76(transaction, &session_id, table, prefix)
+        };
+        let changed = if kind == "repair" {
+            name_report_tasks_in_event_0_76(&mut value, &mut resolve)
+        } else {
+            value
+                .as_array_mut()
+                .is_some_and(|blocks| name_report_tasks_0_76(blocks, &mut resolve))
+        };
+        if !changed {
+            continue;
+        }
+        let encoded = serde_json::to_string(&value)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        transaction.execute(
+            "UPDATE messages SET content = ?1 WHERE id = ?2",
+            rusqlite::params![encoded, id],
+        )?;
+    }
+    Ok(())
+}
 
 /// Bring a session archive written by an older meka to the current shape, reporting whether it
 /// was one. `current` is the version this build writes, handed in as data the way a [`Context`]
@@ -2780,7 +3300,10 @@ const ARCHIVE_FORMAT_0_75: u64 = 9;
 /// checklist on each boundary, by [`snapshot_checklists_0_70`], and the nudge's own block where a
 /// nudge was written as text, by [`block_nudges_0_70`]. Every version before 0.76 then takes
 /// 0.76's names for a session's directories and a spec's scope, by
-/// [`name_working_directories_0_76`].
+/// [`name_working_directories_0_76`], and every version before the release of 0.76 the blocks
+/// 0.76 gives an inbox item, a scheduled fire and a background report, by
+/// [`type_user_events_0_76`], in a repair's messages too and with a report naming only its
+/// tasks, by [`type_repairs_and_name_report_tasks_0_76`].
 pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u64) -> bool {
     match document
         .get("format_version")
@@ -2808,7 +3331,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_69)
         | Some(ARCHIVE_FORMAT_0_70_DEVELOPMENT)
         | Some(ARCHIVE_FORMAT_0_70_DEVELOPMENT_2)
-        | Some(ARCHIVE_FORMAT_0_75) => {}
+        | Some(ARCHIVE_FORMAT_0_75)
+        | Some(ARCHIVE_FORMAT_0_76_DEVELOPMENT) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -2832,6 +3356,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
     snapshot_checklists_0_70(document);
     block_nudges_0_70(document);
     name_working_directories_0_76(document);
+    type_user_events_0_76(document);
+    type_repairs_and_name_report_tasks_0_76(document);
     document["format_version"] = current.into();
     true
 }
@@ -3956,6 +4482,15 @@ mod tests {
                 6525172221673504139_u64,
             ),
             ("subagent_specs_name_their_network", 6204434571494268024_u64),
+            (
+                "inbox_items_fires_and_reports_are_blocks",
+                16587665193673430809_u64,
+            ),
+            ("repairs_take_the_relayed_blocks", 9883890175305426370_u64),
+            (
+                "background_reports_name_only_their_tasks",
+                14970459526399045671_u64,
+            ),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
         /// every column-zero function it calls, recursively. What a Rust step does is its body and
@@ -7117,5 +7652,456 @@ mod tests {
             export.sessions[0].working_directory.as_deref(),
             Some(std::path::Path::new("/w"))
         );
+    }
+
+    /// 0.76's last step types what meka wrote into a user message on another's behalf: a `user`
+    /// row that is an inbox item becomes a `user_blocks` row holding the item's block, with the
+    /// source and the words the header carried and neither an id nor a class, which it never
+    /// held; a `text` block that is a scheduled fire or a report takes its kind, the job's and the
+    /// tasks' ids resolved against the session's own rows where they are there and kept short
+    /// otherwise; a report written as the last section of a context block moves out behind it; a
+    /// person's words are left alone; and a replay changes nothing.
+    #[tokio::test]
+    async fn inbox_items_fires_and_reports_are_blocks_types_what_meka_relayed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meka.db");
+        let report = "[Background task reporting at 2026-10-15 14:33 +00:00]\nYou started these \
+                      earlier and did not wait for them.\n\n---\n\n**e099fc5f** (sleep 6) \
+                      finished after 6s.\n\nBUILD-OK\n";
+        let context_with_report = format!(
+            "<context>\n[Permission context]\nLevel: read.\n\n[Skills]\nnone\n\n{report}</context>"
+        );
+        let fire = "[Scheduled job 1a2b3c4d fired 2026-10-15 14:02 +00:00]\n\ncheck the \
+                    news\n\n[Gate output]\nnew items";
+        {
+            let mut connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(BASELINE_0_42)
+                .expect("the baseline builds");
+            stopped_before(&mut connection, "inbox_items_fires_and_reports_are_blocks");
+            plant_session(&connection, "s");
+            connection
+                .execute(
+                    "INSERT INTO background_tasks (id, session_id, tool, label, status, \
+                     started_at) VALUES ('e099fc5f-0000-4000-8000-000000000000', 's', \
+                     'shell_execute', 'sleep 6', 'completed', 'now')",
+                    [],
+                )
+                .expect("a task row");
+            connection
+                .execute(
+                    "INSERT INTO scheduled_jobs (id, session_id, kind, spec, prompt, created_at, \
+                     next_fire_at) VALUES ('1a2b3c4d-0000-4000-8000-000000000000', 's', 'at', \
+                     '2026-10-15T14:02:00Z', 'check the news', 'now', 'now')",
+                    [],
+                )
+                .expect("a job row");
+            plant_message_of_kind(
+                &connection,
+                "s",
+                "user",
+                "[Message from telegram, arrived 2026-10-15 14:00 +00:00]\nhello there",
+            );
+            plant_message_of_kind(
+                &connection,
+                "s",
+                "user_blocks",
+                &serde_json::json!([
+                    { "type": "turn_context", "text": context_with_report },
+                    { "type": "text", "text": "typed words" },
+                ])
+                .to_string(),
+            );
+            plant_message_of_kind(
+                &connection,
+                "s",
+                "tool_results",
+                &serde_json::json!([
+                    { "type": "tool_result", "tool_use_id": "t", "content": [], "is_error": false },
+                    { "type": "text", "text": report },
+                    { "type": "text", "text": "[Message arrived 2026-10-15 14:01 +00:00 while you were working]\nstop" },
+                ])
+                .to_string(),
+            );
+            plant_message_of_kind(
+                &connection,
+                "s",
+                "user_blocks",
+                &serde_json::json!([
+                    { "type": "turn_context", "text": "<context>\n[Permission context]\n</context>" },
+                    { "type": "text", "text": fire },
+                ])
+                .to_string(),
+            );
+            plant_message_of_kind(&connection, "s", "user", "plain words");
+        }
+
+        crate::store::Store::open(Some(&path), &Context::default())
+            .await
+            .expect("the store migrates on open");
+
+        let mut connection = rusqlite::Connection::open(&path).expect("reopen");
+        let rows = |connection: &rusqlite::Connection| -> Vec<(String, serde_json::Value)> {
+            let mut statement = connection
+                .prepare("SELECT kind, content FROM messages ORDER BY id")
+                .expect("prepare");
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .expect("query")
+                .map(|row| {
+                    let (kind, content) = row.expect("row");
+                    let content = serde_json::from_str(&content)
+                        .unwrap_or(serde_json::Value::String(content));
+                    (kind, content)
+                })
+                .collect()
+        };
+        let converted = rows(&connection);
+        assert_eq!(converted[0].0, "user_blocks");
+        assert_eq!(
+            converted[0].1,
+            serde_json::json!([{
+                "type": "inbox",
+                "source": "telegram",
+                "body": "hello there",
+                "text": "[Message from telegram, arrived 2026-10-15 14:00 +00:00]\nhello there",
+            }])
+        );
+        assert_eq!(
+            converted[1].1,
+            serde_json::json!([
+                { "type": "turn_context", "text": "<context>\n[Permission context]\nLevel: read.\n\n[Skills]\nnone\n</context>" },
+                { "type": "background_report", "task_ids": ["e099fc5f-0000-4000-8000-000000000000"], "text": report },
+                { "type": "text", "text": "typed words" },
+            ]),
+            "the report moves out of the context block, behind it"
+        );
+        assert_eq!(converted[2].0, "tool_results");
+        assert_eq!(
+            converted[2].1[1],
+            serde_json::json!({ "type": "background_report", "task_ids": ["e099fc5f-0000-4000-8000-000000000000"], "text": report })
+        );
+        assert_eq!(
+            converted[2].1[2],
+            serde_json::json!({
+                "type": "inbox",
+                "body": "stop",
+                "text": "[Message arrived 2026-10-15 14:01 +00:00 while you were working]\nstop",
+            })
+        );
+        assert_eq!(
+            converted[3].1[1],
+            serde_json::json!({
+                "type": "scheduled",
+                "job_id": "1a2b3c4d-0000-4000-8000-000000000000",
+                "prompt": "check the news",
+                "text": fire,
+            })
+        );
+        assert_eq!(
+            converted[4],
+            (
+                "user".to_string(),
+                serde_json::Value::String("plain words".to_string())
+            ),
+            "a person's words are left alone"
+        );
+
+        let transaction = connection.transaction().expect("transaction");
+        inbox_items_fires_and_reports_are_blocks(&transaction).expect("a replay");
+        transaction.commit().expect("commit");
+        assert_eq!(rows(&connection), converted, "a replay is a no-op");
+    }
+
+    /// A format-10 archive, the one 0.76's development builds wrote, takes the blocks 0.76 gives
+    /// what meka relayed, with a task or a job named by the short id the text carried, since an
+    /// archive has no rows to resolve it against; a replay is a no-op, and the converted archive
+    /// reads.
+    #[test]
+    fn a_format_10_archive_takes_the_relayed_blocks() {
+        let mut document = serde_json::json!({
+            "format_version": 10,
+            "meka_version": "0.76.0",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "blobs": [],
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "working_directory": "/w",
+                "permission": "read",
+                "capabilities_json": null,
+                "approvals": false,
+                "additional_workspace_directories": [],
+                "subagent_spec_json": null,
+                "profile": "work",
+                "stats": {
+                    "turns": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "redactions": 0,
+                    "redacted_images": 0,
+                    "redacted_bytes": 0,
+                    "turn_position": {"prompt_index": 0, "turn_index": 0},
+                },
+                "turns": [],
+                "events": [{
+                    "at": "2020-01-01T00:00:00Z",
+                    "turn_id": null,
+                    "event": {"Append": {"role": "user", "content": [
+                        {"type": "turn_context", "text": "<context>\n[Permission context]\n\n[Background task reporting at now]\n**7f3a1c22** (make) finished after 6s.\n\nok\n</context>"},
+                        {"type": "text", "text": "[Message from a client, arrived now]\nhello"},
+                    ]}},
+                }],
+                "scratchpad_entries": {},
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        let content = &document["sessions"][0]["events"][0]["event"]["Append"]["content"];
+        assert_eq!(
+            *content,
+            serde_json::json!([
+                {"type": "turn_context", "text": "<context>\n[Permission context]\n</context>"},
+                {"type": "background_report", "task_ids": ["7f3a1c22"], "text": "[Background task reporting at now]\n**7f3a1c22** (make) finished after 6s.\n\nok\n"},
+                {"type": "inbox", "source": "a client", "body": "hello", "text": "[Message from a client, arrived now]\nhello"},
+            ])
+        );
+        let once = document.clone();
+        document["format_version"] = 10.into();
+        assert!(bring_archive_forward(&mut document, current));
+        assert_eq!(document, once, "a replay is a no-op");
+        let export = crate::store::export::parse_session_export(once.to_string().as_bytes())
+            .expect("a converted archive reads");
+        assert!(matches!(
+            &export.sessions[0].events[0].event,
+            crate::conversation::Event::Append(message)
+                if matches!(message.content[1], crate::conversation::ContentBlock::BackgroundReport { .. })
+        ));
+    }
+
+    /// A `repair` row's replacement messages take the blocks the rows they replaced took: an
+    /// inbox item typed, a report moved out of the context block; the assistant's message and a
+    /// repair holding nothing are left alone, and a replay changes nothing.
+    #[tokio::test]
+    async fn repairs_take_the_relayed_blocks_types_the_replacement_messages() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meka.db");
+        let repair = serde_json::json!({"Repair": {"replaced_count": 2, "messages": [
+            {"role": "user", "content": [
+                {"type": "turn_context", "text": "<context>\n[Permission context]\n\n[Background task reporting at now]\n**7f3a1c22** (make) finished after 6s.\n\nok\n</context>"},
+                {"type": "text", "text": "[Message from a client, arrived now]\nhello"},
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "[Message from me, arrived now]\nnot a user message"},
+            ]},
+        ]}});
+        let empty = r#"{"Repair":{"replaced_count":1,"messages":[]}}"#;
+        {
+            let mut connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(BASELINE_0_42)
+                .expect("the baseline builds");
+            stopped_before(&mut connection, "repairs_take_the_relayed_blocks");
+            plant_session(&connection, "s");
+            plant_message_of_kind(&connection, "s", "repair", &repair.to_string());
+            plant_message_of_kind(&connection, "s", "repair", empty);
+        }
+
+        crate::store::Store::open(Some(&path), &Context::default())
+            .await
+            .expect("the store migrates on open");
+
+        let mut connection = rusqlite::Connection::open(&path).expect("reopen");
+        let converted = stored_messages(&connection);
+        let event: serde_json::Value = serde_json::from_str(&converted[0].1).expect("json");
+        assert_eq!(
+            event["Repair"]["messages"][0]["content"],
+            serde_json::json!([
+                {"type": "turn_context", "text": "<context>\n[Permission context]\n</context>"},
+                {"type": "background_report", "task_ids": ["7f3a1c22"], "text": "[Background task reporting at now]\n**7f3a1c22** (make) finished after 6s.\n\nok\n"},
+                {"type": "inbox", "source": "a client", "body": "hello", "text": "[Message from a client, arrived now]\nhello"},
+            ])
+        );
+        assert_eq!(
+            event["Repair"]["messages"][1], repair["Repair"]["messages"][1],
+            "the assistant's message is left alone"
+        );
+        assert_eq!(converted[1].1, empty);
+
+        let transaction = connection.transaction().expect("transaction");
+        repairs_take_the_relayed_blocks(&transaction).expect("a replay");
+        transaction.commit().expect("commit");
+        assert_eq!(
+            stored_messages(&connection),
+            converted,
+            "a replay is a no-op"
+        );
+    }
+
+    /// A report block names the tasks its id lines name and nothing else: an id the block holds
+    /// for a line is kept in full though the row is gone, one it holds none for resolves to the
+    /// session's row where there is one and stays short otherwise, a bold line of a task's own
+    /// output names no task, a report in a repair's messages is read the same, a block already
+    /// right is left alone, and a replay changes nothing.
+    #[tokio::test]
+    async fn background_reports_name_only_their_tasks_reads_the_id_lines() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meka.db");
+        let report = "[Background tasks (2) reporting at now]\nYou started these.\n\n---\n\n\
+                      **2a843993** (web_search) finished after 9s.\n\n**Sources:**\n- one\n\n\
+                      ---\n\n**deadbeef** (make) failed after 1s.\n\n**Top news (today):**\n\
+                      **Summary** (one line):\n**cafebabe**: a commit\n";
+        let named = serde_json::json!(["2a843993-0000-4000-8000-000000000000", "deadbeef"]);
+        let swept = "deadbeef-0000-4000-8000-000000000000";
+        let right = serde_json::json!([
+            {"type": "turn_context", "text": "<context/>"},
+            {"type": "background_report", "task_ids": named, "text": report},
+        ])
+        .to_string();
+        {
+            let mut connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(BASELINE_0_42)
+                .expect("the baseline builds");
+            stopped_before(&mut connection, "background_reports_name_only_their_tasks");
+            plant_session(&connection, "s");
+            connection
+                .execute(
+                    "INSERT INTO background_tasks (id, session_id, tool, label, status, \
+                     started_at) VALUES ('2a843993-0000-4000-8000-000000000000', 's', \
+                     'web_search', 'news', 'completed', 'now')",
+                    [],
+                )
+                .expect("a task row");
+            plant_message_of_kind(
+                &connection,
+                "s",
+                "tool_results",
+                &serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "t", "content": [], "is_error": false},
+                    {"type": "background_report", "task_ids": ["2a843993-0000-4000-8000-000000000000", "Sources:", swept, "Top news (today):"], "text": report},
+                ])
+                .to_string(),
+            );
+            plant_message_of_kind(&connection, "s", "user_blocks", &right);
+            plant_message_of_kind(
+                &connection,
+                "s",
+                "repair",
+                &serde_json::json!({"Repair": {"replaced_count": 1, "messages": [
+                    {"role": "user", "content": [
+                        {"type": "background_report", "task_ids": ["Sources:"], "text": report},
+                    ]},
+                ]}})
+                .to_string(),
+            );
+        }
+
+        crate::store::Store::open(Some(&path), &Context::default())
+            .await
+            .expect("the store migrates on open");
+
+        let mut connection = rusqlite::Connection::open(&path).expect("reopen");
+        let converted = stored_messages(&connection);
+        let results: serde_json::Value = serde_json::from_str(&converted[0].1).expect("json");
+        assert_eq!(
+            results[1]["task_ids"],
+            serde_json::json!(["2a843993-0000-4000-8000-000000000000", swept]),
+            "the swept task keeps the full id the block held: {results}"
+        );
+        assert_eq!(converted[1].1, right, "a block already right is left alone");
+        let repair: serde_json::Value = serde_json::from_str(&converted[2].1).expect("json");
+        assert_eq!(
+            repair["Repair"]["messages"][0]["content"][0]["task_ids"], named,
+            "{repair}"
+        );
+
+        let transaction = connection.transaction().expect("transaction");
+        background_reports_name_only_their_tasks(&transaction).expect("a replay");
+        transaction.commit().expect("commit");
+        assert_eq!(
+            stored_messages(&connection),
+            converted,
+            "a replay is a no-op"
+        );
+    }
+
+    /// A format-10 archive's `Repair` events take the blocks its `Append`s take, and a report in
+    /// either names only the tasks its id lines name; a replay is a no-op, and the converted
+    /// archive reads.
+    #[test]
+    fn a_format_10_archive_types_its_repairs_and_names_only_the_tasks() {
+        let mut document = serde_json::json!({
+            "format_version": 10,
+            "meka_version": "0.76.0",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "blobs": [],
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "working_directory": "/w",
+                "permission": "read",
+                "capabilities_json": null,
+                "approvals": false,
+                "additional_workspace_directories": [],
+                "subagent_spec_json": null,
+                "profile": "work",
+                "stats": {
+                    "turns": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "redactions": 0,
+                    "redacted_images": 0,
+                    "redacted_bytes": 0,
+                    "turn_position": {"prompt_index": 0, "turn_index": 0},
+                },
+                "turns": [],
+                "events": [{
+                    "at": "2020-01-01T00:00:00Z",
+                    "turn_id": null,
+                    "event": {"Repair": {"replaced_count": 1, "messages": [
+                        {"role": "user", "content": [
+                            {"type": "turn_context", "text": "<context>\n[Permission context]\n</context>"},
+                            {"type": "text", "text": "[Background task reporting at now]\n**7f3a1c22** (make) finished after 6s.\n\n**Sources:**\n- one\n**Summary** (one line):\n**cafebabe**: a commit\n"},
+                        ]},
+                    ]}},
+                }],
+                "scratchpad_entries": {},
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        let content =
+            &document["sessions"][0]["events"][0]["event"]["Repair"]["messages"][0]["content"];
+        assert_eq!(
+            *content,
+            serde_json::json!([
+                {"type": "turn_context", "text": "<context>\n[Permission context]\n</context>"},
+                {"type": "background_report", "task_ids": ["7f3a1c22"], "text": "[Background task reporting at now]\n**7f3a1c22** (make) finished after 6s.\n\n**Sources:**\n- one\n**Summary** (one line):\n**cafebabe**: a commit\n"},
+            ])
+        );
+        let once = document.clone();
+        document["format_version"] = 10.into();
+        assert!(bring_archive_forward(&mut document, current));
+        assert_eq!(document, once, "a replay is a no-op");
+        let export = crate::store::export::parse_session_export(once.to_string().as_bytes())
+            .expect("a converted archive reads");
+        assert!(matches!(
+            &export.sessions[0].events[0].event,
+            crate::conversation::Event::Repair { messages, .. }
+                if matches!(messages[0].content[1], crate::conversation::ContentBlock::BackgroundReport { .. })
+        ));
     }
 }

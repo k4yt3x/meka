@@ -3358,7 +3358,7 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 crate::frontend::FrontendEvent::Notice(notice)
-                    if notice.text.starts_with("checklist:") =>
+                    if notice.text.starts_with("Checklist:") =>
                 {
                     Some(notice.text.clone())
                 }
@@ -5016,7 +5016,10 @@ mod tests {
                     .content
                     .iter()
                     .filter_map(|block| match block {
-                        crate::conversation::ContentBlock::Text { text } => Some(text.clone()),
+                        crate::conversation::ContentBlock::Text { text }
+                        | crate::conversation::ContentBlock::Inbox { text, .. } => {
+                            Some(text.clone())
+                        }
                         _ => None,
                     })
                     .collect()

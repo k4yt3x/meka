@@ -640,7 +640,7 @@ pub(crate) async fn run_interactive(
     let stopped = crate::host::release_agent(&agent, &cancel, mcp_manager.as_ref()).await;
     if stopped > 0 {
         crate::render::render_annotation(&format!(
-            "stopping {} background task{}",
+            "Stopping {} background task{}",
             stopped,
             if stopped == 1 { "" } else { "s" }
         ));
@@ -769,7 +769,7 @@ impl crate::host::scheduler::HostHooks for TuiHooks {
     ) {
         let direction = match prompt {
             crate::host::scheduler::OutOfBandPrompt::Outcomes(tasks) => {
-                crate::render::background_report_direction(tasks)
+                crate::background::report_direction(tasks)
             }
             crate::host::scheduler::OutOfBandPrompt::Scheduled(wakeup) => {
                 crate::render::scheduled_fire_direction(wakeup)

@@ -337,6 +337,9 @@ fn received_blocks(message: &Message) -> Vec<&str> {
             {
                 Some(text.as_str())
             }
+            ContentBlock::Inbox { text, .. } | ContentBlock::Scheduled { text, .. } => {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect()
@@ -1140,7 +1143,7 @@ impl Agent {
         // Occupancy is remeasured after the replacement is assembled; the pre-compaction gauge
         // would describe the window being discarded.
         let live = self
-            .build_live_context(session_id, &world_state, None, None, false)
+            .build_live_context(session_id, &world_state, None, false)
             .await;
         // Degrades rather than fails, since the summary is what keeps the session alive, but not
         // silently: an empty inventory tells the model it saved nothing, and it re-derives work it

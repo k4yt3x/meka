@@ -78,7 +78,7 @@ meka --oneshot -p "how many files are here?" --format json
     "cache_creation_input_tokens": 0, "cache_read_input_tokens": 1024
   },
   "notices": [
-    { "level": "warn", "text": "approvals are on but nobody can answer here, so 'shell_execute' was refused without asking" }
+    { "level": "warn", "text": "Approvals are on but nobody can answer here, so 'shell_execute' was refused without asking." }
   ]
 }
 ```

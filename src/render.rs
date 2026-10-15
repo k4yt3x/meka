@@ -348,30 +348,6 @@ pub(crate) fn compaction_summary(outcome: &crate::agent::CompactOutcome) -> Stri
 /// lateness note on.
 const FIRE_DIRECTION_PROMPT_COLUMNS: usize = 40;
 
-/// The stage direction the screen prints where a background report's turn begins: which tasks
-/// ended and how. The report itself is the model's prompt and stays off the screen, as every
-/// tool's output does; the reply that follows carries what matters.
-pub(crate) fn background_report_direction(
-    tasks: &[crate::store::background::BackgroundTask],
-) -> String {
-    match tasks {
-        [task] => format!(
-            "background task {} {} after {}, reporting",
-            task.short_id(),
-            task.status.headline(),
-            crate::background::format_elapsed(task.elapsed())
-        ),
-        _ => {
-            let ended = tasks
-                .iter()
-                .map(|task| format!("{} {}", task.short_id(), task.status.headline()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("{} background tasks reporting: {ended}", tasks.len())
-        }
-    }
-}
-
 /// The stage direction the screen prints where a scheduled fire's turn begins: the job, its
 /// lateness when that is material, and the opening of its prompt, which the person wrote and
 /// needs only to recognize.
@@ -385,75 +361,35 @@ pub(crate) fn scheduled_fire_direction(wakeup: &crate::scheduler::Wakeup) -> Str
     )
 }
 
+/// [`scheduled_fire_direction`] for a fire read back from the log, which holds the job's id and
+/// its words and nothing of how late the fire was: a lateness is news as it happens and a
+/// replay is not the time for it.
+pub(crate) fn replayed_fire_direction(job_id: &str, prompt: &str) -> String {
+    fire_direction(
+        job_id.get(..crate::text::ID_PREFIX).unwrap_or(job_id),
+        prompt,
+        None,
+    )
+}
+
 /// [`scheduled_fire_direction`] on its parts: the job's short id, its prompt, and when the fire
 /// is late, how late and how many occurrences it stands in for.
 fn fire_direction(short_id: &str, prompt: &str, late: Option<(chrono::Duration, u32)>) -> String {
     let prompt = crate::text::sanitize_to_line(prompt, FIRE_DIRECTION_PROMPT_COLUMNS);
     match late {
         Some((late_by, occurrences)) => format!(
-            "scheduled job {short_id} fired {} late, replacing {occurrences} missed \
+            "Scheduled job {short_id} fired {} late, replacing {occurrences} missed \
              occurrence{}: {prompt}",
             crate::scheduler::format_late(late_by),
             if occurrences == 1 { "" } else { "s" }
         ),
-        None => format!("scheduled job {short_id} fired: {prompt}"),
+        None => format!("Scheduled job {short_id} fired: {prompt}"),
     }
 }
 
 #[cfg(test)]
 mod direction_tests {
     use super::*;
-    use crate::store::background::{BackgroundTask, TaskStatus};
-
-    fn task(id: &str, status: TaskStatus, ran_for_seconds: i64) -> BackgroundTask {
-        let finished_at = chrono::Utc::now();
-        BackgroundTask {
-            id: id.to_string(),
-            session_id: uuid::Uuid::nil(),
-            tool: "shell_execute".to_string(),
-            label: "make".to_string(),
-            status,
-            outcome: Some("ok\n".to_string()),
-            scratchpad_entry: None,
-            started_at: finished_at - chrono::Duration::seconds(ran_for_seconds),
-            finished_at: Some(finished_at),
-            announced_at: None,
-            delivered_at: None,
-            subagent_id: None,
-        }
-    }
-
-    /// One task names how it ended and how long it ran; a batch names each task and its end. The
-    /// output is never in it.
-    #[test]
-    fn a_report_direction_names_the_tasks_and_how_they_ended() {
-        let one = background_report_direction(&[task(
-            "3881c9c6-0000-4000-8000-000000000000",
-            TaskStatus::Completed,
-            30,
-        )]);
-        assert_eq!(
-            one,
-            "background task 3881c9c6 finished after 30s, reporting"
-        );
-        let two = background_report_direction(&[
-            task(
-                "3881c9c6-0000-4000-8000-000000000000",
-                TaskStatus::Failed,
-                5,
-            ),
-            task(
-                "7f3a1c22-0000-4000-8000-000000000000",
-                TaskStatus::Canceled,
-                5,
-            ),
-        ]);
-        assert_eq!(
-            two,
-            "2 background tasks reporting: 3881c9c6 failed, 7f3a1c22 was canceled"
-        );
-        assert!(!one.contains("ok") && !two.contains("ok"));
-    }
 
     /// A wakeup's direction counts the occurrence being delivered among the ones it stands in
     /// for, as the prompt the model gets does, and says nothing of a lateness a tick explains.
@@ -478,7 +414,7 @@ mod direction_tests {
         };
         assert_eq!(
             scheduled_fire_direction(&late),
-            "scheduled job 1a2b3c4d fired 2h late, replacing 3 missed occurrences: remind me to \
+            "Scheduled job 1a2b3c4d fired 2h late, replacing 3 missed occurrences: remind me to \
              stretch"
         );
         let on_time = crate::scheduler::Wakeup {
@@ -489,7 +425,7 @@ mod direction_tests {
         };
         assert_eq!(
             scheduled_fire_direction(&on_time),
-            "scheduled job 1a2b3c4d fired: remind me to stretch"
+            "Scheduled job 1a2b3c4d fired: remind me to stretch"
         );
     }
 
@@ -499,7 +435,7 @@ mod direction_tests {
     fn a_fire_direction_quotes_the_prompt_and_the_material_lateness() {
         assert_eq!(
             fire_direction("1a2b3c4d", "remind me to stretch", None),
-            "scheduled job 1a2b3c4d fired: remind me to stretch"
+            "Scheduled job 1a2b3c4d fired: remind me to stretch"
         );
         assert_eq!(
             fire_direction(
@@ -507,7 +443,7 @@ mod direction_tests {
                 "remind me to stretch",
                 Some((chrono::Duration::hours(2), 3))
             ),
-            "scheduled job 1a2b3c4d fired 2h late, replacing 3 missed occurrences: remind me to \
+            "Scheduled job 1a2b3c4d fired 2h late, replacing 3 missed occurrences: remind me to \
              stretch"
         );
         assert!(
@@ -517,7 +453,7 @@ mod direction_tests {
         let long = fire_direction("1a2b3c4d", &"check the build\n".repeat(20), None);
         assert!(!long.contains('\n'), "{long}");
         assert!(
-            long.len() < "scheduled job 1a2b3c4d fired: ".len() + FIRE_DIRECTION_PROMPT_COLUMNS + 4,
+            long.len() < "Scheduled job 1a2b3c4d fired: ".len() + FIRE_DIRECTION_PROMPT_COLUMNS + 4,
             "{long}"
         );
     }

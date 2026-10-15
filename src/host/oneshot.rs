@@ -88,7 +88,9 @@ fn assemble_report(
                 round_boundary = false;
                 text.push_str(&delta);
             }
-            FrontendEvent::Nudged { .. } => round_boundary = true,
+            FrontendEvent::Nudged { .. } | FrontendEvent::BackgroundReported { .. } => {
+                round_boundary = true;
+            }
             FrontendEvent::ToolCallStarted {
                 id, name, input, ..
             } => {
@@ -280,7 +282,8 @@ pub(crate) async fn run_oneshot(
     install_interrupt_handler(
         cancel.clone(),
         &agent,
-        |note: &str| tracing::warn!("{note}"),
+        // The note is said in the screen's voice; here it is a log line, and reads as one.
+        |note: &str| tracing::warn!("{}", crate::text::as_log_line(note)),
         || {
             // Exits from inside the listener's task, so it never reaches the funnel in `main`
             // and has to release the grants itself.
@@ -388,7 +391,7 @@ pub(crate) async fn run_oneshot(
         // Ungated, unlike the claim before the turn: this one is printed for the human on the way
         // out, so whether a turn could start is not a question about it.
         let outcomes = match session_id {
-            Some(id) => crate::host::claim_outcomes_now(&store, id).await,
+            Some(id) => crate::background::claim_outcomes_now(&store, id).await,
             None => Vec::new(),
         };
         if !outcomes.is_empty() {

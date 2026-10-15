@@ -79,6 +79,11 @@ pub(super) struct TurnRecovery {
     /// a compaction summary and a nudge are both plain `User` messages that look exactly like
     /// a prompt from the outside.
     pub(super) prompt_only_events: usize,
+    /// What becomes of the prompt if the turn ends unanswered: the input's own answer at open,
+    /// and [`crate::conversation::PromptRetention::Keep`] once an interrupt has landed a
+    /// background outcome on the prompt, since the row is stamped delivered and the message is
+    /// the report's only copy. The one place the answer is held, read where the turn ends.
+    pub(super) retention: crate::conversation::PromptRetention,
     /// Bounds the emergency compact-and-retry on a [`MekaError::ContextOverflow`] so a request
     /// that stays too large after one compaction fails cleanly instead of looping.
     pub(super) overflow_retries: u32,
@@ -272,8 +277,8 @@ impl TurnRecovery {
                     .cells
                     .frontend
                     .emit(FrontendEvent::Notice(crate::frontend::Notice::warn(
-                        "the content this turn added is back in the session; if the next turn \
-                         fails the same way, rewind the session"
+                        "The content this turn added is back in the session; if the next turn \
+                         fails the same way, rewind the session."
                             .to_string(),
                     )))
                     .await;
@@ -314,8 +319,8 @@ impl TurnRecovery {
                 // `--format json`, not the default: the markdown writer drops
                 // `ContentBlock::Image` outright, which is precisely the content
                 // `DegradeTier::Attachments` takes.
-                "the provider would not take this turn's content; retrying without some of it \
-                 (`meka session export --format json` keeps the original)"
+                "The provider would not take this turn's content; retrying without some of it \
+                 (`meka session export --format json` keeps the original)."
                     .to_string(),
             )))
             .await;
@@ -375,8 +380,8 @@ impl TurnRecovery {
             .frontend
             .emit(FrontendEvent::Notice(crate::frontend::Notice::warn(
                 format!(
-                    "the provider failed every retry; waiting {}s and re-sending unchanged before \
-                     removing anything from this turn",
+                    "The provider failed every retry; waiting {}s and re-sending unchanged before \
+                     removing anything from this turn.",
                     delay.as_secs()
                 ),
             )))
@@ -545,11 +550,11 @@ impl TurnRecovery {
         Ok(())
     }
 
-    /// Append `assistant_message` and the nudge that answers it as one unit, with what arrived in
-    /// the inbox while the reply was written riding behind the nudge: a nudge round is a round
-    /// boundary like a tool round's results, and reads the inbox the same way. Memory moves only
-    /// once the pair is on disk, for the reason the thinking-only nudge gives, and the nudge is
-    /// announced after.
+    /// Append `assistant_message` and the nudge that answers it as one unit, with what arrived
+    /// while the reply was written riding behind the nudge: a nudge round is a round boundary like
+    /// a tool round's results, and reads what arrived the same way. Memory moves only once the
+    /// pair is on disk, for the reason the thinking-only nudge gives, and the nudge is announced
+    /// after.
     async fn append_nudge(
         &mut self,
         agent: &Agent,
@@ -560,13 +565,9 @@ impl TurnRecovery {
         text: String,
     ) -> Result<()> {
         let mut nudge = Message::nudge_message(kind, text.clone());
-        let steering = agent.take_steering(session_id, &self.inbox_ids).await;
-        nudge
-            .content
-            .extend(steering.iter().map(|item| ContentBlock::Text {
-                text: crate::prompt::render_inbox_item(item, true),
-            }));
-        let steered: Vec<Uuid> = steering.iter().map(|item| item.id).collect();
+        let arrivals = agent.take_arrivals(session_id, &self.inbox_ids).await;
+        nudge.content.extend(arrivals.blocks());
+        let steered = arrivals.item_ids();
         agent
             .save_events_atomic_marking_inbox(
                 session_id,
@@ -584,6 +585,7 @@ impl TurnRecovery {
             .frontend
             .emit(crate::frontend::FrontendEvent::Nudged { kind, text })
             .await;
+        arrivals.announce(&agent.cells.frontend).await;
         Ok(())
     }
 
@@ -1152,6 +1154,7 @@ mod tests {
         let mut recovery = TurnRecovery {
             suspect_floor: 0,
             prompt_only_events: 0,
+            retention: crate::conversation::PromptRetention::Keep,
             overflow_retries: 0,
             requested_compactions: 0,
             ceiling_compacted: false,
@@ -1225,6 +1228,7 @@ mod tests {
         let mut recovery = TurnRecovery {
             suspect_floor: 0,
             prompt_only_events: 0,
+            retention: crate::conversation::PromptRetention::Keep,
             overflow_retries: 0,
             requested_compactions: 0,
             ceiling_compacted: false,
@@ -1281,6 +1285,7 @@ mod tests {
         let fresh = || TurnRecovery {
             suspect_floor: 0,
             prompt_only_events: 0,
+            retention: crate::conversation::PromptRetention::Keep,
             overflow_retries: 0,
             requested_compactions: 0,
             ceiling_compacted: false,
@@ -1346,6 +1351,7 @@ mod tests {
         let mut recovery = TurnRecovery {
             suspect_floor: 0,
             prompt_only_events: 0,
+            retention: crate::conversation::PromptRetention::Keep,
             overflow_retries: 0,
             requested_compactions: 0,
             ceiling_compacted: false,
@@ -1840,6 +1846,7 @@ mod tests {
         let mut recovery = TurnRecovery {
             suspect_floor: 0,
             prompt_only_events: 0,
+            retention: crate::conversation::PromptRetention::Keep,
             overflow_retries: 0,
             requested_compactions: 0,
             ceiling_compacted: false,

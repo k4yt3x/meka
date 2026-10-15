@@ -156,7 +156,7 @@ impl Item {
     pub(crate) fn interrupted() -> Self {
         Item::Notice {
             level: crate::frontend::NoticeLevel::Warn,
-            text: "interrupted".to_string(),
+            text: "Interrupted".to_string(),
         }
     }
 }
@@ -234,6 +234,9 @@ pub(crate) struct Transcript {
     orphan_results: std::collections::HashMap<String, OrphanResult>,
     tail: Vec<Entry>,
     settings: Settings,
+    /// The session's task rows, for the direction a replayed report says; see
+    /// [`Self::remember_background_tasks`].
+    background_tasks: Vec<crate::store::background::BackgroundTask>,
     /// The recorded turns of the session, by id, for the row that closes each turn on a replay.
     turn_records: std::collections::HashMap<Uuid, TurnRecord>,
     /// When the running turn started, for the duration its closing row states.
@@ -265,6 +268,7 @@ impl Transcript {
             orphan_results: std::collections::HashMap::new(),
             tail: Vec::new(),
             settings,
+            background_tasks: Vec::new(),
             turn_records: std::collections::HashMap::new(),
             turn_started: None,
             pending_turn_end: None,
@@ -861,6 +865,15 @@ impl Transcript {
             // The words are the model's to read; the stage direction that follows is what the
             // person sees of a nudge.
             FrontendEvent::Nudged { .. } => {}
+            // What reported is said as a stage direction; the words are the model's to read.
+            FrontendEvent::BackgroundReported { tasks, .. } => {
+                self.remember_background_tasks(tasks.clone());
+                self.close_streams();
+                self.push(Item::Notice {
+                    level: NoticeLevel::Info,
+                    text: crate::background::report_direction(&tasks),
+                });
+            }
             FrontendEvent::AssistantTextDelta(text) => self.append_text(&text),
             FrontendEvent::ThinkingProgress { estimated_tokens } => {
                 self.append_thinking(None, estimated_tokens);
@@ -1101,6 +1114,45 @@ impl Transcript {
         }
     }
 
+    /// Keep the session's task rows, so a replayed report can say which tasks reported and how
+    /// they ended: the block names them by id, and the rows hold the facts. Replaces by id, so a
+    /// row read again with a later page or finished live supersedes the one held.
+    pub(crate) fn remember_background_tasks(
+        &mut self,
+        tasks: Vec<crate::store::background::BackgroundTask>,
+    ) {
+        for task in tasks {
+            match self
+                .background_tasks
+                .iter_mut()
+                .find(|held| held.id == task.id)
+            {
+                Some(held) => *held = task,
+                None => self.background_tasks.push(task),
+            }
+        }
+    }
+
+    /// The stage direction for a replayed report: the tasks the ids name, said as the live screen
+    /// said them. A converted row names a task by its short id, so a prefix matches; a task the
+    /// store no longer holds leaves the direction bare.
+    fn replayed_report_direction(&self, task_ids: &[String]) -> String {
+        let tasks: Vec<crate::store::background::BackgroundTask> = task_ids
+            .iter()
+            .filter_map(|id| {
+                self.background_tasks
+                    .iter()
+                    .find(|task| task.id.starts_with(id.as_str()))
+                    .cloned()
+            })
+            .collect();
+        if tasks.is_empty() {
+            "Background task report".to_string()
+        } else {
+            crate::background::report_direction(&tasks)
+        }
+    }
+
     /// The items a run of log events shows, the way a resume shows them: what each side said, the
     /// calls the model made with their results, the stage directions the live run showed, and a
     /// row for each compaction and rewind. A result whose call is not in the run is given to the
@@ -1138,7 +1190,7 @@ impl Transcript {
             let message = match event {
                 Event::Append(message) => message,
                 Event::CompactBoundary { .. } => {
-                    let entry = self.entry(Item::note("context compacted"));
+                    let entry = self.entry(Item::note("Session compacted."));
                     out.push(entry);
                     continue;
                 }
@@ -1147,7 +1199,7 @@ impl Transcript {
                     messages,
                 } if messages.is_empty() => {
                     let entry = self.entry(Item::note(format!(
-                        "rewound {replaced_count} message{}",
+                        "Rewound {replaced_count} message{}.",
                         if *replaced_count == 1 { "" } else { "s" }
                     )));
                     out.push(entry);
@@ -1179,6 +1231,33 @@ impl Transcript {
                             },
                         };
                         let entry = self.entry(item);
+                        out.push(entry);
+                    }
+                    // The person's words, labeled as the live screen labeled them.
+                    ContentBlock::Inbox {
+                        item_id,
+                        class,
+                        body,
+                        ..
+                    } => {
+                        let entry = self.entry(Item::Prompt {
+                            text: body.trim().to_string(),
+                            class: *class,
+                            inbox_id: *item_id,
+                            delivered: true,
+                        });
+                        out.push(entry);
+                    }
+                    // meka's words: a replay says the stage direction the live screen said.
+                    ContentBlock::Scheduled { job_id, prompt, .. } => {
+                        let entry = self.entry(Item::note(crate::render::replayed_fire_direction(
+                            job_id, prompt,
+                        )));
+                        out.push(entry);
+                    }
+                    ContentBlock::BackgroundReport { task_ids, .. } => {
+                        let entry =
+                            self.entry(Item::note(self.replayed_report_direction(task_ids)));
                         out.push(entry);
                     }
                     // meka's own words for the turn; a replay shows what was typed.
@@ -1899,8 +1978,8 @@ mod tests {
         ));
         let shown = items(&transcript);
         assert_eq!(shown.len(), 2, "{shown:?}");
-        assert!(matches!(shown[0], Item::Notice { text, .. } if text == "context compacted"));
-        assert!(matches!(shown[1], Item::Notice { text, .. } if text == "rewound 2 messages"));
+        assert!(matches!(shown[0], Item::Notice { text, .. } if text == "Session compacted."));
+        assert!(matches!(shown[1], Item::Notice { text, .. } if text == "Rewound 2 messages."));
     }
 
     /// The banner stands only while nothing but notices stand with it: the first prompt takes it
@@ -2093,6 +2172,103 @@ mod tests {
             ),
         });
         assert_eq!(kinds(&transcript), vec!["text"]);
+    }
+
+    /// A resume shows what the live screen showed: an inbox item as the prompt it is, labeled by
+    /// its class and tied to its row; a scheduled fire and a background report as the stage
+    /// directions the live screen said, the report's naming the tasks from the rows the page came
+    /// with, or saying only that one reported when the store no longer holds them.
+    #[test]
+    fn a_replay_shows_what_meka_relayed_as_the_live_screen_did() {
+        use crate::{
+            conversation::InboxClass,
+            store::background::{BackgroundTask, TaskStatus},
+        };
+        let finished_at = Utc::now();
+        let mut transcript = transcript();
+        transcript.remember_background_tasks(vec![BackgroundTask {
+            id: "7f3a1c22-0000-4000-8000-000000000000".to_string(),
+            session_id: Uuid::nil(),
+            tool: "shell_execute".to_string(),
+            label: "cargo test".to_string(),
+            status: TaskStatus::Completed,
+            outcome: Some("ok".to_string()),
+            scratchpad_entry: None,
+            started_at: finished_at - chrono::Duration::seconds(30),
+            finished_at: Some(finished_at),
+            announced_at: None,
+            delivered_at: Some(finished_at),
+            subagent_id: None,
+        }]);
+        let item_id = Uuid::new_v4();
+        let user = |content: Vec<ContentBlock>| {
+            Event::Append(Message {
+                role: Role::User,
+                content,
+            })
+        };
+        let context = || ContentBlock::TurnContext {
+            text: "<context/>".to_string(),
+        };
+        transcript.load_page_above(page(
+            vec![
+                user(vec![ContentBlock::Inbox {
+                    item_id: Some(item_id),
+                    class: Some(InboxClass::Steer),
+                    source: Some("telegram".to_string()),
+                    body: "also check the logs".to_string(),
+                    text: "[Message from telegram, arrived now]\nalso check the logs".to_string(),
+                }]),
+                said("Noted."),
+                user(vec![context(), ContentBlock::Scheduled {
+                    job_id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+                    prompt: "remind me to stretch".to_string(),
+                    text: "[Scheduled job 1a2b3c4d fired now]\n\nremind me to stretch".to_string(),
+                }]),
+                said("Stretching."),
+                user(vec![context(), ContentBlock::BackgroundReport {
+                    task_ids: vec!["7f3a1c22-0000-4000-8000-000000000000".to_string()],
+                    text: "[Background task reporting at now]\nok".to_string(),
+                }]),
+                said("Good."),
+                user(vec![context(), ContentBlock::BackgroundReport {
+                    task_ids: vec!["deadbeef".to_string()],
+                    text: "[Background task reporting at now]\ngone".to_string(),
+                }]),
+            ],
+            1,
+            false,
+        ));
+        let shown = items(&transcript);
+        assert!(
+            matches!(
+                shown[0],
+                Item::Prompt {
+                    text,
+                    class: Some(InboxClass::Steer),
+                    inbox_id: Some(id),
+                    delivered: true,
+                } if text == "also check the logs" && *id == item_id
+            ),
+            "an inbox item is the prompt it was, labeled: {:?}",
+            shown[0]
+        );
+        let notes: Vec<&str> = shown
+            .iter()
+            .filter_map(|item| match item {
+                Item::Notice { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes, vec![
+            "Scheduled job 1a2b3c4d fired: remind me to stretch",
+            "Background task 7f3a1c22 finished after 30s",
+            "Background task report",
+        ]);
+        assert!(
+            !shown.iter().any(|item| matches!(item, Item::Prompt { text, .. } if text.contains("[Scheduled") || text.contains("[Background"))),
+            "nothing meka wrote is shown as a prompt: {shown:?}"
+        );
     }
 
     /// On a replay each recorded turn closes where its rows end: inside a page where the next

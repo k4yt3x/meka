@@ -1224,7 +1224,7 @@ model = "claude-sonnet-4-5"
                 Some("agent_message_chunk") => {
                     saw_agent_chunk = true;
                     if update["content"]["text"].as_str().is_some_and(|text| {
-                        text.contains("(checklist: items still open, continuing)")
+                        text.contains("(Checklist: items still open, continuing)")
                     }) {
                         saw_nudge_direction = true;
                     }
@@ -6237,7 +6237,7 @@ fn acp_reports_a_failed_scheduled_turn_as_a_warn_notice() {
         .find(|chunk| chunk.starts_with("[meka warn]"))
         .expect("checked by the loop");
     assert!(
-        notice.contains("scheduled job") && notice.contains("failed"),
+        notice.contains("Scheduled job") && notice.contains("failed"),
         "the notice must say which turn failed: {notice}"
     );
     assert!(
@@ -6305,7 +6305,7 @@ fn acp_withholds_a_failed_fires_upstream_text_when_relaying_is_off() {
         .find(|chunk| chunk.starts_with("[meka warn]"))
         .expect("checked by the loop");
     assert!(
-        notice.contains("scheduled job") && notice.contains("failed"),
+        notice.contains("Scheduled job") && notice.contains("failed"),
         "the notice must still say which turn failed: {notice}"
     );
     assert!(
@@ -6348,7 +6348,7 @@ fn acp_reports_a_compaction_as_a_meka_notice() {
         .collect();
     let notice = chunks
         .iter()
-        .find(|chunk| chunk.starts_with("[meka] compacted the conversation"))
+        .find(|chunk| chunk.starts_with("[meka] Compacted the conversation"))
         .unwrap_or_else(|| panic!("the compaction must reach the editor: {chunks:?}"));
     assert!(
         notice.contains("compaction 1"),
@@ -6391,7 +6391,7 @@ fn loading_a_compacted_session_titles_it_by_its_first_prompt() {
                 |value| value["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
                     && value["params"]["update"]["content"]["text"]
                         .as_str()
-                        .is_some_and(|text| text.starts_with("[meka] compacted"))
+                        .is_some_and(|text| text.starts_with("[meka] Compacted"))
             ),
         "the turn must have compacted: {updates:?}"
     );

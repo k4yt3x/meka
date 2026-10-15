@@ -1349,8 +1349,6 @@ pub(crate) struct TurnContext<'a> {
     /// starts; `None` renders no section.
     pub(crate) turn_retention: Option<std::time::Duration>,
     pub(crate) background: &'a [crate::store::background::BackgroundTask],
-    /// Finished background work delivered by this turn, already rendered, or `None`.
-    pub(crate) outcomes: Option<&'a str>,
     pub(crate) resumed: bool,
 }
 
@@ -1375,7 +1373,6 @@ pub(crate) fn build_turn_context(context: TurnContext<'_>) -> String {
         budget,
         turn_retention,
         background,
-        outcomes,
         resumed,
     } = context;
     let mut sections = Vec::new();
@@ -1419,12 +1416,6 @@ pub(crate) fn build_turn_context(context: TurnContext<'_>) -> String {
 
     if !world_state.is_empty() {
         sections.push(world_state.to_string());
-    }
-
-    // Last, nearest the words: finished background work is what the words that follow may be
-    // about, and a report the model has just read is the one it answers.
-    if let Some(outcomes) = outcomes {
-        sections.push(outcomes.to_string());
     }
 
     format!("<context>\n{}</context>", sections.join("\n"))
@@ -4062,7 +4053,6 @@ mod tests {
             budget: None,
             turn_retention: None,
             background: &[running_task("7f3a1c22", "cargo test --all")],
-            outcomes: None,
             resumed: false,
         });
         assert!(context.contains("[Background]"), "{context}");
@@ -4085,7 +4075,6 @@ mod tests {
             budget: None,
             turn_retention: None,
             background: &[],
-            outcomes: None,
             resumed: false,
         });
         assert!(!context.contains("[Background]"), "{context}");
@@ -4111,7 +4100,6 @@ mod tests {
             budget: None,
             turn_retention: None,
             background: &[finished],
-            outcomes: None,
             resumed: false,
         });
         assert!(!context.contains("42 passed"), "{context}");
@@ -4389,7 +4377,6 @@ mod tests {
             budget: None,
             turn_retention: Some(window),
             background: &[],
-            outcomes: None,
             resumed: false,
         });
         let retention = block.find("[Retention]").expect("the section");
@@ -4409,7 +4396,6 @@ mod tests {
                 budget: None,
                 turn_retention: None,
                 background: &[],
-                outcomes: None,
                 resumed: false,
             })
             .contains("[Retention]")
@@ -4635,7 +4621,6 @@ mod tests {
             budget: None,
             turn_retention: None,
             background: &[],
-            outcomes: None,
             resumed: false,
         });
         assert!(context.starts_with("<context>\n"));
@@ -4664,7 +4649,6 @@ mod tests {
             budget: None,
             turn_retention: None,
             background: &[],
-            outcomes: None,
             resumed: true,
         });
         assert!(
@@ -4769,33 +4753,6 @@ mod tests {
         );
     }
 
-    /// Finished background work rides in the context block, last, so it sits nearest the words.
-    #[test]
-    fn turn_context_carries_outcomes_last() {
-        let context = build_turn_context(TurnContext {
-            vision: true,
-            one_shot: false,
-            permission: Permission::Read,
-            approvals: false,
-            cwd: std::path::Path::new("."),
-            roots: &[],
-            readable: None,
-            network: crate::config::Network::Host,
-            world_state: "[Skills]\nnone",
-            budget: None,
-            turn_retention: None,
-            background: &[],
-            outcomes: Some("[Background task reporting]\n7f3a1c22 finished."),
-            resumed: false,
-        });
-        let outcomes_at = context
-            .find("[Background task reporting]")
-            .expect("carried");
-        let world_at = context.find("[Skills]").expect("world state");
-        assert!(outcomes_at > world_at, "{context}");
-        assert!(context.ends_with("finished.</context>"), "{context}");
-    }
-
     #[test]
     fn turn_context_includes_the_budget() {
         let context = build_turn_context(TurnContext {
@@ -4816,7 +4773,6 @@ mod tests {
             }),
             turn_retention: None,
             background: &[],
-            outcomes: None,
             resumed: false,
         });
         assert!(context.contains("[Context budget]"), "{context}");
@@ -4837,7 +4793,6 @@ mod tests {
             budget: None,
             turn_retention: None,
             background: &[],
-            outcomes: None,
             resumed: false,
         });
         assert!(context.contains("[Permission context]"));
@@ -4859,7 +4814,6 @@ mod tests {
             budget: None,
             turn_retention: None,
             background: &[],
-            outcomes: None,
             resumed: false,
         });
         assert!(context.contains("[Permission context]"));
@@ -4958,10 +4912,6 @@ mod tests {
         assert!(
             !rendered.contains("from") && rendered.ends_with("]\nwhat's your workspace?"),
             "{rendered}"
-        );
-        assert_eq!(
-            crate::conversation::strip_inbox_header(&rendered),
-            "what's your workspace?"
         );
         let mid_turn = render_inbox_item(&item, true);
         assert!(

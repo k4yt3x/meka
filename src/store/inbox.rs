@@ -16,91 +16,19 @@ use chrono::{DateTime, Utc};
 use rusqlite::OptionalExtension;
 
 use super::*;
+pub(crate) use crate::conversation::InboxClass;
 
-/// How an item reaches the model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub(crate) enum InboxClass {
-    /// Injected into the running turn at its next round boundary.
-    Steer,
-    /// Waits for the running turn to end.
-    Followup,
-    /// Cuts the answer the running turn is streaming and is read right after what streamed; read
-    /// at the round boundary, like a steer, while tools run.
-    Interrupt,
-}
-
-impl InboxClass {
-    /// Every value, in the order a refusal lists them.
-    pub(crate) const ALL: [InboxClass; 3] = [Self::Steer, Self::Followup, Self::Interrupt];
-
-    /// The one spelling of this value: the `class` column and the HTTP body.
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Steer => "steer",
-            Self::Followup => "followup",
-            Self::Interrupt => "interrupt",
-        }
+/// The `class IN (...)` clause selecting `classes`, or nothing for every class. Built from
+/// `name()`, which is why no value is bound.
+fn class_clause(classes: &[InboxClass]) -> String {
+    if classes.is_empty() {
+        return String::new();
     }
-
-    /// The `class IN (...)` clause selecting `classes`, or nothing for every class. Built from
-    /// `name()`, which is why no value is bound.
-    fn clause(classes: &[InboxClass]) -> String {
-        if classes.is_empty() {
-            return String::new();
-        }
-        let names: Vec<String> = classes
-            .iter()
-            .map(|class| format!("'{}'", class.name()))
-            .collect();
-        format!(" AND class IN ({})", names.join(", "))
-    }
-
-    fn supported() -> String {
-        Self::ALL
-            .iter()
-            .map(|class| class.name())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
-
-impl std::fmt::Display for InboxClass {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
-    }
-}
-
-impl std::str::FromStr for InboxClass {
-    type Err = String;
-
-    /// Refuses with the names that would have been accepted.
-    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|class| class.name() == value)
-            .ok_or_else(|| {
-                format!(
-                    "'{value}' is not an inbox class. Supported: {}",
-                    Self::supported()
-                )
-            })
-    }
-}
-
-impl TryFrom<String> for InboxClass {
-    type Error = String;
-
-    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
-        value.parse()
-    }
-}
-
-impl From<InboxClass> for String {
-    fn from(class: InboxClass) -> Self {
-        class.name().to_string()
-    }
+    let names: Vec<String> = classes
+        .iter()
+        .map(|class| format!("'{}'", class.name()))
+        .collect();
+    format!(" AND class IN ({})", names.join(", "))
 }
 
 /// Where an item stands, derived from its stamps.
@@ -335,7 +263,7 @@ impl InboxStore {
         classes: &[InboxClass],
         now: DateTime<Utc>,
     ) -> Result<Vec<InboxItem>> {
-        let class_clause = InboxClass::clause(classes);
+        let class_clause = class_clause(classes);
         self.query(
             &format!(
                 "SELECT {COLUMNS} FROM inbox_items WHERE session_id = ?1 AND {PENDING}{class_clause} \
@@ -359,7 +287,7 @@ impl InboxStore {
     ) -> Result<bool> {
         let session_id = session_id.to_string();
         let now = now.to_rfc3339();
-        let class_clause = InboxClass::clause(&[class]);
+        let class_clause = class_clause(&[class]);
         let except: Vec<String> = except.iter().map(Uuid::to_string).collect();
         self.connection
             .call(move |connection| -> rusqlite::Result<bool> {

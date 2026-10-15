@@ -175,13 +175,13 @@ impl crate::host::scheduler::HostHooks for AcpHooks {
         outcome: &Result<(), crate::error::MekaError>,
     ) {
         let what = match job {
-            Some(job) => format!("scheduled job '{}'", job.short_id()),
-            None => "the background outcome report".to_string(),
+            Some(job) => format!("Scheduled job '{}'", job.short_id()),
+            None => "The background outcome report".to_string(),
         };
         let notice = match outcome {
             Ok(()) => return,
             Err(crate::error::MekaError::Interrupted) => {
-                crate::frontend::Notice::info(format!("{what} was interrupted"))
+                crate::frontend::Notice::info(format!("{what} was interrupted."))
             }
             // The words the request door would have given the editor: a provider's body or a
             // store path travels only as `acp_error_for` allows, on this wire as on that one.

@@ -53,11 +53,19 @@ by stating no scope.
 | Session JSON, HTTP API | `cwd` | `working_directory` |
 | Export archive | `additional_roots` | `additional_workspace_directories` |
 | `GET /v1/sessions` filter | `cwd=<path>` | `working_directory=<path>` |
-| Export archive | `format_version` 9 | `format_version` 10 |
+| Export archive | `format_version` 9 | `format_version` 11 |
 | Store | `sessions.cwd`, `sessions.additional_roots_json` | `working_directory`, `additional_workspace_directories_json` |
 
-The two config keys are refused by name, with their line, until renamed. An archive of version 9 or
-older is converted on import. The store's columns are renamed on the first open, behind the usual
+**What meka relays into a user message has its own block.** An inbox item, a scheduled job's fire
+and a background report were `text` blocks, or for a report a section of the `turn_context`
+block; they are `inbox`, `scheduled` and `background_report` blocks now, on `GET /messages`, in a
+blocking turn's `messages` and in an archive, each carrying `text` as the model read it and the
+facts a client labels it by. The store converts what it holds on the first open, and a resumed
+screen shows an item as the labeled prompt it was and a fire or a report as the stage direction
+the live screen said, where it used to show meka's header as something you typed.
+
+The two config keys are refused by name, with their line, until renamed. An archive of version 10
+or older is converted on import. The store's columns are renamed on the first open, behind the usual
 backup; a hand-written query names the new ones. ACP's `additionalDirectories` keeps its protocol
 name, and `/cd` keeps its verb.
 

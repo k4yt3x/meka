@@ -46,12 +46,19 @@ fn compute_fingerprint(message_text: &str, version: &str) -> String {
     hex[..3].to_string()
 }
 
-/// Extracts the text content of the first user message.
+/// The text of the first user message as the model read it, past meka's context block: the words
+/// as typed, or the inbox item, scheduled fire or background report meka relayed in their place.
+/// A session opened on an item or a fire has no typed words, and the fingerprint has to hold
+/// still across its turns, so the relayed block counts as the words do.
 fn extract_first_user_message_text(messages: &[Message]) -> String {
     for message in messages {
         if message.role == Role::User {
             for block in &message.content {
-                if let ContentBlock::Text { text } = block {
+                if let ContentBlock::Text { text }
+                | ContentBlock::Inbox { text, .. }
+                | ContentBlock::Scheduled { text, .. }
+                | ContentBlock::BackgroundReport { text, .. } = block
+                {
                     return text.clone();
                 }
             }
@@ -686,6 +693,34 @@ mod tests {
 
         let empty: Vec<Message> = vec![];
         assert_eq!(extract_first_user_message_text(&empty), "");
+    }
+
+    /// A session opened on an inbox item has no typed words: its first text is what the model
+    /// read, so the fingerprint holds still once words follow rather than moving to them.
+    #[test]
+    fn the_first_user_message_text_is_what_the_model_read_whoever_wrote_it() {
+        let opened_on_an_item = vec![
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::TurnContext {
+                        text: "<context/>".to_string(),
+                    },
+                    ContentBlock::Inbox {
+                        item_id: None,
+                        class: None,
+                        source: Some("a client".to_string()),
+                        body: "hello".to_string(),
+                        text: "[Message from a client, arrived now]\nhello".to_string(),
+                    },
+                ],
+            },
+            Message::user("typed later"),
+        ];
+        assert_eq!(
+            extract_first_user_message_text(&opened_on_an_item),
+            "[Message from a client, arrived now]\nhello"
+        );
     }
 
     #[test]

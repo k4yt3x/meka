@@ -608,7 +608,7 @@ fn a_scheduled_fire_is_announced_as_a_stage_direction_above_its_reply() {
     let announced = rows
         .iter()
         .position(|row| {
-            row.starts_with("• scheduled job ") && row.ends_with(" fired: SCREEN_DELIVERED_MARKER")
+            row.starts_with("• Scheduled job ") && row.ends_with(" fired: SCREEN_DELIVERED_MARKER")
         })
         .unwrap_or_else(|| panic!("the fire is a stage direction naming the job: {rows:#?}"));
     let replied = rows
@@ -829,7 +829,7 @@ fn a_nudge_is_a_stage_direction_set_off_from_the_reply_and_the_next_round() {
     let rows = final_screen(&screens);
     let at = rows
         .iter()
-        .position(|row| row == "• checklist: 1 open item, continuing, nudge 1 of 3")
+        .position(|row| row == "• Checklist: 1 open item, continuing, nudge 1 of 3")
         .unwrap_or_else(|| panic!("the nudge is a row of its own: {rows:#?}"));
     assert_set_off_by_one_blank(rows, at, at, "the nudge");
     assert!(
@@ -938,9 +938,9 @@ fn an_outcome_turn_is_held_by_the_item_deferred_on_its_task() {
             .unwrap_or_else(|| panic!("no row contains {needle:?}: {body:#?}"))
     };
     let started = position("Build started.");
-    let report = position("• background task 1a2b3c4d finished after ");
+    let report = position("• Background task 1a2b3c4d finished after ");
     let noted = position("Noted.");
-    let nudge = position("• checklist: 1 open item, continuing, nudge 1 of 3");
+    let nudge = position("• Checklist: 1 open item, continuing, nudge 1 of 3");
     let read = position("Read it.");
     assert!(
         started < report && report < noted && noted < nudge && nudge < read,
@@ -953,7 +953,14 @@ fn an_outcome_turn_is_held_by_the_item_deferred_on_its_task() {
         1,
         "the deferring turn itself was not nudged: {body:#?}"
     );
-    assert!(body[report].ends_with(", reporting"), "{body:#?}");
+    // The direction ends with how long the task ran: nothing of its output follows.
+    assert!(
+        body[report]
+            .split("finished after ")
+            .nth(1)
+            .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ')),
+        "{body:#?}"
+    );
     assert!(
         !body
             .iter()
@@ -1023,7 +1030,7 @@ fn esc_stops_the_turn() {
     let screens = run_screen(&install, LONG_TURN, &["go", "\x1b", "/exit"]);
     let rows = final_screen(&screens);
     assert!(
-        rows.iter().any(|row| row == "! interrupted"),
+        rows.iter().any(|row| row == "! Interrupted"),
         "the turn was stopped: {rows:#?}"
     );
     assert!(
@@ -1156,7 +1163,7 @@ fn esc_stops_a_running_shell_command() {
         "the command is on the transcript: {rows:#?}"
     );
     assert!(
-        rows.iter().any(|row| row == "! interrupted"),
+        rows.iter().any(|row| row == "! Interrupted"),
         "the stop is marked where a stopped turn's is: {rows:#?}"
     );
     assert!(

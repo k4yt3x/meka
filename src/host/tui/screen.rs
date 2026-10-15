@@ -453,9 +453,21 @@ impl Screen {
                     crate::store::LogPage::default()
                 }
             };
+            let tasks = match store
+                .background_store()
+                .list_background_tasks(session_id)
+                .await
+            {
+                Ok(tasks) => tasks,
+                Err(error) => {
+                    tracing::warn!("failed to read the background tasks for the log: {error}");
+                    Vec::new()
+                }
+            };
             ui.send(UiEvent::HistoryPage {
                 above: true,
                 page,
+                tasks,
                 generation,
             });
         });
@@ -493,9 +505,21 @@ impl Screen {
                     crate::store::LogPage::default()
                 }
             };
+            let tasks = match store
+                .background_store()
+                .list_background_tasks(session_id)
+                .await
+            {
+                Ok(tasks) => tasks,
+                Err(error) => {
+                    tracing::warn!("failed to read the background tasks for the log: {error}");
+                    Vec::new()
+                }
+            };
             ui.send(UiEvent::HistoryPage {
                 above: false,
                 page,
+                tasks,
                 generation,
             });
         });
@@ -948,12 +972,14 @@ impl Screen {
             UiEvent::HistoryPage {
                 above,
                 page,
+                tasks,
                 generation,
             } => {
                 if generation != self.history_generation {
                     return;
                 }
                 self.history_loading = false;
+                self.launch.transcript.remember_background_tasks(tasks);
                 if above {
                     self.launch.transcript.load_page_above(page);
                 } else {
@@ -2174,7 +2200,7 @@ impl Screen {
                     } else {
                         crate::text::format_size(SHELL_OUTPUT_KEEP_BYTES)
                     };
-                    self.push(Item::note(format!("output cut to its last {kept}")));
+                    self.push(Item::note(format!("Output cut to its last {kept}")));
                 }
                 if !printed.trim().is_empty() {
                     self.push(Item::ShellOutput(printed));

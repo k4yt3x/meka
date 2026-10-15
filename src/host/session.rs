@@ -141,41 +141,7 @@ pub(crate) async fn claim_undelivered_outcomes(
     if !scheduler::a_turn_can_carry_them(agent).await {
         return Vec::new();
     }
-    claim_outcomes_now(store, session_id).await
-}
-/// [`claim_undelivered_outcomes`] without the readiness gate.
-///
-/// For a caller that is not about to run a turn -- the one-shot's post-turn report, which prints to
-/// stderr on the way out -- and for tests that drive the claim concurrently with a store but no
-/// agent. A caller that *is* about to run a turn must use the gated form, or a turn refused before
-/// it touches the conversation leaves the batch stamped and unreadable.
-pub(crate) async fn claim_outcomes_now(
-    store: &Store,
-    session_id: uuid::Uuid,
-) -> Vec<crate::store::background::BackgroundTask> {
-    let store = store.background_store();
-    let ready = match store.list_undelivered_background_tasks(session_id).await {
-        Ok(ready) => ready,
-        Err(error) => {
-            tracing::warn!("failed to load background task outcomes: {error}");
-            return Vec::new();
-        }
-    };
-    if ready.is_empty() {
-        return ready;
-    }
-    let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
-    let claimed = match store.mark_background_tasks_delivered(&ids).await {
-        Ok(claimed) => claimed,
-        Err(error) => {
-            tracing::warn!("failed to stamp background outcomes as delivered: {error}");
-            return Vec::new();
-        }
-    };
-    // Only what this caller won. Listing and stamping are two statements, and a poller can claim
-    // the same row in the gap: whoever the `WHERE delivered_at IS NULL` refuses reports nothing,
-    // rather than both of them reporting it.
-    crate::background::only_what_was_won(ready, &claimed)
+    crate::background::claim_outcomes_now(store, session_id).await
 }
 #[cfg(test)]
 mod tests {

@@ -427,10 +427,12 @@ pub(super) const REPAIR_KIND: &str = "repair";
 pub(super) const REDACT_KIND: &str = "redact";
 /// The `messages` row a session's title is read from, as a `WHERE` over `messages` correlated to
 /// `sessions s`: the first user message that carries words. A `user` row is text by construction; a
-/// `user_blocks` row is a JSON array of blocks and is passed over while none of them is a `text`
-/// block, so an image sent alone does not leave the session unlabeled once words follow. Blank
-/// text and a stand-in meka wrote do not count as words in either shape, which is
-/// [`crate::conversation::is_harness_stand_in`] spelled in SQL. A compaction summary is under its
+/// `user_blocks` row is a JSON array of blocks and is passed over while none of them carries a
+/// person's words, a `text` block, an `inbox` item's body or a `scheduled` fire's prompt
+/// ([`crate::conversation::ContentBlock::spoken_words`] spelled in SQL), so an image sent alone
+/// does not leave the session unlabeled once words follow. Blank text and a stand-in meka wrote
+/// do not count as words in either shape, which is [`crate::conversation::is_harness_stand_in`]
+/// spelled in SQL. A compaction summary is under its
 /// own kind and is never selected. This is [`crate::conversation::Conversation::title`]'s
 /// rule over the log, and [`title_of_first_user_row`] then applies that function to the row it
 /// selects, so the two cannot pick different rows.
@@ -452,11 +454,15 @@ static TITLE_ROW_WHERE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
               OR (kind = 'user_blocks'
                   AND json_valid(messages.content)
                   AND EXISTS (SELECT 1 FROM json_each(messages.content)
-                              WHERE json_extract(CASE WHEN json_each.type = 'object'
-                                                      THEN json_each.value END, '$.type') = 'text'
-                                AND {block_words})))",
+                              WHERE ({kind} = 'text' AND {text_words})
+                                 OR ({kind} = 'inbox' AND {body_words})
+                                 OR ({kind} = 'scheduled' AND {prompt_words}))))",
         user_words = is_words("messages.content"),
-        block_words = is_words("json_extract(json_each.value, '$.text')"),
+        kind = "json_extract(CASE WHEN json_each.type = 'object' THEN json_each.value END, \
+                '$.type')",
+        text_words = is_words("json_extract(json_each.value, '$.text')"),
+        body_words = is_words("json_extract(json_each.value, '$.body')"),
+        prompt_words = is_words("json_extract(json_each.value, '$.prompt')"),
     )
 });
 /// Characters a title a user sets may hold: what every wire keeps of a derived one, so a surface
@@ -7677,7 +7683,6 @@ mod tests {
             }),
             turn_retention: None,
             background: &[],
-            outcomes: None,
             resumed: true,
         });
         crate::conversation::Message::user_turn(block, user_input, Vec::new())

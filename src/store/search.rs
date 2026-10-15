@@ -26,7 +26,7 @@ use super::{
     },
 };
 use crate::{
-    conversation::{ContentBlock, Event, Message, Role, is_harness_stand_in, strip_inbox_header},
+    conversation::{ContentBlock, Event, Message, Role},
     error::{MekaError, Result},
     text::is_unspaced_script,
 };
@@ -179,25 +179,18 @@ fn tiered_expressions(words: &[String]) -> Vec<String> {
     expressions
 }
 
-/// The `Text` blocks of a message, rendered by the one block-to-text function the
-/// `conversation_search` tool also reads through, so what the index finds the tool can find.
-/// A user message keeps the words a person sent and not what meka put beside them: a stand-in
-/// meka wrote in place of content, and the header above an inbox item, are left out, the way the
-/// title leaves them out, and a nudge is its own block, which is not text and so is not here.
+/// The words of a message the index holds: for a person's, what they sent and not what meka put
+/// beside it, by the one rule the title reads by ([`ContentBlock::spoken_words`]); for the
+/// model's, its `Text` blocks through the block-to-text function the `conversation_search` tool
+/// reads through, so what the index finds the tool can find.
 fn spoken_words(message: &Message) -> String {
-    let from_a_person = message.role == Role::User;
     message
         .content
         .iter()
-        .filter(|block| matches!(block, ContentBlock::Text { .. }))
-        .filter_map(ContentBlock::search_text)
-        .filter(|text| !from_a_person || !is_harness_stand_in(text))
-        .map(|text| {
-            if from_a_person {
-                strip_inbox_header(&text).to_string()
-            } else {
-                text
-            }
+        .filter_map(|block| match (&message.role, block) {
+            (Role::User, block) => block.spoken_words().map(str::to_string),
+            (Role::Assistant, ContentBlock::Text { .. }) => block.search_text(),
+            (Role::Assistant, _) => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -686,10 +679,29 @@ mod tests {
             crate::conversation::HARNESS_NOTE
         )])
         .await;
-        let headed = session_saying(&store, &[
-            "[Message from a client, arrived 2026-09-24 12:00 +00:00]\nthe words about egrets",
-        ])
-        .await;
+        let headed = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        store
+            .save_event(
+                headed,
+                &Event::Append(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Inbox {
+                        item_id: None,
+                        class: Some(crate::conversation::InboxClass::Steer),
+                        source: Some("a client".to_string()),
+                        body: "the words about egrets".to_string(),
+                        text: "[Message from a client, arrived 2026-09-24 12:00 +00:00]\nthe \
+                               words about egrets"
+                            .to_string(),
+                    }],
+                }),
+                None,
+            )
+            .await
+            .expect("save");
 
         assert!(
             ids_found(&store, "visible output").await.is_empty(),
@@ -987,7 +999,14 @@ mod tests {
                     ContentBlock::TurnContext {
                         text: "the context block".to_string(),
                     },
-                    text("[Message from a client, arrived 2026-01-01 00:00 +00:00]\nthe item"),
+                    ContentBlock::Inbox {
+                        item_id: None,
+                        class: Some(crate::conversation::InboxClass::Followup),
+                        source: Some("a client".to_string()),
+                        body: "the item".to_string(),
+                        text: "[Message from a client, arrived 2026-01-01 00:00 +00:00]\nthe item"
+                            .to_string(),
+                    },
                 ]),
             ),
             (

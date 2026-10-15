@@ -254,7 +254,7 @@ Stopping a scheduled turn works the same as stopping any other.
 
 When a job fires at an idle screen, the turn runs exactly like one you typed: output streams, Esc
 or Ctrl+C stops it, and what you had half-typed stays in the composer. A stage direction above the
-reply names the job and the opening of its prompt, `scheduled job 1a2b3c4d fired: remind me to
+reply names the job and the opening of its prompt, `Scheduled job 1a2b3c4d fired: remind me to
 stretch`, and says how late the fire is when it
 makes up for missed occurrences. The prompt the model is given, with its header and any gate
 output, is not echoed, the way no tool's output is; the reply is what you read.

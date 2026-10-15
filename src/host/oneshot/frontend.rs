@@ -72,7 +72,9 @@ impl Frontend for PlainFrontend {
                 tracing::info!("calling tool '{name}'");
                 crate::sync::lock(&self.answer).boundary();
             }
-            FrontendEvent::Nudged { .. } => crate::sync::lock(&self.answer).boundary(),
+            FrontendEvent::Nudged { .. } | FrontendEvent::BackgroundReported { .. } => {
+                crate::sync::lock(&self.answer).boundary();
+            }
             FrontendEvent::SessionStarted { id } => tracing::info!("created session {id}"),
             FrontendEvent::Notice(notice) => log_notice(&notice),
             _ => {}

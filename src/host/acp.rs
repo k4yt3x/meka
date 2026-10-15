@@ -859,7 +859,7 @@ mod tests {
         ))
         .expect("serializes");
         assert!(
-            nudged.contains("\\n\\n(checklist: 1 open item, continuing, nudge 1 of 3)\\n\\n"),
+            nudged.contains("\\n\\n(Checklist: 1 open item, continuing, nudge 1 of 3)\\n\\n"),
             "{nudged}"
         );
         let advisory = serde_json::to_string(&crate::host::acp::frontend::notice_update(

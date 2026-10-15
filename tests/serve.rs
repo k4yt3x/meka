@@ -9915,12 +9915,15 @@ fn a_steer_posted_mid_turn_is_read_at_the_next_round_boundary() {
     );
     assert!(
         blocks.iter().any(|block| {
-            block["type"] == "text"
+            block["type"] == "inbox"
+                && block["class"] == "steer"
+                && block["body"] == "also check the dates"
                 && block["text"].as_str().is_some_and(|text| {
                     text.contains("while you were working]\nalso check the dates")
                 })
         }),
-        "the steer is persisted with the round, after the results: {with_results}"
+        "the steer is persisted with the round, after the results, as the item it is: \
+         {with_results}"
     );
 }
 
@@ -10035,7 +10038,7 @@ fn an_interrupt_cuts_the_streaming_answer_and_the_turn_carries_on() {
             .map(|blocks| {
                 blocks
                     .iter()
-                    .filter(|block| block["type"] == "text")
+                    .filter(|block| block["type"] == "text" || block["type"] == "inbox")
                     .filter_map(|block| block["text"].as_str())
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -16648,7 +16651,7 @@ fn a_turn_that_stops_with_an_open_item_continues_and_the_feed_says_so() {
     assert_eq!(message_text(&body["messages"][6]), "Done.", "{body}");
     assert_eq!(
         body["notices"],
-        serde_json::json!([{"level": "info", "text": "checklist: 1 open item, continuing, nudge 1 of 3"}]),
+        serde_json::json!([{"level": "info", "text": "Checklist: 1 open item, continuing, nudge 1 of 3"}]),
         "{body}"
     );
     let history: serde_json::Value = harness
@@ -16692,7 +16695,7 @@ fn a_turn_that_stops_with_an_open_item_continues_and_the_feed_says_so() {
         updates[1]
     );
     let notice_at = feed_body
-        .find("checklist: 1 open item, continuing, nudge 1 of 3")
+        .find("Checklist: 1 open item, continuing, nudge 1 of 3")
         .unwrap_or_else(|| panic!("the nudge is announced: {feed_body}"));
     let finished_at = feed_body.find("event: turn.finished").expect("terminal");
     assert!(notice_at < finished_at, "the notice precedes the terminal");
@@ -16879,7 +16882,7 @@ fn a_task_an_item_waits_on_reports_as_a_turn_the_item_holds_open() {
         .expect("the report opened a turn of its own");
     let delivery = &feed_body[at..];
     let nudge_at = delivery
-        .find("checklist: 1 open item, continuing, nudge 1 of 3")
+        .find("Checklist: 1 open item, continuing, nudge 1 of 3")
         .unwrap_or_else(|| panic!("the report's turn is held by the item: {feed_body}"));
     let updates: Vec<&str> = delivery
         .split("event: checklist.updated\n")
@@ -16898,7 +16901,7 @@ fn a_task_an_item_waits_on_reports_as_a_turn_the_item_holds_open() {
         "the nudge is inside the turn: {feed_body}"
     );
     assert!(
-        !feed_body[..at].contains("checklist: 1 open item"),
+        !feed_body[..at].contains("Checklist: 1 open item"),
         "and nowhere before it: {feed_body}"
     );
 

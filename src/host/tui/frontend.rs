@@ -81,6 +81,8 @@ pub(crate) enum UiEvent {
     HistoryPage {
         above: bool,
         page: crate::store::LogPage,
+        /// The session's task rows as of the read, for the direction a replayed report says.
+        tasks: Vec<crate::store::background::BackgroundTask>,
         /// The window it was read for, as on [`Self::Reloaded`].
         generation: u64,
     },

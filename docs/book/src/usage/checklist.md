@@ -30,7 +30,7 @@ calling a tool and such an item remains, meka appends a message listing the open
 ways out, and the agent answers again. It can keep working, complete the items, cancel them with
 a reason, or defer them with a reason. The turn ends once every item is disposed of. Each nudge is
 announced as a notice, so a turn that keeps working after its answer does not look like a hang:
-on the screen as a stage direction between the reply and the next round, `checklist: 1 open
+on the screen as a stage direction between the reply and the next round, `Checklist: 1 open
 item, continuing, nudge 1 of 3`, and on the HTTP feed as a `notice` with the same text.
 
 **Deferral is the honest way to stop.** A deferred item does not hold the turn. It is for an item

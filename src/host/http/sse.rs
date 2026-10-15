@@ -52,6 +52,7 @@ pub(crate) enum SseEventType {
     TurnFailed,
     TurnCanceled,
     Nudged,
+    BackgroundReported,
     InboxDelivered,
     InboxFailed,
     InboxWithdrawn,
@@ -102,6 +103,7 @@ impl SseEventType {
             Self::TurnFailed => "turn.failed",
             Self::TurnCanceled => "turn.canceled",
             Self::Nudged => "turn.nudged",
+            Self::BackgroundReported => "task.reported",
             Self::InboxDelivered => "inbox.delivered",
             Self::InboxFailed => "inbox.failed",
             Self::InboxWithdrawn => "inbox.withdrawn",
@@ -203,6 +205,13 @@ pub(crate) fn translate(
         FrontendEvent::Nudged { kind, text } => (
             SseEventType::Nudged,
             serde_json::json!({ "kind": kind.name(), "text": text }),
+        ),
+        FrontendEvent::BackgroundReported { tasks, text } => (
+            SseEventType::BackgroundReported,
+            serde_json::json!({
+                "task_ids": tasks.iter().map(|task| task.id.as_str()).collect::<Vec<_>>(),
+                "text": text,
+            }),
         ),
         FrontendEvent::AssistantTextDelta(text) => (
             SseEventType::AssistantTextDelta,

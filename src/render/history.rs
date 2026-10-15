@@ -7,7 +7,7 @@
 pub(crate) fn nudge_direction(message: &crate::conversation::Message) -> Option<&'static str> {
     match message.nudge() {
         Some((crate::conversation::NudgeKind::Checklist, _)) => {
-            Some("checklist: items still open, continuing")
+            Some("Checklist: items still open, continuing")
         }
         Some((crate::conversation::NudgeKind::VisibleReply, _)) | None => None,
     }
@@ -27,7 +27,7 @@ mod tests {
         );
         assert_eq!(
             nudge_direction(&checklist),
-            Some("checklist: items still open, continuing")
+            Some("Checklist: items still open, continuing")
         );
         let thinking = crate::conversation::Message::nudge_message(
             crate::conversation::NudgeKind::VisibleReply,

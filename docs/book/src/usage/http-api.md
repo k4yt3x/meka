@@ -530,9 +530,15 @@ tool-result messages after it share it, which is also how `POST /rewind` counts 
 of labels from a chosen one to the last is the `turns` a rewind to that point takes.
 
 A user message carries what the user typed as a `text` block. Ahead of it, when meka added one,
-sits a `turn_context` block: the permission and environment context, catalog changes,
-background outcomes and resume notice meka injected for that turn, which the model saw as text ahead
-of the words. It is typed so a client can show or hide it; the `text` blocks alone are the words.
+sits a `turn_context` block: the permission and environment context, catalog changes and resume
+notice meka injected for that turn, which the model saw as text ahead of the words. Everything
+else meka writes into a user message keeps its own kind, so a client can show it for what it is
+and never has to parse a header: a `nudge` (meka's "keep going", with its `kind`); an `inbox`
+block for a message that reached the model through the inbox, with `body`, the person's words,
+and the `item_id`, `class` and `source` where they were recorded; a `scheduled` block for a
+job's fire, with `job_id` and `prompt`, the job's words; and a `background_report` for finished
+background work, with `task_ids`. On each of these `text` is what the model read, header
+included, as the `nudge` and `turn_context` blocks hold theirs.
 
 An image block, whether an attachment on a user message or a tool result, carries its `media_type`
 and the `hash` of its bytes rather than the bytes. `GET /v1/sessions/{id}/blobs/{hash}` returns them
@@ -635,6 +641,7 @@ Every resident session has one event feed. Everything a turn emits goes on it, w
 | `turn.failed` | `turn_id`, `session_id`, `error` (Problem Detail shape), `revision`, `message_withdrawn` when the turn began | Turn failed mid-stream |
 | `turn.canceled` | `turn_id`, `session_id`, `reason` (`"client"`, `"server_shutdown"`, `"sse_lag"` when the only consumer fell behind and the turn was stopped for it, or `"parent"` on a sub-agent's feed, whose turn stops with its parent's), `revision`, `message_withdrawn` when the turn began | Turn was canceled |
 | `turn.nudged` | `kind`, `text`, `turn_id`, `session_id` | The turn went on past the model's reply: meka wrote `text` into the conversation as a user-role message to send the model back to work, `kind` `visible_reply` after a reply with no visible text, `checklist` after one that left checklist items open |
+| `task.reported` | `task_ids`, `text`, `turn_id`, `session_id` | A turn in flight read finished background work at a tool-round boundary: meka wrote `text`, the report the model reads, into the round's user-role message behind its results |
 
 `turn.finished`, `turn.failed`, and `turn.canceled` are **terminal** for the turn: a `POST /turn` stream closes immediately after its own, and the feed carries on to the next turn. `turn.failed` and `turn.canceled` also carry `message_withdrawn` when the turn began, whether it took the message it was sent back out of the conversation; see [Resending a failed turn](#resending-a-failed-turn). All three carry `revision`, the conversation's revision as the turn ends, omitted only when the store could not say, and on [a sub-agent's feed](#a-sub-agents-feed), whose transcript is not the one the precondition guards; see [Detecting a rewritten history](#detecting-a-rewritten-history).
 
@@ -693,7 +700,7 @@ Three limits. The event exists only when meka streams from its provider, so a se
 
 A turn that stops with a checklist item open does not end: meka sends the model back to the list
 and the turn carries on, inside the same `turn_id`, with a `turn.nudged` carrying the message it
-wrote, a `notice` for each nudge (`checklist: 2 open items, continuing, nudge 1 of 3`) and a `warn`
+wrote, a `notice` for each nudge (`Checklist: 2 open items, continuing, nudge 1 of 3`) and a `warn`
 notice when a cap ends the turn with items still open: three nudges in a row without a tool call,
 or nine in the turn. The message is a user-role message of the conversation whose first block is a
 `nudge` block, so `GET /messages` shows it between the reply it answered and the reply after it,
@@ -818,7 +825,7 @@ max_retries = 3                        # after the first attempt, default 3, at 
 
 `turn.finished` and `turn.failed` cover turns submitted through `POST /turn`. A scheduled job's turn fires `schedule.fired` (which carries its own `status`) instead, so no turn produces two deliveries. A turn the server runs purely to report a background outcome fires neither: the news is the task's, and `task.finished` has already carried it.
 
-`task.finished` is not a turn event. It fires when a background task reaches a terminal state, whether or not any turn reports it: a canceled task fires it with no turn at all, and its outcome then rides whichever turn the session takes next. Expect it alongside a `turn.finished` when a client's own `POST /turn` is what carries the outcome, and expect it on its own for a task interrupted by a host that died, which no turn ever ran.
+`task.finished` is not a turn event. It fires when a background task reaches a terminal state, whether or not any turn reports it: a canceled task fires it with no turn at all, and its outcome then rides the next round boundary of a running turn or whichever turn the session takes next. Expect it alongside a `turn.finished` when a client's own `POST /turn` is what carries the outcome, and expect it on its own for a task interrupted by a host that died, which no turn ever ran.
 
 `inbox.delivered` and `inbox.failed` are the [inbox](#the-inbox)'s two outcomes: the model read an item, or meka gave up on it. A turn the server runs on inbox items posts `turn.finished` or `turn.failed` like a client's, since nothing else carries it.
 

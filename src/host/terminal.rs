@@ -97,11 +97,11 @@ pub(crate) fn escalation_for(press: usize) -> Escalation {
 /// What to tell the user about the tasks a second Ctrl+C stopped, or `None` when it stopped none.
 ///
 /// `None` rather than an empty string, because the difference is whether anything is said at all:
-/// announcing "stopping 0 background tasks" would be false.
+/// announcing "Stopping 0 background tasks" would be false.
 pub(crate) fn background_cancellation_notice(signaled: usize) -> Option<String> {
     (signaled > 0).then(|| {
         format!(
-            "stopping {} background task{}",
+            "Stopping {} background task{}",
             signaled,
             if signaled == 1 { "" } else { "s" }
         )
@@ -168,7 +168,7 @@ pub(crate) fn install_interrupt_handler(
                     }
                 }
                 Escalation::Leave => {
-                    announce("interrupted");
+                    announce("Interrupted");
                     if tokio::time::timeout(INTERRUPT_DRAIN_GRACE, tasks.wait_all())
                         .await
                         .is_err()
@@ -381,11 +381,11 @@ mod tests {
         );
         assert_eq!(
             background_cancellation_notice(1).as_deref(),
-            Some("stopping 1 background task")
+            Some("Stopping 1 background task")
         );
         assert_eq!(
             background_cancellation_notice(4).as_deref(),
-            Some("stopping 4 background tasks")
+            Some("Stopping 4 background tasks")
         );
     }
 }

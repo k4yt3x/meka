@@ -825,11 +825,15 @@ mod tests {
 
         let first = {
             let store = store.clone();
-            tokio::spawn(async move { crate::host::claim_outcomes_now(&store, session_id).await })
+            tokio::spawn(
+                async move { crate::background::claim_outcomes_now(&store, session_id).await },
+            )
         };
         let second = {
             let store = rival;
-            tokio::spawn(async move { crate::host::claim_outcomes_now(&store, session_id).await })
+            tokio::spawn(
+                async move { crate::background::claim_outcomes_now(&store, session_id).await },
+            )
         };
         let (first, second) = (first.await.expect("join"), second.await.expect("join"));
 
@@ -1036,7 +1040,7 @@ mod tests {
             )
             .await
             .expect("finish");
-        let claimed = crate::host::claim_outcomes_now(&store, session_id).await;
+        let claimed = crate::background::claim_outcomes_now(&store, session_id).await;
         assert_eq!(claimed.len(), 1, "the delivery pass claims it");
         assert!(
             claimed[0].announced_at.is_none(),

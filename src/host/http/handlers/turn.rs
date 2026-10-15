@@ -1482,6 +1482,23 @@ impl TurnMessages {
         ]));
     }
 
+    /// A background report meka wrote lands behind the blocks of the user-role message the round
+    /// is building, a tool round's results or a nudge, and opens one of its own after an
+    /// interrupt, as `GET /messages` shows it.
+    fn background_report(&mut self, task_ids: Vec<String>, text: String) {
+        use crate::host::http::handlers::messages::ContentBlockView;
+        self.close_assistant();
+        let block = ContentBlockView::BackgroundReport { task_ids, text };
+        if self.results.is_empty()
+            && let Some(last) = self.messages.last_mut()
+            && last.role == "user"
+        {
+            last.content.push(block);
+        } else {
+            self.results.push(block);
+        }
+    }
+
     fn close_assistant(&mut self) {
         if !self.assistant.is_empty() {
             let content = std::mem::take(&mut self.assistant);
@@ -1558,6 +1575,10 @@ fn assemble_response(
                 ..
             } => messages.tool_result(id, is_error, &content),
             FrontendEvent::Nudged { kind, text } => messages.nudge(kind, text),
+            FrontendEvent::BackgroundReported { tasks, text } => {
+                messages
+                    .background_report(tasks.iter().map(|task| task.id.clone()).collect(), text);
+            }
             FrontendEvent::TokenUsage(token_usage) => {
                 // Last-wins assignment: the agent emits exactly one `TokenUsage` per turn
                 // (accumulated total). If that ever changes, switch to `saturating_add`.

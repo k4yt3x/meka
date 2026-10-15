@@ -386,6 +386,14 @@ pub(crate) enum FrontendEvent {
         kind: crate::conversation::NudgeKind,
         text: String,
     },
+    /// Finished background work meka wrote into the turn in the user's role, at a round boundary
+    /// behind that round's own blocks: the tasks, for a frontend that says what reported, and
+    /// `text`, what the model reads, for one that mirrors the conversation. A session with no turn
+    /// running is reported to by a turn of its own instead, which the host announces.
+    BackgroundReported {
+        tasks: Vec<crate::store::background::BackgroundTask>,
+        text: String,
+    },
     /// A streamed chunk of assistant text. Multiple deltas concatenate into one logical text run;
     /// any non-text event closes the run.
     AssistantTextDelta(String),
@@ -878,7 +886,10 @@ impl Notice {
     /// indistinguishable from a model that chose not to use its tools, and that has sent people
     /// debugging the prompt instead of the flag.
     pub(crate) fn approval_refused_without_asking(tool_name: &str) -> Self {
-        Self::warn(Self::approval_refused_without_asking_text(tool_name))
+        Self::warn(format!(
+            "{}.",
+            Self::approval_refused_without_asking_text(tool_name)
+        ))
     }
 
     /// [`Self::approval_refused_without_asking`] with the host's reason and remedy appended, for a
@@ -892,7 +903,7 @@ impl Notice {
 
     fn approval_refused_without_asking_text(tool_name: &str) -> String {
         format!(
-            "approvals are on but nobody can answer here, so '{tool_name}' was refused without \
+            "Approvals are on but nobody can answer here, so '{tool_name}' was refused without \
              asking"
         )
     }
@@ -904,7 +915,7 @@ impl Notice {
         Self::stage_direction(
             NoticeLevel::Info,
             format!(
-                "checklist: {open} open item{}, continuing, nudge {nudge} of {limit}",
+                "Checklist: {open} open item{}, continuing, nudge {nudge} of {limit}",
                 if open == 1 { "" } else { "s" }
             ),
         )
@@ -916,7 +927,7 @@ impl Notice {
         Self::stage_direction(
             NoticeLevel::Warn,
             format!(
-                "checklist: {open} item{} left open after {nudges} nudges{}",
+                "Checklist: {open} item{} left open after {nudges} nudges{}",
                 if open == 1 { "" } else { "s" },
                 if this_turn { " this turn" } else { "" }
             ),

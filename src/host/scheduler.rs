@@ -296,7 +296,11 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
 
     // Admitted before any outcome is claimed. A claim is one-way, so a prompt refused after it
     // would leave the batch stamped delivered and never handed out again.
-    let input = match crate::agent::TurnInput::from_parts(wakeup.render_prompt(), Vec::new()) {
+    let input = match crate::agent::TurnInput::scheduled(
+        job.id.clone(),
+        job.prompt.clone(),
+        wakeup.render_prompt(),
+    ) {
         Ok(input) => input
             .retaining(job.prompt_retention())
             .originating(crate::provider::TurnOrigin::Scheduled)
@@ -779,7 +783,8 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
 /// this first: [`claim_undelivered_outcomes`] for the hosts that fold a batch into somebody's
 /// prompt, and the two pollers directly, since they stamp with
 /// [`crate::store::background::BackgroundStore::mark_background_tasks_delivered`] to render the
-/// batch as a turn of its own.
+/// batch as a turn of its own. A turn's own round boundary claims without asking: it is running,
+/// so it can carry them.
 pub(crate) async fn a_turn_can_carry_them(agent: &crate::agent::Agent) -> bool {
     if !agent.background_enabled() {
         return false;
@@ -914,7 +919,7 @@ mod tests {
             .next()
             .expect("splitting always yields a first part");
         let admitted = wakeup
-            .find("TurnInput::from_parts(")
+            .find("TurnInput::scheduled(")
             .expect("the fire admits its prompt");
         let claimed = wakeup
             .find("claim_undelivered_outcomes(")

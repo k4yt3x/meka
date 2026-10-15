@@ -3186,7 +3186,6 @@ mod tests {
                 budget: None,
                 turn_retention: None,
                 background: &[],
-                outcomes: None,
                 resumed: false,
             });
             format!("{}\n\n{}", block, "list files under /tmp")
@@ -3223,7 +3222,6 @@ mod tests {
                 budget: None,
                 turn_retention: None,
                 background: &[],
-                outcomes: None,
                 resumed: false,
             });
             format!("{}\n\n{}", block, "now write 'hi' to /tmp/out.txt")
@@ -3353,7 +3351,6 @@ mod tests {
                 budget: None,
                 turn_retention: None,
                 background: &[],
-                outcomes: None,
                 resumed: false,
             });
             format!("{}\n\n{}", block, "investigate scratchpad")

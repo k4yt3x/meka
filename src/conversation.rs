@@ -167,15 +167,13 @@ impl Conversation {
                 _ => None,
             })
             .flat_map(|message| &message.content)
-            .find_map(|block| match block {
-                ContentBlock::Text { text } if !is_harness_stand_in(text) => {
-                    let words = strip_inbox_header(text)
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    (!words.is_empty()).then_some(words)
-                }
-                _ => None,
+            .find_map(|block| {
+                let words = block
+                    .spoken_words()?
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (!words.is_empty()).then_some(words)
             })
             .map(|words| {
                 if words.chars().count() <= chars {
@@ -734,22 +732,14 @@ pub(crate) fn is_harness_stand_in(text: &str) -> bool {
 
 /// How the header meka writes above an inbox item's body begins when the client named the sender:
 /// `[Message from <source>, arrived <time>]`, then a newline, then the body verbatim. Rendered by
-/// `prompt::render_inbox_item`; read back by [`strip_inbox_header`].
+/// `prompt::render_inbox_item`; read back only by the migration that types an item recorded
+/// before [`ContentBlock::Inbox`] existed.
 pub(crate) const INBOX_HEADER_PREFIX: &str = "[Message from ";
 
 /// How the header begins when the client named nobody: `[Message arrived <time>]`. The name is
 /// left out rather than guessed, so the model is never told a sender nobody chose.
 pub(crate) const UNNAMED_INBOX_HEADER_PREFIX: &str = "[Message arrived ";
 
-/// The body of an inbox item as rendered into the conversation, without the header meka wrote
-/// above it; any other text unchanged. What a title reads, so a session opened on an item is
-/// named by the message and not by the header.
-pub(crate) fn strip_inbox_header(text: &str) -> &str {
-    if !text.starts_with(INBOX_HEADER_PREFIX) && !text.starts_with(UNNAMED_INBOX_HEADER_PREFIX) {
-        return text;
-    }
-    text.split_once("]\n").map_or(text, |(_, body)| body)
-}
 /// How the message a compaction writes in place of the summarized turns begins. Read back by the
 /// next compaction, so a summary's own quotes are never quoted a second time.
 pub(crate) const COMPACTION_SUMMARY_PREFIX: &str = "[Conversation summary from session compaction]";
@@ -991,6 +981,79 @@ impl NudgeKind {
     }
 }
 
+/// How an item reaches the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum InboxClass {
+    /// Injected into the running turn at its next round boundary.
+    Steer,
+    /// Waits for the running turn to end.
+    Followup,
+    /// Cuts the answer the running turn is streaming and is read right after what streamed; read
+    /// at the round boundary, like a steer, while tools run.
+    Interrupt,
+}
+
+impl InboxClass {
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [InboxClass; 3] = [Self::Steer, Self::Followup, Self::Interrupt];
+
+    /// The one spelling of this value: the `class` column and the HTTP body.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Steer => "steer",
+            Self::Followup => "followup",
+            Self::Interrupt => "interrupt",
+        }
+    }
+
+    fn supported() -> String {
+        Self::ALL
+            .iter()
+            .map(|class| class.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for InboxClass {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for InboxClass {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|class| class.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not an inbox class. Supported: {}",
+                    Self::supported()
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for InboxClass {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<InboxClass> for String {
+    fn from(class: InboxClass) -> Self {
+        class.name().to_string()
+    }
+}
+
 /// One block of a message, in the shape the session store persists and every provider maps from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1012,6 +1075,37 @@ pub(crate) enum ContentBlock {
     /// block, so every reader that shows what the user typed can skip it, and every provider
     /// renders it as text ahead of the words. A user message carries zero or one of these, first.
     TurnContext {
+        text: String,
+    },
+    /// An inbox item as the model read it: `text` is the header meka wrote with the person's
+    /// words under it, `body` the words alone. Its own block, so every reader shows the words as
+    /// the person's, labeled by `class` and `source` rather than read back from the header, and a
+    /// replay builds the prompt the live screen showed. `item_id` and `class` are absent on an
+    /// item recorded before the block existed.
+    Inbox {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<uuid::Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class: Option<InboxClass>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        body: String,
+        text: String,
+    },
+    /// A scheduled job's fire as the model read it: `text` is the header, the job's words and the
+    /// gate's output when it had one, `prompt` the job's words alone. Its own block, so a replay
+    /// says the stage direction the live screen said rather than showing a prompt nobody typed,
+    /// and a title or a search reads the job's words.
+    Scheduled {
+        job_id: String,
+        prompt: String,
+        text: String,
+    },
+    /// Finished background work as the model read it, the tasks `task_ids` name. Its own block, so
+    /// a reader tells it from the person's words and a replay says which tasks reported, as the
+    /// live screen did.
+    BackgroundReport {
+        task_ids: Vec<String>,
         text: String,
     },
     /// Image supplied as *input* (e.g. an ACP client's @-mention or pasted screenshot). Distinct
@@ -1068,7 +1162,10 @@ impl ContentBlock {
     /// `Text` blocks alone, so what one finds the other can.
     pub(crate) fn search_text(&self) -> Option<String> {
         match self {
-            ContentBlock::Text { text } => Some(text.clone()),
+            ContentBlock::Text { text }
+            | ContentBlock::Inbox { text, .. }
+            | ContentBlock::Scheduled { text, .. }
+            | ContentBlock::BackgroundReport { text, .. } => Some(text.clone()),
             ContentBlock::TurnContext { .. }
             | ContentBlock::Nudge { .. }
             | ContentBlock::Image { .. } => None,
@@ -1090,6 +1187,19 @@ impl ContentBlock {
                     ContentBlock::tool_result_text_content(content)
                 ))
             }
+        }
+    }
+
+    /// The words a person sent in this block, for a title and the search index: typed text, an
+    /// inbox item's body under the header meka wrote, a scheduled job's prompt under its fire
+    /// header. `None` for what meka wrote, a stand-in it put where content was included, and for
+    /// a block that holds no words.
+    pub(crate) fn spoken_words(&self) -> Option<&str> {
+        match self {
+            ContentBlock::Text { text } if !is_harness_stand_in(text) => Some(text.as_str()),
+            ContentBlock::Inbox { body, .. } => Some(body.as_str()),
+            ContentBlock::Scheduled { prompt, .. } => Some(prompt.as_str()),
+            _ => None,
         }
     }
 
@@ -1174,21 +1284,32 @@ impl Message {
         }
     }
 
-    /// The user message a turn appends: meka's context block, the words as typed, then any input
-    /// images. The words are left out when there are none (a turn that only delivers background
-    /// outcomes), so [`Self::text_content`] stays what the user typed.
+    /// [`Self::turn_opening`] for a typed turn, as the tests build one: the context block, the
+    /// words when there are any, then the images.
+    #[cfg(test)]
     pub(crate) fn user_turn(
         context: impl Into<String>,
         words: impl Into<String>,
         images: Vec<ImageSource>,
     ) -> Self {
         let words = words.into();
+        let spoken = (!words.is_empty()).then_some(ContentBlock::Text { text: words });
+        Self::turn_opening(context, spoken.into_iter().collect(), images)
+    }
+
+    /// The user message a turn appends: meka's context block, then what follows it as blocks, a
+    /// background report and the words as typed or a scheduled job's fire, each absent when the
+    /// turn has none, then any input images. The words are left out when there are none, so
+    /// [`Self::text_content`] stays what the user typed.
+    pub(crate) fn turn_opening(
+        context: impl Into<String>,
+        after_context: Vec<ContentBlock>,
+        images: Vec<ImageSource>,
+    ) -> Self {
         let mut content = vec![ContentBlock::TurnContext {
             text: context.into(),
         }];
-        if !words.is_empty() {
-            content.push(ContentBlock::Text { text: words });
-        }
+        content.extend(after_context);
         content.extend(
             images
                 .into_iter()
@@ -1246,7 +1367,9 @@ impl Message {
         self.content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Text { text }
+                | ContentBlock::Inbox { text, .. }
+                | ContentBlock::Scheduled { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -1262,7 +1385,10 @@ impl Message {
             .filter_map(|block| match block {
                 ContentBlock::Text { text }
                 | ContentBlock::TurnContext { text }
-                | ContentBlock::Nudge { text, .. } => Some(text.as_str()),
+                | ContentBlock::Nudge { text, .. }
+                | ContentBlock::Inbox { text, .. }
+                | ContentBlock::Scheduled { text, .. }
+                | ContentBlock::BackgroundReport { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -1461,15 +1587,16 @@ pub(crate) fn write_message_markdown(
         crate::conversation::Role::User => {
             // A `User` message is a turn, a nudge meka wrote into one, or a tool-results envelope;
             // the blocks say which. An inbox item that rode a nudge or a round's results is the
-            // person's, under its own heading after what it rode.
+            // person's, under its own heading after what it rode; a background report is meka's,
+            // under meka's heading wherever it sits.
+            let mut reports = message.content.iter().filter_map(|block| match block {
+                crate::conversation::ContentBlock::BackgroundReport { text, .. } => Some(text),
+                _ => None,
+            });
+            let opens_a_turn = message.opens_turn();
             if let Some((_, text)) = message.nudge() {
                 writeln!(output, "## meka\n").ok();
                 writeln!(output, "{text}\n").ok();
-                let words = message.text_paragraphs();
-                if !words.is_empty() {
-                    writeln!(output, "## User\n").ok();
-                    writeln!(output, "{words}\n").ok();
-                }
             } else if message.carries_tool_results() {
                 for block in &message.content {
                     if let crate::conversation::ContentBlock::ToolResult {
@@ -1490,27 +1617,26 @@ pub(crate) fn write_message_markdown(
                         writeln!(output, "</details>\n").ok();
                     }
                 }
-                let words = message.text_paragraphs();
-                if !words.is_empty() {
-                    writeln!(output, "## User\n").ok();
-                    writeln!(output, "{words}\n").ok();
-                }
-            } else {
+            }
+            let mut reported = false;
+            for report in reports.by_ref() {
+                writeln!(output, "## meka\n").ok();
+                writeln!(output, "{report}\n").ok();
+                reported = true;
+            }
+            let words = message.text_paragraphs();
+            if !words.is_empty() {
                 writeln!(output, "## User\n").ok();
-                let words = message.text_paragraphs();
-                if words.is_empty() {
-                    // `Message::user_turn` leaves the `Text` block out when there were no words,
-                    // so a heading over nothing is what a turn fired for background outcomes
-                    // would otherwise leave.
-                    writeln!(
-                        output,
-                        "*meka opened this turn with no words from the user; its context block \
-                         carried background outcomes or a resume notice.*\n"
-                    )
-                    .ok();
-                } else {
-                    writeln!(output, "{words}\n").ok();
-                }
+                writeln!(output, "{words}\n").ok();
+            } else if opens_a_turn && !reported {
+                writeln!(output, "## User\n").ok();
+                // A turn opened on an image alone carries no `Text` block, so a heading over
+                // nothing is what it would otherwise leave.
+                writeln!(
+                    output,
+                    "*meka opened this turn with no words from the user.*\n"
+                )
+                .ok();
             }
         }
         crate::conversation::Role::Assistant => {
@@ -1531,6 +1657,9 @@ pub(crate) fn write_message_markdown(
                     crate::conversation::ContentBlock::ToolResult { .. }
                     | crate::conversation::ContentBlock::TurnContext { .. }
                     | crate::conversation::ContentBlock::Nudge { .. }
+                    | crate::conversation::ContentBlock::Inbox { .. }
+                    | crate::conversation::ContentBlock::Scheduled { .. }
+                    | crate::conversation::ContentBlock::BackgroundReport { .. }
                     | crate::conversation::ContentBlock::Thinking { .. }
                     | crate::conversation::ContentBlock::RedactedThinking { .. }
                     | crate::conversation::ContentBlock::Image { .. } => {}
@@ -1643,20 +1772,29 @@ mod tests {
     /// above it.
     #[test]
     fn a_title_skips_the_header_above_an_inbox_item() {
+        let item = |source: Option<&str>, body: &str| Message {
+            role: Role::User,
+            content: vec![ContentBlock::Inbox {
+                item_id: None,
+                class: Some(InboxClass::Followup),
+                source: source.map(str::to_string),
+                body: body.to_string(),
+                text: match source {
+                    Some(source) => format!(
+                        "{INBOX_HEADER_PREFIX}{source}, arrived 2026-09-16 05:41 +00:00]\n{body}"
+                    ),
+                    None => {
+                        format!("{UNNAMED_INBOX_HEADER_PREFIX}2026-09-16 05:41 +00:00]\n{body}")
+                    }
+                },
+            }],
+        };
         let mut log = Conversation::new();
-        log.append(Message::user(format!(
-            "{INBOX_HEADER_PREFIX}telegram, arrived 2026-09-16 05:41 +00:00]\nWhat is 5+5?"
-        )));
+        log.append(item(Some("telegram"), "What is 5+5?"));
         assert_eq!(log.title(), "What is 5+5?");
         let mut unnamed = Conversation::new();
-        unnamed.append(Message::user(format!(
-            "{UNNAMED_INBOX_HEADER_PREFIX}2026-09-16 05:41 +00:00]\nWhat is 6+6?"
-        )));
+        unnamed.append(item(None, "What is 6+6?"));
         assert_eq!(unnamed.title(), "What is 6+6?");
-        assert_eq!(
-            strip_inbox_header("[Message from nobody"),
-            "[Message from nobody"
-        );
     }
 
     #[test]

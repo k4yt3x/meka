@@ -116,6 +116,33 @@ pub(crate) enum ContentBlockView {
         kind: String,
         text: String,
     },
+    /// An inbox item the model read: `text` as it read it, header included, `body` the person's
+    /// words, with the item's id, its class (`steer`, `followup`, `interrupt`) and its source
+    /// where they were recorded. Typed so a client shows the words as the person's and labels
+    /// them without parsing the header.
+    Inbox {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        item_id: Option<Uuid>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        class: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        body: String,
+        text: String,
+    },
+    /// A scheduled job's fire the model read: `text` as it read it, `prompt` the job's words,
+    /// `job_id` the job. Typed so a client shows it as a fire rather than as words a person typed.
+    Scheduled {
+        job_id: String,
+        prompt: String,
+        text: String,
+    },
+    /// Finished background work the model read, the tasks `task_ids` name: the `text` a
+    /// `task.reported` feed event carried, or a turn of its own delivered.
+    BackgroundReport {
+        task_ids: Vec<String>,
+        text: String,
+    },
     Image {
         // Signal an input image was present without the base64 payload, mirroring
         // `ToolResultContentView::Image`, so history responses stay tractable.
@@ -335,6 +362,32 @@ fn view_for_block(block: &ContentBlock) -> ContentBlockView {
             kind: kind.name().to_string(),
             text: text.clone(),
         },
+        ContentBlock::Inbox {
+            item_id,
+            class,
+            source,
+            body,
+            text,
+        } => ContentBlockView::Inbox {
+            item_id: *item_id,
+            class: class.map(|class| class.name().to_string()),
+            source: source.clone(),
+            body: body.clone(),
+            text: text.clone(),
+        },
+        ContentBlock::Scheduled {
+            job_id,
+            prompt,
+            text,
+        } => ContentBlockView::Scheduled {
+            job_id: job_id.clone(),
+            prompt: prompt.clone(),
+            text: text.clone(),
+        },
+        ContentBlock::BackgroundReport { task_ids, text } => ContentBlockView::BackgroundReport {
+            task_ids: task_ids.clone(),
+            text: text.clone(),
+        },
         ContentBlock::Image { source } => ContentBlockView::Image {
             media_type: source.media_type().to_string(),
             hash: blob_hash(source),
@@ -441,6 +494,49 @@ mod tests {
             }],
         };
         (call, result)
+    }
+
+    /// What meka wrote on another's behalf keeps its kind on the wire, with the facts a client
+    /// labels it by: an inbox item's words beside its class and source, a fire's job and words, a
+    /// report's tasks; and `text` on each is what the model read.
+    #[test]
+    fn the_view_types_what_meka_relayed() {
+        let views: Vec<serde_json::Value> = [
+            ContentBlock::Inbox {
+                item_id: None,
+                class: Some(crate::conversation::InboxClass::Steer),
+                source: Some("telegram".to_string()),
+                body: "the words".to_string(),
+                text: "[Message from telegram, arrived now]\nthe words".to_string(),
+            },
+            ContentBlock::Scheduled {
+                job_id: "job".to_string(),
+                prompt: "stretch".to_string(),
+                text: "[Scheduled job job fired now]\n\nstretch".to_string(),
+            },
+            ContentBlock::BackgroundReport {
+                task_ids: vec!["task".to_string()],
+                text: "[Background task reporting at now]\nok".to_string(),
+            },
+        ]
+        .iter()
+        .map(|block| serde_json::to_value(view_for_block(block)).expect("json"))
+        .collect();
+        assert_eq!(
+            views[0],
+            serde_json::json!({
+                "type": "inbox",
+                "class": "steer",
+                "source": "telegram",
+                "body": "the words",
+                "text": "[Message from telegram, arrived now]\nthe words",
+            })
+        );
+        assert_eq!(views[1]["type"], "scheduled");
+        assert_eq!(views[1]["job_id"], "job");
+        assert_eq!(views[1]["prompt"], "stretch");
+        assert_eq!(views[2]["type"], "background_report");
+        assert_eq!(views[2]["task_ids"], serde_json::json!(["task"]));
     }
 
     /// A tool round answers with a user-role message, which continues the turn that asked

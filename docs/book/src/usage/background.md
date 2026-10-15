@@ -39,7 +39,7 @@ That returns something like:
 Started in the background as task 7f3a1c22 (cargo test --all). Use `task_list` for status. Use `task_cancel` to stop it.
 ```
 
-The agent then carries on. When the task ends, its outcome arrives as a new turn:
+The agent then carries on. When the task ends between turns, its outcome arrives as a new turn:
 
 ```text
 [Background task reporting at 2026-08-12 14:31 +02:00]
@@ -50,9 +50,18 @@ test result: ok. 1674 passed; 0 failed
 ```
 
 That is the model's prompt. The screen does not echo it, any more than it prints a tool's output:
-a stage direction above the reply says what reported, `background task 7f3a1c22 finished after
-12m 4s, reporting`, and the reply carries the result. Under `meka serve` the text rides the feed
+a stage direction above the reply says what reported, `Background task 7f3a1c22 finished after
+12m 4s`, and the reply carries the result. Under `meka serve` the text rides the feed
 as a `notice`, and an ACP editor shows it as the user turn it is.
+
+When the task ends while a turn is running, the outcome lands inside that turn instead, at its
+next tool-round boundary: behind the results of the round that was running, in the same message,
+the way a message sent to a working agent does. The header is the same, and the trailer tells the
+model to carry on rather than to answer. A turn that is one long reply has no boundary, so the
+outcome waits for it to end; nothing cuts a reply for a report. The screen says the same stage
+direction, `meka serve` puts a `task.reported` event on the turn with the text the model read, and
+an ACP editor shows it as a user turn. A resumed session replays the direction where the report
+landed, since the log records a report as a block of its own rather than as words.
 
 Running tasks also appear in the per-turn context under `[Background]`, so the agent can see what it already started and does not launch a second copy:
 
@@ -67,7 +76,7 @@ That section is rendered fresh every turn from live state, so it is always curre
 
 ## Outcomes
 
-Every task ends in one of four states, and every one of them is reported (as a turn everywhere except `--oneshot`, which has no later turn and prints them instead):
+Every task ends in one of four states, and every one of them is reported: inside a running turn, as a turn of its own otherwise, and printed by `--oneshot` when its one turn did not carry it:
 
 | Status | Meaning |
 |--------|---------|
@@ -94,20 +103,23 @@ The agent has `task_list` and `task_cancel`. You have:
 A canceled task still reports back, so the agent learns it stopped rather than waiting on it, but
 it does not interrupt to say so. Every other outcome wakes the agent when it lands, because nobody
 chose it: a build finished, a tool failed, or a host died holding the task. A cancellation is always
-somebody's deliberate act, and that somebody already knows, so it waits and is read at the top of
-whichever turn the session takes next (yours, or a scheduled job's), as part of that message
-rather than as one of its own. Canceling several tasks costs no turns at all.
+somebody's deliberate act, and that somebody already knows, so it waits and is read at the next
+round boundary of a running turn, or at the top of whichever turn the session takes next (yours, or
+a scheduled job's), as part of that message rather than as one of its own. Canceling several tasks
+costs no turns at all.
 
 Under `meka serve` the turn that delivers an outcome is on the session's
 [event feed](./http-api.md#the-session-feed), opening with a `turn.started` whose `source` is
-`background`, so a client watching the session sees the report arrive and the agent act on it.
+`background`, so a client watching the session sees the report arrive and the agent act on it. One
+read inside a running turn is a `task.reported` event on that turn, carrying the text the model
+read.
 
 Webhooks do not wait on any of that. Under `meka serve`, `task.finished` fires as soon as a task
 reaches a terminal state, rather than when a turn gets around to reporting it, so a canceled task
 is announced immediately, and one left running by a host that died is announced when the session is
 next opened, which it was not before.
 
-An outcome that rides a turn is part of that turn's message, so `/rewind` over that exchange takes
+An outcome that rides a turn, or a round of one, is part of that turn, so `/rewind` over that exchange takes
 the report with it. The task row is already stamped as reported and is not handed out again, so the
 outcome is gone rather than redelivered. `meka session export` still has it: the log is append-only
 (within `[session].turn_retention`, when set), and a rewind changes what the model sees rather than
@@ -132,12 +144,12 @@ A **second** press during the same turn stops them. Between turns, `/task cancel
 
 | Host | Behavior |
 |------|-----------|
-| Screen | Full. Outcomes arrive between turns |
+| Screen | Full. An outcome lands in a running turn at its next tool-round boundary, else between turns |
 | `meka serve` | Full, for sessions currently resident |
 | ACP | Full, for sessions the editor has open |
-| `--oneshot` | The run waits for outstanding tasks before exiting |
+| `--oneshot` | A round boundary of the one turn carries what has ended; the run waits for the rest before exiting |
 
-A one-shot run exits with the turn, so there is no later turn to deliver into. Rather than kill the work halfway through, it waits for every outstanding task and then prints the outcomes on stderr. The agent does not see them: its turn is already over. So a background call under `--oneshot` costs the same wall-clock as a synchronous one without the result reaching the model, which makes it worth avoiding rather than a feature to reach for.
+A one-shot run exits with the turn, so there is no later turn to deliver into. A task that ends while the turn is still calling tools reaches the model at the next round boundary, as anywhere else. For the rest, rather than kill the work halfway through, the run waits for every outstanding task and then prints the outcomes on stderr; the agent does not see those, since its turn is already over. So a background call whose result the answer needs is worth keeping in the foreground under `--oneshot`.
 
 Sub-agents (`agent_spawn`) deliberately cannot start background tasks. A sub-agent's session ends with the single turn that spawned it, so it could neither outlive that turn nor be around to hear the result.
 

@@ -4,8 +4,9 @@
 //! for a twenty-minute build, where the agent's only alternatives today are to hold the turn open
 //! or to approximate detachment with `nohup … &` and then poll for a result nothing will announce.
 //!
-//! A backgrounded call returns a handle immediately and delivers its outcome later, as a turn, over
-//! the same path [`crate::schedule`] already uses to inject one from outside the conversation.
+//! A backgrounded call returns a handle immediately and delivers its outcome later: as a turn, over
+//! the same path [`crate::schedule`] already uses to inject one from outside the conversation, or,
+//! while a turn is running, inside it at its next round boundary, the way a steer reaches it.
 //!
 //! The invariant that shapes everything here: **a task always ends in a delivered outcome.**
 //! [`crate::agent::Agent::run_turn`] is not resumable mid-tool-loop, so work in flight when the
@@ -264,13 +265,71 @@ pub(crate) fn only_what_was_won(
         .collect()
 }
 
+/// Claim every undelivered outcome of `session_id`: list, stamp, keep what the stamp won.
+///
+/// For a caller that puts the batch into the conversation at once: a turn at its round boundary,
+/// a host folding it into the prompt it is about to run, the one-shot's post-turn report. The
+/// stamp is one-way, so a caller that might not run a turn after all asks the host layer's gated
+/// form, which first asks whether one can start.
+pub(crate) async fn claim_outcomes_now(
+    store: &crate::store::Store,
+    session_id: Uuid,
+) -> Vec<BackgroundTask> {
+    let store = store.background_store();
+    let ready = match store.list_undelivered_background_tasks(session_id).await {
+        Ok(ready) => ready,
+        Err(error) => {
+            tracing::warn!("failed to load background task outcomes: {error}");
+            return Vec::new();
+        }
+    };
+    if ready.is_empty() {
+        return ready;
+    }
+    let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
+    let claimed = match store.mark_background_tasks_delivered(&ids).await {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            tracing::warn!("failed to stamp background outcomes as delivered: {error}");
+            return Vec::new();
+        }
+    };
+    // Only what this caller won. Listing and stamping are two statements, and a poller can claim
+    // the same row in the gap: whoever the `WHERE delivered_at IS NULL` refuses reports nothing,
+    // rather than both of them reporting it.
+    only_what_was_won(ready, &claimed)
+}
+
+/// The stage direction a screen says where a report lands: which tasks ended and how. The report
+/// itself is the model's to read and stays off the screen, as every tool's output does; the reply
+/// that follows carries what matters.
+pub(crate) fn report_direction(tasks: &[BackgroundTask]) -> String {
+    match tasks {
+        [task] => format!(
+            "Background task {} {} after {}",
+            task.short_id(),
+            task.status.headline(),
+            format_elapsed(task.elapsed())
+        ),
+        _ => {
+            let ended = tasks
+                .iter()
+                .map(|task| format!("{} {}", task.short_id(), task.status.headline()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{} background tasks: {ended}", tasks.len())
+        }
+    }
+}
+
 /// The retention a carrier prompt deserves once an outcome may be riding on it.
 ///
 /// A recurring job asks for [`crate::conversation::PromptRetention::Withdraw`] because its next
 /// occurrence regenerates the prompt, so a failed copy carries nothing worth keeping. That stops
-/// being true the moment an outcome joins it: the row is stamped delivered before the turn starts
-/// and is never handed out again, so withdrawing the message loses the only copy. Three hosts fold
-/// an outcome into a fired job's prompt and all three ask this, rather than each remembering.
+/// being true the moment an outcome joins it: the row is stamped delivered when it is claimed and
+/// is never handed out again, so withdrawing the message loses the only copy. Three hosts fold an
+/// outcome into a fired job's prompt, and an interrupt lands one on the prompt of a turn in
+/// flight; all four ask this, rather than each remembering.
 pub(crate) fn retention_carrying(
     riding: &[BackgroundTask],
     job: crate::conversation::PromptRetention,
@@ -295,6 +354,13 @@ pub(crate) fn render_outcomes_riding(tasks: &[BackgroundTask]) -> String {
     render_outcomes_with_trailer(tasks, PREAMBLE_TRAILER)
 }
 
+/// [`render_outcomes`] for a report read at a round boundary of a turn in flight, behind that
+/// round's own blocks: the model is mid-task, so the trailer tells it to carry on rather than to
+/// answer.
+pub(crate) fn render_outcomes_mid_turn(tasks: &[BackgroundTask]) -> String {
+    render_outcomes_with_trailer(tasks, MID_TURN_TRAILER)
+}
+
 /// What the standalone form tells the model to do next.
 const STANDALONE_TRAILER: &str = "\nYou started these earlier and did not wait for them. Pick the \
     work back up from here; do not restate this header.\n";
@@ -302,6 +368,10 @@ const STANDALONE_TRAILER: &str = "\nYou started these earlier and did not wait f
 /// The same, for a report that precedes a prompt of its own.
 const PREAMBLE_TRAILER: &str = "\nYou started these earlier and did not wait for them. Read them, \
     then answer what follows; do not restate this header.\n";
+
+/// The same, for a report landing while the model works.
+const MID_TURN_TRAILER: &str = "\nYou started these earlier and did not wait for them. Carry on \
+    with them in mind; do not restate this header.\n";
 
 /// Render one or more finished tasks as the user-turn text that delivers them.
 ///
@@ -811,6 +881,61 @@ mod tests {
             render_outcomes(std::slice::from_ref(&task))
                 .contains("Pick the work back up from here"),
             "while the standalone form, which is the whole prompt, still says it"
+        );
+    }
+
+    fn task_that_ran(id: &str, status: TaskStatus, seconds: i64) -> BackgroundTask {
+        let finished_at = Utc::now();
+        BackgroundTask {
+            id: id.to_string(),
+            started_at: finished_at - chrono::Duration::seconds(seconds),
+            finished_at: Some(finished_at),
+            outcome: Some("ok\n".to_string()),
+            ..task(status, None)
+        }
+    }
+
+    /// One task names how it ended and how long it ran; a batch names each task and its end. The
+    /// output is never in it.
+    #[test]
+    fn a_report_direction_names_the_tasks_and_how_they_ended() {
+        let one = report_direction(&[task_that_ran(
+            "3881c9c6-0000-4000-8000-000000000000",
+            TaskStatus::Completed,
+            30,
+        )]);
+        assert_eq!(one, "Background task 3881c9c6 finished after 30s");
+        let two = report_direction(&[
+            task_that_ran(
+                "3881c9c6-0000-4000-8000-000000000000",
+                TaskStatus::Failed,
+                5,
+            ),
+            task_that_ran(
+                "7f3a1c22-0000-4000-8000-000000000000",
+                TaskStatus::Canceled,
+                5,
+            ),
+        ]);
+        assert_eq!(
+            two,
+            "2 background tasks: 3881c9c6 failed, 7f3a1c22 was canceled"
+        );
+        assert!(!one.contains("ok") && !two.contains("ok"));
+    }
+
+    /// The mid-turn form tells the model to carry on, where the standalone form has it pick the
+    /// work back up and the riding form answer what follows.
+    #[test]
+    fn the_mid_turn_form_tells_the_model_to_carry_on() {
+        let tasks = [task(TaskStatus::Completed, Some("ok"))];
+        let mid_turn = render_outcomes_mid_turn(&tasks);
+        assert!(
+            mid_turn.starts_with("[Background task reporting at ")
+                && mid_turn.contains("Carry on with them in mind")
+                && !mid_turn.contains("answer what follows")
+                && !mid_turn.contains("Pick the work back up"),
+            "{mid_turn}"
         );
     }
 }

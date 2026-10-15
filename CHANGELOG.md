@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `[permissions].network = "none"` cuts confined commands and `web_fetch` off the network.
 - `agent_spawn` takes `network`: `none` narrows a sub-agent, and its scope lines say so.
 - `[web].refuse_private_destinations` refuses a fetch of a loopback, private or link-local host.
+- A finished background task reaches a running turn at its next tool-round boundary.
+- The session feed carries `task.reported` when a running turn reads a background outcome.
+- `GET /messages` types what meka relays: `inbox`, `scheduled` and `background_report` blocks.
 
 ### Changed
 
@@ -31,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `[skills].extra_paths` is `[skills].additional_directories`.
 - **Breaking:** session JSON and the HTTP API name `working_directory`, not `cwd`.
 - **Breaking:** `additional_roots` is `additional_workspace_directories` in the export archive.
-- **Breaking:** the session export format is 10; an older archive is converted on import.
+- **Breaking:** the session export format is 11; an older archive is converted on import.
 - **Breaking:** the store's `sessions` table names the two columns the same way, renamed on open.
 - A directory list beside no `working_directory` is refused; an empty list counts as absent.
 - An `agent_spawn` refusal names every directory it refuses; a non-string list entry is refused.
@@ -41,10 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A boundary refusal names the path as given, never the target of a symlink on it.
 - A dangling symlink inside the boundary is judged where it leads, as the open would be.
 - Tool descriptions, refusals and the context block say directory and workspace, never root.
+- Every line the screen says in its own voice is capitalized; a replay uses the live wording.
 
 ### Fixed
 
 - A `scratchpad` redirect leaves a refusal or an error inline; a command's output is still saved.
+- A resumed screen shows an inbox item as the labeled prompt it was, never meka's header as typed.
+- A resumed screen says a scheduled fire or a background report as a stage direction, not a prompt.
 
 ### Security
 

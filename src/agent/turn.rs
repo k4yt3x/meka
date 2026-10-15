@@ -60,6 +60,13 @@ pub(crate) struct TurnInput {
 
 enum Prompt {
     Typed(String),
+    /// A scheduled job's fire: the job, its words, and the text the model reads, header and gate
+    /// output included.
+    Scheduled {
+        job_id: String,
+        prompt: String,
+        text: String,
+    },
     Outcomes(Vec<crate::store::background::BackgroundTask>),
 }
 
@@ -81,6 +88,32 @@ impl TurnInput {
             riding: Vec::new(),
             inbox: Vec::new(),
             origin: crate::provider::TurnOrigin::Human,
+            turn_id: Uuid::new_v4(),
+        })
+    }
+
+    /// A scheduled job's fire: `job_id` the job, `prompt` its words, `text` what the model reads
+    /// (the fire's header, the words, the gate's output when it had one). Refused when the words
+    /// are blank, for the reason [`Self::from_parts`] refuses them.
+    pub(crate) fn scheduled(
+        job_id: String,
+        prompt: String,
+        text: String,
+    ) -> crate::error::Result<Self> {
+        if prompt.trim().is_empty() {
+            return Err(MekaError::EmptyPrompt);
+        }
+        Ok(Self {
+            prompt: Prompt::Scheduled {
+                job_id,
+                prompt,
+                text,
+            },
+            images: Vec::new(),
+            retention: PromptRetention::Keep,
+            riding: Vec::new(),
+            inbox: Vec::new(),
+            origin: crate::provider::TurnOrigin::Scheduled,
             turn_id: Uuid::new_v4(),
         })
     }
@@ -156,24 +189,65 @@ impl TurnInput {
         self
     }
 
-    /// The words as typed, or nothing for a turn that only delivers background outcomes.
+    /// The words the turn answers, for a compaction to quote: as typed, a scheduled job's own,
+    /// or nothing for a turn that only delivers background outcomes.
     fn words(&self) -> String {
         match &self.prompt {
             Prompt::Typed(text) => text.clone(),
+            Prompt::Scheduled { prompt, .. } => prompt.clone(),
             Prompt::Outcomes(_) => String::new(),
         }
     }
 
-    /// The finished background work this turn delivers, rendered for the turn's context block, or
-    /// `None`. It rides the one user message the turn appends rather than being sent as a message
-    /// of its own, because `withdraw_unanswered_prompt` and `ends_on_a_turn_opening` assume a turn
-    /// opens with exactly one.
-    fn delivered_outcomes(&self) -> Option<String> {
+    /// The words as the block the turn's message carries: typed text, or a scheduled job's fire;
+    /// `None` for a turn opened on a report, an image or inbox items alone.
+    fn spoken(&self) -> Option<ContentBlock> {
         match &self.prompt {
-            Prompt::Outcomes(outcomes) => Some(crate::background::render_outcomes(outcomes)),
-            Prompt::Typed(_) if self.riding.is_empty() => None,
-            Prompt::Typed(_) => Some(crate::background::render_outcomes_riding(&self.riding)),
+            Prompt::Typed(text) if text.is_empty() => None,
+            Prompt::Typed(text) => Some(ContentBlock::Text { text: text.clone() }),
+            Prompt::Scheduled {
+                job_id,
+                prompt,
+                text,
+            } => Some(ContentBlock::Scheduled {
+                job_id: job_id.clone(),
+                prompt: prompt.clone(),
+                text: text.clone(),
+            }),
+            Prompt::Outcomes(_) => None,
         }
+    }
+
+    /// The finished background work this turn delivers, as the block the turn's message carries,
+    /// or `None`. It rides the one user message the turn appends rather than being sent as a
+    /// message of its own, because `withdraw_unanswered_prompt` and `ends_on_a_turn_opening`
+    /// assume a turn opens with exactly one.
+    fn report(&self) -> Option<ContentBlock> {
+        let (tasks, text) = match &self.prompt {
+            Prompt::Outcomes(outcomes) => (outcomes, crate::background::render_outcomes(outcomes)),
+            _ if self.riding.is_empty() => return None,
+            _ => (
+                &self.riding,
+                crate::background::render_outcomes_riding(&self.riding),
+            ),
+        };
+        Some(ContentBlock::BackgroundReport {
+            task_ids: tasks.iter().map(|task| task.id.clone()).collect(),
+            text,
+        })
+    }
+}
+
+/// The block an inbox item takes in the conversation: what the model reads, the header meka
+/// writes with the item's words under it, beside the item's own facts, so every reader shows the
+/// words as the person's without reading the header back.
+fn inbox_block(item: &crate::store::inbox::InboxItem, mid_turn: bool) -> ContentBlock {
+    ContentBlock::Inbox {
+        item_id: Some(item.id),
+        class: Some(item.class),
+        source: item.source.clone(),
+        body: item.body.clone(),
+        text: prompt::render_inbox_item(item, mid_turn),
     }
 }
 
@@ -429,8 +503,13 @@ pub(super) fn strip_images_and_truncate(content: &mut [ContentBlock]) {
                 }
             }
             // The context block too: it is the larger of the two on most turns, and the summarizer
-            // needs no more of it than it needs of a long prompt.
-            ContentBlock::Text { text } | ContentBlock::TurnContext { text }
+            // needs no more of it than it needs of a long prompt; what arrived for the model, a
+            // relayed message or a report, the same.
+            ContentBlock::Text { text }
+            | ContentBlock::TurnContext { text }
+            | ContentBlock::Inbox { text, .. }
+            | ContentBlock::Scheduled { text, .. }
+            | ContentBlock::BackgroundReport { text, .. }
                 if text.len() > MAX_TEXT_CHARS =>
             {
                 let head_end = text.floor_char_boundary(HEAD_CHARS);
@@ -448,10 +527,12 @@ pub(super) fn strip_images_and_truncate(content: &mut [ContentBlock]) {
 
 /// What a turn opens on: the words, images, inbox items and delivered outcomes its input carried.
 struct TurnMaterials {
-    words: String,
+    /// The words the turn answers, as the block the message carries; see [`TurnInput::spoken`].
+    spoken: Option<ContentBlock>,
     images: Vec<ImageSource>,
     inbox: Vec<crate::store::inbox::InboxItem>,
-    outcomes: Option<String>,
+    /// The finished background work the turn delivers; see [`TurnInput::report`].
+    report: Option<ContentBlock>,
     turn_id: Uuid,
     /// Who opened the turn, in the API's words, for its row.
     source: &'static str,
@@ -538,6 +619,76 @@ impl Agent {
         self.store
             .save_events_atomic_marking_inbox(session_id, events, inbox_items, self.current_turn())
             .await
+    }
+}
+
+/// What a round boundary carries behind the round's own blocks, as [`Agent::take_arrivals`] read
+/// it: the finished background outcomes first, then the inbox items, so the person's words come
+/// last. The outcomes are claimed already, by the compare-and-swap every claimer makes, and
+/// rendered once, so the text the conversation holds is the text the frontend is shown; the items
+/// are stamped with the round's save ([`Agent::save_events_atomic_marking_inbox`]).
+pub(super) struct Arrivals {
+    items: Vec<crate::store::inbox::InboxItem>,
+    outcomes: Vec<crate::store::background::BackgroundTask>,
+    report: Option<String>,
+}
+
+impl Arrivals {
+    fn new(
+        items: Vec<crate::store::inbox::InboxItem>,
+        outcomes: Vec<crate::store::background::BackgroundTask>,
+    ) -> Self {
+        let report =
+            (!outcomes.is_empty()).then(|| crate::background::render_outcomes_mid_turn(&outcomes));
+        Self {
+            items,
+            outcomes,
+            report,
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.items.is_empty() && self.outcomes.is_empty()
+    }
+
+    pub(super) fn items(&self) -> &[crate::store::inbox::InboxItem] {
+        &self.items
+    }
+
+    pub(super) fn item_ids(&self) -> Vec<Uuid> {
+        self.items.iter().map(|item| item.id).collect()
+    }
+
+    /// The outcomes among the blocks: each row is stamped, so the message that holds them is
+    /// their only copy.
+    pub(super) fn outcomes(&self) -> &[crate::store::background::BackgroundTask] {
+        &self.outcomes
+    }
+
+    /// The blocks the boundary appends: one for the report, one per item.
+    pub(super) fn blocks(&self) -> Vec<ContentBlock> {
+        self.report
+            .iter()
+            .map(|text| ContentBlock::BackgroundReport {
+                task_ids: self.outcomes.iter().map(|task| task.id.clone()).collect(),
+                text: text.clone(),
+            })
+            .chain(self.items.iter().map(|item| inbox_block(item, true)))
+            .collect()
+    }
+
+    /// Tell the frontend what reported, once the blocks are in the conversation. Nothing for a
+    /// boundary that read no outcome: the items are announced when the provider reads them
+    /// ([`FrontendEvent::InboxDelivered`]).
+    pub(super) async fn announce(self, frontend: &Arc<dyn crate::frontend::Frontend>) {
+        if let Some(text) = self.report {
+            frontend
+                .emit(FrontendEvent::BackgroundReported {
+                    tasks: self.outcomes,
+                    text,
+                })
+                .await;
+        }
     }
 }
 
@@ -654,7 +805,6 @@ impl Agent {
         session_id: Uuid,
         world_state: &str,
         budget: Option<prompt::ContextBudget>,
-        outcomes: Option<&str>,
         resumed: bool,
     ) -> String {
         let catalog = self.tool_registry.tool_catalog();
@@ -694,7 +844,6 @@ impl Agent {
             budget,
             turn_retention: self.options.turn_retention,
             background: &background_tasks,
-            outcomes,
             resumed,
         })
     }
@@ -826,9 +975,9 @@ impl Agent {
         cancellation: CancellationToken,
     ) -> Result<TurnOutcome> {
         let retention = input.retention;
-        let words = input.words();
-        let request_in_flight = words.clone();
-        let outcomes = input.delivered_outcomes();
+        let request_in_flight = input.words();
+        let spoken = input.spoken();
+        let report = input.report();
         let TurnInput {
             images,
             inbox,
@@ -864,10 +1013,10 @@ impl Agent {
 
         let mut opening = self
             .open_turn(messages, session_id, TurnMaterials {
-                words,
+                spoken,
                 images,
                 inbox,
-                outcomes,
+                report,
                 turn_id,
                 // A worker's turns are opened by its parent, through a spawn or a follow-up.
                 source: if self.role.is_worker() {
@@ -895,6 +1044,7 @@ impl Agent {
             recovery: TurnRecovery {
                 suspect_floor: opening.suspect_floor,
                 prompt_only_events: opening.prompt_only_events,
+                retention,
                 overflow_retries: 0,
                 requested_compactions: 0,
                 ceiling_compacted: compacted_before_the_loop,
@@ -1079,10 +1229,10 @@ impl Agent {
         materials: TurnMaterials,
     ) -> Result<TurnOpening> {
         let TurnMaterials {
-            words,
+            spoken,
             images,
             inbox,
-            outcomes,
+            report,
             turn_id,
             source,
         } = materials;
@@ -1108,7 +1258,6 @@ impl Agent {
                 session_id,
                 &world_state,
                 Some(self.context_budget(session_id).await),
-                outcomes.as_deref(),
                 resumed,
             )
             .await;
@@ -1130,7 +1279,7 @@ impl Agent {
                 inbox
             }
         };
-        if words.is_empty() && images.is_empty() && inbox.is_empty() && outcomes.is_none() {
+        if spoken.is_none() && images.is_empty() && inbox.is_empty() && report.is_none() {
             // Everything this turn was opened on was withdrawn while it was starting. Nothing
             // to say, and a message that says nothing is not sent; the world-state snapshot
             // rendered for it goes back to what the model has actually seen, as a withdrawn
@@ -1141,17 +1290,21 @@ impl Agent {
             }
             return Err(MekaError::EmptyPrompt);
         }
-        // Build the user message once (context block, the words, any input images) and reuse it
-        // for both the in-memory append and every persist path below, so attached images survive
-        // resume.
-        let mut user_message = Message::user_turn(context_block, words, images);
+        // Build the user message once (context block, a report, the words, any input images) and
+        // reuse it for both the in-memory append and every persist path below, so attached images
+        // survive resume. The report ahead of the words: finished background work is what the
+        // words that follow may be about, and a report the model has just read is the one it
+        // answers.
+        let mut user_message = Message::turn_opening(
+            context_block,
+            report.into_iter().chain(spoken).collect(),
+            images,
+        );
         // After the words, one block each: an item is somebody else's message, and joined to the
         // words it would read as part of them.
         user_message
             .content
-            .extend(inbox.iter().map(|item| ContentBlock::Text {
-                text: prompt::render_inbox_item(item, false),
-            }));
+            .extend(inbox.iter().map(|item| inbox_block(item, false)));
         let inbox_ids: Vec<Uuid> = inbox.iter().map(|item| item.id).collect();
         // Captured around the append rather than in the `TurnRecovery` literal, which is built
         // after a proactive compaction may have moved the conversation under both. See their
@@ -1631,18 +1784,16 @@ impl Agent {
         }
     }
 
-    /// The inbox items a round boundary carries: steers and interrupts, which nothing cuts a tool
-    /// for, while a followup waits for the turn to end. Items the turn already carries (`carried`,
-    /// the opening's, pending still if the prompt's save failed and the lazy one is yet to run)
-    /// are left out. The one read for a tool round's results, for a nudge and for an interrupt,
-    /// so the three cannot disagree about what a boundary takes. A read that fails takes nothing;
-    /// the item waits for the next boundary, as every other inbox read degrades.
-    pub(super) async fn take_steering(
-        &self,
-        session_id: Uuid,
-        carried: &[Uuid],
-    ) -> Vec<crate::store::inbox::InboxItem> {
-        match self
+    /// What arrived while the model worked, read at a round boundary: the inbox items that reach
+    /// a running turn, steers and interrupts, while a followup waits for the turn to end; and the
+    /// background outcomes that landed, which the model started and did not wait for. Items the
+    /// turn already carries (`carried`, the opening's, pending still if the prompt's save failed
+    /// and the lazy one is yet to run) are left out. The one read for a tool round's results, for
+    /// a nudge and for an interrupt, so the three cannot disagree about what a boundary takes. A
+    /// read that fails takes nothing; the item waits for the next boundary, as every other inbox
+    /// read degrades, and an outcome for the next boundary or the turn's end.
+    pub(super) async fn take_arrivals(&self, session_id: Uuid, carried: &[Uuid]) -> Arrivals {
+        let items = match self
             .store
             .inbox_store()
             .take_pending(
@@ -1663,7 +1814,16 @@ impl Agent {
                 tracing::warn!("failed to read the inbox at a round boundary: {error}");
                 Vec::new()
             }
-        }
+        };
+        // Only where the switch is on: a worker, and a session on a host that turned it off, has
+        // no task to report and pays no query per round. The turn is running, so the readiness
+        // question the hosts' claim asks first is answered.
+        let outcomes = if self.background_enabled() {
+            crate::background::claim_outcomes_now(&self.store, session_id).await
+        } else {
+            Vec::new()
+        };
+        Arrivals::new(items, outcomes)
     }
 
     /// The session's background tasks whose outcome the model has been given, for the checklist's
@@ -1965,17 +2125,15 @@ impl Agent {
             tracing::warn!("failed to persist oversized tool results: {error}");
         }
 
-        // The round boundary is where a message that arrived while the tools ran is read: after
-        // the results, in the same user message, which every wire accepts and which keeps the
-        // cache prefix ahead of it intact. Read here and stamped with the round below, so the
-        // text and the stamp are one write.
-        let steering = self
-            .take_steering(session_id, &run.recovery.inbox_ids)
+        // The round boundary is where what arrived while the tools ran is read: after the
+        // results, in the same user message, which every wire accepts and which keeps the cache
+        // prefix ahead of it intact. Read here, and the items stamped with the round below, so
+        // their text and their stamp are one write.
+        let arrivals = self
+            .take_arrivals(session_id, &run.recovery.inbox_ids)
             .await;
-        tool_results.extend(steering.iter().map(|item| ContentBlock::Text {
-            text: prompt::render_inbox_item(item, true),
-        }));
-        let steered: Vec<Uuid> = steering.iter().map(|item| item.id).collect();
+        tool_results.extend(arrivals.blocks());
+        let steered = arrivals.item_ids();
 
         let result_message = Message {
             role: Role::User,
@@ -2004,7 +2162,9 @@ impl Agent {
                      not carry it: {error}"
                 );
                 error
-            })
+            })?;
+        arrivals.announce(&self.cells.frontend).await;
+        Ok(())
     }
 
     /// Run the compaction `context_compact` asked for during this round, if any; whether one was
@@ -2193,7 +2353,7 @@ impl Agent {
             // where the materialized tail alone cannot tell a prompt from a compaction summary.
             // `a_fire_interrupted_before_it_began_withdraws_its_prompt` pins the shape.
             Err(_)
-                if retention == PromptRetention::Withdraw
+                if recovery.retention == PromptRetention::Withdraw
                     && messages.events_len() == recovery.prompt_only_events
                     && messages.ends_on_a_turn_opening() =>
             {
@@ -2346,7 +2506,8 @@ impl Agent {
     /// streamed, so the next request carries them.
     ///
     /// Read again rather than trusting the watcher: what it saw may have been withdrawn since, and
-    /// a steer that arrived in the meantime belongs here as much as at a tool round's boundary.
+    /// a steer or a background outcome that arrived in the meantime belongs here as much as at a
+    /// tool round's boundary.
     /// With nothing to put in, the partial is dropped and the request is repeated as it stood.
     ///
     /// The shape depends on what streamed. Text that did is kept as the assistant's message,
@@ -2366,20 +2527,15 @@ impl Agent {
         use crate::conversation::Event;
 
         // The cut is spent either way: with nothing to carry, the request is repeated as it stood.
-        let items = self.take_steering(session_id, &recovery.inbox_ids).await;
-        if items.is_empty() {
+        let arrivals = self.take_arrivals(session_id, &recovery.inbox_ids).await;
+        if arrivals.is_empty() {
             return Ok(());
         }
         recovery
             .ensure_prompt_saved(self, session_id, prompt)
             .await?;
-        let ids: Vec<uuid::Uuid> = items.iter().map(|item| item.id).collect();
-        let blocks: Vec<ContentBlock> = items
-            .iter()
-            .map(|item| ContentBlock::Text {
-                text: prompt::render_inbox_item(item, true),
-            })
-            .collect();
+        let ids = arrivals.item_ids();
+        let blocks = arrivals.blocks();
         let partial = partial
             .map(|partial| partial.without_tool_use())
             .filter(|partial| {
@@ -2438,12 +2594,17 @@ impl Agent {
                 .await?;
                 messages.replace_tail(1, Vec::new());
                 messages.append(joined);
+                // The prompt moved and the items are part of it now, so a withdrawal takes both
+                // back and offers the items again with it.
                 if prompt_stood_alone {
-                    // The prompt moved and the items are part of it now, so a withdrawal takes
-                    // both back and offers the items again with it.
                     recovery.prompt_only_events = messages.events_len();
                     recovery.inbox_ids.extend(ids);
                 }
+                // An outcome that joined makes the prompt the only copy of its report, so the
+                // prompt is kept whatever its retention said, as one an outcome rides from the
+                // start is.
+                recovery.retention =
+                    crate::background::retention_carrying(arrivals.outcomes(), recovery.retention);
             }
             (None, false) => {
                 let arrived = Message {
@@ -2459,22 +2620,25 @@ impl Agent {
                 messages.append(arrived);
             }
         }
-        let count = items.len();
-        tracing::info!("an inbox interrupt cut the provider call; {count} item(s) appended");
-        let text = match items.as_slice() {
-            [
-                crate::store::inbox::InboxItem {
-                    source: Some(source),
-                    ..
-                },
-            ] => format!("Interrupted the answer to read a message from '{source}'."),
-            [_] => "Interrupted the answer to read a message.".to_string(),
-            _ => format!("Interrupted the answer to read {count} messages."),
-        };
-        self.cells
-            .frontend
-            .emit(FrontendEvent::Notice(crate::frontend::Notice::info(text)))
-            .await;
+        let count = arrivals.items().len();
+        if count > 0 {
+            tracing::info!("an inbox interrupt cut the provider call; {count} item(s) appended");
+            let text = match arrivals.items() {
+                [
+                    crate::store::inbox::InboxItem {
+                        source: Some(source),
+                        ..
+                    },
+                ] => format!("Interrupted the answer to read a message from '{source}'."),
+                [_] => "Interrupted the answer to read a message.".to_string(),
+                _ => format!("Interrupted the answer to read {count} messages."),
+            };
+            self.cells
+                .frontend
+                .emit(FrontendEvent::Notice(crate::frontend::Notice::info(text)))
+                .await;
+        }
+        arrivals.announce(&self.cells.frontend).await;
         Ok(())
     }
 
@@ -2884,12 +3048,17 @@ mod tests {
         (agent, provider, store)
     }
 
+    /// The text the model reads in `message` beyond its context and its results, block by block:
+    /// the words as typed, an inbox item and a report as rendered.
     fn text_blocks(message: &Message) -> Vec<&str> {
         message
             .content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Text { text }
+                | ContentBlock::Inbox { text, .. }
+                | ContentBlock::Scheduled { text, .. }
+                | ContentBlock::BackgroundReport { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect()
@@ -3737,7 +3906,10 @@ mod tests {
         );
         assert!(
             stored.as_slice().iter().any(|message| {
-                message.is_nudge() && message.text_content().contains("actually, this")
+                message.is_nudge()
+                    && text_blocks(message)
+                        .iter()
+                        .any(|text| text.contains("actually, this"))
             }),
             "with the person's words as the person's, behind the nudge: {:?}",
             stored.as_slice()
@@ -4012,6 +4184,130 @@ mod tests {
                 }) if messages.is_empty()
             ),
             "{events:?}"
+        );
+    }
+
+    /// An outcome an interrupt lands on a withdrawable prompt keeps the prompt when the turn then
+    /// fails: the row is stamped, so the message is the report's only copy, and the item that
+    /// joined with it rides the kept prompt rather than being offered again.
+    #[tokio::test]
+    async fn a_prompt_an_interrupt_landed_an_outcome_on_is_kept_when_the_turn_fails() {
+        use crate::store::background::{BackgroundTask, TaskStatus};
+        let (mut agent, _provider, store, session_id, _frontend) = agent_with_session(vec![
+            vec![
+                MockEvent::Sleep { ms: 5000 },
+                MockEvent::Text {
+                    text: "late".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: crate::provider::mock::MockStopReason::EndTurn,
+                },
+            ],
+            vec![MockEvent::Fail {
+                message: "provider down".to_string(),
+            }],
+        ])
+        .await;
+        agent.enable_background_for_test(2);
+        let background = store.background_store();
+        let task = BackgroundTask {
+            id: "7f3a1c22-0000-4000-8000-000000000000".to_string(),
+            session_id,
+            tool: "shell_execute".to_string(),
+            label: "cargo test".to_string(),
+            status: TaskStatus::Running,
+            outcome: None,
+            scratchpad_entry: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            announced_at: None,
+            delivered_at: None,
+            subagent_id: None,
+        };
+        background
+            .start_background_task(&task)
+            .await
+            .expect("start");
+        background
+            .finish_background_task(
+                &task.id,
+                TaskStatus::Completed,
+                Some("42 passed".to_string()),
+                None,
+            )
+            .await
+            .expect("finish");
+        let inbox = store.inbox_store();
+        inbox
+            .enqueue(
+                NewInboxItem::from_parts(
+                    session_id,
+                    InboxClass::Steer,
+                    Some("test".to_string()),
+                    "hello?",
+                )
+                .expect("item"),
+            )
+            .await
+            .expect("enqueue");
+        let waiting = inbox
+            .take_pending(session_id, &[], chrono::Utc::now())
+            .await
+            .expect("pending");
+        let enqueued = enqueue_later(
+            &store,
+            session_id,
+            InboxClass::Interrupt,
+            "and this",
+            std::time::Duration::from_millis(300),
+        );
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::inbox(waiting)
+                    .expect("items")
+                    .retaining(PromptRetention::Withdraw),
+                CancellationToken::new(),
+            )
+            .await;
+        let interrupt = enqueued.await.expect("enqueued");
+        assert!(outcome.is_err(), "the provider refused: {outcome:?}");
+        assert_eq!(
+            messages.len(),
+            1,
+            "the prompt is kept: {:?}",
+            messages.as_slice()
+        );
+        let prompt = &messages.as_slice()[0];
+        assert!(
+            text_blocks(prompt)
+                .iter()
+                .any(|text| text.contains("42 passed")),
+            "the report rides the kept prompt: {prompt:?}"
+        );
+        assert!(
+            background
+                .list_undelivered_background_tasks(session_id)
+                .await
+                .expect("list")
+                .is_empty(),
+            "the row stays stamped"
+        );
+        let item = inbox.get(interrupt).await.expect("get").expect("row");
+        assert_eq!(
+            item.state(),
+            InboxState::Appended,
+            "the item rides the kept prompt: {item:?}"
+        );
+        let events = store.load_events(session_id).await.expect("events");
+        assert!(
+            matches!(
+                events.last(),
+                Some(crate::conversation::Event::Append(message))
+                    if text_blocks(message).iter().any(|text| text.contains("42 passed"))
+            ),
+            "the kept prompt is the log's end: {events:?}"
         );
     }
 
@@ -8245,6 +8541,209 @@ mod tests {
         );
     }
 
+    /// A tool that returns once its gate opens, for a task that must end while a later round runs.
+    struct GatedFixture(Arc<tokio::sync::Notify>);
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for GatedFixture {
+        fn definition(&self) -> ToolDefinition {
+            SlowFixture.definition()
+        }
+
+        fn required_permission(&self) -> crate::permission::Permission {
+            crate::permission::Permission::Read
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: crate::tools::ToolContext,
+        ) -> Result<crate::tools::ToolOutput> {
+            self.0.notified().await;
+            Ok(crate::tools::ToolOutput::text(
+                "42 passed".to_string(),
+                false,
+            ))
+        }
+    }
+
+    /// A tool that opens the gate and returns once the task's row is terminal and undelivered:
+    /// the row is written after the tool behind the gate returns, and the boundary reads the row.
+    struct AwaitFinished {
+        gate: Arc<tokio::sync::Notify>,
+        store: Store,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for AwaitFinished {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "await_finished".to_string(),
+                description: "wait for the task".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+                ..Default::default()
+            }
+        }
+
+        fn required_permission(&self) -> crate::permission::Permission {
+            crate::permission::Permission::Read
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            context: crate::tools::ToolContext,
+        ) -> Result<crate::tools::ToolOutput> {
+            let session_id = context.session_id.expect("a session");
+            self.gate.notify_one();
+            for _ in 0..500 {
+                let ready = self
+                    .store
+                    .background_store()
+                    .list_undelivered_background_tasks(session_id)
+                    .await
+                    .expect("list");
+                if !ready.is_empty() {
+                    return Ok(crate::tools::ToolOutput::text("waited".to_string(), false));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the task never finished");
+        }
+    }
+
+    /// An outcome that lands while a turn runs reaches the model at the turn's next round
+    /// boundary, behind that round's results and in the same user message, as a steer does: the
+    /// request after the round carries it and the round on disk holds it, the row is stamped so
+    /// no turn of its own follows, the frontend is told what reported, and a boundary nothing had
+    /// reached by carries nothing.
+    #[tokio::test]
+    async fn a_background_outcome_lands_at_the_next_round_boundary_of_a_running_turn() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            background_round("cargo test"),
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-2".to_string(),
+                    name: "await_finished".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            text_round("carried on"),
+        ]));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let store = Store::for_test().await;
+        let registry = crate::tools::ToolRegistry::new();
+        registry.enable_background();
+        registry
+            .register(Arc::new(GatedFixture(gate.clone())))
+            .expect("register the gated fixture");
+        registry
+            .register(Arc::new(AwaitFinished {
+                gate,
+                store: store.clone(),
+            }))
+            .expect("register the waiter");
+        let mut agent =
+            build_test_agent(Arc::clone(&provider) as Arc<dyn Provider>, registry, &store);
+        agent.enable_background_for_test(2);
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = frontend.clone();
+
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("run the suite".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+
+        let requests = provider.streams();
+        assert_eq!(
+            requests.len(),
+            3,
+            "two tool rounds and the request after them"
+        );
+        let untouched = requests[1]
+            .messages
+            .last()
+            .expect("the first round's results");
+        assert!(
+            text_blocks(untouched).is_empty(),
+            "nothing had finished at the first boundary: {untouched:?}"
+        );
+        let boundary = requests[2]
+            .messages
+            .last()
+            .expect("the second round's results");
+        assert!(
+            matches!(
+                boundary.content.first(),
+                Some(ContentBlock::ToolResult { .. })
+            ),
+            "the results lead the message: {boundary:?}"
+        );
+        let injected = text_blocks(boundary);
+        assert_eq!(injected.len(), 1, "one report, one block: {boundary:?}");
+        assert!(
+            injected[0].starts_with("[Background task reporting at ")
+                && injected[0].contains("42 passed")
+                && injected[0].contains("Carry on with them in mind"),
+            "{}",
+            injected[0]
+        );
+
+        let session_id = agent.session_id().expect("the turn created a session");
+        assert!(
+            store
+                .background_store()
+                .list_undelivered_background_tasks(session_id)
+                .await
+                .expect("list")
+                .is_empty(),
+            "the boundary's claim stamped the row"
+        );
+        let stored = store.load_events(session_id).await.expect("load events");
+        let persisted = stored
+            .iter()
+            .filter_map(|event| match event {
+                crate::conversation::Event::Append(message) => Some(message),
+                _ => None,
+            })
+            .filter(|message| {
+                text_blocks(message)
+                    .iter()
+                    .any(|text| text.contains("42 passed"))
+            })
+            .count();
+        assert_eq!(persisted, 1, "the round on disk holds the report");
+        let reported: Vec<(usize, String)> = frontend
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                crate::frontend::FrontendEvent::BackgroundReported { tasks, text } => {
+                    Some((tasks.len(), text))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reported.len(), 1, "told once: {reported:?}");
+        assert_eq!(reported[0].0, 1);
+        assert_eq!(
+            reported[0].1, injected[0],
+            "the frontend is shown the text the model read"
+        );
+    }
+
     fn background_round(command: &str) -> Vec<crate::provider::mock::MockEvent> {
         use crate::provider::mock::{MockEvent, MockStopReason};
         vec![
@@ -8372,7 +8871,9 @@ mod tests {
         );
     }
 
-    /// A finished task's outcome has to reach the conversation, and exactly once.
+    /// A finished task's outcome has to reach the conversation, and exactly once. The task ends
+    /// after the turn, so no round boundary of it could claim the outcome: the host's claim, which
+    /// this test stands in for, is what takes it.
     #[tokio::test]
     async fn a_finished_task_is_recorded_for_delivery_once() {
         use crate::provider::mock::MockProvider;
@@ -8381,7 +8882,8 @@ mod tests {
             background_round("cargo test"),
             text_round("started it"),
         ]));
-        let (agent, store) = background_agent(provider, Arc::new(QuickFixture)).await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (agent, store) = background_agent(provider, Arc::new(GatedFixture(gate.clone()))).await;
 
         let mut messages = Conversation::new();
         agent
@@ -8393,6 +8895,7 @@ mod tests {
             )
             .await
             .expect("turn succeeds");
+        gate.notify_one();
         let session_id = agent.session_id().expect("session");
         agent.background_tasks().wait_for_session(session_id).await;
 
@@ -8431,12 +8934,13 @@ mod tests {
 
     /// Nothing awaits a background task's `JoinHandle` outside `--oneshot`, so an unwind that
     /// escaped would skip both the outcome write and the slot release: a report that never comes,
-    /// and a ceiling permanently one lower.
+    /// and a ceiling permanently one lower. The panic waits for the turn to end, so the report is
+    /// found undelivered rather than claimed by a round boundary.
     #[tokio::test]
     async fn a_panicking_background_tool_still_reports_and_frees_its_slot() {
         use crate::provider::mock::MockProvider;
 
-        struct PanicFixture;
+        struct PanicFixture(Arc<tokio::sync::Notify>);
 
         #[async_trait::async_trait]
         impl crate::tools::Tool for PanicFixture {
@@ -8453,6 +8957,7 @@ mod tests {
                 _input: serde_json::Value,
                 _context: crate::tools::ToolContext,
             ) -> Result<crate::tools::ToolOutput> {
+                self.0.notified().await;
                 panic!("tool exploded");
             }
         }
@@ -8461,9 +8966,10 @@ mod tests {
             background_round("boom"),
             text_round("started"),
         ]));
+        let gate = Arc::new(tokio::sync::Notify::new());
         let (agent, store) = background_agent(
             provider,
-            Arc::new(PanicFixture) as Arc<dyn crate::tools::Tool>,
+            Arc::new(PanicFixture(gate.clone())) as Arc<dyn crate::tools::Tool>,
         )
         .await;
 
@@ -8477,6 +8983,7 @@ mod tests {
             )
             .await
             .expect("turn succeeds");
+        gate.notify_one();
         let session_id = agent.session_id().expect("session");
         agent.background_tasks().wait_for_session(session_id).await;
 
@@ -9173,7 +9680,7 @@ mod tests {
             .events()
             .iter()
             .filter_map(|event| match event {
-                FrontendEvent::Notice(notice) if notice.text.starts_with("checklist:") => {
+                FrontendEvent::Notice(notice) if notice.text.starts_with("Checklist:") => {
                     Some(notice.text.clone())
                 }
                 _ => None,
@@ -9286,7 +9793,7 @@ mod tests {
             "the turn ended on the reply after the edit"
         );
         assert_eq!(checklist_notices(&frontend), vec![
-            "checklist: 1 open item, continuing, nudge 1 of 3".to_string()
+            "Checklist: 1 open item, continuing, nudge 1 of 3".to_string()
         ]);
         assert!(agent.cells.checklist.get().items.is_empty());
     }
@@ -9335,12 +9842,12 @@ mod tests {
             "six"
         );
         assert_eq!(checklist_notices(&frontend), vec![
-            "checklist: 1 open item, continuing, nudge 1 of 3".to_string(),
-            "checklist: 1 open item, continuing, nudge 2 of 3".to_string(),
-            "checklist: 1 open item, continuing, nudge 1 of 3".to_string(),
-            "checklist: 1 open item, continuing, nudge 2 of 3".to_string(),
-            "checklist: 1 open item, continuing, nudge 3 of 3".to_string(),
-            "checklist: 1 item left open after 3 nudges".to_string(),
+            "Checklist: 1 open item, continuing, nudge 1 of 3".to_string(),
+            "Checklist: 1 open item, continuing, nudge 2 of 3".to_string(),
+            "Checklist: 1 open item, continuing, nudge 1 of 3".to_string(),
+            "Checklist: 1 open item, continuing, nudge 2 of 3".to_string(),
+            "Checklist: 1 open item, continuing, nudge 3 of 3".to_string(),
+            "Checklist: 1 item left open after 3 nudges".to_string(),
         ]);
         assert_eq!(
             agent.cells.checklist.get().items.len(),
@@ -9871,7 +10378,7 @@ mod tests {
             .expect("the reporting turn ends");
         assert_eq!(nudges_in(&messages), 1);
         assert_eq!(checklist_notices(&frontend), vec![
-            "checklist: 1 open item, continuing, nudge 1 of 3".to_string()
+            "Checklist: 1 open item, continuing, nudge 1 of 3".to_string()
         ]);
         assert!(agent.cells.checklist.get().items.is_empty());
     }
@@ -9962,7 +10469,7 @@ mod tests {
         assert!(nudge_text(&messages).contains("task 1a2b3c4d failed, so this item is open again"));
         assert_eq!(nudges_in(&messages), 1);
         assert_eq!(checklist_notices(&frontend), vec![
-            "checklist: 1 open item, continuing, nudge 1 of 3".to_string()
+            "Checklist: 1 open item, continuing, nudge 1 of 3".to_string()
         ]);
         let item = &agent.cells.checklist.get().items[0];
         assert_eq!(item.status, crate::checklist::ChecklistStatus::Deferred);
@@ -10231,12 +10738,12 @@ mod tests {
         assert!(
             notices[..CHECKLIST_NUDGES_PER_TURN as usize]
                 .iter()
-                .all(|notice| notice == "checklist: 1 open item, continuing, nudge 1 of 3"),
+                .all(|notice| notice == "Checklist: 1 open item, continuing, nudge 1 of 3"),
             "every run was reset by the read: {notices:?}"
         );
         assert_eq!(
             notices[CHECKLIST_NUDGES_PER_TURN as usize],
-            "checklist: 1 item left open after 9 nudges this turn"
+            "Checklist: 1 item left open after 9 nudges this turn"
         );
         assert_eq!(agent.cells.checklist.get().items.len(), 1);
         assert_eq!(
