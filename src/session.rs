@@ -210,12 +210,17 @@ pub(crate) struct SessionCells {
     pub(crate) cwd: crate::workspace::SharedCwd,
     pub(crate) roots: crate::workspace::SharedRoots,
     /// Directories the session may read but not write, beyond its roots: what a parent's
-    /// `readable_roots` handed a sub-agent. Empty on every other session.
+    /// `additional_readable_directories` handed a sub-agent, or each
+    /// `--additional-readable-directory` on a run. Empty on every other session.
     pub(crate) read_only_roots: crate::workspace::SharedRoots,
     /// Whether this session's reads are confined, and to what beyond its roots: the process's
     /// boundary from the configuration, or one a spawn switched on for a sub-agent
     /// ([`crate::workspace::ReadBoundary::for_worker`]).
     pub(crate) read_boundary: crate::workspace::ReadBoundary,
+    /// What this session's confined commands and `web_fetch` may reach: `[permissions].network`
+    /// for a root session, and what its spawn stated, never wider than its parent's, for a
+    /// sub-agent.
+    pub(crate) network: crate::config::Network,
     pub(crate) session_id: SharedSessionId,
     pub(crate) checklist: crate::checklist::SharedChecklist,
     /// What the session runs on, published so a switch reaches everything holding this.
@@ -258,6 +263,7 @@ impl SessionCells {
             roots,
             read_only_roots: crate::workspace::SharedRoots::default(),
             read_boundary: crate::workspace::ReadBoundary::unconfined(),
+            network: crate::config::Network::Host,
             session_id: SharedSessionId::default(),
             checklist: crate::checklist::SharedChecklist::default(),
             profile,
@@ -340,6 +346,7 @@ impl SessionCells {
             roots: self.roots.clone(),
             read_only_roots: self.read_only_roots.clone(),
             read_boundary: self.read_boundary.clone(),
+            network: self.network,
             session_id: self.session_id.clone(),
         }
     }
@@ -359,6 +366,8 @@ pub(crate) struct ToolSite {
     pub(crate) read_only_roots: crate::workspace::SharedRoots,
     /// See [`SessionCells::read_boundary`].
     pub(crate) read_boundary: crate::workspace::ReadBoundary,
+    /// See [`SessionCells::network`].
+    pub(crate) network: crate::config::Network,
     pub(crate) session_id: SharedSessionId,
 }
 
@@ -375,6 +384,7 @@ impl ToolSite {
             roots: crate::workspace::SharedRoots::default(),
             read_only_roots: crate::workspace::SharedRoots::default(),
             read_boundary: crate::workspace::ReadBoundary::unconfined(),
+            network: crate::config::Network::Host,
             session_id: SharedSessionId::default(),
         }
     }
@@ -1258,11 +1268,11 @@ mod tests {
                 "parent_id": null,
                 "created_at": "2020-01-01T00:00:00Z",
                 "updated_at": "2020-01-01T00:00:00Z",
-                "cwd": null,
+                "working_directory": null,
                 "permission": null,
                 "approvals": false,
                 "capabilities_json": null,
-                "additional_roots": [],
+                "additional_workspace_directories": [],
                 "subagent_spec_json": null,
                 "profile": "",
                 "stats": crate::stats::SessionStatsSnapshot::default(),
@@ -1311,11 +1321,11 @@ mod tests {
                     "parent_id": null,
                     "created_at": "2020-01-01T00:00:00Z",
                     "updated_at": "2020-01-01T00:00:00Z",
-                    "cwd": null,
+                    "working_directory": null,
                     "permission": null,
                     "approvals": false,
                     "capabilities_json": null,
-                    "additional_roots": [],
+                    "additional_workspace_directories": [],
                     "subagent_spec_json": null,
                     "profile": "work",
                     "base_url_override": base_url,

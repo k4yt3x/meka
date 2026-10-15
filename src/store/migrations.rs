@@ -342,6 +342,20 @@ const MIGRATIONS: &[Migration] = &[
         name: "nudges_are_blocks",
         step: Step::Rust(nudges_are_blocks),
     },
+    // 0.76 names a session's working directory and additional workspace directories on the row
+    // as the wire and the spawn call name them, and every sub-agent spec takes the three scope
+    // fields the spawn call has.
+    Migration {
+        name: "sessions_name_their_working_directory",
+        step: Step::Rust(sessions_name_their_working_directory),
+    },
+    // 0.76 records what a sub-agent's shell and `web_fetch` may reach; a spec written before the
+    // field held the host's network, which is what it takes here, while a spec that loses the
+    // field later reads as `none`.
+    Migration {
+        name: "subagent_specs_name_their_network",
+        step: Step::Rust(subagent_specs_name_their_network),
+    },
 ];
 
 /// The position of the last turn a session opened, beside the eight cumulative counters: `NULL`
@@ -717,7 +731,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 5_240_258_893_683_659_556;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 2_276_857_717_155_333_933;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -2540,6 +2554,197 @@ fn rename_tools_0_60_in_spec(spec: &str) -> Option<String> {
     serde_json::to_string(&value).ok()
 }
 
+/// 0.76 names a session's working directory and its additional workspace directories on the row
+/// as the wire and the spawn call name them, and every sub-agent spec takes the three scope
+/// fields the spawn call has. The columns are renamed only while the old name is there and the
+/// new one is not, and a spec without either old key is left alone, so a replay changes nothing.
+/// One step for both, so the spec conversion reads the column by the name this step gives it and
+/// never by the one it takes away.
+fn sessions_name_their_working_directory(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    rename_column_once(transaction, "sessions", "cwd", "working_directory")?;
+    rename_column_once(
+        transaction,
+        "sessions",
+        "additional_roots_json",
+        "additional_workspace_directories_json",
+    )?;
+    let specs: Vec<(String, Option<String>, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT id, working_directory, subagent_spec_json FROM sessions WHERE \
+             subagent_spec_json IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, working_directory, spec) in specs {
+        if let Some(converted) = scope_fields_0_76_in_spec(&spec, working_directory.as_deref()) {
+            transaction.execute(
+                "UPDATE sessions SET subagent_spec_json = ?1 WHERE id = ?2",
+                rusqlite::params![converted, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Move a spec's `writable_roots` and `readable_roots` into 0.76's three scope fields, reporting
+/// whether anything changed: the first writable root becomes `working_directory` and the rest
+/// `additional_workspace_directories`; the readable roots become
+/// `additional_readable_directories`, beside `working_directory` set to `working_directory`, the
+/// row's, when the spec named no writable root, since a worker given only readable roots worked
+/// where its parent did. A spec naming neither stays bare, and one naming readable roots on a row
+/// that recorded no directory becomes bare too, since a list without a working directory is a
+/// spec no door can read. A spec without either old key is left as it is.
+fn scope_fields_0_76(spec: &mut serde_json::Value, working_directory: Option<&str>) -> bool {
+    let Some(object) = spec.as_object_mut() else {
+        return false;
+    };
+    let writable = object.remove("writable_roots");
+    let readable = object.remove("readable_roots");
+    if writable.is_none() && readable.is_none() {
+        return false;
+    }
+    let mut writable: Vec<serde_json::Value> = writable
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let readable: Vec<serde_json::Value> = readable
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    if !writable.is_empty() {
+        let first = writable.remove(0);
+        object.insert("working_directory".to_string(), first);
+        if !writable.is_empty() {
+            object.insert(
+                "additional_workspace_directories".to_string(),
+                serde_json::Value::Array(writable),
+            );
+        }
+    } else if !readable.is_empty()
+        && let Some(working_directory) = working_directory
+    {
+        object.insert(
+            "working_directory".to_string(),
+            serde_json::Value::String(working_directory.to_string()),
+        );
+    }
+    if !readable.is_empty() && object.contains_key("working_directory") {
+        object.insert(
+            "additional_readable_directories".to_string(),
+            serde_json::Value::Array(readable),
+        );
+    }
+    true
+}
+
+/// Every sub-agent spec without a `network` takes `host`, the setting every worker held before
+/// the field existed. A spec that has one is left alone, so a replay changes nothing.
+fn subagent_specs_name_their_network(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let specs: Vec<(String, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT id, subagent_spec_json FROM sessions WHERE subagent_spec_json IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, spec) in specs {
+        if let Some(stamped) = network_0_76_in_spec(&spec) {
+            transaction.execute(
+                "UPDATE sessions SET subagent_spec_json = ?1 WHERE id = ?2",
+                rusqlite::params![stamped, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Give a spec the `network` 0.76 records, `host`, where it has none, reporting whether it did.
+fn network_0_76(spec: &mut serde_json::Value) -> bool {
+    let Some(object) = spec.as_object_mut() else {
+        return false;
+    };
+    if object.contains_key("network") {
+        return false;
+    }
+    object.insert(
+        "network".to_string(),
+        serde_json::Value::String("host".to_string()),
+    );
+    true
+}
+
+/// [`network_0_76`] over a spec held as a JSON string. `None` when nothing changed or the string
+/// is not JSON.
+fn network_0_76_in_spec(spec: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(spec).ok()?;
+    if !network_0_76(&mut value) {
+        return None;
+    }
+    serde_json::to_string(&value).ok()
+}
+
+/// [`scope_fields_0_76`] over a sub-agent spec held as a JSON string, as the session row and the
+/// archive both hold it. `None` when nothing changed or the string is not JSON.
+fn scope_fields_0_76_in_spec(spec: &str, working_directory: Option<&str>) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(spec).ok()?;
+    if !scope_fields_0_76(&mut value, working_directory) {
+        return None;
+    }
+    serde_json::to_string(&value).ok()
+}
+
+/// Every session of an archive takes 0.76's names: `cwd` becomes `working_directory`,
+/// `additional_roots` becomes `additional_workspace_directories`, and its spec takes the three
+/// scope fields by [`scope_fields_0_76`], with the session's own directory as the row's, and the
+/// `network` of [`network_0_76`]. A
+/// session that already has a new name keeps its value and loses the old key: the conversions
+/// before this one run again on every pass, and [`require_fields_0_65`] puts an empty
+/// `additional_roots` back wherever the key is absent, which after this pass is everywhere.
+fn name_working_directories_0_76(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        let Some(fields) = session.as_object_mut() else {
+            continue;
+        };
+        for (old, new) in [
+            ("cwd", "working_directory"),
+            ("additional_roots", "additional_workspace_directories"),
+        ] {
+            if let Some(value) = fields.remove(old)
+                && !fields.contains_key(new)
+            {
+                fields.insert(new.to_string(), value);
+            }
+        }
+        let working_directory = fields
+            .get("working_directory")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let converted = fields
+            .get("subagent_spec_json")
+            .and_then(|spec| spec.as_str())
+            .and_then(|spec| scope_fields_0_76_in_spec(spec, working_directory.as_deref()));
+        if let Some(converted) = converted {
+            fields.insert("subagent_spec_json".to_string(), converted.into());
+        }
+        let stamped = fields
+            .get("subagent_spec_json")
+            .and_then(|spec| spec.as_str())
+            .and_then(network_0_76_in_spec);
+        if let Some(stamped) = stamped {
+            fields.insert("subagent_spec_json".to_string(), stamped.into());
+        }
+    }
+}
+
 /// The archive `format_version` 0.59 wrote.
 const ARCHIVE_FORMAT_0_59: u64 = 3;
 /// The archive `format_version` 0.60 through 0.64 wrote. Those releases added fields to the
@@ -2557,6 +2762,9 @@ const ARCHIVE_FORMAT_0_70_DEVELOPMENT: u64 = 7;
 /// The archive `format_version` 0.70's later development builds wrote, with the checklist but
 /// with every nudge as plain text.
 const ARCHIVE_FORMAT_0_70_DEVELOPMENT_2: u64 = 8;
+/// The archive `format_version` 0.70 through 0.75 wrote, naming a session's `cwd` and
+/// `additional_roots` and a spec's `writable_roots` and `readable_roots`.
+const ARCHIVE_FORMAT_0_75: u64 = 9;
 
 /// Bring a session archive written by an older meka to the current shape, reporting whether it
 /// was one. `current` is the version this build writes, handed in as data the way a [`Context`]
@@ -2570,7 +2778,9 @@ const ARCHIVE_FORMAT_0_70_DEVELOPMENT_2: u64 = 8;
 /// before 0.70 takes the turns 0.70 records, none, by [`record_turns_0_70`]. Every version before
 /// the release of 0.70 then takes the checklist tools' names, by [`rename_tools_0_70`], an empty
 /// checklist on each boundary, by [`snapshot_checklists_0_70`], and the nudge's own block where a
-/// nudge was written as text, by [`block_nudges_0_70`].
+/// nudge was written as text, by [`block_nudges_0_70`]. Every version before 0.76 then takes
+/// 0.76's names for a session's directories and a spec's scope, by
+/// [`name_working_directories_0_76`].
 pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u64) -> bool {
     match document
         .get("format_version")
@@ -2597,7 +2807,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_66)
         | Some(ARCHIVE_FORMAT_0_69)
         | Some(ARCHIVE_FORMAT_0_70_DEVELOPMENT)
-        | Some(ARCHIVE_FORMAT_0_70_DEVELOPMENT_2) => {}
+        | Some(ARCHIVE_FORMAT_0_70_DEVELOPMENT_2)
+        | Some(ARCHIVE_FORMAT_0_75) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -2620,6 +2831,7 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
     }
     snapshot_checklists_0_70(document);
     block_nudges_0_70(document);
+    name_working_directories_0_76(document);
     document["format_version"] = current.into();
     true
 }
@@ -3739,6 +3951,11 @@ mod tests {
                 17876045330514229377_u64,
             ),
             ("nudges_are_blocks", 3286139522237048285_u64),
+            (
+                "sessions_name_their_working_directory",
+                6525172221673504139_u64,
+            ),
+            ("subagent_specs_name_their_network", 6204434571494268024_u64),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
         /// every column-zero function it calls, recursively. What a Rust step does is its body and
@@ -4320,7 +4537,7 @@ mod tests {
             .expect("the spec");
         assert_eq!(
             spec_after,
-            r#"{"permission":"read","denied_tools":["file_write","checklist_edit","checklist_read","checklist_add","memory_read"]}"#
+            r#"{"permission":"read","denied_tools":["file_write","checklist_edit","checklist_read","checklist_add","memory_read"],"network":"host"}"#
         );
         let task_tool: String = connection
             .query_row(
@@ -4461,13 +4678,17 @@ mod tests {
         assert_eq!(
             export.sessions[0].subagent_spec_json.as_deref(),
             Some(
-                r#"{"permission":"read","denied_tools":["file_write","checklist_edit","checklist_read","checklist_add"]}"#
+                r#"{"permission":"read","denied_tools":["file_write","checklist_edit","checklist_read","checklist_add"],"network":"host"}"#
             )
         );
         // And the fields 0.59 never wrote arrive with what their absence meant.
         assert!(export.blobs.is_empty());
         assert!(!export.sessions[0].approvals);
-        assert!(export.sessions[0].additional_roots.is_empty());
+        assert!(
+            export.sessions[0]
+                .additional_workspace_directories
+                .is_empty()
+        );
         assert_eq!(
             export.sessions[0].profile, "work",
             "a field written is kept"
@@ -4506,7 +4727,7 @@ mod tests {
         assert!(export.blobs.is_empty());
         let session = &export.sessions[0];
         assert!(!session.approvals);
-        assert!(session.additional_roots.is_empty());
+        assert!(session.additional_workspace_directories.is_empty());
         assert!(session.subagent_spec_json.is_none());
         assert_eq!(session.profile, "");
 
@@ -4968,7 +5189,7 @@ mod tests {
         );
         assert_eq!(
             session["subagent_spec_json"],
-            "{\"permission\":\"read\",\"denied_tools\":[\"checklist_read\",\"mcp__x__todo_read\"]}",
+            "{\"permission\":\"read\",\"denied_tools\":[\"checklist_read\",\"mcp__x__todo_read\"],\"network\":\"host\"}",
             "a name is matched whole"
         );
         let once = document.clone();
@@ -6706,6 +6927,195 @@ mod tests {
         assert_eq!(
             user_version(&connection).expect("version"),
             MIGRATIONS.len() as u32
+        );
+    }
+
+    /// 0.76's steps rename the two columns with their data intact, restate every spec in the
+    /// three scope fields, the first writable root the working directory and the rest the
+    /// additional workspace directories, the readable roots the additional readable directories
+    /// beside the row's directory, a bare spec staying bare and an empty or null old key dropped,
+    /// and stamp `host` on every spec that names no network while one that does is left alone. A
+    /// replay over the converted store changes nothing.
+    #[tokio::test]
+    async fn sessions_name_their_working_directory_renames_the_columns_and_restates_every_spec() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meka.db");
+        let specs = [
+            (
+                "a",
+                r#"{"permission":"workspace","writable_roots":["/w/a","/w/b"]}"#,
+                serde_json::json!({
+                    "permission": "workspace",
+                    "working_directory": "/w/a",
+                    "additional_workspace_directories": ["/w/b"],
+                    "network": "host",
+                }),
+            ),
+            (
+                "b",
+                r#"{"permission":"read","readable_roots":["/r"]}"#,
+                serde_json::json!({
+                    "permission": "read",
+                    "working_directory": "/w",
+                    "additional_readable_directories": ["/r"],
+                    "network": "host",
+                }),
+            ),
+            (
+                "c",
+                r#"{"permission":"read"}"#,
+                serde_json::json!({ "permission": "read", "network": "host" }),
+            ),
+            (
+                "d",
+                r#"{"permission":"read","writable_roots":[],"readable_roots":null}"#,
+                serde_json::json!({ "permission": "read", "network": "host" }),
+            ),
+            (
+                "e",
+                r#"{"permission":"read","network":"none"}"#,
+                serde_json::json!({ "permission": "read", "network": "none" }),
+            ),
+        ];
+        {
+            let mut connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(BASELINE_0_42)
+                .expect("the baseline builds");
+            stopped_before(&mut connection, "sessions_name_their_working_directory");
+            for (id, spec, _) in &specs {
+                plant_session(&connection, id);
+                connection
+                    .execute(
+                        "UPDATE sessions SET cwd = '/w', additional_roots_json = '[\"/w/x\"]', \
+                         subagent_spec_json = ?1 WHERE id = ?2",
+                        rusqlite::params![spec, id],
+                    )
+                    .expect("a spec on a row that recorded its directory");
+            }
+        }
+
+        crate::store::Store::open(Some(&path), &Context::default())
+            .await
+            .expect("the store migrates on open");
+
+        let mut connection = rusqlite::Connection::open(&path).expect("reopen");
+        let columns = table_columns(&connection, "sessions").expect("columns");
+        assert!(
+            columns.iter().any(|column| column == "working_directory")
+                && columns
+                    .iter()
+                    .any(|column| column == "additional_workspace_directories_json")
+                && !columns
+                    .iter()
+                    .any(|column| column == "cwd" || column == "additional_roots_json"),
+            "{columns:?}"
+        );
+        let stored = |connection: &rusqlite::Connection, id: &str| -> (String, String, String) {
+            connection
+                .query_row(
+                    "SELECT working_directory, additional_workspace_directories_json, \
+                     subagent_spec_json FROM sessions WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("the row")
+        };
+        for (id, _, expected) in &specs {
+            let (directory, roots, spec) = stored(&connection, id);
+            assert_eq!(directory, "/w", "the data moves with the column");
+            assert_eq!(roots, "[\"/w/x\"]");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&spec).expect("json"),
+                *expected,
+                "spec {id}"
+            );
+        }
+
+        let before: Vec<(String, String, String)> = specs
+            .iter()
+            .map(|(id, ..)| stored(&connection, id))
+            .collect();
+        let transaction = connection.transaction().expect("transaction");
+        sessions_name_their_working_directory(&transaction).expect("a replay");
+        subagent_specs_name_their_network(&transaction).expect("a replay");
+        transaction.commit().expect("commit");
+        let after: Vec<(String, String, String)> = specs
+            .iter()
+            .map(|(id, ..)| stored(&connection, id))
+            .collect();
+        assert_eq!(after, before, "a replay is a no-op");
+    }
+
+    /// A format-9 archive, the one 0.70 through 0.75 wrote, takes 0.76's names for a session's
+    /// directories and the three scope fields for its spec, with the session's own directory as
+    /// the row's; a replay is a no-op, and the converted archive reads.
+    #[test]
+    fn a_format_9_archive_takes_the_working_directory_names() {
+        let mut document = serde_json::json!({
+            "format_version": 9,
+            "meka_version": "0.75.0",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "blobs": [],
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "cwd": "/w",
+                "permission": "read",
+                "capabilities_json": null,
+                "approvals": false,
+                "additional_roots": ["/w/x"],
+                "subagent_spec_json": "{\"permission\":\"read\",\"readable_roots\":[\"/r\"]}",
+                "profile": "work",
+                "stats": {
+                    "turns": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "redactions": 0,
+                    "redacted_images": 0,
+                    "redacted_bytes": 0,
+                    "turn_position": {"prompt_index": 0, "turn_index": 0},
+                },
+                "turns": [],
+                "events": [],
+                "scratchpad_entries": {},
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        let session = &document["sessions"][0];
+        assert_eq!(session["working_directory"], "/w");
+        assert_eq!(
+            session["additional_workspace_directories"],
+            serde_json::json!(["/w/x"])
+        );
+        assert!(session.get("cwd").is_none() && session.get("additional_roots").is_none());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                session["subagent_spec_json"].as_str().expect("spec")
+            )
+            .expect("json"),
+            serde_json::json!({
+                "permission": "read",
+                "working_directory": "/w",
+                "additional_readable_directories": ["/r"],
+                "network": "host",
+            })
+        );
+        let once = document.clone();
+        document["format_version"] = 9.into();
+        assert!(bring_archive_forward(&mut document, current));
+        assert_eq!(document, once, "a replay is a no-op");
+        let export = crate::store::export::parse_session_export(once.to_string().as_bytes())
+            .expect("a converted archive reads");
+        assert_eq!(
+            export.sessions[0].working_directory.as_deref(),
+            Some(std::path::Path::new("/w"))
         );
     }
 }

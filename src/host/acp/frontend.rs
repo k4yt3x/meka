@@ -1404,7 +1404,7 @@ pub(super) fn level_description(permission: Permission) -> &'static str {
     match permission {
         Permission::None => "No tools available.",
         Permission::Read => "File reads and searches only. No writes, no shell.",
-        Permission::Workspace => "Writes confined to the workspace roots.",
+        Permission::Workspace => "Writes confined to the workspace.",
         Permission::Unrestricted => "Writes and shell commands reach anywhere on the machine.",
     }
 }

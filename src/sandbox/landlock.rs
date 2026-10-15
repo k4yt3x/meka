@@ -295,7 +295,11 @@ fn push_grant(grants: &mut Vec<LandlockGrant>, path: &Path, allowed: u64) {
 /// in a `pre_exec` context (after fork, before exec), or at the top of `main` before any thread
 /// starts, as [`run_confined`] does. All operations are async-signal-safe (syscalls only, no heap
 /// allocation).
-pub(crate) unsafe fn apply_landlock(abi_version: i32, grants: &[LandlockGrant]) -> Result<(), i32> {
+pub(crate) unsafe fn apply_landlock(
+    abi_version: i32,
+    grants: &[LandlockGrant],
+    network: crate::config::Network,
+) -> Result<(), i32> {
     unsafe {
         // `PR_SET_NO_NEW_PRIVS` is required for unprivileged Landlock use.
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
@@ -304,7 +308,7 @@ pub(crate) unsafe fn apply_landlock(abi_version: i32, grants: &[LandlockGrant]) 
 
         let attr = LandlockRulesetAttr {
             handled_access_fs: handled_access_for_abi(abi_version),
-            handled_access_net: 0,
+            handled_access_net: handled_network_for_abi(abi_version, network),
             scoped: scoped_for_abi(abi_version),
         };
 
@@ -390,10 +394,14 @@ pub(crate) fn run_confined(
         return std::io::Error::other("no command to run");
     };
     let grants = landlock_grants(abi_version, writable, readable, scratch, &[]);
+    // The host's network: Bubblewrap unshared the namespace already when the session's setting is
+    // `none`, so the layer has nothing to add.
     // SAFETY: called from the top of `main`, before tracing or the runtime has started a thread,
     // so the process is single-threaded; the no-allocation half of the contract exists for the
     // `pre_exec` caller and is not what this call site relies on.
-    if let Err(errno) = unsafe { apply_landlock(abi_version, &grants) } {
+    if let Err(errno) =
+        unsafe { apply_landlock(abi_version, &grants, crate::config::Network::Host) }
+    {
         return std::io::Error::from_raw_os_error(errno);
     }
     // Everything above stdio was inherited, the descriptor this image was exec'd from included,
@@ -406,6 +414,17 @@ pub(crate) fn run_confined(
     }
     std::os::unix::process::CommandExt::exec(std::process::Command::new(program).args(arguments))
 }
+/// The network rights the ruleset handles: every TCP bind and connect on `none` from ABI v4, the
+/// first with network rights, and granted to no port, which is what refuses them all. UDP has no
+/// Landlock right on any ABI and stays open, as the docs say. Nothing on `host`.
+pub(super) fn handled_network_for_abi(abi_version: i32, network: crate::config::Network) -> u64 {
+    if network == crate::config::Network::None && abi_version >= 4 {
+        LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
+    } else {
+        0
+    }
+}
+
 pub(super) fn handled_access_for_abi(abi_version: i32) -> u64 {
     let mut access = LANDLOCK_ACCESS_FS_EXECUTE
         | LANDLOCK_ACCESS_FS_WRITE_FILE
@@ -471,6 +490,8 @@ pub(super) const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
 /// of the filesystem boundary rather than a gap in it. `scoped` covers only *abstract* sockets, so
 /// it does not reach these.
 pub(super) const LANDLOCK_ACCESS_FS_RESOLVE_UNIX: u64 = 1 << 16;
+pub(super) const LANDLOCK_ACCESS_NET_BIND_TCP: u64 = 1 << 0;
+pub(super) const LANDLOCK_ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
 pub(super) const LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
 pub(super) const LANDLOCK_SCOPE_SIGNAL: u64 = 1 << 1;
 #[repr(C)]
@@ -509,7 +530,8 @@ mod tests {
         command.arg("-c").arg(script);
         unsafe {
             command.pre_exec(move || {
-                super::apply_landlock(abi, &grants).map_err(std::io::Error::from_raw_os_error)
+                super::apply_landlock(abi, &grants, crate::config::Network::Host)
+                    .map_err(std::io::Error::from_raw_os_error)
             });
         }
         command.status().expect("spawn").code()
@@ -906,5 +928,68 @@ mod tests {
         assert!(other.join("in.txt").exists());
         assert!(!private.join("inside.txt").exists());
         assert!(!base.join("fresh.txt").exists());
+    }
+
+    /// The ruleset handles every TCP bind and connect on `none` from ABI v4, which granted to no
+    /// port refuses them all; nothing on `host`, and nothing on an ABI without network rights.
+    #[test]
+    fn the_ruleset_handles_tcp_only_on_none_from_abi_4() {
+        let both = super::LANDLOCK_ACCESS_NET_BIND_TCP | super::LANDLOCK_ACCESS_NET_CONNECT_TCP;
+        assert_eq!(
+            super::handled_network_for_abi(4, crate::config::Network::None),
+            both
+        );
+        assert_eq!(
+            super::handled_network_for_abi(9, crate::config::Network::None),
+            both
+        );
+        assert_eq!(
+            super::handled_network_for_abi(3, crate::config::Network::None),
+            0
+        );
+        assert_eq!(
+            super::handled_network_for_abi(9, crate::config::Network::Host),
+            0
+        );
+    }
+
+    /// A command under the ruleset cannot connect to a TCP port on `none` and can on `host`,
+    /// judged by the kernel against a listener this test holds.
+    #[test]
+    fn a_confined_command_cannot_connect_on_none() {
+        let Some(abi) = usable_abi() else {
+            return;
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
+        let port = listener.local_addr().expect("address").port();
+        let script = format!(
+            "python3 -c \"import socket; socket.create_connection(('127.0.0.1', {port}), 2)\" \
+             >/dev/null 2>&1 && exit 5; exit 6"
+        );
+        // The system paths readable and executable, as a read-only command has them, so the
+        // shell and the interpreter can start; only the network differs between the two runs.
+        let grants = super::landlock_grants(abi, &[], None, &[], &[]);
+        let exit_under = |network: crate::config::Network| -> Option<i32> {
+            let grants = grants.clone();
+            let mut command = std::process::Command::new("/bin/sh");
+            command.arg("-c").arg(&script);
+            unsafe {
+                command.pre_exec(move || {
+                    super::apply_landlock(abi, &grants, network)
+                        .map_err(std::io::Error::from_raw_os_error)
+                });
+            }
+            command.status().expect("spawn").code()
+        };
+        assert_eq!(
+            exit_under(crate::config::Network::Host),
+            Some(5),
+            "the listener must be reachable on `host`, or the test proves nothing"
+        );
+        assert_eq!(
+            exit_under(crate::config::Network::None),
+            Some(6),
+            "the connect must be refused on `none`"
+        );
     }
 }

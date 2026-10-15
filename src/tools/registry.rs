@@ -1016,8 +1016,13 @@ impl ToolRegistry {
         self.register_builtin(Arc::new(grep::SearchContentsTool { site: site.clone() }));
         // A malformed proxy URL or unreadable CA file surfaces as a startup error rather than
         // silently falling back to an unconfigured client (which would ignore the user's intent).
-        let web_client = web::build_web_client(web_client_config)?;
-        self.register_builtin(Arc::new(web::FetchUrlTool { client: web_client }));
+        if web::web_fetch_registered(site.network) {
+            let web_client = web::build_web_client(web_client_config)?;
+            self.register_builtin(Arc::new(web::FetchUrlTool {
+                refuse_private_destinations: web_client_config.refuse_private_destinations,
+                client: web_client,
+            }));
+        }
         self.register_builtin(Arc::new(shell::ExecuteCommandTool {
             scope: write_scope,
             #[cfg(windows)]

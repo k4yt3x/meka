@@ -234,6 +234,7 @@ pub(crate) async fn run_oneshot(
             &crate::sandbox::SandboxState::new(
                 config.sandbox,
                 config.confine_reads,
+                config.network,
                 &shared.sandbox,
             ),
             crate::sandbox::WarnContext::InitialReadLevel,
@@ -261,7 +262,12 @@ pub(crate) async fn run_oneshot(
         permission: shared_permission,
         frontend: oneshot_frontend,
         cwd,
-        roots: crate::workspace::SharedRoots::new(config.request.writable_roots.clone()),
+        roots: crate::workspace::SharedRoots::new(
+            config.request.additional_workspace_directories.clone(),
+        ),
+        read_only_roots: crate::workspace::SharedRoots::new(
+            config.request.additional_readable_directories.clone(),
+        ),
         // `--oneshot` prints one answer and exits; nothing reads a live gauge.
         context_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         context_overhead: Arc::new(std::sync::atomic::AtomicU64::new(0)),

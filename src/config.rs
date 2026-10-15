@@ -122,7 +122,7 @@ pub(crate) struct SkillsConfig {
     /// A leading `~` is expanded (see [`expand_user_path`]). A relative path is resolved against
     /// the process working directory, which is why nothing here is scanned implicitly: meka does
     /// not auto-trust the cwd, so a project's skills are read only when a path names them.
-    pub(crate) extra_paths: Option<Vec<String>>,
+    pub(crate) additional_directories: Option<Vec<String>>,
 }
 
 /// `[schedule]` table: agent-created wakeups ([`crate::schedule`]).
@@ -311,6 +311,10 @@ pub(crate) struct PermissionsConfig {
     /// command needs to run, the way writes are confined to the roots at `workspace`. Off unless
     /// set: a boundary on reads is the stronger promise, and one the user states.
     pub(crate) confine_reads: Option<bool>,
+    /// What a confined command and `web_fetch` may reach: `"host"`, the default, or `"none"`. A
+    /// boundary like `confine_reads`, reaching the in-process tool and the sandboxed shell alike,
+    /// which is why it is not a `[shell]` key.
+    pub(crate) network: Option<Network>,
 }
 
 /// Built-in tool filters, mirroring the per-server knobs on [`McpServerConfig`]. Applied at
@@ -692,6 +696,10 @@ pub(crate) struct WebConfig {
     /// DANGER: accept certificates whose hostname doesn't match. Allows MITM; only use against
     /// trusted local dev servers.
     pub(crate) danger_accept_invalid_hostnames: Option<bool>,
+    /// Refuse a destination that resolves to a loopback, private, link-local or unspecified
+    /// address, on every connection the client makes, a redirect's included. Off by default: a
+    /// local service is often exactly what a fetch is for.
+    pub(crate) refuse_private_destinations: Option<bool>,
 }
 
 /// Minimum TLS version accepted by the web-tools client. Normalized from `[web].min_tls_version` so
@@ -734,6 +742,8 @@ pub(crate) struct WebClientConfig {
     pub(crate) min_tls_version: Option<MinTlsVersion>,
     pub(crate) danger_accept_invalid_certs: bool,
     pub(crate) danger_accept_invalid_hostnames: bool,
+    /// `[web].refuse_private_destinations`.
+    pub(crate) refuse_private_destinations: bool,
 }
 
 impl Default for WebClientConfig {
@@ -750,6 +760,7 @@ impl Default for WebClientConfig {
             min_tls_version: None,
             danger_accept_invalid_certs: false,
             danger_accept_invalid_hostnames: false,
+            refuse_private_destinations: false,
         }
     }
 }
@@ -798,6 +809,7 @@ impl WebClientConfig {
             min_tls_version,
             danger_accept_invalid_certs: file.danger_accept_invalid_certs.unwrap_or(false),
             danger_accept_invalid_hostnames: file.danger_accept_invalid_hostnames.unwrap_or(false),
+            refuse_private_destinations: file.refuse_private_destinations.unwrap_or(false),
         }
     }
 }
@@ -840,7 +852,7 @@ pub(crate) struct ShellConfig {
     /// Directories every confined command may read beyond the system directories, when
     /// `[permissions].confine_reads` is on: where this machine keeps system software that the
     /// platform list does not name.
-    pub(crate) readable_paths: Option<Vec<PathBuf>>,
+    pub(crate) additional_readable_directories: Option<Vec<PathBuf>>,
     /// Linux-only choice between `"landlock"` and `"bubblewrap"`. When omitted, the resolver
     /// auto-picks bubblewrap if available and falls back to landlock with a one-shot warning (see
     /// `src/sandbox.rs` and `Warn 2` in `warn_if_sandbox_issues`).
@@ -936,6 +948,96 @@ impl TryFrom<String> for SandboxBackend {
 impl From<SandboxBackend> for String {
     fn from(backend: SandboxBackend) -> Self {
         backend.name().to_string()
+    }
+}
+
+/// What a confined command and the in-process web tool may reach on the network, as
+/// `[permissions].network` and `agent_spawn`'s `network` spell it: the host's network, or none.
+///
+/// `none` is held by the backends that can hold it, Bubblewrap, Landlock and `sandbox-exec`, and
+/// by meka itself for `web_fetch`, which runs in the meka process where no sandbox reaches and is
+/// withheld. Windows has no mechanism for a command and says so at startup. An MCP server is a
+/// separate process outside the sandbox, so the setting never reaches it: a worker that must not
+/// reach the network is also given no server that can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum Network {
+    Host,
+    None,
+}
+
+impl Network {
+    /// Every setting, in the order the names sort.
+    pub(crate) const ALL: [Network; 2] = [Self::Host, Self::None];
+
+    /// The one spelling `[permissions].network` and `agent_spawn`'s `network` take.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::None => "none",
+        }
+    }
+
+    /// The restrictive reading of a spec that lost the field.
+    pub(crate) const fn none() -> Self {
+        Self::None
+    }
+
+    /// The narrower of two settings, which is `none` under either: what a sub-agent holds under
+    /// its parent, and what a replayed spec holds under the parent's setting now.
+    pub(crate) fn narrowest(self, other: Network) -> Network {
+        if self == Self::None || other == Self::None {
+            Self::None
+        } else {
+            Self::Host
+        }
+    }
+
+    /// The names, joined for a refusal that lists what would have been accepted.
+    pub(crate) fn supported() -> String {
+        Self::ALL
+            .iter()
+            .map(|network| network.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for Network {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for Network {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|network| network.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a network setting. Supported: {}",
+                    Self::supported()
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for Network {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<Network> for String {
+    fn from(network: Network) -> Self {
+        network.name().to_string()
     }
 }
 
@@ -1300,7 +1402,8 @@ pub(crate) struct CliOverrides {
     pub(crate) instructions: Option<String>,
     pub(crate) permission: Option<Permission>,
     pub(crate) sandbox_backend: Option<SandboxBackend>,
-    pub(crate) writable_roots: Vec<std::path::PathBuf>,
+    pub(crate) additional_workspace_directories: Vec<std::path::PathBuf>,
+    pub(crate) additional_readable_directories: Vec<std::path::PathBuf>,
     pub(crate) no_stream: bool,
     pub(crate) resume: Option<Option<String>>,
     pub(crate) continue_last: bool,
@@ -1331,13 +1434,19 @@ pub(crate) struct RunRequest {
     /// set whether or not anyone asked for it. Resuming needs to tell the two apart: a session
     /// runs on the profile it recorded, and only an explicit request rewrites that.
     pub(crate) requested_profile: Option<String>,
-    /// Extra workspace roots from `--writable-root`, joined with the cwd (and, under ACP, the
-    /// client's folders) to form the write boundary at `workspace` permission.
+    /// The workspace beyond the working directory, from `--additional-workspace-directory`:
+    /// joined with the cwd (and, under ACP, the client's folders) to form the write boundary at
+    /// `workspace` and the search scope at every level.
     ///
-    /// CLI-only by design. Which folders a run may write is a per-run scope like the working
+    /// CLI-only by design. Which directories a run works in is a per-run scope like the working
     /// directory, not a preference worth persisting, so there is deliberately no `config.toml`
     /// key and no env tier for it.
-    pub(crate) writable_roots: Vec<std::path::PathBuf>,
+    pub(crate) additional_workspace_directories: Vec<std::path::PathBuf>,
+    /// What this run reads beyond its workspace, from `--additional-readable-directory`: the
+    /// session's own read-only directories, held where a sub-agent's are, so a bare spawn
+    /// inherits them and a shaped one does not. The per-run form of
+    /// `[shell].additional_readable_directories`, and CLI-only for the reason above.
+    pub(crate) additional_readable_directories: Vec<std::path::PathBuf>,
     /// CLI-flag override for `[serve].bind` (`meka serve --bind ...`). Wins over the config file
     /// when set.
     pub(crate) serve_bind_override: Option<String>,
@@ -1401,6 +1510,9 @@ pub(crate) struct ResolvedConfig {
     /// Resolved `[permissions].confine_reads`: whether reads below `unrestricted` stay within the
     /// session's roots.
     pub(crate) confine_reads: bool,
+    /// Resolved `[permissions].network`: what every root session's confined commands and
+    /// `web_fetch` may reach, and the widest setting a sub-agent can hold.
+    pub(crate) network: Network,
     pub(crate) streaming: bool,
     pub(crate) show_session_id_on_create: bool,
     pub(crate) show_session_id_on_resume: bool,
@@ -1416,8 +1528,9 @@ pub(crate) struct ResolvedConfig {
     pub(crate) turn_end_summary: Vec<TurnEndFact>,
     pub(crate) web_client: WebClientConfig,
     pub(crate) sandbox: bool,
-    /// Resolved `[shell].readable_paths`, as written: canonicalized where they are used.
-    pub(crate) readable_paths: Vec<PathBuf>,
+    /// Resolved `[shell].additional_readable_directories`, as written: canonicalized where they
+    /// are used.
+    pub(crate) shell_additional_readable_directories: Vec<PathBuf>,
     /// `[shell].sandbox_backend` (or its flag and variable), before any auto-pick. Linux-only;
     /// the host resolves and probes it at startup ([`crate::sandbox::resolve_backend`]) because
     /// the pick depends on what the machine has.
@@ -1486,12 +1599,13 @@ pub(crate) struct ResolvedConfig {
     /// Whether `skill_write` / `skill_delete` are additionally registered. Defaults to `false`;
     /// see [`SkillsConfig::agent_managed`].
     pub(crate) skills_agent_managed: bool,
-    /// Read-only skill roots scanned in addition to meka's own; see [`SkillsConfig::extra_paths`].
-    /// Already tilde-expanded, and empty unless configured.
+    /// Read-only skill roots scanned in addition to meka's own; see
+    /// [`SkillsConfig::additional_directories`]. Already tilde-expanded, and empty unless
+    /// configured.
     ///
     /// Read through [`Self::skill_roots`] rather than directly, so the "native first, then these"
     /// order has one owner.
-    pub(crate) skills_extra_paths: Vec<std::path::PathBuf>,
+    pub(crate) skills_additional_directories: Vec<std::path::PathBuf>,
     /// Whether the `memory_*` tools are registered and the `[Memory]` index rendered. Defaults to
     /// `true`; see [`MemoryConfig`].
     pub(crate) memory_enabled: bool,
@@ -1661,7 +1775,7 @@ pub(crate) fn substitute_env(input: &str) -> Result<(String, bool), String> {
     Ok((expansion.text, environment_supplied))
 }
 
-/// Resolve `[skills] extra_paths` into the read-only roots discovery will scan.
+/// Resolve `[skills] additional_directories` into the read-only roots discovery will scan.
 ///
 /// A *function* rather than a chain inside [`ResolvedConfig::resolve`], because each of the four
 /// things it drops has its own reason and each needs saying out loud:
@@ -1679,30 +1793,30 @@ pub(crate) fn substitute_env(input: &str) -> Result<(String, bool), String> {
 /// Compared as written after expansion, not canonicalized: resolving symlinks would touch the
 /// filesystem, and the promise that a configured-but-absent root leaves no trace is worth more than
 /// catching two spellings of one directory. Discovery's own first-wins rule handles that case.
-fn resolve_skills_extra_paths(raw: &[String], native: Option<&Path>) -> Vec<PathBuf> {
+fn resolve_skills_additional_directories(raw: &[String], native: Option<&Path>) -> Vec<PathBuf> {
     let mut resolved: Vec<PathBuf> = Vec::new();
     for entry in raw {
         if entry.trim().is_empty() {
-            tracing::warn!("[skills] extra_paths contains an empty entry; ignoring it");
+            tracing::warn!("[skills] additional_directories contains an empty entry; ignoring it");
             continue;
         }
         let Some(path) = expand_user_path(entry) else {
             tracing::warn!(
-                "ignoring [skills] extra_paths entry '{entry}': no home directory to expand `~` \
-                 into"
+                "ignoring [skills] additional_directories entry '{entry}': no home directory to \
+                 expand `~` into"
             );
             continue;
         };
         if Some(path.as_path()) == native {
             tracing::warn!(
-                "[skills] extra_paths entry '{entry}' is meka's own skills directory, which is \
-                 always scanned first; ignoring it"
+                "[skills] additional_directories entry '{entry}' is meka's own skills directory, \
+                 which is always scanned first; ignoring it"
             );
             continue;
         }
         if resolved.contains(&path) {
             tracing::warn!(
-                "[skills] extra_paths lists '{entry}' more than once; ignoring the repeat"
+                "[skills] additional_directories lists '{entry}' more than once; ignoring the repeat"
             );
             continue;
         }
@@ -2168,8 +2282,11 @@ impl ResolvedConfig {
         let file_skills = config_file.skills.unwrap_or_default();
         let skills_enabled = file_skills.enabled.unwrap_or(true);
         let skills_agent_managed = file_skills.agent_managed.unwrap_or(false);
-        let skills_extra_paths = resolve_skills_extra_paths(
-            file_skills.extra_paths.as_deref().unwrap_or_default(),
+        let skills_additional_directories = resolve_skills_additional_directories(
+            file_skills
+                .additional_directories
+                .as_deref()
+                .unwrap_or_default(),
             crate::paths::skills_dir().as_deref(),
         );
         // The two keys read as independent but are not: `enabled = false` registers no skill tools
@@ -2301,18 +2418,29 @@ impl ResolvedConfig {
             .or_else(sandbox_backend_override)
             .or(file_shell.sandbox_backend);
 
-        // A root that does not resolve contributes nothing to the write boundary, because
-        // `writable_roots` drops what it cannot canonicalize. Silently, until a write is refused
+        // A directory that does not resolve contributes nothing to either boundary, because
+        // `usable_roots` drops what it cannot canonicalize. Silently, until an access is refused
         // with a boundary the user believed included this path. The path is kept regardless of the
-        // warning: a build directory that does not exist yet is a legitimate root, and the boundary
-        // is recomputed on every write rather than frozen here.
-        for root in &overrides.writable_roots {
-            if let Err(error) = std::fs::canonicalize(root) {
-                tracing::warn!(
-                    "--writable-root {root} does not resolve ({error}); it grants nothing until \
-                     it exists",
-                    root = root.display()
-                );
+        // warning: a build directory that does not exist yet is a legitimate directory, and the
+        // boundary is recomputed on every access rather than frozen here.
+        for (flag, directories) in [
+            (
+                "--additional-workspace-directory",
+                &overrides.additional_workspace_directories,
+            ),
+            (
+                "--additional-readable-directory",
+                &overrides.additional_readable_directories,
+            ),
+        ] {
+            for directory in directories {
+                if let Err(error) = std::fs::canonicalize(directory) {
+                    tracing::warn!(
+                        "{flag} {directory} does not resolve ({error}); it grants nothing until \
+                         it exists",
+                        directory = directory.display()
+                    );
+                }
             }
         }
 
@@ -2329,6 +2457,7 @@ impl ResolvedConfig {
             enabled_permissions,
             approvals: file_permissions.approvals.unwrap_or(false),
             confine_reads: file_permissions.confine_reads.unwrap_or(false),
+            network: file_permissions.network.unwrap_or(Network::Host),
             streaming: streaming_enabled(overrides.no_stream, file_display.stream),
             show_session_id_on_create: file_display.show_session_id_on_create.unwrap_or(false),
             show_session_id_on_resume: file_display.show_session_id_on_resume.unwrap_or(true),
@@ -2343,7 +2472,9 @@ impl ResolvedConfig {
                 .unwrap_or_else(|| StatusFact::DEFAULT_ROW.to_vec()),
             web_client: WebClientConfig::from_file(&file_web),
             sandbox: file_shell.sandbox.unwrap_or(true),
-            readable_paths: file_shell.readable_paths.unwrap_or_default(),
+            shell_additional_readable_directories: file_shell
+                .additional_readable_directories
+                .unwrap_or_default(),
             sandbox_backend,
             retention: file_session.retention,
             turn_retention: file_session.turn_retention,
@@ -2384,7 +2515,7 @@ impl ResolvedConfig {
             standing_instructions,
             skills_enabled,
             skills_agent_managed,
-            skills_extra_paths,
+            skills_additional_directories,
             memory_enabled,
             schedule,
             background,
@@ -2399,7 +2530,8 @@ impl ResolvedConfig {
             mcp_http_concurrency,
             serve: config_file.serve,
             request: RunRequest {
-                writable_roots: overrides.writable_roots,
+                additional_workspace_directories: overrides.additional_workspace_directories,
+                additional_readable_directories: overrides.additional_readable_directories,
                 requested_permission,
                 requested_profile: overrides.profile,
                 session_resume: SessionResume::from_flags(
@@ -2433,11 +2565,11 @@ impl ResolvedConfig {
 
     /// Every directory skills are read from, in precedence order.
     ///
-    /// A method rather than the four `skill_roots(&config.skills_extra_paths)` spellings it
-    /// replaces: the derivation is "meka's own first, then the configured extras", and a caller
-    /// that assembled it itself was a caller that could get the order wrong.
+    /// A method rather than the four `skill_roots(&config.skills_additional_directories)` spellings
+    /// it replaces: the derivation is "meka's own first, then the configured extras", and a
+    /// caller that assembled it itself was a caller that could get the order wrong.
     pub(crate) fn skill_roots(&self) -> Vec<PathBuf> {
-        crate::paths::skill_roots(&self.skills_extra_paths)
+        crate::paths::skill_roots(&self.skills_additional_directories)
     }
 
     pub(crate) fn validate(&self) -> crate::error::Result<()> {
@@ -2875,9 +3007,9 @@ mod tests {
     ///
     /// `~\projects` is what a Windows user types, because it is what PowerShell's own expansion
     /// produces. Matching a literal `"~/"` left it alone, so `/cd` reported the tilde back as a
-    /// missing directory and `[skills] extra_paths` resolved to a root that never existed.
-    /// `[web].ca_cert_file` is a path setting like the others, so `~` reaches the home directory
-    /// instead of the web client failing on a file literally named `~/...`.
+    /// missing directory and `[skills] additional_directories` resolved to a root that never
+    /// existed. `[web].ca_cert_file` is a path setting like the others, so `~` reaches the home
+    /// directory instead of the web client failing on a file literally named `~/...`.
     #[test]
     fn the_ca_cert_path_goes_through_tilde_expansion() {
         let home = crate::paths::expand_user_path("~").expect("a home directory");
@@ -2909,16 +3041,16 @@ mod tests {
         );
     }
 
-    /// `extra_paths` resolution drops what discovery cannot use, and says so each time.
+    /// `additional_directories` resolution drops what discovery cannot use, and says so each time.
     ///
     /// A repeat, or meka's own root listed again, makes discovery walk the directory twice and then
     /// report every skill in it as shadowed *by itself*, a warning naming one path twice, which
     /// an operator can neither act on nor dismiss. The empty entry is the dangerous one: it would
     /// expand to `$HOME` and make the whole home directory a skills root.
     #[test]
-    fn extra_paths_drops_repeats_the_native_root_and_empty_entries() {
+    fn additional_directories_drops_repeats_the_native_root_and_empty_entries() {
         let native = PathBuf::from("/config/skills");
-        let resolved = resolve_skills_extra_paths(
+        let resolved = resolve_skills_additional_directories(
             &[
                 "/a/skills".to_string(),
                 "/a/skills".to_string(),
@@ -2936,7 +3068,7 @@ mod tests {
 
         // With no native root there is nothing to compare against, and the rest still applies.
         assert_eq!(
-            resolve_skills_extra_paths(&["/a".to_string(), "/a".to_string()], None),
+            resolve_skills_additional_directories(&["/a".to_string(), "/a".to_string()], None),
             vec![PathBuf::from("/a")]
         );
     }
@@ -3123,6 +3255,7 @@ danger_accept_invalid_hostnames = true
             min_tls_version: Some("1.3".to_string()),
             danger_accept_invalid_certs: Some(true),
             danger_accept_invalid_hostnames: Some(true),
+            refuse_private_destinations: None,
         };
         let config = WebClientConfig::from_file(&file);
         assert_eq!(config.user_agent, "ua");
@@ -5532,7 +5665,7 @@ enabled = ["read", "workspace"]
 confine_reads = true
 
 [shell]
-readable_paths = ["/opt/tools", "/snap"]
+additional_readable_directories = ["/opt/tools", "/snap"]
 "#,
         )
         .expect("parse toml");
@@ -5541,11 +5674,51 @@ readable_paths = ["/opt/tools", "/snap"]
             Some(true)
         );
         assert_eq!(
-            config.shell.expect("shell").readable_paths,
+            config.shell.expect("shell").additional_readable_directories,
             Some(vec![PathBuf::from("/opt/tools"), PathBuf::from("/snap")])
         );
         let bare: ConfigFile = toml::from_str("").expect("parse toml");
         assert!(bare.permissions.is_none() && bare.shell.is_none());
+    }
+
+    /// The network is a `[permissions]` key with two spellings, since it is a boundary that
+    /// reaches `web_fetch` as well as the shell, and the web guard a `[web]` switch; the narrower
+    /// of two settings is `none` under either.
+    #[test]
+    fn the_network_is_a_permissions_key_and_the_private_guard_a_web_switch() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[permissions]
+network = "none"
+
+[web]
+refuse_private_destinations = true
+"#,
+        )
+        .expect("parse toml");
+        assert_eq!(
+            config.permissions.expect("permissions").network,
+            Some(Network::None)
+        );
+        assert!(
+            toml::from_str::<ConfigFile>("[shell]\nnetwork = \"none\"\n").is_err(),
+            "the key has one home"
+        );
+        assert_eq!(
+            config.web.expect("web").refuse_private_destinations,
+            Some(true)
+        );
+        let error = toml::from_str::<ConfigFile>("[permissions]\nnetwork = \"wifi\"\n")
+            .expect_err("an unknown setting is refused")
+            .to_string();
+        assert!(
+            error.contains("'wifi' is not a network setting") && error.contains("host, none"),
+            "{error}"
+        );
+        assert_eq!(Network::Host.narrowest(Network::Host), Network::Host);
+        assert_eq!(Network::Host.narrowest(Network::None), Network::None);
+        assert_eq!(Network::None.narrowest(Network::Host), Network::None);
+        assert_eq!(Network::None.narrowest(Network::None), Network::None);
     }
 
     /// `sandbox_backend = "bubblewrap"` and `"landlock"` deserialize cleanly. Any other value,

@@ -20,6 +20,112 @@ use crate::{
     tools::util::build_image_tool_output,
 };
 
+/// The redirect policy: `0` follows no redirect and returns the 3xx as the response, any other
+/// cap follows that many hops. With the private guard on, a hop naming a private literal address
+/// is refused as well; a hop naming a host is judged by the resolver when it connects.
+fn redirect_policy(max_redirects: usize, refuse_private: bool) -> reqwest::redirect::Policy {
+    if !refuse_private {
+        return if max_redirects == 0 {
+            reqwest::redirect::Policy::none()
+        } else {
+            reqwest::redirect::Policy::limited(max_redirects)
+        };
+    }
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if max_redirects == 0 {
+            return attempt.stop();
+        }
+        if attempt.previous().len() > max_redirects {
+            return attempt.error("too many redirects");
+        }
+        match private_literal_destination(attempt.url().as_str()) {
+            Some(address) => attempt.error(format!(
+                "a redirect to {address}, which `[web].refuse_private_destinations` refuses"
+            )),
+            None => attempt.follow(),
+        }
+    })
+}
+
+/// The address a URL names outright, when it names a private one: the door for a literal, which
+/// hyper connects to without resolving. A host name answers `None` here and is judged by
+/// [`PrivateDestinationGuard`] when it is resolved.
+fn private_literal_destination(url: &str) -> Option<std::net::IpAddr> {
+    let address = match url::Url::parse(url).ok()?.host()? {
+        url::Host::Ipv4(address) => std::net::IpAddr::V4(address),
+        url::Host::Ipv6(address) => std::net::IpAddr::V6(address),
+        url::Host::Domain(_) => return None,
+    };
+    is_private_destination(address).then_some(address)
+}
+
+/// The resolver `[web].refuse_private_destinations` installs: every name the client connects to
+/// is looked up here, and one that answers with a loopback, private, link-local or unspecified
+/// address is refused whole.
+///
+/// On the client's resolver rather than on the URL, so every connection is judged on the
+/// addresses it would actually use: a redirect's target, a literal address, and a name that
+/// answers differently on a second lookup, which a check made on the first would let through. A
+/// name that answers with a public address beside a private one is refused too, since the client
+/// would connect to whichever it tried first. With a proxy configured the proxy resolves the
+/// target and this sees only the proxy's own name, which the config page says.
+struct PrivateDestinationGuard;
+
+impl reqwest::dns::Resolve for PrivateDestinationGuard {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addresses: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            if let Some(address) = addresses
+                .iter()
+                .find(|address| is_private_destination(address.ip()))
+            {
+                return Err(format!(
+                    "'{host}' resolves to {}, which `[web].refuse_private_destinations` refuses",
+                    address.ip()
+                )
+                .into());
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Whether an address is one a fetch must not reach under `[web].refuse_private_destinations`:
+/// loopback, private, link-local, carrier-grade NAT, unspecified and broadcast, and an IPv6
+/// address that maps one of those.
+fn is_private_destination(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(v4) => {
+            let [first, second, ..] = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || (first == 100 && (64..=127).contains(&second))
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| is_private_destination(std::net::IpAddr::V4(v4)))
+        }
+    }
+}
+
+/// Whether `web_fetch` is registered under `network`: the fetch runs in the meka process, where
+/// no sandbox reaches, so the one way to keep a session off the network is to give it no tool
+/// that is on it. One predicate for the registry and for `meka tool list`, which shows the tool
+/// as disabled rather than dropping its row.
+pub(crate) fn web_fetch_registered(network: crate::config::Network) -> bool {
+    network == crate::config::Network::Host
+}
+
 /// Build the `reqwest::Client` for `web_fetch` from the resolved
 /// [`WebClientConfig`].
 ///
@@ -33,6 +139,13 @@ pub(crate) fn build_web_client(config: &WebClientConfig) -> Result<reqwest::Clie
     let mut builder = reqwest::Client::builder()
         .user_agent(&config.user_agent)
         .timeout(config.request_timeout);
+    // The guard has two doors, since hyper resolves a name through the client's resolver and
+    // connects to a literal address without asking it: the resolver below judges every name, and
+    // the redirect policy judges every hop a literal names, as `web_fetch` judges the URL it is
+    // given.
+    if config.refuse_private_destinations {
+        builder = builder.dns_resolver(std::sync::Arc::new(PrivateDestinationGuard));
+    }
 
     if let Some(timeout) = config.connect_timeout {
         builder = builder.connect_timeout(timeout);
@@ -41,13 +154,10 @@ pub(crate) fn build_web_client(config: &WebClientConfig) -> Result<reqwest::Clie
         builder = builder.read_timeout(timeout);
     }
 
-    // `0` → no redirects at all (Policy::none). Any non-zero cap maps to Policy::limited(n).
-    let policy = if config.max_redirects == 0 {
-        reqwest::redirect::Policy::none()
-    } else {
-        reqwest::redirect::Policy::limited(config.max_redirects)
-    };
-    builder = builder.redirect(policy);
+    builder = builder.redirect(redirect_policy(
+        config.max_redirects,
+        config.refuse_private_destinations,
+    ));
 
     match config.proxy.as_deref() {
         None => {}
@@ -199,6 +309,9 @@ fn apply_headers(
 }
 
 pub(super) struct FetchUrlTool {
+    /// `[web].refuse_private_destinations`: whether a URL naming a private literal address is
+    /// refused before the request, the one door of the guard the client itself cannot hold.
+    pub(super) refuse_private_destinations: bool,
     pub(crate) client: reqwest::Client,
 }
 
@@ -258,6 +371,16 @@ impl Tool for FetchUrlTool {
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let url = require_str(&input, "url", "web_fetch")?;
+        if self.refuse_private_destinations
+            && let Some(address) = private_literal_destination(&url)
+        {
+            return Err(MekaError::ToolExecution {
+                tool_name: "web_fetch".to_string(),
+                message: format!(
+                    "'{url}' names {address}, which `[web].refuse_private_destinations` refuses"
+                ),
+            });
+        }
         // Every wait below is raced against the turn's cancellation, as `shell_execute` races
         // its child: the agent awaits every tool future, so a fetch that ignored the token held a
         // canceled turn until the peer answered or `[web] request_timeout` ran out. Dropping the
@@ -794,6 +917,7 @@ mod tests {
     #[test]
     fn fetch_url_definition_has_headers_regex_and_raw() {
         let tool = FetchUrlTool {
+            refuse_private_destinations: false,
             client: reqwest::Client::new(),
         };
         let def = tool.definition();
@@ -817,6 +941,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let tool = FetchUrlTool {
+            refuse_private_destinations: false,
             client: build_web_client(&WebClientConfig::default()).expect("client"),
         };
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -880,5 +1005,150 @@ mod tests {
         let without = serde_json::json!({ "limit": 100 });
         assert!(redirects_to_scratchpad(&with));
         assert!(!redirects_to_scratchpad(&without));
+    }
+
+    /// What `[web].refuse_private_destinations` keeps a fetch from: loopback, private, link-local,
+    /// carrier-grade NAT, unspecified and broadcast, in both families and through a mapped
+    /// address; a public address is admitted.
+    #[test]
+    fn a_private_destination_is_every_address_a_fetch_must_not_reach() {
+        use std::net::IpAddr;
+        for refused in [
+            "127.0.0.1",
+            "127.9.9.9",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "::1",
+            "::",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+        ] {
+            let address: IpAddr = refused.parse().expect("an address");
+            assert!(is_private_destination(address), "{refused} must be refused");
+        }
+        for admitted in ["93.184.216.34", "1.1.1.1", "2606:4700:4700::1111"] {
+            let address: IpAddr = admitted.parse().expect("an address");
+            assert!(
+                !is_private_destination(address),
+                "{admitted} must be admitted"
+            );
+        }
+    }
+
+    /// The guard refuses a name on its addresses, a literal and `localhost` alike, with the
+    /// address in the refusal, and admits a public literal.
+    #[tokio::test]
+    async fn the_private_destination_guard_judges_a_name_by_its_addresses() {
+        use reqwest::dns::Resolve;
+        let guard = PrivateDestinationGuard;
+        for refused in ["127.0.0.1", "localhost", "10.0.0.7"] {
+            let name: reqwest::dns::Name = refused.parse().expect("a name");
+            let error = guard
+                .resolve(name)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{refused} must be refused"))
+                .to_string();
+            assert!(
+                error.contains(refused) && error.contains("refuse_private_destinations"),
+                "{error}"
+            );
+        }
+        let name: reqwest::dns::Name = "93.184.216.34".parse().expect("a name");
+        let addresses: Vec<std::net::SocketAddr> = guard
+            .resolve(name)
+            .await
+            .expect("a public literal is admitted")
+            .collect();
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0].ip().to_string(), "93.184.216.34");
+    }
+
+    /// The switch holds both doors: `web_fetch` refuses a URL naming a loopback literal before
+    /// any connection is made, and the client refuses a redirect hop naming one; without the
+    /// switch the same fetch reaches the listener.
+    #[tokio::test]
+    async fn the_switch_keeps_a_fetch_off_a_loopback_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listen");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn({
+            let accepted = accepted.clone();
+            let origin = origin.clone();
+            async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut request = [0u8; 1024];
+                    let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+                    let reply = if request.starts_with(b"GET /hop ") {
+                        format!(
+                            "HTTP/1.1 302 Found\r\nlocation: {origin}/private\r\ncontent-length: 0\r\n\r\n"
+                        )
+                    } else {
+                        "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n".to_string()
+                    };
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(&mut socket, reply.as_bytes()).await;
+                }
+            }
+        });
+        let guarded = WebClientConfig {
+            refuse_private_destinations: true,
+            ..WebClientConfig::default()
+        };
+        let tool = FetchUrlTool {
+            refuse_private_destinations: true,
+            client: build_web_client(&guarded).expect("client"),
+        };
+        let error = tool
+            .execute(
+                serde_json::json!({ "url": format!("{origin}/") }),
+                crate::tools::ToolContext::detached(tokio_util::sync::CancellationToken::new()),
+            )
+            .await
+            .expect_err("the tool refuses the literal")
+            .to_string();
+        assert!(
+            error.contains("names 127.0.0.1") && error.contains("refuse_private_destinations"),
+            "{error}"
+        );
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing may have connected"
+        );
+
+        // The client's own door, reached without the tool's: the first hop is accepted, the
+        // redirect to a loopback literal is not.
+        let error = build_web_client(&guarded)
+            .expect("client")
+            .get(format!("{origin}/hop"))
+            .send()
+            .await
+            .expect_err("the hop is refused");
+        let chain = std::iter::successors(Some(&error as &dyn std::error::Error), |error| {
+            error.source()
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+        assert!(chain.contains("refuse_private_destinations"), "{chain}");
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let open = build_web_client(&WebClientConfig::default()).expect("client");
+        let response = open
+            .get(format!("{origin}/"))
+            .send()
+            .await
+            .expect("reaches the listener");
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
     }
 }

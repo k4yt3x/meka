@@ -145,7 +145,7 @@ columns of the tables in `HEAD_TABLES`. The count is the ledger's to state: `the
 
 | Table | Owner | Columns and indexes |
 |-------|-------|---------------------|
-| `sessions` | `store/sessions.rs` | `id`, `created_at`, `updated_at`, `parent_session_id`, `cwd`, `permission`, `approvals`, `profile`, `capabilities_json`, `token_id`, `additional_roots_json`, `subagent_spec_json`, `context_tokens`, `title`, `pinned_at`, the eight cumulative counters `turns`, `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `redactions`, `redacted_images`, `redacted_bytes`, and the position of the last turn opened, `prompt_index` and `turn_index`, both NULL on a session that numbers nothing. `idx_sessions_updated_at`, `idx_sessions_parent_session_id`. |
+| `sessions` | `store/sessions.rs` | `id`, `created_at`, `updated_at`, `parent_session_id`, `working_directory`, `permission`, `approvals`, `profile`, `capabilities_json`, `token_id`, `additional_workspace_directories_json`, `subagent_spec_json`, `context_tokens`, `title`, `pinned_at`, the eight cumulative counters `turns`, `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `redactions`, `redacted_images`, `redacted_bytes`, and the position of the last turn opened, `prompt_index` and `turn_index`, both NULL on a session that numbers nothing. `idx_sessions_updated_at`, `idx_sessions_parent_session_id`. |
 | `messages` | `store/sessions.rs` | `id`, `session_id`, `kind`, `content`, `created_at`, `turn_id`. `idx_messages_session_id`, `idx_messages_session_id_kind`. The writer names the turn; the store never infers one from the table. |
 | `turns` | `store/turns.rs` | `id`, `session_id`, `source`, `started_at`, `ended_at`, `status`, `stop_reason`, `error_type` (the kind's name, never a URI), `detail`, the four usage counters. `idx_turns_session_started_at`, which the listing's per-row `last_turn` subquery leans on: a second per-row join would be the one to measure. |
 | `account_credentials` | `store/credentials.rs` | `account`, `credentials_json`, `updated_at`. |
@@ -281,7 +281,7 @@ the three rows marked `for_editors` (`/mcp`, `/status`, `/usage`) as `available_
 Only HTTP and ACP can receive a request while a turn holds the session, and the two answer
 differently by design.
 
-- **HTTP refuses what needs the turn to end.** A `PATCH` naming `cwd` or `profile`, `DELETE`,
+- **HTTP refuses what needs the turn to end.** A `PATCH` naming `working_directory` or `profile`, `DELETE`,
   fork, compact and rewind check `in_flight` (or fail `claim_idle`) and return 409 with `type`
   `https://meka.run/errors/turn-in-flight`, through `turn_in_flight_conflict` and
   `ProblemDetail::for_error(MekaError::TurnInFlight)`. A second `POST /turn` on the session gets

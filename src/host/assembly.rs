@@ -29,8 +29,8 @@ pub(crate) struct SharedDeps {
     pub(crate) agent_options: AgentOptions,
     /// What the sandbox probe found at startup; every session's materials are built from it.
     pub(crate) sandbox: crate::sandbox::SandboxResolution,
-    /// What `[permissions].confine_reads` and `[shell].readable_paths` resolve to, once: every
-    /// session this host builds reads within it.
+    /// What `[permissions].confine_reads` and `[shell].additional_readable_directories` resolve
+    /// to, once: every session this host builds reads within it.
     pub(crate) read_boundary: crate::workspace::ReadBoundary,
     /// The dispatcher a scheduled gate's tool probe resolves against.
     pub(crate) gate_tools: Option<Arc<dyn crate::schedule::GateTools>>,
@@ -213,7 +213,12 @@ pub(crate) async fn build_shared_deps(
     // the startup warning about an unusable or improvable sandbox is given from the same answer.
     let sandbox = crate::sandbox::resolve_backend(config.sandbox_backend, config.sandbox);
     crate::sandbox::warn_if_sandbox_issues(
-        &crate::sandbox::SandboxState::new(config.sandbox, config.confine_reads, &sandbox),
+        &crate::sandbox::SandboxState::new(
+            config.sandbox,
+            config.confine_reads,
+            config.network,
+            &sandbox,
+        ),
         crate::sandbox::WarnContext::Startup,
     );
     let sandbox_capability = crate::sandbox::capability_from_probe(&sandbox.probe);
@@ -230,7 +235,7 @@ pub(crate) async fn build_shared_deps(
     // `disabled()` is distinct from an empty store: it keeps the subsystem's tools out of the
     // registry entirely, which is the point of the config switch.
     let skills = if config.skills_enabled {
-        crate::skills::SkillCache::discover(config.skills_extra_paths.clone())
+        crate::skills::SkillCache::discover(config.skills_additional_directories.clone())
     } else {
         crate::skills::SkillCache::disabled()
     };
@@ -345,6 +350,9 @@ pub(crate) struct SessionSpec {
     pub(crate) frontend: Arc<dyn crate::frontend::Frontend>,
     pub(crate) cwd: crate::workspace::SharedCwd,
     pub(crate) roots: crate::workspace::SharedRoots,
+    /// What the session reads beyond its workspace: each `--additional-readable-directory` on a
+    /// run, under the screen, a one-shot run or ACP; nothing for a served session.
+    pub(crate) read_only_roots: crate::workspace::SharedRoots,
     pub(crate) context_tokens: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) context_overhead: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) context_window: Arc<std::sync::atomic::AtomicU64>,
@@ -381,6 +389,7 @@ pub(crate) async fn build_session_agent(
         frontend,
         cwd,
         roots,
+        read_only_roots,
         context_tokens,
         context_overhead,
         context_window,
@@ -407,6 +416,8 @@ pub(crate) async fn build_session_agent(
     cells.context_overhead = context_overhead;
     // The process's read boundary, before the tools that judge by it are registered.
     cells.read_boundary = shared.read_boundary.clone();
+    cells.read_only_roots = read_only_roots;
+    cells.network = shared.config.network;
     if let Some(id) = session_id {
         cells.seed_context_tokens(&shared.store, id).await;
     }

@@ -63,8 +63,8 @@ pub(crate) fn list(
 /// even in the common case where every row says `no`.
 ///
 /// `native_root` is meka's own store, the only directory anything writes to. A skill from anywhere
-/// else came from `[skills] extra_paths`, which is what `External` reports; `paths` answers the
-/// question that raises, by naming where each one actually is.
+/// else came from `[skills] additional_directories`, which is what `External` reports; `paths`
+/// answers the question that raises, by naming where each one actually is.
 ///
 /// Nothing else about a skill belongs here. `license`, `compatibility`, `allowed-tools`, `version`
 /// and arbitrary `metadata` keys are per-skill detail, which is what `meka skill get` is for; a
@@ -555,8 +555,8 @@ pub(crate) async fn run_skill_subcommand(
     action: &crate::cli::SkillAction,
     cli_args: &crate::cli::Cli,
 ) -> anyhow::Result<()> {
-    // Resolved rather than defaulted: `[skills] extra_paths` decides which roots these read, and a
-    // handler that ignored it would report a store the running agent does not have.
+    // Resolved rather than defaulted: `[skills] additional_directories` decides which roots these
+    // read, and a handler that ignored it would report a store the running agent does not have.
     let config = ResolvedConfig::resolve(cli_args.overrides());
     config.require_readable_config()?;
     let roots = config.skill_roots();
@@ -1089,10 +1089,10 @@ mod tests {
     /// so whether or not the file there parses.
     ///
     /// Both halves were untested, and the second was wrong: the check read the *loaded* skills, so
-    /// a broken `SKILL.md` in an `extra_paths` root was a name nothing had an opinion about. The
-    /// add went through, meka's own store won precedence forever after, and nothing said a word,
-    /// which is the worst case to shadow silently, because the original is not reported anywhere
-    /// either.
+    /// a broken `SKILL.md` in an `additional_directories` root was a name nothing had an opinion
+    /// about. The add went through, meka's own store won precedence forever after, and nothing
+    /// said a word, which is the worst case to shadow silently, because the original is not
+    /// reported anywhere either.
     #[tokio::test]
     async fn adding_over_a_read_only_root_is_refused_even_when_that_file_is_broken() {
         let temp = tempfile::tempdir().expect("tempdir");

@@ -680,7 +680,7 @@ impl Agent {
             .cells
             .site()
             .read_scope()
-            .session_roots_at(permission, &self.cells.cwd);
+            .additional_readable_at(permission, &self.cells.cwd);
         prompt::build_turn_context(prompt::TurnContext {
             vision: self.cells.profile.current().vision,
             one_shot: self.options.one_shot,
@@ -689,6 +689,7 @@ impl Agent {
             cwd: &cwd,
             roots: &roots,
             readable: readable.as_deref(),
+            network: self.cells.network,
             world_state,
             budget,
             turn_retention: self.options.turn_retention,
@@ -1926,7 +1927,7 @@ impl Agent {
         mut round_events: Vec<crate::conversation::Event>,
     ) -> Result<()> {
         let session_id = run.session_id;
-        let (mut tool_results, tool_durations) = self
+        let (mut tool_results, tool_durations, inline_results) = self
             .execute_tool_calls(
                 assistant_message,
                 loaded,
@@ -1940,6 +1941,7 @@ impl Agent {
             &self.store,
             session_id,
             &self.tool_registry.inherited_scratchpad_names(),
+            &inline_results,
             assistant_message,
             &mut tool_results,
         )

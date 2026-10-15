@@ -10,6 +10,57 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.75 to 0.76
+
+**A sub-agent's scope is three fields.** `agent_spawn`'s `writable_roots` and `readable_roots`
+are gone. A call names `working_directory`, where the sub-agent works, and may add
+`additional_workspace_directories`, more of its workspace with the working directory's rights, and
+`additional_readable_directories`, what it reads beyond its workspace. A call naming none of the
+three gives the sub-agent the parent's whole scope, as before; a list needs `working_directory`
+beside it, and `"."` is the parent's own directory. Stored specs are converted when the store is
+opened: the first writable root becomes the working directory and the rest the workspace list, and
+the readable roots become the readable list beside the directory the sub-agent was spawned in. A
+sub-agent that had only readable roots no longer follows the parent's other directories. The common
+calls, before and after:
+
+| 0.75 | 0.76 |
+|---|---|
+| `{"writable_roots": ["/a"]}` | `{"working_directory": "/a"}` |
+| `{"writable_roots": ["/a", "/b"]}` | `{"working_directory": "/a", "additional_workspace_directories": ["/b"]}` |
+| `{"readable_roots": ["/b"]}` | `{"working_directory": ".", "additional_readable_directories": ["/b"]}` |
+| `{"writable_roots": ["/a"], "readable_roots": ["/b"]}` | `{"working_directory": "/a", "additional_readable_directories": ["/b"]}` |
+
+A list no longer runs the sub-agent at `workspace` on its own: it runs at the parent's level unless
+`permission` lowers it, and a list beside `unrestricted` is refused. A `permission` above the
+parent's is refused rather than clamped. The result of a spawn and of a follow-up opens with
+`Agent:`, `Permission:` and the scope the sub-agent holds, in the lines the environment block uses;
+a script that read `agent:` from the first line reads `Agent:`.
+
+**A sub-agent's reads follow its spawn.** `[permissions].confine_reads` governs root sessions
+alone. A sub-agent reads what its spawn call stated, or what its parent reads when it stated
+nothing, on every installation. A parent whose reads are not confined hands reads anywhere only
+by stating no scope.
+
+**Every surface says directory.** One table of the renames:
+
+| Surface | 0.75 | 0.76 |
+|---|---|---|
+| Run flag | `--writable-root <PATH>` | `--additional-workspace-directory <DIR>` |
+| Run flag | none | `--additional-readable-directory <DIR>` |
+| `memory export` | `--dir` | `--directory` |
+| `config.toml` | `[shell].readable_paths` | `[shell].additional_readable_directories` |
+| `config.toml` | `[skills].extra_paths` | `[skills].additional_directories` |
+| Session JSON, HTTP API | `cwd` | `working_directory` |
+| Export archive | `additional_roots` | `additional_workspace_directories` |
+| `GET /v1/sessions` filter | `cwd=<path>` | `working_directory=<path>` |
+| Export archive | `format_version` 9 | `format_version` 10 |
+| Store | `sessions.cwd`, `sessions.additional_roots_json` | `working_directory`, `additional_workspace_directories_json` |
+
+The two config keys are refused by name, with their line, until renamed. An archive of version 9 or
+older is converted on import. The store's columns are renamed on the first open, behind the usual
+backup; a hand-written query names the new ones. ACP's `additionalDirectories` keeps its protocol
+name, and `/cd` keeps its verb.
+
 ## 0.73 to 0.74
 
 **A one-shot run prints the answer alone, as markdown.** `meka --oneshot` writes the last text

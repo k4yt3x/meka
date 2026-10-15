@@ -112,7 +112,7 @@ credentials](./config-file.md#leftover-credentials).
 ## Why some settings have no config key
 
 A few things are deliberately CLI-only, with no `config.toml` key and no environment variable.
-`--writable-root` is the current example: which folders a run may write at `workspace` permission is
+`--additional-workspace-directory` is the current example: which directories a run works in is
 a per-run scope, like the working directory itself, not a preference worth persisting. Writing it
 into a file would make the boundary depend on where the file lives rather than on what you asked for
 this time.

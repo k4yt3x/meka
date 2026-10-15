@@ -10,8 +10,8 @@
 //! What lives in the block, and why each would otherwise invalidate the prefix:
 //!
 //! - **permission level** and the tools it blocks: `/permission` and Shift+Tab change it mid-turn.
-//! - **cwd and workspace roots**: `/cd`, `--writable-root`, and an ACP client re-sending
-//!   `additionalDirectories`.
+//! - **cwd and workspace roots**: `/cd`, `--additional-workspace-directory`, and an ACP client
+//!   re-sending `additionalDirectories`.
 //! - **tools, skills, MCP server instructions** ([`WorldSnapshot`]): skills are re-read from disk
 //!   every turn, MCP servers connect late and can hot-swap their tool lists.
 //!
@@ -912,13 +912,15 @@ pub(crate) fn build_system_prompt(inputs: SystemPromptInputs<'_>) -> String {
          - `none`: no tool calls without approval.\n\
          - `read`: tools classified `read`, including updates to meka-managed memory, scratchpad \
          entries, and the checklist.\n\
-         - `workspace`: file and shell writes stay inside the listed workspace roots. An MCP \
-         tool that needs more than `workspace` runs in its server's own process, which cannot be \
-         confined, so its call needs approval or is refused.\n\
+         - `workspace`: file and shell writes stay inside the workspace. An MCP tool that needs \
+         more than `workspace` runs in its server's own process, which cannot be confined, so \
+         its call needs approval or is refused.\n\
          - `unrestricted`: no workspace write boundary or level-based approval.\n\n",
     );
     prompt.push_str(if sandboxed_shell {
-        "The shell is read-only at `read` and workspace-confined at `workspace`.\n\n"
+        "The shell is read-only at `read` and workspace-confined at `workspace`; a refused \
+         command sees the kernel's own `Permission denied` or `No such file or directory`, and \
+         nothing it writes under `/tmp` outlives it.\n\n"
     } else {
         "The shell is refused below `unrestricted`, since nothing confines it here.\n\n"
     });
@@ -927,6 +929,7 @@ pub(crate) fn build_system_prompt(inputs: SystemPromptInputs<'_>) -> String {
          them off it is refused. Neither relaxes file or shell boundaries. MCP servers run outside \
          the sandbox. A refusal names the level the call needs.\n\n",
     );
+    prompt.push_str(WORKSPACE_SECTION);
     if one_shot {
         prompt.push_str("This run ends after your answer and cannot ask for approval.\n\n");
     }
@@ -1046,6 +1049,19 @@ pub(crate) fn build_system_prompt(inputs: SystemPromptInputs<'_>) -> String {
     prompt
 }
 
+/// The rules about the directories `[Environment context]` names, stated once here while the
+/// block carries only the values. meka's own directories are named by role, not by path: a read
+/// refused under them says so, naming the directory, so the model can tell that refusal from a
+/// missing file without the paths sitting in every session's prompt.
+const WORKSPACE_SECTION: &str = "## Workspace\n\n\
+    `[Environment context]` names your working directory, where the shell starts and relative \
+    paths resolve; your additional workspace directories, part of your workspace with the same \
+    rights, searched with it by default; and your additional readable directories, read-only, \
+    searched only when named. Below `unrestricted` a read reaches the workspace, the readable \
+    directories and the system directories (`/usr`, `/etc` and the like), or anywhere when the \
+    block says so. meka's own configuration and data directories are never readable; the skills \
+    store under the first is.\n\n";
+
 /// Build the per-turn `[Permission context]` block: the current level and the approvals switch.
 /// What a level allows is stated once in the system prompt, and the `[Available tools]` catalog
 /// lists every tool's required level, so the block stays two values long regardless of how many
@@ -1063,101 +1079,109 @@ pub(crate) fn build_permission_context(permission: Permission, approvals: bool) 
     format!("[Permission context]\nLevel: {permission}.{approvals}\n")
 }
 
-/// Build the per-turn environment context block (pwd, extra workspace roots, date). Returns an
-/// empty string at the `None` permission level so system info isn't leaked. The `cwd` argument is
-/// the agent's per-session working directory; passing it explicitly (rather than reading process
+/// What the scope lines describe: a session's or a worker's directories at its level, the values
+/// every door holds in its cells.
+pub(crate) struct ScopeLines<'a> {
+    pub(crate) permission: Permission,
+    pub(crate) cwd: &'a std::path::Path,
+    /// The additional workspace directories as held; the lines name the usable ones.
+    pub(crate) roots: &'a [std::path::PathBuf],
+    /// The additional readable directories, or `None` when reads reach everywhere.
+    pub(crate) readable: Option<&'a [std::path::PathBuf]>,
+    /// What the shell and `web_fetch` may reach; stated only when it is `none`.
+    pub(crate) network: crate::config::Network,
+}
+
+/// The lines that state a scope, in the environment block's own form: a capitalized key with its
+/// value on the line, and a list introduced by a sentence ending in a colon with one entry per
+/// line indented two spaces. One formatter for the block and for the spawn and follow-up result,
+/// so a parent reads its worker's scope in the words it reads its own.
+///
+/// Each heading is true at every level, which is what lets the form be one: the workspace is
+/// writable at `workspace`, read-only at `read` and searched at every level, and the readable
+/// directories are read at every level that confines reads. The workspace line is omitted when
+/// there is nothing beyond the working directory, since the model acts on nothing there, while
+/// the readable line says `none`, which tells it reads are confined and reach nothing beyond the
+/// workspace. The readable line is omitted at `unrestricted`, where nothing confines reads, and
+/// nothing is stated at `none`, where nothing reads. The system directories are stated nowhere
+/// here: they are the same on every turn, and the directories listed are what the model has to keep
+/// to. The network is stated only when it is cut off, since the host's network is what every
+/// session has unless told otherwise; at `unrestricted` the cut holds `web_fetch` alone, since
+/// nothing sandboxes the shell there, and the line says so.
+pub(crate) fn render_scope_lines(scope: &ScopeLines<'_>) -> String {
+    if scope.permission == Permission::None {
+        return String::new();
+    }
+    let mut lines = format!("Working directory: {}\n", scope.cwd.display());
+    let workspace = crate::workspace::additional_workspace_directories(scope.cwd, scope.roots);
+    if !workspace.is_empty() {
+        push_directory_list(&mut lines, "Additional workspace directories", &workspace);
+    }
+    if scope.permission != Permission::Unrestricted {
+        match scope.readable {
+            Some(readable) => {
+                push_directory_list(&mut lines, "Additional readable directories", readable);
+            }
+            None => lines.push_str("Additional readable directories: anywhere\n"),
+        }
+    }
+    if scope.network == crate::config::Network::None {
+        lines.push_str(if scope.permission == Permission::Unrestricted {
+            "Network: none (web_fetch)\n"
+        } else {
+            "Network: none (shell and web_fetch)\n"
+        });
+    }
+    lines
+}
+
+/// `heading: none` on one line, or the heading as a sentence over the entries.
+fn push_directory_list(lines: &mut String, heading: &str, directories: &[std::path::PathBuf]) {
+    if directories.is_empty() {
+        lines.push_str(&format!("{heading}: none\n"));
+        return;
+    }
+    lines.push_str(&format!("{heading}:\n"));
+    for directory in directories {
+        lines.push_str(&format!("  {}\n", directory.display()));
+    }
+}
+
+/// Build the per-turn environment context block: the scope lines and the date. Returns an empty
+/// string at the `None` permission level so system info isn't leaked. The `cwd` argument is the
+/// agent's per-session working directory; passing it explicitly (rather than reading process
 /// state) lets multiple sessions in one process report their own cwds correctly.
 ///
-/// `roots` are the workspace roots beyond `cwd` (`additionalDirectories` or `--writable-root`).
-/// Naming them is the whole point of tracking them: without this line the model has no way to learn
-/// the other folders exist, and would report a file it cannot find as absent rather than looking.
-/// Emits nothing when the list is empty, so single-root output is unchanged.
+/// `roots` are the additional workspace directories (an ACP client's `additionalDirectories`, or
+/// each `--additional-workspace-directory`) and `readable` the additional readable ones, or `None`
+/// when reads reach everywhere. Naming them is the whole point of tracking them: without these
+/// lines the model has no way to learn the other directories exist, and would report a file it
+/// cannot find as absent rather than looking.
 fn build_environment_context(
     permission: Permission,
     cwd: &std::path::Path,
     roots: &[std::path::PathBuf],
     readable: Option<&[std::path::PathBuf]>,
+    network: crate::config::Network,
 ) -> String {
     if permission == Permission::None {
         return String::new();
     }
 
     let mut context = String::from("[Environment context]\n");
-    context.push_str(&format!("Working directory: {}\n", cwd.display()));
-
-    if !roots.is_empty() {
+    context.push_str(&render_scope_lines(&ScopeLines {
+        permission,
+        cwd,
+        roots,
+        readable,
+        network,
+    }));
+    // The one platform whose shell cannot hold the boundary; the model is told rather than left
+    // to find out from a command that read what a tool refused.
+    if readable.is_some() && cfg!(windows) {
         context.push_str(
-            "Additional workspace roots (searched alongside the working directory; \
-             relative paths still resolve against the working directory):\n",
+            "On this platform the shell's reads are not confined; the file tools' are.\n",
         );
-        for root in roots {
-            context.push_str(&format!("  {}\n", root.display()));
-        }
-    }
-
-    // Named only at `workspace`, because only there does the answer constrain anything. Stating it
-    // at the other levels would be noise at best and wrong at worst: at `unrestricted` there is no
-    // boundary to describe, and at `read` nothing writes at all.
-    if permission == Permission::Workspace {
-        // The roots that will actually hold, recomputed rather than restated. The list above is
-        // what the session was asked for; one of those may be gone, be a file, be a masked system
-        // directory, or be contained by another, and the model was being told it could write to
-        // paths where the next write would be refused. Naming the boundary a second time is worth
-        // the duplication when the two lists can differ. Filesystem I/O on the turn path: one
-        // `canonicalize` plus one `metadata` per root, synchronously, at `workspace` only. That is
-        // microseconds against a local disk and bounded by the root count, which is one or two in
-        // practice, and it is the same call `WriteScope::confined_to` already makes on every
-        // single write, so a root on a wedged network mount stalls the write door long before it
-        // stalls this.
-        let writable = crate::workspace::usable_roots(
-            std::iter::once(cwd.to_path_buf()).chain(roots.iter().cloned()),
-        );
-        if writable.is_empty() {
-            context.push_str(
-                "No workspace root is currently writable. File and shell writes require an \
-                 existing, unmasked workspace root.\n",
-            );
-        } else {
-            context.push_str("File and shell writes are confined to these roots:\n");
-            for root in &writable {
-                context.push_str(&format!("  {}\n", root.display()));
-            }
-            // Deliberately not "the sandbox refuses it": whether one exists is a per-platform,
-            // per-config question this function cannot answer, and when the answer is no the shell
-            // is refused outright rather than run unconfined. Stating the outcome covers both.
-            if readable.is_none() {
-                context.push_str(
-                    "Reads may reach outside these roots, except meka's private directories.\n",
-                );
-            }
-        }
-    }
-
-    // Stated at every level that confines, since `read` reads and the boundary binds it as much
-    // as `workspace`. The system directories are named in a word rather than listed: they are the
-    // same on every turn, and the roots are what the model has to keep to.
-    if let Some(readable) = readable {
-        if readable.is_empty() {
-            context.push_str(
-                "No readable root currently resolves: file and shell reads reach only the \
-                 system directories until one does.\n",
-            );
-        } else {
-            context.push_str(
-                "File and shell reads are confined to these roots, and to the system \
-                 directories (`/usr`, `/etc` and the like):\n",
-            );
-            for root in readable {
-                context.push_str(&format!("  {}\n", root.display()));
-            }
-        }
-        // The one platform whose shell cannot hold the boundary; the model is told rather than
-        // left to find out from a command that read what a tool refused.
-        if cfg!(windows) {
-            context.push_str(
-                "On this platform the shell's reads are not confined; the file tools' are.\n",
-            );
-        }
     }
 
     let now = chrono::Local::now().to_rfc2822();
@@ -1314,9 +1338,11 @@ pub(crate) struct TurnContext<'a> {
     pub(crate) one_shot: bool,
     pub(crate) cwd: &'a std::path::Path,
     pub(crate) roots: &'a [std::path::PathBuf],
-    /// The roots reads are confined to at this level, the session's own without the platform's
-    /// paths, or `None` when reads reach everywhere.
+    /// The directories reads reach beyond the workspace at this level, or `None` when reads reach
+    /// everywhere.
     pub(crate) readable: Option<&'a [std::path::PathBuf]>,
+    /// What the shell and `web_fetch` may reach.
+    pub(crate) network: crate::config::Network,
     pub(crate) world_state: &'a str,
     pub(crate) budget: Option<ContextBudget>,
     /// `[session].turn_retention`, for the `[Retention]` section that dates where the record
@@ -1344,6 +1370,7 @@ pub(crate) fn build_turn_context(context: TurnContext<'_>) -> String {
         cwd,
         roots,
         readable,
+        network,
         world_state,
         budget,
         turn_retention,
@@ -1385,7 +1412,7 @@ pub(crate) fn build_turn_context(context: TurnContext<'_>) -> String {
         sections.push(render_background_section(background));
     }
 
-    let environment_context = build_environment_context(permission, cwd, roots, readable);
+    let environment_context = build_environment_context(permission, cwd, roots, readable, network);
     if !environment_context.is_empty() {
         sections.push(environment_context);
     }
@@ -4030,6 +4057,7 @@ mod tests {
             cwd: std::path::Path::new("."),
             roots: &[],
             readable: None,
+            network: crate::config::Network::Host,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -4052,6 +4080,7 @@ mod tests {
             cwd: std::path::Path::new("."),
             roots: &[],
             readable: None,
+            network: crate::config::Network::Host,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -4077,6 +4106,7 @@ mod tests {
             cwd: std::path::Path::new("."),
             roots: &[],
             readable: None,
+            network: crate::config::Network::Host,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -4184,9 +4214,7 @@ mod tests {
     fn the_system_prompt_names_the_workspace_boundary() {
         let prompt = build_system_prompt(SystemPromptInputs::for_test(true, None));
         assert!(
-            prompt.contains(
-                "`workspace`: file and shell writes stay inside the listed workspace roots"
-            ),
+            prompt.contains("`workspace`: file and shell writes stay inside the workspace"),
             "{prompt}"
         );
         assert!(prompt.contains("cannot be confined"), "{prompt}");
@@ -4356,6 +4384,7 @@ mod tests {
             cwd: std::path::Path::new("."),
             roots: &[],
             readable: None,
+            network: crate::config::Network::Host,
             world_state: "",
             budget: None,
             turn_retention: Some(window),
@@ -4375,6 +4404,7 @@ mod tests {
                 cwd: std::path::Path::new("."),
                 roots: &[],
                 readable: None,
+                network: crate::config::Network::Host,
                 world_state: "",
                 budget: None,
                 turn_retention: None,
@@ -4386,41 +4416,69 @@ mod tests {
         );
     }
 
-    /// With reads confined the block names the readable roots at every level that reads, says
-    /// nothing about reads reaching outside, and says when no root resolves.
+    /// The block names the additional readable directories at every level that confines reads:
+    /// the list when there is one, `none` when nothing beyond the workspace resolves, `anywhere`
+    /// when reads are not confined, and no line at all at `unrestricted`.
     #[test]
-    fn the_environment_block_names_the_readable_roots_when_reads_are_confined() {
+    fn the_environment_block_names_the_additional_readable_directories() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cwd = crate::workspace::canonical_for_test(temp.path());
+        let reference = cwd.parent().expect("parent").join("reference");
         let roots: Vec<std::path::PathBuf> = vec![];
-        let readable = vec![cwd.clone()];
+        let readable = vec![reference.clone()];
         for level in [Permission::Read, Permission::Workspace] {
-            let context = build_environment_context(level, &cwd, &roots, Some(&readable));
+            let context = build_environment_context(
+                level,
+                &cwd,
+                &roots,
+                Some(&readable),
+                crate::config::Network::Host,
+            );
             assert!(
-                context.contains("File and shell reads are confined to these roots"),
+                context.contains(&format!(
+                    "Additional readable directories:\n  {}\n",
+                    reference.display()
+                )),
                 "{level}: {context}"
             );
-            assert!(
-                context.contains(&format!("  {}\n", cwd.display())),
-                "{context}"
-            );
-            assert!(!context.contains("Reads may reach outside"), "{context}");
             assert_eq!(
                 context.contains("the shell's reads are not confined"),
                 cfg!(windows),
                 "{context}"
             );
         }
-        let open = build_environment_context(Permission::Workspace, &cwd, &roots, None);
+        let open = build_environment_context(
+            Permission::Workspace,
+            &cwd,
+            &roots,
+            None,
+            crate::config::Network::Host,
+        );
         assert!(
-            open.contains("Reads may reach outside these roots"),
+            open.contains("Additional readable directories: anywhere\n"),
             "{open}"
         );
-        assert!(!open.contains("reads are confined"), "{open}");
-        let none = build_environment_context(Permission::Read, &cwd, &roots, Some(&[]));
+        let none = build_environment_context(
+            Permission::Read,
+            &cwd,
+            &roots,
+            Some(&[]),
+            crate::config::Network::Host,
+        );
         assert!(
-            none.contains("No readable root currently resolves"),
+            none.contains("Additional readable directories: none\n"),
             "{none}"
+        );
+        let unrestricted = build_environment_context(
+            Permission::Unrestricted,
+            &cwd,
+            &roots,
+            None,
+            crate::config::Network::Host,
+        );
+        assert!(
+            !unrestricted.contains("Additional readable directories"),
+            "{unrestricted}"
         );
     }
 
@@ -4454,8 +4512,13 @@ mod tests {
 
     #[test]
     fn environment_context_names_the_working_directory_and_the_date() {
-        let context =
-            build_environment_context(Permission::Read, std::path::Path::new("."), &[], None);
+        let context = build_environment_context(
+            Permission::Read,
+            std::path::Path::new("."),
+            &[],
+            None,
+            crate::config::Network::Host,
+        );
         assert!(context.contains("[Environment context]"));
         assert!(context.contains("Working directory:"));
         assert!(context.contains("Date:"));
@@ -4463,50 +4526,73 @@ mod tests {
 
     #[test]
     fn environment_context_none_mode() {
-        let context =
-            build_environment_context(Permission::None, std::path::Path::new("."), &[], None);
+        let context = build_environment_context(
+            Permission::None,
+            std::path::Path::new("."),
+            &[],
+            None,
+            crate::config::Network::Host,
+        );
         assert!(context.is_empty());
     }
 
-    /// Single-root output must be untouched: every screen, HTTP, and single-folder ACP session goes
-    /// through here, and an extra line would change the prompt for all of them.
+    /// Single-directory output carries no workspace line: every screen, HTTP, and single-folder
+    /// ACP session goes through here, and a line saying there is nothing would cost every turn
+    /// of every one of them for a fact the model acts on nowhere.
     #[test]
-    fn environment_context_omits_roots_when_empty() {
-        let context =
-            build_environment_context(Permission::Read, std::path::Path::new("/work"), &[], None);
-        assert!(context.contains("Working directory: /work"));
-        assert!(!context.contains("Additional workspace roots"));
-    }
-
-    /// Naming the extra roots is the point of tracking them: without this the model cannot learn
-    /// the other folders exist and reports files in them as missing.
-    #[test]
-    fn environment_context_names_additional_roots() {
-        let roots = vec![
-            std::path::PathBuf::from("/work/shared"),
-            std::path::PathBuf::from("/work/docs"),
-        ];
+    fn environment_context_omits_the_workspace_line_when_there_is_nothing_to_list() {
         let context = build_environment_context(
             Permission::Read,
-            std::path::Path::new("/work/main"),
-            &roots,
+            std::path::Path::new("/work"),
+            &[],
             None,
+            crate::config::Network::Host,
         );
-        assert!(context.contains("Working directory: /work/main"));
-        assert!(context.contains("Additional workspace roots"));
-        assert!(context.contains("/work/shared"));
-        assert!(context.contains("/work/docs"));
+        assert!(context.contains("Working directory: /work\n"));
+        assert!(
+            !context.contains("Additional workspace directories"),
+            "{context}"
+        );
     }
 
-    /// At `workspace` the block must name the boundary that will actually hold, which is not the
-    /// same list as the roots the session was handed.
-    ///
-    /// The requested list is echoed unchanged for search, so this checks the *second* list: a root
-    /// that does not resolve is absent from it, and a root contained by the cwd has collapsed into
-    /// it. Telling the model it may write somewhere the next write is refused is a wrong answer
-    /// that costs a wasted turn and reads to the user as a broken boundary.
+    /// Naming the additional directories is the point of tracking them: without this the model
+    /// cannot learn the other directories exist and reports files in them as missing.
     #[test]
-    fn at_workspace_the_environment_names_only_the_roots_that_will_hold() {
+    fn environment_context_names_the_additional_workspace_directories() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = crate::workspace::canonical_for_test(temp.path());
+        let cwd = base.join("main");
+        let shared = base.join("shared");
+        let docs = base.join("docs");
+        for directory in [&cwd, &shared, &docs] {
+            std::fs::create_dir_all(directory).expect("mkdir");
+        }
+        let roots = vec![shared.clone(), docs.clone()];
+        let context = build_environment_context(
+            Permission::Read,
+            &cwd,
+            &roots,
+            None,
+            crate::config::Network::Host,
+        );
+        assert!(context.contains(&format!("Working directory: {}\n", cwd.display())));
+        assert!(
+            context.contains(&format!(
+                "Additional workspace directories:\n  {}\n  {}\n",
+                shared.display(),
+                docs.display()
+            )),
+            "{context}"
+        );
+    }
+
+    /// The block names the directories that will actually hold, which is not the same list as
+    /// the directories the session was handed: one that does not resolve is absent, and one
+    /// contained by the cwd has collapsed into it. Telling the model it may write somewhere the
+    /// next write is refused is a wrong answer that costs a wasted turn and reads to the user as
+    /// a broken boundary. The same lines at every level, since the workspace is one place.
+    #[test]
+    fn the_environment_names_only_the_directories_that_will_hold() {
         let temp = tempfile::tempdir().expect("temp dir");
         let cwd = crate::workspace::canonical_for_test(temp.path());
         let nested = cwd.join("nested");
@@ -4514,37 +4600,22 @@ mod tests {
         let missing = cwd.join("was-deleted");
 
         let roots = vec![nested.clone(), missing.clone()];
-        let context = build_environment_context(Permission::Workspace, &cwd, &roots, None);
-
-        let confined = context
-            .split_once("File and shell writes are confined to these roots")
-            .expect("workspace boundary is named")
-            .1;
-        assert!(
-            confined.contains(&cwd.display().to_string()),
-            "the cwd is always writable: {confined}"
-        );
-        assert!(
-            !confined.contains(&missing.display().to_string()),
-            "a root that does not resolve must not be listed as writable: {confined}"
-        );
-        assert!(
-            !confined.contains(&nested.display().to_string()),
-            "a root contained by the cwd has collapsed into it: {confined}"
-        );
-        assert!(
-            !context.contains("by the sandbox"),
-            "whether a sandbox exists is a per-platform, per-config question this block cannot \
-             answer: {context}"
-        );
-
-        // Every other level leaves the boundary unstated, which is what keeps the prompt identical
-        // for the sessions that have no boundary to describe.
-        for quiet in [Permission::Read, Permission::Unrestricted, Permission::None] {
-            let context = build_environment_context(quiet, &cwd, &roots, None);
+        for level in [
+            Permission::Read,
+            Permission::Workspace,
+            Permission::Unrestricted,
+        ] {
+            let context =
+                build_environment_context(level, &cwd, &roots, None, crate::config::Network::Host);
             assert!(
-                !context.contains("Writes are confined"),
-                "{quiet} must not describe a write boundary"
+                !context.contains("Additional workspace directories"),
+                "{level}: a directory that does not resolve must not be listed, and one \
+                 contained by the cwd has collapsed into it: {context}"
+            );
+            assert!(
+                !context.contains("by the sandbox"),
+                "whether a sandbox exists is a per-platform, per-config question this block \
+                 cannot answer: {context}"
             );
         }
     }
@@ -4559,6 +4630,7 @@ mod tests {
             cwd: std::path::Path::new("."),
             roots: &[],
             readable: None,
+            network: crate::config::Network::Host,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -4587,6 +4659,7 @@ mod tests {
             cwd: std::path::Path::new("."),
             roots: &[],
             readable: None,
+            network: crate::config::Network::Host,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -4707,6 +4780,7 @@ mod tests {
             cwd: std::path::Path::new("."),
             roots: &[],
             readable: None,
+            network: crate::config::Network::Host,
             world_state: "[Skills]\nnone",
             budget: None,
             turn_retention: None,
@@ -4732,6 +4806,7 @@ mod tests {
             cwd: std::path::Path::new("."),
             roots: &[],
             readable: None,
+            network: crate::config::Network::Host,
             world_state: "",
             budget: Some(ContextBudget {
                 used: 42_000,
@@ -4757,6 +4832,7 @@ mod tests {
             cwd: std::path::Path::new("."),
             roots: &[],
             readable: None,
+            network: crate::config::Network::Host,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -4778,6 +4854,7 @@ mod tests {
             cwd: std::path::Path::new("."),
             roots: &[],
             readable: None,
+            network: crate::config::Network::Host,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -4898,5 +4975,31 @@ mod tests {
             named.starts_with("[Message from k4yt3x, arrived "),
             "{named}"
         );
+    }
+
+    /// The network line is stated only when the network is cut off; at `unrestricted`, where
+    /// nothing confines the shell, it names the tool the cut still withholds.
+    #[test]
+    fn the_scope_lines_state_the_network_only_when_it_is_cut_off() {
+        let cwd = std::path::Path::new("/work");
+        let lines = |permission, network| {
+            render_scope_lines(&ScopeLines {
+                permission,
+                cwd,
+                roots: &[],
+                readable: None,
+                network,
+            })
+        };
+        assert!(
+            lines(Permission::Workspace, crate::config::Network::None)
+                .ends_with("Network: none (shell and web_fetch)\n")
+        );
+        assert!(!lines(Permission::Workspace, crate::config::Network::Host).contains("Network:"));
+        assert!(
+            lines(Permission::Unrestricted, crate::config::Network::None)
+                .ends_with("Network: none (web_fetch)\n")
+        );
+        assert!(lines(Permission::Read, crate::config::Network::None).contains("Network: none"));
     }
 }

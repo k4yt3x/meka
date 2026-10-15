@@ -939,7 +939,8 @@ Controls which permission levels are reachable at runtime and which level the se
 | `default` | No | Level the session starts at. One of `"none"`, `"read"`, `"workspace"`, `"unrestricted"`. Default `"read"`. Overridden by `--permission` and `MEKA_PERMISSION`. |
 | `enabled` | No | List of levels that can be reached at runtime via `/permission` and Shift+Tab. Default `["none", "read", "workspace", "unrestricted"]`. Disabled levels are skipped during Shift+Tab cycling and refused by `/permission` with an error. |
 | `approvals` | No | Whether a new session starts with [approvals](../usage/permissions.md#approvals) on: a tool call needing more than the session's level is put to you rather than refused. Default `false`. A session records its own switch afterwards, moved by `/approvals`, `PATCH /v1/sessions/{id}` or the ACP `approvals` config option. |
-| `confine_reads` | No | Whether reads below `unrestricted` are confined to the session's roots and the directories a command needs to run, the way writes are confined to the roots at `workspace`. Default `false`. Instance-wide, read at startup: every session this process runs is bound by it, and `unrestricted` is the per-session escape. With it off, a parent can still confine a sub-agent's reads through `agent_spawn`'s `readable_roots`. See [The read boundary](../usage/permissions.md#the-read-boundary). |
+| `confine_reads` | No | Whether a root session's reads below `unrestricted` are confined to its workspace, its additional readable directories and the directories a command needs to run, the way writes are confined to the workspace at `workspace`. Default `false`. Instance-wide, read at startup: every root session this process runs is bound by it, and `unrestricted` is the per-session escape. A sub-agent's reads are confined to its scope whatever this says. See [The read boundary](../usage/permissions.md#the-read-boundary). |
+| `network` | No | What a confined command and `web_fetch` may reach: `"host"`, the machine's network, or `"none"`. Default `"host"`. With `"none"`, Bubblewrap unshares the network namespace, Landlock refuses every TCP bind and connect (UDP has no Landlock right and stays open), `sandbox-exec` withholds its outbound rule, and `web_fetch`, which runs in the meka process where no sandbox reaches, is withheld from every session and listed by `meka tool list` as `disabled`. Windows has no mechanism for a command and warns once at startup; the tool is withheld there too. An MCP server is a separate process outside the sandbox and keeps its own network: a session that must not reach the network is also given no server that can, through `[[mcp.servers]]` or a sub-agent's `allow_servers`. `unrestricted` runs the shell unsandboxed, so the setting holds `web_fetch` alone there, and the scope lines say `Network: none (web_fetch)`. A sub-agent holds its parent's setting unless its spawn narrows it with [`network`](../tools/overview.md#agent_spawn), and its scope lines say `Network: none (shell and web_fetch)` when it is cut off. A boundary like `confine_reads`, reaching the in-process tool and the sandboxed shell alike, which is why it lives here and not under `[shell]`. |
 
 A level meka does not have is refused at parse, with the line. An `enabled` list that names nothing falls back to `read` alone, with a warning, rather than to the default set, so an empty list cannot widen authority. If `default` is not in `enabled`, meka logs a warning and falls back to `read` if it's enabled, otherwise the lowest enabled level (in `none → read → workspace → unrestricted` order). Same behavior if `--permission` or `MEKA_PERMISSION` selects a disabled level: meka warns and starts at the configured default rather than refusing to launch.
 
@@ -949,6 +950,7 @@ default = "read"
 enabled = ["none", "read", "workspace", "unrestricted"]
 approvals = true     # ask me about anything above the level instead of refusing it
 confine_reads = true # reads stay within the roots, as writes do at workspace
+network = "none"     # confined commands and web_fetch are cut off the network
 ```
 
 ## `[shell]`
@@ -991,15 +993,15 @@ sandbox = true
 sandbox_backend = "bubblewrap"  # or "landlock", or "bubblewrap-landlock" to require the layer
 ```
 
-### `shell.readable_paths`
+### `shell.additional_readable_directories`
 
-Directories every confined command may read beyond the system directories, wherever reads are confined: with [`permissions.confine_reads`](#permissions) on, and for a sub-agent whose spawn confined them. The system directories are where the operating system keeps the programs, libraries and configuration a command needs to run at all, and the list is deliberately system-level: on Linux `/bin`, `/sbin`, `/usr`, `/lib`, `/lib32`, `/lib64`, `/etc`, `/proc`, `/dev`, `/nix/store` and `/run/current-system/sw`; on macOS `/bin`, `/sbin`, `/usr`, `/etc`, `/System`, `/Library/Apple`, `/Library/Preferences`, `/Library/Filesystems/NetFSPlugins`, `/var/db`, `/opt/homebrew`, `/Library/Developer` and `/dev`, plus the active developer directory `xcode-select` records, since the developer commands in `/usr/bin` are stubs that run the real binaries from there. Each is taken only where it exists. The skill roots [`[skills].extra_paths`](#skills) names are readable too. Add here what else this machine keeps system software under: `/opt`, `/snap`, a toolchain outside the home directory. An entry is warned about and dropped when it does not resolve, when it is relative, or when it is a directory the sandbox masks (`/tmp`, `/run`, the runtime directory, the filesystem root, meka's own directories), since Bubblewrap binds the readable paths after its masks and `/run` named here would hand the session bus back to a confined command. Never in effect on Windows, where the shell's reads are not confined.
+Directories every confined command may read beyond the system directories, wherever reads are confined: with [`permissions.confine_reads`](#permissions) on, and for every sub-agent, whose reads its scope confines. Additional beyond the system directories, as the flag [`--additional-readable-directory`](./cli-options.md#--additional-readable-directory-dir) is per run. The system directories are where the operating system keeps the programs, libraries and configuration a command needs to run at all, and the list is deliberately system-level: on Linux `/bin`, `/sbin`, `/usr`, `/lib`, `/lib32`, `/lib64`, `/etc`, `/proc`, `/dev`, `/nix/store` and `/run/current-system/sw`; on macOS `/bin`, `/sbin`, `/usr`, `/etc`, `/System`, `/Library/Apple`, `/Library/Preferences`, `/Library/Filesystems/NetFSPlugins`, `/var/db`, `/opt/homebrew`, `/Library/Developer` and `/dev`, plus the active developer directory `xcode-select` records, since the developer commands in `/usr/bin` are stubs that run the real binaries from there. Each is taken only where it exists. The skill directories [`[skills].additional_directories`](#skills) names are readable too. Add here what else this machine keeps system software under: `/opt`, `/snap`, a toolchain outside the home directory. An entry is warned about and dropped when it does not resolve, when it is relative, or when it is a directory the sandbox masks (`/tmp`, `/run`, the runtime directory, the filesystem root, meka's own directories), since Bubblewrap binds the readable directories after its masks and `/run` named here would hand the session bus back to a confined command. Never in effect on Windows, where the shell's reads are not confined.
 
 Default: `[]`
 
 ```toml
 [shell]
-readable_paths = ["/opt", "/snap"]
+additional_readable_directories = ["/opt", "/snap"]
 ```
 
 ## `[tools]`: built-in tool filters
@@ -1093,7 +1095,7 @@ Controls the skill store. See the [Skills](../usage/skills.md) guide.
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Register `skill_read` / `skill_search` and render the skills index |
 | `agent_managed` | bool | `false` | Additionally register `skill_write` / `skill_delete` |
-| `extra_paths` | array | `[]` | Additional directories to scan, read-only |
+| `additional_directories` | array | `[]` | Directories to scan beyond meka's own store, read-only |
 
 ```toml
 [skills]
@@ -1104,11 +1106,11 @@ Setting `enabled = false` keeps every skill tool's schema out of every request a
 
 `agent_managed = true` lets the agent author its own skills. It is off by default because you normally curate that store yourself; it exists for a long-running agent that dispatches sub-agents, where a skill is the only artifact that both survives the session and can be handed to a sub-agent as its task. Sub-agents never receive the authoring tools whatever this is set to. See [Letting the agent manage skills](../usage/skills.md#letting-the-agent-manage-skills).
 
-`extra_paths` adds directories to the scan. They are strictly read-only: meka never creates them and never writes into them, so an entry that does not exist is simply skipped and leaves nothing behind. A leading `~` is expanded. Where reads are confined, these directories stay readable, as meka's own skills store does, so a skill's bundled files can be read; see [the read boundary](../usage/permissions.md#the-read-boundary).
+`additional_directories` adds directories to the scan beyond meka's own store. They are strictly read-only: meka never creates them and never writes into them, so an entry that does not exist is simply skipped and leaves nothing behind. A leading `~` is expanded. Where reads are confined, these directories stay readable, as meka's own skills store does, so a skill's bundled files can be read; see [the read boundary](../usage/permissions.md#the-read-boundary).
 
 ```toml
 [skills]
-extra_paths = ["~/.agents/skills"]
+additional_directories = ["~/.agents/skills"]
 ```
 
 `~/.agents/skills` is the cross-client convention, so pointing at it makes skills installed by other Agent Skills clients visible here. It is not a default: reading a directory outside meka's own namespace is your call. meka's own store is searched first and wins a name collision. There is no automatic project-level scan, for the same reason meka reads nothing from the working directory that config does not name, the files under [`[instructions]`](#instructions) included; name the path here if you want a project's skills read. See [Reading skills from other directories](../usage/skills.md#reading-skills-from-other-directories).
@@ -1333,6 +1335,7 @@ Settings for the HTTP client `web_fetch` uses. All keys are optional; unset fiel
 | `min_tls_version` | string | unset (reqwest default) | Minimum TLS version. Accepts `"1.0"`, `"1.1"`, `"1.2"`, `"1.3"`. Unknown values log a warning and fall through. Note: the bundled rustls backend supports only TLS 1.2 and 1.3; `"1.0"` / `"1.1"` will surface a build error. |
 | `danger_accept_invalid_certs` | bool | `false` | **DANGEROUS.** Disable TLS certificate validation entirely. Emits a `warn!` on every startup when enabled. Only use against trusted local dev servers. |
 | `danger_accept_invalid_hostnames` | bool | `false` | **DANGEROUS.** Accept certificates whose hostname doesn't match. Emits a `warn!` on every startup when enabled. Only use against trusted local dev servers. |
+| `refuse_private_destinations` | bool | `false` | Refuse a fetch whose destination is a loopback, private, link-local, carrier-grade NAT or unspecified address, judged on every connection: the URL as given, every redirect hop, and every address a host name resolves to, so a name that answers differently twice cannot slip past. Off by default, since a local service is often exactly what a fetch is for. With `proxy` set, the proxy resolves the target and the guard sees only the proxy's own name, which it judges too: a proxy on this machine is named by its address, `127.0.0.1`, not `localhost`. |
 
 ### Example: corporate proxy with a private CA
 

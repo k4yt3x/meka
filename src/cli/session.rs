@@ -349,7 +349,7 @@ async fn show_session(
             "profile",
             crate::text::sanitize_to_line(&session.profile, usize::MAX),
         ),
-        ("cwd", match &session.cwd {
+        ("working directory", match &session.cwd {
             Some(cwd) => crate::text::sanitize_to_line(&cwd.to_string_lossy(), usize::MAX),
             None => "-".to_string(),
         }),
@@ -990,11 +990,11 @@ mod tests {
                     "parent_id": null,
                     "created_at": "2020-01-01T00:00:00Z",
                     "updated_at": "2020-01-01T00:00:00Z",
-                    "cwd": null,
+                    "working_directory": null,
                     "permission": null,
                     "approvals": false,
                     "capabilities_json": null,
-                    "additional_roots": [],
+                    "additional_workspace_directories": [],
                     "subagent_spec_json": null,
                     "profile": "work",
                     "stats": crate::stats::SessionStatsSnapshot::default(),

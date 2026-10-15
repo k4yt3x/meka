@@ -8,7 +8,7 @@ Skills are normally authored by you. An agent can also be allowed to write its o
 
 ## How skills work
 
-- Skills live in `~/.config/meka/skills/` (platform-specific config dir). Additional read-only directories can be added with [`extra_paths`](#reading-skills-from-other-directories).
+- Skills live in `~/.config/meka/skills/` (platform-specific config dir). Additional read-only directories can be added with [`additional_directories`](#reading-skills-from-other-directories).
 - Each skill is a directory: `skills/<name>/SKILL.md`. A lowercase `skill.md` is accepted too.
 - Any entry whose name begins with `.` is skipped at discovery. This covers VCS metadata (`.git`), editor/IDE state (`.vscode`, `.idea`), filesystem artifacts (`.DS_Store`, `.Trash`), and any other dotfile or dotdir that may sit alongside your skills.
 - `SKILL.md` starts with a YAML frontmatter block declaring the skill's metadata, followed by Markdown body content.
@@ -151,22 +151,22 @@ This is the only directory meka ever *writes* to. It is created the first time s
 
 ## Reading skills from other directories
 
-`[skills] extra_paths` adds directories to scan. They are **read-only**: meka never creates them and never writes into them, so listing one costs nothing if it does not exist.
+`[skills] additional_directories` adds directories to scan. They are **read-only**: meka never creates them and never writes into them, so listing one costs nothing if it does not exist.
 
 ```toml
 [skills]
-extra_paths = ["~/.agents/skills", "~/src/team-skills/skills"]
+additional_directories = ["~/.agents/skills", "~/src/team-skills/skills"]
 ```
 
 `~` is expanded. A relative path resolves against the process working directory.
 
 The default is empty. `~/.agents/skills` has emerged as a cross-client convention, so pointing at it makes skills installed by other Agent Skills clients visible to meka, but whether to read a directory outside meka's own namespace is your decision rather than a default.
 
-**Precedence.** meka's own store is searched first, then each `extra_paths` entry in order. When two directories hold the same skill name, the first wins and the shadowed one is logged.
+**Precedence.** meka's own store is searched first, then each `additional_directories` entry in order. When two directories hold the same skill name, the first wins and the shadowed one is logged.
 
-**Writes never follow.** `skill_write`, `skill_delete`, `meka skill add`, `meka skill remove`, `PUT /v1/skills/{name}` and `DELETE /v1/skills/{name}` all target meka's own store. Asked to write a name that resolves to a skill in a read-only root, they refuse, because writing would create a second copy that shadows the original instead of changing it; the refusal says to edit or remove it where it lives, and the CLI names the directory. This holds whether or not the file there is valid: a directory whose `SKILL.md` does not parse still claims that name, and shadowing a broken skill is the case worth refusing hardest, since nothing then reports the original at all.
+**Writes never follow.** `skill_write`, `skill_delete`, `meka skill add`, `meka skill remove`, `PUT /v1/skills/{name}` and `DELETE /v1/skills/{name}` all target meka's own store. Asked to write a name that resolves to a skill in a read-only directory, they refuse, because writing would create a second copy that shadows the original instead of changing it; the refusal says to edit or remove it where it lives, and the CLI names the directory. This holds whether or not the file there is valid: a directory whose `SKILL.md` does not parse still claims that name, and shadowing a broken skill is the case worth refusing hardest, since nothing then reports the original at all.
 
-There is deliberately no automatic project-level scan. meka reads nothing from the working directory that config does not name, [instructions](./instructions.md#reading-a-projects-agentsmd) included, because a cloned repository that could silently add instructions to the agent's context is exactly the trust it never extends. Name a project's skills directory in `extra_paths` if you want it read.
+There is deliberately no automatic project-level scan. meka reads nothing from the working directory that config does not name, [instructions](./instructions.md#reading-a-projects-agentsmd) included, because a cloned repository that could silently add instructions to the agent's context is exactly the trust it never extends. Name a project's skills directory in `additional_directories` if you want it read.
 
 ## Listing skills
 
@@ -179,7 +179,7 @@ deploy-service  Jane Doe  2         no        How to deploy the service. Use whe
 borrowed        -         5         yes       A skill another client installed.
 ```
 
-`External` is `yes` for a skill found under [`extra_paths`](#reading-skills-from-other-directories) rather than in meka's own store. It is always present, even when nothing is external, so a script's field offsets do not shift with the store's contents.
+`External` is `yes` for a skill found under [`additional_directories`](#reading-skills-from-other-directories) rather than in meka's own store. It is always present, even when nothing is external, so a script's field offsets do not shift with the store's contents.
 
 `--paths` adds the on-disk `Path`, which is how you find out *where* an external skill lives. Nothing else goes in this table: `license`, `compatibility`, `allowed-tools`, `version` and arbitrary `metadata` keys are per-skill detail, and `meka skill get <name>` prints all of them.
 
@@ -336,7 +336,7 @@ Notes on how it behaves:
   says so rather than claiming a change that did not happen.
 - A file that exists at that name but is not a valid skill is **refused, not overwritten**. Such a
   file is invisible everywhere else in meka, so nothing could tell you what was about to be lost.
-- A skill from a read-only [`extra_paths`](#reading-skills-from-other-directories) root is
+- A skill from a read-only [`additional_directories`](#reading-skills-from-other-directories) directory is
   **refused** by both tools, since writing would shadow it rather than change it.
 - A hand-written skill in meka's own store is not protected from being rewritten. The flag being off
   by default, and your config directory being in version control, is the safety net for that case.

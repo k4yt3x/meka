@@ -51,7 +51,7 @@ Every `<SESSION_ID>` is a full id or any unique prefix of one, which is what the
 
 ```bash
 meka session list [-n <LIMIT>] [--include-children] [--format <FORMAT>]   # default limit: 20; sub-agent sessions hidden unless asked
-meka session show <SESSION_ID> [--format <FORMAT>]    # full id, cwd, permission, title
+meka session show <SESSION_ID> [--format <FORMAT>]    # full id, working directory, permission, title
 meka session export <SESSION_ID> [-o <OUTPUT>] [--format <FORMAT>]   # markdown (default) or json; -o - prints to stdout
 meka session import <INPUT>                           # a JSON export; - reads stdin
 meka session fork <SESSION_ID>                        # prints the copy's id
@@ -250,41 +250,58 @@ the default. Passing `--permission` alongside `-c` / `-r` repins it, the way `--
 level that is no longer in `[permissions].enabled` is not granted on resume: the session drops to
 the configured default with a warning.
 
-### `--writable-root <PATH>`
+### `--additional-workspace-directory <DIR>`
 
-Add a directory to the workspace, so writes may land there at `workspace` permission. Repeatable.
-The working directory is always a root; this adds to it.
+Add a directory to the workspace beside the working directory, with the working directory's
+rights: writable at `workspace`, read-only at `read`, searched with it by the search tools.
+Repeatable. The working directory is always part of the workspace; this adds to it.
 
 ```bash
-meka --permission workspace --writable-root ../shared-assets --writable-root /srv/build
+meka --permission workspace --additional-workspace-directory ../shared-assets --additional-workspace-directory /srv/build
 ```
 
-Deliberately a flag rather than a config key: which folders this run may write is a per-run scope,
-like the working directory itself, not a preference to persist.
+Deliberately a flag rather than a config key: which directories this run works in is a per-run
+scope, like the working directory itself, not a preference to persist.
 
 A path that does not resolve at startup is reported as a warning and kept, so a build directory that
-does not exist yet becomes a root the moment it does. A path that is not a directory, or a system
-directory the sandbox masks, is refused with a warning: neither can be expressed as a boundary by
-every backend.
+does not exist yet joins the workspace the moment it does. A path that is not a directory, or a
+system directory the sandbox masks, is refused with a warning: neither can be expressed as a boundary
+by every backend.
 
 The masked set is the filesystem root itself plus `/proc`, `/dev`, `/sys`, `/run`, `/tmp` and
-`/var/tmp`, and `/run/user` and `$XDG_RUNTIME_DIR` as whole subtrees. A root is refused when it *is*
-one of these and when it is an **ancestor** of one, but not when it is merely underneath: a root
-under one of these is usually fine and refusing it would be a real loss, since
-`/run/media/$USER/drive` is an ordinary external disk. The ancestor half is why `--writable-root
-/var` is refused, and it is also why `--writable-root ~` is refused on WSL and on minimal window
-managers, where `$XDG_RUNTIME_DIR` lives under `$HOME` and so binding `$HOME` would hand the session
-bus back. `/tmp` and `/var/tmp` are in the set because
-Bubblewrap masks them with a tmpfs and then binds the requested root back over it, last mount
-winning: binding `/tmp/work` restores just that directory, but binding `/tmp` restores the entire
-host `/tmp` including every X11, D-Bus and tmux socket in it, which is a route straight back out of
-the sandbox. The cost is that a session started with `cd /tmp` has no write boundary, which is the
-safe direction to fail.
+`/var/tmp`, and `/run/user` and `$XDG_RUNTIME_DIR` as whole subtrees. A directory is refused when
+it *is* one of these and when it is an **ancestor** of one, but not when it is merely underneath:
+a directory under one of these is usually fine and refusing it would be a real loss, since
+`/run/media/$USER/drive` is an ordinary external disk. The ancestor half is why
+`--additional-workspace-directory /var` is refused, and it is also why
+`--additional-workspace-directory ~` is refused on WSL and on minimal window managers, where
+`$XDG_RUNTIME_DIR` lives under `$HOME` and so binding `$HOME` would hand the session bus back.
+`/tmp` and `/var/tmp` are in the set because Bubblewrap masks them with a tmpfs and then binds the
+requested directory back over it, last mount winning: binding `/tmp/work` restores just that
+directory, but binding `/tmp` restores the entire host `/tmp` including every X11, D-Bus and tmux
+socket in it, which is a route straight back out of the sandbox. The cost is that a session
+started with `cd /tmp` has no write boundary, which is the safe direction to fail.
 
-The flag reaches the interactive screen, one-shot runs, and ACP sessions. It does **not** reach sessions created
-through `POST /v1/sessions`, which are single-root by design, and therefore does not reach a
-scheduled turn under `meka serve` either: those run in the session the job belongs to, which the
-HTTP API created.
+The flag reaches the interactive screen, one-shot runs, and ACP sessions. It does **not** reach
+sessions created through `POST /v1/sessions`, which are single-directory by design, and therefore
+does not reach a scheduled turn under `meka serve` either: those run in the session the job belongs
+to, which the HTTP API created.
+
+### `--additional-readable-directory <DIR>`
+
+Add a directory this run may read beyond its workspace and never write, which the search tools
+cover only when named. Repeatable. In effect where reads are confined, by
+[`[permissions].confine_reads`](./config-file.md#permissions); the per-run form of
+[`[shell].additional_readable_directories`](./config-file.md#shelladditional_readable_directories),
+held by the session rather than the installation, so a sub-agent spawned with nothing named
+inherits it and one given a scope of its own does not.
+
+```bash
+meka --permission read --additional-readable-directory ~/reference
+```
+
+A path that does not resolve is reported as a warning and kept, as the workspace flag's is. The
+flag reaches the same hosts the workspace flag does, and is likewise never recorded on the session.
 
 ### `--sandbox-backend <BACKEND>`
 

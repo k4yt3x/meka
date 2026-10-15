@@ -344,7 +344,7 @@ fn insufficient_scope_returns_403() {
         ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &["sessions:r"]);
     let response = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": "/tmp"}))
+        .json(&serde_json::json!({"working_directory": "/tmp"}))
         .send()
         .expect("send");
     assert_eq!(response.status(), 403);
@@ -376,7 +376,7 @@ fn create_and_list_session_round_trip() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
         }))
         .send()
         .expect("send");
@@ -414,7 +414,7 @@ fn blocking_turn_returns_the_assistants_text_from_mock_provider() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -460,7 +460,7 @@ fn per_turn_context_states_the_catalog_once_not_every_turn() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -520,7 +520,7 @@ fn fork_copies_the_conversation_into_a_new_session() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "permission": "read",
         }))
         .send()
@@ -662,7 +662,7 @@ fn the_level_and_approvals_change_under_a_running_turn() {
 
     let moved = harness
         .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     assert_eq!(
@@ -699,7 +699,7 @@ fn fork_during_an_in_flight_turn_is_refused_with_409() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -797,18 +797,18 @@ fn a_session_cwd_is_recorded_canonically_and_found_by_either_spelling() {
 
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": link.to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": link.to_string_lossy()}))
         .send()
         .expect("send");
     assert_eq!(create.status(), 201);
     let created: serde_json::Value = create.json().expect("parse");
-    assert_eq!(created["cwd"], canonical_spelling(&real));
+    assert_eq!(created["working_directory"], canonical_spelling(&real));
     let id = created["id"].as_str().expect("id").to_string();
 
     for spelling in [&link, &real] {
         let listed: serde_json::Value = harness
             .request(reqwest::Method::GET, "/v1/sessions")
-            .query(&[("cwd", spelling.to_string_lossy().as_ref())])
+            .query(&[("working_directory", spelling.to_string_lossy().as_ref())])
             .send()
             .expect("send")
             .json()
@@ -826,7 +826,7 @@ fn a_session_cwd_is_recorded_canonically_and_found_by_either_spelling() {
     std::fs::write(&file, b"x").expect("write");
     let refused = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": file.to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": file.to_string_lossy()}))
         .send()
         .expect("send");
     assert_eq!(refused.status(), 422);
@@ -844,7 +844,7 @@ fn fork_accepts_a_cwd_override() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -856,12 +856,12 @@ fn fork_accepts_a_cwd_override() {
     std::fs::create_dir_all(&elsewhere).expect("mkdir");
     let fork = harness
         .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/fork"))
-        .json(&serde_json::json!({"cwd": elsewhere.to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": elsewhere.to_string_lossy()}))
         .send()
         .expect("send");
     assert_eq!(fork.status(), 201);
     let forked: serde_json::Value = fork.json().expect("parse");
-    assert_eq!(forked["cwd"], canonical_spelling(&elsewhere));
+    assert_eq!(forked["working_directory"], canonical_spelling(&elsewhere));
 }
 
 #[test]
@@ -869,7 +869,7 @@ fn fork_rejects_a_relative_cwd_and_an_unknown_session() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -879,7 +879,7 @@ fn fork_rejects_a_relative_cwd_and_an_unknown_session() {
 
     let relative = harness
         .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/fork"))
-        .json(&serde_json::json!({"cwd": "relative/path"}))
+        .json(&serde_json::json!({"working_directory": "relative/path"}))
         .send()
         .expect("send");
     assert_eq!(relative.status(), 422);
@@ -915,7 +915,7 @@ fn idempotency_key_replays_return_cached_body() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -956,7 +956,7 @@ fn a_title_and_a_pin_are_patched_and_the_listing_puts_the_pin_first() {
     let create = |harness: &ServeTestHarness| -> serde_json::Value {
         harness
             .request(reqwest::Method::POST, "/v1/sessions")
-            .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+            .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
             .send()
             .expect("send")
             .json()
@@ -1032,7 +1032,7 @@ fn a_dormant_session_is_titled_and_pinned_without_being_revived() {
     );
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -1103,7 +1103,7 @@ fn search_finds_a_session_by_the_words_of_its_turn() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -1149,7 +1149,7 @@ fn patch_session_updates_permission_and_cwd() {
     let temp_dir = std::env::temp_dir().to_string_lossy().to_string();
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": temp_dir, "permission": "unrestricted"}))
+        .json(&serde_json::json!({"working_directory": temp_dir, "permission": "unrestricted"}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -1163,14 +1163,14 @@ fn patch_session_updates_permission_and_cwd() {
         .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
         .json(&serde_json::json!({
             "permission": "read",
-            "cwd": new_cwd.to_string_lossy(),
+            "working_directory": new_cwd.to_string_lossy(),
         }))
         .send()
         .expect("send");
     assert_eq!(patched.status(), 200);
     let body: serde_json::Value = patched.json().expect("parse");
     assert_eq!(body["permission"], "read");
-    assert_eq!(body["cwd"], canonical_spelling(&new_cwd));
+    assert_eq!(body["working_directory"], canonical_spelling(&new_cwd));
 }
 
 /// A request sent from its own thread, for a test that needs two in flight at once. Answers the
@@ -1235,7 +1235,7 @@ fn a_cwd_patch_cannot_be_overtaken_by_a_turn() {
         &harness,
         reqwest::Method::PATCH,
         &format!("/v1/sessions/{id}"),
-        serde_json::json!({ "cwd": other.to_string_lossy() }),
+        serde_json::json!({ "working_directory": other.to_string_lossy() }),
     );
     std::thread::sleep(Duration::from_millis(300));
     let turn = request_on_a_thread(
@@ -1276,7 +1276,7 @@ fn a_cwd_patch_cannot_be_overtaken_by_a_turn() {
         .expect("send")
         .json()
         .expect("parse");
-    assert_eq!(session["cwd"], canonical_spelling(&other));
+    assert_eq!(session["working_directory"], canonical_spelling(&other));
     std::fs::remove_dir_all(&other).ok();
 }
 
@@ -1395,7 +1395,7 @@ fn patch_session_rejects_relative_cwd() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -1405,7 +1405,7 @@ fn patch_session_rejects_relative_cwd() {
 
     let response = harness
         .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
-        .json(&serde_json::json!({"cwd": "relative/path"}))
+        .json(&serde_json::json!({"working_directory": "relative/path"}))
         .send()
         .expect("send");
     assert_eq!(response.status(), 422);
@@ -1416,7 +1416,7 @@ fn idempotency_key_with_different_body_returns_409_conflict() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -1455,7 +1455,7 @@ fn streaming_turn_emits_turn_started_text_delta_and_finished() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -1534,7 +1534,7 @@ fn retrying_after_a_timeout_replays_the_turn_instead_of_repeating_it() {
     let harness = ServeTestHarness::spawn("", script);
     let id = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send")
         .json::<serde_json::Value>()
@@ -1600,7 +1600,7 @@ fn a_blocking_turn_survives_the_client_hanging_up() {
     let harness = ServeTestHarness::spawn("", script);
     let id = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send")
         .json::<serde_json::Value>()
@@ -1681,7 +1681,7 @@ fn second_turn_on_same_session_returns_409_turn_in_flight() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -1735,7 +1735,7 @@ fn concurrent_streaming_turns_return_409() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -1785,7 +1785,7 @@ fn cancel_idempotent_when_no_turn_in_flight() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -1817,7 +1817,7 @@ fn oversize_body_returns_413() {
     let response = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "permission": huge,
         }))
         .send()
@@ -1962,7 +1962,7 @@ fn re_attach_to_evicted_session_continues_conversation() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "permission": "read",
         }))
         .send()
@@ -2044,7 +2044,7 @@ fn idempotency_does_not_cache_server_errors() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -2094,7 +2094,7 @@ fn cancel_during_in_flight_turn_emits_canceled_event() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -2408,7 +2408,7 @@ fn max_concurrent_turns_returns_429_across_sessions() {
     for _ in 0..2 {
         let create = harness
             .request(reqwest::Method::POST, "/v1/sessions")
-            .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+            .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
             .send()
             .expect("send");
         let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -2478,7 +2478,7 @@ fn graceful_shutdown_emits_server_shutdown_canceled() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -2560,7 +2560,7 @@ fn graceful_shutdown_waits_for_a_detached_turn_to_unwind() {
     let mut harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -2637,7 +2637,7 @@ fn mid_turn_permission_round_trips() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": workspace.path().to_string_lossy(),
+            "working_directory": workspace.path().to_string_lossy(),
             "permission": "read",
             "approvals": true,
         }))
@@ -2788,7 +2788,7 @@ fn streaming_tool_call_emits_executing_and_completed_events() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -2840,7 +2840,7 @@ fn streaming_tool_call_announces_composition_before_it_executes() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -2941,7 +2941,7 @@ fn malformed_create_body_returns_422() {
     let response = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "permission": "not-a-permission",
         }))
         .send()
@@ -2958,7 +2958,7 @@ fn malformed_turn_body_missing_message_returns_422() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -2983,7 +2983,7 @@ const TINY_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAD
 fn create_session_id(harness: &ServeTestHarness) -> String {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     create.json::<serde_json::Value>().expect("parse")["id"]
@@ -3016,7 +3016,7 @@ fn a_session_reads_the_listed_files_from_the_directory_the_client_chose() {
 
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": project.to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": project.to_string_lossy()}))
         .send()
         .expect("create");
     assert_eq!(create.status(), 201);
@@ -3569,7 +3569,7 @@ fn a_workspace_session_writes_inside_its_cwd_and_is_refused_outside() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": inside_dir.path(),
+            "working_directory": inside_dir.path(),
             "permission": "workspace",
         }))
         .send()
@@ -3620,7 +3620,7 @@ fn streaming_session_without_prompt_support_does_not_park_on_permission() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "permission": "read",
             "approvals": true,
             "capabilities": {"supports_permission_prompts": false},
@@ -3668,7 +3668,7 @@ fn an_image_is_judged_against_the_profile_the_session_runs_on() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "profile": "blind",
         }))
         .send()
@@ -3808,7 +3808,7 @@ fn multi_session_parallel_happy_path() {
     for _ in 0..2 {
         let create = harness
             .request(reqwest::Method::POST, "/v1/sessions")
-            .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+            .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
             .send()
             .expect("create");
         let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -3870,7 +3870,7 @@ fn thinking_delta_streams_with_capability_enabled() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "capabilities": {"supports_reasoning_stream": true},
         }))
         .send()
@@ -3924,7 +3924,7 @@ fn a_retry_does_not_send_the_reasoning_twice() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "capabilities": {"supports_reasoning_stream": true},
         }))
         .send()
@@ -3971,7 +3971,7 @@ fn a_blocking_turn_retries_even_with_reasoning_enabled() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "capabilities": {"supports_reasoning_stream": true},
         }))
         .send()
@@ -4026,7 +4026,7 @@ fn a_blocking_turn_after_a_streamed_one_keeps_its_retry() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "capabilities": {"supports_reasoning_stream": true},
         }))
         .send()
@@ -4075,7 +4075,7 @@ fn thinking_deltas_stream_one_event_per_chunk() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "capabilities": {"supports_reasoning_stream": true},
         }))
         .send()
@@ -4114,7 +4114,7 @@ fn thinking_delta_filtered_when_capability_disabled() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -4146,7 +4146,7 @@ fn streaming_provider_failure_emits_turn_failed_event() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -4187,7 +4187,7 @@ fn a_streaming_failure_says_whether_the_message_was_withdrawn() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -4250,7 +4250,7 @@ fn the_turn_failed_payload_tells_a_transient_failure_from_a_permanent_one() {
         let harness = ServeTestHarness::spawn("", script);
         let create = harness
             .request(reqwest::Method::POST, "/v1/sessions")
-            .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+            .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
             .send()
             .expect("create");
         let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -4314,7 +4314,7 @@ fn permission_allow_outcome_resumes_turn() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": workspace.path().to_string_lossy(),
+            "working_directory": workspace.path().to_string_lossy(),
             "permission": "read",
             "approvals": true,
         }))
@@ -4415,7 +4415,7 @@ fn messages_pagination_offset_limit() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -4468,7 +4468,7 @@ fn unknown_request_id_returns_404_request_not_found() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -4637,7 +4637,10 @@ fn a_row_that_records_no_cwd_omits_it() {
         .busy_timeout(Duration::from_secs(5))
         .expect("set a busy timeout");
     let erased = store
-        .execute("UPDATE sessions SET cwd = NULL WHERE id = ?1", [&id])
+        .execute(
+            "UPDATE sessions SET working_directory = NULL WHERE id = ?1",
+            [&id],
+        )
         .expect("erase the recorded working directory");
     assert_eq!(erased, 1, "the session row must exist to be made bare");
 
@@ -4648,7 +4651,7 @@ fn a_row_that_records_no_cwd_omits_it() {
         .json()
         .expect("parse");
     assert!(
-        shown.get("cwd").is_none(),
+        shown.get("working_directory").is_none(),
         "a working directory nobody recorded must be omitted, not null: {shown}"
     );
     assert_eq!(
@@ -4670,7 +4673,7 @@ fn a_row_that_records_no_cwd_omits_it() {
         .find(|row| row["id"].as_str() == Some(id.as_str()))
         .unwrap_or_else(|| panic!("the session should still be listed: {listing}"));
     assert!(
-        row.get("cwd").is_none(),
+        row.get("working_directory").is_none(),
         "the listing omits it on the same terms: {row}"
     );
 }
@@ -4690,7 +4693,7 @@ fn answering_a_prompt_on_an_evicted_session_does_not_revive_it() {
     );
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -4738,7 +4741,7 @@ fn idempotency_key_in_flight_returns_409() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -4791,7 +4794,7 @@ fn turn_options_unknown_skill_returns_422() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -4832,7 +4835,7 @@ fn a_turn_naming_a_broken_skill_says_why_rather_than_unknown() {
 
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -4919,7 +4922,7 @@ fn turn_options_unknown_field_returns_422() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -4953,7 +4956,7 @@ fn delete_while_turn_in_flight_returns_409() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -5042,7 +5045,7 @@ fn created_at_survives_gc_and_reattach() {
     );
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     assert_eq!(create.status(), 201);
@@ -5119,7 +5122,7 @@ fn a_reattached_session_compacts_on_the_measurement_its_row_recorded() {
     );
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     assert_eq!(create.status(), 201);
@@ -5159,7 +5162,7 @@ fn turn_request_unknown_top_level_field_returns_422() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -5187,7 +5190,7 @@ fn patch_session_atomic_rejects_when_cwd_is_invalid() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "permission": "read",
         }))
         .send()
@@ -5201,7 +5204,7 @@ fn patch_session_atomic_rejects_when_cwd_is_invalid() {
         .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
         .json(&serde_json::json!({
             "permission": "unrestricted",
-            "cwd": "relative/path",
+            "working_directory": "relative/path",
         }))
         .send()
         .expect("patch");
@@ -5276,7 +5279,7 @@ fn delete_on_idle_true_removes_db_row_on_eviction() {
     );
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     assert_eq!(create.status(), 201);
@@ -5320,7 +5323,7 @@ fn idempotency_cache_does_not_persist_turn_in_flight_409() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -5405,7 +5408,7 @@ fn blocking_turn_response_carries_the_turns_messages_and_usage() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -5500,7 +5503,7 @@ fn refusal_stop_reason_propagates_through_blocking_response() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -5544,7 +5547,7 @@ fn streaming_turn_event_ids_are_dense_and_monotonic() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -5615,7 +5618,7 @@ fn sticky_allow_always_short_circuits_second_tool_call() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": workspace.path().to_string_lossy(),
+            "working_directory": workspace.path().to_string_lossy(),
             "permission": "read",
             "approvals": true,
         }))
@@ -5725,7 +5728,7 @@ fn blocking_turn_with_reasoning_stream_includes_thinking() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "capabilities": {"supports_reasoning_stream": true},
         }))
         .send()
@@ -5769,7 +5772,7 @@ fn cancel_during_blocking_turn_returns_409_turn_canceled() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -5833,7 +5836,7 @@ fn blocking_turn_with_approvals_auto_denies_with_notice() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": harness.root().to_string_lossy(),
+            "working_directory": harness.root().to_string_lossy(),
             "permission": "read",
             "approvals": true,
         }))
@@ -5889,7 +5892,7 @@ fn blocking_turn_with_approvals_succeeds() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "permission": "read",
             "approvals": true,
         }))
@@ -5925,7 +5928,7 @@ fn terminal_sse_events_carry_turn_id_and_session_id() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -5974,7 +5977,7 @@ fn responses_body_unknown_field_returns_422() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "permission": "read",
             "approvals": true,
         }))
@@ -6028,7 +6031,7 @@ fn cancel_mid_tool_call_leaves_no_orphaned_tool_use_in_the_store() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -6150,7 +6153,7 @@ fn option_fields_are_absent_not_null_when_unset() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -6188,9 +6191,9 @@ fn option_fields_are_absent_not_null_when_unset() {
     let session_text = get.text().expect("text");
     let session: serde_json::Value = serde_json::from_str(&session_text).expect("parse session");
     assert!(
-        session["cwd"].is_string(),
+        session["working_directory"].is_string(),
         "cwd must be a string when set; got: {}",
-        session["cwd"],
+        session["working_directory"],
     );
     assert!(
         session["last_turn"]["ended_at"].is_string(),
@@ -6231,7 +6234,7 @@ fn a_scheduled_turn_marks_the_session_in_flight() {
     let harness = ServeTestHarness::spawn("\n[schedule]\npoll_interval = \"1s\"\n", script);
     let id = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create")
         .json::<serde_json::Value>()
@@ -6314,7 +6317,7 @@ fn scheduled_job_fires_without_a_client_request() {
 
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -6383,7 +6386,7 @@ fn a_request_still_asking_for_isolation_is_refused_by_name() {
 
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     assert_eq!(create.status(), 201);
@@ -6437,7 +6440,7 @@ fn a_request_still_asking_for_isolation_is_refused_by_name() {
 fn session_with_one_turn(harness: &ServeTestHarness) -> String {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     assert_eq!(create.status(), 201);
@@ -6521,7 +6524,7 @@ context_window = 32000
         let create = harness
             .request(reqwest::Method::POST, "/v1/sessions")
             .json(&serde_json::json!({
-                "cwd": std::env::temp_dir().to_string_lossy(),
+                "working_directory": std::env::temp_dir().to_string_lossy(),
                 "profile": provider,
             }))
             .send()
@@ -6564,7 +6567,7 @@ fn context_endpoint_omits_used_before_any_turn() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let created: serde_json::Value = create.json().expect("parse");
@@ -6588,7 +6591,7 @@ fn context_endpoint_requires_sessions_read_scope() {
         ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &["sessions:w"]);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let created: serde_json::Value = create.json().expect("parse");
@@ -7263,7 +7266,7 @@ fn canceling_a_scheduled_job_takes_its_full_id_and_reports_a_miss() {
     ]);
     let id = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send")
         .json::<serde_json::Value>()
@@ -7342,7 +7345,7 @@ fn creating_a_job_is_refused_when_scheduling_is_disabled() {
     );
     let id = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send")
         .json::<serde_json::Value>()
@@ -7488,7 +7491,7 @@ fn a_job_that_could_never_fire_is_refused_and_an_existing_one_is_reported() {
         .post(format!("{}/v1/sessions", harness.base_url))
         .header("Authorization", "Bearer sk_test_full")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "permission": "read",
         }))
         .send()
@@ -7580,7 +7583,7 @@ fn a_gate_refusal_is_a_422_when_no_permission_would_help() {
             .post(format!("{}/v1/sessions", harness.base_url))
             .header("Authorization", "Bearer sk_test_full")
             .json(&serde_json::json!({
-                "cwd": std::env::temp_dir().to_string_lossy(),
+                "working_directory": std::env::temp_dir().to_string_lossy(),
                 "permission": permission,
             }))
             .send()
@@ -7648,7 +7651,7 @@ fn a_read_only_built_in_tool_gate_is_accepted_at_read() {
         .post(format!("{}/v1/sessions", harness.base_url))
         .header("Authorization", "Bearer sk_test_full")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "permission": "read",
         }))
         .send()
@@ -7719,7 +7722,7 @@ fn a_schedule_scoped_token_sees_a_gate_without_its_command() {
         .post(format!("{}/v1/sessions", harness.base_url))
         .header("Authorization", "Bearer sk_test_full")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "permission": "unrestricted",
         }))
         .send()
@@ -7802,7 +7805,7 @@ fn planting_a_gate_needs_more_than_the_schedule_scope() {
         .post(format!("{}/v1/sessions", harness.base_url))
         .header("Authorization", "Bearer sk_test_full")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "permission": "unrestricted",
         }))
         .send()
@@ -7861,7 +7864,7 @@ fn a_gate_below_write_permission_is_not_reported_as_a_scope_failure() {
     let id = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "permission": "read",
         }))
         .send()
@@ -7902,7 +7905,7 @@ fn scheduled_job_create_list_and_cancel_round_trip() {
     ]);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let created: serde_json::Value = create.json().expect("parse");
@@ -7982,7 +7985,7 @@ fn scheduled_job_rejects_two_schedules() {
     ]);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let created: serde_json::Value = create.json().expect("parse");
@@ -8018,7 +8021,7 @@ fn schedule_endpoints_require_the_schedule_scopes() {
     ]);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let created: serde_json::Value = create.json().expect("parse");
@@ -8238,8 +8241,9 @@ fn skill_write_read_and_delete_round_trip() {
     assert_eq!(gone.status(), 404);
 }
 
-/// A skill under a read-only `[skills] extra_paths` root is neither writable nor deletable here,
-/// and both refusals arrive as 409 `store-read-only` naming where the file actually is.
+/// A skill under a read-only `[skills] additional_directories` root is neither writable nor
+/// deletable here, and both refusals arrive as 409 `store-read-only` naming where the file actually
+/// is.
 ///
 /// Writing would not update that skill: it would put a second copy in meka's own store which wins
 /// precedence, so the caller is told it edited a procedure while every other client goes on reading
@@ -8264,7 +8268,10 @@ fn a_skill_in_a_read_only_root_is_refused_by_put_and_delete() {
     let shared = shared_root.path().to_path_buf();
     let harness = ServeTestHarness::spawn_with(
         "",
-        &format!("\n[skills]\nextra_paths = ['{}']\n", shared.display()),
+        &format!(
+            "\n[skills]\nadditional_directories = ['{}']\n",
+            shared.display()
+        ),
         mock_simple_turn(),
         "sk_test_token",
         STORE_SCOPES,
@@ -8310,7 +8317,7 @@ fn a_skill_in_a_read_only_root_is_refused_by_put_and_delete() {
         // `meka skill` still prints the location, because its reader is the person who configured
         // the root; `ForeignSkill` carries it as data so the two doors can differ.
         assert!(
-            detail.contains(&format!("'{name}'")) && detail.contains("extra_paths"),
+            detail.contains(&format!("'{name}'")) && detail.contains("additional_directories"),
             "the refusal must say which skill and why: {problem}"
         );
         assert!(
@@ -9101,7 +9108,7 @@ fn an_attending_feed_reader_is_asked_to_approve_a_gated_call_the_inbox_started()
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": workspace.path().to_string_lossy(),
+            "working_directory": workspace.path().to_string_lossy(),
             "permission": "read",
             "approvals": true,
             "capabilities": {"supports_permission_prompts": false},
@@ -9182,7 +9189,7 @@ fn a_feed_reader_that_does_not_attend_gets_the_refusal_notice() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": workspace.path().to_string_lossy(),
+            "working_directory": workspace.path().to_string_lossy(),
             "permission": "read",
             "approvals": true,
         }))
@@ -9420,7 +9427,7 @@ fn a_running_sub_agents_feed_streams_its_tool_calls_and_its_terminal() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": workspace.path().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": workspace.path().to_string_lossy()}))
         .send()
         .expect("create");
     let parent = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -9559,7 +9566,7 @@ fn a_sub_agents_feed_opens_under_its_parents_streaming_turn() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": workspace.path().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": workspace.path().to_string_lossy()}))
         .send()
         .expect("create");
     let parent = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -9645,7 +9652,7 @@ fn a_sub_agents_feed_mirrors_the_prompt_parked_on_its_parent() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": workspace.path().to_string_lossy(),
+            "working_directory": workspace.path().to_string_lossy(),
             "permission": "read",
             "approvals": true,
             "capabilities": {"supports_permission_prompts": false},
@@ -10527,7 +10534,7 @@ fn inbox_items_replay_on_their_key_and_withdraw_only_while_pending() {
 fn start_streaming_session(harness: &ServeTestHarness) -> String {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     create.json::<serde_json::Value>().expect("parse")["id"]
@@ -12837,7 +12844,7 @@ fn errors_from_an_allowed_origin_keep_their_cors_headers() {
         .request(reqwest::Method::POST, "/v1/sessions")
         .header("Origin", "https://ui.example")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "permission": "x".repeat(4096),
         }))
         .send()
@@ -12851,7 +12858,7 @@ fn errors_from_an_allowed_origin_keep_their_cors_headers() {
         .request(reqwest::Method::POST, "/v1/sessions")
         .header("Origin", "https://ui.example")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "permission": "not-a-permission",
         }))
         .send()
@@ -13714,7 +13721,7 @@ fn a_canceled_turn_is_not_cached_against_its_idempotency_key() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -13868,7 +13875,7 @@ fn one_idempotency_key_across_two_sessions_answers_each_with_its_own_turn() {
     let create = |harness: &ServeTestHarness| {
         harness
             .request(reqwest::Method::POST, "/v1/sessions")
-            .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+            .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
             .send()
             .expect("create")
             .json::<serde_json::Value>()
@@ -13941,7 +13948,7 @@ context_window = 32000
     // path this test is not about. An import writes rows and nothing else.
     let created = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let source = created.json::<serde_json::Value>().expect("parse")["id"]
@@ -14054,7 +14061,7 @@ context_window = 32000
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "profile": "mock",
         }))
         .send()
@@ -14212,7 +14219,7 @@ context_window = 32000
     let bad_create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "profile": "ghost",
         }))
         .send()
@@ -14238,7 +14245,7 @@ context_window = 32000
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "profile": "mock",
         }))
         .send()
@@ -14895,7 +14902,7 @@ fn relay_provider_errors_decides_whether_the_upstream_body_reaches_the_caller() 
         let harness = ServeTestHarness::spawn(extra, script.clone());
         let create = harness
             .request(reqwest::Method::POST, "/v1/sessions")
-            .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+            .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
             .send()
             .expect("create");
         let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -14956,7 +14963,7 @@ fn relay_provider_errors_is_honored_on_the_streaming_path() {
         let harness = ServeTestHarness::spawn(extra, script.clone());
         let create = harness
             .request(reqwest::Method::POST, "/v1/sessions")
-            .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+            .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
             .send()
             .expect("create");
         let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -15002,7 +15009,7 @@ fn a_relayed_upstream_body_is_size_bounded() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -15206,7 +15213,7 @@ fn a_failed_turn_keeps_its_message_unless_the_client_says_it_will_resend() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -15331,7 +15338,7 @@ fn withdraw_keeps_a_message_once_text_landed_and_takes_it_back_on_a_cancel() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -15416,7 +15423,7 @@ grace = "0s"
     let harness = ServeTestHarness::spawn_with_prelude(prelude, "", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -15486,7 +15493,7 @@ fn a_read_shell_under_landlock_cannot_read_the_store() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "working_directory": std::env::temp_dir().to_string_lossy(),
             "permission": "read",
         }))
         .send()
@@ -15572,7 +15579,7 @@ fn a_read_shell_inherits_only_its_standard_descriptors() {
         let create = harness
             .request(reqwest::Method::POST, "/v1/sessions")
             .json(&serde_json::json!({
-                "cwd": std::env::temp_dir().to_string_lossy(),
+                "working_directory": std::env::temp_dir().to_string_lossy(),
                 "permission": "read",
             }))
             .send()
@@ -15753,7 +15760,7 @@ fn the_record_says_how_the_last_turn_ended() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -15959,7 +15966,7 @@ fn a_running_sub_agent_reads_as_in_flight() {
     let harness = ServeTestHarness::spawn("", spawning_script());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let parent = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -16070,7 +16077,7 @@ fn a_parked_prompt_waits_for_its_attender_through_the_reattach_grace() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": workspace.path().to_string_lossy(),
+            "working_directory": workspace.path().to_string_lossy(),
             "permission": "read",
             "approvals": true,
             "capabilities": {"supports_permission_prompts": false},
@@ -16234,7 +16241,7 @@ fn the_listing_filters_by_profile_pin_and_time() {
         harness
             .request(reqwest::Method::POST, "/v1/sessions")
             .json(&serde_json::json!({
-                "cwd": std::env::temp_dir().to_string_lossy(),
+                "working_directory": std::env::temp_dir().to_string_lossy(),
                 "profile": profile,
             }))
             .send()
@@ -16388,7 +16395,7 @@ fn the_server_feed_carries_every_change_to_a_session_record() {
     let feed = open_server_feed(&harness, None);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("create");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -16579,7 +16586,7 @@ fn a_turn_that_stops_with_an_open_item_continues_and_the_feed_says_so() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let created: serde_json::Value = create.json().expect("parse");
@@ -16736,7 +16743,7 @@ fn a_fork_carries_the_checklist_its_source_left_open() {
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .json(&serde_json::json!({"working_directory": std::env::temp_dir().to_string_lossy()}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]

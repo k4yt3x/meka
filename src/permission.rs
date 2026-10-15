@@ -33,7 +33,8 @@ use crate::error::MekaError;
 ///   because scope is enforced at the write door rather than by hiding tools. Keeping the tool set
 ///   independent of the level is what holds the API tools array byte-identical across mid-session
 ///   toggles, which the Claude prompt-cache prefix depends on.
-/// - [`Permission::clamp_to`] is the **authority bound** for a sub-agent.
+/// - [`Permission::is_within`] is the **authority bound** for a sub-agent: a spawn asking for a
+///   level outside its parent's is refused at the door.
 ///
 /// One spelling per level, [`Self::name`], is what `Display`, `FromStr` and serde all go through,
 /// so a persisted level reads the way `config.toml` writes it and nothing accepts a second form.
@@ -169,12 +170,6 @@ impl Permission {
     /// name so the replay door reads as the question it asks.
     pub(crate) fn greatest_within_both(self, other: Permission) -> Permission {
         self.min(other)
-    }
-
-    /// The authority a sub-agent actually gets when it asks for `self` under `parent`: the request
-    /// when the parent holds it, else the parent's own level.
-    pub(crate) fn clamp_to(self, parent: Permission) -> Permission {
-        if self.is_within(parent) { self } else { parent }
     }
 }
 
@@ -560,10 +555,10 @@ mod tests {
         assert!(Permission::Workspace < Permission::Unrestricted);
     }
 
-    /// The sub-agent clamp never returns authority the parent does not hold, for any of the 16
-    /// pairs, and containment is the ladder's own order.
+    /// Containment, the sub-agent's authority bound, is the ladder's own order for any of the 16
+    /// pairs.
     #[test]
-    fn clamp_to_never_exceeds_the_parent_for_any_pair() {
+    fn containment_is_the_ladders_order_for_any_pair() {
         for child in EVERY {
             for parent in EVERY {
                 assert_eq!(
@@ -571,27 +566,8 @@ mod tests {
                     child <= parent,
                     "{child}.is_within({parent}) disagrees with the ladder"
                 );
-                let granted = child.clamp_to(parent);
-                assert!(
-                    granted.is_within(parent),
-                    "{child} under {parent} yielded {granted}, which is not within {parent}"
-                );
-                assert!(
-                    granted.is_within(child),
-                    "{child} under {parent} yielded {granted}, wider than the request"
-                );
             }
         }
-        assert_eq!(
-            Permission::Unrestricted.clamp_to(Permission::Workspace),
-            Permission::Workspace,
-            "a child asking for the whole filesystem under a `workspace` parent gets `workspace`"
-        );
-        assert_eq!(
-            Permission::Read.clamp_to(Permission::Unrestricted),
-            Permission::Read,
-            "an ordinary narrower request is granted as asked"
-        );
     }
 
     /// A replayed grant is bounded by the spawn call as well as by the parent, and it is the

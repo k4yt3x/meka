@@ -15,9 +15,10 @@ use super::*;
 
 /// Refuse to create or overwrite `name` because it belongs to a read-only root, or `None`.
 ///
-/// `[skills] extra_paths` roots are scanned but never written to, and [`SkillCache::root`] only
-/// ever names meka's own, so a write to a name that already resolves elsewhere would not update
-/// that skill: it would put a second one in meka's store that shadows it.
+/// `[skills] additional_directories` roots are scanned but never written to, and
+/// [`SkillCache::root`] only ever names meka's own, so a write to a name that already resolves
+/// elsewhere would not update that skill: it would put a second one in meka's store that shadows
+/// it.
 ///
 /// One function for all five write doors (`skill_write`, `meka skill add`, `PUT /v1/skills`, and
 /// through [`refuse_foreign_delete`] the two delete doors), because copies of a rule drift: checked
@@ -49,7 +50,7 @@ pub(crate) fn refuse_foreign_delete(
     })
 }
 /// A skill a write or delete door may not touch, because the name resolves under a root `[skills]
-/// extra_paths` names.
+/// additional_directories` names.
 ///
 /// Two renderings of one refusal, because the doors have different audiences. `meka skill` and the
 /// `skill_*` tools answer someone at this installation, for whom the file's location is the
@@ -70,7 +71,7 @@ impl std::fmt::Display for ForeignSkill {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "skill '{}' is in a `[skills] extra_paths` root, which meka does not write to; {}",
+            "skill '{}' is in a `[skills] additional_directories` root, which meka does not write to; {}",
             self.name, self.remedy
         )
     }

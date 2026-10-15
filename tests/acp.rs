@@ -4587,7 +4587,7 @@ fn an_acp_load_or_resume_refused_by_the_builder_leaves_the_workspace_alone() {
         assert_eq!(moved, 1, "the repin matched no row");
         let cwd_before: Option<String> = connection
             .query_row(
-                "SELECT cwd FROM sessions WHERE id = ?1",
+                "SELECT working_directory FROM sessions WHERE id = ?1",
                 [&session_id],
                 |row| row.get(0),
             )
@@ -4616,7 +4616,7 @@ fn an_acp_load_or_resume_refused_by_the_builder_leaves_the_workspace_alone() {
         let connection = rusqlite::Connection::open(harness.database()).expect("reopen the store");
         let cwd_after: Option<String> = connection
             .query_row(
-                "SELECT cwd FROM sessions WHERE id = ?1",
+                "SELECT working_directory FROM sessions WHERE id = ?1",
                 [&session_id],
                 |row| row.get(0),
             )
@@ -5662,7 +5662,7 @@ fn acp_session_new_accepts_a_cwd_only_as_an_existing_directory_spelled_canonical
         let store = rusqlite::Connection::open(harness.database()).expect("open the store");
         let recorded: String = store
             .query_row(
-                "SELECT cwd FROM sessions WHERE id = ?1",
+                "SELECT working_directory FROM sessions WHERE id = ?1",
                 [&session_id],
                 |row| row.get(0),
             )
@@ -5808,7 +5808,7 @@ fn acp_session_load_refuses_a_sub_agent_before_touching_its_row() {
     let store = rusqlite::Connection::open(harness.database()).expect("open the store");
     let (worker, cwd_before): (String, Option<String>) = store
         .query_row(
-            "SELECT id, cwd FROM sessions WHERE parent_session_id IS NOT NULL",
+            "SELECT id, working_directory FROM sessions WHERE parent_session_id IS NOT NULL",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -5837,9 +5837,11 @@ fn acp_session_load_refuses_a_sub_agent_before_touching_its_row() {
 
     let store = rusqlite::Connection::open(harness.database()).expect("reopen the store");
     let cwd_after: Option<String> = store
-        .query_row("SELECT cwd FROM sessions WHERE id = ?1", [&worker], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT working_directory FROM sessions WHERE id = ?1",
+            [&worker],
+            |row| row.get(0),
+        )
         .expect("the worker row is still readable");
     assert_eq!(
         cwd_before, cwd_after,

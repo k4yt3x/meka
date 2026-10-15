@@ -7,13 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.75.1] - 2026-10-14
+## [0.76.0] - 2026-10-14
+
+### Added
+
+- `agent_spawn` takes `working_directory`: where a sub-agent works and where its paths resolve.
+- `agent_spawn` takes `additional_workspace_directories` and `additional_readable_directories`.
+- A spawn or follow-up result opens with `Agent:`, `Permission:` and the scope the sub-agent holds.
+- The context block states the additional workspace and readable directories at every level.
+- `--additional-readable-directory` names what a run reads beyond its workspace, repeatable.
+- `[permissions].network = "none"` cuts confined commands and `web_fetch` off the network.
+- `agent_spawn` takes `network`: `none` narrows a sub-agent, and its scope lines say so.
+- `[web].refuse_private_destinations` refuses a fetch of a loopback, private or link-local host.
 
 ### Changed
 
-- `agent_spawn` refuses a `readable_roots` entry the sub-agent's workspace already covers.
-- A confined read refuses a path outside the roots the same way whether or not it exists.
+- **Breaking:** `agent_spawn` loses `writable_roots` and `readable_roots`; stored specs convert.
+- **Breaking:** a sub-agent reads what its spawn states, else what its parent reads.
+- **Breaking:** a `permission` above the parent's is refused by name rather than clamped.
+- **Breaking:** `--writable-root` is `--additional-workspace-directory`.
+- **Breaking:** `memory export --dir` is `--directory`.
+- **Breaking:** `[shell].readable_paths` is `[shell].additional_readable_directories`.
+- **Breaking:** `[skills].extra_paths` is `[skills].additional_directories`.
+- **Breaking:** session JSON and the HTTP API name `working_directory`, not `cwd`.
+- **Breaking:** `additional_roots` is `additional_workspace_directories` in the export archive.
+- **Breaking:** the session export format is 10; an older archive is converted on import.
+- **Breaking:** the store's `sessions` table names the two columns the same way, renamed on open.
+- A directory list beside no `working_directory` is refused; an empty list counts as absent.
+- An `agent_spawn` refusal names every directory it refuses; a non-string list entry is refused.
+- A readable directory inside the workspace, a repeat, or a directory in both lists is merged.
+- A sub-agent spawned with a list runs at its parent's level unless `permission` lowers it.
+- A confined read refuses a path outside the boundary the same way whether or not it exists.
 - A boundary refusal names the path as given, never the target of a symlink on it.
+- A dangling symlink inside the boundary is judged where it leads, as the open would be.
+- Tool descriptions, refusals and the context block say directory and workspace, never root.
+
+### Fixed
+
+- A `scratchpad` redirect leaves a refusal or an error inline; a command's output is still saved.
 
 ### Security
 

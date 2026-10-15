@@ -844,9 +844,9 @@ pub(super) fn decode_list_cursor(token: &str) -> Result<ListSessionsCursor> {
     serde_json::from_slice(&bytes)
         .map_err(|error| MekaError::Usage(format!("invalid list cursor: {error}")))
 }
-/// Encode an additional-root list for the `additional_roots_json` column. `None` for the empty case
-/// keeps "no extra roots" as NULL, so the column has one representation for one meaning rather than
-/// NULL and `[]` both appearing.
+/// Encode an additional-root list for the `additional_workspace_directories_json` column. `None`
+/// for the empty case keeps "no extra roots" as NULL, so the column has one representation for one
+/// meaning rather than NULL and `[]` both appearing.
 pub(super) fn encode_additional_roots(roots: &[PathBuf]) -> Result<Option<String>> {
     if roots.is_empty() {
         return Ok(None);
@@ -855,7 +855,7 @@ pub(super) fn encode_additional_roots(roots: &[PathBuf]) -> Result<Option<String
         .map(Some)
         .map_err(|error| MekaError::Database(format!("failed to encode additional roots: {error}")))
 }
-/// Decode the persisted `additional_roots_json` column into workspace roots.
+/// Decode the persisted `additional_workspace_directories_json` column into workspace roots.
 ///
 /// NULL (every session that never carried extra roots) and unparseable JSON both yield an empty
 /// list. Failing soft is right here: a session whose root list can't be read is still perfectly
@@ -1186,7 +1186,7 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "INSERT INTO sessions (id, created_at, updated_at, cwd, permission, approvals, \
+                    "INSERT INTO sessions (id, created_at, updated_at, working_directory, permission, approvals, \
                      capabilities_json, token_id, profile)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     rusqlite::params![
@@ -1269,8 +1269,8 @@ impl Store {
                     // the provider stopped being read off that row; see the parameter's note.
                     // `approvals` is still read off it: a sub-agent shares its parent's switch.
                     "INSERT INTO sessions
-                         (id, created_at, updated_at, parent_session_id, cwd,
-                          additional_roots_json, subagent_spec_json, permission, approvals,
+                         (id, created_at, updated_at, parent_session_id, working_directory,
+                          additional_workspace_directories_json, subagent_spec_json, permission, approvals,
                           profile)
                      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, approvals, ?9
                      FROM sessions WHERE id = ?4",
@@ -1507,8 +1507,8 @@ impl Store {
                 let rows = transaction.execute(
                     "INSERT INTO sessions (
                          id, created_at, updated_at, parent_session_id, subagent_spec_json,
-                         cwd, permission, approvals,
-                         capabilities_json, token_id, additional_roots_json, profile,
+                         working_directory, permission, approvals,
+                         capabilities_json, token_id, additional_workspace_directories_json, profile,
                          turns,
                          input_tokens, output_tokens,
                          cache_creation_input_tokens, cache_read_input_tokens,
@@ -1517,9 +1517,9 @@ impl Store {
                          context_tokens, title
                      )
                      SELECT ?1, ?2, ?2, parent_session_id, subagent_spec_json,
-                            COALESCE(?3, cwd), permission, approvals,
+                            COALESCE(?3, working_directory), permission, approvals,
                             capabilities_json, ?4,
-                            CASE WHEN ?5 THEN ?6 ELSE additional_roots_json END, profile,
+                            CASE WHEN ?5 THEN ?6 ELSE additional_workspace_directories_json END, profile,
                             turns,
                             input_tokens, output_tokens,
                             cache_creation_input_tokens, cache_read_input_tokens,
@@ -1888,8 +1888,8 @@ impl Store {
                 for session in &encoded {
                     transaction.execute(
                         "INSERT INTO sessions (
-                             id, created_at, updated_at, parent_session_id, cwd, permission,
-                             capabilities_json, additional_roots_json, subagent_spec_json,
+                             id, created_at, updated_at, parent_session_id, working_directory, permission,
+                             capabilities_json, additional_workspace_directories_json, subagent_spec_json,
                              profile, approvals,
                              turns, input_tokens, output_tokens,
                              cache_creation_input_tokens, cache_read_input_tokens,
@@ -2101,7 +2101,7 @@ impl Store {
                          FROM sessions s JOIN tree ON s.parent_session_id = tree.id
                      )
                      SELECT s.id, s.parent_session_id, s.created_at, s.updated_at,
-                            s.cwd, s.permission, s.capabilities_json, s.additional_roots_json,
+                            s.working_directory, s.permission, s.capabilities_json, s.additional_workspace_directories_json,
                             s.subagent_spec_json, s.profile, s.approvals, s.title, s.pinned_at
                      FROM sessions s JOIN tree ON s.id = tree.id
                      ORDER BY tree.depth ASC, s.created_at ASC, s.id ASC",
@@ -2781,7 +2781,7 @@ impl Store {
                     clauses.push(&not_spawned);
                 }
                 if cwd_filter_string.is_some() {
-                    clauses.push("s.cwd = :cwd");
+                    clauses.push("s.working_directory = :cwd");
                 }
                 if profile_filter.is_some() {
                     clauses.push("s.profile = :profile");
@@ -2815,7 +2815,7 @@ impl Store {
                 let (turn_columns, latest_turn_join) =
                     (super::turns::TURN_COLUMNS, super::turns::LATEST_TURN_JOIN);
                 let query = format!(
-                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id, s.profile, s.approvals,
+                    "SELECT s.id, s.created_at, s.updated_at, s.working_directory, s.permission, s.capabilities_json, s.additional_workspace_directories_json, s.token_id, s.parent_session_id, s.profile, s.approvals,
                             s.title, s.pinned_at,
                             COALESCE(
                               (SELECT content FROM messages
@@ -2973,7 +2973,7 @@ impl Store {
                 let (turn_columns, latest_turn_join) =
                     (super::turns::TURN_COLUMNS, super::turns::LATEST_TURN_JOIN);
                 let mut statement = connection.prepare(&format!(
-                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id, s.profile, s.approvals,
+                    "SELECT s.id, s.created_at, s.updated_at, s.working_directory, s.permission, s.capabilities_json, s.additional_workspace_directories_json, s.token_id, s.parent_session_id, s.profile, s.approvals,
                             s.title, s.pinned_at,
                             COALESCE(
                               (SELECT content FROM messages
@@ -3617,7 +3617,7 @@ impl Store {
                     params.push((":approvals", approvals));
                 }
                 if let Some(cwd) = &cwd {
-                    assignments.push("cwd = :cwd");
+                    assignments.push("working_directory = :cwd");
                     params.push((":cwd", cwd));
                 }
                 if let Some(profile) = &profile {
@@ -3625,7 +3625,7 @@ impl Store {
                     params.push((":profile", profile));
                 }
                 if let Some(roots) = &roots {
-                    assignments.push("additional_roots_json = :roots");
+                    assignments.push("additional_workspace_directories_json = :roots");
                     params.push((":roots", roots));
                 }
                 if let Some(title) = &title {
@@ -5606,11 +5606,11 @@ mod tests {
             "created_at",
             "updated_at",
             "parent_session_id",
-            "cwd",
+            "working_directory",
             "permission",
             "capabilities_json",
             "token_id",
-            "additional_roots_json",
+            "additional_workspace_directories_json",
             // Copied by a fork, together with `parent_session_id`: a fork of a sub-agent is a
             // sibling under the same parent, and a copy that dropped either would be a drivable
             // sub-agent with no spawn terms. See `fork_session_locked`'s doc comment.
@@ -7667,6 +7667,7 @@ mod tests {
             cwd: std::path::Path::new("."),
             roots: &[],
             readable: None,
+            network: crate::config::Network::Host,
             world_state: "",
             budget: Some(crate::prompt::ContextBudget {
                 used: 42_000,

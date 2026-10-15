@@ -147,8 +147,12 @@ pub(crate) async fn run_interactive(
 
     let shared_permission = SharedPermission::new(start_permission, config.enabled_permissions)
         .with_approvals(start_approvals);
-    let sandbox_state =
-        crate::sandbox::SandboxState::new(config.sandbox, config.confine_reads, &shared.sandbox);
+    let sandbox_state = crate::sandbox::SandboxState::new(
+        config.sandbox,
+        config.confine_reads,
+        config.network,
+        &shared.sandbox,
+    );
     if start_permission == crate::permission::Permission::Read {
         crate::sandbox::warn_if_sandbox_issues(
             &sandbox_state,
@@ -219,7 +223,12 @@ pub(crate) async fn run_interactive(
         permission: shared_permission.clone(),
         frontend: Arc::clone(&frontend) as Arc<dyn crate::frontend::Frontend>,
         cwd: cwd.clone(),
-        roots: crate::workspace::SharedRoots::new(config.request.writable_roots.clone()),
+        roots: crate::workspace::SharedRoots::new(
+            config.request.additional_workspace_directories.clone(),
+        ),
+        read_only_roots: crate::workspace::SharedRoots::new(
+            config.request.additional_readable_directories.clone(),
+        ),
         context_tokens: Arc::clone(&context_tokens),
         context_overhead: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         context_window: Arc::clone(&context_window_gauge),

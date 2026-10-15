@@ -284,10 +284,10 @@ pub(super) async fn handle_load_session(
 
     // Before the lock, and before the writes below. `build_session_runtime` refuses a sub-agent at
     // the end of this handler, but by then it has taken the sub-agent's file lock, rewritten its
-    // `cwd` and replaced its `additional_roots_json`: durable writes to a session the caller may
-    // not drive, followed by an *internal* error for something the caller got wrong. `cwd` is the
-    // writable boundary at `workspace` and the directory a scheduled gate is re-checked in, so
-    // moving it is not cosmetic.
+    // `working_directory` and replaced its `additional_workspace_directories_json`: durable writes
+    // to a session the caller may not drive, followed by an *internal* error for something the
+    // caller got wrong. The working directory is the writable boundary at `workspace` and the
+    // directory a scheduled gate is re-checked in, so moving it is not cosmetic.
     //
     // The `claim_session` call in between is *not* part of the harm, though it looks like it: its
     // sweep is keyed on this id, and a sub-agent has no `background_tasks` rows because
@@ -1162,7 +1162,14 @@ pub(super) async fn build_session_runtime(
     let roots = SharedRoots::new(
         additional_roots
             .into_iter()
-            .chain(shared.config.request.writable_roots.iter().cloned())
+            .chain(
+                shared
+                    .config
+                    .request
+                    .additional_workspace_directories
+                    .iter()
+                    .cloned(),
+            )
             .collect(),
     );
     let permission = SharedPermission::new(permission, shared.config.enabled_permissions)
@@ -1196,6 +1203,13 @@ pub(super) async fn build_session_runtime(
             frontend,
             cwd: cwd.clone(),
             roots: roots.clone(),
+            read_only_roots: SharedRoots::new(
+                shared
+                    .config
+                    .request
+                    .additional_readable_directories
+                    .clone(),
+            ),
             context_tokens: Arc::clone(&context_tokens),
             context_overhead: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             context_window,

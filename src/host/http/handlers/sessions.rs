@@ -96,7 +96,7 @@ impl Drop for SessionRollback {
 pub(crate) struct CreateSessionRequest {
     /// Absolute path. Defaults to the server process's `current_dir` if omitted.
     #[schema(value_type = Option<String>)]
-    pub(crate) cwd: Option<std::path::PathBuf>,
+    pub(crate) working_directory: Option<std::path::PathBuf>,
     /// Permission level the session starts in. Defaults to the server's configured default
     /// from `[permissions].default` (typically `read`). Must be in the enabled set.
     pub(crate) permission: Option<String>,
@@ -217,7 +217,7 @@ pub(crate) struct ListSessionsQuery {
     /// Only list sessions whose working directory is this one, compared in the canonical spelling
     /// every session records.
     #[serde(default)]
-    pub(crate) cwd: Option<String>,
+    pub(crate) working_directory: Option<String>,
     /// Only the sub-agents this session spawned, its direct children. A tree view expands one
     /// node with one call and recurses for depth. Names sub-agents by definition, so
     /// `include_children` is moot beside it; a session with none, or an id no session has, is an
@@ -276,7 +276,7 @@ pub(crate) async fn create_session(
     let body: CreateSessionRequest = serde_json::from_slice(&raw_body)
         .map_err(|error| ProblemDetail::invalid_body("session creation", error))?;
 
-    let cwd_path = match body.cwd {
+    let cwd_path = match body.working_directory {
         Some(path) => accepted_cwd(&path)?,
         // Propagate `current_dir()` failure as 500 rather than falling back to a relative
         // path, which would surprise tools that resolve paths absolutely.
@@ -379,6 +379,7 @@ pub(crate) async fn create_session(
             frontend: frontend_dyn,
             cwd: cwd.clone(),
             roots: crate::workspace::SharedRoots::default(),
+            read_only_roots: crate::workspace::SharedRoots::default(),
             context_tokens: Arc::clone(&context_used),
             context_overhead: Arc::clone(&context_overhead),
             context_window: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -422,7 +423,7 @@ pub(crate) async fn create_session(
             id: session_uuid,
             created_at: timestamp.clone(),
             updated_at: timestamp,
-            cwd: Some(cwd_path),
+            working_directory: Some(cwd_path),
             permission: Some(permission),
             approvals,
             profile,
@@ -460,7 +461,7 @@ pub(crate) async fn create_session(
 pub(crate) struct ForkSessionBody {
     /// Absolute path for the forked session. Absent → inherit the source's.
     #[schema(value_type = Option<String>)]
-    pub(crate) cwd: Option<std::path::PathBuf>,
+    pub(crate) working_directory: Option<std::path::PathBuf>,
 }
 
 /// POST /v1/sessions/{id}/fork: copy a session's conversation into a new one.
@@ -506,7 +507,11 @@ pub(crate) async fn fork_session(
         serde_json::from_slice(&raw_body)
             .map_err(|error| ProblemDetail::invalid_body("session fork", error))?
     };
-    let cwd = body.cwd.as_deref().map(accepted_cwd).transpose()?;
+    let cwd = body
+        .working_directory
+        .as_deref()
+        .map(accepted_cwd)
+        .transpose()?;
 
     // Before the copy, not after it. A fork of a sub-agent is a sibling under the same parent
     // (`Store::fork_session_locked`), so the copy is a sub-agent too and `ensure_session_loaded`
@@ -697,7 +702,7 @@ pub(crate) async fn fork_session(
             id: forked.id,
             created_at: forked.created_at.clone(),
             updated_at: forked.created_at,
-            cwd: Some(entry.cells().cwd.get()),
+            working_directory: Some(entry.cells().cwd.get()),
             permission: Some(entry.cells().permission.get()),
             approvals: entry.cells().permission.approvals(),
             profile: forked_info.profile,
@@ -772,7 +777,7 @@ pub(crate) async fn list_sessions(
     let filter = crate::store::SessionFilter {
         include_children: query.include_children.unwrap_or(false),
         cwd: query
-            .cwd
+            .working_directory
             .as_deref()
             .map(|given| crate::workspace::cwd_filter(std::path::Path::new(given))),
         parent: query.parent,
@@ -1100,7 +1105,7 @@ pub(crate) async fn get_session(
                 id: entry.id,
                 created_at: entry.created_at.to_rfc3339(),
                 updated_at,
-                cwd: Some(entry.cells().cwd.get()),
+                working_directory: Some(entry.cells().cwd.get()),
                 permission: Some(entry.cells().permission.get()),
                 approvals: entry.cells().permission.approvals(),
                 profile: info.profile,
@@ -1342,7 +1347,7 @@ pub(crate) async fn patch_session(
     // agent has to move with the row.
     if body.permission.is_none()
         && body.approvals.is_none()
-        && body.cwd.is_none()
+        && body.working_directory.is_none()
         && (body.profile.is_some() || new_title.is_some() || body.pinned.is_some())
         && !state.sessions.read().await.contains_key(&id)
         && let Some(response) = patch_dormant_session(
@@ -1378,7 +1383,7 @@ pub(crate) async fn patch_session(
     const DOING: &str = "change the session's working directory or profile";
     let (entry, _turn_exclusive) = loop {
         let entry = ensure_session_loaded(&state, id).await?;
-        if body.cwd.is_none() && body.profile.is_none() {
+        if body.working_directory.is_none() && body.profile.is_none() {
             break (entry, None);
         }
         let map = state.sessions.read().await;
@@ -1420,7 +1425,7 @@ pub(crate) async fn patch_session(
         }
         None => None,
     };
-    let new_cwd = match body.cwd.clone() {
+    let new_cwd = match body.working_directory.clone() {
         Some(path) => Some(accepted_cwd(&path)?),
         None => None,
     };
@@ -1569,7 +1574,7 @@ pub(crate) async fn patch_session(
             id: entry.id,
             created_at: entry.created_at.to_rfc3339(),
             updated_at,
-            cwd: Some(cwd_snapshot),
+            working_directory: Some(cwd_snapshot),
             permission: Some(entry.cells().permission.get()),
             approvals: entry.cells().permission.approvals(),
             profile: info.profile,
@@ -1609,7 +1614,7 @@ pub(crate) struct PatchSessionRequest {
     /// New working directory. Must be absolute. Absent → keep current.
     #[serde(default)]
     #[schema(value_type = Option<String>)]
-    pub(crate) cwd: Option<std::path::PathBuf>,
+    pub(crate) working_directory: Option<std::path::PathBuf>,
     /// Profile to move the session onto. Must name a profile in `config.toml`. Absent → keep
     /// current.
     ///

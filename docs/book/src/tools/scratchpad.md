@@ -5,7 +5,7 @@ The scratchpad is a session-scoped working memory that the agent can use to stor
 ## When the scratchpad is used
 
 - **Proactively**: The agent stores intermediate results (extracted text, API responses, research notes) for later use.
-- **Via `scratchpad` parameter**: any tool call carrying one has its output saved there instead of returned inline. See [Scratchpad parameter](./overview.md#scratchpad-parameter) for which tools advertise it.
+- **Via `scratchpad` parameter**: any tool call carrying one has its output saved there instead of returned inline. A failed call stays inline, since a refusal or an error is a sentence about the call and not the output the caller redirected; the exception is a command, whose exit code and output are its result however it ended and go to the entry as asked. See [Scratchpad parameter](./overview.md#scratchpad-parameter) for which tools advertise it.
 - **Automatically**: when a tool's output exceeds 30,000 bytes, it is saved under a generated name (e.g. `shell_execute_a1b2c3_1`) and replaced with a preview. Reading the entry back is never treated that way: a `scratchpad_read` reply stays inline however large, sized to what fits in the context window (see `scratchpad_read` below).
 
 ## Tools

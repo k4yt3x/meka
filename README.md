@@ -104,7 +104,7 @@ The prompt indicator shows the current permission level. Press **Shift+Tab** to 
 
 - `[n]` **none**: no tools; the model can only reply with text
 - `[r]` **read**: read-only tools, and a shell sandboxed against writes
-- `[w]` **workspace**: every tool; writes confined to the cwd and any `--writable-root`
+- `[w]` **workspace**: every tool; writes confined to the workspace: the cwd and any `--additional-workspace-directory`
 - `[u]` **unrestricted**: every tool, with no boundary on where writes land
 
 A call the level does not cover is refused, or, with `/approvals on`, put to you for approval.

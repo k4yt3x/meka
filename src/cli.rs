@@ -709,8 +709,8 @@ pub(crate) enum MemoryAction {
     /// Write every memory out as Markdown, one file per memory
     Export {
         /// Directory to write into; must be new or empty (default: ./meka-memory-export)
-        #[arg(long, value_name = "PATH")]
-        dir: Option<std::path::PathBuf>,
+        #[arg(long, value_name = "DIR")]
+        directory: Option<std::path::PathBuf>,
     },
 }
 
@@ -1048,14 +1048,21 @@ pub(crate) struct Cli {
     )]
     pub(crate) permission: Option<Permission>,
 
-    /// Extra directory writable at `workspace` permission (repeatable)
+    /// More of this run's workspace beside the working directory (repeatable)
     ///
-    /// The working directory is always writable at that level, as are any folders an ACP client
-    /// supplies. This adds to them.
-    // A flag rather than a config key: which folders this run may write is per-run scope, like the
-    // working directory itself, not a preference to persist.
-    #[arg(long = "writable-root", value_name = "PATH")]
-    pub(crate) writable_root: Vec<std::path::PathBuf>,
+    /// Part of the workspace with the working directory's rights: writable at `workspace`,
+    /// read-only at `read`, searched with it. An ACP client's folders join the same list.
+    // A flag rather than a config key: which directories this run works in is per-run scope, like
+    // the working directory itself, not a preference to persist.
+    #[arg(long = "additional-workspace-directory", value_name = "DIR")]
+    pub(crate) additional_workspace_directory: Vec<std::path::PathBuf>,
+
+    /// Directory this run may read beyond its workspace, never write (repeatable)
+    ///
+    /// The per-run form of `[shell].additional_readable_directories`; in effect where reads are
+    /// confined.
+    #[arg(long = "additional-readable-directory", value_name = "DIR")]
+    pub(crate) additional_readable_directory: Vec<std::path::PathBuf>,
 
     /// Profile for this session; on a resume, repins it
     ///
@@ -1132,7 +1139,8 @@ impl Cli {
             instructions: self.instructions.clone(),
             permission: self.permission,
             sandbox_backend: self.sandbox_backend,
-            writable_roots: self.writable_root.clone(),
+            additional_workspace_directories: self.additional_workspace_directory.clone(),
+            additional_readable_directories: self.additional_readable_directory.clone(),
             no_stream: self.no_stream,
             resume: self.resume.clone(),
             continue_last: self.continue_last,

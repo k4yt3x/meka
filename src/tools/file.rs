@@ -1090,6 +1090,7 @@ impl Tool for ReadFileTool {
                         },
                     ],
                     is_error: false,
+                    is_output: false,
                     spill_hint: crate::tools::SpillHint::default(),
                     frontend_metadata: None,
                     structured: None,
@@ -1646,8 +1647,8 @@ impl Tool for WriteFileTool {
         ToolDefinition {
             name: "file_write".to_string(),
             description: "Create or overwrite a file with the given content, creating parent \
-                          directories as needed. A path outside the workspace roots is refused \
-                          unless the level is `unrestricted`."
+                          directories as needed. A path outside the workspace is refused unless \
+                          the level is `unrestricted`."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -5844,7 +5845,7 @@ mod tests {
             .expect_err("outside the roots");
         let message = refused.to_string();
         assert!(
-            message.contains("outside the readable roots")
+            message.contains("outside the readable directories")
                 && message.contains(&work.display().to_string()),
             "{message}"
         );

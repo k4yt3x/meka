@@ -53,6 +53,7 @@ fn bwrap_args(
     readable: Option<&[std::path::PathBuf]>,
     cwd: &std::path::Path,
     private: &[std::path::PathBuf],
+    network: crate::config::Network,
 ) -> Vec<std::ffi::OsString> {
     // Reading everywhere, `--ro-bind /` enforces "no writes". Reading within a boundary, the root
     // is an empty tmpfs instead and only the readable paths are bound into it, read-only: what is
@@ -60,7 +61,7 @@ fn bwrap_args(
     // roots and a symlink out of them points at nothing. `--unshare-*` cuts off PID / user / UTS /
     // IPC views, and the tmpfs masks over `/run`, `/tmp`, `/var/tmp` and `$XDG_RUNTIME_DIR` make
     // the dbus and systemd-user sockets unreachable so the agent cannot `dbus-send` state-changing
-    // methods. `--unshare-net` is intentionally absent; network must stay open for `curl |
+    // methods. `--unshare-net` only on `none`: by default the network stays open for `curl |
     // pdftotext` and similar pipelines.
     let root: &[&str] = match readable {
         Some(_) => &["--tmpfs", "/"],
@@ -82,6 +83,9 @@ fn bwrap_args(
         ])
         .map(std::ffi::OsString::from)
         .collect();
+    if network == crate::config::Network::None {
+        args.push("--unshare-net".into());
+    }
 
     for mask in bwrap_masks() {
         args.push("--tmpfs".into());
@@ -314,6 +318,12 @@ impl ExecuteCommandTool {
 
 #[async_trait]
 impl Tool for ExecuteCommandTool {
+    /// A command's exit code and output are its result however it ended, so a failed command's
+    /// output goes where the call sent it.
+    fn reports_failure_as_output(&self) -> bool {
+        true
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "shell_execute".to_string(),
@@ -382,6 +392,7 @@ impl Tool for ExecuteCommandTool {
             &self.scope,
             &self.site.read_scope(),
             &self.site.cwd,
+            self.site.network,
         );
         self.admit_confinement(level, confinement.is_sandboxed())
             .err()
@@ -409,6 +420,7 @@ impl Tool for ExecuteCommandTool {
             &self.scope,
             &self.site.read_scope(),
             &self.site.cwd,
+            self.site.network,
         );
         let sandboxed = confinement.is_sandboxed();
         self.admit_confinement(permission, sandboxed)?;
@@ -509,6 +521,7 @@ impl Tool for ExecuteCommandTool {
                 confinement.writable(),
                 confinement.readable(),
                 &crate::workspace::private_directories(),
+                confinement.network(),
             );
             let mut cmd = tokio::process::Command::new(crate::sandbox::seatbelt::SANDBOX_EXEC_PATH);
             cmd.arg("-p").arg(&profile);
@@ -549,16 +562,17 @@ impl Tool for ExecuteCommandTool {
             // Bubblewrap path: `--ro-bind /` enforces "no writes", `--unshare-*` cuts off PID /
             // user / UTS / IPC views, tmpfs masks over `/run`, `/tmp`, `/var/tmp`, and
             // `$XDG_RUNTIME_DIR` make the dbus and systemd-user sockets unreachable so the agent
-            // can't `dbus-send` state-changing methods. `--unshare-net` is intentionally absent;
-            // network must stay open for `curl | pdftotext` and similar pipelines. The Landlock
-            // layer inside closes what the masks do not reach: a socket under `$HOME`, the
-            // abstract namespace, device ioctls.
+            // can't `dbus-send` state-changing methods. The network stays open unless the
+            // session's setting is `none`, which unshares it. The Landlock layer inside closes
+            // what the masks do not reach: a socket under `$HOME`, the abstract namespace, device
+            // ioctls.
             let mut cmd = tokio::process::Command::new(bwrap_path);
             cmd.args(bwrap_args(
                 confinement.writable(),
                 confinement.readable(),
                 &self.site.cwd.get(),
                 &crate::workspace::private_directories(),
+                confinement.network(),
             ));
             cmd.arg("--");
             if let Some(executable) = &inner_executable {
@@ -625,6 +639,8 @@ impl Tool for ExecuteCommandTool {
                 ),
                 None => Vec::new(),
             };
+            #[cfg(target_os = "linux")]
+            let network = confinement.network();
 
             unsafe {
                 command_builder.pre_exec(move || {
@@ -649,7 +665,7 @@ impl Tool for ExecuteCommandTool {
                     }
                     #[cfg(target_os = "linux")]
                     if let Some(abi) = landlock_abi {
-                        crate::sandbox::apply_landlock(abi, &grants)
+                        crate::sandbox::apply_landlock(abi, &grants, network)
                             .map_err(std::io::Error::from_raw_os_error)?;
                     }
                     Ok(())
@@ -2772,11 +2788,16 @@ mod tests {
                 PathBuf::from("/proc"),
                 work.clone(),
             ];
-            let text: Vec<String> =
-                super::bwrap_args(std::slice::from_ref(&work), Some(&readable), &work, &[])
-                    .iter()
-                    .map(|arg| arg.to_string_lossy().into_owned())
-                    .collect();
+            let text: Vec<String> = super::bwrap_args(
+                std::slice::from_ref(&work),
+                Some(&readable),
+                &work,
+                &[],
+                crate::config::Network::Host,
+            )
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
             let at = |pair: [&str; 2]| text.windows(2).position(|w| w == pair);
             assert_eq!(at(["--tmpfs", "/"]), Some(2), "the root is empty: {text:?}");
             assert!(
@@ -2801,7 +2822,7 @@ mod tests {
         /// The inner layer is told the readable paths too, so the Landlock ruleset inside bwrap
         /// confines reads as the mounts do.
         #[test]
-        fn the_inner_layer_is_told_the_readable_paths() {
+        fn the_inner_layer_is_told_the_readable_directories() {
             let readable = vec![PathBuf::from("/usr"), PathBuf::from("/home/someone/work")];
             let text: Vec<String> = super::inner_confinement_argv(
                 std::path::Path::new("/proc/self/fd/7"),
@@ -2864,7 +2885,13 @@ mod tests {
                 },
             );
             let status = std::process::Command::new(bwrap)
-                .args(super::bwrap_args(&[], Some(&readable), &work, &[]))
+                .args(super::bwrap_args(
+                    &[],
+                    Some(&readable),
+                    &work,
+                    &[],
+                    crate::config::Network::Host,
+                ))
                 .arg("--")
                 .arg("sh")
                 .arg("-c")
@@ -2959,10 +2986,11 @@ mod tests {
                 std::path::PathBuf::from("/"),
             ];
             for cwd in masked {
-                let text: Vec<String> = super::bwrap_args(&[], None, &cwd, &[])
-                    .iter()
-                    .map(|arg| arg.to_string_lossy().into_owned())
-                    .collect();
+                let text: Vec<String> =
+                    super::bwrap_args(&[], None, &cwd, &[], crate::config::Network::Host)
+                        .iter()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect();
 
                 // The bind is what undoes the mask, so its absence is the property. Checked as an
                 // adjacent pair rather than by searching for the path alone, because `/tmp` also
@@ -3007,7 +3035,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         fn the_child_is_given_a_working_directory_it_can_reach() {
             let cwd = PathBuf::from("/tmp/session-cwd");
-            let args = super::bwrap_args(&[], None, &cwd, &[]);
+            let args = super::bwrap_args(&[], None, &cwd, &[], crate::config::Network::Host);
             let text: Vec<String> = args
                 .iter()
                 .map(|arg| arg.to_string_lossy().into_owned())
@@ -3039,7 +3067,13 @@ mod tests {
 
             // A cwd that is also a writable root ends up read-write, because the rw bind comes
             // later.
-            let rw = super::bwrap_args(std::slice::from_ref(&cwd), None, &cwd, &[]);
+            let rw = super::bwrap_args(
+                std::slice::from_ref(&cwd),
+                None,
+                &cwd,
+                &[],
+                crate::config::Network::Host,
+            );
             let rw: Vec<String> = rw
                 .iter()
                 .map(|arg| arg.to_string_lossy().into_owned())
@@ -3059,6 +3093,7 @@ mod tests {
                 None,
                 std::path::Path::new("/tmp/work"),
                 &[],
+                crate::config::Network::Host,
             );
             let last_mask = args
                 .iter()
@@ -3120,6 +3155,7 @@ mod tests {
                     None,
                     &work,
                     &[],
+                    crate::config::Network::Host,
                 ))
                 .arg("--")
                 .arg("sh")
@@ -3159,6 +3195,7 @@ mod tests {
                 None,
                 &root,
                 std::slice::from_ref(&store),
+                crate::config::Network::Host,
             )
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -3187,7 +3224,7 @@ mod tests {
 
         /// The store stays hidden under a writable root that contains it, on real bubblewrap.
         #[test]
-        fn a_confined_shell_cannot_read_meka_s_store_under_a_writable_root() {
+        fn a_confined_shell_cannot_read_meka_s_store_under_a_workspace_directory() {
             let Some(bwrap) = which_bwrap() else {
                 eprintln!("bwrap not installed; skipping");
                 return;
@@ -3213,6 +3250,7 @@ mod tests {
                     None,
                     &work,
                     std::slice::from_ref(&store),
+                    crate::config::Network::Host,
                 ))
                 .arg("--")
                 .arg("sh")
@@ -3286,6 +3324,148 @@ mod tests {
                 .collect()
         }
 
+        /// The network namespace is unshared on `none` and kept on `host`.
+        #[test]
+        fn the_bubblewrap_arguments_unshare_the_network_only_on_none() {
+            let cwd = PathBuf::from("/tmp/session-cwd");
+            let open = strings(&super::bwrap_args(
+                &[],
+                None,
+                &cwd,
+                &[],
+                crate::config::Network::Host,
+            ));
+            assert!(!open.iter().any(|arg| arg == "--unshare-net"), "{open:?}");
+            let closed = strings(&super::bwrap_args(
+                &[],
+                None,
+                &cwd,
+                &[],
+                crate::config::Network::None,
+            ));
+            assert!(
+                closed.iter().any(|arg| arg == "--unshare-net"),
+                "{closed:?}"
+            );
+        }
+
+        /// On real bubblewrap, a command cannot connect to a TCP port on `none` and can on
+        /// `host`, against a listener this test holds.
+        #[test]
+        fn a_confined_shell_cannot_connect_on_none() {
+            let Some(bwrap) = which_bwrap() else {
+                eprintln!("bwrap not installed; skipping");
+                return;
+            };
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
+            let port = listener.local_addr().expect("address").port();
+            let temp = tempfile::tempdir().expect("tempdir");
+            let work = crate::workspace::canonical_for_test(temp.path());
+            let script = format!(
+                "python3 -c \"import socket; socket.create_connection(('127.0.0.1', {port}), 2)\" \
+                 >/dev/null 2>&1 && exit 5; exit 6"
+            );
+            let exit_under = |network: crate::config::Network| -> Option<i32> {
+                std::process::Command::new(&bwrap)
+                    .args(super::bwrap_args(&[], None, &work, &[], network))
+                    .arg("--")
+                    .arg("sh")
+                    .arg("-c")
+                    .arg(&script)
+                    .status()
+                    .expect("spawn bwrap")
+                    .code()
+            };
+            assert_eq!(
+                exit_under(crate::config::Network::Host),
+                Some(5),
+                "the listener must be reachable on `host`, or the test proves nothing"
+            );
+            assert_eq!(
+                exit_under(crate::config::Network::None),
+                Some(6),
+                "the connect must fail on `none`"
+            );
+        }
+
+        /// Every mount a confined command sees is read-only, in both forms of the root, unless
+        /// it is the workspace, a mask, meka's own directory, `/dev` or `/proc`: the sandbox's
+        /// whole promise rests on no bind landing read-write by mistake, and a regression fails
+        /// here rather than in an audit.
+        #[test]
+        fn every_mount_a_confined_shell_sees_is_read_only_outside_the_workspace() {
+            let Some(bwrap) = which_bwrap() else {
+                eprintln!("bwrap not installed; skipping");
+                return;
+            };
+            let temp = tempfile::tempdir().expect("tempdir");
+            let root = crate::workspace::canonical_for_test(temp.path());
+            let work = root.join("work");
+            let private = root.join("meka-store");
+            for directory in [&work, &private] {
+                std::fs::create_dir(directory).expect("mkdir");
+            }
+            let base = crate::workspace::ReadBoundary::new(true, &[], &[]).base;
+            let confined: Vec<PathBuf> = std::iter::once(root.clone()).chain(base).collect();
+            // Writable by design: the masks and meka's directory are empty tmpfs, `/dev` and
+            // `/proc` are the sandbox's own, and so is the empty root when reads are confined.
+            let scratch: Vec<PathBuf> = super::bwrap_masks()
+                .into_iter()
+                .chain([private.clone()])
+                .collect();
+            for (form, readable) in [
+                ("reading everywhere", None),
+                ("reads confined", Some(confined.as_slice())),
+            ] {
+                let output = std::process::Command::new(&bwrap)
+                    .args(super::bwrap_args(
+                        std::slice::from_ref(&work),
+                        readable,
+                        &work,
+                        std::slice::from_ref(&private),
+                        crate::config::Network::Host,
+                    ))
+                    .arg("--")
+                    .arg("cat")
+                    .arg("/proc/self/mountinfo")
+                    .output()
+                    .expect("spawn bwrap");
+                assert!(
+                    output.status.success(),
+                    "{form}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let table = String::from_utf8_lossy(&output.stdout);
+                // A shadowed mount stays listed, so the workspace is read-write when any of its
+                // lines is: the later bind is the one in effect.
+                let mut workspace_read_write = false;
+                for line in table.lines() {
+                    // `<id> <parent> <major:minor> <root> <mount point> <options> ... - <type> ...`
+                    let fields: Vec<&str> = line.split(' ').collect();
+                    let point = std::path::Path::new(fields[4]);
+                    let read_only = fields[5].split(',').any(|option| option == "ro");
+                    if point == work {
+                        workspace_read_write |= !read_only;
+                        continue;
+                    }
+                    let sandbox_own = point.starts_with("/dev")
+                        || point.starts_with("/proc")
+                        || (readable.is_some() && point == std::path::Path::new("/"));
+                    if sandbox_own || scratch.iter().any(|mask| point == mask) {
+                        continue;
+                    }
+                    assert!(
+                        read_only,
+                        "{form}: a mount outside the workspace is read-write: {line}"
+                    );
+                }
+                assert!(
+                    workspace_read_write,
+                    "{form}: the workspace must be mounted read-write:\n{table}"
+                );
+            }
+        }
+
         fn which_bwrap() -> Option<std::path::PathBuf> {
             let path = std::env::var_os("PATH")?;
             std::env::split_paths(&path)
@@ -3298,8 +3478,9 @@ mod tests {
     ///
     /// The Linux dialects are each tested through their helpers (`bwrap_args`, `apply_landlock`)
     /// with a hand-built root list, so nothing else exercises the wire between `Confinement` and
-    /// the backend: cut it (`bwrap_args(&[])`, `apply_landlock(abi, &[])`) and the workspace shell
-    /// is silently read-only, which is the level's central promise.
+    /// the backend: cut it (`bwrap_args(&[], crate::config::Network::Host)`, `apply_landlock(abi,
+    /// &[])`) and the workspace shell is silently read-only, which is the level's central
+    /// promise.
     #[cfg(unix)]
     mod workspace_shell_boundary {
 

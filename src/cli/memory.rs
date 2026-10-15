@@ -455,7 +455,7 @@ pub(crate) async fn run_remove(store: &MemoryStore, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// `meka memory export --dir <path>`: one `<name>.md` per memory, frontmatter and body.
+/// `meka memory export --directory <path>`: one `<name>.md` per memory, frontmatter and body.
 ///
 /// The answer for `grep`, a git repository, or a backup that is not a database. Frontmatter and
 /// body, so what comes out is readable and editable on its own terms rather than a dump.
@@ -678,7 +678,7 @@ pub(crate) async fn run_verify(store: &MemoryStore, rebuild: bool) -> Result<()>
     }
 }
 
-/// The directory `meka memory export` writes to when `--dir` is not given.
+/// The directory `meka memory export` writes to when `--directory` is not given.
 pub(crate) fn default_export_dir() -> PathBuf {
     PathBuf::from("meka-memory-export")
 }
@@ -736,8 +736,8 @@ pub(crate) async fn run_memory_subcommand(
         crate::cli::MemoryAction::Verify { rebuild } => {
             crate::cli::memory::run_verify(&store, *rebuild).await?
         }
-        crate::cli::MemoryAction::Export { dir } => {
-            let directory = dir
+        crate::cli::MemoryAction::Export { directory } => {
+            let directory = directory
                 .clone()
                 .unwrap_or_else(crate::cli::memory::default_export_dir);
             crate::cli::memory::run_export(&store, &directory).await?

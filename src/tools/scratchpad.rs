@@ -85,10 +85,19 @@ fn build_large_output_preview(name: &str, text: &str) -> String {
 /// parameter every tool takes, so `shell_execute({.., scratchpad: "<inherited>"})` wrote a local
 /// row under the parent's name and every later `scratchpad_read` found the shadow first. The
 /// result stays inline, with the same refusal the tools give, so the model learns why.
+///
+/// `inline` names the calls whose result is a word about the call rather than the tool's output
+/// ([`crate::tools::ToolOutput::is_output`]): meka's refusal, an argument error, an interruption,
+/// or a failure from a tool whose failed result is a complaint. Those stay inline whatever the
+/// call asked: the caller redirected the output, a sentence about the call is neither large nor
+/// sensitive, and redirected it tells the caller only that the call failed, with a read of the
+/// entry owed to learn why. A command's failure, its output with its exit code, is its output and
+/// goes to the entry as asked.
 pub(crate) async fn save_explicit_scratchpad_results(
     store: &Store,
     session_id: Uuid,
     inherited_names: &[String],
+    inline: &[String],
     assistant_message: &Message,
     results: &mut [ContentBlock],
 ) -> Result<()> {
@@ -109,6 +118,9 @@ pub(crate) async fn save_explicit_scratchpad_results(
             let Some(name) = scratchpad_name else {
                 continue;
             };
+            if inline.iter().any(|id| id == tool_use_id) {
+                continue;
+            }
 
             let text = ContentBlock::tool_result_text_content(content);
             if text.is_empty() {
@@ -2052,9 +2064,16 @@ mod tests {
             is_error: false,
         }];
 
-        save_explicit_scratchpad_results(&manager, session_id, &[], &assistant_msg, &mut results)
-            .await
-            .expect("save");
+        save_explicit_scratchpad_results(
+            &manager,
+            session_id,
+            &[],
+            &[],
+            &assistant_msg,
+            &mut results,
+        )
+        .await
+        .expect("save");
 
         // Result should be replaced with a reference
         if let ContentBlock::ToolResult { content, .. } = &results[0] {
@@ -2098,6 +2117,7 @@ mod tests {
             &manager,
             session_id,
             &["build_log".to_string()],
+            &[],
             &assistant_msg,
             &mut results,
         )
@@ -2118,6 +2138,84 @@ mod tests {
         let text = ContentBlock::tool_result_text_content(content);
         assert!(text.contains("the worker's own output"), "{text}");
         assert!(text.contains("inherited read-only"), "{text}");
+    }
+
+    /// A word about the call stays inline whatever it asked, while a command's failure is its
+    /// output and goes to the entry; which is which is the dispatcher's call, handed in.
+    #[tokio::test]
+    async fn a_word_about_the_call_stays_inline_under_a_redirect_and_a_commands_failure_does_not() {
+        let manager = Store::for_test().await;
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        let assistant_msg = make_assistant_message(vec![
+            (
+                "call-1",
+                "file_read",
+                serde_json::json!({"path": "/etc/shadow", "scratchpad": "refused"}),
+            ),
+            (
+                "call-2",
+                "shell_execute",
+                serde_json::json!({"command": "make", "scratchpad": "build"}),
+            ),
+        ]);
+        let failed = |id: &str, text: &str| ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: vec![ToolResultContent::Text {
+                text: text.to_string(),
+            }],
+            is_error: true,
+        };
+        let mut results = vec![
+            failed(
+                "call-1",
+                "Tool error: '/etc/shadow' resolves outside the readable directories",
+            ),
+            failed("call-2", "make: *** No rule\nExit code: 2"),
+        ];
+
+        save_explicit_scratchpad_results(
+            &manager,
+            session_id,
+            &[],
+            &["call-1".to_string()],
+            &assistant_msg,
+            &mut results,
+        )
+        .await
+        .expect("save");
+
+        let text = |index: usize| match &results[index] {
+            ContentBlock::ToolResult { content, .. } => {
+                ContentBlock::tool_result_text_content(content)
+            }
+            other => panic!("a tool result: {other:?}"),
+        };
+        assert!(text(0).contains("resolves outside"), "{}", text(0));
+        assert_eq!(
+            manager
+                .load_scratchpad_entry(session_id, "refused")
+                .await
+                .expect("load"),
+            None,
+            "meka's own refusal is not saved"
+        );
+        assert!(
+            text(1).contains("scratchpad_read") && !text(1).contains("No rule"),
+            "{}",
+            text(1)
+        );
+        assert_eq!(
+            manager
+                .load_scratchpad_entry(session_id, "build")
+                .await
+                .expect("load")
+                .as_deref(),
+            Some("make: *** No rule\nExit code: 2"),
+            "a command's own failure is the tool's output"
+        );
     }
 
     #[tokio::test]
@@ -2142,9 +2240,16 @@ mod tests {
             is_error: false,
         }];
 
-        save_explicit_scratchpad_results(&manager, session_id, &[], &assistant_msg, &mut results)
-            .await
-            .expect("save");
+        save_explicit_scratchpad_results(
+            &manager,
+            session_id,
+            &[],
+            &[],
+            &assistant_msg,
+            &mut results,
+        )
+        .await
+        .expect("save");
 
         // Result should be unchanged
         if let ContentBlock::ToolResult { content, .. } = &results[0] {
@@ -2182,9 +2287,16 @@ mod tests {
             is_error: false,
         }];
 
-        save_explicit_scratchpad_results(&manager, session_id, &[], &assistant_msg, &mut results)
-            .await
-            .expect("save");
+        save_explicit_scratchpad_results(
+            &manager,
+            session_id,
+            &[],
+            &[],
+            &assistant_msg,
+            &mut results,
+        )
+        .await
+        .expect("save");
 
         // Pre-existing scratchpad entry should be untouched.
         let loaded = manager

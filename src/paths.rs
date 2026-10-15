@@ -9,9 +9,10 @@ use std::path::PathBuf;
 /// Returns `None` only when a tilde needs the home directory but it cannot be determined, which the
 /// caller reports rather than silently treating `~` as a relative directory of that name.
 ///
-/// Shared by the screen's `/cd` (and its path completer) and by `[skills] extra_paths`, so a tilde
-/// means the same thing wherever a user types a path. Deliberately does *not* expand `~user`: that
-/// needs a password-database lookup, and no config surface here has ever accepted the form.
+/// Shared by the screen's `/cd` (and its path completer) and by `[skills] additional_directories`,
+/// so a tilde means the same thing wherever a user types a path. Deliberately does *not* expand
+/// `~user`: that needs a password-database lookup, and no config surface here has ever accepted the
+/// form.
 pub(crate) fn expand_user_path(target: &str) -> Option<PathBuf> {
     if target.is_empty() || target == "~" {
         dirs::home_dir()
@@ -76,7 +77,8 @@ pub(crate) fn config_file_path() -> Option<PathBuf> {
 pub(crate) fn skills_dir() -> Option<PathBuf> {
     crate::paths::meka_config_dir().map(|dir| dir.join("skills"))
 }
-/// The roots to scan, in precedence order: meka's own first, then `extra_paths` as given.
+/// The roots to scan, in precedence order: meka's own first, then `additional_directories` as
+/// given.
 ///
 /// meka's own root leads because it is the store the user curates *through meka*, and because it is
 /// the only one anything writes to; a skill there should not be shadowed by a copy another client

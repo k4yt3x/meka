@@ -135,7 +135,7 @@ pub(crate) struct WriteSkillRequest {
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "The skill store is disabled", body = ProblemDetail),
-        (status = 409, description = "The skill lives in a read-only root from `[skills] extra_paths`", body = ProblemDetail),
+        (status = 409, description = "The skill lives in a read-only root from `[skills] additional_directories`", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid name, empty description, or an unwritable path", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
@@ -170,10 +170,11 @@ pub(crate) async fn put_skill(
     let installed = state.shared.skills.current().await;
     let existing = installed.find(&name);
 
-    // A skill discovered under a read-only `extra_paths` root is not this endpoint's to change: the
-    // write would land in meka's own store and *shadow* it, so the caller would be told it updated
-    // a skill while the file every other client reads stayed as it was. Unlike the module note
-    // above about an operator's deliberate choices, nobody chooses a silent fork.
+    // A skill discovered under a read-only `additional_directories` root is not this endpoint's to
+    // change: the write would land in meka's own store and *shadow* it, so the caller would be
+    // told it updated a skill while the file every other client reads stayed as it was. Unlike
+    // the module note above about an operator's deliberate choices, nobody chooses a silent
+    // fork.
     //
     // Shared with the CLI and the tools rather than spelled out here, which is also what makes it
     // cover a shadowed file that does not parse: a check against the loaded skills alone lets a
@@ -255,7 +256,7 @@ pub(crate) async fn put_skill(
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such skill", body = ProblemDetail),
-        (status = 409, description = "The skill lives in a read-only root from `[skills] extra_paths`", body = ProblemDetail),
+        (status = 409, description = "The skill lives in a read-only root from `[skills] additional_directories`", body = ProblemDetail),
         (status = 422, description = "Invalid name, or a symlinked skill directory", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),

@@ -8,7 +8,7 @@ use super::*;
 /// away included: the reader takes this version's shape alone, and an older archive the migration
 /// module knows is brought forward before it is read. `meka session import` refuses any other
 /// version.
-pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 9;
+pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 10;
 /// Decode an archive, refusing one written for another `format_version` before its shape is read.
 ///
 /// The version is read on its own first, because a release that changed the shape also changed
@@ -119,16 +119,17 @@ pub(crate) struct ExportedSession {
     pub(crate) parent_id: Option<String>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
-    /// A string in the archive, a path in the struct, like `additional_roots` below.
-    pub(crate) cwd: Option<std::path::PathBuf>,
+    /// A string in the archive, a path in the struct, like `additional_workspace_directories`
+    /// below.
+    pub(crate) working_directory: Option<std::path::PathBuf>,
     /// The level the session ran at, as its one spelling; an archive naming anything else is
     /// refused at parse rather than written to a row no reader could resolve.
     pub(crate) permission: Option<crate::permission::Permission>,
     /// Whether calls above the level were submitted for approval.
     pub(crate) approvals: bool,
     pub(crate) capabilities_json: Option<String>,
-    /// Workspace roots beyond `cwd`; empty for a single-root session.
-    pub(crate) additional_roots: Vec<std::path::PathBuf>,
+    /// The workspace beyond the working directory; empty for a single-directory session.
+    pub(crate) additional_workspace_directories: Vec<std::path::PathBuf>,
     /// A sub-agent's spawn terms; `null` for a session nothing spawned, which an absent key also
     /// reads as, by serde's rule for an `Option`.
     pub(crate) subagent_spec_json: Option<String>,
@@ -234,11 +235,11 @@ pub(crate) async fn build_session_export(
             parent_id: meta.parent_id.map(|id| id.to_string()),
             created_at: meta.created_at,
             updated_at: meta.updated_at,
-            cwd: meta.cwd,
+            working_directory: meta.cwd,
             permission: meta.permission,
             approvals: meta.approvals,
             capabilities_json: meta.capabilities_json,
-            additional_roots: meta.additional_roots,
+            additional_workspace_directories: meta.additional_roots,
             subagent_spec_json: meta.subagent_spec_json,
             profile: meta.profile,
             title: meta.title,
@@ -499,11 +500,11 @@ pub(crate) fn plan_import(
             new_id,
             new_parent_id,
             created_at: session.created_at,
-            cwd: session.cwd,
+            cwd: session.working_directory,
             permission,
             approvals: session.approvals,
             capabilities_json: session.capabilities_json,
-            additional_roots: session.additional_roots,
+            additional_roots: session.additional_workspace_directories,
             subagent_spec_json: session.subagent_spec_json,
             profile,
             // Through the same acceptor every door that sets one uses, so an archive cannot
@@ -595,7 +596,12 @@ mod tests {
     #[test]
     fn a_current_archive_missing_a_field_is_refused_rather_than_defaulted() {
         let mut archive = serde_json::to_value(archive_on("work")).expect("serialize");
-        for field in ["approvals", "additional_roots", "profile", "turns"] {
+        for field in [
+            "approvals",
+            "additional_workspace_directories",
+            "profile",
+            "turns",
+        ] {
             let mut lacking = archive.clone();
             lacking["sessions"][0]
                 .as_object_mut()
@@ -625,11 +631,11 @@ mod tests {
                 "parent_id": null,
                 "created_at": "2020-01-01T00:00:00Z",
                 "updated_at": "2020-01-01T00:00:00Z",
-                "cwd": null,
+                "working_directory": null,
                 "permission": "read",
                 "approvals": false,
                 "capabilities_json": null,
-                "additional_roots": [],
+                "additional_workspace_directories": [],
                 "subagent_spec_json": null,
                 "profile": profile,
                 "stats": crate::stats::SessionStatsSnapshot::default(),

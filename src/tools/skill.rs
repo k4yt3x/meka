@@ -126,8 +126,8 @@ fn require_root(cache: &SkillCache, tool_name: &str) -> Result<std::path::PathBu
 /// valid skill" but never why.
 ///
 /// The `meka skill remove` remedy is only offered when the file is one that command can reach; for
-/// a broken skill under a read-only `extra_paths` root it answers "not found", so the refusal names
-/// the path instead.
+/// a broken skill under a read-only `additional_directories` root it answers "not found", so the
+/// refusal names the path instead.
 ///
 /// [`skills::write_skill`] refuses the same case independently; this exists so the refusal arrives
 /// as a readable tool result rather than a tool error, and so `skill_delete` gets it too.
@@ -910,10 +910,10 @@ mod tests {
     /// The read-only rule covers a foreign skill whose `SKILL.md` does not parse, and the refusal
     /// sends the reader to the file rather than to a command that cannot reach it.
     ///
-    /// Compared against the loaded skills alone, an unparseable file in an `extra_paths` root is a
-    /// name nothing has an opinion about and gets shadowed silently, the worst case to shadow
-    /// since the original is then reported nowhere; and `meka skill remove` answers "not found"
-    /// for a file meka does not own.
+    /// Compared against the loaded skills alone, an unparseable file in an `additional_directories`
+    /// root is a name nothing has an opinion about and gets shadowed silently, the worst case
+    /// to shadow since the original is then reported nowhere; and `meka skill remove` answers
+    /// "not found" for a file meka does not own.
     #[tokio::test]
     async fn a_broken_skill_in_a_read_only_root_is_neither_shadowed_nor_misdirected() {
         let temp = tempfile::tempdir().expect("tempdir");

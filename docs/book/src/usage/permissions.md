@@ -10,7 +10,7 @@ control over the agent's capabilities and prevent accidental modifications.
 |-------|-----------|----------------|
 | **None** | `[n]` (green) | No tools without approval. |
 | **Read** | `[r]` (yellow) | Read-only tools: `file_read`, `file_find`, `file_search`, `web_fetch`, `shell_execute` (sandboxed read-only), `checklist_*`, `agent_spawn`, scratchpad tools |
-| **Workspace** | `[w]` (orange) | File and shell writes stay inside workspace roots. Unconfined MCP calls may need approval or be refused; the shell needs an available sandbox |
+| **Workspace** | `[w]` (orange) | File and shell writes stay inside the workspace. Unconfined MCP calls may need approval or be refused; the shell needs an available sandbox |
 | **Unrestricted** | `[u]` (red) | Every tool, no boundary. `shell_execute` runs with no sandbox at all |
 
 The ladder is ordered by **reach**: each level contains the ones below it, and a tool call that
@@ -19,17 +19,21 @@ instead.
 
 ## The workspace boundary
 
-At `workspace`, a write may land under:
+At `workspace`, a write may land under the workspace: the working directory and the additional
+workspace directories. Those are:
 
 - the working directory (which `/cd` moves),
 - any folder an ACP client supplied as an additional directory,
-- any `--writable-root <PATH>` you passed, repeatable.
+- any `--additional-workspace-directory <DIR>` you passed, repeatable.
 
-Roots are resolved to their canonical form, so a symlink inside the workspace that points out of it
-resolves to where it actually lands and is refused. A root that does not exist is dropped rather
-than trusted; if none resolve, nothing is writable. A `--writable-root` that does not resolve at
-startup is reported as a warning, and kept: a build directory that does not exist yet becomes a root
-the moment it does.
+A sub-agent's are what its spawn call stated, or its parent's when it stated nothing; see
+[`agent_spawn`](../tools/overview.md#agent_spawn).
+
+Directories are resolved to their canonical form, so a symlink inside the workspace that points out
+of it resolves to where it actually lands and is refused. A directory that does not exist is
+dropped rather than trusted; if none resolve, nothing is writable. An
+`--additional-workspace-directory` that does not resolve at startup is reported as a warning, and
+kept: a build directory that does not exist yet joins the workspace the moment it does.
 
 **The boundary follows the working directory.** It is recomputed on every write rather than fixed
 when the session starts, so `/cd /etc` at `workspace` makes `/etc` writable from that point on. This
@@ -42,30 +46,32 @@ Because the boundary follows the directory, the directory is recorded on the ses
 [resume reopens it](./sessions.md) rather than adopting your shell's. Resuming a `workspace` session
 from `$HOME` would otherwise make your whole home directory writable without you asking.
 
-One consequence worth knowing: a *relative* `--writable-root` resolves against your shell, not
-against the session. `meka -c --writable-root build` run from `~` grants `~/build`, while the
-session itself may reopen in `~/project`. That follows from the flag belonging to the process rather
-than to the session; pass an absolute path when you mean a directory inside the session's.
+One consequence worth knowing: a *relative* `--additional-workspace-directory` resolves against
+your shell, not against the session. `meka -c --additional-workspace-directory build` run from `~`
+grants `~/build`, while the session itself may reopen in `~/project`. That follows from the flag
+belonging to the process rather than to the session; pass an absolute path when you mean a
+directory inside the session's.
 
-`--writable-root` belongs to the process and reaches the screen, a one-shot run, and an ACP session.
-It does **not** reach a session created through `POST /v1/sessions`: the HTTP API is single-root, so a session there is confined to its own
-`cwd` and nothing else. Extra roots supplied by an ACP client apply to that client's session only,
-and meka does not report your `--writable-root` back to the client as though the client had asked
-for it.
+`--additional-workspace-directory` and `--additional-readable-directory` belong to the process and
+reach the screen, a one-shot run, and an ACP session. Neither reaches a session created through
+`POST /v1/sessions`: the HTTP API is single-directory, so a session there is confined to its own
+`working_directory` and nothing else. Extra directories supplied by an ACP client apply to that
+client's session only, and meka does not report your flags back to the client as though the client
+had asked for them.
 
-Because it belongs to the process, it is not recorded on the session either, and resuming a session
-does not bring it back: pass it again. This is the difference between it and the profile and
-permission level, which *are* recorded and *do* come back. Writing it to the row would mean a
-`meka serve` sharing the data directory could later grant those roots to a job it fires, on the
-authority of a flag that process was never given.
+Because they belong to the process, they are not recorded on the session either, and resuming a
+session does not bring them back: pass them again. This is the difference between them and the
+profile and permission level, which *are* recorded and *do* come back. Writing them to the row
+would mean a `meka serve` sharing the data directory could later grant those directories to a job
+it fires, on the authority of a flag that process was never given.
 
 The same set governs both halves, derived once so they cannot disagree: the `file_*` tools check it
-before writing, and the shell sandbox is built from it. A refusal from `file_write` names the roots
-so the agent can retry somewhere valid.
+before writing, and the shell sandbox is built from it. A refusal from `file_write` names the
+workspace so the agent can retry somewhere valid.
 
-A sub-agent can be handed a narrower boundary than its parent's: [`agent_spawn`'s
-`writable_roots`](../tools/overview.md#agent_spawn) names the directories it may write under, each
-of which must lie inside the parent's own.
+A sub-agent can be handed a narrower workspace than its parent's: [`agent_spawn`'s
+`working_directory` and `additional_workspace_directories`](../tools/overview.md#agent_spawn) name
+it, each inside the parent's own.
 
 ## The read boundary
 
@@ -73,22 +79,23 @@ Reads are not confined by default: the workspace boundary says "this cannot chan
 the workspace", not "this cannot see them". `[permissions].confine_reads = true` adds the second
 promise. Below `unrestricted`, a read, by a file tool or by a command, may then land only under:
 
-- the session's roots, the same list writes are confined to: the working directory, an ACP client's
-  additional directories, each `--writable-root`;
-- the read-only roots a parent handed a sub-agent through [`agent_spawn`'s
-  `readable_roots`](../tools/overview.md#agent_spawn);
+- the workspace, the same set writes are confined to: the working directory, an ACP client's
+  additional directories, each `--additional-workspace-directory`;
+- the additional readable directories: each `--additional-readable-directory` on a run, and what a
+  parent handed a sub-agent through [`agent_spawn`'s
+  `additional_readable_directories`](../tools/overview.md#agent_spawn);
 - the system directories, where the operating system keeps the programs, libraries and
-  configuration a command needs to run at all, and anything [`[shell].readable_paths`](../configuration/config-file.md#shellreadable_paths) adds. The home directory is not among them: that is the point;
-- the skill roots [`[skills].extra_paths`](../configuration/config-file.md#skills) names, so a
+  configuration a command needs to run at all, and anything [`[shell].additional_readable_directories`](../configuration/config-file.md#shelladditional_readable_directories) adds. The home directory is not among them: that is the point;
+- the skill directories [`[skills].additional_directories`](../configuration/config-file.md#skills) names, so a
   skill's bundled files stay readable, as meka's own skills store does.
 
-The switch is instance-wide and read at startup, so every session the process runs is bound by it;
-`unrestricted` remains the per-session way out, since it disclaims every boundary. The same set
-governs both halves, derived once: `file_read`, `file_find`, `file_search` and
-`scratchpad_load_file` refuse a path outside it and name the roots, `file_find` and `file_search`
-step around what a symlink reaches outside it, and the shell sandbox is built from it. The
-environment block the agent reads each turn names the readable roots and the fact that the
-system directories are readable too.
+The switch is instance-wide and read at startup, so every root session the process runs is bound
+by it; `unrestricted` remains the per-session way out, since it disclaims every boundary. The same
+set governs both halves, derived once: `file_read`, `file_find`, `file_search` and
+`scratchpad_load_file` refuse a path outside it and name the directories, `file_find` and
+`file_search` step around what a symlink reaches outside it, and the shell sandbox is built from
+it. The environment block the agent reads each turn names its additional workspace and readable
+directories, or says `anywhere` when its reads are not confined.
 
 What a command no longer sees, it mostly does not see at all: under Bubblewrap the root of the
 sandbox is an empty filesystem with only the readable paths bound into it, so a path outside them
@@ -100,23 +107,23 @@ existence, name and size may still be visible under Landlock alone and under mac
 is not mediated so that paths resolve through their ancestors; the bytes are what the boundary
 protects.
 
-The switch is the deployment's default, not the only way in. With it off, a parent still confines
-a sub-agent's reads by naming `readable_roots`: that sub-agent, and anything it spawns, reads its
-workspace, the list and the system directories, the way `writable_roots` hands a sub-agent a
-write boundary from a parent that has none. A spawn turns confinement on, never off. An entry
-inside the sub-agent's workspace is refused, since the workspace is readable already; the
-refusal names `writable_roots`, which is how a sub-agent is confined to a directory. A
-sub-agent's reach never exceeds its parent's here either: `readable_roots` are admitted against
-the parent's own readable roots when the parent's reads are confined, a parent reading everywhere
-may name anywhere, and a follow-up re-admits the worker's directory and roots against the parent's
-reach at that moment. A sub-agent whose call names nothing holds its parent's boundary, and one
-handed a list runs at `workspace` unless its call asks for less.
+The switch governs root sessions alone. A sub-agent's reads are what its spawn call stated, or its
+parent's when it stated nothing: a parent whose reads are not confined still confines a
+sub-agent's by naming `working_directory`, and the sub-agent, and anything it spawns, then reads
+its workspace, its additional readable directories and the system directories, the way a working
+directory hands it a write boundary. A spawn turns confinement on, never off: a stated scope
+confines reads, and a bare spawn follows the parent's. A sub-agent's reach never exceeds its
+parent's here either: every directory
+it is handed is admitted against what the parent can read, the working directory and the
+workspace list against what it can write when the sub-agent writes, and a follow-up re-admits the
+whole scope against the parent's reach at that moment, at the level the sub-agent runs at then.
 
-The file tools refuse a path outside the roots in the same words whether or not it exists, and
+The file tools refuse a path outside the boundary in the same words whether or not it exists, and
 name it as it was given rather than where a symlink leads, so a confined session learns neither
-which paths exist beyond its roots nor what its links point at. `agent_spawn` judges
-`writable_roots` and `readable_roots` the same way. A command under Landlock alone and under
-macOS can still tell a missing path from a denied one, as above.
+which paths exist beyond its reach nor what its links point at; a link whose target is missing is
+judged where it leads, as the open would be. `agent_spawn` judges every directory it is handed
+the same way. A command under Landlock alone and under macOS can still tell a missing path from a
+denied one, as above.
 
 On Windows the shell cannot hold this boundary: neither token mechanism confines reads. The file
 tools keep it, a command does not, the agent is told so in its environment block, and startup logs
@@ -155,37 +162,37 @@ Four limits, stated plainly because none of them is visible from the inside:
 
 | Platform | Backend | Confines the shell's writes | Confines the shell's reads, with `confine_reads` on |
 |----------|---------|-----------------------------|-----------------------------------------------------|
-| Linux | Bubblewrap (preferred) | Yes: read-only root bind, plus a writable bind per root, with the Landlock ruleset inside where the kernel has one | Yes: an empty root with only the readable paths bound into it, read-only, the roots read-write; what is not bound is absent |
-| Linux | Landlock (fallback) | Yes: one path-beneath rule per root, or one per sibling where the root contains meka's directories | Yes: read and execute rules on the readable paths instead of on `/`; names and sizes outside stay visible to `stat` |
-| macOS | `sandbox-exec` | Yes: writable subpath per root | Yes: data reads and executable mappings per readable path instead of everywhere; existence and metadata stay global so paths resolve |
-| Windows | `WRITE_RESTRICTED` token + per-root ACE | Yes: writes are permitted only where a workspace capability has an ACE | No: the file tools hold the boundary, a command reads anywhere, and startup warns once |
+| Linux | Bubblewrap (preferred) | Yes: read-only root bind, plus a writable bind per workspace directory, with the Landlock ruleset inside where the kernel has one | Yes: an empty root with only the readable paths bound into it, read-only, the roots read-write; what is not bound is absent |
+| Linux | Landlock (fallback) | Yes: one path-beneath rule per workspace directory, or one per sibling where it contains meka's directories | Yes: read and execute rules on the readable paths instead of on `/`; names and sizes outside stay visible to `stat` |
+| macOS | `sandbox-exec` | Yes: writable subpath per workspace directory | Yes: data reads and executable mappings per readable path instead of everywhere; existence and metadata stay global so paths resolve |
+| Windows | `WRITE_RESTRICTED` token + an ACE per workspace directory | Yes: writes are permitted only where a workspace capability has an ACE | No: the file tools hold the boundary, a command reads anywhere, and startup warns once |
 
 Under Bubblewrap, `/tmp`, `/run` and `/var/tmp` are masked with a tmpfs, so paths there are not
-merely unwritable but invisible. A workspace root under `/tmp` is bound after the mask and stays
+merely unwritable but invisible. A workspace directory under `/tmp` is bound after the mask and stays
 reachable.
 
 meka's own directories are hidden too: the config directory and the data directory holding
 `meka.db` and every account credential. Bubblewrap masks them
 after every workspace bind and `sandbox-exec` denies them last, so a confined command cannot read
-the credential store even from a workspace root at `$HOME` that contains it, and the in-process
-`file_write` and `file_edit` refuse a target under them whatever roots the session holds. The
+the credential store even from a workspace directory at `$HOME` that contains it, and the in-process
+`file_write` and `file_edit` refuse a target under them whatever directories the session holds. The
 in-process read tools (`file_read`, `file_search`, `file_find`, `scratchpad_load_file`) refuse
-them below `unrestricted` too, and a search from a root above them steps around them. The one exception is meka's own skills store, `skills/` under the config directory, which those readers reach at every level: a skill's bundled files are what its body tells the agent to read, and nothing secret lives there. The same
+them below `unrestricted` too, and a search from a directory above them steps around them. The one exception is meka's own skills store, `skills/` under the config directory, which those readers reach at every level: a skill's bundled files are what its body tells the agent to read, and nothing secret lives there; a dot-entry at the store's top level (`.git` and the like, which discovery skips too) stays hidden with the rest. The same
 readers refuse a process's own `/proc` directory (`/proc/<pid>`, `/proc/self`,
 `/proc/thread-self`), whose `environ`, `cmdline`, `fd` and `mem` carry what the process was given,
 meka's own environment and an MCP server's credential included; the system-wide files beside them
 (`/proc/meminfo`, `/proc/cpuinfo`, `/proc/mounts`) stay readable. Landlock
 rules only add access, so meka hides them there by never covering them: reading files is granted
 per sibling along the path to each, which keeps their names and sizes visible and their bytes
-not, and a workspace root above them is split the same way, at the cost that a new file under
-such a root can land only in one of its subdirectories. The Windows token cannot express the
+not, and a workspace directory above them is split the same way, at the cost that a new file under
+such a directory can land only in one of its subdirectories. The Windows token cannot express the
 denial at all: under it a command at `read` can still read the config directory and the store,
-account credentials included, and a workspace root containing them can write them; see
+account credentials included, and a workspace directory containing them can write them; see
 [Shell](../tools/shell.md#macos-and-windows). Only `unrestricted` writes there on the other
 backends.
 
 Windows works differently enough to be worth stating. meka mints a deterministic capability SID per
-workspace root, adds an inheritable write ACE for it on that root, and runs the shell under a
+workspace directory, adds an inheritable write ACE for it on that directory, and runs the shell under a
 `WRITE_RESTRICTED` token carrying that capability. Three consequences:
 
 - **It writes to your directory's ACL.** The grant is real, standing state, visible in `icacls` as
@@ -196,13 +203,13 @@ workspace root, adds an inheritable write ACE for it on that root, and runs the 
   **A crash or a kill still strands it.** Nothing runs on those paths, so the ACE outlives them. It
   grants nothing to anyone but a meka run in that same directory, and is reused rather than
   duplicated next time, but if you want it gone:
-  `icacls "<root>" /remove:g *<the S-1-4-… from icacls>`.
+  `icacls "<directory>" /remove:g *<the S-1-4-… from icacls>`.
 
-  The grant is tracked per process, not per session, so several sessions confining the same root
+  The grant is tracked per process, not per session, so several sessions confining the same directory
   share one ACE, and it is released when the process exits rather than when any one of them ends.
   Under `meka serve` that means the ACE stands for the lifetime of the server.
-- **It needs you to own the root.** Ownership supplies `WRITE_DAC` implicitly, which is what lets
-  meka grant without elevation. A network share or another user's folder cannot be a workspace root.
+- **It needs you to own the directory.** Ownership supplies `WRITE_DAC` implicitly, which is what lets
+  meka grant without elevation. A network share or another user's folder cannot be a workspace directory.
 - **Writes are restricted; nothing else is.** A `WRITE_RESTRICTED` token intersects write accesses
   only. Anything carrying an explicit `Everyone: Write` ACE stays writable even outside the
   workspace, which has no Unix analog.
@@ -336,11 +343,11 @@ ACP client; set `approvals = true` under `[permissions]` to start every new sess
 the level, it is recorded on the session and comes back on a resume.
 
 **An approved call still runs at the session's level.** Approval turns a refusal into a question; it
-does not widen reach. An approved `file_write` at `read` lands only under the workspace roots, and
+does not widen reach. An approved `file_write` at `read` lands only inside the workspace, and
 an approved `shell_execute` at `read` runs in the read-only sandbox. To let an approved call reach
 further, raise the level. At `unrestricted` nothing sits above the level, so nothing is ever asked.
 A call the level refuses however you answer is refused without a prompt: a write outside the
-workspace roots, or `shell_execute` below `unrestricted` when nothing can sandbox it.
+workspace, or `shell_execute` below `unrestricted` when nothing can sandbox it.
 
 `none` with approvals on is the most cautious shape: every tool call is put to you, and nothing runs
 unattended. Sub-agents share their parent's switch, and their prompts are forwarded to the parent's
@@ -439,7 +446,7 @@ Working directory: /home/you/project
 </context>
 ```
 
-The section carries only the two values that change; what each level allows and what the approvals switch does are stated once in the system prompt. That short section is almost the only permission-dependent content in the request; `[Environment context]` is the other, since it is empty at `none` and gains a writable-roots block at `workspace`. The system prompt and the tools-array schemas stay byte-identical across `/permission` toggles, so mid-session level changes don't invalidate the Claude prompt cache; the entire conversation stays warm.
+The section carries only the two values that change; what each level allows and what the approvals switch does are stated once in the system prompt. That short section is almost the only permission-dependent content in the request; `[Environment context]` is the other, since it is empty at `none` and omits the readable line at `unrestricted`. The system prompt and the tools-array schemas stay byte-identical across `/permission` toggles, so mid-session level changes don't invalidate the Claude prompt cache; the entire conversation stays warm.
 
 The same reasoning is why the tool catalog itself lives here rather than in the system prompt. Prompt caching is prefix-based, and the system prompt heads that prefix, so anything cached there that later changes (an MCP server connecting late or hot-swapping its tools, a skill being installed) would re-cache the entire conversation behind it. The `<context>` block rides inside your own message instead, so changes are appended rather than rewritten.
 
@@ -455,7 +462,7 @@ Any built-in tool's required permission can be overridden from `config.toml` wit
 
 ### Sub-agent permissions
 
-Sub-agents spawned via `agent_spawn` inherit the parent's permission level by default. At `unrestricted` the sub-agent can call `file_write`, `file_edit`, and unsandboxed `shell_execute`; at `read` it's confined to read-only tools. To run one delegated task with reduced privileges, pass the `permission` parameter (e.g. `agent_spawn({prompt: "...", permission: "read"})`): it is clamped to the parent's level as a ceiling, so a sub-agent can only ever be equal-or-more restricted, never escalated. To narrow *where* it may write rather than whether, pass [`writable_roots`](../tools/overview.md#agent_spawn). A sub-agent shares its parent's approvals switch, and its prompts reach the parent's frontend. Alternatively, cycle the parent into a lower level before issuing the spawning prompt to restrict every sub-agent it spawns.
+Sub-agents spawned via `agent_spawn` inherit the parent's permission level by default. At `unrestricted` the sub-agent can call `file_write`, `file_edit`, and unsandboxed `shell_execute`; at `read` it's confined to read-only tools. To run one delegated task with reduced privileges, pass the `permission` parameter (e.g. `agent_spawn({prompt: "...", permission: "read"})`); a level above the parent's is refused by name, so no sub-agent is ever escalated past the agent that spawned it. Where it works and what it reaches is the spawn call's scope; see [`agent_spawn`](../tools/overview.md#agent_spawn).
 
 ## Examples
 
@@ -476,8 +483,8 @@ Commands like `ls`, `cat`, `git log`, `df`, `ps`, and `uname` work normally. Com
 
 Two things the sandbox deliberately does **not** restrict, on every backend:
 
-- **Reads**, unless [`[permissions].confine_reads`](#the-read-boundary) is on. A sandboxed command can otherwise read anything your user can, including `~/.ssh` and `~/.aws/credentials`, and on Windows meka's own store. `read` protects the machine from being *changed*, not from being *read*.
-- **The network.** Outbound connections are left open, so a command at `read` can still send what it read. Provider API keys are scrubbed from the child's environment, but that is one vector, not a boundary.
+- **Reads**, on a root session unless [`[permissions].confine_reads`](#the-read-boundary) is on. A sandboxed command can otherwise read anything your user can, including `~/.ssh` and `~/.aws/credentials`, and on Windows meka's own store. `read` protects the machine from being *changed*, not from being *read*. A sub-agent's reads are confined to its scope whatever the switch says.
+- **The network**, unless [`[permissions].network = "none"`](../configuration/config-file.md#permissions) cuts it off, which Bubblewrap, Landlock and `sandbox-exec` hold and Windows cannot. Open, a command at `read` can still send what it read. Provider API keys are scrubbed from the child's environment, but that is one vector, not a boundary.
 
 On Windows, `workspace` extends that first point to meka's own process. Its `WRITE_RESTRICTED` token restricts writes only, and unlike `read` it deliberately leaves the integrity label at the parent's level, so a confined command can open meka with `PROCESS_VM_READ` and read its memory. Measured on Windows 11: `OpenProcess` succeeds and `ReadProcessMemory` returns data. This is the one respect in which `workspace` confines less than `read`, whose Low-integrity token Windows blocks from opening a medium-integrity process at all. It grants nothing that reading `meka.db` would not, which a command at either level can already do, but it is worth knowing if you were treating `workspace` as strictly wider than `read` in every direction. They are not ordered that way; see the ladder note above.
 
@@ -503,7 +510,7 @@ The agent will explain that it cannot write files at `read` and suggest switchin
 
 Of those, only the skill tools reach the filesystem at all; memory is a table in the store. Note what that makes `skill_write` at `read`: a persistence primitive. A skill it writes is read back into every later session's prompt, so a prompt-injected instruction can outlive the turn that carried it. That is the reason `[skills] agent_managed` is off by default and the tool is never given to a sub-agent. That boundary is enforced in two places: a skill name must be one path component matching the Agent Skills spec's own rule (lowercase letters, digits and hyphens), so it cannot contain `..` or a path separator, and a symlink sitting at that name is refused rather than followed, so an existing link cannot redirect a write out of the skills directory. Memory names are governed by a different and wider rule (`[A-Za-z0-9_-]`), which is safe for a different reason: a memory name is a primary key in a table, never a path. `file_write`, `file_edit` and `scratchpad_save_file` are the only built-ins that touch your tree, and all three require `workspace` or above, and are fenced to the workspace roots at that level.
 
-A root you asked for is not always a root you get. `--writable-root` drops a path three ways, each with a warning: one that is not a directory, one naming a system directory the sandbox masks (`/`, `/proc`, `/dev`, `/sys`, `/run`, `/tmp`, `/var/tmp`, `$XDG_RUNTIME_DIR`), and one that does not resolve at startup; the last is kept rather than refused, so a build directory becomes a root the moment it exists. See [CLI options](../configuration/cli-options.md#--writable-root-path).
+A directory you asked for is not always one you get. `--additional-workspace-directory` drops a path three ways, each with a warning: one that is not a directory, one naming a system directory the sandbox masks (`/`, `/proc`, `/dev`, `/sys`, `/run`, `/tmp`, `/var/tmp`, `$XDG_RUNTIME_DIR`), and one that does not resolve at startup; the last is kept rather than refused, so a build directory joins the workspace the moment it exists. See [CLI options](../configuration/cli-options.md#--additional-workspace-directory-dir).
 
 #### MCP tools are the exception
 

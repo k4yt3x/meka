@@ -41,7 +41,7 @@ Two flags are refused rather than ignored: `-c` and `-r`. Both name one run's se
 curl -s -X POST http://localhost:8080/v1/sessions \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"cwd": "/home/user/project"}' | jq .id
+  -d '{"working_directory": "/home/user/project"}' | jq .id
 # → "550e8400-e29b-41d4-a716-446655440000"
 
 # Submit a turn
@@ -109,7 +109,7 @@ POST   /v1/sessions           Create a session
 GET    /v1/sessions           List sessions (paginated)
 GET    /v1/sessions/search    Find sessions by the words of their conversations
 GET    /v1/sessions/{id}      Get session details
-PATCH  /v1/sessions/{id}      Update permission, approvals, cwd, profile, title or pin
+PATCH  /v1/sessions/{id}      Update permission, approvals, working_directory, profile, title or pin
 DELETE /v1/sessions/{id}      Close and clean up
 POST   /v1/sessions/{id}/fork Branch a copy off a session
 ```
@@ -117,7 +117,7 @@ POST   /v1/sessions/{id}/fork Branch a copy off a session
 `GET /v1/sessions` is paginated. `limit` is how many to return (default 50, clamped to 1..200).
 Pinned sessions come first, newest pin on top, then the rest most recently updated first. When
 more remain, the response carries `next_cursor`; pass it back as `cursor` for the next page.
-`include_children=true` lists sub-agent sessions too, `cwd=<path>` keeps only the sessions in
+`include_children=true` lists sub-agent sessions too, `working_directory=<path>` keeps only the sessions in
 that working directory, compared in the canonical spelling every session records, and
 `parent=<id>` lists one session's direct children: the sub-agents it spawned, which is what a
 tree view asks for per expanded node, and what an audit asks to learn what a session dispatched.
@@ -132,7 +132,7 @@ approvals switch, a profile, and capabilities:
 
 ```json
 {
-  "cwd": "/home/user/project",
+  "working_directory": "/home/user/project",
   "permission": "workspace",
   "approvals": false,
   "profile": "work",
@@ -154,7 +154,7 @@ Create, get, list, fork and `PATCH` all answer with the same session record:
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "created_at": "2026-05-26T13:45:12Z",
   "updated_at": "2026-05-26T13:47:01Z",
-  "cwd": "/home/user/project",
+  "working_directory": "/home/user/project",
   "permission": "workspace",
   "approvals": false,
   "profile": "work",
@@ -180,7 +180,7 @@ and on a deferred item its `reason` and the `task` it waits on when it waits on 
 session this server holds; the feed's `checklist.updated` carries the same list on every change.
 
 `created_at` is when the row was made; `updated_at` moves on a turn and on any change to what the
-session runs as (`permission`, `approvals`, `cwd`, `profile`), a `PATCH` included, but not on a
+session runs as (`permission`, `approvals`, `working_directory`, `profile`), a `PATCH` included, but not on a
 title or a pin; `title` is the title a client set, else the first user message's words, whitespace
 collapsed and cut to 200 characters. A pinned session also carries `pinned_at`.
 
@@ -202,7 +202,7 @@ the conversation: it has no row and no message names it.
 
 On every response and event this API sends, a field that has no value is omitted rather than sent
 as `null`. On a session that means `last_turn` until a turn has begun, `approvals_pending` on a
-session this server does not hold, `cwd` when the row recorded none, `permission` when the session
+session this server does not hold, `working_directory` when the row recorded none, `permission` when the session
 is not loaded and its row records no level, and `parent_id`, which only a sub-agent's session
 carries. The same rule gives a turn its `refusal_text` only on a refusal and a tool call its
 `display_summary` only when the tool has a label. It is also why `meka session show --format json`
@@ -220,7 +220,7 @@ To move a live session onto another profile, `PATCH /v1/sessions/{id}` with `{"p
 That rewrites the session's row, so it holds for a resume from any surface rather than for this
 request. Switching mid-conversation is allowed and is your call: a thinking block is tagged with the
 backend that produced it and is not replayed to a different one, so from the next turn the model no
-longer sees the reasoning recorded under the old profile. Like `cwd`, it is a `409` when a turn is
+longer sees the reasoning recorded under the old profile. Like `working_directory`, it is a `409` when a turn is
 already in flight; cancel first. A `PATCH` naming either field holds the session while it writes,
 the way compact does, so a turn arriving meanwhile answers `409` rather than starting under it, and
 so does a second such `PATCH`. `permission` and `approvals` are the two fields that apply during
@@ -229,7 +229,7 @@ a turn; see [Permission levels over HTTP](#permission-levels-over-http).
 A `PATCH` naming a profile moves the session to that profile, and the profile is the whole story:
 the model, the account and every model-tied setting come from it, so there is nothing else on the
 row to reconcile. The row is also the billing record, so a profile the store cannot record fails the
-request; `permission`, `approvals` and `cwd` still apply to the live session when their row write
+request; `permission`, `approvals` and `working_directory` still apply to the live session when their row write
 fails, and the failure is logged.
 
 If you run more than one `meka` on the same store, send the `PATCH` to whichever process has the
@@ -240,10 +240,10 @@ holding a session may change what it runs on.
 
 A body naming **only** `profile` is also the rescue for a session whose profile has left
 `config.toml`: it moves the row without building an agent, so it works on a session that cannot
-currently run. Adding `permission` or `cwd` to the same body loses that, because those need a loaded
+currently run. Adding `permission` or `working_directory` to the same body loses that, because those need a loaded
 session and loading one is exactly what fails; send the profile on its own first.
 
-The `cwd` field is validated on create, fork and patch, by the same rule the screen's `/cd` and ACP
+The `working_directory` field is validated on create, fork and patch, by the same rule the screen's `/cd` and ACP
 apply:
 
 - Must be an **absolute path** (no relative paths).
@@ -251,10 +251,10 @@ apply:
 - Must be a **directory** (not a file, device, or socket).
 - Must not contain **null bytes** (which cause kernel/userspace path mismatch).
 - Is recorded, and echoed back, in its **canonical spelling**: symlinks resolved, `.` and `..`
-  removed. Every host records the same spelling, so a `cwd` filter on the listing finds a session
+  removed. Every host records the same spelling, so a `working_directory` filter on the listing finds a session
   however its directory was spelled.
 
-If `cwd` is omitted, it defaults to the server process's current working directory.
+If `working_directory` is omitted, it defaults to the server process's current working directory.
 
 Sessions persist server-side until explicitly deleted or evicted by the idle timeout GC (see [Session lifecycle](#session-lifecycle)).
 
@@ -285,7 +285,7 @@ forks as well as a live one. A source with a turn in flight answers `409` `turn-
 process holds answers `409` `session-locked`. Either copy would have ended on a prompt nothing
 answered.
 
-The body is optional and inherits everything by default. The only field is `cwd`, matching ACP's
+The body is optional and inherits everything by default. The only field is `working_directory`, matching ACP's
 `session/fork`, which likewise carries a workspace but no permission or capability fields. An
 `If-Match` header holding the `ETag` of `GET /v1/sessions/{id}/messages` makes the copy
 conditional on the source being as it was read; see [Detecting a rewritten
@@ -293,7 +293,7 @@ history](#detecting-a-rewritten-history). Branching from a point is a fork under
 followed by a rewind of the copy, which nothing else can run a turn on in between:
 
 ```json
-{ "cwd": "/home/user/other-project" }
+{ "working_directory": "/home/user/other-project" }
 ```
 
 Permission, approvals, capabilities and the profile are inherited and remain changeable afterwards via
@@ -875,7 +875,7 @@ Delivery is fire-and-forget on a detached task, so a slow or dead receiver never
 
 The same four [permission levels](./permissions.md) apply: `none`, `read`, `workspace`, `unrestricted`. Set the level at session creation or update it via `PATCH /v1/sessions/{id}`; `approvals` sits beside it on both, and `{"approvals": true}` in a `PATCH` body turns it on for a live session.
 
-Both apply during a turn: the next tool call is checked against the new level and the new switch, as the screen's Shift+Tab and ACP's `session/set_mode` do, so dropping a running session to `read` is a brake and not a request to stop. `cwd` and `profile` wait for the turn to end, and a body naming either answers `409` `turn-in-flight` meanwhile.
+Both apply during a turn: the next tool call is checked against the new level and the new switch, as the screen's Shift+Tab and ACP's `session/set_mode` do, so dropping a running session to `read` is a brake and not a request to stop. `working_directory` and `profile` wait for the turn to end, and a body naming either answers `409` `turn-in-flight` meanwhile.
 
 ### Approvals
 
@@ -897,7 +897,7 @@ Possible outcomes:
 | `allow_always` | Allow this and all future calls to this tool (session-scoped) |
 | `deny_always` | Deny this and all future calls to this tool (session-scoped) |
 
-`input` is every argument the call was made with, and a prompt should show it: `tool_name` alone asks you to approve a write without showing what is written. If no response arrives within 30 minutes the request is denied; `expires_in_seconds` on the event carries that figure, counted from when the prompt was parked, and `expires_at` carries the deadline itself, which is the one to show when the event reached you from the replay ring minutes after it was parked. It is the same backstop an ACP client's prompt gets. When the last client that could answer disconnects, the prompt waits out [`[serve] stream_reattach_grace`](../configuration/config-file.md#servestream_reattach_grace), the window a streaming turn already gives its reader, and is canceled only if nobody is attending by then: a browser tab reloading or waking from suspension finds its prompt still parked, and a closed one costs the call after the window rather than at once. An approved call still runs at the session's level: approval never widens reach, so an approved write at `read` lands only under the session's `cwd`.
+`input` is every argument the call was made with, and a prompt should show it: `tool_name` alone asks you to approve a write without showing what is written. If no response arrives within 30 minutes the request is denied; `expires_in_seconds` on the event carries that figure, counted from when the prompt was parked, and `expires_at` carries the deadline itself, which is the one to show when the event reached you from the replay ring minutes after it was parked. It is the same backstop an ACP client's prompt gets. When the last client that could answer disconnects, the prompt waits out [`[serve] stream_reattach_grace`](../configuration/config-file.md#servestream_reattach_grace), the window a streaming turn already gives its reader, and is canceled only if nobody is attending by then: a browser tab reloading or waking from suspension finds its prompt still parked, and a closed one costs the call after the window rather than at once. An approved call still runs at the session's level: approval never widens reach, so an approved write at `read` lands only inside the session's workspace.
 
 However a prompt closes, answered by you or another client, expired, or canceled because the turn ended or nobody was left to answer, the feed says so with `permission_resolved`, carrying the `request_id` and the `outcome`, so a second client showing the same prompt can take it down rather than learn of it from a `404`. While a prompt is parked, the session record counts it in `approvals_pending`, on the listing too, which is how a list of sessions says which ones are waiting on a person; the prompts themselves are on the feed, which hands every one still parked to a client that joins. A call a sub-agent makes is asked through its parent's feed and answered on the parent's `responses` route; the event names the sub-agent in `subagent_id`.
 
@@ -1032,7 +1032,7 @@ All HTTP error responses use [RFC 9457 Problem Details](https://www.rfc-editor.o
 
 The `type` URI is the stable, machine-readable error code. Route error handling on `type`, not on `status` or `detail`.
 
-> **A parse failure names the field.** A body that does not parse is a `422` `invalid-body` whose `detail` reads `invalid <endpoint> request body: <what the parser found>`, naming the field at fault: an unknown one, a missing one, or one of the wrong type. Every request type denies unknown fields, so a typo is refused rather than ignored. The names it cites are the wire schema, which the [OpenAPI spec](#endpoint-reference) defines; nothing internal is in them. Validation that runs after parsing, such as a profile that is not configured or a `cwd` that does not exist, names the field the same way.
+> **A parse failure names the field.** A body that does not parse is a `422` `invalid-body` whose `detail` reads `invalid <endpoint> request body: <what the parser found>`, naming the field at fault: an unknown one, a missing one, or one of the wrong type. Every request type denies unknown fields, so a typo is refused rather than ignored. The names it cites are the wire schema, which the [OpenAPI spec](#endpoint-reference) defines; nothing internal is in them. Validation that runs after parsing, such as a profile that is not configured or a `working_directory` that does not exist, names the field the same way.
 >
 > A `502` on a turn carries the provider's own response text in a `provider_response` member **when `[serve] relay_provider_errors` is on, which is the default**; a deployment that has turned it off omits the member entirely. It exists because the upstream's error type is the actionable part and a client that cannot see it is left guessing. `detail` stays meka's own sentence either way, so nothing is traded for it, and the relayed text is capped at 4 KiB with the cut marked. The full text goes to the server log regardless.
 >
@@ -1059,7 +1059,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/turn-canceled` | 409 | Turn was canceled |
 | `/errors/turn-mismatch` | 409 | `POST /cancel` named a turn that is not the one in flight; the `turn_id` member names the one that is. Nothing was canceled |
 | `/errors/inbox-appended` | 409 | The inbox item is already in the conversation, so only a turn can answer it now; nothing to withdraw |
-| `/errors/store-read-only` | 409 | The skill lives under a `[skills] extra_paths` root; meka reads those but never writes to them, so writing here would shadow the file rather than change it |
+| `/errors/store-read-only` | 409 | The skill lives under a `[skills] additional_directories` directory; meka reads those but never writes to them, so writing here would shadow the file rather than change it |
 | `/errors/subagent-not-running` | 409 | The id names a sub-agent this process is not running, so there is no feed to read; its feed exists while its parent runs it, and `last_turn` on its record says how its last run ended |
 | `/errors/session-not-drivable` | 422 | The id names a sub-agent's conversation, which only its parent drives. Reading it is unaffected; the message names the parent and what to do there: `agent_followup` for a turn or a fork, `POST /v1/sessions/{parent}/responses/{request_id}` for an approval, the parent itself for a scheduled job, and the parent's feed for a sub-agent's `attend`. **Do not retry with a corrected payload**: no body addressed at this id is accepted |
 | `/errors/request-not-found` | 404 | Unknown or expired `request_id` |
@@ -1292,7 +1292,7 @@ BASE="http://localhost:8080"
 SESSION=$(curl -sf -X POST "$BASE/v1/sessions" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d "{\"cwd\": \"$(pwd)\"}" | jq -r .id)
+  -d "{\"working_directory\": \"$(pwd)\"}" | jq -r .id)
 
 # Run a turn
 RESULT=$(curl -sf -X POST "$BASE/v1/sessions/$SESSION/turn" \
@@ -1407,7 +1407,7 @@ Key points:
 | GET | `/v1/openapi.json` | None, and off unless `[serve].docs` is set | OpenAPI spec |
 | GET | `/v1/docs` | None, and off unless `[serve].docs` is set | Swagger UI |
 
-`GET /v1/sessions` is paginated by `limit` and `cursor` (see [Sessions](#sessions)), and takes `include_children=true` to list sub-agent sessions alongside root ones, `cwd=<path>` to filter by working directory, and `parent=<id>` to list one session's direct children. A sub-agent's session record carries `parent_id`, which is what reconnects it to the session that dispatched it.
+`GET /v1/sessions` is paginated by `limit` and `cursor` (see [Sessions](#sessions)), and takes `include_children=true` to list sub-agent sessions alongside root ones, `working_directory=<path>` to filter by working directory, and `parent=<id>` to list one session's direct children. A sub-agent's session record carries `parent_id`, which is what reconnects it to the session that dispatched it.
 
 A memory record carries both `updated_at` (when the row last changed) and `created_at` (when the memory was made, stamped once at creation), plus its `tags` and its `read_count`, how many times the agent has recalled it through `memory_read`. The two timestamps are deliberately separate: a description edit moves `updated_at` without the note saying anything new, and it is `created_at` that the model is shown as an age. `PUT /v1/memory/{name}` accepts `tags` with the same omit-to-keep rule as `body`: omit to leave an existing memory's labels alone, send `[]` to clear them.
 

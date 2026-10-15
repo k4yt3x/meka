@@ -52,7 +52,12 @@ pub(crate) fn run_tool_subcommand(
             // warning is the one a session start gives, and it explains an `unrestricted` row.
             let sandbox = crate::sandbox::resolve_backend(config.sandbox_backend, config.sandbox);
             crate::sandbox::warn_if_sandbox_issues(
-                &crate::sandbox::SandboxState::new(config.sandbox, config.confine_reads, &sandbox),
+                &crate::sandbox::SandboxState::new(
+                    config.sandbox,
+                    config.confine_reads,
+                    config.network,
+                    &sandbox,
+                ),
                 crate::sandbox::WarnContext::ToolListing,
             );
             let materials = crate::session::SessionMaterials {
@@ -106,6 +111,8 @@ pub(crate) fn run_tool_subcommand(
             // every other tool's.
             let agent_family_registered =
                 crate::tools::subagent::agent_tools_registered(&filter, config.subagent_max_depth);
+            // Withheld from every session on `none`, asked the same way.
+            let web_fetch_registered = crate::tools::web::web_fetch_registered(config.network);
 
             let views: Vec<crate::view::ConfiguredToolView> = catalog
                 .into_iter()
@@ -113,7 +120,8 @@ pub(crate) fn run_tool_subcommand(
                     let override_entry = filter.permission_overrides.get(&name).copied();
                     let enabled = filter.admits(&name)
                         && (agent_family_registered
-                            || !crate::tools::subagent::AGENT_TOOL_NAMES.contains(&name.as_str()));
+                            || !crate::tools::subagent::AGENT_TOOL_NAMES.contains(&name.as_str()))
+                        && (web_fetch_registered || name != "web_fetch");
                     crate::view::ConfiguredToolView {
                         tool: crate::view::ToolView::new(
                             name,

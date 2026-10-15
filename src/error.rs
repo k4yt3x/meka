@@ -232,8 +232,9 @@ pub(crate) enum ErrorKind {
     /// because the caller was aiming at something specific and it is gone; whatever runs now is
     /// somebody else's.
     TurnMismatch,
-    /// The named skill lives under a read-only root from `[skills] extra_paths`, so writing it
-    /// here would create a shadowing copy in meka's own store rather than change the file.
+    /// The named skill lives under a read-only root from `[skills] additional_directories`, so
+    /// writing it here would create a shadowing copy in meka's own store rather than change the
+    /// file.
     ///
     /// Distinct from [`Self::InvalidBody`]: the request is well-formed and the remedy is to pick
     /// another name or edit that file directly, not to fix the payload.
@@ -459,7 +460,7 @@ impl ErrorKind {
             Self::Idempotency => "Idempotency-Key conflict",
             Self::InboxAppended => "Inbox item already appended",
             Self::TurnMismatch => "Turn is not the one in flight",
-            Self::StoreReadOnly => "Skill is in a read-only root",
+            Self::StoreReadOnly => "Skill is in a read-only directory",
             Self::SessionNotDrivable => "Session is a sub-agent's conversation",
             Self::SubagentNotRunning => "Sub-agent is not running here",
             Self::InvalidBody => "Invalid request body",

@@ -44,7 +44,7 @@ pub(crate) struct SessionView {
     /// imported as it was written.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "serve", schema(value_type = Option<String>))]
-    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) working_directory: Option<PathBuf>,
     /// The session's permission level (`none`, `read`, `workspace`, `unrestricted`). Omitted when
     /// the row records no level: every door of this meka records one, so a bare row is an outside
     /// hand's, and inventing a value for it would state a level the session never ran at.
@@ -81,7 +81,7 @@ impl From<&SessionSummary> for SessionView {
             id: session.id,
             created_at: session.created_at.clone(),
             updated_at: session.updated_at.clone(),
-            cwd: session.cwd.clone(),
+            working_directory: session.cwd.clone(),
             permission: session.permission,
             approvals: session.approvals,
             profile: session.profile.clone(),
@@ -523,7 +523,7 @@ impl From<&Skill> for SkillView {
 pub(crate) struct InstalledSkillView {
     #[serde(flatten)]
     pub(crate) skill: SkillView,
-    /// Found under `[skills] extra_paths` rather than in meka's own store.
+    /// Found under `[skills] additional_directories` rather than in meka's own store.
     pub(crate) external: bool,
     pub(crate) source_dir: PathBuf,
 }
@@ -666,14 +666,14 @@ mod tests {
             "id",
             "created_at",
             "updated_at",
-            "cwd",
+            "working_directory",
             "permission",
             "approvals",
             "profile",
             "title",
             "parent_id"
         ]);
-        assert_eq!(document["cwd"], "/work");
+        assert_eq!(document["working_directory"], "/work");
         assert_eq!(document["permission"], "read");
         assert_eq!(document["approvals"], true);
         assert_eq!(document["profile"], "work");
@@ -687,7 +687,7 @@ mod tests {
         view.permission = None;
         let document = serde_json::to_value(&view).expect("serializes");
         let object = document.as_object().expect("an object");
-        for absent in ["cwd", "permission", "parent_id"] {
+        for absent in ["working_directory", "permission", "parent_id"] {
             assert!(
                 !object.contains_key(absent),
                 "{absent} must be omitted rather than null: {document}"

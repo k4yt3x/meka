@@ -16,10 +16,13 @@
 //! usable, sandboxing is unavailable and shell execution at `read` hard-errors rather than running
 //! unconfined.
 //!
-//! **What every backend does not restrict**: reads. A sandboxed child can read any file the user
-//! can, other than meka's own directories, and the network is deliberately left open on all of
-//! them. The boundary these enforce is "this command cannot change the machine", not "this command
-//! cannot see or send anything". Landlock alone also cannot stop a command changing a file's mode,
+//! **What every backend leaves open**: the network, unless `[permissions].network` is `none`, which
+//! Bubblewrap holds by unsharing the namespace, Landlock by refusing every TCP port from ABI v4
+//! and `sandbox-exec` by withholding the outbound rule, and which Windows cannot hold; and reads
+//! outside the boundary only where `[permissions].confine_reads` is off and the session is a root
+//! one, since a sub-agent's reads are confined to its scope on every backend but Windows. The
+//! boundary these enforce is "this command cannot change the machine", not "this command cannot
+//! send anything". Landlock alone also cannot stop a command changing a file's mode,
 //! owner, timestamps or extended attributes: no ABI has a right for those, and Bubblewrap's
 //! read-only bind is what refuses them.
 
@@ -63,6 +66,7 @@ pub(crate) enum Confinement {
     /// read boundary is on.
     ReadOnly {
         readable: Option<Vec<std::path::PathBuf>>,
+        network: crate::config::Network,
     },
     /// Writes only beneath the canonical `writable` roots. `workspace`. Reads everywhere, or only
     /// beneath `readable`, which then holds the writable roots too, and the paths a command needs
@@ -73,6 +77,7 @@ pub(crate) enum Confinement {
     Workspace {
         writable: Vec<std::path::PathBuf>,
         readable: Option<Vec<std::path::PathBuf>>,
+        network: crate::config::Network,
     },
 }
 
@@ -90,6 +95,7 @@ impl Confinement {
         scope: &crate::workspace::WriteScope,
         reads: &crate::workspace::ReadScope,
         cwd: &crate::workspace::SharedCwd,
+        network: crate::config::Network,
     ) -> Self {
         if !sandbox_enabled {
             return Self::Unconfined;
@@ -101,10 +107,29 @@ impl Confinement {
             crate::permission::Permission::Workspace => Self::Workspace {
                 writable: scope.confined_to_at(permission, cwd).unwrap_or_default(),
                 readable: reads.confined_to_at(permission, cwd),
+                network,
             },
             _ => Self::ReadOnly {
                 readable: reads.confined_to_at(permission, cwd),
+                network,
             },
+        }
+    }
+
+    /// What this call may reach on the network. The host's for an unconfined call, since nothing
+    /// holds a narrower setting there.
+    #[cfg_attr(
+        windows,
+        allow(
+            dead_code,
+            reason = "the Windows token cannot cut a command off the network, so its spawn path \
+                      never asks"
+        )
+    )]
+    pub(crate) fn network(&self) -> crate::config::Network {
+        match self {
+            Self::Unconfined => crate::config::Network::Host,
+            Self::ReadOnly { network, .. } | Self::Workspace { network, .. } => *network,
         }
     }
 
@@ -132,7 +157,9 @@ impl Confinement {
     pub(crate) fn readable(&self) -> Option<&[std::path::PathBuf]> {
         match self {
             Self::Unconfined => None,
-            Self::ReadOnly { readable } | Self::Workspace { readable, .. } => readable.as_deref(),
+            Self::ReadOnly { readable, .. } | Self::Workspace { readable, .. } => {
+                readable.as_deref()
+            }
         }
     }
 }
@@ -345,16 +372,28 @@ pub(crate) struct SandboxState {
         allow(dead_code, reason = "read only on the Windows warning path")
     )]
     pub(crate) confine_reads: bool,
+    /// `[permissions].network`, for the one platform whose shell cannot hold `none`.
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "read only on the Windows warning path")
+    )]
+    pub(crate) network: crate::config::Network,
     pub(crate) backend: crate::config::SandboxBackend,
     pub(crate) auto_resolved: bool,
     pub(crate) probe: BackendProbe,
 }
 
 impl SandboxState {
-    pub(crate) fn new(enabled: bool, confine_reads: bool, resolution: &SandboxResolution) -> Self {
+    pub(crate) fn new(
+        enabled: bool,
+        confine_reads: bool,
+        network: crate::config::Network,
+        resolution: &SandboxResolution,
+    ) -> Self {
         Self {
             enabled,
             confine_reads,
+            network,
             backend: resolution.backend,
             auto_resolved: resolution.auto_resolved,
             probe: resolution.probe.clone(),
@@ -417,6 +456,12 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
             tracing::warn!(
                 "`[permissions].confine_reads` holds for the file tools only: the Windows sandbox \
                  cannot confine a command's reads"
+            );
+        }
+        if state.network == crate::config::Network::None {
+            tracing::warn!(
+                "`[permissions].network = \"none\"` holds for `web_fetch` only: the Windows sandbox \
+                 cannot cut a command off the network"
             );
         }
     }
@@ -1094,6 +1139,7 @@ mod tests {
     fn landlock_state(auto_resolved: bool) -> super::SandboxState {
         super::SandboxState {
             confine_reads: false,
+            network: crate::config::Network::Host,
             enabled: true,
             backend: crate::config::SandboxBackend::Landlock,
             auto_resolved,
@@ -1351,6 +1397,7 @@ mod tests {
             std::slice::from_ref(&root),
             Some(&readable),
             std::slice::from_ref(&store),
+            crate::config::Network::Host,
         );
         assert!(!profile.contains("(allow file-read*)\n"), "{profile}");
         assert!(
@@ -1387,7 +1434,12 @@ mod tests {
             !profile.contains("/Users/someone"),
             "paths travel out of band: {profile}"
         );
-        let (anywhere, _) = sandbox_profile_for(std::slice::from_ref(&root), None, &[]);
+        let (anywhere, _) = sandbox_profile_for(
+            std::slice::from_ref(&root),
+            None,
+            &[],
+            crate::config::Network::Host,
+        );
         assert!(anywhere.contains("(allow file-read*)\n"), "{anywhere}");
     }
 
@@ -1408,6 +1460,7 @@ mod tests {
             std::slice::from_ref(&root),
             None,
             std::slice::from_ref(&store),
+            crate::config::Network::Host,
         );
         let allow = profile
             .find("(allow file-write* (subpath (param \"MEKA_WRITABLE_0\")))")
@@ -1438,7 +1491,8 @@ mod tests {
             std::path::PathBuf::from(r#"/tmp/it's "quoted""#),
             std::path::PathBuf::from(r"/tmp/trailing\"),
         ];
-        let (profile, params) = sandbox_profile_for(&roots, None, &[]);
+        let (profile, params) =
+            sandbox_profile_for(&roots, None, &[], crate::config::Network::Host);
 
         assert_eq!(params, vec![
             std::ffi::OsString::from("-D"),
@@ -1478,7 +1532,12 @@ mod tests {
         let root = std::path::PathBuf::from(OsStr::from_bytes(b"/tmp/work\xff"));
         assert!(root.to_str().is_none(), "precondition: not valid UTF-8");
 
-        let (profile, params) = sandbox_profile_for(std::slice::from_ref(&root), None, &[]);
+        let (profile, params) = sandbox_profile_for(
+            std::slice::from_ref(&root),
+            None,
+            &[],
+            crate::config::Network::Host,
+        );
         assert_eq!(params.len(), 2, "the root must not be dropped: {params:?}");
 
         let mut expected = std::ffi::OsString::from("MEKA_WRITABLE_0=");
@@ -1810,21 +1869,46 @@ mod tests {
 
         for level in [Permission::None, Permission::Read] {
             assert_eq!(
-                Confinement::resolve(true, level, &scope, &reads, &cwd),
-                Confinement::ReadOnly { readable: None },
+                Confinement::resolve(
+                    true,
+                    level,
+                    &scope,
+                    &reads,
+                    &cwd,
+                    crate::config::Network::Host
+                ),
+                Confinement::ReadOnly {
+                    readable: None,
+                    network: crate::config::Network::Host,
+                },
                 "{level} must confine the shell read-only"
             );
         }
         assert_eq!(
-            Confinement::resolve(true, Permission::Workspace, &scope, &reads, &cwd),
+            Confinement::resolve(
+                true,
+                Permission::Workspace,
+                &scope,
+                &reads,
+                &cwd,
+                crate::config::Network::Host
+            ),
             Confinement::Workspace {
                 writable: vec![base],
-                readable: None
+                readable: None,
+                network: crate::config::Network::Host,
             },
             "workspace must hand the shell the same roots the file tools fence against"
         );
         assert_eq!(
-            Confinement::resolve(true, Permission::Unrestricted, &scope, &reads, &cwd),
+            Confinement::resolve(
+                true,
+                Permission::Unrestricted,
+                &scope,
+                &reads,
+                &cwd,
+                crate::config::Network::Host
+            ),
             Confinement::Unconfined,
             "unrestricted runs the shell unsandboxed"
         );
@@ -1850,14 +1934,29 @@ mod tests {
         );
 
         for level in [Permission::None, Permission::Read, Permission::Workspace] {
-            let confinement = Confinement::resolve(true, level, &scope, &reads, &cwd);
+            let confinement = Confinement::resolve(
+                true,
+                level,
+                &scope,
+                &reads,
+                &cwd,
+                crate::config::Network::Host,
+            );
             let readable = confinement
                 .readable()
                 .unwrap_or_else(|| panic!("{level} must confine reads"));
             assert_eq!(readable, [base.clone(), system.clone()], "{level}");
         }
         assert_eq!(
-            Confinement::resolve(true, Permission::Unrestricted, &scope, &reads, &cwd).readable(),
+            Confinement::resolve(
+                true,
+                Permission::Unrestricted,
+                &scope,
+                &reads,
+                &cwd,
+                crate::config::Network::Host
+            )
+            .readable(),
             None
         );
     }
@@ -1878,7 +1977,14 @@ mod tests {
             Permission::Unrestricted,
         ] {
             assert_eq!(
-                Confinement::resolve(false, level, &scope, &reads, &cwd),
+                Confinement::resolve(
+                    false,
+                    level,
+                    &scope,
+                    &reads,
+                    &cwd,
+                    crate::config::Network::Host
+                ),
                 Confinement::Unconfined
             );
         }
@@ -1896,7 +2002,14 @@ mod tests {
             crate::permission::EnabledPermissions::ALL,
         ));
 
-        let confinement = Confinement::resolve(true, Permission::Workspace, &scope, &reads, &cwd);
+        let confinement = Confinement::resolve(
+            true,
+            Permission::Workspace,
+            &scope,
+            &reads,
+            &cwd,
+            crate::config::Network::Host,
+        );
         assert!(confinement.is_sandboxed(), "it must still be sandboxed");
         assert!(
             // Not `is_sandboxed()`, which holds by construction for any `Workspace(_)` and so
@@ -1904,6 +2017,71 @@ mod tests {
             // what every dialect turns into "no write may land anywhere".
             confinement.writable().is_empty(),
             "and must grant no writable root, which is read-only in effect"
+        );
+    }
+
+    /// The confinement carries the session's network setting at every confined level, and an
+    /// unconfined call reports the host's, since nothing holds a narrower setting there.
+    #[test]
+    fn the_confinement_carries_the_network_below_unrestricted() {
+        use crate::permission::{EnabledPermissions, Permission, SharedPermission};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd =
+            crate::workspace::SharedCwd::new(crate::workspace::canonical_for_test(temp.path()));
+        let permission = SharedPermission::new(Permission::Read, EnabledPermissions::ALL);
+        let scope = crate::workspace::WriteScope::new(
+            permission.clone(),
+            crate::workspace::SharedRoots::default(),
+            crate::workspace::WriteLocks::default(),
+        );
+        let reads = crate::workspace::ReadScope::unconfined(permission);
+        for level in [Permission::Read, Permission::Workspace] {
+            let confined = Confinement::resolve(
+                true,
+                level,
+                &scope,
+                &reads,
+                &cwd,
+                crate::config::Network::None,
+            );
+            assert_eq!(confined.network(), crate::config::Network::None, "{level}");
+        }
+        assert_eq!(
+            Confinement::resolve(
+                true,
+                Permission::Unrestricted,
+                &scope,
+                &reads,
+                &cwd,
+                crate::config::Network::None
+            )
+            .network(),
+            crate::config::Network::Host
+        );
+    }
+
+    /// The seatbelt profile opens the network with one rule, appended on `host` and withheld on
+    /// `none`, under which `(deny default)` refuses every outbound socket.
+    #[test]
+    fn the_seatbelt_profile_opens_the_network_only_on_host() {
+        let root = std::path::PathBuf::from("/Users/someone/work");
+        let (open, _) = sandbox_profile_for(
+            std::slice::from_ref(&root),
+            None,
+            &[],
+            crate::config::Network::Host,
+        );
+        assert!(open.contains("(allow network-outbound)"), "{open}");
+        let (closed, _) = sandbox_profile_for(
+            std::slice::from_ref(&root),
+            None,
+            &[],
+            crate::config::Network::None,
+        );
+        assert!(!closed.contains("network-outbound"), "{closed}");
+        assert!(
+            closed.contains("(deny default)"),
+            "the deny is what refuses the sockets the rule no longer allows: {closed}"
         );
     }
 }

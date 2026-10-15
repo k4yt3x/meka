@@ -4,7 +4,7 @@
 
 Execute a shell command and return its output.
 
-**Permission:** `read` (sandboxed read-only) / `workspace` (sandboxed, writable inside the workspace roots) / `unrestricted` (unsandboxed)
+**Permission:** `read` (sandboxed read-only) / `workspace` (sandboxed, writable inside the workspace) / `unrestricted` (unsandboxed)
 
 ### Parameters
 
@@ -29,6 +29,10 @@ Execute a shell command and return its output.
 - **Unix (`sh -c`)**: POSIX `$VAR` expansion applies. Pass a literal `$` with single quotes (`'$foo'`) or backslash escape (`\$foo`).
 - **Windows (`powershell.exe -Command`)**: The script body reaches PowerShell directly. Use PowerShell syntax (`$var = ...`, `$env:PATH`), and crucially, **do not** wrap your command in another `powershell -Command "..."`. The outer PowerShell will expand your inner `$var` references to empty strings before the inner shell runs, producing a parser error on mangled syntax. If you need to invoke a nested script, drop it into a `.ps1` file and run it by path, use `-EncodedCommand <base64>`, or escape each `$` as `` `$ ``.
 
+### Network
+
+The sandbox leaves the network open by default: the threat model is "no state mutation", and `curl http://x | pdftotext` must keep working. [`[permissions].network = "none"`](../configuration/config-file.md#permissions) cuts a confined command off: Bubblewrap unshares the network namespace, so not even loopback answers; Landlock handles every TCP bind and connect from ABI v4 and grants no port, which leaves UDP open since no Landlock ABI has a right over it; `sandbox-exec` withholds its outbound rule under `(deny default)`, which closes every socket while the system resolver's Mach service stays reachable, so a command can still look names up. Windows cannot cut a command off and warns once at startup. The setting reaches `web_fetch` too, which runs in the meka process where no sandbox reaches and is withheld whole, and it never reaches an MCP server, which is a process outside the sandbox: withhold the server instead. A sub-agent holds its parent's setting unless its spawn narrows it with `network`, and the scope lines of a session that is cut off say `Network: none (shell and web_fetch)`.
+
 ### Read-only sandbox
 
 At **`read`**, commands run inside a sandbox that blocks writes to the user's real data. Reads, program execution, and network access still work normally: the threat model is "no state mutation, but `curl http://x | pdftotext` must keep working."
@@ -44,7 +48,8 @@ At **`read`**, commands run inside a sandbox that blocks writes to the user's re
 | Filesystem reads elsewhere, with `confine_reads` off | | ✓ |
 | Unix sockets the Bubblewrap masks do not cover (`$HOME`, `/var/lib`, the abstract namespace) | Landlock, and Bubblewrap on kernel 7.1+ (6.12+ for the abstract namespace) | Bubblewrap on older kernels / Windows |
 | Program execution | | ✓ |
-| Outbound network (TCP/UDP) | | ✓ |
+| Outbound network, with [`[permissions].network`](../configuration/config-file.md#permissions) at its default `host` | | ✓ |
+| Outbound network, with `[permissions].network = "none"` | Bubblewrap (the namespace is unshared) / Landlock (every TCP port, from ABI v4; UDP stays open) / macOS | Windows |
 | dbus / systemd-user state mutations | Bubblewrap / macOS / Landlock | Windows |
 | Mach IPC state mutation (launchd, pasteboard, LaunchServices) | macOS | Linux / Windows |
 | COM / RPC to Low-integrity-accepting services (Windows) | | ✓ |

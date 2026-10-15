@@ -85,8 +85,8 @@ longer sees the reasoning recorded under the old profile, for the reason above.
 
 ### What a resume does not restore
 
-`--writable-root` is not restored, because it belongs to the process rather than the session; pass
-it again. See [permissions](./permissions.md) for why recording it would be wrong.
+`--additional-workspace-directory` and `--additional-readable-directory` are not restored, because
+they belong to the process rather than the session; pass them again. See [permissions](./permissions.md) for why recording it would be wrong.
 
 **A resumed session opens in the directory it recorded**, not the one your shell is in. `meka -c` from anywhere reopens the session where it was working, and `/cd` is the only thing that moves it. This is deliberate: at [`workspace`](./permissions.md) the working directory *is* the writable boundary, so adopting the shell's would silently widen it: resume a project session from `$HOME` and the whole home directory becomes writable, with a [scheduled job](./scheduling.md) able to fire before you could react. If the recorded directory has since been removed, meka warns and opens where you are. To get back to your shell's directory, run `/cd` with no argument.
 
@@ -159,12 +159,12 @@ screen's [input history](./interactive-mode.md#input-history)), and `account_cre
 | `created_at` | TEXT (RFC 3339) | When the session was created |
 | `updated_at` | TEXT (RFC 3339) | When the session was last updated |
 | `parent_session_id` | TEXT (UUID) | The session that spawned this sub-agent, or NULL |
-| `cwd` | TEXT | Working directory the session is in; moved only by `/cd`, ACP, or `PATCH` |
+| `working_directory` | TEXT | Working directory the session is in; moved only by `/cd`, ACP, or `PATCH` |
 | `permission` | TEXT | Permission level a re-attached session resumes with, and the level a scheduled gate is re-checked against |
 | `approvals` | INTEGER | Whether calls above the level are put to the user for approval |
 | `capabilities_json` | TEXT | Per-session capability flags, for HTTP re-attach |
 | `token_id` | TEXT | Bearer token that created the session, for HTTP |
-| `additional_roots_json` | TEXT | Workspace roots beyond `cwd` |
+| `additional_workspace_directories_json` | TEXT | The workspace beyond `working_directory`, as a JSON list |
 | `subagent_spec_json` | TEXT | The terms a sub-agent was spawned under |
 | `turns`, `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `redactions`, `redacted_images`, `redacted_bytes` | INTEGER | The cumulative counters behind `/status` |
 | `prompt_index`, `turn_index` | INTEGER | The position of the last turn opened, which the Claude subscription wire reports; both NULL on a session that numbers nothing, which is one that had turns before the columns existed |
@@ -411,7 +411,7 @@ currently say. `meka profile list` shows them.
 
 Both commands take `--format json`. The listing becomes `{"sessions": [...]}` and `show` one object,
 each session carrying `id`, `created_at`, `updated_at`, `profile`, `title`, `approvals`, and, when
-the row records them, `cwd`, `permission`, `capabilities`, `parent_id`, `pinned_at` and
+the row records them, `working_directory`, `permission`, `capabilities`, `parent_id`, `pinned_at` and
 `last_turn`: the fields [`GET /v1/sessions`](http-api.md) returns under the same names, less the
 three only a running host can answer (`turn_in_flight`, `inbox_pending`, `approvals_pending`). Ids
 are printed in full, and an empty store is
@@ -419,7 +419,7 @@ are printed in full, and an empty store is
 
 ```bash
 meka session list --format json | jq -r '.sessions[] | "\(.id) \(.profile)"'
-meka session show 550e8400 --format json | jq .cwd
+meka session show 550e8400 --format json | jq .working_directory
 ```
 
 ## Titling a session

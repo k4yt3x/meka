@@ -411,6 +411,7 @@ pub(crate) async fn ensure_session_loaded_holding(
             frontend: frontend_dyn,
             cwd: cwd.clone(),
             roots: crate::workspace::SharedRoots::default(),
+            read_only_roots: crate::workspace::SharedRoots::default(),
             context_tokens: Arc::clone(&context_used),
             context_overhead: Arc::clone(&context_overhead),
             context_window: Arc::new(std::sync::atomic::AtomicU64::new(0)),

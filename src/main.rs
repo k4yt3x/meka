@@ -350,8 +350,8 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
     // If --skill is set, validate and render the body upfront so an invalid name fails fast
     // before any session/MCP setup. The combined string (extra + body, mirroring the screen's
     // `/skill <name> [extra...]`) then takes the place of cli.prompt as the first-turn input.
-    // Resolved config comes first because `[skills] extra_paths` decides which roots the lookup
-    // sees.
+    // Resolved config comes first because `[skills] additional_directories` decides which roots the
+    // lookup sees.
     let skill_prompt = runtime.block_on(host::build_skill_prompt(
         cli.skill.as_deref(),
         cli.prompt.as_deref(),

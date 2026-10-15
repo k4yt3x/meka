@@ -20,7 +20,7 @@ pub(crate) mod shell;
 mod skill;
 pub(crate) mod subagent;
 pub(crate) mod util;
-mod web;
+pub(crate) mod web;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -598,8 +598,8 @@ pub(crate) fn admit_tool_call(
         }
         return Admission::Refuse(Box::new(ToolOutput::text(
             format!(
-                "'{name}' requires `{required}`; the session is at `{permission}`. Ask the user to \
-                 raise it to `{required}`."
+                "'{name}' requires `{required}`; the session is at `{permission}`. Ask for \
+                 `{required}` if the task needs it."
             ),
             true,
         )));
@@ -742,6 +742,14 @@ pub(crate) struct ToolOutput {
     /// text. A caller that needs JSON from one of those falls back to parsing `content` itself,
     /// where there is no fence to confuse it.
     pub(crate) structured: Option<serde_json::Value>,
+    /// Whether this is the tool's output, which the `scratchpad` parameter may redirect, as
+    /// opposed to a word about the call, which stays inline whatever the call asked: meka's own
+    /// (a refusal, an argument error, an interruption, a panic, a background start notice) or the
+    /// tool's, a failure it reports, unless [`Tool::reports_failure_as_output`] makes that failure
+    /// its output. Set at
+    /// the one door a tool's result comes through, the dispatcher's `run_tool`: the caller asked
+    /// for the output, and a sentence about the call is neither large nor sensitive.
+    pub(crate) is_output: bool,
 }
 
 impl ToolOutput {
@@ -752,6 +760,7 @@ impl ToolOutput {
             spill_hint: SpillHint::default(),
             frontend_metadata: None,
             structured: None,
+            is_output: false,
         }
     }
 
@@ -860,6 +869,16 @@ pub(crate) trait Tool: Send + Sync {
     /// adapter has none, so `Workspace.allows(Unrestricted)` alone would let an unannotated tool
     /// write anywhere from inside the confined level.
     fn runs_outside_confinement(&self) -> bool {
+        false
+    }
+    /// Whether a failure this tool reports is its output: what the call produced, which the
+    /// `scratchpad` parameter redirects as it would a success. True for a command, whose exit
+    /// code and output are the result however it ended. False, the default, for a tool whose
+    /// failed result is a word about the call (a refusal, bad arguments, a status with no body,
+    /// an MCP server's `isError` reply, which the protocol means for the model to read and
+    /// correct by), which stays inline whatever the call asked, since the caller redirected the
+    /// output and not the sentence about it.
+    fn reports_failure_as_output(&self) -> bool {
         false
     }
     /// Run the tool. Long-running implementations must observe `context.cancellation` (e.g. via
@@ -1300,6 +1319,23 @@ mod tests {
     /// to answer `definition()`, so the collaborators are the cheapest that construct: an in-memory
     /// store, a zeroed gauge, and a server whose command does not exist (`prepare` validates config
     /// and spawns nothing).
+    /// Which built-ins report a failure as their output, so the `scratchpad` redirect takes it:
+    /// the shell alone, whose exit code and output are the result however the command ended.
+    #[tokio::test]
+    async fn only_the_shell_reports_a_failure_as_its_output() {
+        let registry = registry_with_every_builtin().await;
+        let reporting: Vec<String> = registry
+            .registered_tool_names()
+            .into_iter()
+            .filter(|name| {
+                registry
+                    .get(name)
+                    .is_some_and(|tool| tool.reports_failure_as_output())
+            })
+            .collect();
+        assert_eq!(reporting, vec!["shell_execute".to_string()]);
+    }
+
     async fn registry_with_every_builtin() -> ToolRegistry {
         let registry = tool_registry_for_test_with(BuiltinToolFilter::default(), true).await;
         let store = Store::for_test().await;
@@ -1314,7 +1350,7 @@ mod tests {
         }
 
         for definition in [
-            subagent::agent_spawn_definition(&[], false),
+            subagent::agent_spawn_definition(&[]),
             subagent::agent_list_definition(),
             subagent::agent_followup_definition(),
             subagent::agent_steer_definition(),

@@ -339,6 +339,36 @@ fn tool_list_reports_the_agent_family_as_denied_at_depth_zero() {
     }
 }
 
+/// `[permissions].network = "none"` withholds `web_fetch` from every session, and the listing says
+/// so the way it does for the agent family: the row stays, marked disabled.
+#[test]
+fn tool_list_reports_web_fetch_as_disabled_under_network_none() {
+    let install = Install::new();
+    let config_dir = install.config_dir();
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[permissions]\nnetwork = \"none\"\n",
+    )
+    .expect("write config.toml");
+    let output = run_isolated(&install, &["tool", "list"]);
+    assert!(output.status.success(), "{:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let row = |name: &str| {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("'{name}' must have a row, got:\n{stdout}"))
+            .to_string()
+    };
+    assert!(
+        row("web_fetch").contains("disabled"),
+        "{}",
+        row("web_fetch")
+    );
+    assert!(row("file_read").contains("enabled"), "{}", row("file_read"));
+}
+
 #[test]
 fn mcp_add_http_positional_url_persists_server() {
     // Notion-style happy path: positional URL, transport auto-detected from the URL scheme, no
@@ -837,23 +867,24 @@ fn the_workspace_level_is_accepted_at_the_flag_and_in_the_config_file() {
     );
 }
 
-/// `--writable-root` naming a path that does not exist warns, and does not fail the run.
+/// `--additional-workspace-directory` naming a path that does not exist warns, and does not fail
+/// the run.
 ///
 /// Both halves matter. A root that cannot be canonicalized is dropped from the boundary by
 /// `writable_roots`, so without the warning the user learns about it from a refused write naming a
 /// boundary they believed included the path. And a build directory that does not exist *yet* is a
 /// legitimate root, so this cannot be an error: the boundary is recomputed on every write.
 #[test]
-fn an_unresolvable_writable_root_warns_without_failing_the_run() {
+fn an_unresolvable_workspace_directory_warns_without_failing_the_run() {
     let install = Install::new();
     let missing = install.root().join("not-created-yet");
     let output = resolve_config(&install, "", &[
-        "--writable-root",
+        "--additional-workspace-directory",
         missing.to_str().expect("path"),
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--writable-root") && stderr.contains("does not resolve"),
+        stderr.contains("--additional-workspace-directory") && stderr.contains("does not resolve"),
         "an unresolvable root must say so: {stderr}"
     );
     assert!(
@@ -864,7 +895,7 @@ fn an_unresolvable_writable_root_warns_without_failing_the_run() {
     // The existing case stays quiet, so the warning means something when it appears.
     std::fs::create_dir_all(&missing).expect("create the root");
     let output = resolve_config(&install, "", &[
-        "--writable-root",
+        "--additional-workspace-directory",
         missing.to_str().expect("path"),
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1358,7 +1389,7 @@ fn only_session(install: &Install) -> String {
 /// The working directory the one session recorded.
 fn only_session_cwd(install: &Install) -> Option<String> {
     store(install)
-        .query_row("SELECT cwd FROM sessions", [], |row| {
+        .query_row("SELECT working_directory FROM sessions", [], |row| {
             row.get::<_, Option<String>>(0)
         })
         .expect("exactly one session")
@@ -2319,7 +2350,7 @@ fn a_failed_oneshot_turn_still_waits_for_its_detached_work() {
 /// parent's workspace and still refused, since the worker's boundary is the list and nothing
 /// of the parent's.
 #[test]
-fn a_sub_agent_bounded_by_writable_roots_writes_only_there() {
+fn a_sub_agent_placed_in_a_directory_writes_only_there() {
     let install = Install::new();
     write_capable_config(&install);
     let work = install.work_dir();
@@ -2331,7 +2362,7 @@ fn a_sub_agent_bounded_by_writable_roots_writes_only_there() {
         &work,
         r#"[
           [{"type":"tool_use_start","id":"call-1","name":"agent_spawn"},
-           {"type":"tool_use_end","input":{"prompt":"write both","writable_roots":["sub"]}},
+           {"type":"tool_use_end","input":{"prompt":"write both","working_directory":"sub"}},
            {"type":"message_end","stop_reason":"tool_use"}],
           [{"type":"tool_use_start","id":"call-2","name":"file_write"},
            {"type":"tool_use_end","input":{"path":"inside.txt","content":"in"}},
@@ -2360,7 +2391,7 @@ fn a_sub_agent_bounded_by_writable_roots_writes_only_there() {
     );
     let (cwd, spec): (String, String) = store(&install)
         .query_row(
-            "SELECT cwd, subagent_spec_json FROM sessions WHERE parent_session_id IS NOT NULL",
+            "SELECT working_directory, subagent_spec_json FROM sessions WHERE parent_session_id IS NOT NULL",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -2377,7 +2408,7 @@ fn a_sub_agent_bounded_by_writable_roots_writes_only_there() {
         "the worker's working directory is the first root, spelled canonically"
     );
     assert!(
-        spec.contains("\"writable_roots\":[\""),
+        spec.contains("\"working_directory\":\""),
         "the spawn terms carry the bounds: {spec}"
     );
 }
@@ -3125,7 +3156,9 @@ fn session_list_and_show_print_the_session_as_json() {
     assert_eq!(row["permission"], "read");
     assert_eq!(row["approvals"], false);
     assert!(
-        row["created_at"].is_string() && row["updated_at"].is_string() && row["cwd"].is_string(),
+        row["created_at"].is_string()
+            && row["updated_at"].is_string()
+            && row["working_directory"].is_string(),
         "{row}"
     );
     assert!(

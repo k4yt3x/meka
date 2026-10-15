@@ -68,7 +68,7 @@ Tools are grouped by the minimum permission level required:
 - All memory tools. Writing a memory needs only read permission: memories live in the store,
   which is meka's own, not your working tree.
 
-**Workspace permission** (available at `workspace` and above; writes are confined to the workspace roots at `workspace`):
+**Workspace permission** (available at `workspace` and above; writes are confined to the workspace at `workspace`):
 - `file_edit`, `file_write`, `scratchpad_save_file`
 
 `shell_execute` is not in that list: it asks for `read` when a sandbox backend is available and `unrestricted` when none is, so it is reachable at `read` and confined by the *level*, not by its own requirement.
@@ -140,7 +140,7 @@ These two are also the only parameters meka type-checks. A `background` that is 
 
 ## Scratchpad parameter
 
-A `scratchpad` string parameter saves a tool's output to the scratchpad under that name instead of returning it inline, so a large result stays out of the conversation.
+A `scratchpad` string parameter saves a tool's output to the scratchpad under that name instead of returning it inline, so a large result stays out of the conversation. It redirects the tool's output alone: a refusal or an error stays inline, since the caller asked for the output and a sentence about the call is neither large nor sensitive; a command that exits non-zero is output, exit code included, and is saved.
 
 ```text
 shell_execute({"command": "pdftotext doc.pdf -", "scratchpad": "pdf_text"})
@@ -185,11 +185,46 @@ Multiple `agent_spawn` calls in one assistant turn run in parallel; useful when 
 
 **Recursion.** Sub-agents may themselves spawn further sub-agents, so an agent can orchestrate a team. Nesting is bounded by [`session.subagent_max_depth`](../configuration/config-file.md#sessionsubagent_max_depth) (default 3; `1` reproduces the old "sub-agents can't spawn" behavior, `0` disables `agent_spawn` entirely). Pass the optional `max_depth` parameter to tune how deep a given subtree may recurse; a built-in absolute cap always bounds real nesting so recursion can't run away.
 
-**Permission.** By default a sub-agent inherits the parent's permission level. Pass the optional `permission` parameter (`none` / `read` / `workspace` / `unrestricted`) to run it at a *more restricted* level: the value is clamped to the parent's level as a ceiling, so a sub-agent can never be escalated above its parent. This lets an orchestrator hand untrusted or risky work to a read-only sub-agent. A sub-agent shares its parent's approvals switch, and its prompts reach the parent's frontend.
+**Permission.** By default a sub-agent inherits the parent's permission level. Pass the optional `permission` parameter (`none` / `read` / `workspace` / `unrestricted`) to run it at a *more restricted* level; a level above your own is refused by name, so a sub-agent can never be escalated above its parent. This lets an orchestrator hand untrusted or risky work to a read-only sub-agent while keeping its own level for the rest of the turn.
 
-**Writable roots.** Pass `writable_roots`, a list of directories, to confine the sub-agent's writes to exactly those: the first becomes its working directory, so relative paths in its tool calls resolve there, and the rest become its additional workspace roots. Nothing of your own workspace comes with it. Each entry must be an existing directory; a relative one resolves against your working directory. You must be at `workspace` or `unrestricted`, and at `workspace` every entry must lie inside your own [workspace boundary](../usage/permissions.md#the-workspace-boundary), so a sub-agent's reach never exceeds yours; at `unrestricted` any directory may be named. The sub-agent runs at `workspace` unless `permission` asks for less. `permission: "unrestricted"` alongside `writable_roots` is refused, since the list would then bound nothing, and so is an empty list. The bounds are recorded with the sub-agent and hold across `agent_followup`, which checks them against your reach at that moment: a session that has since dropped below `workspace`, or moved to a directory that no longer contains them, cannot resume the sub-agent.
+**Scope.** Three fields say where a sub-agent works and what it reaches. Leave all three out and it has your whole scope: your working directory, your additional workspace and readable directories, and your level.
 
-**Readable roots.** Pass `readable_roots`, a list of directories, to confine the sub-agent's reads: it then reads its workspace (yours, or the one `writable_roots` gives it), the listed directories and the system directories, and nothing else, whether or not your own reads are confined by [`[permissions].confine_reads`](../usage/permissions.md#the-read-boundary). A parent reading everywhere hands a sub-agent a read boundary this way, as it hands one a write boundary with `writable_roots`; a parent whose reads are confined narrows it. The sub-agent runs at `workspace` unless `permission` asks for less, for the reason `writable_roots` drops it there: `unrestricted` disclaims every boundary. Omitted, the sub-agent holds your boundary: where reads are confined, a sub-agent below `unrestricted` reads your roots, or only its writable roots when `writable_roots` bounds it, plus the system directories; where they are not, it reads everywhere its level allows. The parameter's description states which of those holds in this process, so you need not infer it. Each entry must be an existing directory; a relative one resolves against your working directory; and when your reads are confined, each must lie inside your readable roots, so a sub-agent's reach never exceeds yours. Each must also lie outside the sub-agent's workspace: the workspace is readable already, so an entry inside it is refused, and the refusal names the spelling that confines a sub-agent to a directory, `writable_roots`, with `permission: "read"` for one that writes nothing. An entry that contains the workspace widens the reads and is accepted: list the repository to let a worker that writes only to an output directory read the sources. An empty list is refused, and so is `permission: "unrestricted"` alongside it, since the list would then bound nothing. The grant is recorded with the spawn terms and replayed on `agent_followup`, admitted against your reach at that moment.
+- `working_directory`: where it works. Its shell starts there and its relative paths resolve there; writable at `workspace`, read-only at `read`. Relative to your working directory, and `"."` is your working directory. Naming it states the sub-agent's whole scope: this directory, the two lists below, and nothing else of yours. It is required beside either list, so a list never stands beside an unnamed directory.
+- `additional_workspace_directories`: more of its workspace beyond the working directory, with the working directory's rights: writable at `workspace`, read-only at `read`, searched by default. Relative paths never resolve against them.
+- `additional_readable_directories`: directories it may read beyond its workspace and never write, which a search covers only when named.
+
+Every entry must be an existing directory within your reach: one you could write, for the working directory and the workspace list when the sub-agent writes, and one you can read otherwise. An entry outside your reach is refused in the same words whether or not it exists, so a sub-agent learns nothing about what lies beyond you; a missing entry inside it is told so. Every entry is judged, and one refusal names each that fails. A list beside `unrestricted`, asked for or inherited, is refused, since nothing is confined there. What adds nothing is merged rather than refused: a repeat, an empty list, a workspace entry inside the working directory, a readable entry inside the workspace, a directory named in both lists. Symlinks are resolved when the sub-agent is spawned, and the scope it holds is stated in canonical form.
+
+A sub-agent with a stated scope reads its workspace, its additional readable directories and the system directories, and nothing else, whether or not your own reads are confined by [`[permissions].confine_reads`](../usage/permissions.md#the-read-boundary); it writes its workspace at `workspace` and nothing at `read`. A spawn turns read confinement on, never off: a parent whose reads are confined cannot hand a sub-agent reads anywhere.
+
+The shapes, one spelling each:
+
+```json
+{"prompt": "..."}                                                                         like you: your whole scope, your level
+{"prompt": "...", "permission": "read"}                                                   like you, read-only
+{"prompt": "...", "working_directory": "/a"}                                              works in /a only
+{"prompt": "...", "working_directory": "/a", "permission": "read"}                        reads /a only
+{"prompt": "...", "working_directory": "/a", "additional_workspace_directories": ["/b"]}  writes /a and /b
+{"prompt": "...", "working_directory": "/a", "additional_readable_directories": ["/b"]}   writes /a, reads /b
+{"prompt": "...", "working_directory": ".", "additional_readable_directories": ["/b"]}    your directory and /b, nothing else of yours
+{"prompt": "...", "working_directory": "/a/out", "additional_readable_directories": ["/a"]} reads /a, writes out
+```
+
+**What it reports.** The result opens with the sub-agent's id and the scope it holds, in the lines the environment block uses, and the report follows:
+
+```
+Agent: 3f2c…
+Permission: workspace
+Working directory: /home/u/repo-a
+Additional workspace directories:
+  /srv/exports
+Additional readable directories:
+  /home/u/repo-b
+```
+
+The workspace line is omitted when there is nothing beyond the working directory; `none` sits on the readable line when the sub-agent reads nothing beyond its workspace, and `anywhere` when its reads are not confined; `Network: none (shell and web_fetch)` follows when the sub-agent is cut off the network, or `Network: none (web_fetch)` at `unrestricted`, where only the tool is withheld. A follow-up's result opens the same way, with the scope as re-admitted against your reach at that moment.
+
+**Network.** Pass `network: "none"` to cut the sub-agent's shell off the network and withhold `web_fetch` from it; the default is your own setting, [`[permissions].network`](../configuration/config-file.md#permissions). `host` under your own `none` is refused, since a sub-agent never reaches wider than its parent, and asking for `none` beside `unrestricted` is refused, since an unsandboxed shell cannot hold it; a sub-agent that inherits `none` at `unrestricted` holds what you hold, `web_fetch` withheld and a shell nothing sandboxes. An MCP server runs outside the sandbox and keeps its own network: a sub-agent that must not reach the network is also given no server that can, through `allow_servers` or `deny_servers`. A follow-up narrows the recorded setting to yours at that moment, as it narrows the level. The scope lines of a sub-agent that is cut off end with `Network: none (shell and web_fetch)`.
 
 **Tools.** Four lists narrow what the sub-agent sees, and nothing widens it. `allow_tools` names exactly the tools it sees, by name as they appear in your own tool list, built-ins and `mcp__<server>__<tool>` names in one namespace; everything else is withheld, so a worker that needs two tools is spawned with two names rather than twenty denials. `allow_servers` names the MCP servers it may see at all; a server outside the list is withheld whole, its tools, its resources and its prompts, and built-ins are untouched. `deny_servers` and `deny_tools` withhold by name as before. The lists compose the way `[tools]` and each `[[mcp.servers]]` compose theirs: a tool must pass every list with an opinion about it, and a deny wins on overlap, so a name in both `allow_tools` and `deny_tools` is withheld. Every list narrows what [`[subagents]`](../configuration/config-file.md#subagents) and your own ancestors already set: denials accumulate down the tree and allow-lists intersect, so a nested `agent_spawn` can only ever narrow further and cannot name back a tool its parent lost. An empty allow-list is refused; omit it to withhold nothing. A name that matches no built-in and no configured server restricts nothing and is warned about. Config is the place to put a restriction you always want, since the failure mode this guards against is an orchestrator forgetting to ask for it.
 
@@ -204,7 +239,7 @@ Neither can be granted beyond what you hold yourself, so authority only narrows 
 
 **What it sees.** A sub-agent gets the same per-turn context the root does, over its own registry: the tool discovery index, the skill index, the memories it was granted, and the instructions of the MCP servers it is allowed to use. Its conversation, checklist and scratchpad entries are private; filesystem changes are shared within the workspace it was given.
 
-**Follow-up.** `agent_spawn` returns the sub-agent's id on the first line of its result, above the report. Keep it if you might have a second question: with it you can call `agent_followup` instead of re-spawning one that would have to rediscover everything.
+**Follow-up.** `agent_spawn` returns the sub-agent's id on the first line of its result, above its scope and its report. Keep it if you might have a second question: with it you can call `agent_followup` instead of re-spawning one that would have to rediscover everything.
 
 ## `agent_list` / `agent_followup` / `agent_steer` / `agent_delete`
 
@@ -219,7 +254,7 @@ A sub-agent is not a one-shot. Its conversation persists under its own session, 
 
 **All five go together.** Denying `agent_spawn` in [`[tools].disabled_tools`](../configuration/config-file.md#tools-built-in-tool-filters), or setting [`session.subagent_max_depth = 0`](../configuration/config-file.md#sessionsubagent_max_depth), removes the four lifecycle tools too: an agent that cannot delegate has no sub-agents for them to act on, and leaving them behind would let it drive the ones a previous run left in the store. `meka tool list` reports all five as `disabled` in either case. Denying only `agent_list` removes just that one.
 
-**A follow-up runs under the terms of the spawn, not your current ones.** The permission level, the four tool lists, the memory level and the inherited scratchpad names are recorded when the sub-agent is created and replayed on every follow-up. If you spawned a sub-agent at `read` and have since switched to `unrestricted`, following up on it still runs it at `read`. That is deliberate: otherwise a second question would be a way to escalate a sub-agent you deliberately restricted. A sub-agent that shares your workspace keeps the working directory it was spawned in; at `workspace`, a follow-up is refused once that directory lies outside your own boundary, the same check a sub-agent's `writable_roots` get.
+**A follow-up runs under the terms of the spawn, not your current ones.** The permission level, the scope, the four tool lists, the memory level and the inherited scratchpad names are recorded when the sub-agent is created and replayed on every follow-up. If you spawned a sub-agent at `read` and have since switched to `unrestricted`, following up on it still runs it at `read`. That is deliberate: otherwise a second question would be a way to escalate a sub-agent you deliberately restricted. A sub-agent spawned with nothing named keeps the working directory it was spawned in and follows the rest of your scope; one with a scope of its own keeps that scope. Either way a follow-up re-admits what the sub-agent holds against your reach at that moment, at the level it runs at then: a directory you can no longer grant refuses the follow-up, and a level you have dropped to narrows it.
 
 One thing does *not* survive a follow-up, because it only ever lived in memory: which files the sub-agent had read. It is told as much at the start of the turn. Its checklist does survive, read back from its own conversation, so a follow-up still owes what the sub-agent left open. Its context gauge does survive: the follow-up starts from the occupancy the sub-agent's row last recorded, so its first turn back is checked against the ceiling like any other.
 

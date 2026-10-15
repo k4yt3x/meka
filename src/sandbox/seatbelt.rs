@@ -51,7 +51,16 @@ const READ_CONFINED_RULES: &str = r#"
 (allow file-ioctl)
 (allow file-read-metadata)
 "#;
-/// Everything after the read rules: processes, sysctls, IPC and the network.
+/// The one rule that opens the network, appended on `host` and withheld on `none`, which under
+/// `(deny default)` is what refuses every outbound socket.
+///
+/// Outbound only. Codex's `(allow network-bind (local ip "*:0"))` and the matching
+/// `network-inbound` are left out: a current macOS rejects `"*:0"` as a parse error, which refuses
+/// the whole profile, and nothing at the read level binds a listening socket.
+const NETWORK_OUTBOUND_RULE: &str =
+    "\n; Outbound BSD sockets (curl, http clients, etc.)\n(allow network-outbound)\n";
+
+/// Everything after the read rules: processes, sysctls, IPC and the network's services.
 const PROFILE_BODY: &str = r#"
 ; child processes inherit the policy of their parent
 (allow process-exec)
@@ -165,13 +174,6 @@ const PROFILE_BODY: &str = r#"
     (socket-domain AF_SYSTEM)
     (socket-protocol 2)))
 
-; Outbound BSD sockets (curl, http clients, etc.)
-;
-; Outbound only. Codex's `(allow network-bind (local ip "*:0"))` and the matching `network-inbound`
-; are left out: a current macOS rejects `"*:0"` as a parse error, which refuses the whole profile,
-; and nothing at the read level binds a listening socket.
-(allow network-outbound)
-
 ; Services needed for hostname lookup, TLS trust evaluation, proxy config.
 (allow mach-lookup
   (global-name "com.apple.bsd.dirhelper")
@@ -213,11 +215,15 @@ pub(crate) fn sandbox_profile_for(
     writable: &[std::path::PathBuf],
     readable: Option<&[std::path::PathBuf]>,
     private: &[std::path::PathBuf],
+    network: crate::config::Network,
 ) -> (String, Vec<std::ffi::OsString>) {
     let mut profile = match readable {
         None => SANDBOX_PROFILE_READONLY.clone(),
         Some(_) => format!("{PROFILE_PRELUDE}{READ_CONFINED_RULES}{PROFILE_BODY}"),
     };
+    if network == crate::config::Network::Host {
+        profile.push_str(NETWORK_OUTBOUND_RULE);
+    }
     let mut params = Vec::new();
     for (index, path) in readable.unwrap_or_default().iter().enumerate() {
         let key = format!("MEKA_READABLE_{index}");

@@ -120,9 +120,9 @@ pub(crate) struct Skill {
     /// The root this skill was discovered under.
     ///
     /// Only meaningful against [`SkillCache::root`]: a skill whose root is a different one came
-    /// from `[skills] extra_paths` and belongs to whoever put it there, so meka must not write
-    /// over it or delete it. Stored rather than derived by prefix-matching the path, because a
-    /// symlinked or `..`-containing root would make that comparison quietly wrong.
+    /// from `[skills] additional_directories` and belongs to whoever put it there, so meka must
+    /// not write over it or delete it. Stored rather than derived by prefix-matching the path,
+    /// because a symlinked or `..`-containing root would make that comparison quietly wrong.
     pub(crate) root: PathBuf,
 }
 
@@ -151,9 +151,9 @@ pub(crate) struct SkippedSkill {
     ///
     /// Without this a directory that fails to parse is a name the store has no opinion about, and
     /// the write doors would compare against the loaded list only, so `meka skill add` and
-    /// `PUT /v1/skills/{name}` would refuse to shadow a working skill in an `extra_paths` root and
-    /// silently shadow a broken one, which is the case where masking the file is least
-    /// recoverable: nothing then reports the original at all.
+    /// `PUT /v1/skills/{name}` would refuse to shadow a working skill in an
+    /// `additional_directories` root and silently shadow a broken one, which is the case where
+    /// masking the file is least recoverable: nothing then reports the original at all.
     pub(crate) root: PathBuf,
 }
 
@@ -589,11 +589,11 @@ fn disk_snapshot(root: &Path) -> Option<BTreeMap<PathBuf, (SystemTime, u64)>> {
 /// Snapshot every root at once.
 ///
 /// Only the native root (meka's own) can veto the snapshot by failing, which is the case the
-/// stale-rather-than-wipe rule exists for. An `extra_paths` root that fails contributes nothing
-/// instead, exactly as `discover_skills_in_roots` treats it: the two must agree, because a snapshot
-/// that never changes pins the cache forever, and a pinned cache ignores `invalidate()` and so
-/// hides every later `skill_write` and `skill_delete`, including ones in meka's own store, which
-/// the failing root has nothing to do with.
+/// stale-rather-than-wipe rule exists for. An `additional_directories` root that fails contributes
+/// nothing instead, exactly as `discover_skills_in_roots` treats it: the two must agree, because a
+/// snapshot that never changes pins the cache forever, and a pinned cache ignores `invalidate()`
+/// and so hides every later `skill_write` and `skill_delete`, including ones in meka's own store,
+/// which the failing root has nothing to do with.
 fn snapshot_roots(
     native: Option<&Path>,
     roots: &[PathBuf],
@@ -671,7 +671,7 @@ pub(crate) struct SkillCache {
     /// [`skills_dir`] returns `None` or when constructed via `SkillCache::for_root(None)` for test
     /// scaffolding / subcommands that don't read skills.
     root: Option<PathBuf>,
-    /// Read-only roots from `[skills] extra_paths`, scanned after [`Self::root`].
+    /// Read-only roots from `[skills] additional_directories`, scanned after [`Self::root`].
     ///
     /// Never created and never written to. Keeping them out of [`Self::root`] is what makes that
     /// guarantee structural rather than a convention: the write tools ask for `root()`, so there
@@ -762,8 +762,8 @@ impl SkillCache {
     /// names onto this, so a `None` here is what distinguishes "nothing installed" from "nowhere to
     /// install to" in their error text.
     ///
-    /// Deliberately never returns an `extra_paths` root: those are read-only, and this is the
-    /// accessor every write goes through.
+    /// Deliberately never returns an `additional_directories` root: those are read-only, and this
+    /// is the accessor every write goes through.
     pub(crate) fn root(&self) -> Option<&Path> {
         self.root.as_deref()
     }
@@ -2895,7 +2895,7 @@ mod tests {
 
     /// `root()` is what every write joins onto, so it must never name a read-only root.
     #[test]
-    fn the_writable_root_is_only_ever_mekas_own() {
+    fn the_writable_directory_is_only_ever_mekas_own() {
         let temp = tempfile::tempdir().expect("tempdir");
         let native = temp.path().join("native");
         let shared = temp.path().join("shared");

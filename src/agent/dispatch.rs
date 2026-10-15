@@ -41,14 +41,20 @@ pub(super) enum CallDoor {
 
 impl Agent {
     /// `loaded` is the turn's active-tool set, used only to tell a call made against a schema the
-    /// model has actually seen from one made blind; see [`Self::schema_advisory`].
+    /// model has actually seen from one made blind; see [`Self::schema_advisory`]. The third value
+    /// names the calls whose result is a word about the call rather than the tool's output, which
+    /// the `scratchpad` redirect leaves inline; see [`crate::tools::ToolOutput::is_output`].
     pub(super) async fn execute_tool_calls(
         &self,
         assistant_message: &Message,
         loaded: &[String],
         attribution: &crate::provider::Attribution,
         cancellation: CancellationToken,
-    ) -> (Vec<ContentBlock>, Vec<crate::provider::ToolDuration>) {
+    ) -> (
+        Vec<ContentBlock>,
+        Vec<crate::provider::ToolDuration>,
+        Vec<String>,
+    ) {
         // Emit tool-call indicators in source order. The streaming path already emitted these as
         // `ToolUseEnd` events; this loop only fires for the blocking provider path. Serial so
         // concurrent execution below can't interleave indicators.
@@ -115,8 +121,12 @@ impl Agent {
         // `checklist_*` call landed and actually changed the state.
         let mut results = Vec::with_capacity(planned.len());
         let mut durations = Vec::with_capacity(planned.len());
+        let mut inline_results = Vec::new();
         let mut checklist_fired = false;
         for ((id, name, _), (output, elapsed)) in planned.into_iter().zip(outputs) {
+            if !output.is_output {
+                inline_results.push(id.clone());
+            }
             durations.push(crate::provider::ToolDuration {
                 name: name.clone(),
                 elapsed,
@@ -171,7 +181,7 @@ impl Agent {
             }
         }
 
-        (results, durations)
+        (results, durations, inline_results)
     }
 
     pub(super) async fn resolve_and_execute_tool(
@@ -598,14 +608,20 @@ impl Agent {
         crate::tools::ToolOutput::text(notice, false)
     }
 
-    /// Invoke a tool and turn its failure into the output the model reads.
+    /// Invoke a tool and turn its failure into the output the model reads, marking the tool's
+    /// output ([`crate::tools::ToolOutput::is_output`]): a result it returned, or a failure it
+    /// reports when it says its failures are its output. This is the one door a tool's result
+    /// comes through, so the mark is set here and nowhere else.
     pub(super) async fn run_tool(
         tool: &dyn crate::tools::Tool,
         input: &serde_json::Value,
         context: crate::tools::ToolContext,
     ) -> crate::tools::ToolOutput {
         match tool.execute(input.clone(), context).await {
-            Ok(output) => output,
+            Ok(output) => crate::tools::ToolOutput {
+                is_output: !output.is_error || tool.reports_failure_as_output(),
+                ..output
+            },
             Err(MekaError::Interrupted) => {
                 crate::tools::ToolOutput::text("Tool execution interrupted.".to_string(), true)
             }
@@ -709,6 +725,92 @@ mod tests {
         assert_eq!(super::approval_input(&input, true), input);
     }
 
+    /// The tool's output is marked as such and a word about the call is not: a result the tool
+    /// returned, and a failure it reports when its failures are its output, as a command's exit
+    /// is; neither a failure from a tool whose failed result is a complaint nor meka's own
+    /// refusal. The `scratchpad` redirect takes the former and leaves the latter inline, so a
+    /// caller that redirected a refused call still reads why.
+    #[tokio::test]
+    async fn the_tools_output_is_told_apart_from_a_word_about_the_call() {
+        use crate::provider::mock::MockProvider;
+
+        struct Fixture(&'static str);
+
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for Fixture {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: self.0.to_string(),
+                    description: "fixture".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                    ..Default::default()
+                }
+            }
+
+            fn required_permission(&self) -> crate::permission::Permission {
+                crate::permission::Permission::Read
+            }
+
+            fn reports_failure_as_output(&self) -> bool {
+                self.0 == "command"
+            }
+
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _context: crate::tools::ToolContext,
+            ) -> crate::error::Result<crate::tools::ToolOutput> {
+                match self.0 {
+                    "command" | "complaining" => {
+                        Ok(crate::tools::ToolOutput::text("failed".to_string(), true))
+                    }
+                    "succeeding" => Ok(crate::tools::ToolOutput::text("done".to_string(), false)),
+                    _ => Err(crate::error::MekaError::ToolExecution {
+                        tool_name: self.0.to_string(),
+                        message: "refused".to_string(),
+                    }),
+                }
+            }
+        }
+
+        let registry = crate::tools::ToolRegistry::new();
+        let names = ["command", "complaining", "succeeding", "refusing"];
+        for name in names {
+            registry
+                .register(Arc::new(Fixture(name)))
+                .expect("registration");
+        }
+        let (agent, _store) =
+            agent_with_registry_for_test(Arc::new(MockProvider::from_rounds(vec![])), registry)
+                .await;
+        let message = crate::conversation::Message {
+            role: crate::conversation::Role::Assistant,
+            content: names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| crate::conversation::ContentBlock::ToolUse {
+                    id: format!("call-{}", index + 1),
+                    name: name.to_string(),
+                    input: serde_json::json!({ "scratchpad": "probe" }),
+                })
+                .collect(),
+        };
+        let (results, _, inline_results) = agent
+            .execute_tool_calls(
+                &message,
+                &[],
+                &crate::provider::Attribution::default(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(results.len(), 4);
+        assert_eq!(
+            inline_results,
+            vec!["call-2".to_string(), "call-4".to_string()],
+            "a complaint and a refusal stay inline; a command's failure and a result are output"
+        );
+    }
+
     /// A tool that panics is a failed result, not a dead turn: the assistant's `tool_use` is
     /// already in memory when the tools run, and a panic that unwinds the turn leaves the
     /// conversation ending on a call with no result, rejected by the provider on every later
@@ -758,7 +860,7 @@ mod tests {
                 input: serde_json::json!({}),
             }],
         };
-        let (results, _durations) = agent
+        let (results, _durations, _) = agent
             .execute_tool_calls(
                 &call,
                 &[],
@@ -1134,7 +1236,7 @@ mod tests {
                 },
             ],
         };
-        let (results, durations) = agent
+        let (results, durations, _) = agent
             .execute_tool_calls(
                 &message,
                 &[],
@@ -1223,7 +1325,7 @@ mod tests {
                 },
             ],
         };
-        let (results, _) = agent
+        let (results, ..) = agent
             .execute_tool_calls(
                 &message,
                 &[],

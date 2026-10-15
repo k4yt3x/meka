@@ -106,7 +106,7 @@ What an `InternalError`'s `data` carries follows the same policy the HTTP API ap
 - **`session/set_mode { sessionId, modeId }`**: flips the agent's `Permission` cell. A level outside `[permissions].enabled` is refused with `InvalidParams`. On success, meka emits `session/update: current_mode_update`. The flip is atomic and applies to the *next* tool call within an in-flight turn; no need to wait for the turn to finish.
 - **`session/set_config_option { sessionId, configId, value }`**: sets one of the three entries in `configOptions`. Returns the full list with its new values. See [Session config options](#session-config-options).
 
-`session/new`, `session/load`, `session/resume` and `session/fork` all answer with `modes` and `configOptions`, and each is followed by an `available_commands_update` (see [Slash commands](#slash-commands)). `--writable-root` on the `meka acp` command line adds to every session's workspace roots, beside whatever the client sent.
+`session/new`, `session/load`, `session/resume` and `session/fork` all answer with `modes` and `configOptions`, and each is followed by an `available_commands_update` (see [Slash commands](#slash-commands)). `--additional-workspace-directory` on the `meka acp` command line adds to every session's workspace, beside whatever the client sent as `additionalDirectories`; those are the session's additional workspace directories at every level, writable at `workspace` and read-only at `read` as the working directory is, since `session/set_mode` moves the level while the session runs. `--additional-readable-directory` adds what every session reads beyond its workspace.
 
 ### Idle sessions are released
 

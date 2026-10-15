@@ -43,7 +43,7 @@ impl Tool for SearchContentsTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "File or directory to search in. Omit to search every workspace root (the working directory plus any additional roots listed in the environment context). Set it to search a specific file or subtree."
+                        "description": "File or directory to search in. Omit to search the workspace: the working directory and the additional workspace directories the environment context lists. Set it to search a specific file or subtree."
                     },
                     "glob": {
                         "type": "string",
@@ -1076,7 +1076,9 @@ mod tests {
             .await
             .expect_err("a base outside the roots");
         assert!(
-            refused.to_string().contains("outside the readable roots"),
+            refused
+                .to_string()
+                .contains("outside the readable directories"),
             "{refused}"
         );
         let found = tool
