@@ -13,11 +13,11 @@ Manage accounts and their credentials. `meka account add` writes an `[accounts.<
 are the read-only views described under [Account info](../usage/account.md).
 
 ```bash
-meka account add anthropic --backend claude-subscription
+meka account add claude --backend claude-subscription
 meka account list [--format <FORMAT>]
-meka account login anthropic
-meka account remove anthropic
-meka account rename anthropic claude
+meka account login claude
+meka account remove claude
+meka account rename claude personal
 meka account usage [NAME] [--format <FORMAT>]    # session / weekly windows
 meka account whoami [NAME] [--format <FORMAT>]   # plan, tier, org, role and local auth status
 meka account stats [NAME] [--format <FORMAT>]    # lifetime tokens, streaks, per-day counts

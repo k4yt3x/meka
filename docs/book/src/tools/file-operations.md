@@ -54,13 +54,13 @@ Only read image files when the current model supports vision input; text-only mo
 Read an entire file:
 
 ```text
-meka ~/project [r] > show me the contents of src/main.rs
+> show me the contents of src/main.rs
 ```
 
 Read lines 10-20:
 
 ```text
-meka ~/project [r] > show me lines 10 through 20 of src/main.rs
+> show me lines 10 through 20 of src/main.rs
 ```
 
 ---

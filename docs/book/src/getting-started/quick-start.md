@@ -8,8 +8,8 @@ credential flow (OAuth login or API-key prompt) and writes the account to
 
 ```bash
 # Claude Code subscription (OAuth)
-meka account add anthropic --backend claude-subscription
-meka profile add work --account anthropic --model claude-opus-5-5
+meka account add claude --backend claude-subscription
+meka profile add work --account claude --model claude-opus-5-5
 
 # or a Claude API key
 meka account add anthropic --backend anthropic-messages
@@ -31,39 +31,27 @@ add more later and switch with `meka profile use <name>` or the per-run `--profi
 
 ## 2. Start using meka
 
-After setup, you will see a prompt:
-
-```text
-meka ~/project [r] >
-```
-
-The `[r]` indicates the **read** permission level (the default). The agent can read files, search, and run shell commands in a sandbox that blocks writes. It cannot modify your files.
+After setup, run `meka`. The screen opens on the conversation, with a composer at the bottom and a status row under it that opens with the permission level: **read** by default. The agent can read files, search, and run shell commands in a sandbox that blocks writes. It cannot modify your files.
 
 ## 3. Ask it something
 
 ```text
-meka ~/project [r] > what files are in the current directory?
+> what files are in the current directory?
 ```
 
 The agent will use the `file_find` tool to list files and describe them.
 
 ## 4. Enable the workspace level
 
-Press **Shift+Tab** to cycle the permission to `workspace`, where the agent may write inside your working directory:
+Press **Shift+Tab** to cycle the permission to `workspace`, where the agent may write inside your working directory. Now it can modify files too, and its shell may write inside the same boundary:
 
 ```text
-meka ~/project [w] >
-```
-
-Now it can modify files too, and its shell may write inside the same boundary:
-
-```text
-meka ~/project [w] > create a file called hello.txt with the text "hello world"
+> create a file called hello.txt with the text "hello world"
 ```
 
 ## 5. One-shot mode
 
-For quick tasks without entering the interactive shell:
+For quick tasks without opening the screen:
 
 ```bash
 meka --oneshot -p "what is my current working directory?"

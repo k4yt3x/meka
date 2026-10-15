@@ -58,7 +58,7 @@ meka profile add llama --account ollama --model llama3
 # OpenRouter
 meka account add openrouter --backend openai-chat-completions \
     --base-url https://openrouter.ai/api/v1
-meka profile add sonnet --account openrouter --model anthropic/claude-sonnet-4.6
+meka profile add sonnet --account openrouter --model anthropic/claude-sonnet-5.5
 ```
 
 The resulting tables (the key, if any, lives in the store):

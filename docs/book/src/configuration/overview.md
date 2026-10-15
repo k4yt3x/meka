@@ -7,11 +7,11 @@ profile is what meka asks that account for: a model and every model-tied setting
 to get started is to let the two command suites write both for you:
 
 ```console
-$ meka account add anthropic --backend claude-subscription
-$ meka profile add work --account anthropic --model claude-opus-5-5
+$ meka account add claude --backend claude-subscription
+$ meka profile add work --account claude --model claude-opus-5-5
 ```
 
-The first command writes an `[accounts.anthropic]` table to the config file, runs the OAuth login
+The first command writes an `[accounts.claude]` table to the config file, runs the OAuth login
 (or prompts for an API key, depending on the backend), and saves the secret to the store. The
 second writes a `[profiles.work]` table naming that account. With one profile configured, it is the
 default. The resulting config looks like:
@@ -19,11 +19,11 @@ default. The resulting config looks like:
 ```toml
 default_profile = "work"
 
-[accounts.anthropic]
+[accounts.claude]
 backend = "claude-subscription"
 
 [profiles.work]
-account = "anthropic"
+account = "claude"
 model   = "claude-opus-5-5"
 ```
 
@@ -68,7 +68,7 @@ meka profile set work model claude-opus-5-5
 To run something different, make a second profile on the same account and select it:
 
 ```bash
-meka profile add fast --account anthropic --model claude-haiku-4-5 --context-window 200000
+meka profile add fast --account claude --model claude-haiku-5-5 --context-window 200000
 meka --profile fast -p "quick question"
 ```
 

@@ -52,7 +52,7 @@ file holds only the non-secret settings shown below.
 ```toml
 default_profile = "work"
 
-[accounts.anthropic]
+[accounts.claude]
 backend = "claude-subscription"
 
 [accounts.ollama]
@@ -60,12 +60,12 @@ backend  = "openai-chat-completions"
 base_url = "http://localhost:11434/v1"
 
 [profiles.work]
-account = "anthropic"
+account = "claude"
 model   = "claude-opus-5-5"
 
 [profiles.fast]
-account        = "anthropic"
-model          = "claude-haiku-4-5"
+account        = "claude"
+model          = "claude-haiku-5-5"
 context_window = 200000
 
 [profiles.local]
@@ -600,8 +600,8 @@ $ meka profile add local --account ollama --model llama3
 $ meka account add openrouter --backend openai-chat-completions \
     --base-url https://openrouter.ai/api/v1
 # Prompts for your OpenRouter key (sk-or-...).
-$ meka profile add sonnet --account openrouter --model anthropic/claude-sonnet-4.6
-$ meka profile add gpt --account openrouter --model openai/gpt-5.6-sol
+$ meka profile add sonnet --account openrouter --model anthropic/claude-sonnet-5.5
+$ meka profile add gpt --account openrouter --model openai/gpt-6-astra
 ```
 
 ## `[mcp]`

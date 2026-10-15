@@ -8,7 +8,7 @@ A general-purpose AI agent harness.
 > [!IMPORTANT]
 > meka is opinionated software and has not stabilized. Defaults, configuration keys, tool names, and stored formats may change between releases. Read the changelog before upgrading.
 
-![meka Screenshot](https://github.com/user-attachments/assets/2efa1688-1461-4d26-9743-a3e88203e522)
+![meka Screenshot](https://github.com/user-attachments/assets/e43c6691-155d-4a1f-aa39-e82d6834684c)
 
 ## Features
 
@@ -16,7 +16,7 @@ A general-purpose AI agent harness.
 - **Proactive context management**: the agent watches its own usage and compacts when it chooses.
 - **Memory**: notes the agent keeps, tagged, ranked, and searchable across sessions.
 - **Sandboxed shell**: write access confined by the operating system itself.
-- **Sub-agents**: the parent seeds one with a skill and can follow up on it later; several run in parallel.
+- **Sub-agents**: the parent seeds one with a skill and can follow up on it later.
 - **Background tasks**: detached tool calls that report back when they finish.
 - **Skills**: [Agent Skills](https://agentskills.io/specification) compliant, portable across clients.
 - **MCP**: any standard-compliant server, over streamable HTTP or stdio.
@@ -56,23 +56,19 @@ To let the agent do anything short of touching your machine, the [`mekabox`](scr
 Add an account with `meka account add`, then a profile on it with `meka profile add`. The first runs the OAuth login (or prompts for an API key), saves the secret to the store, and writes the account to `~/.config/meka/config.toml`; the second names the model:
 
 ```bash
-meka account add anthropic --backend claude-subscription
-meka profile add work --account anthropic --model claude-opus-5-5
+meka account add claude --backend claude-subscription
+meka profile add work --account claude --model claude-opus-5-5
 ```
 
-An account is a backend, an endpoint and a login. The backend is either a wire protocol (`anthropic-messages`, `openai-chat-completions`, `openai-responses`) or a subscription (`claude-subscription`, `chatgpt-subscription`). A profile is an account plus a model, so one login can serve several models. Add several and switch with `meka profile use <name>` or `--profile <name>`. For an OpenAI-compatible endpoint like OpenRouter, set `--base-url` on the account:
+An account is a backend, an endpoint and a login. A profile is an account plus a model, so one login can serve several models. Add several and switch with `meka profile use <name>` or `--profile <name>`. For an OpenAI-compatible endpoint like OpenRouter, set `--base-url` on the account:
 
 ```bash
 meka account add openrouter --backend openai-chat-completions --base-url https://openrouter.ai/api/v1
 meka profile add opus --account openrouter --model anthropic/claude-opus-5.5
+meka profile add astra --account openrouter --model openai/gpt-6-astra
 ```
 
-Run `meka` and start typing. Press Shift+Tab to cycle permissions (none, read, workspace, unrestricted):
-
-```console
-meka ~/project [r] > find all TODO comments in this project
-meka ~/project [u] > install and start nginx
-```
+Run `meka` and start typing. Press Shift+Tab to cycle permissions (none, read, workspace, unrestricted).
 
 See the [documentation](https://docs.meka.run) for the full usage guide.
 
@@ -96,16 +92,16 @@ The agent has access to the following built-in tools, grouped by class:
 - `mcp_*`: list, read, and subscribe to MCP resources, and render MCP prompts
 - `tool_*`: find a tool by keyword, or load a deferred tool's schema
 
-Run `meka tool list` for the current set with descriptions. Long-output tools take an optional `scratchpad` parameter to save their output there instead of returning it. See the [tool reference](https://docs.meka.run/tools/overview.html).
+Run `meka tool list` for the current set with descriptions. See the [tool reference](https://docs.meka.run/tools/overview.html).
 
 ## Permissions
 
-The prompt indicator shows the current permission level. Press **Shift+Tab** to cycle between levels:
+The status row shows the current permission level. Press **Shift+Tab** to cycle between levels:
 
-- `[n]` **none**: no tools; the model can only reply with text
-- `[r]` **read**: read-only tools, and a shell sandboxed against writes
-- `[w]` **workspace**: every tool; writes confined to the workspace: the cwd and any `--additional-workspace-directory`
-- `[u]` **unrestricted**: every tool, with no boundary on where writes land
+- **none**: no tools; the model can only reply with text
+- **read**: read-only tools, and a shell sandboxed against writes
+- **workspace**: every tool; writes confined to the working directory
+- **unrestricted**: every tool, with no boundary on where writes land
 
 A call the level does not cover is refused, or, with `/approvals on`, put to you for approval.
 
@@ -114,20 +110,20 @@ A call the level does not cover is refused, or, with `/approvals on`, put to you
 Conversations are persisted in the store, a local SQLite file, and can be resumed:
 
 - `meka -c` continues the last session
-- `meka -r <id>` resumes a session by id, or by any unique prefix of one
+- `meka -r [<id>]` resumes a session by id, or picks one interactively from a list
 - `meka session list` / `remove` / `export` manage and export past sessions
-- `/compact`, `/fork`, `/rewind`, `/export` act on the current session from the shell
+- `/compact`, `/fork`, `/rewind`, `/export` act on the current session from the screen
 
 ## Shell escape
 
 Prefix input with `!` to execute a command directly, bypassing the LLM:
 
-```console
-meka ~/project [r] > !uname -a
-meka ~/project [r] > !docker ps
+```text
+> !uname -a
+> !docker ps
 ```
 
-Type `/exit`, `/quit`, `exit` or `quit`, or press **Ctrl+D** on an empty line, to leave the shell.
+Type `/exit`, `/quit`, `exit` or `quit`, or press **Ctrl+D** with the composer empty, to leave the screen.
 
 ## AI use declaration
 

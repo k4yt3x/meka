@@ -5,7 +5,7 @@
 The name reflects the design: the model is the pilot, and meka is the mech it operates. The pilot (the model and the backend serving it) is swappable; the harness around it stays the same.
 
 ```text
-meka ~/project [r] > find all Rust files in this project and count the lines of code
+> find all Rust files in this project and count the lines of code
 ```
 
 You describe the goal in natural language and the agent decides which tools to use to reach it.

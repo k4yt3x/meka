@@ -281,8 +281,8 @@ Shows the session's resolved model parameters followed by its cumulative counter
 ```
 /status
   Profile:         work
-  Account:         anthropic (claude-subscription)
-  Model:           claude-opus-4-8
+  Account:         claude (claude-subscription)
+  Model:           claude-opus-5-5
   Context:         128.4k / 1.0M (13% used, 871.6k left)
   Effort:          xhigh
   Thinking:        adaptive

@@ -6,12 +6,12 @@ control over the agent's capabilities and prevent accidental modifications.
 
 ## Permission levels
 
-| Level | Indicator | What it allows |
-|-------|-----------|----------------|
-| **None** | `[n]` (green) | No tools without approval. |
-| **Read** | `[r]` (yellow) | Read-only tools: `file_read`, `file_find`, `file_search`, `web_fetch`, `shell_execute` (sandboxed read-only), `checklist_*`, `agent_spawn`, scratchpad tools |
-| **Workspace** | `[w]` (orange) | File and shell writes stay inside the workspace. Unconfined MCP calls may need approval or be refused; the shell needs an available sandbox |
-| **Unrestricted** | `[u]` (red) | Every tool, no boundary. `shell_execute` runs with no sandbox at all |
+| Level | Color | What it allows |
+|-------|-------|----------------|
+| **None** | green | No tools without approval. |
+| **Read** | yellow | Read-only tools: `file_read`, `file_find`, `file_search`, `web_fetch`, `shell_execute` (sandboxed read-only), `checklist_*`, `agent_spawn`, scratchpad tools |
+| **Workspace** | orange | File and shell writes stay inside the workspace. Unconfined MCP calls may need approval or be refused; the shell needs an available sandbox |
+| **Unrestricted** | red | Every tool, no boundary. `shell_execute` runs with no sandbox at all |
 
 The ladder is ordered by **reach**: each level contains the ones below it, and a tool call that
 needs more than the session's level is refused. With [approvals](#approvals) on, it is put to you
@@ -316,7 +316,7 @@ Or use the `/permission` slash command:
 
 `/permission <level>` against a disabled level prints an error naming the currently enabled set.
 
-The prompt indicator updates immediately to reflect the new level. The agent learns the current level via a per-turn `[Permission context]` block prepended to your message (see *How permissions work* below).
+The status row updates immediately to reflect the new level. The agent learns the current level via a per-turn `[Permission context]` block prepended to your message (see *How permissions work* below).
 
 ## Approvals
 
@@ -469,14 +469,14 @@ Sub-agents spawned via `agent_spawn` inherit the parent's permission level by de
 ### Read (the default)
 
 ```text
-meka ~/project [r] > read the contents of main.rs
+> read the contents of main.rs
 ```
 
 The agent uses `file_read` and shows the contents. Shell commands also work at `read`, but run in a **read-only sandbox**; the filesystem is write-protected for the child process:
 
 ```text
-meka ~/project [r] > list the files in this directory
-meka ~/project [r] > show me the git log
+> list the files in this directory
+> show me the git log
 ```
 
 Commands like `ls`, `cat`, `git log`, `df`, `ps`, and `uname` work normally. Commands that attempt to write to the filesystem (e.g. `touch`, `rm`, `mkdir`) fail with a permission error.
@@ -493,7 +493,7 @@ If no sandbox backend is usable, shell commands at `read` **fail** rather than r
 If you ask the agent to modify a file:
 
 ```text
-meka ~/project [r] > add a comment to the top of main.rs
+> add a comment to the top of main.rs
 ```
 
 The agent will explain that it cannot write files at `read` and suggest switching to `workspace`.
@@ -527,7 +527,7 @@ So the honest statement of `read`'s filesystem guarantee is: your tree is safe f
 ### Workspace
 
 ```text
-meka ~/project [w] > run cargo test and show me the output
+> run cargo test and show me the output
 ```
 
 The agent uses `shell_execute` to run the tests and shows the results.
