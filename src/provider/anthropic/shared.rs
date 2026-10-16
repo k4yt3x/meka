@@ -1983,41 +1983,46 @@ mod tests {
         assert!(block.get("signature").is_none());
     }
 
-    /// The mirror of the Responses encoder's refusal, for a session recorded against OpenAI and
-    /// resumed under Claude. Sealed reasoning is not a Claude signature, and a thinking block
-    /// without one is rejected, so the block is left out: neither the blob nor an unsigned block
-    /// reaches the wire.
+    /// The mirror of the other encoders' refusals, for a session recorded against OpenAI or a
+    /// Chat Completions endpoint and resumed under Claude. Sealed reasoning is not a Claude
+    /// signature and verbatim reasoning has none, and a thinking block without one is rejected,
+    /// so the block is left out: neither the blob nor the text reaches the wire.
     #[test]
-    fn sealed_reasoning_is_never_sent_to_claude_as_a_signature() {
-        let message = crate::conversation::Message {
-            role: crate::conversation::Role::Assistant,
-            content: vec![
-                ContentBlock::Thinking {
-                    thinking: "a summary".to_string(),
-                    opaque: Some(OpaqueReasoning::Sealed {
-                        encrypted_content: "OPENAI_SEALED".to_string(),
-                        id: Some("rs_1".to_string()),
-                    }),
-                },
-                // Trailing thinking is stripped from the last assistant message, so the block has
-                // to be followed by something for this to be testing the encoder at all.
-                ContentBlock::Text {
-                    text: "answer".to_string(),
-                },
-            ],
-        };
-        let converted =
-            convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::OneHour));
-        let content = converted[0]["content"].as_array().expect("content");
+    fn another_wires_reasoning_is_never_sent_to_claude_as_a_signature() {
+        for opaque in [
+            OpaqueReasoning::Sealed {
+                encrypted_content: "OPENAI_SEALED".to_string(),
+                id: Some("rs_1".to_string()),
+            },
+            OpaqueReasoning::Verbatim,
+        ] {
+            let message = crate::conversation::Message {
+                role: crate::conversation::Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "the reasoning".to_string(),
+                        opaque: Some(opaque.clone()),
+                    },
+                    // Trailing thinking is stripped from the last assistant message, so the block
+                    // has to be followed by something for this to be testing the encoder at all.
+                    ContentBlock::Text {
+                        text: "answer".to_string(),
+                    },
+                ],
+            };
+            let converted =
+                convert_messages_to_claude_content(&[message], Some(CacheBreakpoint::OneHour));
+            let content = converted[0]["content"].as_array().expect("content");
 
-        assert_eq!(content.len(), 1, "{content:?}");
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "answer");
-        assert!(
-            !serde_json::to_string(&converted)
-                .expect("serialize")
-                .contains("OPENAI_SEALED")
-        );
+            assert_eq!(content.len(), 1, "{opaque:?}: {content:?}");
+            assert_eq!(content[0]["type"], "text");
+            assert_eq!(content[0]["text"], "answer");
+            let serialized = serde_json::to_string(&converted).expect("serialize");
+            assert!(
+                !serialized.contains("OPENAI_SEALED") && !serialized.contains("the reasoning"),
+                "{opaque:?}: {serialized}"
+            );
+        }
     }
 
     /// An Anthropic-compatible endpoint that does not sign its thinking (the `synthetic` backend)

@@ -1573,14 +1573,14 @@ mod tests {
         ));
     }
 
-    /// Both shapes survive a round trip, and `Sealed` omits an id it does not have.
+    /// Every shape survives a round trip, and `Sealed` omits an id it does not have.
     ///
     /// Named for what it can actually check. There is no backward compatibility to test: 0.42 reads
     /// only this shape, and a store written by an earlier release is brought forward by the
     /// migration script, not by serde. The `skip_serializing_if` is the part worth pinning -- drop
     /// it and every id-less sealed block starts writing `"id":null` into the log.
     #[test]
-    fn both_opaque_shapes_round_trip_and_an_absent_id_is_not_written() {
+    fn every_opaque_shape_round_trips_and_an_absent_id_is_not_written() {
         for (stored, expected) in [
             (
                 r#"{"type":"thinking","thinking":"hmm","opaque":{"type":"signed","signature":"SIG"}}"#,
@@ -1594,6 +1594,10 @@ mod tests {
                     encrypted_content: "E".to_string(),
                     id: None,
                 },
+            ),
+            (
+                r#"{"type":"thinking","thinking":"r","opaque":{"type":"verbatim"}}"#,
+                OpaqueReasoning::Verbatim,
             ),
         ] {
             let block: ContentBlock = serde_json::from_str(stored).expect("must load");

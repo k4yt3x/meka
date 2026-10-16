@@ -2785,6 +2785,9 @@ const ARCHIVE_FORMAT_0_75: u64 = 9;
 /// job's fire and a background report as `text` blocks, or the report as a section of the
 /// context block.
 const ARCHIVE_FORMAT_0_76_DEVELOPMENT: u64 = 10;
+/// The archive `format_version` 0.76 wrote, whose thinking blocks carry a Claude signature or
+/// sealed Responses reasoning and never a Chat Completions endpoint's own text.
+const ARCHIVE_FORMAT_0_76: u64 = 11;
 
 /// How the text meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
@@ -3332,7 +3335,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_70_DEVELOPMENT)
         | Some(ARCHIVE_FORMAT_0_70_DEVELOPMENT_2)
         | Some(ARCHIVE_FORMAT_0_75)
-        | Some(ARCHIVE_FORMAT_0_76_DEVELOPMENT) => {}
+        | Some(ARCHIVE_FORMAT_0_76_DEVELOPMENT)
+        | Some(ARCHIVE_FORMAT_0_76) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -8102,6 +8106,68 @@ mod tests {
             &export.sessions[0].events[0].event,
             crate::conversation::Event::Repair { messages, .. }
                 if matches!(messages[0].content[1], crate::conversation::ContentBlock::BackgroundReport { .. })
+        ));
+    }
+
+    /// A 0.76 archive holds every shape the current one does but the verbatim reasoning a Chat
+    /// Completions endpoint's thinking block carries, so it is read as it is: nothing to convert,
+    /// and a replay changes nothing.
+    #[test]
+    fn a_format_11_archive_is_read_as_it_is() {
+        let mut document = serde_json::json!({
+            "format_version": 11,
+            "meka_version": "0.76.0",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "blobs": [],
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "working_directory": "/w",
+                "permission": "read",
+                "capabilities_json": null,
+                "approvals": false,
+                "additional_workspace_directories": [],
+                "subagent_spec_json": null,
+                "profile": "work",
+                "stats": {
+                    "turns": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "redactions": 0,
+                    "redacted_images": 0,
+                    "redacted_bytes": 0,
+                    "turn_position": {"prompt_index": 0, "turn_index": 0},
+                },
+                "turns": [],
+                "events": [{
+                    "at": "2020-01-01T00:00:00Z",
+                    "turn_id": null,
+                    "event": {"Append": {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "hmm", "opaque": {"type": "signed", "signature": "MAC"}},
+                        {"type": "text", "text": "answer"},
+                    ]}},
+                }],
+                "scratchpad_entries": {},
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        let mut before = document.clone();
+        before["format_version"] = current.into();
+        assert!(bring_archive_forward(&mut document, current));
+        assert_eq!(document, before, "nothing to convert but the version stamp");
+        let export = crate::store::export::parse_session_export(document.to_string().as_bytes())
+            .expect("a 0.76 archive reads");
+        assert!(matches!(
+            &export.sessions[0].events[0].event,
+            crate::conversation::Event::Append(message)
+                if matches!(&message.content[0], crate::conversation::ContentBlock::Thinking {
+                    opaque: Some(crate::conversation::OpaqueReasoning::Signed { .. }), ..
+                })
         ));
     }
 }

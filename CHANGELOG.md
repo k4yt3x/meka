@@ -7,10 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `openai-chat-completions` shows the reasoning an endpoint streams as thinking and keeps it.
+
 ### Changed
 
+- Session archives are `format_version` 12; a 0.76 archive is read as it is.
 - `openai-responses` and `chatgpt-subscription` let the model call several tools in one round.
 - The YAML frontmatter parser is `yaml_serde`, the YAML organization's maintained `serde_yaml` fork.
+
+### Fixed
+
+- `openai-chat-completions` sends `reasoning_content` back, as DeepSeek's thinking mode requires.
 
 ## [0.76.0] - 2026-10-15
 

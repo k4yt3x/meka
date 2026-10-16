@@ -939,15 +939,15 @@ pub(crate) enum ToolResultContent {
     Text { text: String },
     Image { source: ImageSource },
 }
-/// The half of a thinking block meka cannot read, and which provider it belongs to.
+/// What a thinking block carries back to the wire that produced it, and which wire that is.
 ///
-/// The two backends that emit reasoning hand back different things, and the difference decides both
+/// The wires that emit reasoning hand back different things, and the difference decides both
 /// what may be replayed and what the readable half is worth. Held as one nullable `signature`,
 /// wrong states are representable: a `chatgpt-subscription` session's `encrypted_content` resumed
 /// under Claude is replayed verbatim as Claude's `signature`, a blob from the wrong cryptosystem
 /// presented as authentication for text it does not authenticate, and the other direction opens
-/// the moment the Responses encoder replays reasoning. Naming the two shapes makes both a type
-/// error instead of a thing to remember.
+/// the moment the Responses encoder replays reasoning. Naming the shapes makes both a type error
+/// instead of a thing to remember.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum OpaqueReasoning {
@@ -961,6 +961,10 @@ pub(crate) enum OpaqueReasoning {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
     },
+    /// Chat Completions. The reasoning is the block's `thinking` text, and that text is what goes
+    /// back, as the `reasoning_content` of its assistant message: DeepSeek's thinking mode
+    /// rejects a request with tools that omits it, and the other endpoints accept or ignore it.
+    Verbatim,
 }
 /// Why the loop wrote a nudge: the reply it answers had no visible text, or left checklist items
 /// open. What a surface shows for a replayed nudge depends on it, and the wire carries it.
@@ -1116,8 +1120,9 @@ pub(crate) enum ContentBlock {
     },
     Thinking {
         /// The readable half, and only the readable half. How much of the reasoning it is depends
-        /// on `opaque`: under [`OpaqueReasoning::Signed`] this is the reasoning, under
-        /// [`OpaqueReasoning::Sealed`] it is a summary of reasoning kept elsewhere.
+        /// on `opaque`: under [`OpaqueReasoning::Signed`] and [`OpaqueReasoning::Verbatim`] this
+        /// is the reasoning, under [`OpaqueReasoning::Sealed`] it is a summary of reasoning kept
+        /// elsewhere.
         thinking: String,
         /// What the provider wants handed back to carry this reasoning into the next request.
         /// `None` when it gave nothing to carry, which makes the block display-only.

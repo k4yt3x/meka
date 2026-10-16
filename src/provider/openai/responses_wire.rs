@@ -2160,32 +2160,47 @@ mod tests {
     }
 
     /// A session is not bound to the provider that recorded it: `meka -c -p other` resumes one
-    /// under anything. A Claude thinking block reaching this encoder must not be replayed, because
-    /// its signature is a MAC from another cryptosystem and its `thinking` is the reasoning itself
-    /// -- sending them as `encrypted_content` and a `summary` hands OpenAI a blob it cannot
-    /// decrypt and leaks the whole Claude reasoning beside it. This was live before the two shapes
-    /// were named apart.
+    /// under anything. A thinking block another wire recorded must not be replayed here. A Claude
+    /// signature is a MAC from another cryptosystem and its `thinking` is the reasoning itself,
+    /// so sending them as `encrypted_content` and a `summary` hands OpenAI a blob it cannot
+    /// decrypt and leaks the whole Claude reasoning beside it; a Chat Completions block is the
+    /// reasoning in the clear with nothing sealed to replay at all.
     #[test]
-    fn a_claude_signature_is_never_replayed_to_openai() {
-        let claude_turn = assistant(vec![
-            ContentBlock::Thinking {
-                thinking: "the full Claude reasoning".to_string(),
-                opaque: Some(OpaqueReasoning::Signed {
-                    signature: "CLAUDE_MAC".to_string(),
-                }),
+    fn another_wires_reasoning_is_never_replayed_to_openai() {
+        for opaque in [
+            OpaqueReasoning::Signed {
+                signature: "CLAUDE_MAC".to_string(),
             },
-            ContentBlock::Text {
-                text: "answer".to_string(),
-            },
-        ]);
-        let serialized = serde_json::to_string(&serde_json::Value::Array(input_of(&[
-            Message::user("hi"),
-            claude_turn,
-        ])))
-        .expect("serialize");
+            OpaqueReasoning::Verbatim,
+        ] {
+            let foreign_turn = assistant(vec![
+                ContentBlock::Thinking {
+                    thinking: "the full reasoning".to_string(),
+                    opaque: Some(opaque.clone()),
+                },
+                ContentBlock::Text {
+                    text: "answer".to_string(),
+                },
+            ]);
+            let serialized = serde_json::to_string(&serde_json::Value::Array(input_of(&[
+                Message::user("hi"),
+                foreign_turn,
+            ])))
+            .expect("serialize");
 
-        assert!(!serialized.contains("CLAUDE_MAC"), "{serialized}");
-        assert!(!serialized.contains("\"reasoning\""), "{serialized}");
+            assert!(
+                !serialized.contains("CLAUDE_MAC"),
+                "{opaque:?}: {serialized}"
+            );
+            assert!(
+                !serialized.contains("the full reasoning"),
+                "{opaque:?}: {serialized}"
+            );
+            assert!(
+                !serialized.contains("\"reasoning\""),
+                "{opaque:?}: {serialized}"
+            );
+        }
     }
 
     /// A summary is a digest written for a person; without `encrypted_content` there is no
