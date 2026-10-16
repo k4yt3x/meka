@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `openai-responses` and `chatgpt-subscription` let the model call several tools in one round.
+
 ## [0.76.0] - 2026-10-15
 
 ### Added

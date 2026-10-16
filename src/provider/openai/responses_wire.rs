@@ -61,7 +61,6 @@ pub(super) fn build_request_body(
         "model": model,
         "input": input,
         "tool_choice": "auto",
-        "parallel_tool_calls": false,
         "store": false,
         "stream": stream,
     });
@@ -872,7 +871,7 @@ mod tests {
         assert_eq!(body["model"], "gpt-5");
         assert_eq!(body["stream"], true);
         assert_eq!(body["tool_choice"], "auto");
-        assert_eq!(body["parallel_tool_calls"], false);
+        assert!(body.get("parallel_tool_calls").is_none());
         assert_eq!(body["store"], false);
         assert!(body.get("instructions").is_none());
         assert!(body.get("tools").is_none());
@@ -1323,6 +1322,89 @@ mod tests {
         assert!(matches!(events[2], StreamEvent::MessageEnd {
             stop_reason: StopReason::ToolUse
         }));
+    }
+
+    /// The Responses stream closes one item before it opens the next, so one argument buffer is
+    /// enough: each call must reach the agent as its own start and end pair, in stream order.
+    #[test]
+    fn a_response_with_two_function_calls_yields_both_tool_uses_in_order() {
+        let (events, outcome) = run_events(&[
+            (
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index": 0,
+                    "item": {"type": "function_call", "call_id": "c1", "name": "file_read"}
+                }),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                serde_json::json!({"output_index": 0, "delta": "{\"path\":\"/tmp/a\"}"}),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "c1",
+                        "name": "file_read",
+                        "arguments": "{\"path\":\"/tmp/a\"}"
+                    }
+                }),
+            ),
+            (
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index": 1,
+                    "item": {"type": "function_call", "call_id": "c2", "name": "file_read"}
+                }),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                serde_json::json!({"output_index": 1, "delta": "{\"path\":\"/tmp/b\"}"}),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index": 1,
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "c2",
+                        "name": "file_read",
+                        "arguments": "{\"path\":\"/tmp/b\"}"
+                    }
+                }),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({
+                    "response": {"id": "r1", "status": "completed"}
+                }),
+            ),
+        ]);
+        outcome.expect("clean stream");
+        let calls: Vec<(&str, &str)> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolUseStart { id, name } => Some((id.as_str(), name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, vec![("c1", "file_read"), ("c2", "file_read")]);
+        let paths: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolUseEnd { input } => input["path"].as_str(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths, vec!["/tmp/a", "/tmp/b"]);
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::MessageEnd {
+                stop_reason: StopReason::ToolUse
+            })
+        ));
     }
 
     /// `run_events` drives `process_event` directly, so it can never reach the fall-through at the

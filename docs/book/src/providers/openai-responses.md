@@ -76,9 +76,8 @@ meka does not implement.
 non-streaming request.
 
 Request body fields meka sets: `model`, `input`, `instructions` (the system prompt, when non-empty),
-`tools`, `tool_choice: auto`, `parallel_tool_calls: false`, `store: false`, `stream: true`,
-`reasoning.effort` (only when `effort` is set), and `max_output_tokens` (only when
-`max_output_tokens` is set).
+`tools`, `tool_choice: auto`, `store: false`, `stream: true`, `reasoning.effort` (only when `effort`
+is set), and `max_output_tokens` (only when `max_output_tokens` is set).
 
 What it deliberately does **not** send is `include: ["reasoning.encrypted_content"]` or
 `reasoning.summary`. Both are OpenAI extensions: the first round-trips reasoning across stateless
