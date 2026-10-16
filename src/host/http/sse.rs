@@ -344,6 +344,11 @@ fn tool_result_content_view(
             crate::conversation::ToolResultContent::Image { source } => TextOrImage::Image {
                 media_type: source.media_type().to_string(),
             },
+            crate::conversation::ToolResultContent::ToolReference { tool_name } => {
+                TextOrImage::ToolReference {
+                    tool_name: tool_name.clone(),
+                }
+            }
         })
         .collect()
 }
@@ -380,8 +385,16 @@ impl From<ProgressUpdate> for ProgressView {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum TextOrImage {
-    Text { text: String },
-    Image { media_type: String },
+    Text {
+        text: String,
+    },
+    Image {
+        media_type: String,
+    },
+    /// A deferred tool the result made callable, by name.
+    ToolReference {
+        tool_name: String,
+    },
 }
 
 #[cfg(test)]

@@ -782,8 +782,17 @@ impl ToolOutput {
 
     /// Append harness-authored text to the model-visible result, extending the trailing text block
     /// rather than adding one. An MCP result can be a mix of text and images, and a bare text block
-    /// tacked onto the end of that is easy to read as part of the tool's own output.
+    /// tacked onto the end of that is easy to read as part of the tool's own output. A result made
+    /// of tool references takes none: the wire refuses text beside a reference, and the endpoint
+    /// expands the references into the very schemas a notice would describe.
     pub(crate) fn append_notice(&mut self, notice: &str) {
+        if self
+            .content
+            .iter()
+            .any(|item| matches!(item, ToolResultContent::ToolReference { .. }))
+        {
+            return;
+        }
         match self.content.last_mut() {
             Some(ToolResultContent::Text { text }) => text.push_str(notice),
             _ => self.content.push(ToolResultContent::Text {
@@ -894,6 +903,9 @@ fn flatten_tool_text(output: &ToolOutput) -> String {
         .filter_map(|block| match block {
             crate::conversation::ToolResultContent::Text { text } => Some(text.as_str()),
             crate::conversation::ToolResultContent::Image { .. } => None,
+            crate::conversation::ToolResultContent::ToolReference { tool_name } => {
+                Some(tool_name.as_str())
+            }
         })
         .collect::<Vec<_>>()
         .join("")
@@ -1375,6 +1387,7 @@ mod tests {
             allowed_tools: None,
             disabled_tools: None,
             eager_load_tools: None,
+            deferral: None,
             tool_permissions: None,
             trust_read_only_hint: None,
             disabled: None,
@@ -2341,6 +2354,23 @@ mod tests {
                 output.content
             );
         }
+    }
+
+    /// A notice extends the trailing text and never rides beside a reference: the wire refuses
+    /// text in a result that carries one.
+    #[test]
+    fn a_notice_never_joins_a_result_made_of_references() {
+        let mut textual = ToolOutput::text("done".to_string(), false);
+        textual.append_notice("\n\n[meka harness] note");
+        assert_eq!(textual.content.len(), 1);
+        assert!(ContentBlock::tool_result_text_content(&textual.content).ends_with("note"));
+
+        let mut referenced = ToolOutput::text(String::new(), false);
+        referenced.content = vec![ToolResultContent::ToolReference {
+            tool_name: "mcp__x__y".to_string(),
+        }];
+        referenced.append_notice("\n\n[meka harness] note");
+        assert_eq!(referenced.content.len(), 1, "{:?}", referenced.content);
     }
 
     #[test]

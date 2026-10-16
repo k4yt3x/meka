@@ -26,7 +26,8 @@ use crate::{
     conversation::{ContentBlock, Message, OpaqueReasoning, Role, ToolResultContent},
     error::{MekaError, Result},
     provider::{
-        CompletionRequest, StopReason, StreamEvent, ToolDefinition,
+        CompletionRequest, DeferredToolDelivery, LOAD_TOOL_NAME, SEARCH_TOOL_NAME, StopReason,
+        StreamEvent, ToolDefinition, search_tool_parameters,
         sse::{End, Step},
     },
     stats::TokenUsage,
@@ -36,10 +37,25 @@ use crate::{
 /// `ContentBlock` shape into Responses API `input` items (`message`, `function_call`,
 /// `function_call_output`).
 ///
+/// The request body for one completion, for a backend that may declare its deferred tools.
+///
 /// The result carries only what every Responses implementation understands. A backend that knows
 /// more about its own endpoint adds to it afterwards; see [`include_encrypted_reasoning`], which
 /// only `chatgpt-subscription` applies.
-pub(super) fn build_request_body(
+///
+/// Under [`DeferredToolDelivery::Searched`] the endpoint's own `tool_search` is declared with
+/// client execution in place of meka's two discovery tools, `deferred_tools` ride with
+/// `defer_loading`, a recorded `tool_search` call replays as the endpoint's `tool_search_call`
+/// item, and its result as a `tool_search_output` carrying the definitions the result referenced,
+/// since only that item registers a definition on this wire. Under the other deliveries nothing
+/// changes but the deferred entries, which the agent hands over empty when the wire appends.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one argument per request field, as the wrapper has"
+)]
+pub(super) fn build_request_body_for(
+    delivery: DeferredToolDelivery,
+    deferred_tools: &[ToolDefinition],
     model: &str,
     system_prompt: &str,
     messages: &[Message],
@@ -48,12 +64,15 @@ pub(super) fn build_request_body(
     max_output_tokens: Option<u64>,
     stream: bool,
 ) -> serde_json::Value {
+    let searched = searched_call_ids(delivery, messages);
     let mut input = Vec::with_capacity(messages.len());
 
     for message in messages {
         match message.role {
-            Role::User => encode_user_message(message, &mut input),
-            Role::Assistant => encode_assistant_message(message, &mut input),
+            Role::User => {
+                encode_user_message(message, &mut input, &searched, tools, deferred_tools)
+            }
+            Role::Assistant => encode_assistant_message(message, &mut input, &searched),
         }
     }
 
@@ -69,8 +88,9 @@ pub(super) fn build_request_body(
         body["instructions"] = serde_json::Value::String(system_prompt.to_string());
     }
 
-    if !tools.is_empty() {
-        body["tools"] = serde_json::Value::Array(encode_tools(tools));
+    let declared = encode_tools(tools, deferred_tools, delivery, !searched.is_empty());
+    if !declared.is_empty() {
+        body["tools"] = serde_json::Value::Array(declared);
     }
 
     if let Some(effort) = reasoning_effort {
@@ -111,7 +131,7 @@ pub(super) async fn aggregate_stream(
 /// refusal to be used out of order rather than a live branch; the ordering is asserted by
 /// `an_unconfigured_profile_still_asks_for_a_summary_and_encrypted_reasoning`.
 ///
-/// This is *not* in [`build_request_body`] because it is a fact about one endpoint rather than
+/// This is *not* in [`build_request_body_for`] because it is a fact about one endpoint rather than
 /// about the protocol. `include` is an OpenAI extension; `chatgpt-subscription` sends it because
 /// its endpoint is always ChatGPT and the first-party Codex client sends it, while
 /// `openai-responses` reaches Ollama, vLLM, LM Studio and OpenRouter, where meka has no basis for
@@ -153,7 +173,8 @@ pub(super) fn drop_replayed_reasoning(body: &mut serde_json::Value) {
 /// Endpoint-specific for the same reason as [`include_encrypted_reasoning`]: `summary` is an
 /// OpenAI parameter, and only `chatgpt-subscription` knows it is talking to OpenAI.
 ///
-/// Takes the body [`build_request_body`] returns, where `reasoning` is either an object or absent;
+/// Takes the body [`build_request_body_for`] returns, where `reasoning` is either an object or
+/// absent;
 /// indexing promotes an absent key through a null to an object, which is how the no-effort case
 /// gets its `reasoning` block.
 pub(super) fn request_reasoning_summary(body: &mut serde_json::Value) {
@@ -185,6 +206,10 @@ fn build_tool_result_output(content: &[ToolResultContent]) -> serde_json::Value 
                 "text": text,
             }),
             ToolResultContent::Image { source } => input_image_part(source),
+            ToolResultContent::ToolReference { tool_name } => serde_json::json!({
+                "type": "input_text",
+                "text": tool_name,
+            }),
         })
         .collect();
     serde_json::Value::Array(parts)
@@ -206,7 +231,63 @@ fn input_image_part(source: &crate::image::ImageSource) -> serde_json::Value {
     }
 }
 
-fn encode_user_message(message: &Message, input: &mut Vec<serde_json::Value>) {
+/// The ids of the `tool_search` calls a conversation recorded, which replay as the endpoint's own
+/// search item under [`DeferredToolDelivery::Searched`]; empty under every other delivery, where
+/// the same name is meka's function tool.
+fn searched_call_ids(
+    delivery: DeferredToolDelivery,
+    messages: &[Message],
+) -> std::collections::HashSet<String> {
+    if delivery != DeferredToolDelivery::Searched {
+        return std::collections::HashSet::new();
+    }
+    messages
+        .iter()
+        .filter(|message| message.role == Role::Assistant)
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, .. } if name == SEARCH_TOOL_NAME => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One function entry of the `tools` array; `deferred` marks it `defer_loading`, which withholds
+/// the schema until a `tool_search_output` carries it.
+fn function_declaration(tool: &ToolDefinition, deferred: bool) -> serde_json::Value {
+    let mut declaration = serde_json::json!({
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "strict": false,
+        "parameters": tool.parameters,
+    });
+    if deferred {
+        declaration["defer_loading"] = serde_json::Value::Bool(true);
+    }
+    declaration
+}
+
+/// The endpoint's own search item, declared with client execution so meka answers it. One door
+/// for finding by keyword and loading by name, because only its output registers a definition on
+/// this wire.
+fn tool_search_declaration() -> serde_json::Value {
+    serde_json::json!({
+        "type": "tool_search",
+        "execution": "client",
+        "description": "Find deferred tools by keyword, or load them by exact name from the \
+                        catalog. Every tool returned becomes callable.",
+        "parameters": search_tool_parameters(DeferredToolDelivery::Searched),
+    })
+}
+
+fn encode_user_message(
+    message: &Message,
+    input: &mut Vec<serde_json::Value>,
+    searched: &std::collections::HashSet<String>,
+    tools: &[ToolDefinition],
+    deferred_tools: &[ToolDefinition],
+) {
     let mut text_parts: Vec<&str> = Vec::new();
     let mut image_parts: Vec<serde_json::Value> = Vec::new();
 
@@ -228,11 +309,41 @@ fn encode_user_message(message: &Message, input: &mut Vec<serde_json::Value>) {
                 content,
                 ..
             } => {
-                input.push(serde_json::json!({
-                    "type": "function_call_output",
-                    "call_id": tool_use_id,
-                    "output": build_tool_result_output(content),
-                }));
+                if searched.contains(tool_use_id) {
+                    // The definitions the result referenced, looked up in what this request
+                    // declares; a name no longer registered (a server withdrew it) is left out.
+                    let definitions: Vec<serde_json::Value> = content
+                        .iter()
+                        .filter_map(|item| match item {
+                            ToolResultContent::ToolReference { tool_name } => tools
+                                .iter()
+                                .chain(deferred_tools)
+                                .find(|tool| &tool.name == tool_name)
+                                .map(|tool| function_declaration(tool, false)),
+                            _ => None,
+                        })
+                        .collect();
+                    input.push(serde_json::json!({
+                        "type": "tool_search_output",
+                        "call_id": tool_use_id,
+                        "execution": "client",
+                        "status": "completed",
+                        "tools": definitions,
+                    }));
+                    // The output item carries definitions and nothing else, so what the search
+                    // said in words, a match list or why nothing was loaded, follows as the
+                    // message's text.
+                    text_parts.extend(content.iter().filter_map(|item| match item {
+                        ToolResultContent::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    }));
+                } else {
+                    input.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": tool_use_id,
+                        "output": build_tool_result_output(content),
+                    }));
+                }
             }
             // ToolUse / Thinking on a user message would be malformed; ignore defensively to match
             // the Chat Completions encoder's behavior.
@@ -262,7 +373,11 @@ fn encode_user_message(message: &Message, input: &mut Vec<serde_json::Value>) {
 /// followed by the output that reasoning produced, or the API rejects the whole request: `Item
 /// '<id>' of type 'reasoning' was provided without its required following item`. Emitting all the
 /// text first and then all the calls breaks that pairing as soon as a turn thinks twice.
-fn encode_assistant_message(message: &Message, input: &mut Vec<serde_json::Value>) {
+fn encode_assistant_message(
+    message: &Message,
+    input: &mut Vec<serde_json::Value>,
+    searched: &std::collections::HashSet<String>,
+) {
     let mut pending_text = String::new();
 
     for (index, block) in message.content.iter().enumerate() {
@@ -293,12 +408,22 @@ fn encode_assistant_message(message: &Message, input: &mut Vec<serde_json::Value
                 input: arguments,
             } => {
                 flush_assistant_text(&mut pending_text, input);
-                input.push(serde_json::json!({
-                    "type": "function_call",
-                    "name": name,
-                    "call_id": id,
-                    "arguments": arguments.to_string(),
-                }));
+                if searched.contains(id) {
+                    input.push(serde_json::json!({
+                        "type": "tool_search_call",
+                        "call_id": id,
+                        "arguments": arguments,
+                        "execution": "client",
+                        "status": "completed",
+                    }));
+                } else {
+                    input.push(serde_json::json!({
+                        "type": "function_call",
+                        "name": name,
+                        "call_id": id,
+                        "arguments": arguments.to_string(),
+                    }));
+                }
             }
             _ => {}
         }
@@ -366,19 +491,36 @@ fn reasoning_input_item(
     item
 }
 
-fn encode_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
-    tools
-        .iter()
-        .map(|tool| {
-            serde_json::json!({
-                "type": "function",
-                "name": tool.name,
-                "description": tool.description,
-                "strict": false,
-                "parameters": tool.parameters,
+fn encode_tools(
+    tools: &[ToolDefinition],
+    deferred_tools: &[ToolDefinition],
+    delivery: DeferredToolDelivery,
+    replays_a_search: bool,
+) -> Vec<serde_json::Value> {
+    let searched = delivery == DeferredToolDelivery::Searched;
+    let mut declared = Vec::with_capacity(tools.len() + deferred_tools.len() + 1);
+    // The endpoint's search item rides while there is something for it to find, or while the
+    // history replays a search it answered; with neither it is a tool the model can only call
+    // for nothing, as meka's own discovery tools would be.
+    if searched && (!deferred_tools.is_empty() || replays_a_search) {
+        declared.push(tool_search_declaration());
+    }
+    declared.extend(
+        tools
+            .iter()
+            // The endpoint's search item does both jobs here; meka's two function tools would
+            // be a second door whose results register nothing.
+            .filter(|tool| {
+                !(searched && (tool.name == LOAD_TOOL_NAME || tool.name == SEARCH_TOOL_NAME))
             })
-        })
-        .collect()
+            .map(|tool| function_declaration(tool, false)),
+    );
+    declared.extend(
+        deferred_tools
+            .iter()
+            .map(|tool| function_declaration(tool, true)),
+    );
+    declared
 }
 
 /// Mutable state threaded through SSE event processing. Tracks the in-flight tool call's
@@ -460,17 +602,23 @@ pub(super) fn process_event(
             let Some(item) = data.get("item") else {
                 return Ok(out);
             };
-            if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if item_type == "function_call" || item_type == "tool_search_call" {
                 let id = item
                     .get("call_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
-                let name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
+                // The endpoint's search item has no name of its own; it dispatches as meka's
+                // search tool, which answers both a query and a list of names.
+                let name = if item_type == "tool_search_call" {
+                    SEARCH_TOOL_NAME.to_string()
+                } else {
+                    item.get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                };
                 state.active_tool_call = Some(ActiveToolCall {
                     arguments_buffer: String::new(),
                 });
@@ -493,7 +641,27 @@ pub(super) fn process_event(
                 return Ok(out);
             };
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if item_type == "function_call" {
+            if item_type == "tool_search_call" {
+                // Arrives whole: the arguments are an object on the done item, with no deltas
+                // before it.
+                state.active_tool_call.take();
+                let call_id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let arguments = match item.get("arguments") {
+                    Some(serde_json::Value::String(raw)) => raw.clone(),
+                    Some(value) if !value.is_null() => value.to_string(),
+                    _ => "{}".to_string(),
+                };
+                out.push(crate::provider::tool_use_event(
+                    call_id,
+                    SEARCH_TOOL_NAME.to_string(),
+                    &arguments,
+                ));
+            } else if item_type == "function_call" {
                 let buffered = state.active_tool_call.take();
                 // Read off the completed item: `ActiveToolCall` carries only the argument buffer,
                 // and the item is the authoritative copy of the identity anyway.
@@ -601,8 +769,16 @@ pub(super) fn process_event(
         // be reported as a stream that ended early, retried twice against an error that repeats.
         "error" => {
             state.finished = true;
+            // The frame's fields sit at its top level on the public endpoint and under `error` on
+            // the ChatGPT backend; the fallback label says nothing about the cause, so the frame
+            // itself goes to the log.
+            tracing::debug!("Responses error frame: {data}");
+            let fields = data
+                .get("error")
+                .filter(|value| value.is_object())
+                .unwrap_or(data);
             return Err(crate::error::provider_stream_error_object(
-                data,
+                fields,
                 "error event",
             ));
         }
@@ -690,6 +866,7 @@ pub(super) trait ResponsesBackend: crate::oauth::RefreshesCredential + Send + Sy
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
+        deferred_tools: &[ToolDefinition],
         attribution: &crate::provider::Attribution,
     ) -> serde_json::Value;
     /// The profile's request ceiling, when it states one; see [`crate::provider::budget`]. `None`
@@ -732,11 +909,18 @@ pub(super) async fn stream<B: ResponsesBackend>(
         system_prompt,
         messages,
         tools,
+        deferred_tools,
         attribution,
         ..
     } = request;
-    let (body_json, redaction_notice) =
-        body_within_budget(backend, system_prompt, messages, tools, &attribution)?;
+    let (body_json, redaction_notice) = body_within_budget(
+        backend,
+        system_prompt,
+        messages,
+        tools,
+        deferred_tools,
+        &attribution,
+    )?;
     // A send error here means the consumer hung up already, which the SSE driver reports itself.
     if let Some(notice) = redaction_notice
         && event_sender
@@ -772,6 +956,7 @@ pub(super) fn body_within_budget<B: ResponsesBackend + ?Sized>(
     system_prompt: &str,
     messages: &[Message],
     tools: &[ToolDefinition],
+    deferred_tools: &[ToolDefinition],
     attribution: &crate::provider::Attribution,
 ) -> Result<(String, Option<crate::frontend::Notice>)> {
     match backend.max_request_bytes() {
@@ -781,6 +966,7 @@ pub(super) fn body_within_budget<B: ResponsesBackend + ?Sized>(
                     system_prompt,
                     messages,
                     tools,
+                    deferred_tools,
                     attribution,
                 ))
             })
@@ -790,6 +976,7 @@ pub(super) fn body_within_budget<B: ResponsesBackend + ?Sized>(
                 system_prompt,
                 messages,
                 tools,
+                deferred_tools,
                 attribution,
             ))?,
             None,
@@ -864,6 +1051,29 @@ impl crate::provider::sse::Protocol for ResponsesStream {
 mod tests {
     use super::*;
     use crate::conversation::ToolResultContent;
+
+    /// An appending request with nothing deferred, which is what most of these tests build.
+    fn build_request_body(
+        model: &str,
+        system_prompt: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        reasoning_effort: Option<&str>,
+        max_output_tokens: Option<u64>,
+        stream: bool,
+    ) -> serde_json::Value {
+        build_request_body_for(
+            DeferredToolDelivery::Appended,
+            &[],
+            model,
+            system_prompt,
+            messages,
+            tools,
+            reasoning_effort,
+            max_output_tokens,
+            stream,
+        )
+    }
 
     #[test]
     fn a_minimal_request_body_states_only_the_defaults() {
@@ -1658,6 +1868,37 @@ mod tests {
         assert!(matches!(result, Err(MekaError::RetryableProvider { .. })));
     }
 
+    /// The stream's own error frame names its cause whether the fields sit at the top level or
+    /// under `error`, and a numeric or server code in either place is retried.
+    #[test]
+    fn an_error_frame_names_its_cause_from_either_shape() {
+        let mut state = SseState::default();
+        let flat = process_event(
+            "error",
+            &serde_json::json!({"type": "error", "code": "invalid_request", "message": "flat cause"}),
+            &mut state,
+        );
+        assert!(state.finished);
+        assert!(
+            matches!(flat, Err(MekaError::Provider(ref message)) if message == "flat cause"),
+            "{flat:?}"
+        );
+        let mut state = SseState::default();
+        // The ChatGPT backend's overload frame as captured on 2026-10-16: nested, and transient.
+        let nested = process_event(
+            "error",
+            &serde_json::json!({"type": "error", "sequence_number": 3, "error": {
+                "message": "Our servers are currently overloaded. Please try again later.",
+                "type": "service_unavailable_error", "param": null, "code": "server_is_overloaded",
+            }}),
+            &mut state,
+        );
+        assert!(
+            matches!(nested, Err(MekaError::RetryableProvider { ref message, .. }) if message.starts_with("Our servers")),
+            "{nested:?}"
+        );
+    }
+
     #[test]
     fn process_event_failed_without_code_stays_permanent() {
         // No `code`/`type` field at all: the default is not-retryable.
@@ -1733,6 +1974,7 @@ mod tests {
             "",
             &messages,
             &[],
+            &[],
             &Default::default(),
         )
         .expect("fits after redaction");
@@ -1742,9 +1984,15 @@ mod tests {
         );
         assert!(notice.is_some(), "the redaction is announced");
 
-        let (body, notice) =
-            body_within_budget(&with_ceiling(None), "", &messages, &[], &Default::default())
-                .expect("no ceiling, no refusal");
+        let (body, notice) = body_within_budget(
+            &with_ceiling(None),
+            "",
+            &messages,
+            &[],
+            &[],
+            &Default::default(),
+        )
+        .expect("no ceiling, no refusal");
         assert!(body.contains(&image), "sent as built without a ceiling");
         assert!(notice.is_none());
     }
@@ -2046,6 +2294,239 @@ mod tests {
             name: "file_read".to_string(),
             input: serde_json::json!({}),
         }
+    }
+
+    fn definition(name: &str) -> ToolDefinition {
+        ToolDefinition::new(
+            name,
+            format!("{name} does a thing"),
+            serde_json::json!({"type": "object"}),
+        )
+    }
+
+    /// On a searched wire the endpoint's own search item is declared with client execution in
+    /// place of meka's two discovery tools, and every deferred tool rides with `defer_loading`.
+    /// A referenced wire declares the deferred tools and keeps the discovery tools; an appending
+    /// wire sends the array as built.
+    #[test]
+    fn a_searched_wire_declares_the_endpoint_s_search_item_and_the_deferred_tools() {
+        let tools = [
+            definition(LOAD_TOOL_NAME),
+            definition(SEARCH_TOOL_NAME),
+            definition("file_read"),
+        ];
+        let deferred = [definition("mcp__kv__probe")];
+        let declared = |delivery: DeferredToolDelivery, deferred: &[ToolDefinition]| {
+            let body = build_request_body_for(
+                delivery,
+                deferred,
+                "gpt-5",
+                "",
+                &[Message::user("hi")],
+                &tools,
+                None,
+                None,
+                true,
+            );
+            body["tools"].as_array().cloned().unwrap_or_default()
+        };
+
+        let searched = declared(DeferredToolDelivery::Searched, &deferred);
+        assert_eq!(searched[0]["type"], "tool_search", "{searched:?}");
+        assert_eq!(searched[0]["execution"], "client");
+        assert!(
+            searched[0]["parameters"]["properties"]
+                .get("names")
+                .is_some(),
+            "the item is the one door that loads here: {searched:?}"
+        );
+        let functions: Vec<(&str, bool)> = searched[1..]
+            .iter()
+            .map(|tool| {
+                (
+                    tool["name"].as_str().unwrap_or(""),
+                    tool["defer_loading"] == true,
+                )
+            })
+            .collect();
+        assert_eq!(functions, vec![
+            ("file_read", false),
+            ("mcp__kv__probe", true)
+        ]);
+
+        let referenced = declared(DeferredToolDelivery::Referenced, &deferred);
+        let names: Vec<&str> = referenced
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(names, vec![
+            LOAD_TOOL_NAME,
+            SEARCH_TOOL_NAME,
+            "file_read",
+            "mcp__kv__probe"
+        ]);
+        assert!(referenced.iter().all(|tool| tool["type"] == "function"));
+        assert_eq!(referenced[3]["defer_loading"], true);
+        assert!(referenced[2].get("defer_loading").is_none());
+
+        let appended = declared(DeferredToolDelivery::Appended, &[]);
+        assert_eq!(appended.len(), 3);
+        assert!(
+            appended
+                .iter()
+                .all(|tool| tool.get("defer_loading").is_none())
+        );
+
+        // Nothing deferred and no search in the history: the item leaves with the discovery
+        // functions, so a compaction's request or a session with every tool eager declares none.
+        let bare = declared(DeferredToolDelivery::Searched, &[]);
+        assert_eq!(bare.len(), 1, "{bare:?}");
+        assert_eq!(bare[0]["name"], "file_read");
+    }
+
+    /// A history that replays a search keeps the endpoint's item declared even when nothing is
+    /// deferred any longer, since the replayed call names it.
+    #[test]
+    fn a_replayed_search_keeps_the_search_item_with_nothing_deferred() {
+        let history = [
+            Message::user("hi"),
+            assistant(vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: SEARCH_TOOL_NAME.to_string(),
+                input: serde_json::json!({"names": ["mcp__kv__probe"]}),
+            }]),
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: vec![ToolResultContent::ToolReference {
+                        tool_name: "mcp__kv__probe".to_string(),
+                    }],
+                    is_error: false,
+                }],
+            },
+        ];
+        let body = build_request_body_for(
+            DeferredToolDelivery::Searched,
+            &[],
+            "gpt-5",
+            "",
+            &history,
+            &[definition("file_read")],
+            None,
+            None,
+            true,
+        );
+        let tools = body["tools"].as_array().cloned().unwrap_or_default();
+        assert_eq!(tools[0]["type"], "tool_search", "{tools:?}");
+        assert_eq!(body["input"][2]["type"], "tool_search_output");
+        assert_eq!(
+            body["input"][2]["tools"].as_array().map(Vec::len),
+            Some(0),
+            "nothing declared to deliver"
+        );
+    }
+
+    /// A recorded `tool_search` call replays as the endpoint's own items on a searched wire, its
+    /// result as a `tool_search_output` carrying the definitions it referenced; on any other
+    /// delivery the same history is a function call whose output reads the reference as text.
+    #[test]
+    fn a_recorded_search_replays_as_the_endpoint_s_items_on_a_searched_wire() {
+        let history = [
+            Message::user("hi"),
+            assistant(vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: SEARCH_TOOL_NAME.to_string(),
+                input: serde_json::json!({"names": ["mcp__kv__probe"]}),
+            }]),
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: vec![
+                        ToolResultContent::Text {
+                            text: "loaded".to_string(),
+                        },
+                        ToolResultContent::ToolReference {
+                            tool_name: "mcp__kv__probe".to_string(),
+                        },
+                    ],
+                    is_error: false,
+                }],
+            },
+        ];
+        let deferred = [definition("mcp__kv__probe")];
+        let input = |delivery: DeferredToolDelivery| {
+            build_request_body_for(
+                delivery,
+                &deferred,
+                "gpt-5",
+                "",
+                &history,
+                &[],
+                None,
+                None,
+                true,
+            )["input"]
+                .as_array()
+                .cloned()
+                .expect("input array")
+        };
+
+        let searched = input(DeferredToolDelivery::Searched);
+        assert_eq!(searched[1]["type"], "tool_search_call", "{searched:?}");
+        assert_eq!(searched[1]["call_id"], "call_1");
+        assert_eq!(searched[1]["arguments"]["names"][0], "mcp__kv__probe");
+        assert_eq!(searched[1]["execution"], "client");
+        assert_eq!(searched[2]["type"], "tool_search_output");
+        assert_eq!(searched[2]["call_id"], "call_1");
+        assert_eq!(searched[2]["tools"][0]["name"], "mcp__kv__probe");
+        assert!(searched[2]["tools"][0].get("defer_loading").is_none());
+        // The words of the result follow the item, which has no place for them.
+        assert_eq!(searched[3]["type"], "message", "{searched:?}");
+        assert_eq!(searched[3]["content"][0]["text"], "loaded");
+        assert_eq!(searched.len(), 4);
+
+        let appended = input(DeferredToolDelivery::Appended);
+        assert_eq!(appended[1]["type"], "function_call", "{appended:?}");
+        assert_eq!(appended[2]["type"], "function_call_output");
+        let output = appended[2]["output"].as_str().expect("text output");
+        assert!(
+            output.contains("loaded") && output.contains("mcp__kv__probe"),
+            "{output}"
+        );
+    }
+
+    /// The endpoint's search item arrives whole on its done frame and dispatches as meka's search
+    /// tool, which answers both a query and a list of names.
+    #[test]
+    fn a_tool_search_call_item_dispatches_as_the_search_tool() {
+        let (events, outcome) = run_events(&[
+            (
+                "response.output_item.added",
+                serde_json::json!({"item": {"type": "tool_search_call", "call_id": "call_1", "execution": "client", "arguments": {}, "status": "in_progress"}}),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({"item": {"type": "tool_search_call", "call_id": "call_1", "execution": "client", "arguments": {"names": ["mcp__kv__probe"]}, "status": "completed"}}),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({"response": {"id": "r1", "status": "completed"}}),
+            ),
+        ]);
+        outcome.expect("clean stream");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    StreamEvent::ToolUseStart { id, name },
+                    StreamEvent::ToolUseEnd { input },
+                    StreamEvent::MessageEnd { stop_reason: StopReason::ToolUse },
+                ] if id == "call_1" && name == SEARCH_TOOL_NAME && input["names"][0] == "mcp__kv__probe"
+            ),
+            "{events:?}"
+        );
     }
 
     fn assistant(content: Vec<ContentBlock>) -> Message {

@@ -31,6 +31,7 @@ pub(crate) async fn run(
             max_request_bytes,
             cache_control,
             thinking_display,
+            deferred_tools,
         } => run_add(name, account.as_deref(), model.clone(), ProfileTuning {
             context_window: *context_window,
             max_output_tokens: *max_output_tokens,
@@ -41,6 +42,7 @@ pub(crate) async fn run(
             max_request_bytes: *max_request_bytes,
             cache_control: *cache_control,
             thinking_display: *thinking_display,
+            deferred_tools: *deferred_tools,
         }),
         ProfileAction::List { format } => run_list(*format),
         ProfileAction::Set {
@@ -79,6 +81,7 @@ struct ProfileTuning {
     max_request_bytes: Option<u64>,
     cache_control: Option<bool>,
     thinking_display: Option<crate::config::ThinkingDisplay>,
+    deferred_tools: Option<crate::config::DeferredTools>,
 }
 
 fn run_add(
@@ -355,6 +358,7 @@ pub(super) const SETTABLE_PROFILE_KEYS: &[&str] = &[
     "max_request_bytes",
     "cache_control",
     "thinking_display",
+    "deferred_tools",
 ];
 
 /// Parse one `key`/`value` pair into the TOML value the profile should carry.
@@ -393,6 +397,12 @@ fn parse_profile_value(name: &str, key: &str, value: &str) -> anyhow::Result<tom
         "thinking_budget" => integer("thinking_budget"),
         "max_request_bytes" => integer("max_request_bytes"),
         "cache_control" => boolean("cache_control"),
+        "deferred_tools" => {
+            let setting = value
+                .parse::<crate::config::DeferredTools>()
+                .map_err(anyhow::Error::msg)?;
+            Ok(toml_edit::Value::from(setting.name()))
+        }
         "thinking_display" => {
             let display = value
                 .parse::<crate::config::ThinkingDisplay>()
@@ -774,6 +784,9 @@ fn upsert_profile_document(
     if let Some(display) = tuning.thinking_display {
         profile.insert("thinking_display", toml_edit::value(display.name()));
     }
+    if let Some(setting) = tuning.deferred_tools {
+        profile.insert("deferred_tools", toml_edit::value(setting.name()));
+    }
     // Redundant here, since the inserts above already run in order, and deliberately kept: it is
     // the one line that makes "every writer leaves the canonical order" true of this writer too,
     // rather than true only for as long as nobody adds an insert in the wrong place.
@@ -988,6 +1001,9 @@ fn resolve_tuning(
     if !backend.reads_profile_key("cache_control") && flags.cache_control.take().is_some() {
         dropped.push("--cache-control");
     }
+    if !backend.reads_profile_key("deferred_tools") && flags.deferred_tools.take().is_some() {
+        dropped.push("--deferred-tools");
+    }
     if !dropped.is_empty() {
         tracing::warn!(
             "ignoring {dropped}: a '{backend}' account never sends the field",
@@ -1081,6 +1097,7 @@ fn resolve_tuning(
         thinking_display: flags.thinking_display,
         max_request_bytes: flags.max_request_bytes,
         cache_control: flags.cache_control,
+        deferred_tools: flags.deferred_tools,
     })
 }
 
@@ -1572,6 +1589,25 @@ mod tests {
             // Every prompted setting is pinned, so this returns before any prompt: no stdin.
             let tuning = resolve_tuning(flags(), backend, "work", None, None).expect("resolve");
             assert_eq!(tuning.cache_control, kept, "{backend}");
+        }
+    }
+
+    /// Chat Completions has no declaration to make, so the flag is dropped there and kept on the
+    /// four wires that have one.
+    #[test]
+    fn a_deferred_tools_flag_is_dropped_only_for_chat_completions() {
+        let flags = || ProfileTuning {
+            deferred_tools: Some(config::DeferredTools::Native),
+            thinking: Some(config::ThinkingMode::Off),
+            context_window: Some(1_024),
+            effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        for backend in config::Backend::ALL {
+            let tuning = resolve_tuning(flags(), backend, "work", None, None).expect("resolve");
+            let kept = (backend != config::Backend::OpenAiChatCompletions)
+                .then_some(config::DeferredTools::Native);
+            assert_eq!(tuning.deferred_tools, kept, "{backend}");
         }
     }
 
@@ -2109,6 +2145,7 @@ account = "work"
                 "vision" | "cache_control" => "true",
                 "thinking_display" => "updates",
                 "thinking" => "adaptive",
+                "deferred_tools" => "native",
                 _ => "value",
             };
             assert!(

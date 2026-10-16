@@ -101,6 +101,93 @@ pub(crate) struct DailyUsage {
     pub(crate) date: String,
     pub(crate) tokens: i64,
 }
+/// Name of the tool that loads a deferred tool's schema. Calls to it are scanned out of the
+/// conversation to compute the per-turn active tool set; see
+/// `crate::tools::load_tool::extract_loaded_tool_names_from_events`.
+pub(crate) const LOAD_TOOL_NAME: &str = "tool_load";
+/// Name of the tool that searches the registry by keyword, `tool_load`'s sibling. Also what the
+/// Responses wire's own search item is recorded as, so one dispatch door serves both.
+pub(crate) const SEARCH_TOOL_NAME: &str = "tool_search";
+
+/// How a wire carries the tools a request defers.
+///
+/// What the model sees of a deferred tool is the same under all three: a catalog entry until it
+/// loads the tool, the schema afterwards. What differs is where the schema travels, which decides
+/// whether a load rewrites the cached prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeferredToolDelivery {
+    /// A loaded tool joins the `tools` array on the next request, which moves everything cached
+    /// behind the array. The one shape every endpoint takes.
+    Appended,
+    /// Every deferred tool is declared from the first request with `defer_loading`, and a load
+    /// answers with `tool_reference` blocks the endpoint expands where they sit, so the array
+    /// never changes. Anthropic's endpoints.
+    Referenced,
+    /// Every deferred tool is declared with `defer_loading`, and the endpoint's own `tool_search`
+    /// with client execution both finds and loads, answered by a `tool_search_output` carrying
+    /// the definitions; meka's two discovery tools are not declared beside it. OpenAI's
+    /// Responses endpoints.
+    Searched,
+}
+
+impl DeferredToolDelivery {
+    /// Whether deferred tools are declared on the first request rather than appended on a load.
+    pub(crate) const fn declares(self) -> bool {
+        !matches!(self, Self::Appended)
+    }
+
+    /// Whether the wire loads a deferred tool through its own search item, named by exact name,
+    /// rather than through `tool_load`.
+    pub(crate) const fn loads_by_search(self) -> bool {
+        matches!(self, Self::Searched)
+    }
+}
+
+/// The tool the model is told to load a deferred tool with: `tool_search` by exact name on a wire
+/// whose own search item does both jobs, `tool_load` elsewhere.
+pub(crate) const fn load_door(loads_by_search: bool) -> &'static str {
+    if loads_by_search {
+        SEARCH_TOOL_NAME
+    } else {
+        LOAD_TOOL_NAME
+    }
+}
+
+/// Whether `name` is one of the two tools that exist to find and load deferred tools, which the
+/// request and the context block carry only while something is deferred.
+pub(crate) fn is_discovery_tool(name: &str) -> bool {
+    name == LOAD_TOOL_NAME || name == SEARCH_TOOL_NAME
+}
+
+/// The parameters of the search tool, as the wire declares them. Where meka declares the function,
+/// `query` alone and required: `tool_load` is what loads. Under
+/// [`DeferredToolDelivery::Searched`] the endpoint's own search item is the one door that
+/// registers a definition, so it takes `names` beside `query`, and the dispatch of its calls is
+/// held to that shape rather than the function's.
+pub(crate) fn search_tool_parameters(delivery: DeferredToolDelivery) -> serde_json::Value {
+    const QUERY: &str = "Words to look for in tool names and descriptions.";
+    match delivery {
+        DeferredToolDelivery::Searched => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": QUERY},
+                "names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Exact tool names to load instead of searching.",
+                },
+            },
+        }),
+        DeferredToolDelivery::Appended | DeferredToolDelivery::Referenced => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": QUERY},
+            },
+            "required": ["query"],
+        }),
+    }
+}
+
 /// A tool as every backend advertises it to the model: name, description and JSON schema.
 #[derive(Debug, Clone, Serialize, Default)]
 pub(crate) struct ToolDefinition {
@@ -226,6 +313,9 @@ pub(crate) struct CompletionRequest<'a> {
     pub(crate) system_prompt: &'a str,
     pub(crate) messages: &'a [Message],
     pub(crate) tools: &'a [ToolDefinition],
+    /// The deferred tools a declaring wire lists beside `tools` with `defer_loading`; empty on a
+    /// wire that appends, and on every request that carries no deferred tool.
+    pub(crate) deferred_tools: &'a [ToolDefinition],
     pub(crate) thinking: ThinkingOverride,
     /// Who the request is for; see [`crate::provider::Attribution`].
     pub(crate) attribution: crate::provider::Attribution,
@@ -241,9 +331,16 @@ impl<'a> CompletionRequest<'a> {
             system_prompt,
             messages,
             tools,
+            deferred_tools: &[],
             thinking: ThinkingOverride::Inherit,
             attribution: crate::provider::Attribution::default(),
         }
+    }
+
+    /// Declare `deferred_tools` beside the tools, for a wire that carries them that way.
+    pub(crate) fn declaring(mut self, deferred_tools: &'a [ToolDefinition]) -> Self {
+        self.deferred_tools = deferred_tools;
+        self
     }
 
     /// Say who the request is for.

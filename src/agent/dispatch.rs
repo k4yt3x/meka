@@ -217,6 +217,11 @@ impl Agent {
             let hint = crate::tools::did_you_mean_hint(name, registered.iter().map(String::as_str));
             return crate::tools::ToolOutput::text(format!("Unknown tool: '{name}'.{hint}"), true);
         };
+        // Registered but not on this wire: a model that saw the schema on an earlier profile may
+        // still ask for it after the session moved.
+        if !self.tool_registry.is_carried(name) {
+            return crate::tools::ToolOutput::text(crate::tools::not_carried_refusal(name), true);
+        }
 
         self.run_admitted_call(
             &tool,

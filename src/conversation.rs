@@ -932,12 +932,23 @@ pub(crate) enum Role {
     User,
     Assistant,
 }
-/// One item of a tool result: text, or an image the tool produced.
+/// One item of a tool result: text, an image the tool produced, or a reference to a tool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ToolResultContent {
-    Text { text: String },
-    Image { source: ImageSource },
+    Text {
+        text: String,
+    },
+    Image {
+        source: ImageSource,
+    },
+    /// A deferred tool `tool_load` or `tool_search` made callable, by name. Written only when the
+    /// wire declares its deferred tools and loads them in place: Anthropic expands the reference
+    /// where it sits, the Responses wire answers with the tool's definition, and a wire that
+    /// appends never records one. Everywhere a reader wants text, it reads as the name.
+    ToolReference {
+        tool_name: String,
+    },
 }
 /// What a thinking block carries back to the wire that produced it, and which wire that is.
 ///
@@ -1215,6 +1226,7 @@ impl ContentBlock {
             .map(|block| match block {
                 ToolResultContent::Text { text } => text.as_str(),
                 ToolResultContent::Image { .. } => "[Image]",
+                ToolResultContent::ToolReference { tool_name } => tool_name.as_str(),
             })
             .collect::<Vec<_>>()
             .join("")
@@ -2847,7 +2859,10 @@ mod tests {
             load_tool_use("u1", "scratchpad_read"),
             load_tool_result("u1", false),
         ]);
-        let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events());
+        let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(
+            log.events(),
+            crate::provider::DeferredToolDelivery::Appended,
+        );
         assert!(loaded.iter().any(|name| name == "scratchpad_read"));
     }
 
@@ -2866,7 +2881,10 @@ mod tests {
             load_tool_result("u4", false),
         ]);
         assert_eq!(
-            crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events()),
+            crate::tools::load_tool::extract_loaded_tool_names_from_events(
+                log.events(),
+                crate::provider::DeferredToolDelivery::Appended
+            ),
             vec!["omega".to_string(), "alpha".to_string()]
         );
     }
@@ -2887,7 +2905,10 @@ mod tests {
             Default::default(),
         );
 
-        let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events());
+        let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(
+            log.events(),
+            crate::provider::DeferredToolDelivery::Appended,
+        );
         assert!(loaded.iter().any(|name| name == "scratchpad_read"));
     }
 
@@ -2914,8 +2935,10 @@ mod tests {
         );
 
         let view_before: Vec<String> = log.as_slice().iter().map(|m| m.text_content()).collect();
-        let loaded_before =
-            crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events());
+        let loaded_before = crate::tools::load_tool::extract_loaded_tool_names_from_events(
+            log.events(),
+            crate::provider::DeferredToolDelivery::Appended,
+        );
 
         log.prune_compacted_events();
 
@@ -2924,12 +2947,18 @@ mod tests {
         assert_eq!(view_before, view_after);
         assert_eq!(
             loaded_before,
-            crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events())
+            crate::tools::load_tool::extract_loaded_tool_names_from_events(
+                log.events(),
+                crate::provider::DeferredToolDelivery::Appended
+            )
         );
         assert!(
-            crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events())
-                .iter()
-                .any(|name| name == "scratchpad_read"),
+            crate::tools::load_tool::extract_loaded_tool_names_from_events(
+                log.events(),
+                crate::provider::DeferredToolDelivery::Appended
+            )
+            .iter()
+            .any(|name| name == "scratchpad_read"),
             "deferred tool must survive the prune"
         );
 
@@ -2944,6 +2973,81 @@ mod tests {
             .filter(|e| matches!(e, Event::CompactBoundary { .. }))
             .count();
         assert_eq!(boundary_count, 1, "only the last boundary should remain");
+    }
+
+    /// A reference in a result is a load whichever tool answered, which is how `tool_search` loads
+    /// on a declaring wire. Across a boundary the deliveries part: an appending wire's array
+    /// carries the snapshot forward, a declaring wire's references went with the window, so only
+    /// the loads after it stand.
+    #[test]
+    fn extract_loaded_tool_names_reads_references_and_a_declaring_wire_forgets_them_at_a_boundary()
+    {
+        use crate::provider::DeferredToolDelivery;
+        let mut log = Conversation::new();
+        log.append(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "s1".to_string(),
+                name: "tool_search".to_string(),
+                input: serde_json::json!({"names": ["mcp__kv__alpha"]}),
+            }],
+        });
+        log.append(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "s1".to_string(),
+                content: vec![ToolResultContent::ToolReference {
+                    tool_name: "mcp__kv__alpha".to_string(),
+                }],
+                is_error: false,
+            }],
+        });
+        let before = extract(&log, DeferredToolDelivery::Appended);
+        assert_eq!(before, vec!["mcp__kv__alpha"]);
+        assert_eq!(extract(&log, DeferredToolDelivery::Searched), before);
+
+        log.replace_for_compaction(
+            Message::user("[summary]"),
+            Vec::new(),
+            ["mcp__kv__alpha", "mcp__kv__beta"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            Default::default(),
+        );
+        log.append(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "l1".to_string(),
+                name: "tool_load".to_string(),
+                input: serde_json::json!({"name": "mcp__kv__gamma"}),
+            }],
+        });
+        log.append(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "l1".to_string(),
+                content: vec![ToolResultContent::Text {
+                    text: "loaded".to_string(),
+                }],
+                is_error: false,
+            }],
+        });
+        assert_eq!(extract(&log, DeferredToolDelivery::Appended), vec![
+            "mcp__kv__alpha",
+            "mcp__kv__beta",
+            "mcp__kv__gamma"
+        ]);
+        assert_eq!(extract(&log, DeferredToolDelivery::Referenced), vec![
+            "mcp__kv__gamma"
+        ]);
+        assert_eq!(extract(&log, DeferredToolDelivery::Searched), vec![
+            "mcp__kv__gamma"
+        ]);
+
+        fn extract(log: &Conversation, delivery: DeferredToolDelivery) -> Vec<String> {
+            crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events(), delivery)
+        }
     }
 
     #[test]
@@ -2961,7 +3065,10 @@ mod tests {
             Default::default(),
         );
 
-        let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events());
+        let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(
+            log.events(),
+            crate::provider::DeferredToolDelivery::Appended,
+        );
         assert!(!loaded.iter().any(|name| name == "scratchpad_read"));
     }
 

@@ -2991,6 +2991,8 @@ mod tests {
         )
         .expect("subagent registry should build");
 
+        // The discovery tools ride only while something is deferred, for a worker as for the root.
+        sub_registry.register_deferred_fixture("fixture_alpha");
         let active: Vec<String> = sub_registry
             .definitions_active_with_loaded(&[])
             .into_iter()

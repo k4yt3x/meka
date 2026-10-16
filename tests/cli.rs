@@ -666,6 +666,8 @@ fn mcp_add_tool_filter_and_permission_flags_round_trip() {
         "notion-update-page=unrestricted",
         "--eager-load-tool",
         "notion-search",
+        "--deferral",
+        "eager",
     ]);
     assert!(
         output.status.success(),
@@ -692,6 +694,10 @@ fn mcp_add_tool_filter_and_permission_flags_round_trip() {
     assert!(
         contents.contains("eager_load_tools"),
         "eager_load_tools missing:\n{contents}"
+    );
+    assert!(
+        contents.contains("deferral = \"eager\""),
+        "deferral missing:\n{contents}"
     );
     assert!(
         contents.contains("tool_permissions"),

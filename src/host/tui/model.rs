@@ -1409,7 +1409,8 @@ fn result_text(content: &[ToolResultContent]) -> (String, usize) {
     let mut images = 0;
     for part in content {
         match part {
-            ToolResultContent::Text { text: part } => {
+            ToolResultContent::Text { text: part }
+            | ToolResultContent::ToolReference { tool_name: part } => {
                 if !text.is_empty() {
                     text.push('\n');
                 }

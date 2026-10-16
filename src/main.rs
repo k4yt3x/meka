@@ -470,6 +470,7 @@ async fn async_main(
             config.mcp_tool_timeout,
         )
         .await?;
+        manager.set_deferral(config.mcp_deferral);
         mcp_context.set_manager(Arc::downgrade(&manager));
         Some(manager)
     } else {

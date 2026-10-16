@@ -546,7 +546,10 @@ under that media type, and only for a session whose messages reference the hash,
 names the image again by that hash; see [Image attachments](#image-attachments). An image the
 request budget redacted to fit the profile's `max_request_bytes` reads as a `text` block saying so:
 the redaction is recorded on the conversation once, so what the model was last sent is what the
-history shows.
+history shows. A tool result may also carry a `tool_reference` item, `{"type": "tool_reference",
+"tool_name": "..."}`: a deferred tool that `tool_load` or `tool_search` made callable on a profile
+whose [`deferred_tools`](../configuration/config-file.md#deferred_tools) is `native`, which the
+provider expanded into the tool's schema where the item sits.
 
 ### Compaction, rewind and export
 

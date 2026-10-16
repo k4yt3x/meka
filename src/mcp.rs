@@ -21,8 +21,8 @@ use std::{
 pub(crate) use handler::{CallContext, McpTool};
 use policy::*;
 pub(crate) use policy::{
-    AdvertisedTool, PermissionSource, resolve_tool_permission, tool_is_allowed,
-    tool_should_eager_load, warn_on_stale_tool_config,
+    AdvertisedTool, PermissionSource, resolve_tool_permission, tool_exposure, tool_is_allowed,
+    warn_on_stale_tool_config,
 };
 use rmcp::{
     Peer, RoleClient,
@@ -107,6 +107,10 @@ pub(crate) struct McpClientManager {
     /// `readOnlyHint`. `None` means "no user default": resolution falls through to the
     /// hardcoded strict `Unrestricted`.
     mcp_default_permission: Option<Permission>,
+    /// `[mcp].deferral`, for the meta-tools, which belong to no server. Set once by the host after
+    /// [`Self::prepare`]; left unset by a test or a `meka mcp` command, where it reads as the
+    /// default.
+    deferral: OnceLock<crate::config::Deferral>,
     /// Flipped to `true` by the background connector once every enabled entry has reached a
     /// terminal state (Connected or Failed). The turn gate watches this via
     /// [`Self::await_settled`] / [`Self::all_ready`].
@@ -138,8 +142,9 @@ pub(crate) struct McpClientManager {
 /// `meka serve` and `meka acp` is none of them (`start_connector` runs in `build_shared_deps`,
 /// before any session exists), so every `mcp__*` schema would ship on every request.
 ///
-/// The classification happens here, where [`tool_should_eager_load`] still has the raw name and the
-/// server config; a registry sees only the namespaced name and could not ask.
+/// The classification happens here, where [`tool_exposure`] still has the raw name and the server
+/// config; a registry sees only the namespaced name and could not ask. A hidden tool is dropped
+/// here too, ahead of every registration path, so no door can register it.
 #[derive(Clone)]
 pub(crate) struct ServerTools {
     pub(crate) tools: Vec<Arc<McpTool>>,
@@ -149,13 +154,18 @@ pub(crate) struct ServerTools {
 
 impl ServerTools {
     pub(crate) fn from_tools(tools: Vec<McpTool>) -> Self {
-        let deferred = tools
-            .iter()
-            .filter(|tool| !tool_should_eager_load(tool.server_config(), tool.raw_name()))
-            .map(|tool| tool.namespaced_name.clone())
-            .collect();
+        let mut kept = Vec::with_capacity(tools.len());
+        let mut deferred = Vec::new();
+        for tool in tools {
+            match tool_exposure(tool.server_config(), tool.raw_name()) {
+                crate::config::Deferral::Hidden => continue,
+                crate::config::Deferral::Deferred => deferred.push(tool.namespaced_name.clone()),
+                crate::config::Deferral::Eager => {}
+            }
+            kept.push(Arc::new(tool));
+        }
         Self {
-            tools: tools.into_iter().map(Arc::new).collect(),
+            tools: kept,
             deferred,
         }
     }
@@ -764,6 +774,7 @@ impl McpClientManager {
             servers,
             client_context,
             mcp_default_permission,
+            deferral: OnceLock::new(),
             settled: settled_tx,
             pending_entries: std::sync::Mutex::new(Some(pending)),
             tools_snapshot: tokio::sync::RwLock::new(HashMap::new()),
@@ -829,6 +840,17 @@ impl McpClientManager {
     pub(crate) async fn unsubscribe(&self, identity: usize) {
         let mut observers = self.observers.write().await;
         observers.retain(|observer| observer.identity() != identity);
+    }
+
+    /// Record `[mcp].deferral` for the meta-tools; a second call is ignored.
+    pub(crate) fn set_deferral(&self, deferral: crate::config::Deferral) {
+        // `set` fails only when the slot is already filled, which is the documented no-op.
+        let _already_set = self.deferral.set(deferral);
+    }
+
+    /// What becomes of the meta-tools: `[mcp].deferral`, or its default when nothing recorded it.
+    pub(crate) fn deferral(&self) -> crate::config::Deferral {
+        self.deferral.get().copied().unwrap_or_default()
     }
 
     /// The bound to put on an MCP request made outside the connector.
@@ -1192,6 +1214,7 @@ impl McpClientManager {
                 self.mcp_default_permission,
             );
             let allowed = tool_is_allowed(server_config, &raw_name);
+            let exposure = tool_exposure(server_config, &raw_name);
             let read_only_hint_declined =
                 read_only_hint_was_declined(tool.annotations.as_ref(), permission_source);
             out.push(AdvertisedTool {
@@ -1200,6 +1223,7 @@ impl McpClientManager {
                 resolved_permission,
                 permission_source,
                 allowed,
+                exposure,
                 read_only_hint_declined,
             });
         }
@@ -2005,43 +2029,43 @@ mod tests {
         warn_on_stale_tool_config("s", &server, &advertised);
     }
 
+    /// A server that states nothing defers every tool; an empty eager list changes nothing.
     #[test]
-    fn tool_should_eager_load_unset_returns_false() {
-        let server = McpServerConfig::for_test("s");
-        assert!(!tool_should_eager_load(&server, "search"));
-        assert!(!tool_should_eager_load(&server, "anything"));
-    }
-
-    #[test]
-    fn tool_should_eager_load_empty_list_returns_false() {
+    fn a_tool_no_setting_names_is_deferred() {
+        use crate::config::Deferral;
         let mut server = McpServerConfig::for_test("s");
+        assert_eq!(tool_exposure(&server, "search"), Deferral::Deferred);
         server.eager_load_tools = Some(Vec::new());
-        assert!(!tool_should_eager_load(&server, "search"));
+        assert_eq!(tool_exposure(&server, "search"), Deferral::Deferred);
     }
 
+    /// `eager_load_tools` names a tool eager whatever the server's `deferral` says, by its raw
+    /// name alone: the namespaced `mcp__notion__search` must not match an entry of `search`, or
+    /// one entry would reach across servers.
     #[test]
-    fn tool_should_eager_load_matching_name_returns_true() {
-        let mut server = McpServerConfig::for_test("s");
-        server.eager_load_tools = Some(vec!["search".into(), "fetch".into()]);
-        assert!(tool_should_eager_load(&server, "search"));
-        assert!(tool_should_eager_load(&server, "fetch"));
-    }
-
-    #[test]
-    fn tool_should_eager_load_nonmatching_returns_false() {
-        let mut server = McpServerConfig::for_test("s");
-        server.eager_load_tools = Some(vec!["search".into()]);
-        assert!(!tool_should_eager_load(&server, "create-page"));
-    }
-
-    #[test]
-    fn tool_should_eager_load_uses_raw_not_namespaced_name() {
-        // The check is against the server-advertised raw name; the namespaced `mcp__notion__search`
-        // form must NOT match an entry of `"search"`; that would create a footgun where users
-        // could accidentally over-match across servers.
+    fn a_named_tool_is_eager_under_every_deferral_and_only_by_its_raw_name() {
+        use crate::config::Deferral;
         let mut server = McpServerConfig::for_test("notion");
-        server.eager_load_tools = Some(vec!["search".into()]);
-        assert!(!tool_should_eager_load(&server, "mcp__notion__search"));
+        server.eager_load_tools = Some(vec!["search".into(), "fetch".into()]);
+        for deferral in Deferral::ALL {
+            server.deferral = Some(deferral);
+            assert_eq!(
+                tool_exposure(&server, "search"),
+                Deferral::Eager,
+                "{deferral}"
+            );
+            assert_eq!(
+                tool_exposure(&server, "fetch"),
+                Deferral::Eager,
+                "{deferral}"
+            );
+            assert_eq!(
+                tool_exposure(&server, "create-page"),
+                deferral,
+                "an unnamed tool takes the server's setting"
+            );
+            assert_eq!(tool_exposure(&server, "mcp__notion__search"), deferral);
+        }
     }
 
     #[test]
@@ -2247,6 +2271,78 @@ mod tests {
         );
     }
 
+    /// The server's `deferral` decides what `eager_load_tools` does not name, on the same discovery
+    /// path: `eager` declares both tools, `hidden` registers neither, and a named tool is declared
+    /// under either.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovery_follows_the_server_s_deferral_for_the_tools_it_does_not_name() {
+        for deferral in [
+            crate::config::Deferral::Eager,
+            crate::config::Deferral::Hidden,
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let state = temp.path().join("stub.json");
+            std::fs::write(&state, r#"{"tools": ["search", "create_page"]}"#)
+                .expect("write the stub's state");
+            let mut config = McpServerConfig::for_test("notion");
+            config.transport = McpTransport::Stdio;
+            config.url = None;
+            config.command = Some("python3".to_string());
+            config.args = Some(vec![
+                format!(
+                    "{}/tests/fixtures/mcp_stub_server.py",
+                    env!("CARGO_MANIFEST_DIR")
+                ),
+                state.display().to_string(),
+            ]);
+            config.eager_load_tools = Some(vec!["search".to_string()]);
+            config.deferral = Some(deferral);
+            let context = McpClientContext::new();
+            let manager = McpClientManager::prepare(
+                &[config],
+                None,
+                None,
+                Arc::clone(&context),
+                crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+            )
+            .await
+            .expect("prepare");
+            context.set_manager(Arc::downgrade(&manager));
+            let entry = manager
+                .servers
+                .get("notion")
+                .cloned()
+                .expect("the configured entry");
+            connector::connect_one(
+                Arc::clone(&entry),
+                Arc::clone(&manager),
+                None,
+                std::time::Duration::from_secs(20),
+            )
+            .await;
+            let registry = crate::tools::ToolRegistry::new();
+            crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
+            assert!(
+                registry.get("mcp__notion__search").is_some()
+                    && !registry.is_deferred("mcp__notion__search"),
+                "{deferral}: the named tool is declared: {:?}",
+                entry.state().await.label()
+            );
+            match deferral {
+                crate::config::Deferral::Eager => assert!(
+                    registry.get("mcp__notion__create_page").is_some()
+                        && !registry.is_deferred("mcp__notion__create_page"),
+                    "eager declares the unnamed tool too"
+                ),
+                crate::config::Deferral::Hidden => assert!(
+                    registry.get("mcp__notion__create_page").is_none(),
+                    "hidden registers nothing it was not named"
+                ),
+                crate::config::Deferral::Deferred => unreachable!("not in the loop"),
+            }
+        }
+    }
     /// A reconnect is a new session with the server, and its tool set is only knowable by asking.
     ///
     /// Ending the reconnect path at the transport is justified by "the tool adapters already exist

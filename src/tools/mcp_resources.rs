@@ -537,14 +537,20 @@ pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClien
     if visible_servers(&manager, &tool_scope).is_empty() {
         return;
     }
+    // The seven are discovery-style helpers, so they take the install's `[mcp].deferral` the way
+    // a server's unnamed tools take the server's: deferred by default, declared under `eager`, and
+    // under `hidden` not registered at all.
+    let deferral = manager.deferral();
+    if deferral == crate::config::Deferral::Hidden {
+        return;
+    }
     // These seven are registered directly rather than through `register_builtin`, so they honor
     // the `[tools]` block-list and the sub-agent deny list only because this asks.
     // `admits_infrastructure` ignores `allowed_tools`, which would silently delete them from any
     // install that has one.
     //
-    // All seven are discovery-style helpers, so each is marked deferred. Marking rides along in the
-    // same macro: a deferred marker for a tool that was never registered is a name `tool_load`
-    // would offer and then fail to find.
+    // Marking rides along in the same macro: a deferred marker for a tool that was never
+    // registered is a name `tool_load` would offer and then fail to find.
     macro_rules! register_meta {
         ($name:expr, $tool:expr) => {
             if registry.admits_infrastructure($name) {
@@ -557,7 +563,9 @@ pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClien
                     $name,
                     " tool name collision"
                 ));
-                registry.mark_deferred($name);
+                if deferral == crate::config::Deferral::Deferred {
+                    registry.mark_deferred($name);
+                }
             }
         };
     }
@@ -869,6 +877,44 @@ mod tests {
         assert!(out[1].contains("beta"));
     }
 
+    /// The meta-tools take `[mcp].deferral` the way a server's unnamed tools take the server's:
+    /// declared under `eager`, absent under `hidden`.
+    #[tokio::test]
+    async fn mcp_resource_tools_follow_the_install_s_deferral() {
+        use crate::{
+            config::{Deferral, McpServerConfig, McpTransport},
+            mcp::{McpClientContext, McpClientManager},
+            tools::ToolRegistry,
+        };
+        for deferral in [Deferral::Eager, Deferral::Hidden] {
+            let mut server_config = McpServerConfig::for_test("fixture-srv");
+            server_config.transport = McpTransport::Stdio;
+            server_config.url = None;
+            server_config.command = Some("/bin/false".to_string());
+            let manager = McpClientManager::prepare(
+                &[server_config],
+                None,
+                None,
+                McpClientContext::new(),
+                crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+            )
+            .await
+            .expect("prepare with one server should succeed");
+            manager.set_deferral(deferral);
+            let registry = ToolRegistry::new();
+            register_all(&registry, manager);
+            let registered = registry.get("mcp_resource_list").is_some();
+            match deferral {
+                Deferral::Eager => assert!(
+                    registered && !registry.is_deferred("mcp_resource_list"),
+                    "eager declares the meta-tools"
+                ),
+                Deferral::Hidden => assert!(!registered, "hidden registers no meta-tool"),
+                Deferral::Deferred => unreachable!("not in the loop"),
+            }
+        }
+    }
+
     /// The seven MCP resource tools stay deferred after registration, or every MCP-using session
     /// would carry seven extra tool schemas in its tools array on the first turn.
     #[tokio::test]
@@ -893,6 +939,7 @@ mod tests {
             allowed_tools: None,
             disabled_tools: None,
             eager_load_tools: None,
+            deferral: None,
             tool_permissions: None,
             trust_read_only_hint: None,
             disabled: None,
@@ -912,10 +959,6 @@ mod tests {
         let registry = ToolRegistry::new();
         register_all(&registry, manager);
 
-        let entries = registry.tool_catalog();
-        let by_name: std::collections::HashMap<_, _> =
-            entries.iter().map(|(n, _, _, d)| (n.clone(), *d)).collect();
-
         for name in [
             "mcp_resource_list",
             "mcp_resource_read",
@@ -926,11 +969,11 @@ mod tests {
             "mcp_resource_updates_list",
         ] {
             assert!(
-                by_name.contains_key(name),
+                registry.get(name).is_some(),
                 "MCP resource tool {name} not registered"
             );
             assert!(
-                by_name[name],
+                registry.is_deferred(name),
                 "MCP resource tool {name} should still be deferred (would otherwise \
                  bloat the tools array on every MCP-enabled session)",
             );

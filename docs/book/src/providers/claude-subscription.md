@@ -133,11 +133,11 @@ meka forwards the model string verbatim and doesn't gate which strings are valid
 - `x-cc-compaction-request` and `x-claude-code-compaction`: on a compaction's requests, what set it going: `manual` for `/compact`, `POST /compact` and `context_compact`, `auto` for a ceiling crossed, `reactive` for a request the provider refused as too large
 - `x-cc-context-compacted` and `x-claude-code-context-compacted`: the same word on the conversation's first request after a compaction
 
-These are what Claude Code 2.1.284 says about each request; for the two compaction facts it keeps a first-party name and a gateway-hint name and sends both.
+These are what Claude Code 2.1.301 says about each request; for the two compaction facts it keeps a first-party name and a gateway-hint name and sends both.
 
 ### Beta header
 
-Composed dynamically from the model, window and thinking settings, mirroring Claude Code's own assembly. Order is significant; the list below matches the Claude Code 2.1.284 interactive-CLI wire capture on Opus 5.5 (tools present, thinking on, display updates) exactly:
+Composed dynamically from the model, window and thinking settings, mirroring Claude Code's own assembly. Order is significant; the list below matches the Claude Code 2.1.301 interactive-CLI wire capture on Opus 5.5 (tools present, thinking on, display updates) exactly:
 
 | Beta | When |
 |------|------|
@@ -149,12 +149,11 @@ Composed dynamically from the model, window and thinking settings, mirroring Cla
 | `thinking-token-count-2026-05-13` | Any modern Claude (4.x+) |
 | `context-management-2025-06-27` | Any modern Claude (4.x+) |
 | `prompt-caching-scope-2026-01-05` | Always |
-| `mid-conversation-system-2026-04-07` | Everything except Claude 3.x, Opus 4.7 and older, Sonnet 4.6 and older, and Haiku 4.5 |
-| `per-turn-control-2026-07-01` | Opus 5.5, Sonnet 5.5 and Fable 5.1, the three models Claude Code's bundled catalog grants per-turn effort; nothing newer, since Claude Code sends nothing for a model its catalog does not list |
-| `mid-conversation-tool-changes-2026-07-01` | Wherever the mid-conversation system beta goes, except Sonnet 5 and Sonnet 5.5 |
+| `per-turn-control-2026-07-01` | Opus 5.5, Sonnet 5.5, Haiku 5.5 and Fable 5.1, the four models Claude Code's bundled catalog grants per-turn effort; nothing newer, since Claude Code sends nothing for a model its catalog does not list |
+| `mid-conversation-tool-changes-2026-07-01` | Everything except Claude 3.x, Opus 4.7 and older, Sonnet 5 and older, and Haiku 4.5, which is where Claude Code's catalog withholds `mid_conv_tool_change` |
 | `advanced-tool-use-2025-11-20` | When the request carries tools (meka always does) |
 | `effort-2025-11-24` | Every model that takes an effort at all, whether or not the profile set one |
-| `fallback-credit-2026-06-01` | A compaction's requests only. Claude Code 2.1.284 arms it on a turn only while its UI shows a fallback model, which the capture never did, and on a compaction whenever the model has a refusal fallback in its catalog; it only advertises that the server may answer with a fallback credit, and meka sends no `fallbacks` of its own |
+| `fallback-credit-2026-06-01` | A compaction's requests only. Claude Code 2.1.301 arms it on a turn only while its UI shows a fallback model, which the capture never did, and on a compaction whenever the model has a refusal fallback in its catalog; it only advertises that the server may answer with a fallback credit, and meka sends no `fallbacks` of its own |
 | `thinking-binding-controls-2026-08-01` | Any modern Claude with thinking on. Nothing in the body goes with it: Claude Code leaves the binding behavior to the server |
 | `thinking-display-updates-2026-08-18` | Any modern Claude with thinking on under `thinking_display = "updates"`, paired with `thinking.display = "updates"` |
 | `extended-cache-ttl-2025-04-11` | Every request but a compaction's and a sub-agent's, which take the API's own TTL; see [Cache control](#cache-control) |
@@ -191,6 +190,7 @@ Nothing in meka depends on that order. `patch_request_body` finds the `cch=00000
 - `thinking.display`: see [`thinking_display`](#thinking_display); absent with thinking off and under `redacted`.
 - `diagnostics.previous_message_id`: the id of the previous response's message in this conversation, `null` on the first request, after a resume, and after a compaction that summarized that response away; absent on a compaction request, which is a side query. Pairs with the `cache-diagnosis-2026-04-07` beta.
 - `temperature: 1` (only when `thinking = "off"`, and only for models that still accept sampling params).
+- `tools`: never meka's MCP meta-tools (`mcp_resource_*`, `mcp_prompt_*`). The endpoint answers a request declaring a tool named `mcp_<x>` with "You're out of extra usage" whatever the tool is, while a server's `mcp__<server>__<tool>` names pass, so a session on this backend neither carries nor lists them.
 - `max_tokens`: `128_000` under `thinking = "adaptive"`, `max(thinking_budget * 2, 32_000)` under `budgeted`, `32_000` under `off`. Claude Code reads the figure off a per-model catalog, which says `128_000` for Opus 5.5 and `64_000` for the rest of the current line-up; [`max_output_tokens`](../configuration/config-file.md#max_output_tokens) on the profile states another.
 
 ### Reasoning effort
@@ -203,7 +203,7 @@ Claude Code never leaves `output_config.effort` to the server on a model that ta
 | profile sets nothing | `medium` |
 | model takes no effort | nothing, and no beta; a configured value is dropped with a warning |
 
-One value for every model, not a copy of that table. `medium` is what the 2.1.284 table says for Opus 5.5, the model `meka profile add` suggests, and for Sonnet 5.5; most other entries say `high`, Opus 4.7's says `xhigh`, and `high` is what Claude Code falls back to for any model the table does not list. Carrying the per-model figures instead would add facts about Anthropic's data that go stale on their release schedule and buy nothing, because the server cannot tell a default meka chose from a value you configured. Models that take no effort at all are the Claude 3.x line, Opus 4.0/4.1, Sonnet 4.0/4.5 and Haiku 4.5.
+One value for every model, not a copy of that table. `medium` is what the 2.1.301 table says for Opus 5.5, the model `meka profile add` suggests, and for Sonnet 5.5; most other entries say `high`, Opus 4.7's says `xhigh`, and `high` is what Claude Code falls back to for any model the table does not list. Carrying the per-model figures instead would add facts about Anthropic's data that go stale on their release schedule and buy nothing, because the server cannot tell a default meka chose from a value you configured. Models that take no effort at all are the Claude 3.x line, Opus 4.0/4.1, Sonnet 4.0/4.5 and Haiku 4.5.
 
 A value you configure is absolute. Claude Code silently lowers `xhigh` or `max` to `high` on a model whose bundled entry lacks the capability; meka does not, because that table is a snapshot of someone else's system and quietly overriding what you asked for on the strength of it is worse than letting the API answer.
 
@@ -216,10 +216,10 @@ The most recent message's last content block and the user system prompt carry `c
 Caching is prefix-based: the tools array precedes the system prompt, which precedes the messages, so a byte changing early invalidates everything after it. meka is built so that nothing which changes mid-session sits in that prefix.
 
 - **The system prompt is fixed for a session.** It carries only the role description, permission model, standing instructions, guidelines, and OS/shell info, all resolved once at startup. The tool catalog, skill list, and MCP server instructions live in the per-turn `<context>` block instead, because all three can change while a session runs.
-- **The tools array only grows at the tail.** `tool_load` appends a schema rather than reordering. The array heads the prefix, so the request after a load still rewrites the whole cache once; what the append buys is that nothing else moves, and the request after that reads it all back.
+- **The tools array does not change.** Under the backend's default [`deferred_tools = "native"`](../configuration/config-file.md#deferred_tools) every deferred tool is declared from the first request with `defer_loading`, and a `tool_load` answers with a reference the API expands in place rather than adding to the array. Under `append` the array grows at the tail instead, and the request after a load rewrites the whole cache once.
 - **Permission toggles cost nothing.** See [Permissions](../usage/permissions.md).
 
-Three things do legitimately invalidate it, all by necessity rather than oversight: compaction, which rewrites the head of the conversation; a `tool_load` call, which grows the tools array; and an MCP server withdrawing a tool via `tools/list_changed`, which removes it from the array. A change to the array re-caches everything behind it once, the system prompt included, and the following request reads it all back.
+Three things do legitimately invalidate it, all by necessity rather than oversight: compaction, which rewrites the head of the conversation; a `tool_load` call on an `append` profile, which grows the tools array; and an MCP server withdrawing a tool via `tools/list_changed`, which removes it from the array. A change to the array re-caches everything behind it once, the system prompt included, and the following request reads it all back.
 
 You can see the effect directly: `/status` reports the cache hit ratio, and reads should dominate from the second turn onward.
 

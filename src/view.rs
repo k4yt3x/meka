@@ -286,6 +286,9 @@ pub(crate) struct McpToolView {
     /// `false` when `allowed_tools` or `disabled_tools` filters this tool out, so the agent never
     /// sees it. Listed anyway: "configured away" and "not advertised" are different problems.
     pub(crate) allowed: bool,
+    /// How the tool ships when allowed: `eager` (declared from the first request), `deferred`
+    /// (loaded on demand) or `hidden` (not registered), per `deferral` and `eager_load_tools`.
+    pub(crate) loading: &'static str,
     /// The server advertised `readOnlyHint: true` and `trust_read_only_hint = false` withheld it.
     /// `permission_source` names only the step that won, and a declined hint by definition did
     /// not, so without this a server advertising no hint and one whose hint was refused read
@@ -301,6 +304,7 @@ impl From<&AdvertisedTool> for McpToolView {
             required_permission: tool.resolved_permission,
             permission_source: tool.permission_source.as_str(),
             allowed: tool.allowed,
+            loading: tool.exposure.name(),
             read_only_hint_declined: tool.read_only_hint_declined,
         }
     }

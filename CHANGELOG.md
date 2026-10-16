@@ -7,19 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.77.0] - 2026-10-16
+
 ### Added
 
 - `openai-chat-completions` shows the reasoning an endpoint streams as thinking and keeps it.
+- Profiles take `deferred_tools = "native" | "append"`: how a request carries unloaded tools.
+- Under `native`, deferred tools are declared once and a `tool_load` rewrites no prompt cache.
+- `[mcp].deferral` and a server's `deferral`: `deferred`, `eager` or `hidden`; `mcp add --deferral`.
+- `meka mcp tools` and `GET /v1/mcp/{name}/tools` state how each tool ships: `loading`.
+- A tool result may carry a `tool_reference` item on a `native` profile, in the API and SSE feed.
 
 ### Changed
 
 - Session archives are `format_version` 12; a 0.76 archive is read as it is.
+- Official Anthropic and OpenAI endpoints and both subscriptions default to `native` deferral.
+- The first request of every live session after this upgrade rewrites its prompt cache once.
+- The `claude-subscription` backend matches Claude Code 2.1.301.
+- `tool_load` and `tool_search` leave the request and the context block when nothing is deferred.
 - `openai-responses` and `chatgpt-subscription` let the model call several tools in one round.
 - The YAML frontmatter parser is `yaml_serde`, the YAML organization's maintained `serde_yaml` fork.
 
 ### Fixed
 
 - `openai-chat-completions` sends `reasoning_content` back, as DeepSeek's thinking mode requires.
+- A sub-agent whose scope holds only deferred tools gets them declared outright and can call them.
+- A Responses stream's error frame reports its cause, and the ChatGPT backend's overload is retried.
 
 ## [0.76.0] - 2026-10-15
 
@@ -2748,8 +2761,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.75.1...HEAD
-[0.75.1]: https://github.com/k4yt3x/meka/compare/0.75.0...0.75.1
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.77.0...HEAD
+[0.77.0]: https://github.com/k4yt3x/meka/compare/0.76.0...0.77.0
+[0.76.0]: https://github.com/k4yt3x/meka/compare/0.75.0...0.76.0
 [0.75.0]: https://github.com/k4yt3x/meka/compare/0.74.0...0.75.0
 [0.74.0]: https://github.com/k4yt3x/meka/compare/0.73.0...0.74.0
 [0.73.0]: https://github.com/k4yt3x/meka/compare/0.72.0...0.73.0

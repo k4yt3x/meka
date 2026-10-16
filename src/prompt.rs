@@ -21,7 +21,11 @@ mod world;
 
 pub(crate) use self::world::render_world_state;
 use self::world::*;
-use crate::{permission::Permission, store::ScratchpadEntry};
+use crate::{
+    permission::Permission,
+    provider::{LOAD_TOOL_NAME, SEARCH_TOOL_NAME, is_discovery_tool, load_door},
+    store::ScratchpadEntry,
+};
 
 /// A tool's entry in the catalog rendered into the per-turn `<context>` block. Tuple:
 /// `(name, description, required_permission, is_deferred)`. Produced by
@@ -139,6 +143,9 @@ struct ScheduledIndexEntry {
 pub(crate) struct WorldSnapshot {
     /// Tool name → `(required permission, deferred, one-line summary)`.
     tools: std::collections::BTreeMap<String, (Permission, bool, String)>,
+    /// Whether the wire loads a deferred tool through `tool_search` named by exact name rather
+    /// than through `tool_load`, which is what the discovery text tells the model to call.
+    loads_by_search: bool,
     /// `(skill name, description)`, in the `(priority, name)` order [`crate::skills`] produced.
     ///
     /// A `Vec`, not a map, for the same reason `memories` is one: the order is the ranking, and
@@ -205,7 +212,7 @@ const MEMORY_INDEX_TOOL: &str = "memory_read";
 const MEMORY_WRITE_TOOL: &str = "memory_write";
 const MEMORY_SEARCH_TOOL: &str = "memory_search";
 const SKILL_SEARCH_TOOL: &str = "skill_search";
-const TOOL_SEARCH_TOOL: &str = "tool_search";
+const TOOL_SEARCH_TOOL: &str = SEARCH_TOOL_NAME;
 const SCHEDULE_INDEX_TOOL: &str = "schedule_list";
 const TASK_INDEX_TOOL: &str = crate::background::TASK_INDEX_TOOL;
 
@@ -259,6 +266,13 @@ impl WorldSnapshot {
         self.memories.clone_from(&previous.memories);
     }
 
+    /// Say that this wire loads a deferred tool through `tool_search`; see
+    /// [`Self::loads_by_search`].
+    pub(crate) fn loading_by_search(mut self, loads_by_search: bool) -> Self {
+        self.loads_by_search = loads_by_search;
+        self
+    }
+
     /// Build the picture the model will be shown.
     ///
     /// Each store's index is dropped when the tool that opens it is not registered. That happens
@@ -296,9 +310,15 @@ impl WorldSnapshot {
         } else {
             &[]
         };
+        // The two discovery tools leave with the section they serve, as they leave the request
+        // (`ToolRegistry::active_tools`): named under `[Available tools]` with nothing to find,
+        // they would be an instruction the model cannot use.
+        let anything_deferred = catalog.iter().any(|(_, _, _, deferred)| *deferred);
         Self {
+            loads_by_search: false,
             tools: catalog
                 .iter()
+                .filter(|(name, ..)| anything_deferred || !is_discovery_tool(name))
                 .map(|(name, description, required, deferred)| {
                     (
                         name.clone(),
@@ -473,7 +493,7 @@ fn clip_at_word_boundary(text: &str, limit: usize) -> String {
 /// Root and worker world state use this renderer over their own registries. Summarizing is
 /// idempotent, so a catalog that already carries summaries (the world snapshot's) renders
 /// unchanged.
-pub(crate) fn render_tool_discovery(catalog: &[ToolCatalogEntry]) -> String {
+pub(crate) fn render_tool_discovery(catalog: &[ToolCatalogEntry], loads_by_search: bool) -> String {
     let deferred: Vec<ToolCatalogEntry> = catalog
         .iter()
         .filter(|(_, _, _, deferred)| *deferred)
@@ -491,10 +511,16 @@ pub(crate) fn render_tool_discovery(catalog: &[ToolCatalogEntry]) -> String {
     }
     let searchable = catalog_has(catalog, TOOL_SEARCH_TOOL);
 
-    let mut out = String::from(
+    // The endpoint's search item loads the exact names in `names`; `tool_load` takes one name or
+    // a list, and a name passed as a query would load its near misses too.
+    let load = if loads_by_search {
+        format!("call `{TOOL_SEARCH_TOOL}` with the exact names in `names`")
+    } else {
+        format!("call `{LOAD_TOOL_NAME}` with its exact name or a list of names")
+    };
+    let mut out = format!(
         "[Tool discovery]\nRegistered tools with schemas loaded on demand. If a schema is absent \
-         from the API catalog, call `tool_load` with its exact name or a list of names before \
-         using it. Summaries ending in `…` are shortened.",
+         from the API catalog, {load} before using it. Summaries ending in `…` are shortened."
     );
     if searchable {
         out.push_str(
@@ -3078,7 +3104,7 @@ mod tests {
     #[test]
     fn the_tool_index_keeps_summaries_while_they_fit() {
         let catalog = with_tool_search(deferred_catalog("notion", 3, "Search Notion pages."));
-        let section = render_tool_discovery(&catalog);
+        let section = render_tool_discovery(&catalog, false);
         assert!(
             section.contains("MCP server: notion (3 tools)"),
             "{section}"
@@ -3097,7 +3123,7 @@ mod tests {
     fn the_tool_index_falls_back_to_names_past_its_byte_budget() {
         let description = "x".repeat(240);
         let catalog = with_tool_search(deferred_catalog("notion", 40, &description));
-        let section = render_tool_discovery(&catalog);
+        let section = render_tool_discovery(&catalog, false);
         assert!(section.len() <= TOOL_INDEX_MAX_BYTES, "{}", section.len());
         for index in 0..40 {
             let line = format!("- **mcp__notion__tool_{index:03}** (level `read`)\n");
@@ -3113,7 +3139,7 @@ mod tests {
     fn the_tool_index_counts_what_it_cannot_name() {
         let mut catalog = deferred_catalog("aaa", 250, "One.");
         catalog.extend(deferred_catalog("zzz", 50, "Two."));
-        let section = render_tool_discovery(&with_tool_search(catalog));
+        let section = render_tool_discovery(&with_tool_search(catalog), false);
         let shown = section
             .lines()
             .filter(|line| line.starts_with("- **"))
@@ -3132,13 +3158,13 @@ mod tests {
     #[test]
     fn the_tool_index_names_tool_search_only_when_it_is_registered() {
         let catalog = deferred_catalog("aaa", 300, "One.");
-        let without = render_tool_discovery(&catalog);
+        let without = render_tool_discovery(&catalog, false);
         assert!(
             without.contains("more tools not shown here.\n"),
             "{without}"
         );
         assert!(!without.contains("tool_search"), "{without}");
-        let with = render_tool_discovery(&with_tool_search(catalog));
+        let with = render_tool_discovery(&with_tool_search(catalog), false);
         assert!(with.contains("use `tool_search` to find them"), "{with}");
         assert!(
             with.contains("`tool_search` finds a tool by keyword"),
@@ -3217,12 +3243,83 @@ mod tests {
                 )
             })
             .collect();
-        let section = render_tool_discovery(&with_tool_search(catalog));
+        let section = render_tool_discovery(&with_tool_search(catalog), false);
         assert!(section.len() <= TOOL_INDEX_MAX_BYTES, "{}", section.len());
         assert!(section.contains("groups not listed above"), "{section}");
         assert!(
             section.contains("MCP server: server000 (1 tool)"),
             "{section}"
+        );
+    }
+
+    /// The discovery text sends the model through the door its wire loads by: `tool_search` by
+    /// exact name where the endpoint's own search item does both jobs, `tool_load` elsewhere, in
+    /// the full rendering and in the diff's new-tools line alike.
+    #[test]
+    fn the_discovery_text_names_the_door_the_wire_loads_through() {
+        let catalog = with_tool_search(deferred_catalog("s", 1, "One."));
+        let by_load = render_tool_discovery(&catalog, false);
+        assert!(
+            by_load.contains("call `tool_load` with its exact name"),
+            "{by_load}"
+        );
+        let by_search = render_tool_discovery(&catalog, true);
+        assert!(
+            by_search.contains("call `tool_search` with the exact names in `names`"),
+            "{by_search}"
+        );
+        assert!(!by_search.contains("`tool_load`"), "{by_search}");
+
+        let snapshot = |count: usize| {
+            WorldSnapshot::new(
+                &with_tool_search(deferred_catalog("s", count, "One.")),
+                &no_skills(),
+                &[],
+                &[],
+                &[],
+            )
+        };
+        let diff = render_world_state_diff(&snapshot(2).loading_by_search(true), &snapshot(1));
+        assert!(
+            diff.contains("New deferred tools (use `tool_search` for schemas)"),
+            "{diff}"
+        );
+        let diff = render_world_state_diff(&snapshot(2), &snapshot(1));
+        assert!(
+            diff.contains("New deferred tools (use `tool_load` for schemas)"),
+            "{diff}"
+        );
+    }
+
+    /// With nothing deferred the discovery tools leave the snapshot: the request drops them too
+    /// (`ToolRegistry::active_tools`), and `[Available tools]` must not name a tool the array
+    /// lacks.
+    #[test]
+    fn the_discovery_tools_leave_the_snapshot_with_the_last_deferred_tool() {
+        let snapshot =
+            |catalog: &[ToolCatalogEntry]| WorldSnapshot::new(catalog, &no_skills(), &[], &[], &[]);
+        let mut with_load = with_tool_search(deferred_catalog("s", 1, "One."));
+        with_load.push((
+            LOAD_TOOL_NAME.to_string(),
+            "Load schemas.".to_string(),
+            Permission::Read,
+            false,
+        ));
+        let something_deferred = snapshot(&with_load);
+        assert!(something_deferred.tools.contains_key(TOOL_SEARCH_TOOL));
+        assert!(something_deferred.tools.contains_key(LOAD_TOOL_NAME));
+        let mut nothing_deferred = with_tool_search(Vec::new());
+        nothing_deferred.push((
+            LOAD_TOOL_NAME.to_string(),
+            "Load schemas.".to_string(),
+            Permission::Read,
+            false,
+        ));
+        let nothing_deferred = snapshot(&nothing_deferred);
+        assert!(
+            nothing_deferred.tools.is_empty(),
+            "{:?}",
+            nothing_deferred.tools
         );
     }
 
@@ -3233,7 +3330,9 @@ mod tests {
         let snapshot =
             |catalog: &[ToolCatalogEntry]| WorldSnapshot::new(catalog, &no_skills(), &[], &[], &[]);
         let before = snapshot(&with_tool_search(deferred_catalog("gone", 300, "One.")));
-        let after = snapshot(&with_tool_search(Vec::new()));
+        // One deferred tool stays, so `tool_search` still has something to find and the
+        // departure line can point at it.
+        let after = snapshot(&with_tool_search(deferred_catalog("stays", 1, "One.")));
         let diff = render_world_state_diff(&after, &before);
         let line = diff
             .lines()

@@ -11,6 +11,9 @@ pub(crate) struct McpConfig {
     /// unset the hardcoded fallback is `Unrestricted`, i.e. strict. Typed, like `[permissions]`,
     /// so a level meka does not have is refused where the file is parsed.
     pub(crate) default_permission: Option<Permission>,
+    /// What becomes of a tool that no `eager_load_tools` entry names, on every server that states
+    /// no `deferral` of its own. Unset is `deferred`.
+    pub(crate) deferral: Option<Deferral>,
     pub(crate) servers: Option<Vec<McpServerConfig>>,
     /// Default for each server's [`McpServerConfig::required`]. When true, every enabled server
     /// gates the turn; when false (the default) only servers that opt in with `required = true`
@@ -68,6 +71,10 @@ pub(crate) struct McpServerConfig {
     /// schema in the cacheable tools-array prefix. Names that don't match an advertised tool
     /// surface as a `warn!` via [`crate::mcp::warn_on_stale_tool_config`].
     pub(crate) eager_load_tools: Option<Vec<String>>,
+    /// What becomes of this server's tools that [`Self::eager_load_tools`] does not name. `None`
+    /// inherits `[mcp].deferral`, settled in [`crate::config::ResolvedConfig::resolve`] the way
+    /// [`Self::required`] is, so every later reader holds a value.
+    pub(crate) deferral: Option<Deferral>,
     /// Optional per-tool permission overrides keyed by raw tool name. Beats the server-level
     /// `permission` and the server's `readOnlyHint` annotation when resolving a tool's required
     /// permission at registration time. Typed for the same reason [`Self::permission`] is.
@@ -126,11 +133,85 @@ impl McpServerConfig {
             allowed_tools: None,
             disabled_tools: None,
             eager_load_tools: None,
+            deferral: None,
             tool_permissions: None,
             trust_read_only_hint: None,
             disabled: None,
             required: None,
         }
+    }
+}
+/// What becomes of an MCP tool that no `eager_load_tools` entry names: the per-server and
+/// install-wide `deferral` setting.
+///
+/// A deferred tool costs a load, and on a wire with no deferral mechanism of its own that load
+/// rewrites the cached prefix once; `eager` buys a stable prefix at the price of every schema in
+/// the window from the first request, and `hidden` keeps only what the install named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum Deferral {
+    /// Listed in the catalog with its schema withheld until the model loads it.
+    #[default]
+    Deferred,
+    /// Declared with its schema from the first request.
+    Eager,
+    /// Not registered at all: absent from the catalog, the registry and the gauge.
+    Hidden,
+}
+impl Deferral {
+    /// Every setting, in the order the names sort.
+    pub(crate) const ALL: [Deferral; 3] = [Self::Deferred, Self::Eager, Self::Hidden];
+
+    /// The one spelling `deferral` takes.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Deferred => "deferred",
+            Self::Eager => "eager",
+            Self::Hidden => "hidden",
+        }
+    }
+
+    /// The names, joined for a refusal that lists what would have been accepted.
+    pub(crate) fn supported() -> String {
+        Self::ALL
+            .iter()
+            .map(|deferral| deferral.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+impl std::fmt::Display for Deferral {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+impl std::str::FromStr for Deferral {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|deferral| deferral.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a deferral setting. Supported: {}",
+                    Self::supported()
+                )
+            })
+    }
+}
+impl TryFrom<String> for Deferral {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+impl From<Deferral> for String {
+    fn from(deferral: Deferral) -> Self {
+        deferral.name().to_string()
     }
 }
 /// How an MCP server is reached. One spelling, [`Self::name`], on `transport` in the file and on

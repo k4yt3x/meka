@@ -6271,7 +6271,10 @@ mod tests {
             texts(&Conversation::from_events(whole)),
         );
         assert_eq!(
-            crate::tools::load_tool::extract_loaded_tool_names_from_events(&view),
+            crate::tools::load_tool::extract_loaded_tool_names_from_events(
+                &view,
+                crate::provider::DeferredToolDelivery::Appended
+            ),
             vec!["mcp__b__y".to_string()],
             "the boundary carries the loaded tools the dropped rows would have named"
         );

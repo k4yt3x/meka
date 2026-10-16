@@ -53,7 +53,7 @@ pub(super) fn render_world_state_full(current: &WorldSnapshot) -> String {
         sections.push(out);
     }
 
-    let discovery = render_tool_discovery(&catalog);
+    let discovery = render_tool_discovery(&catalog, current.loads_by_search);
     if !discovery.is_empty() {
         sections.push(discovery);
     }
@@ -662,8 +662,12 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
     ) {
         lines.push(line);
     }
+    let new_deferred_lead = format!(
+        "- New deferred tools (use `{}` for schemas): ",
+        load_door(current.loads_by_search)
+    );
     if let Some(line) = tool_change_line(
-        "- New deferred tools (use `tool_load` for schemas): ",
+        &new_deferred_lead,
         &described(&newly_deferred),
         &named(&newly_deferred),
         searchable,

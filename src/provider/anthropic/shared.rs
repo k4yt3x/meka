@@ -4,7 +4,7 @@
 //! response parsing, per-model capability detection, the thinking override, and the one driver
 //! both providers send through.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::HashSet};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -139,7 +139,7 @@ pub(super) fn model_is_haiku(model: &str) -> bool {
 /// first-party feature an arbitrary endpoint may not implement.
 ///
 /// The `max_tokens` sent when the profile states no `max_output_tokens`: 128000 under adaptive
-/// thinking, which is what Claude Code 2.1.284 sends for Opus 5.5 (verified by wire capture), the
+/// thinking, which is what Claude Code 2.1.301 sends for Opus 5.5 (verified by wire capture), the
 /// model `profile add` suggests, and the most every model that takes adaptive thinking accepts;
 /// 32000 otherwise, raised to twice the budget under budgeted thinking when that is more. Claude
 /// Code reads the figure off a per-model catalog, which says 64000 for the rest of the line-up;
@@ -234,11 +234,11 @@ pub(super) fn model_supports_temperature(model: &str) -> bool {
 
 /// Whether a Claude model accepts `output_config.effort`.
 ///
-/// A denylist mirroring Claude Code 2.1.284's own gate, which excludes the Claude 3.x line, Opus
+/// A denylist mirroring Claude Code 2.1.301's own gate, which excludes the Claude 3.x line, Opus
 /// 4.0/4.1, Sonnet 4.0/4.5 and Haiku 4.5 and sends the field to everything else on the first-party
 /// endpoint. Same reasoning and same single caller as
-/// [`model_supports_mid_conversation_system`]: an unrecognized name here is one *newer* than the
-/// list, and effort is what those models are for.
+/// [`model_supports_mid_conversation_tool_changes`]: an unrecognized name here is one *newer* than
+/// the list, and effort is what those models are for.
 pub(super) fn model_supports_effort(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     if lower.contains("claude-3-") {
@@ -261,7 +261,7 @@ pub(super) fn model_supports_effort(model: &str) -> bool {
 /// The effort `claude-subscription` sends when the profile configures none.
 ///
 /// Claude Code reads a per-model `default_effort` out of a table bundled in its binary and clamps
-/// it to what that model accepts. `medium` is the 2.1.284 table's figure for Opus 5.5, the model
+/// it to what that model accepts. `medium` is the 2.1.301 table's figure for Opus 5.5, the model
 /// `profile add` suggests; most other entries say `high`, Opus 4.7's says `xhigh`, and `high` is
 /// what Claude Code falls back to for a model the table does not list.
 ///
@@ -272,51 +272,20 @@ pub(super) fn model_supports_effort(model: &str) -> bool {
 /// for the wrong tier. Anyone who wants a different one sets `effort` on the profile.
 pub(super) const DEFAULT_EFFORT: &str = "medium";
 
-/// Whether a Claude model supports mid-conversation system messages (the
-/// `mid-conversation-system-2026-04-07` beta).
-///
-/// A **denylist**, mirroring Claude Code 2.1.284's gate model for model: the Claude 3.x line, Opus
-/// 4.0/4.1/4.5/4.6/4.7, Sonnet 4.0/4.5/4.6 and Haiku 4.5 are excluded, and everything else on the
-/// first-party endpoint is sent it. The direction is the opposite of
-/// [`model_supports_temperature`]'s and deliberately so, because the two fail in opposite ways: an
-/// unrecognized model here is one *newer* than the list, which Claude Code sends the beta to, and
-/// withholding it would silently drop the mid-conversation system messages meka relies on. It is
-/// safe only because this gate has exactly one caller, `claude-subscription`, whose endpoint is
-/// always Anthropic's, so an unrecognized name there is necessarily a real Claude. Do not reach
-/// for it from a backend a `base_url` can point anywhere.
-pub(super) fn model_supports_mid_conversation_system(model: &str) -> bool {
-    let lower = model.to_ascii_lowercase();
-    if lower.contains("claude-3-") {
-        return false;
-    }
-    let Some(version) = parse_model_version(&lower) else {
-        return true;
-    };
-    if lower.contains("opus") {
-        !matches!(version, (4, 0) | (4, 1) | (4, 5) | (4, 6) | (4, 7))
-    } else if lower.contains("sonnet") {
-        !matches!(version, (4, 0) | (4, 5) | (4, 6))
-    } else if lower.contains("haiku") {
-        version != (4, 5)
-    } else {
-        true
-    }
-}
-
 /// Whether a Claude model takes Claude Code's per-turn effort statements (the
 /// `per-turn-control-2026-07-01` beta).
 ///
-/// An **allowlist**, because that is the direction Claude Code 2.1.284's own gate points: it
+/// An **allowlist**, because that is the direction Claude Code 2.1.301's own gate points: it
 /// reads the `per_turn_effort` capability off the model catalog bundled in its binary, and a
-/// model the catalog does not list gets nothing. The catalog grants it to Opus 5.5, Sonnet 5.5
-/// and Fable 5.1 alone, so an unrecognized name, which in practice means one newer than this
-/// list, resolves to `false` and the beta is omitted, which every model tolerates.
+/// model the catalog does not list gets nothing. The catalog grants it to Opus 5.5, Sonnet 5.5,
+/// Haiku 5.5 and Fable 5.1 alone, so an unrecognized name, which in practice means one newer than
+/// this list, resolves to `false` and the beta is omitted, which every model tolerates.
 pub(super) fn model_supports_per_turn_effort(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     let Some(version) = parse_model_version(&lower) else {
         return false;
     };
-    if lower.contains("opus") || lower.contains("sonnet") {
+    if lower.contains("opus") || lower.contains("sonnet") || lower.contains("haiku") {
         version == (5, 5)
     } else if lower.contains("fable") {
         version == (5, 1)
@@ -328,17 +297,31 @@ pub(super) fn model_supports_per_turn_effort(model: &str) -> bool {
 /// Whether a Claude model accepts tool changes mid-conversation (the
 /// `mid-conversation-tool-changes-2026-07-01` beta).
 ///
-/// Claude Code 2.1.284 sends it where it sends the mid-conversation system beta, minus the two
-/// catalog entries that have `mid_conv_system` without `mid_conv_tool_change`, which are Sonnet 5
-/// and Sonnet 5.5; a model its catalog does not list is sent both. So this is
-/// [`model_supports_mid_conversation_system`]'s denylist plus the two Sonnets, pointed the same
-/// way for the same reason.
+/// A **denylist**, mirroring Claude Code 2.1.301's gate model for model: it reads the
+/// `mid_conv_tool_change` capability off its bundled catalog, which withholds it from the Claude
+/// 3.x line, Opus 4.0 through 4.7, Sonnet 4.0 through 5.0 and Haiku 4.5, and sends the beta to a
+/// model the catalog does not list. An unrecognized name here is one *newer* than the list, which
+/// Claude Code sends the beta to, and withholding it would silently drop the tool changes meka
+/// relies on. Safe only because this gate has exactly one caller, `claude-subscription`, whose
+/// endpoint is always Anthropic's, so an unrecognized name there is necessarily a real Claude. Do
+/// not reach for it from a backend a `base_url` can point anywhere.
 pub(super) fn model_supports_mid_conversation_tool_changes(model: &str) -> bool {
-    if !model_supports_mid_conversation_system(model) {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("claude-3-") {
         return false;
     }
-    let lower = model.to_ascii_lowercase();
-    !(lower.contains("sonnet") && matches!(parse_model_version(&lower), Some((5, 0) | (5, 5))))
+    let Some(version) = parse_model_version(&lower) else {
+        return true;
+    };
+    if lower.contains("opus") {
+        !matches!(version, (4, 0) | (4, 1) | (4, 5) | (4, 6) | (4, 7))
+    } else if lower.contains("sonnet") {
+        !matches!(version, (4, 0) | (4, 5) | (4, 6) | (5, 0))
+    } else if lower.contains("haiku") {
+        version != (4, 5)
+    } else {
+        true
+    }
 }
 
 /// The name of an SSE frame: the `type` the data names, else the `event:` line.
@@ -464,14 +447,28 @@ pub(super) fn convert_messages_to_claude_content(
                                     ToolResultContent::Image { source } => {
                                         claude_image_block(source)
                                     }
+                                    // The API expands the reference into the tool's definition
+                                    // where it sits, under the deferred-tools beta the declaring
+                                    // backends send.
+                                    ToolResultContent::ToolReference { tool_name } => {
+                                        serde_json::json!({
+                                            "type": "tool_reference",
+                                            "tool_name": tool_name,
+                                        })
+                                    }
                                 })
                                 .collect();
-                            serde_json::json!({
+                            // `is_error` is the API's optional flag with false as its default, and
+                            // Claude Code writes it only on a failure; a success carries no key.
+                            let mut block = serde_json::json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_use_id,
                                 "content": content,
-                                "is_error": is_error,
-                            })
+                            });
+                            if *is_error {
+                                block["is_error"] = serde_json::Value::Bool(true);
+                            }
+                            block
                         }
                         // Only a block Claude signed goes back to Claude: the API makes
                         // `signature` required and rejects the whole request without one. A block
@@ -570,6 +567,69 @@ pub(super) fn convert_tools_to_claude_tools(tools: &[ToolDefinition]) -> Vec<ser
             })
         })
         .collect()
+}
+
+/// The deferred tools of a request, declared with `defer_loading` so the API withholds their
+/// schemas until a `tool_reference` names them: listed beside the active tools, never in the
+/// prompt, which is what keeps the cached prefix whole across a load.
+pub(super) fn convert_deferred_tools_to_claude_tools(
+    tools: &[ToolDefinition],
+) -> Vec<serde_json::Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.parameters,
+                "defer_loading": true,
+            })
+        })
+        .collect()
+}
+
+/// Append `deferred` to the body's `tools`, creating the array for a request whose active tools
+/// are none, and keep a `tool_reference` block in the history only where this request declares
+/// its tool. The API expands a reference against the `tools` array, so one naming a tool that is
+/// not there (a server withdrew it, or the session moved to a profile that appends) is sent as the
+/// text of its name instead, in place, with any cache marker the block carries.
+pub(super) fn declare_deferred_tools(body: &mut serde_json::Value, deferred: &[ToolDefinition]) {
+    let declared: HashSet<&str> = deferred.iter().map(|tool| tool.name.as_str()).collect();
+    let result_blocks = body
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.get_mut("content")?.as_array_mut())
+        .flatten()
+        .filter(|block| block["type"] == "tool_result")
+        .filter_map(|block| block.get_mut("content")?.as_array_mut())
+        .flatten();
+    for item in result_blocks {
+        if item["type"] != "tool_reference" {
+            continue;
+        }
+        let name = item["tool_name"].as_str().unwrap_or_default();
+        if declared.contains(name) {
+            continue;
+        }
+        let name = serde_json::Value::String(name.to_string());
+        if let Some(fields) = item.as_object_mut() {
+            fields.remove("tool_name");
+            fields.insert("type".to_string(), "text".into());
+            fields.insert("text".to_string(), name);
+        }
+    }
+    if deferred.is_empty() {
+        return;
+    }
+    let declared = convert_deferred_tools_to_claude_tools(deferred);
+    match body.get_mut("tools").and_then(|tools| tools.as_array_mut()) {
+        Some(tools) => tools.extend(declared),
+        None => {
+            body["tools"] = serde_json::Value::Array(declared);
+        }
+    }
 }
 
 /// A Claude `stop_reason` as meka's own.
@@ -704,11 +764,16 @@ pub(super) trait ClaudeBackend: crate::oauth::RefreshesCredential + Send + Sync 
     /// `max_request_bytes`, else [`MAX_REQUEST_BYTES`].
     fn max_request_bytes(&self) -> usize;
     /// The request body for one completion, before serialization.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per request field, as the request has"
+    )]
     fn request_body(
         &self,
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
+        deferred_tools: &[ToolDefinition],
         stream: bool,
         thinking: ThinkingOverride,
         attribution: &crate::provider::Attribution,
@@ -723,6 +788,7 @@ pub(super) trait ClaudeBackend: crate::oauth::RefreshesCredential + Send + Sync 
         &self,
         request: reqwest::RequestBuilder,
         has_tools: bool,
+        declares_deferred: bool,
         stream: bool,
         thinking: ThinkingOverride,
         attribution: &crate::provider::Attribution,
@@ -762,6 +828,7 @@ pub(super) async fn complete<B: ClaudeBackend>(
         system_prompt,
         messages,
         tools,
+        deferred_tools,
         thinking,
         attribution,
         ..
@@ -772,6 +839,7 @@ pub(super) async fn complete<B: ClaudeBackend>(
                 system_prompt,
                 messages,
                 tools,
+                deferred_tools,
                 false,
                 thinking,
                 &attribution,
@@ -789,6 +857,7 @@ pub(super) async fn complete<B: ClaudeBackend>(
                 .authenticated_request(
                     backend.client().post(backend.endpoint()),
                     !tools.is_empty(),
+                    !deferred_tools.is_empty(),
                     false,
                     thinking,
                     &attribution,
@@ -839,6 +908,7 @@ pub(super) async fn stream<B: ClaudeBackend>(
         system_prompt,
         messages,
         tools,
+        deferred_tools,
         thinking,
         attribution,
         ..
@@ -849,6 +919,7 @@ pub(super) async fn stream<B: ClaudeBackend>(
                 system_prompt,
                 messages,
                 tools,
+                deferred_tools,
                 true,
                 thinking,
                 &attribution,
@@ -872,6 +943,7 @@ pub(super) async fn stream<B: ClaudeBackend>(
                 .authenticated_request(
                     backend.client().post(backend.endpoint()),
                     !tools.is_empty(),
+                    !deferred_tools.is_empty(),
                     true,
                     thinking,
                     &attribution,
@@ -1983,6 +2055,126 @@ mod tests {
         assert!(block.get("signature").is_none());
     }
 
+    /// Deferred tools are declared beside the active ones with `defer_loading`, whether or not the
+    /// request had a `tools` array to extend, and a request with none to declare is left alone.
+    #[test]
+    fn declare_deferred_tools_lists_them_with_defer_loading() {
+        let deferred = [ToolDefinition::new(
+            "mcp__kv__probe",
+            "probe",
+            serde_json::json!({"type": "object"}),
+        )];
+        let mut with_tools = serde_json::json!({"tools": [{"name": "file_read"}]});
+        declare_deferred_tools(&mut with_tools, &deferred);
+        assert_eq!(with_tools["tools"][0]["name"], "file_read");
+        assert_eq!(with_tools["tools"][1]["name"], "mcp__kv__probe");
+        assert_eq!(with_tools["tools"][1]["defer_loading"], true);
+        assert!(with_tools["tools"][0].get("defer_loading").is_none());
+
+        let mut without_tools = serde_json::json!({"model": "m"});
+        declare_deferred_tools(&mut without_tools, &deferred);
+        assert_eq!(without_tools["tools"][0]["defer_loading"], true);
+
+        let mut nothing = serde_json::json!({"model": "m"});
+        declare_deferred_tools(&mut nothing, &[]);
+        assert!(nothing.get("tools").is_none());
+    }
+
+    /// A reference the request cannot back is sent as text: the API expands a reference against
+    /// the `tools` array and rejects one it cannot find there. The block keeps its place and its
+    /// cache marker, so the breakpoint the converter set stays where it was.
+    #[test]
+    fn a_reference_to_a_tool_the_request_does_not_declare_is_text() {
+        let mut body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [
+                        {"type": "tool_reference", "tool_name": "mcp__kv__probe"},
+                        {"type": "tool_reference", "tool_name": "mcp__gone__tool", "cache_control": {"type": "ephemeral"}},
+                    ],
+                    "is_error": false,
+                }],
+            }],
+        });
+        let deferred = [ToolDefinition::new(
+            "mcp__kv__probe",
+            "probe",
+            serde_json::json!({"type": "object"}),
+        )];
+        declare_deferred_tools(&mut body, &deferred);
+        let content = &body["messages"][0]["content"][0]["content"];
+        assert_eq!(content[0]["type"], "tool_reference", "{content}");
+        assert_eq!(content[1]["type"], "text", "{content}");
+        assert_eq!(content[1]["text"], "mcp__gone__tool");
+        assert!(content[1].get("tool_name").is_none());
+        assert_eq!(content[1]["cache_control"]["type"], "ephemeral");
+
+        declare_deferred_tools(&mut body, &[]);
+        let content = &body["messages"][0]["content"][0]["content"];
+        assert_eq!(
+            content[0]["type"], "text",
+            "nothing declared, nothing referenced: {content}"
+        );
+    }
+
+    /// A successful result carries no `is_error`, the API's default and the shape Claude Code
+    /// sends; a failed one says `true`.
+    #[test]
+    fn a_result_names_is_error_only_on_a_failure() {
+        let result = |is_error: bool| crate::conversation::Message {
+            role: crate::conversation::Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: vec![ToolResultContent::Text {
+                    text: "done".to_string(),
+                }],
+                is_error,
+            }],
+        };
+        let ok = convert_messages_to_claude_content(&[result(false)], None);
+        assert!(ok[0]["content"][0].get("is_error").is_none(), "{ok:?}");
+        assert_eq!(
+            ok[0]["content"][0]
+                .as_object()
+                .map(|block| block.keys().cloned().collect::<Vec<_>>()),
+            Some(vec![
+                "type".to_string(),
+                "tool_use_id".to_string(),
+                "content".to_string()
+            ])
+        );
+        let failed = convert_messages_to_claude_content(&[result(true)], None);
+        assert_eq!(failed[0]["content"][0]["is_error"], true);
+    }
+
+    /// A tool reference in a result goes to Claude as the `tool_reference` block the API expands.
+    #[test]
+    fn a_tool_reference_in_a_result_is_a_reference_block() {
+        let message = crate::conversation::Message {
+            role: crate::conversation::Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: vec![
+                    ToolResultContent::Text {
+                        text: "loaded".to_string(),
+                    },
+                    ToolResultContent::ToolReference {
+                        tool_name: "mcp__kv__probe".to_string(),
+                    },
+                ],
+                is_error: false,
+            }],
+        };
+        let converted = convert_messages_to_claude_content(&[message], None);
+        let content = &converted[0]["content"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "tool_reference", "{content}");
+        assert_eq!(content[1]["tool_name"], "mcp__kv__probe");
+    }
+
     /// The mirror of the other encoders' refusals, for a session recorded against OpenAI or a
     /// Chat Completions endpoint and resumed under Claude. Sealed reasoning is not a Claude
     /// signature and verbatim reasoning has none, and a thinking block without one is rejected,
@@ -2322,39 +2514,13 @@ mod tests {
     }
 
     #[test]
-    fn mid_conversation_system_is_sent_to_every_model_outside_the_denylist() {
-        // Everything outside Claude Code's denylist sends the beta, which is every current model
-        // and every future one.
+    fn per_turn_effort_goes_to_the_four_models_the_catalog_grants_it() {
         for model in [
-            "claude-opus-4-8",
-            "claude-opus-5",
-            "claude-opus-5-0",
             "claude-opus-5-5",
-            "claude-sonnet-5",
-            "claude-fable-5",
-            "claude-mythos-5",
-            "claude-opus-7",
-            "claude-something-new",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-1",
         ] {
-            assert!(model_supports_mid_conversation_system(model), "{model}");
-        }
-        // The denylist itself: Opus 4.7 and down, Sonnet 4.6 and down, Haiku 4.5, Claude 3.x.
-        for model in [
-            "claude-opus-4-7",
-            "claude-opus-4-6-20250514",
-            "claude-opus-4-0",
-            "claude-sonnet-4-6",
-            "claude-sonnet-4-5",
-            "claude-haiku-4-5-20251001",
-            "claude-3-5-sonnet-20241022",
-        ] {
-            assert!(!model_supports_mid_conversation_system(model), "{model}");
-        }
-    }
-
-    #[test]
-    fn per_turn_effort_goes_to_the_three_models_the_catalog_grants_it() {
-        for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"] {
             assert!(model_supports_per_turn_effort(model), "{model}");
         }
         // An allowlist: the rest of the line-up and anything newer are left out, since Claude
@@ -2373,25 +2539,32 @@ mod tests {
     }
 
     #[test]
-    fn mid_conversation_tool_changes_follow_the_system_beta_except_on_the_sonnets() {
+    fn mid_conversation_tool_changes_follow_the_catalog_s_denylist() {
+        // Every catalog entry with `mid_conv_tool_change`, and anything the catalog does not list.
         for model in [
             "claude-opus-4-8",
             "claude-opus-5",
             "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
             "claude-fable-5-1",
             "claude-mythos-5",
             "claude-opus-7",
+            "claude-something-new",
         ] {
             assert!(
                 model_supports_mid_conversation_tool_changes(model),
                 "{model}"
             );
         }
+        // The denylist itself: Opus 4.7 and down, Sonnet 5 and down, Haiku 4.5, Claude 3.x.
         for model in [
             "claude-sonnet-5",
-            "claude-sonnet-5-5",
             "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
             "claude-opus-4-7",
+            "claude-opus-4-6-20250514",
+            "claude-opus-4-0",
             "claude-haiku-4-5",
             "claude-3-5-sonnet-20241022",
         ] {

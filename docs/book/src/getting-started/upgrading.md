@@ -10,6 +10,26 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.76 to 0.77
+
+Nothing is renamed and no key is refused; three things change what a running deployment does.
+
+**Deferred tools are declared natively on the official endpoints.** A profile on
+`claude-subscription`, `chatgpt-subscription`, or `anthropic-messages` and `openai-responses`
+without a `base_url` now declares every deferred tool from the first request with `defer_loading`,
+and a load no longer rewrites the prompt cache. Set
+[`deferred_tools = "append"`](../configuration/config-file.md#deferred_tools) on a profile to keep
+the 0.76 shape. A profile behind a `base_url` keeps `append` unless it states `native`.
+
+**The first request of every live session rewrites its prompt cache once.** The tools array and
+the shape of a successful tool result both change, so a session resumed on 0.77 reads nothing back
+on its first request and everything from the second.
+
+**A `claude-subscription` session has no MCP meta-tools.** The `mcp_resource_*` and
+`mcp_prompt_*` tools leave the request and the catalog on that backend, because its endpoint refuses
+their names; see [Deferred tools](../tools/overview.md#deferred-tools). They are back the moment the
+session moves to another profile.
+
 ## 0.75 to 0.76
 
 **A sub-agent's scope is three fields.** `agent_spawn`'s `writable_roots` and `readable_roots`

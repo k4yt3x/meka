@@ -210,6 +210,11 @@ pub(crate) struct MockProvider {
     /// in the response at all, so a test that did not record this had nothing to assert against
     /// and passed with the production path reverted.
     streams: Mutex<Vec<StreamRequest>>,
+    /// How this mock says its wire carries deferred tools; unset reads as appended, like a wire
+    /// with no declaration of its own.
+    delivery: Mutex<Option<crate::provider::DeferredToolDelivery>>,
+    /// Tool names this mock's wire refuses; empty, like a wire that refuses none.
+    refused_names: Mutex<Vec<String>>,
 }
 
 /// One recorded [`Provider::stream`] call. Owned rather than borrowed because a test inspects it
@@ -292,10 +297,34 @@ impl MockProvider {
             ..Default::default()
         }
     }
+
+    /// The same mock answering [`Provider::deferred_tool_delivery`] with `delivery`.
+    #[cfg(test)]
+    pub(crate) fn delivering(self, delivery: crate::provider::DeferredToolDelivery) -> Self {
+        *crate::sync::lock(&self.delivery) = Some(delivery);
+        self
+    }
+
+    /// The same mock refusing the tool `name` by its name.
+    #[cfg(test)]
+    pub(crate) fn refusing(self, name: &str) -> Self {
+        crate::sync::lock(&self.refused_names).push(name.to_string());
+        self
+    }
 }
 
 #[async_trait]
 impl Provider for MockProvider {
+    fn deferred_tool_delivery(&self) -> crate::provider::DeferredToolDelivery {
+        crate::sync::lock(&self.delivery).unwrap_or(crate::provider::DeferredToolDelivery::Appended)
+    }
+
+    fn refuses_tool_name(&self, name: &str) -> bool {
+        crate::sync::lock(&self.refused_names)
+            .iter()
+            .any(|refused| refused == name)
+    }
+
     /// Drains one round and folds it into a finished message, so a single script drives either
     /// path. Non-streaming is not an exotic corner: `--no-stream` runs this way, sub-agents
     /// included, as does auto-compaction's summarizer.

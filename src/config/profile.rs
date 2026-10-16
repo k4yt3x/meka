@@ -117,6 +117,10 @@ pub(crate) struct ProfileConfig {
     /// `claude-subscription` only: how the model's thinking is presented, one of Claude Code's
     /// three display modes. Defaults to `updates`, Claude Code's own default.
     pub(crate) thinking_display: Option<crate::config::ThinkingDisplay>,
+    /// How the wire carries deferred tools, `native` or `append`; see
+    /// [`crate::config::DeferredTools`]. Unset takes the endpoint's answer: `native` on the
+    /// subscription backends and on an API-key backend with no `base_url`, `append` otherwise.
+    pub(crate) deferred_tools: Option<crate::config::DeferredTools>,
 }
 /// [`AccountConfig`]'s field order, as the key names a `config.toml` account table carries.
 pub(crate) const ACCOUNT_KEY_ORDER: &[&str] = &[
@@ -144,6 +148,7 @@ pub(crate) const PROFILE_KEY_ORDER: &[&str] = &[
     "max_request_bytes",
     "cache_control",
     "thinking_display",
+    "deferred_tools",
 ];
 /// Put one table's keys into `order`.
 ///
@@ -217,6 +222,8 @@ pub(crate) struct ProfileSettings {
     /// a figure meka has no reason to believe.
     pub(crate) thinking_budget: u64,
     pub(crate) thinking_display: crate::config::ThinkingDisplay,
+    /// See [`ProfileConfig::deferred_tools`]; resolved to the endpoint's default here.
+    pub(crate) deferred_tools: crate::config::DeferredTools,
     /// See [`ProfileConfig::max_request_bytes`]; `None` leaves the backend's default.
     pub(crate) max_request_bytes: Option<usize>,
     /// See [`ProfileConfig::cache_control`]; resolved to the default here.
@@ -332,6 +339,9 @@ pub(crate) fn resolve_profile(
             .or(default_thinking_budget)
             .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS),
         thinking_display: profile.thinking_display.unwrap_or_default(),
+        deferred_tools: profile.deferred_tools.unwrap_or(
+            crate::config::DeferredTools::default_for(backend, account.base_url.is_some()),
+        ),
     })
 }
 /// The `claude-subscription` device identifier for one account, seeding and persisting one when
@@ -687,6 +697,52 @@ mod tests {
         assert_eq!(settings.effort, None, "no effort means the provider's own");
     }
 
+    /// The key resolves to the endpoint's default when unset, and to what the profile says
+    /// otherwise.
+    #[test]
+    fn deferred_tools_resolves_to_the_endpoint_s_default_unless_stated() {
+        use crate::config::DeferredTools;
+        let resolve = |backend: &str, base_url: Option<&str>, stated: Option<DeferredTools>| {
+            let mut account = account_on(backend);
+            account.base_url = base_url.map(str::to_string);
+            let profile = ProfileConfig {
+                deferred_tools: stated,
+                ..ProfileConfig::default()
+            };
+            resolve_profile(&profile, &account, None, None, String::new())
+                .expect("resolves")
+                .deferred_tools
+        };
+        assert_eq!(
+            resolve("anthropic-messages", None, None),
+            DeferredTools::Native
+        );
+        assert_eq!(
+            resolve(
+                "anthropic-messages",
+                Some("https://openrouter.ai/api/v1"),
+                None
+            ),
+            DeferredTools::Append
+        );
+        assert_eq!(
+            resolve(
+                "anthropic-messages",
+                Some("https://openrouter.ai/api/v1"),
+                Some(DeferredTools::Native)
+            ),
+            DeferredTools::Native
+        );
+        assert_eq!(
+            resolve("claude-subscription", None, Some(DeferredTools::Append)),
+            DeferredTools::Append
+        );
+        assert_eq!(
+            resolve("openai-chat-completions", None, None),
+            DeferredTools::Append
+        );
+    }
+
     /// A profile's own window beats `[session].context_window`, which is the whole reason a
     /// per-profile value exists: one small model among several must not drag the rest down.
     #[test]
@@ -936,6 +992,7 @@ mod tests {
             "max_request_bytes = 8388608\n",
             "cache_control = false\n",
             "thinking_display = \"redacted\"\n",
+            "deferred_tools = \"append\"\n",
         );
 
         let parsed: ConfigFile =

@@ -265,7 +265,7 @@ Override the per-request output (completion) token cap. When unset, each backend
 | Claude, `off` | 32000 |
 | Every other backend | the endpoint's own |
 
-The Claude figures are meka's own defaults for the two Anthropic backends. The adaptive one is what Claude Code 2.1.284 sends for Opus 5.5, the model `meka profile add` suggests, and the most any model that takes adaptive thinking accepts; Claude Code's per-model catalog says the same for Sonnet 5.5 and 64000 for the rest of the line-up, and stating a figure here replaces the default. The OpenAI backends send no cap unless the profile states one, because each reaches whatever `base_url` names and the endpoint's default is that endpoint's fact.
+The Claude figures are meka's own defaults for the two Anthropic backends. The adaptive one is what Claude Code 2.1.301 sends for Opus 5.5, the model `meka profile add` suggests, and the most any model that takes adaptive thinking accepts; Claude Code's per-model catalog says the same for Sonnet 5.5 and 64000 for the rest of the line-up, and stating a figure here replaces the default. The OpenAI backends send no cap unless the profile states one, because each reaches whatever `base_url` names and the endpoint's default is that endpoint's fact.
 
 Under `thinking = "budgeted"` the value must exceed the profile's resolved thinking budget ([`thinking_budget`](#thinking_budget), else [`[thinking].budget`](#thinkingbudget), else 16000). `meka profile add` and `meka profile set` both refuse a profile that fails this, and it is validated again at startup.
 
@@ -403,6 +403,33 @@ account          = "anthropic"
 thinking_display = "updates"
 ```
 
+### `deferred_tools`
+
+How a request carries the tools the agent has not loaded: `native` or `append`. Every backend but
+`openai-chat-completions` reads it. Under `append` a deferred tool is absent from the request until
+`tool_load` adds its schema to the `tools` array; the array heads the cached prefix, so the request
+after a load rewrites the whole cache once. Under `native` every deferred tool is declared from the
+first request with `defer_loading`, the array never changes, and `tool_load` and `tool_search`
+answer with a reference the endpoint expands in place: Anthropic's `tool_reference` block on
+`anthropic-messages` and `claude-subscription`; on `openai-responses` and `chatgpt-subscription`
+the endpoint's own `tool_search` item, which replaces the two discovery tools there and takes a
+`query` to find or a list of `names` to load. Unset is `native` on the two subscription backends
+and on `anthropic-messages` and `openai-responses` without a `base_url`, and `append` elsewhere: a
+gateway that ignores `defer_loading` accepts it silently and shows the model every deferred schema
+from the first request, which costs more than `append` and is invisible. Whether a gateway honors
+it varies by model and by the upstream it routes a request to, so check a profile before setting
+`native` on it: a deferred tool called with the right arguments and no load means the schema was
+shown. See
+[Deferred tools](../tools/overview.md#deferred-tools) for the cost model and for `deferral`, the
+registry setting that decides which tools are deferred at all.
+
+```toml
+[profiles.claude-via-openrouter]
+account        = "openrouter"
+model          = "anthropic/claude-opus-5-5"
+deferred_tools = "native"
+```
+
 ## `meka account` CLI
 
 Add, re-authenticate, list and remove accounts without editing `config.toml` by hand. The
@@ -465,7 +492,7 @@ as writing an empty value: an absent key follows whatever the documented default
 which is what an unstated setting has always meant. `model` is the one key with no default to fall
 back to, so `--unset model` and an empty `model` are both refused.
 
-Ten keys are settable, each named after the [profile field](#profile-fields) it writes:
+Eleven keys are settable, each named after the [profile field](#profile-fields) it writes:
 
 | Key | Value |
 |---|---|
@@ -479,6 +506,7 @@ Ten keys are settable, each named after the [profile field](#profile-fields) it 
 | `max_request_bytes` | A whole number of bytes |
 | `cache_control` | `true` or `false` |
 | `thinking_display` | `updates`, `summarized` or `redacted` |
+| `deferred_tools` | `native` or `append` |
 
 A token count must be whole and at most 9223372036854775807, the largest integer TOML can represent;
 anything else is refused before the file is opened. A boolean takes `true` or `false` and nothing
@@ -628,7 +656,8 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `permission` | No | Server-wide permission override: `none`, `read`, `workspace` or `unrestricted`. Applies to every tool on this server, beating the `readOnlyHint` the server advertises and the `[mcp].default_permission` global fallback. Any other value is refused at startup, naming the line, the way an unknown key is. See *Permission resolution* below. |
 | `allowed_tools` | No | Optional allow-list of raw tool names (the form the server advertises, not the `server__tool` namespaced form). When set and non-empty, only these tools are registered; all others from this server are ignored. |
 | `disabled_tools` | No | Optional block-list of raw tool names. Applied **after** `allowed_tools`; tools listed here are never registered. Both lists can coexist; the net set is `allowed_tools \ disabled_tools`. |
-| `eager_load_tools` | No | Raw tool names that should ship **eager-loaded** instead of deferred. Listed tools skip the `tool_load` round-trip and sit in the cacheable tools-array prefix from turn 1. Use this for tools the agent invokes constantly (search, fetch, …); leave others deferred so the tools array stays lean. |
+| `eager_load_tools` | No | Raw tool names that ship **eager-loaded** whatever `deferral` says. Listed tools skip the `tool_load` round-trip and sit in the cacheable tools-array prefix from turn 1. Use this for tools the agent invokes constantly (search, fetch, …); leave others deferred so the tools array stays lean. |
+| `deferral` | No | How this server's other tools ship: `deferred` (listed under `[Tool discovery]`, schema on `tool_load`), `eager` (every tool declared from the first request) or `hidden` (not registered at all: not in the catalog, the request or the context gauge). Unset inherits `[mcp].deferral`. See [Deferred tools](../tools/overview.md#deferred-tools) for what each costs. |
 | `tool_permissions` | No | Per-tool permission overrides keyed by raw tool name, same values as `permission`. Beats the server-level `permission` and the server's `readOnlyHint` when resolving a tool's required permission. A level meka does not have is refused at startup, naming the line. |
 | `trust_read_only_hint` | No | Whether this server's `readOnlyHint: true` may classify a tool as `read`. Defaults to `true`. Set `false` for a server you have not audited: its hints become advisory for display only, so its tools fall through to the strict `unrestricted` fallback, skipping `[mcp].default_permission` (a global convenience must not re-grant what a per-server audit decision refused). A `readOnlyHint: false` is still honored either way, since it only raises the requirement. See *Permission resolution* below. |
 | `disabled` | No | When `true`, the server is skipped entirely at startup: no process is spawned, no HTTP connect is attempted. Flip it back with `meka mcp enable <name>` or by editing the config. Unset means `false`. |
@@ -639,6 +668,7 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | Field | Purpose |
 |-------|---------|
 | `default_permission` | Fallback permission for MCP tools whose server didn't advertise `readOnlyHint` and doesn't have a `permission` override. Accepts `"none"`, `"read"`, `"workspace"`, or `"unrestricted"`; any other value is refused at startup, naming the line. If unset the hardcoded fallback is `"unrestricted"` (strict). It stays there deliberately: an MCP server runs unsandboxed, so `workspace` cannot confine it. |
+| `deferral` | Default for every server's `deferral`: `deferred` (the default), `eager` or `hidden`. A server's own `deferral` wins, a name in its `eager_load_tools` ships eager under every value, and the MCP resource and prompt tools follow this setting. |
 | `default_required` | Default for every server's `required` flag. When `true`, all enabled servers gate the turn; when `false` (the default) only servers with `required = true` do. An unavailable optional server doesn't stop the turn; its failure is logged once when it happens, and its live state is shown by `/mcp list` on the screen or probed with `meka mcp reconnect <name>`. |
 | `grace` | Per-turn cap on how long to wait for still-`Pending` servers to connect before deciding. A duration string; default `"3s"`. `"0s"` skips the wait, for scripts that want to fail fast. |
 | `connect_timeout` | Per-server timeout for connect + `initialize` + `list_tools`. A hung stdio spawn or slow HTTPS handshake can't stall the whole fleet past this bound. A duration string; default `"30s"`. `"0s"` is refused at startup. |

@@ -478,6 +478,16 @@ pub(crate) enum ProfileAction {
             )
         )]
         thinking_display: Option<crate::config::ThinkingDisplay>,
+        #[arg(
+            long = "deferred-tools",
+            value_name = "MODE",
+            help = listed(
+                "How a request carries deferred tools",
+                crate::config::DeferredTools::ALL.iter().map(|setting| setting.name()),
+                " (default: by endpoint)"
+            )
+        )]
+        deferred_tools: Option<crate::config::DeferredTools>,
     },
     /// List configured profiles
     List {
@@ -910,6 +920,17 @@ pub(crate) enum McpAction {
         /// Raw tool name to eager-load (repeatable; skips `tool_load`)
         #[arg(long = "eager-load-tool", value_name = "TOOL")]
         eager_load_tool: Vec<String>,
+
+        #[arg(
+            long = "deferral",
+            value_name = "MODE",
+            help = listed(
+                "Tool loading",
+                crate::config::Deferral::ALL.iter().map(|deferral| deferral.name()),
+                " (default: `[mcp].deferral`)"
+            )
+        )]
+        deferral: Option<crate::config::Deferral>,
 
         /// Per-tool permission override (repeatable)
         #[arg(long = "tool-permission", value_name = "TOOL=LEVEL")]

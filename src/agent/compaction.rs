@@ -639,10 +639,17 @@ impl Agent {
         // `DegradeTier::ToolExchanges` empties a refused call in place while a previous compaction
         // replaces everything before it with a summary that names nothing. A short snapshot would
         // be made permanent by `prune_compacted_events`.
+        //
+        // Recorded as an appending wire reads the log whatever this profile's wire does: a reader
+        // on a declaring wire forgets the snapshot at the boundary anyway, and a session moved
+        // onto an appending profile later needs every load the log knows.
         let loaded_tools_snapshot: std::collections::HashSet<String> =
-            crate::tools::load_tool::extract_loaded_tool_names_from_events(messages.events())
-                .into_iter()
-                .collect();
+            crate::tools::load_tool::extract_loaded_tool_names_from_events(
+                messages.events(),
+                crate::provider::DeferredToolDelivery::Appended,
+            )
+            .into_iter()
+            .collect();
 
         // The last point before the window is destroyed, and the one that catches an interrupt
         // arriving inside the summarizer, whose request is sent under a token nothing fires:

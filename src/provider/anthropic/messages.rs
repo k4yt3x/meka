@@ -32,6 +32,9 @@ pub(crate) struct AnthropicMessagesProvider {
     interleaved_thinking: bool,
     /// See [`crate::config::ProfileConfig::cache_control`].
     cache_control: bool,
+    /// See `ProfileConfig::deferred_tools`: whether deferred tools are declared with
+    /// `defer_loading` and loaded in place, under the `advanced-tool-use-2025-11-20` beta.
+    deferred_tools: crate::config::DeferredTools,
     thinking: ThinkingMode,
     thinking_budget_tokens: u64,
     /// The settled `output_config.effort` for the request body, resolved once at construction from
@@ -53,6 +56,7 @@ impl AnthropicMessagesProvider {
             base_url,
             interleaved_thinking,
             cache_control,
+            deferred_tools,
             thinking,
             thinking_budget_tokens,
             effort,
@@ -72,6 +76,7 @@ impl AnthropicMessagesProvider {
             model,
             interleaved_thinking,
             cache_control,
+            deferred_tools,
             thinking,
             thinking_budget_tokens,
             resolved_effort,
@@ -89,8 +94,13 @@ impl AnthropicMessagesProvider {
         self.resolved_effort.clone()
     }
 
-    fn compute_betas(&self, thinking: ThinkingOverride) -> Option<String> {
+    fn compute_betas(&self, thinking: ThinkingOverride, declares_deferred: bool) -> Option<String> {
         let mut parts: Vec<&str> = Vec::new();
+        // The beta `defer_loading` and `tool_reference` need, sent only on a request that declares
+        // a deferred tool: the profile's `deferred_tools` says whether this endpoint takes it.
+        if declares_deferred {
+            parts.push("advanced-tool-use-2025-11-20");
+        }
         // Whether the endpoint takes the beta is the endpoint's fact, which this backend cannot
         // know from `base_url`; the account states it, defaulting to the direct API's answer, so
         // a gateway that refuses the header has a key rather than a `thinking = off`.
@@ -167,6 +177,7 @@ impl AnthropicMessagesProvider {
         &self,
         request: reqwest::RequestBuilder,
         thinking: ThinkingOverride,
+        declares_deferred: bool,
     ) -> reqwest::RequestBuilder {
         let mut request = request
             .header("accept", "application/json")
@@ -174,7 +185,7 @@ impl AnthropicMessagesProvider {
             .header("anthropic-version", "2023-06-01")
             .header("x-api-key", &self.api_key);
 
-        if let Some(betas) = self.compute_betas(thinking) {
+        if let Some(betas) = self.compute_betas(thinking, declares_deferred) {
             request = request.header("anthropic-beta", betas);
         }
 
@@ -204,17 +215,21 @@ impl shared::ClaudeBackend for AnthropicMessagesProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
+        deferred_tools: &[ToolDefinition],
         stream: bool,
         thinking: ThinkingOverride,
         _attribution: &crate::provider::Attribution,
     ) -> serde_json::Value {
-        self.build_request_body(system_prompt, messages, tools, stream, thinking)
+        let mut body = self.build_request_body(system_prompt, messages, tools, stream, thinking);
+        shared::declare_deferred_tools(&mut body, deferred_tools);
+        body
     }
 
     async fn authenticated_request(
         &self,
         request: reqwest::RequestBuilder,
         _has_tools: bool,
+        declares_deferred: bool,
         stream: bool,
         thinking: ThinkingOverride,
         _attribution: &crate::provider::Attribution,
@@ -224,12 +239,21 @@ impl shared::ClaudeBackend for AnthropicMessagesProvider {
         } else {
             request
         };
-        Ok(self.apply_headers(request, thinking))
+        Ok(self.apply_headers(request, thinking, declares_deferred))
     }
 }
 
 #[async_trait]
 impl Provider for AnthropicMessagesProvider {
+    fn deferred_tool_delivery(&self) -> crate::provider::DeferredToolDelivery {
+        match self.deferred_tools {
+            crate::config::DeferredTools::Native => {
+                crate::provider::DeferredToolDelivery::Referenced
+            }
+            crate::config::DeferredTools::Append => crate::provider::DeferredToolDelivery::Appended,
+        }
+    }
+
     async fn complete(
         &self,
         request: CompletionRequest<'_>,
@@ -485,10 +509,21 @@ mod tests {
             )
             .expect("provider")
         };
-        assert_eq!(build(false).compute_betas(ThinkingOverride::Inherit), None);
+        assert_eq!(
+            build(false).compute_betas(ThinkingOverride::Inherit, false),
+            None
+        );
+        // The deferred-tools beta rides only on a request that declares one, whatever the
+        // account says about thinking.
+        assert_eq!(
+            build(false)
+                .compute_betas(ThinkingOverride::Inherit, true)
+                .as_deref(),
+            Some("advanced-tool-use-2025-11-20")
+        );
         assert_eq!(
             build(true)
-                .compute_betas(ThinkingOverride::Inherit)
+                .compute_betas(ThinkingOverride::Inherit, false)
                 .as_deref(),
             Some("interleaved-thinking-2025-05-14")
         );
@@ -553,7 +588,7 @@ mod tests {
         }
         .expect("build test provider");
         let betas = thinking_on
-            .compute_betas(ThinkingOverride::Inherit)
+            .compute_betas(ThinkingOverride::Inherit, false)
             .unwrap_or_default();
         assert!(betas.contains("interleaved-thinking-2025-05-14"));
         assert!(
@@ -563,7 +598,7 @@ mod tests {
         // Thinking off on a 1M-capable model → no betas at all.
         assert!(
             provider("claude-opus-4-8", None)
-                .compute_betas(ThinkingOverride::Inherit)
+                .compute_betas(ThinkingOverride::Inherit, false)
                 .is_none()
         );
     }

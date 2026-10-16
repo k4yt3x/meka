@@ -1756,9 +1756,12 @@ mod tests {
         }
 
         assert!(
-            crate::tools::load_tool::extract_loaded_tool_names_from_events(messages.events())
-                .iter()
-                .any(|name| name == "web_fetch"),
+            crate::tools::load_tool::extract_loaded_tool_names_from_events(
+                messages.events(),
+                crate::provider::DeferredToolDelivery::Appended
+            )
+            .iter()
+            .any(|name| name == "web_fetch"),
             "a tool loaded before the first boundary must survive the second: {:?}",
             messages.events()
         );
@@ -1803,9 +1806,12 @@ mod tests {
             },
         ];
         assert!(
-            crate::tools::load_tool::extract_loaded_tool_names_from_events(&events)
-                .iter()
-                .any(|name| name == "web_fetch"),
+            crate::tools::load_tool::extract_loaded_tool_names_from_events(
+                &events,
+                crate::provider::DeferredToolDelivery::Appended
+            )
+            .iter()
+            .any(|name| name == "web_fetch"),
             "the log still holds the rows that recorded the load, and a repair only ever adds"
         );
     }

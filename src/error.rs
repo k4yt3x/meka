@@ -912,12 +912,15 @@ pub(crate) fn provider_stream_error(code: &str, message: String) -> MekaError {
     match code {
         // Anthropic `error.type`.
         "overloaded_error" | "rate_limit_error" | "api_error"
-        // OpenAI Responses `error.code`.
-        | "server_error" | "rate_limit_exceeded" | "overloaded" => MekaError::RetryableProvider {
-            message,
-            retry_after: None,
-            server_error_on_completion: false,
-        },
+        // OpenAI Responses `error.code`; `server_is_overloaded` is the ChatGPT backend's, captured
+        // on 2026-10-16 under `type: service_unavailable_error`.
+        | "server_error" | "rate_limit_exceeded" | "overloaded" | "server_is_overloaded" => {
+            MekaError::RetryableProvider {
+                message,
+                retry_after: None,
+                server_error_on_completion: false,
+            }
+        }
         _ => MekaError::Provider(message),
     }
 }

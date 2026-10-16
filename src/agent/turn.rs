@@ -487,6 +487,8 @@ pub(super) fn strip_images_and_truncate(content: &mut [ContentBlock]) {
                                 text: "[image]".to_string(),
                             };
                         }
+                        // A name, already as short as it gets.
+                        ToolResultContent::ToolReference { .. } => {}
                         ToolResultContent::Text { text } => {
                             if text.len() > MAX_TEXT_CHARS {
                                 let head_end = text.floor_char_boundary(HEAD_CHARS);
@@ -788,6 +790,10 @@ impl Agent {
                     &scheduled,
                     self.cells.permission.get(),
                     self.options.gate_tools.as_deref(),
+                )
+                .loading_by_search(
+                    self.tool_registry.deferred_tool_delivery()
+                        == crate::provider::DeferredToolDelivery::Searched,
                 );
         // A failed read is not evidence of deletion. Preserve what was known, including across a
         // compaction that removes the messages carrying it.
@@ -1886,15 +1892,18 @@ impl Agent {
 
         // Recompute the active tool set every iteration so a `tool_load` call earlier in this
         // turn becomes visible to the model on the very next request, without mutating any
-        // registry state. Append-only growth keeps the tools array's cache prefix stable.
+        // registry state.
         //
         // Read from events (not the materialized slice) so the deferred-tool snapshot stored on
         // `Event::CompactBoundary` survives across compaction; otherwise tools the model loaded
         // pre-compaction would silently drop out of the active set on the next turn.
-        let loaded =
-            crate::tools::load_tool::extract_loaded_tool_names_from_events(messages.events());
+        let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(
+            messages.events(),
+            self.tool_registry.deferred_tool_delivery(),
+        );
         let active = self.tool_registry.active_tools(&loaded);
         let tools: Arc<[ToolDefinition]> = Arc::from(active.definitions);
+        let deferred_tools: Arc<[ToolDefinition]> = Arc::from(active.deferred_definitions);
 
         // The part of the window that is not conversation, for `context_check` to report.
         // Re-stamped per round because the active tool set grows as `tool_load` pulls in deferred
@@ -1925,6 +1934,7 @@ impl Agent {
                 Arc::clone(&run.system_prompt),
                 Arc::from(api_messages),
                 tools,
+                deferred_tools,
                 request_attribution,
                 round.clone(),
                 progress,
@@ -1938,6 +1948,7 @@ impl Agent {
                 "the turn's provider call",
                 &self.provider(),
                 CompletionRequest::new(&run.system_prompt, api_messages, &tools)
+                    .declaring(&deferred_tools)
                     .attributed(request_attribution),
                 round,
                 round,
@@ -2651,11 +2662,16 @@ impl Agent {
     /// already seen partial output would duplicate or corrupt what's on screen. Nothing is
     /// persisted to the session DB until the whole turn's result is resolved (see `run_turn`),
     /// so a discarded attempt never leaves a partial write behind.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per request field, as the request has"
+    )]
     pub(super) async fn run_streaming(
         &self,
         system_prompt: Arc<str>,
         messages: Arc<[Message]>,
         tools: Arc<[ToolDefinition]>,
+        deferred_tools: Arc<[ToolDefinition]>,
         attribution: crate::provider::Attribution,
         cancellation: CancellationToken,
         progress: &mut StreamProgress,
@@ -2672,6 +2688,7 @@ impl Agent {
                     Arc::clone(&system_prompt),
                     Arc::clone(&messages),
                     Arc::clone(&tools),
+                    Arc::clone(&deferred_tools),
                     attribution.clone(),
                     cancellation.clone(),
                     progress,
@@ -2707,11 +2724,16 @@ impl Agent {
     /// `Message`. `content_started` is set the instant anything user-visible is forwarded to the
     /// frontend; see [`Self::run_streaming`], which reads it back to decide whether a failure is
     /// safe to retry.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per request field, as the request has"
+    )]
     pub(super) async fn run_streaming_attempt(
         &self,
         system_prompt: Arc<str>,
         messages: Arc<[Message]>,
         tools: Arc<[ToolDefinition]>,
+        deferred_tools: Arc<[ToolDefinition]>,
         attribution: crate::provider::Attribution,
         cancellation: CancellationToken,
         progress: &mut StreamProgress,
@@ -2729,6 +2751,7 @@ impl Agent {
             provider
                 .stream(
                     CompletionRequest::new(&system_prompt, &messages, &tools)
+                        .declaring(&deferred_tools)
                         .attributed(attribution),
                     event_sender,
                     cancellation_clone,
@@ -8039,6 +8062,69 @@ mod tests {
                 stop_reason: MockStopReason::ToolUse,
             },
         ]
+    }
+
+    /// A call of a tool the wire does not carry is refused at dispatch with the same sentence a
+    /// load gives, and the tool does not run: a model that saw the schema on an earlier profile
+    /// may still ask for it after the session moved.
+    #[tokio::test]
+    async fn a_call_of_a_tool_the_wire_does_not_carry_is_refused() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(
+            MockProvider::from_rounds(vec![
+                send_file_round(serde_json::json!({"path": "/tmp/a.png"})),
+                vec![
+                    MockEvent::Text {
+                        text: "noted".to_string(),
+                    },
+                    MockEvent::MessageEnd {
+                        stop_reason: MockStopReason::EndTurn,
+                    },
+                ],
+            ])
+            .refusing("mcp__bridge__send_file"),
+        );
+        let registry = send_file_registry();
+        registry.publish_profile(&crate::provider::PublishedProfile::detached(
+            &crate::provider::ResolvedProfile {
+                provider: Arc::clone(&provider) as Arc<dyn crate::provider::Provider>,
+                profile: "test".to_string(),
+                context_window: 200_000,
+                vision: true,
+            },
+        ));
+        let (agent, _store) = agent_with_registry_for_test(provider, registry).await;
+
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("send the picture".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn succeeds");
+
+        let results: String = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => {
+                    Some(ContentBlock::tool_result_text_content(content))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            results.contains(&crate::tools::not_carried_refusal("mcp__bridge__send_file")),
+            "{results}"
+        );
+        assert!(
+            !results.contains("Sent (message id"),
+            "the tool did not run: {results}"
+        );
     }
 
     /// The whole incident, end to end: a deferred tool is callable without `tool_load`, so a model

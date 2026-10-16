@@ -22,7 +22,7 @@ Manage configured servers without editing `config.toml` by hand:
 | `meka mcp disable <name>` | Set `disabled = true` on the server entry. The next `meka` start skips it entirely. |
 | `meka mcp enable <name>` | Clear the `disabled` flag, so the server connects on the next start. |
 | `meka mcp reconnect <name>` | Smoke-test a connect; exits non-zero with the error when it fails. |
-| `meka mcp tools <name> [--format json]` | Connect and list every advertised tool with its resolved permission, the chain step that decided it, and whether the current config allows it. Useful for populating `--allow-tool`, `--disable-tool`, or `--tool-permission` overrides without leaving the CLI. Under `json`, the object `GET /v1/mcp/{name}/tools` answers with (`server`, `tools[]` of `raw_name`, `description`, `required_permission`, `permission_source`, `allowed`) plus `read_only_hint_declined`. |
+| `meka mcp tools <name> [--format json]` | Connect and list every advertised tool with its resolved permission, the chain step that decided it, and whether the current config allows it. Useful for populating `--allow-tool`, `--disable-tool`, or `--tool-permission` overrides without leaving the CLI. Under `json`, the object `GET /v1/mcp/{name}/tools` answers with (`server`, `tools[]` of `raw_name`, `description`, `required_permission`, `permission_source`, `allowed`, `loading`) plus `read_only_hint_declined`. |
 | `meka mcp login <name>` | Drive interactive OAuth. If the server has no `[auth]` block and uses HTTP, assumes `type = "oauth"` and persists the block on success. With `--auth-token-stdin` or `--client-secret-stdin`, stores that secret and exits instead, which is also how you rotate one. |
 | `meka mcp logout <name>` | Call the provider's `revocation_endpoint` (RFC 7009) best-effort, then clear every stored credential for the server. |
 
@@ -59,6 +59,7 @@ A confidential OAuth client holds two at once: the long-lived client secret it a
 | `--allow-tool <TOOL>` | Raw tool name to allow (repeatable). When set, only listed tools register. |
 | `--disable-tool <TOOL>` | Raw tool name to block (repeatable). Applied after `--allow-tool`. |
 | `--eager-load-tool <TOOL>` | Raw tool name to eager-load (repeatable). Listed tools skip the `tool_load` round-trip and ship in the cacheable tools-array prefix from turn 1. |
+| `--deferral <MODE>` | Persist `deferral`: `deferred`, `eager` or `hidden`. Omitted, the server inherits `[mcp].deferral`. |
 | `--tool-permission <TOOL=LEVEL>` | Per-tool permission override (repeatable). `LEVEL` is `none`, `read`, `workspace` or `unrestricted`. |
 | `--no-login` | Skip the auto-login an HTTP server's probe would otherwise start; run `meka mcp login <name>` later. |
 | `--required` | Persist `required = true`, so a turn is refused while this server is not connected. Omitted, the server inherits `[mcp].default_required` and is optional by default. |
@@ -131,7 +132,7 @@ On the screen:
 
 ## Resources and prompts
 
-In addition to tools, meka exposes MCP resources and prompts through several builtin tools (deferred: the agent finds them under `[Tool discovery]` or with `tool_search`, calls `tool_load` for the schema, then invokes them):
+In addition to tools, meka exposes MCP resources and prompts through several builtin tools (deferred: the agent finds them under `[Tool discovery]` or with `tool_search`, calls `tool_load` for the schema, then invokes them; absent on a `claude-subscription` profile, whose endpoint refuses tool names starting with `mcp_`; they follow [`[mcp].deferral`](../configuration/config-file.md#mcp-top-level-table), so `eager` declares them from the first request and `hidden` leaves them out):
 
 | Builtin | Purpose |
 |---------|---------|

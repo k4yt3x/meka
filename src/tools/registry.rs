@@ -20,16 +20,12 @@ impl ToolRegistry {
         self.mark_deferred(name);
     }
 }
-/// Name of the meta-tool that loads a deferred tool's schema. Calls to this tool are scanned out of
-/// the conversation to compute the per-turn active tool set; see
-/// [`crate::tools::load_tool::extract_loaded_tool_names_from_events`].
-pub(crate) const LOAD_TOOL_NAME: &str = "tool_load";
+use crate::provider::DeferredToolDelivery;
+pub(crate) use crate::provider::{LOAD_TOOL_NAME, SEARCH_TOOL_NAME, is_discovery_tool};
 /// Most tools one `tool_load` call will render. A batch past this is more likely a model loading a
 /// whole server speculatively than a task that genuinely needs them all, and each schema is
 /// unbounded in size.
 pub(crate) const MAX_LOAD_TOOL_BATCH: usize = 10;
-/// Name of the meta-tool that searches the registry by keyword: `tool_load`'s sibling.
-pub(crate) const SEARCH_TOOL_NAME: &str = "tool_search";
 /// Most matches one `tool_search` call renders: one `tool_load` batch, so everything a search
 /// turns up can be loaded in the next call.
 pub(crate) const TOOL_SEARCH_MAX_RESULTS: usize = MAX_LOAD_TOOL_BATCH;
@@ -297,6 +293,32 @@ pub(crate) fn stale_scope_entries(
     }
     stale
 }
+/// How the wire of the session that published `profile` carries deferred tools. A cell no session
+/// published to (a test's, a gate probe's) appends, like a wire with no declaration of its own.
+pub(super) fn wire_delivery(
+    profile: &std::sync::OnceLock<crate::provider::PublishedProfile>,
+) -> DeferredToolDelivery {
+    profile
+        .get()
+        .map(|profile| profile.current().provider.deferred_tool_delivery())
+        .unwrap_or(DeferredToolDelivery::Appended)
+}
+/// Whether the wire of the session that published `profile` carries the tool `name`. A backend
+/// may refuse a name outright, and a session can move onto one mid-conversation, so the tool stays
+/// registered and every door that would carry, show, load or run it asks here, per request. A
+/// cell no session published to carries everything.
+pub(super) fn is_carried_by_wire(
+    profile: &std::sync::OnceLock<crate::provider::PublishedProfile>,
+    name: &str,
+) -> bool {
+    !profile
+        .get()
+        .is_some_and(|profile| profile.current().provider.refuses_tool_name(name))
+}
+/// The one sentence a load or a call of a tool the wire does not carry is answered with.
+pub(crate) fn not_carried_refusal(name: &str) -> String {
+    format!("Tool '{name}' is not available on this profile's backend.")
+}
 /// Server name out of a namespaced MCP tool name, or `None` for a built-in. Server names cannot
 /// contain `__` (`mcp::sanitize::normalize_server_name`), so the first occurrence splits them.
 pub(crate) fn server_of_tool(tool_name: &str) -> Option<&str> {
@@ -507,6 +529,11 @@ pub(crate) struct ToolRegistry {
     /// provider. Off leaves it out entirely rather than refusing it at dispatch: a parameter the
     /// model can see but cannot use is worse than one it cannot see.
     pub(super) background_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// The session's published profile, whose provider says how the wire carries deferred tools.
+    /// Read per request rather than copied, so a profile switch is one store into the cell and
+    /// nothing to keep in step. Unset on a registry no session published to (a test's, a gate
+    /// probe's), which appends.
+    pub(super) profile: Arc<std::sync::OnceLock<crate::provider::PublishedProfile>>,
     /// Scratchpad entries a parent lent this session read-only, recorded by the session-scoped
     /// pass so the turn's universal `scratchpad` parameter refuses them like the tools do. Empty
     /// on the root agent's registry.
@@ -592,7 +619,36 @@ impl Registered {
 /// The tools a request carries, and what their schemas cost the window.
 pub(crate) struct ActiveTools {
     pub(crate) definitions: Vec<ToolDefinition>,
+    /// The deferred tools a declaring wire lists beside `definitions` with `defer_loading`; empty
+    /// on a wire that appends a loaded tool to `definitions` instead.
+    pub(crate) deferred_definitions: Vec<ToolDefinition>,
     pub(crate) schema_tokens: u64,
+}
+
+/// The registry's tools as one request carries them; see [`ToolRegistry::carried`].
+struct Carried<'a> {
+    delivery: DeferredToolDelivery,
+    /// Every carried tool that is not deferred, in registration order, the two discovery tools
+    /// among them whether or not they ride.
+    active: Vec<&'a RegisteredTool>,
+    /// Every carried deferred tool, in registration order.
+    deferred: Vec<&'a RegisteredTool>,
+    /// Whether the two discovery tools ride as functions: only while something is deferred for
+    /// them to find, and never on a wire whose own search item does both jobs.
+    discovery_rides: bool,
+    /// Whether the deferred tools are declared outright, schemas and all, because nothing else
+    /// rides. A declaring endpoint refuses an array that is deferred through, and an appending
+    /// wire would leave such a scope (a sub-agent allow-listed to one MCP tool, with no
+    /// `tool_load` in it) nothing it can call; with nothing active there is no prefix to keep
+    /// stable either way.
+    declared_outright: bool,
+}
+
+impl Carried<'_> {
+    /// Whether `entry` is in the array: every active tool but a discovery tool that does not ride.
+    fn rides(&self, entry: &RegisteredTool) -> bool {
+        self.discovery_rides || !is_discovery_tool(&entry.definition.name)
+    }
 }
 
 impl ToolRegistry {
@@ -620,6 +676,7 @@ impl ToolRegistry {
             tool_scope: Arc::new(tool_scope),
             mcp_manager: Arc::new(std::sync::OnceLock::new()),
             background_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            profile: Arc::new(std::sync::OnceLock::new()),
             read_tracker: Arc::new(RwLock::new(HashMap::new())),
             write_scope: Arc::new(std::sync::RwLock::new(None)),
             inherited_scratchpad_names: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -775,6 +832,7 @@ impl ToolRegistry {
             mcp_manager: Arc::downgrade(&self.mcp_manager),
             permission_overrides: Arc::clone(&self.permission_overrides),
             permission: crate::tools::tests::shared_permission_for_test(),
+            profile: Arc::clone(&self.profile),
         }));
     }
 
@@ -819,11 +877,29 @@ impl ToolRegistry {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Every registered tool name. Unlike [`Self::tool_catalog`] this clones no descriptions and
-    /// imposes no order, which is all a "did you mean" lookup needs.
+    /// Hand the registry the session's published profile; see [`Self::profile`]. A second call is
+    /// ignored, since every session's registries share one cell.
+    pub(crate) fn publish_profile(&self, profile: &crate::provider::PublishedProfile) {
+        // `set` fails only when the slot is already filled, which is the documented no-op.
+        let _already_set = self.profile.set(profile.clone());
+    }
+
+    /// Whether this session's wire carries the tool `name` now; see [`is_carried_by_wire`].
+    pub(crate) fn is_carried(&self, name: &str) -> bool {
+        is_carried_by_wire(&self.profile, name)
+    }
+
+    /// How this session's wire carries deferred tools now; see [`wire_delivery`].
+    pub(crate) fn deferred_tool_delivery(&self) -> DeferredToolDelivery {
+        wire_delivery(&self.profile)
+    }
+
+    /// Every registered tool name the wire carries. Unlike [`Self::tool_catalog`] this clones no
+    /// descriptions and imposes no order, which is all a "did you mean" lookup needs.
     pub(crate) fn registered_tool_names(&self) -> Vec<String> {
         crate::sync::read(&self.tools)
             .names()
+            .filter(|name| self.is_carried(name))
             .map(str::to_string)
             .collect()
     }
@@ -898,45 +974,76 @@ impl ToolRegistry {
         self.active_tools(loaded).definitions
     }
 
-    /// The tools a request carries: every tool that is not deferred, in registration order, then
-    /// the deferred ones `loaded` names, in the order they were loaded, so the array only ever
-    /// grows at its end and the cache prefix ahead of it stands. With what their schemas cost, for
-    /// the gauge.
+    /// The tools a request carries, by the wire's delivery. Every tool that is not deferred, in
+    /// registration order; then, on a wire that appends, the deferred ones `loaded` names in the
+    /// order they were loaded, so a replay of the same conversation builds the same array. On a
+    /// wire that declares, every deferred tool rides separately as a deferred definition whatever
+    /// `loaded` holds, and `loaded` only prices the gauge. With what their schemas cost.
+    ///
+    /// `tool_load` and `tool_search` ride only while something is deferred for them to find, and
+    /// never on a wire whose own search item does both jobs: with every tool declared or hidden
+    /// they would be two schemas the model can only call for nothing.
     pub(crate) fn active_tools(&self, loaded: &[String]) -> ActiveTools {
         let deferred = crate::sync::read(&self.deferred);
         let tools = crate::sync::read(&self.tools);
+        let carried = self.carried(&tools, &deferred);
+        let delivery = carried.delivery;
 
         let mut definitions: Vec<ToolDefinition> = Vec::new();
+        let mut deferred_definitions: Vec<ToolDefinition> = Vec::new();
         let mut schema_tokens: u64 = 0;
-        for entry in tools
-            .iter()
-            .filter(|entry| !deferred.contains(&entry.definition.name))
-        {
+        for entry in carried.active.iter().filter(|entry| carried.rides(entry)) {
             definitions.push(entry.definition.clone());
             schema_tokens = schema_tokens.saturating_add(entry.schema_tokens);
         }
+        for entry in &carried.deferred {
+            if carried.declared_outright {
+                definitions.push(entry.definition.clone());
+                schema_tokens = schema_tokens.saturating_add(entry.schema_tokens);
+            } else if delivery.declares() {
+                deferred_definitions.push(entry.definition.clone());
+            }
+        }
 
+        // On a wire that appends, a loaded tool joins the array in load order, so a replay of the
+        // same conversation builds the same array; on a wire that declares, its schema reaches the
+        // model through the reference rather than the array, so the load only prices it. A name
+        // that isn't deferred is in the active half already; one with no registry entry was loaded
+        // and later removed (an MCP `tools/list_changed` swap) and drops out; a set declared
+        // outright is in the array and priced.
+        let mut loaded_names: HashSet<&str> = HashSet::new();
         for name in loaded {
-            // Names that aren't deferred are already in the active half; a name with no registry
-            // entry was loaded and later removed (an MCP `tools/list_changed` swap) and simply
-            // drops out.
-            if !deferred.contains(name) {
+            if carried.declared_outright || !deferred.contains(name) || !self.is_carried(name) {
                 continue;
             }
             if let Some(entry) = tools.get(name) {
-                definitions.push(entry.definition.clone());
+                loaded_names.insert(name.as_str());
+                if !delivery.declares() {
+                    definitions.push(entry.definition.clone());
+                }
                 schema_tokens = schema_tokens.saturating_add(entry.schema_tokens);
             }
         }
+        drop(carried);
         drop(tools);
         drop(deferred);
 
         if self.background_enabled() {
             for definition in &mut definitions {
-                if !crate::tools::detachable(&definition.name) {
-                    continue;
+                if crate::tools::detachable(&definition.name)
+                    && offer_background(&mut definition.parameters)
+                {
+                    schema_tokens = schema_tokens.saturating_add(*BACKGROUND_PROPERTY_TOKENS);
                 }
-                if offer_background(&mut definition.parameters) {
+            }
+            // A deferred declaration carries the property so the schema the endpoint expands
+            // offers it, but the window holds only the schemas the model loaded, so only those
+            // price it.
+            for definition in &mut deferred_definitions {
+                if crate::tools::detachable(&definition.name)
+                    && offer_background(&mut definition.parameters)
+                    && loaded_names.contains(definition.name.as_str())
+                {
                     schema_tokens = schema_tokens.saturating_add(*BACKGROUND_PROPERTY_TOKENS);
                 }
             }
@@ -944,34 +1051,80 @@ impl ToolRegistry {
 
         ActiveTools {
             definitions,
+            deferred_definitions,
             schema_tokens,
         }
+    }
+
+    /// What a request carries of the registry, before pricing: one classification for the array
+    /// and the catalog, so the catalog never calls a tool deferred that the array declares.
+    fn carried<'a>(&self, tools: &'a Registered, deferred_names: &HashSet<String>) -> Carried<'a> {
+        let delivery = self.deferred_tool_delivery();
+        let (deferred, active): (Vec<&RegisteredTool>, Vec<&RegisteredTool>) = tools
+            .iter()
+            .filter(|entry| self.is_carried(&entry.definition.name))
+            .partition(|entry| deferred_names.contains(&entry.definition.name));
+        let discovery_rides = !deferred.is_empty() && delivery != DeferredToolDelivery::Searched;
+        let mut carried = Carried {
+            delivery,
+            active,
+            deferred,
+            discovery_rides,
+            declared_outright: false,
+        };
+        carried.declared_outright = !carried.deferred.is_empty()
+            && !carried.active.iter().any(|entry| carried.rides(entry));
+        carried
     }
 
     /// Returns (name, description, required_permission, is_deferred) for every registered tool.
     /// Drives the permission-independent `[Available tools]` catalog plus the per-turn
     /// `[Permission context]` block that names currently-blocked tools. Sorted by (name) for
     /// deterministic output.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the classification borrows the registry guard until the entries are built; the guard \
+                  is scoped to that block and the sort runs after it is dropped"
+    )]
     pub(crate) fn tool_catalog(&self) -> Vec<(String, String, Permission, bool)> {
-        let deferred = crate::sync::read(&self.deferred);
-        let mut entries: Vec<(String, String, Permission, bool)> = crate::sync::read(&self.tools)
-            .iter()
-            .map(|entry| {
-                let def = &entry.definition;
-                let is_deferred = deferred.contains(&def.name);
-                let required = crate::tools::effective_permission(
-                    &self.permission_overrides,
-                    &def.name,
-                    entry.tool.required_permission(),
-                );
-                (
-                    def.name.clone(),
-                    def.description.clone(),
-                    required,
-                    is_deferred,
+        let entry_of = |entry: &RegisteredTool, is_deferred: bool| {
+            let def = &entry.definition;
+            let required = crate::tools::effective_permission(
+                &self.permission_overrides,
+                &def.name,
+                entry.tool.required_permission(),
+            );
+            (
+                def.name.clone(),
+                def.description.clone(),
+                required,
+                is_deferred,
+            )
+        };
+        let mut entries: Vec<(String, String, Permission, bool)> = {
+            let deferred = crate::sync::read(&self.deferred);
+            let tools = crate::sync::read(&self.tools);
+            let carried = self.carried(&tools, &deferred);
+            carried
+                .active
+                .iter()
+                // The wire's own search item answers to `tool_search`'s name; `tool_load` has no
+                // counterpart there and leaves the catalog as it leaves the request.
+                .filter(|entry| {
+                    !(entry.definition.name == LOAD_TOOL_NAME
+                        && carried.delivery == DeferredToolDelivery::Searched)
+                })
+                .map(|entry| entry_of(entry, false))
+                // A set declared outright is in the array with its schemas, so to the model it is
+                // not deferred.
+                .chain(
+                    carried
+                        .deferred
+                        .iter()
+                        .map(|entry| entry_of(entry, !carried.declared_outright)),
                 )
-            })
-            .collect();
+                .collect()
+        };
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         entries
     }
@@ -1084,19 +1237,19 @@ impl ToolRegistry {
         *crate::sync::write(&self.inherited_scratchpad_names) = inherited_scratchpad_names.clone();
         // The two registry meta-tools, root and sub-agent alike: the same door for both is what
         // keeps a worker's picture of its tools identical to its parent's.
-        self.register_builtin(Arc::new(load_tool::LoadToolTool {
+        let loader = load_tool::LoadToolTool {
             tools: Arc::downgrade(&self.tools),
             deferred: Arc::downgrade(&self.deferred),
             mcp_manager: Arc::downgrade(&self.mcp_manager),
             permission_overrides: Arc::clone(&self.permission_overrides),
             permission: cells.permission.clone(),
-        }));
+            profile: Arc::clone(&self.profile),
+        };
+        // In the order the model meets them: a search finds, a load follows.
         self.register_builtin(Arc::new(load_tool::ToolSearchTool {
-            tools: Arc::downgrade(&self.tools),
-            deferred: Arc::downgrade(&self.deferred),
-            permission_overrides: Arc::clone(&self.permission_overrides),
-            permission: cells.permission.clone(),
+            loader: loader.clone(),
         }));
+        self.register_builtin(Arc::new(loader));
         // Both stores register their tools only when the subsystem is switched on. Skipping is
         // the whole point of the config switch: a disabled subsystem must keep its schemas out of
         // every request, not ship tools that can only ever fail.
@@ -1305,6 +1458,7 @@ impl ToolRegistry {
         options: &crate::session::AgentOptions,
     ) -> Result<Self> {
         let registry = Self::new_with_filter(materials.core.builtin_filter.clone());
+        registry.publish_profile(&cells.profile);
         // Before the tools are registered, because both the `task_*` registration and the schema
         // splice read this flag.
         if materials.background.enabled {
@@ -1412,6 +1566,7 @@ impl ToolRegistry {
             materials.core.builtin_filter.clone(),
             scope.tool_scope,
         );
+        registry.publish_profile(&cells.profile);
         registry.register_core_tools(&materials.core, cells.site())?;
         registry.register_session_scoped_tools(materials, cells, SessionScope {
             // Never, whatever the installation's `agent_managed` says. See the registration site.
@@ -2220,13 +2375,334 @@ mod tests {
         assert!(!active.iter().any(|t| t.name == "fixture_alpha"));
     }
 
+    /// What a request carries follows the wire. Appending: a loaded deferred tool joins the array.
+    /// Declaring by reference: every deferred tool rides as a deferred definition whatever was
+    /// loaded, and the discovery tools stay. Declaring by search: the same, minus the discovery
+    /// tools, whose job the endpoint's own search item does.
     #[tokio::test]
-    async fn definitions_active_load_tool_itself_always_visible() {
-        // tool_load is the bootstrap meta-tool. It must appear in the active set for an empty
-        // conversation; otherwise the model has no way to discover deferred tools.
+    async fn the_active_set_follows_the_wire_s_delivery() {
+        use crate::provider::DeferredToolDelivery;
         let registry = tool_registry_for_test().await;
+        registry.register_deferred_fixture("fixture_alpha");
+        let publish = |delivery: DeferredToolDelivery| {
+            registry
+                .profile
+                .get()
+                .expect("the test registry published its cells' profile")
+                .store(&crate::provider::ResolvedProfile {
+                    provider: std::sync::Arc::new(
+                        crate::provider::mock::MockProvider::from_rounds(Vec::new())
+                            .delivering(delivery),
+                    ),
+                    profile: "test".to_string(),
+                    context_window: 1_000,
+                    vision: true,
+                });
+        };
+        let names = |definitions: &[ToolDefinition]| -> Vec<String> {
+            definitions
+                .iter()
+                .map(|definition| definition.name.clone())
+                .collect()
+        };
+        let loaded = vec!["fixture_alpha".to_string()];
+
+        publish(DeferredToolDelivery::Appended);
+        let appended = registry.active_tools(&loaded);
+        assert!(names(&appended.definitions).contains(&"fixture_alpha".to_string()));
+        assert!(appended.deferred_definitions.is_empty());
+
+        publish(DeferredToolDelivery::Referenced);
+        let referenced = registry.active_tools(&loaded);
+        assert_eq!(names(&referenced.deferred_definitions), vec![
+            "fixture_alpha"
+        ]);
+        let active = names(&referenced.definitions);
+        assert!(!active.contains(&"fixture_alpha".to_string()), "{active:?}");
+        assert!(
+            active.iter().any(|name| name == LOAD_TOOL_NAME),
+            "{active:?}"
+        );
+        assert!(
+            active.iter().any(|name| name == SEARCH_TOOL_NAME),
+            "{active:?}"
+        );
+
+        publish(DeferredToolDelivery::Searched);
+        let searched = registry.active_tools(&[]);
+        assert_eq!(names(&searched.deferred_definitions), vec!["fixture_alpha"]);
+        let active = names(&searched.definitions);
+        assert!(
+            !active.iter().any(|name| is_discovery_tool(name)),
+            "{active:?}"
+        );
+        // The catalog names what the request carries: the endpoint's item answers to
+        // `tool_search`'s name, and nothing on that wire answers to `tool_load`'s.
+        let catalog: Vec<String> = registry
+            .tool_catalog()
+            .into_iter()
+            .map(|(name, ..)| name)
+            .collect();
+        assert!(
+            catalog.iter().any(|name| name == SEARCH_TOOL_NAME),
+            "{catalog:?}"
+        );
+        assert!(
+            !catalog.iter().any(|name| name == LOAD_TOOL_NAME),
+            "{catalog:?}"
+        );
+    }
+
+    /// With nothing active the deferred tools are declared outright on a declaring wire, since the
+    /// API refuses an array that is deferred through; the moment something active is there they go
+    /// back to riding as deferred declarations.
+    #[tokio::test]
+    async fn an_all_deferred_set_is_declared_outright() {
+        use crate::provider::DeferredToolDelivery;
+        let registry = ToolRegistry::new();
+        registry.register_deferred_fixture("mcp__probe__fetch");
+        let published =
+            crate::provider::PublishedProfile::detached(&crate::provider::ResolvedProfile {
+                provider: std::sync::Arc::new(
+                    crate::provider::mock::MockProvider::from_rounds(Vec::new())
+                        .delivering(DeferredToolDelivery::Referenced),
+                ),
+                profile: "test".to_string(),
+                context_window: 1_000,
+                vision: true,
+            });
+        registry.publish_profile(&published);
+        let alone = registry.active_tools(&[]);
+        assert_eq!(
+            alone
+                .definitions
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mcp__probe__fetch"]
+        );
+        assert!(alone.deferred_definitions.is_empty());
+        assert!(alone.schema_tokens > 0, "declared outright, it is priced");
+        let loaded_too = registry.active_tools(&["mcp__probe__fetch".to_string()]);
+        assert_eq!(
+            loaded_too.schema_tokens, alone.schema_tokens,
+            "a load of a tool declared outright prices it once"
+        );
+        // The catalog says what the array does: a tool declared with its schema is not deferred
+        // to the model, so the context block lists it as available and asks for no load.
+        let catalog = registry.tool_catalog();
+        assert_eq!(catalog.len(), 1);
+        assert!(
+            !catalog[0].3,
+            "declared outright, so not deferred: {catalog:?}"
+        );
+
+        // An appending wire declares such a set outright too: with no `tool_load` in the scope,
+        // nothing else could ever make the tool callable.
+        published.store(&crate::provider::ResolvedProfile {
+            provider: std::sync::Arc::new(
+                crate::provider::mock::MockProvider::from_rounds(Vec::new())
+                    .delivering(DeferredToolDelivery::Appended),
+            ),
+            profile: "test".to_string(),
+            context_window: 1_000,
+            vision: true,
+        });
+        let appended = registry.active_tools(&[]);
+        assert_eq!(
+            appended
+                .definitions
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mcp__probe__fetch"]
+        );
+        published.store(&crate::provider::ResolvedProfile {
+            provider: std::sync::Arc::new(
+                crate::provider::mock::MockProvider::from_rounds(Vec::new())
+                    .delivering(DeferredToolDelivery::Referenced),
+            ),
+            profile: "test".to_string(),
+            context_window: 1_000,
+            vision: true,
+        });
+
+        registry.register_load_tool_for_test();
+        let with_discovery = registry.active_tools(&[]);
+        assert_eq!(
+            with_discovery
+                .deferred_definitions
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mcp__probe__fetch"]
+        );
+        assert!(!with_discovery.definitions.is_empty());
+    }
+
+    /// A name the wire refuses leaves the request, whether the tool is active, deferred, or
+    /// deferred and loaded, and leaves the catalog with it; the rest of the registry is untouched,
+    /// and the tool stays registered for the profile the session may move back to.
+    #[tokio::test]
+    async fn a_name_the_wire_refuses_leaves_the_request_and_the_catalog() {
+        use crate::provider::DeferredToolDelivery;
+        let registry = tool_registry_for_test().await;
+        registry.register_deferred_fixture("mcp_probe");
+        registry.register_deferred_fixture("fixture_alpha");
+        let publish = |delivery: DeferredToolDelivery| {
+            registry
+                .profile
+                .get()
+                .expect("the test registry published its cells' profile")
+                .store(&crate::provider::ResolvedProfile {
+                    provider: std::sync::Arc::new(
+                        crate::provider::mock::MockProvider::from_rounds(Vec::new())
+                            .delivering(delivery)
+                            .refusing("mcp_probe")
+                            .refusing("file_read"),
+                    ),
+                    profile: "test".to_string(),
+                    context_window: 1_000,
+                    vision: true,
+                });
+        };
+        let names = |definitions: &[ToolDefinition]| -> Vec<String> {
+            definitions
+                .iter()
+                .map(|definition| definition.name.clone())
+                .collect()
+        };
+        let loaded = vec!["mcp_probe".to_string(), "fixture_alpha".to_string()];
+
+        publish(DeferredToolDelivery::Appended);
+        let appended = names(&registry.active_tools(&loaded).definitions);
+        assert!(!appended.contains(&"file_read".to_string()), "{appended:?}");
+        assert!(!appended.contains(&"mcp_probe".to_string()), "{appended:?}");
+        assert!(
+            appended.contains(&"fixture_alpha".to_string()),
+            "{appended:?}"
+        );
+        assert!(appended.contains(&"file_write".to_string()), "{appended:?}");
+
+        publish(DeferredToolDelivery::Referenced);
+        let referenced = registry.active_tools(&[]);
+        assert_eq!(names(&referenced.deferred_definitions), vec![
+            "fixture_alpha"
+        ]);
+        assert!(!names(&referenced.definitions).contains(&"file_read".to_string()));
+
+        let catalog: Vec<String> = registry
+            .tool_catalog()
+            .into_iter()
+            .map(|(name, ..)| name)
+            .collect();
+        assert!(!catalog.contains(&"mcp_probe".to_string()), "{catalog:?}");
+        assert!(!catalog.contains(&"file_read".to_string()), "{catalog:?}");
+        assert!(
+            catalog.contains(&"fixture_alpha".to_string()),
+            "{catalog:?}"
+        );
+        assert!(registry.get("mcp_probe").is_some(), "still registered");
+        assert!(!registry.is_carried("mcp_probe"));
+        assert!(registry.is_carried("fixture_alpha"));
+    }
+
+    /// The two discovery tools exist to find deferred tools: with none deferred they are two
+    /// schemas the model can only call for nothing, and the moment one is deferred they ride.
+    #[tokio::test]
+    async fn the_discovery_tools_ride_only_while_something_is_deferred() {
+        let registry = tool_registry_for_test().await;
+        let names = |registry: &ToolRegistry| -> Vec<String> {
+            registry
+                .definitions_active(&[])
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect()
+        };
+        let bare = names(&registry);
+        assert!(!bare.iter().any(|name| is_discovery_tool(name)), "{bare:?}");
+        registry.register_deferred_fixture("fixture_alpha");
+        let with_deferred = names(&registry);
+        assert!(with_deferred.iter().any(|name| name == LOAD_TOOL_NAME));
+        assert!(with_deferred.iter().any(|name| name == SEARCH_TOOL_NAME));
+        assert!(!with_deferred.iter().any(|name| name == "fixture_alpha"));
+    }
+
+    /// A deferred tool the wire refuses is nothing for the discovery tools to find: with no other
+    /// deferred tool they leave the array, as they leave the context block, whose catalog never
+    /// listed the refused tool.
+    #[tokio::test]
+    async fn the_discovery_tools_do_not_ride_for_a_deferred_tool_the_wire_refuses() {
+        let registry = tool_registry_for_test().await;
+        registry.register_deferred_fixture("mcp_probe");
+        registry
+            .profile
+            .get()
+            .expect("the test registry published its cells' profile")
+            .store(&crate::provider::ResolvedProfile {
+                provider: std::sync::Arc::new(
+                    crate::provider::mock::MockProvider::from_rounds(Vec::new())
+                        .refusing("mcp_probe"),
+                ),
+                profile: "test".to_string(),
+                context_window: 1_000,
+                vision: true,
+            });
         let active = registry.definitions_active(&[]);
-        assert!(active.iter().any(|t| t.name == "tool_load"));
+        assert!(
+            !active.iter().any(|tool| is_discovery_tool(&tool.name)),
+            "{:?}",
+            active.iter().map(|tool| &tool.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// The gauge prices what the window holds. A deferred declaration carries the background
+    /// property so the expanded schema offers it, but until the model loads the tool neither the
+    /// schema nor the property is in the window, so a declaring wire prices the same as an
+    /// appending one with the same loads.
+    #[tokio::test]
+    async fn a_declaring_wire_prices_a_deferred_tool_only_once_loaded() {
+        use crate::provider::DeferredToolDelivery;
+        let registry = tool_registry_for_test().await;
+        registry.enable_background();
+        registry.register_deferred_fixture("mcp__kv__fetch");
+        let publish = |delivery: DeferredToolDelivery| {
+            registry
+                .profile
+                .get()
+                .expect("the test registry published its cells' profile")
+                .store(&crate::provider::ResolvedProfile {
+                    provider: std::sync::Arc::new(
+                        crate::provider::mock::MockProvider::from_rounds(Vec::new())
+                            .delivering(delivery),
+                    ),
+                    profile: "test".to_string(),
+                    context_window: 1_000,
+                    vision: true,
+                });
+        };
+        let loaded = vec!["mcp__kv__fetch".to_string()];
+        publish(DeferredToolDelivery::Appended);
+        let appended_bare = registry.active_tools(&[]).schema_tokens;
+        let appended_loaded = registry.active_tools(&loaded).schema_tokens;
+        publish(DeferredToolDelivery::Referenced);
+        let referenced_bare = registry.active_tools(&[]);
+        let referenced_loaded = registry.active_tools(&loaded);
+        assert!(
+            referenced_bare.deferred_definitions[0].parameters["properties"]
+                .get("background")
+                .is_some(),
+            "the declaration offers the property"
+        );
+        assert_eq!(
+            referenced_bare.schema_tokens, appended_bare,
+            "nothing loaded"
+        );
+        assert_eq!(
+            referenced_loaded.schema_tokens, appended_loaded,
+            "one loaded"
+        );
+        assert!(appended_loaded > appended_bare);
     }
 
     #[tokio::test]

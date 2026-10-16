@@ -185,6 +185,10 @@ pub(crate) enum ToolResultContentView {
         #[serde(skip_serializing_if = "Option::is_none")]
         hash: Option<String>,
     },
+    /// A deferred tool the result made callable, by name.
+    ToolReference {
+        tool_name: String,
+    },
 }
 
 /// The hash an image view names, when the source is a reference into the store.
@@ -423,6 +427,11 @@ pub(crate) fn tool_result_views(content: &[ToolResultContent]) -> Vec<ToolResult
                 media_type: source.media_type().to_string(),
                 hash: blob_hash(source),
             },
+            ToolResultContent::ToolReference { tool_name } => {
+                ToolResultContentView::ToolReference {
+                    tool_name: tool_name.clone(),
+                }
+            }
         })
         .collect()
 }

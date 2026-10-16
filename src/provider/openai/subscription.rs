@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use self::auth::{extract_account_id, extract_expiration_seconds};
 use super::responses_wire::{
-    build_request_body, include_encrypted_reasoning, request_reasoning_summary,
+    build_request_body_for, include_encrypted_reasoning, request_reasoning_summary,
 };
 use crate::{
     conversation::Message,
@@ -58,6 +58,9 @@ pub(crate) struct ChatGptSubscriptionProvider {
     max_output_tokens: Option<u64>,
     /// See [`crate::config::ProfileConfig::max_request_bytes`]; unset means no ceiling here.
     max_request_bytes: Option<usize>,
+    /// See `ProfileConfig::deferred_tools`: whether deferred tools are declared with
+    /// `defer_loading` and loaded through the endpoint's own `tool_search`.
+    deferred_tools: crate::config::DeferredTools,
     user_agent: String,
 }
 
@@ -75,6 +78,7 @@ impl ChatGptSubscriptionProvider {
             effort: reasoning_effort,
             max_output_tokens,
             max_request_bytes,
+            deferred_tools,
             ..
         } = settings;
         // chatgpt.com is fronted by Cloudflare; enabling the cookie jar lets bot-clearance cookies
@@ -109,6 +113,7 @@ impl ChatGptSubscriptionProvider {
             resolved_effort,
             max_output_tokens,
             max_request_bytes,
+            deferred_tools,
             user_agent: format!(
                 "meka/{} ({}; {})",
                 env!("CARGO_PKG_VERSION"),
@@ -134,9 +139,12 @@ impl ChatGptSubscriptionProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
+        deferred_tools: &[ToolDefinition],
         attribution: &crate::provider::Attribution,
     ) -> serde_json::Value {
-        let mut body = build_request_body(
+        let mut body = build_request_body_for(
+            self.deferred_tool_delivery(),
+            deferred_tools,
             &self.model,
             system_prompt,
             messages,
@@ -381,9 +389,10 @@ impl super::responses_wire::ResponsesBackend for ChatGptSubscriptionProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
+        deferred_tools: &[ToolDefinition],
         attribution: &crate::provider::Attribution,
     ) -> serde_json::Value {
-        self.build_body(system_prompt, messages, tools, attribution)
+        self.build_body(system_prompt, messages, tools, deferred_tools, attribution)
     }
 
     fn max_request_bytes(&self) -> Option<usize> {
@@ -423,6 +432,13 @@ impl crate::oauth::RefreshesCredential for ChatGptSubscriptionProvider {
 
 #[async_trait]
 impl Provider for ChatGptSubscriptionProvider {
+    fn deferred_tool_delivery(&self) -> crate::provider::DeferredToolDelivery {
+        match self.deferred_tools {
+            crate::config::DeferredTools::Native => crate::provider::DeferredToolDelivery::Searched,
+            crate::config::DeferredTools::Append => crate::provider::DeferredToolDelivery::Appended,
+        }
+    }
+
     async fn complete(
         &self,
         request: CompletionRequest<'_>,
@@ -907,12 +923,18 @@ mod tests {
             session_id: Some(session_id),
             ..Default::default()
         };
-        let body = provider_for_test().build_body("s", &[Message::user("hi")], &[], &attribution);
+        let body =
+            provider_for_test().build_body("s", &[Message::user("hi")], &[], &[], &attribution);
         assert_eq!(body["prompt_cache_key"], session_id.to_string(), "{body}");
 
         // A side query that serves no session sends no key rather than an empty one.
-        let bare =
-            provider_for_test().build_body("s", &[Message::user("hi")], &[], &Default::default());
+        let bare = provider_for_test().build_body(
+            "s",
+            &[Message::user("hi")],
+            &[],
+            &[],
+            &Default::default(),
+        );
         assert!(bare.get("prompt_cache_key").is_none(), "{bare}");
     }
 
@@ -1013,8 +1035,13 @@ mod tests {
     /// without reasoning carried across turns.
     #[test]
     fn the_subscription_asks_chatgpt_to_round_trip_its_reasoning() {
-        let body =
-            provider_for_test().build_body("s", &[Message::user("hi")], &[], &Default::default());
+        let body = provider_for_test().build_body(
+            "s",
+            &[Message::user("hi")],
+            &[],
+            &[],
+            &Default::default(),
+        );
         assert_eq!(body["reasoning"]["effort"], "high");
         let include = body["include"].as_array().expect("include");
         assert!(
@@ -1029,8 +1056,13 @@ mod tests {
     /// still thinks, the stream carries no summary deltas, and a long think renders as a hang.
     #[test]
     fn the_subscription_asks_chatgpt_to_summarize_its_reasoning() {
-        let body =
-            provider_for_test().build_body("s", &[Message::user("hi")], &[], &Default::default());
+        let body = provider_for_test().build_body(
+            "s",
+            &[Message::user("hi")],
+            &[],
+            &[],
+            &Default::default(),
+        );
         assert_eq!(body["reasoning"]["summary"], "auto", "{body}");
     }
 
@@ -1055,7 +1087,8 @@ mod tests {
             .max_output_tokens(None),
         )
         .expect("provider");
-        let body = unconfigured.build_body("s", &[Message::user("hi")], &[], &Default::default());
+        let body =
+            unconfigured.build_body("s", &[Message::user("hi")], &[], &[], &Default::default());
 
         assert!(body["reasoning"].get("effort").is_none(), "{body}");
         assert_eq!(body["reasoning"]["summary"], "auto", "{body}");

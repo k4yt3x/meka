@@ -2,6 +2,7 @@
 //! policy over `[[mcp.servers]]`, with no client state behind it.
 
 use super::*;
+use crate::config::Deferral;
 
 /// Decide whether a tool advertised by a server should be registered. Applies `allowed_tools`
 /// (restrict-in, when set and non-empty) then `disabled_tools` (always-remove). Both fields can
@@ -22,15 +23,20 @@ pub(crate) fn tool_is_allowed(server_config: &McpServerConfig, tool_raw_name: &s
     true
 }
 
-/// Whether the given raw tool name is in this server's
-/// [`eager_load_tools`][McpServerConfig::eager_load_tools] list. Mirrors [`tool_is_allowed`]'s
-/// shape. When true, the registration sites skip `mark_deferred` so the tool ships in the cacheable
-/// tools-array prefix from the first turn instead of after a `tool_load` round-trip.
-pub(crate) fn tool_should_eager_load(server_config: &McpServerConfig, tool_raw_name: &str) -> bool {
-    server_config
+/// What becomes of one of this server's tools: eager when its
+/// [`eager_load_tools`][McpServerConfig::eager_load_tools] names it, else the server's `deferral`,
+/// which [`crate::config::ResolvedConfig::resolve`] settled from `[mcp].deferral`. Mirrors
+/// [`tool_is_allowed`]'s shape, and is the one definition every registration path classifies by.
+pub(crate) fn tool_exposure(server_config: &McpServerConfig, tool_raw_name: &str) -> Deferral {
+    let named_eager = server_config
         .eager_load_tools
         .as_ref()
-        .is_some_and(|list| list.iter().any(|n| n == tool_raw_name))
+        .is_some_and(|list| list.iter().any(|n| n == tool_raw_name));
+    if named_eager {
+        Deferral::Eager
+    } else {
+        server_config.deferral.unwrap_or_default()
+    }
 }
 
 /// Warn once per entry in `allowed_tools` / `disabled_tools` / `eager_load_tools` /
@@ -151,6 +157,8 @@ pub(crate) struct AdvertisedTool {
     /// `false` if currently filtered out by `allowed_tools` / `disabled_tools`, i.e. the agent
     /// would never see this tool.
     pub(crate) allowed: bool,
+    /// How the tool ships when it is allowed: declared, deferred, or not registered at all.
+    pub(crate) exposure: Deferral,
     /// The server advertised `readOnlyHint: true` and `trust_read_only_hint = false` withheld it,
     /// so resolution fell through to the steps below.
     ///

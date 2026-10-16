@@ -519,6 +519,19 @@ pub(crate) trait Provider: Send + Sync {
         Ok(None)
     }
 
+    /// How this wire carries the tools a request defers. Default: appended on a load, which is
+    /// what a wire with no declaration of its own does.
+    fn deferred_tool_delivery(&self) -> DeferredToolDelivery {
+        DeferredToolDelivery::Appended
+    }
+
+    /// Whether this wire refuses a tool by its name alone, whatever its definition. Default: no
+    /// name is refused. A session can move onto such a wire mid-conversation, so the registry
+    /// keeps the tool and asks per request rather than at registration.
+    fn refuses_tool_name(&self, _name: &str) -> bool {
+        false
+    }
+
     /// The reasoning-effort value this provider will send on the wire (its settled
     /// `output_config.effort` / `reasoning.effort`), or `None` when it sends none. For display only
     /// (the `/status` model block); the request path reads the same settled slot. Default: `None`

@@ -138,6 +138,7 @@ pub(crate) fn estimate_message(message: &Message) -> u64 {
                 .map(|item| match item {
                     ToolResultContent::Text { text } => estimate_text(text),
                     ToolResultContent::Image { .. } => IMAGE_TOKENS,
+                    ToolResultContent::ToolReference { tool_name } => estimate_text(tool_name),
                 })
                 .fold(0u64, u64::saturating_add),
         };

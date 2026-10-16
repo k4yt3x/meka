@@ -26,6 +26,8 @@ pub(crate) struct ProviderBuilder {
     pub(super) device_id: String,
     pub(super) effort: Option<String>,
     pub(super) thinking_display: crate::config::ThinkingDisplay,
+    /// See `ProfileConfig::deferred_tools`; read by every backend but Chat Completions.
+    pub(super) deferred_tools: crate::config::DeferredTools,
     pub(super) context_window: Option<u64>,
     pub(super) max_output_tokens: Option<u64>,
     pub(super) max_request_bytes: Option<usize>,
@@ -52,6 +54,7 @@ impl ProviderBuilder {
             device_id: String::new(),
             effort: None,
             thinking_display: crate::config::ThinkingDisplay::default(),
+            deferred_tools: crate::config::DeferredTools::Append,
             context_window: None,
             max_output_tokens: None,
             max_request_bytes: None,
@@ -136,6 +139,11 @@ impl ProviderBuilder {
     /// How thinking is presented. Only consumed by `claude-subscription`.
     pub(crate) fn thinking_display(mut self, value: crate::config::ThinkingDisplay) -> Self {
         self.thinking_display = value;
+        self
+    }
+
+    pub(crate) fn deferred_tools(mut self, value: crate::config::DeferredTools) -> Self {
+        self.deferred_tools = value;
         self
     }
 
@@ -527,6 +535,7 @@ impl ProviderRegistry {
             .device_id(settings.device_id.clone())
             .effort(settings.effort.clone())
             .thinking_display(settings.thinking_display)
+            .deferred_tools(settings.deferred_tools)
             .context_window(settings.context_window)
             .max_output_tokens(settings.max_output_tokens)
             .max_request_bytes(settings.max_request_bytes)

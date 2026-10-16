@@ -1134,6 +1134,8 @@ impl Backend {
             // Not `claude-subscription`: its breakpoint is pinned by the captured wire, and its
             // endpoint cannot vary.
             "cache_control" => matches!(self, Self::AnthropicMessages),
+            // Chat Completions has no declaration to make.
+            "deferred_tools" => !matches!(self, Self::OpenAiChatCompletions),
             _ => true,
         }
     }
@@ -1580,6 +1582,8 @@ pub(crate) struct ResolvedConfig {
     /// resolution in `src/mcp.rs` doesn't have to re-read the config file. `None` means "no
     /// `[mcp]` default configured"; resolution falls through to the hardcoded `Unrestricted`.
     pub(crate) mcp_default_permission: Option<Permission>,
+    /// `[mcp].deferral`, for the MCP meta-tools: every server's own copy is settled on its entry.
+    pub(crate) mcp_deferral: Deferral,
     /// Non-secret projection of the configured profiles, for `GET /v1/profiles`.
     ///
     /// A projection rather than the profiles themselves, so a field added to [`ProfileConfig`]
@@ -2320,6 +2324,7 @@ impl ResolvedConfig {
             .http_concurrency
             .unwrap_or(DEFAULT_MCP_HTTP_CONCURRENCY);
         let mcp_default_permission = file_mcp.default_permission;
+        let mcp_deferral = file_mcp.deferral.unwrap_or_default();
         apply_cli_eager_load_overrides(&overrides.eager_load_tools, &mut mcp_servers);
         // Settle `required` here so no later consumer has to remember that `None` means "inherit
         // `default_required`". Everything downstream reads a plain `Some(bool)`, and the default
@@ -2327,6 +2332,9 @@ impl ResolvedConfig {
         // a future reader could gate on, believing it still decides turns on its own. It doesn't.
         for server in &mut mcp_servers {
             server.required = Some(server.required.unwrap_or(mcp_default_required));
+            // Settled for the same reason. The default is carried as well, unlike `required`'s,
+            // because the MCP meta-tools belong to no server and follow the install's answer.
+            server.deferral = Some(server.deferral.unwrap_or(mcp_deferral));
         }
 
         let profile_summaries: Vec<ProfileSummary> = profiles
@@ -2510,6 +2518,7 @@ impl ResolvedConfig {
                 .and_then(|settings| settings.max_output_tokens),
             mcp_servers,
             mcp_default_permission,
+            mcp_deferral,
             profile_summaries,
             instruction_files,
             standing_instructions,
@@ -2897,6 +2906,90 @@ impl From<ThinkingMode> for String {
     }
 }
 
+/// How a profile's wire carries the tools a request defers: the endpoint's own declaration, or
+/// the array growth every endpoint takes.
+///
+/// Unset, a profile takes `native` where the endpoint is known to honor it, the two subscription
+/// backends and an API-key backend with no `base_url`, and `append` everywhere else. A gateway
+/// that ignores `defer_loading` accepts it silently and then shows every deferred schema from the
+/// first request, so the default errs toward append and the key is the way to say otherwise,
+/// per profile because one gateway answers differently per model behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum DeferredTools {
+    /// Deferred tools are declared from the first request and loaded in place.
+    Native,
+    /// A loaded tool joins the `tools` array on the next request.
+    Append,
+}
+
+impl DeferredTools {
+    pub(crate) const ALL: [DeferredTools; 2] = [Self::Append, Self::Native];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Append => "append",
+        }
+    }
+
+    pub(crate) fn supported() -> String {
+        Self::ALL
+            .iter()
+            .map(|setting| setting.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// What an unset key means for `backend`, given whether the account names a `base_url`.
+    pub(crate) const fn default_for(backend: Backend, has_base_url: bool) -> Self {
+        match backend {
+            Backend::ClaudeSubscription | Backend::ChatGptSubscription => Self::Native,
+            Backend::AnthropicMessages | Backend::OpenAiResponses if !has_base_url => Self::Native,
+            Backend::AnthropicMessages
+            | Backend::OpenAiResponses
+            | Backend::OpenAiChatCompletions => Self::Append,
+        }
+    }
+}
+
+impl std::fmt::Display for DeferredTools {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for DeferredTools {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|setting| setting.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a deferred tools setting. Supported: {}",
+                    Self::supported()
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for DeferredTools {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<DeferredTools> for String {
+    fn from(setting: DeferredTools) -> Self {
+        setting.name().to_string()
+    }
+}
+
 /// How a `claude-subscription` turn asks for its thinking to be presented: Claude Code's three
 /// display modes, one wire shape each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
@@ -3108,6 +3201,7 @@ mod tests {
             allowed_tools: None,
             disabled_tools: None,
             eager_load_tools: None,
+            deferral: None,
             tool_permissions: None,
             trust_read_only_hint: None,
             disabled: None,
@@ -4063,6 +4157,100 @@ required = false
         };
         assert_eq!(by_name("gates"), Some(true), "inherits default_required");
         assert_eq!(by_name("optout"), Some(false), "explicit opt-out wins");
+    }
+
+    /// Unset, the key takes the endpoint's answer: native where the endpoint is fixed or official,
+    /// append behind a `base_url`, and Chat Completions never reads it at all.
+    #[test]
+    fn deferred_tools_defaults_to_native_on_an_official_endpoint_only() {
+        use Backend::*;
+        for (backend, has_base_url, expected) in [
+            (ClaudeSubscription, false, DeferredTools::Native),
+            (ClaudeSubscription, true, DeferredTools::Native),
+            (ChatGptSubscription, false, DeferredTools::Native),
+            (ChatGptSubscription, true, DeferredTools::Native),
+            (AnthropicMessages, false, DeferredTools::Native),
+            (AnthropicMessages, true, DeferredTools::Append),
+            (OpenAiResponses, false, DeferredTools::Native),
+            (OpenAiResponses, true, DeferredTools::Append),
+            (OpenAiChatCompletions, false, DeferredTools::Append),
+            (OpenAiChatCompletions, true, DeferredTools::Append),
+        ] {
+            assert_eq!(
+                DeferredTools::default_for(backend, has_base_url),
+                expected,
+                "{backend} base_url={has_base_url}"
+            );
+        }
+        for backend in Backend::ALL {
+            assert_eq!(
+                backend.reads_profile_key("deferred_tools"),
+                backend != OpenAiChatCompletions,
+                "{backend}"
+            );
+        }
+    }
+
+    /// `[mcp].deferral` is settled onto every server that states none, a server's own setting
+    /// wins, and the install's answer is carried for the meta-tools; unset, everything defers.
+    #[test]
+    fn deferral_seeds_each_server_and_per_server_wins() {
+        let resolved = resolve_with_config(
+            r#"
+[mcp]
+deferral = "eager"
+
+[[mcp.servers]]
+name = "follows"
+transport = "http"
+url = "http://localhost/mcp"
+
+[[mcp.servers]]
+name = "locked"
+transport = "http"
+url = "http://localhost/mcp"
+deferral = "hidden"
+"#,
+        );
+        let by_name = |n: &str| {
+            resolved
+                .mcp_servers
+                .iter()
+                .find(|s| s.name == n)
+                .unwrap_or_else(|| panic!("{n} present"))
+                .deferral
+        };
+        assert_eq!(by_name("follows"), Some(Deferral::Eager));
+        assert_eq!(by_name("locked"), Some(Deferral::Hidden));
+        assert_eq!(resolved.mcp_deferral, Deferral::Eager);
+
+        let unset = resolve_with_config(
+            r#"
+[[mcp.servers]]
+name = "plain"
+transport = "http"
+url = "http://localhost/mcp"
+"#,
+        );
+        assert_eq!(unset.mcp_servers[0].deferral, Some(Deferral::Deferred));
+        assert_eq!(unset.mcp_deferral, Deferral::Deferred);
+        assert!(
+            toml::from_str::<McpServerConfig>(
+                "name = \"s\"\ntransport = \"http\"\nderferral = \"eager\""
+            )
+            .is_err(),
+            "an unknown key is refused"
+        );
+        let refused = toml::from_str::<McpServerConfig>(
+            "name = \"s\"\ntransport = \"http\"\ndeferral = \"lazy\"",
+        )
+        .expect_err("a spelling outside the three is refused");
+        assert!(
+            refused
+                .to_string()
+                .contains("Supported: deferred, eager, hidden"),
+            "{refused}"
+        );
     }
 
     /// The default is off: an unavailable server degrades the session instead of stopping it.
@@ -5350,6 +5538,8 @@ thinking = "budgeted"
         }
         check(&ThinkingMode::ALL, ThinkingMode::name);
         check(&McpTransport::ALL, McpTransport::name);
+        check(&Deferral::ALL, Deferral::name);
+        check(&DeferredTools::ALL, DeferredTools::name);
         check(&OutputFormat::ALL, OutputFormat::name);
         check(
             &crate::cli::SessionExportFormat::ALL,

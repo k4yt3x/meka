@@ -1143,6 +1143,7 @@ pub(super) fn build_completion_content(
                 ))),
                 None => text_content_block(crate::image::UNRESOLVED_IMAGE_PLACEHOLDER.to_string()),
             },
+            ToolResultContent::ToolReference { tool_name } => text_content_block(tool_name.clone()),
         })
         .collect()
 }

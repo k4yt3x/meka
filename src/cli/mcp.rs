@@ -456,7 +456,15 @@ pub(crate) async fn run_tools(
                 } else {
                     tool.permission_source.as_str().to_string()
                 },
-                if tool.allowed { "enabled" } else { "disabled" }.to_string(),
+                // The same words `meka tool list` uses for a built-in, plus `hidden`, which only
+                // an MCP tool can be.
+                match (tool.allowed, tool.exposure) {
+                    (false, _) => "disabled",
+                    (true, crate::config::Deferral::Eager) => "enabled",
+                    (true, crate::config::Deferral::Deferred) => "deferred",
+                    (true, crate::config::Deferral::Hidden) => "hidden",
+                }
+                .to_string(),
                 crate::text::prose_cell(&tool.description),
             ]
         })
@@ -859,6 +867,8 @@ pub(crate) struct AddArgs {
     pub(crate) disable_tool: Vec<String>,
     /// Raw tool names to eager-load (skip `tool_load` round-trip).
     pub(crate) eager_load_tool: Vec<String>,
+    /// `deferral` for the server's other tools.
+    pub(crate) deferral: Option<crate::config::Deferral>,
     /// Raw `NAME=LEVEL` pairs for per-tool permission overrides.
     pub(crate) tool_permission: Vec<String>,
     /// Persist with `required = true` so an unavailable server gates the turn instead of being
@@ -897,6 +907,7 @@ struct ResolvedAddArgs {
     allowed_tools: Option<Vec<String>>,
     disabled_tools: Option<Vec<String>>,
     eager_load_tools: Option<Vec<String>>,
+    deferral: Option<crate::config::Deferral>,
     tool_permissions: Option<std::collections::HashMap<String, crate::permission::Permission>>,
     no_login: bool,
     disabled: bool,
@@ -1200,6 +1211,7 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
         allow_tool,
         disable_tool,
         eager_load_tool,
+        deferral,
         tool_permission,
         disabled,
         required,
@@ -1226,7 +1238,6 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
                 .map_err(|error| usage_err(format!("`--permission`: {error}")))
         })
         .transpose()?;
-
     // Per-tool permission overrides arrive as `NAME=LEVEL` strings. Parse + validate here so bad
     // input never lands in config.toml.
     let tool_permissions = if tool_permission.is_empty() {
@@ -1313,6 +1324,7 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
                 allowed_tools,
                 disabled_tools,
                 eager_load_tools,
+                deferral,
                 tool_permissions,
                 no_login,
                 disabled,
@@ -1358,6 +1370,7 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
                 allowed_tools,
                 disabled_tools,
                 eager_load_tools,
+                deferral,
                 tool_permissions,
                 no_login,
                 disabled,
@@ -1514,6 +1527,7 @@ fn resolved_to_server_config(resolved: &ResolvedAddArgs) -> McpServerConfig {
         allowed_tools: resolved.allowed_tools.clone(),
         disabled_tools: resolved.disabled_tools.clone(),
         eager_load_tools: resolved.eager_load_tools.clone(),
+        deferral: resolved.deferral,
         tool_permissions: resolved.tool_permissions.clone(),
         // No `meka mcp add` flag drives this: declining a server's `readOnlyHint` is a standing
         // policy decision about a server you already distrust, not something to pick while adding
@@ -1615,6 +1629,9 @@ fn build_server_table(resolved: &ResolvedAddArgs) -> toml_edit::Table {
             "eager_load_tools",
             toml_edit::Item::Value(toml_edit::Value::Array(arr)),
         );
+    }
+    if let Some(deferral) = resolved.deferral {
+        table.insert("deferral", toml_edit::value(deferral.name()));
     }
     if let Some(permissions) = resolved.tool_permissions.as_ref()
         && !permissions.is_empty()
@@ -1965,6 +1982,7 @@ pub(crate) async fn run_mcp_subcommand(
             allow_tool,
             disable_tool,
             eager_load_tool,
+            deferral,
             tool_permission,
             disabled,
             required,
@@ -1999,6 +2017,7 @@ pub(crate) async fn run_mcp_subcommand(
                     allow_tool: allow_tool.clone(),
                     disable_tool: disable_tool.clone(),
                     eager_load_tool: eager_load_tool.clone(),
+                    deferral: *deferral,
                     tool_permission: tool_permission.clone(),
                     disabled: *disabled,
                     required: *required,
@@ -2041,6 +2060,7 @@ mod tests {
             allow_tool: Vec::new(),
             disable_tool: Vec::new(),
             eager_load_tool: Vec::new(),
+            deferral: None,
             tool_permission: Vec::new(),
             disabled: false,
             required: false,
@@ -2288,6 +2308,51 @@ mod tests {
         assert_eq!(round_trip(true), Some(true));
         // Left out entirely when false, so the server keeps inheriting `[mcp].default_required`.
         assert_eq!(round_trip(false), None);
+    }
+
+    /// `--deferral` is written as the key, and left out when the flag was not given, so the server
+    /// keeps inheriting `[mcp].deferral`; a spelling outside the three is refused at the flag.
+    #[test]
+    fn build_server_table_persists_deferral_only_when_set() {
+        let round_trip = |deferral: Option<crate::config::Deferral>| {
+            let mut args = bare_add("bridge", Some("http://127.0.0.1:9100/mcp"));
+            args.deferral = deferral;
+            let resolved = resolve_add_args(args)?;
+            let mut doc = toml_edit::DocumentMut::new();
+            let mut servers = toml_edit::ArrayOfTables::new();
+            servers.push(build_server_table(&resolved));
+            doc.insert(
+                "mcp",
+                toml_edit::Item::Table({
+                    let mut table = toml_edit::Table::new();
+                    table.insert("servers", toml_edit::Item::ArrayOfTables(servers));
+                    table
+                }),
+            );
+            let parsed: crate::config::ConfigFile =
+                toml::from_str(&doc.to_string()).expect("valid config");
+            Ok::<_, anyhow::Error>(parsed.mcp.expect("mcp").servers.expect("servers")[0].deferral)
+        };
+        assert_eq!(
+            round_trip(Some(crate::config::Deferral::Eager)).expect("resolve"),
+            Some(crate::config::Deferral::Eager)
+        );
+        assert_eq!(round_trip(None).expect("resolve"), None);
+        use clap::Parser as _;
+        let refused = crate::cli::Cli::try_parse_from([
+            "meka",
+            "mcp",
+            "add",
+            "--deferral",
+            "lazy",
+            "bridge",
+            "http://127.0.0.1:9100/mcp",
+        ])
+        .expect_err("refused at the flag");
+        assert!(
+            refused.to_string().contains("deferred, eager, hidden"),
+            "{refused}"
+        );
     }
 
     fn server_named(name: &str) -> McpServerConfig {

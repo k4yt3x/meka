@@ -15,13 +15,15 @@ use async_trait::async_trait;
 
 use super::{
     Admission, LOAD_TOOL_NAME, SEARCH_TOOL_NAME, TOOL_SEARCH_MAX_RESULTS, Tool, ToolOutput,
-    admit_tool_call, util::require_str,
+    admit_tool_call,
+    registry::{is_carried_by_wire, not_carried_refusal, wire_delivery},
+    util::require_str,
 };
 use crate::{
-    conversation::{ContentBlock, Event, Message},
+    conversation::{ContentBlock, Event, Message, ToolResultContent},
     error::Result,
     permission::{Permission, SharedPermission},
-    provider::ToolDefinition,
+    provider::{DeferredToolDelivery, ToolDefinition, load_door, search_tool_parameters},
 };
 
 type ToolSet = Weak<RwLock<super::registry::Registered>>;
@@ -31,6 +33,7 @@ type DeferredSet = Weak<RwLock<HashSet<String>>>;
 /// [`super::ToolRegistry`] like any other tool, so the same `Arc` lifecycle applies. The `Weak`
 /// handles avoid a self-referential cycle (registry → `Arc<dyn Tool>` → `Arc<RwLock<…>>` →
 /// registry).
+#[derive(Clone)]
 pub(super) struct LoadToolTool {
     pub(super) tools: ToolSet,
     pub(super) deferred: DeferredSet,
@@ -44,6 +47,10 @@ pub(super) struct LoadToolTool {
     /// The session's live level and approvals switch, read at call time as dispatch reads them, so
     /// a result says what a call would do now rather than at registration.
     pub(super) permission: SharedPermission,
+    /// The session's published profile, read at call time as the registry reads it: on a wire that
+    /// declares its deferred tools a load answers with references the wire expands, and carries no
+    /// schema text of its own.
+    pub(super) profile: Arc<std::sync::OnceLock<crate::provider::PublishedProfile>>,
 }
 
 impl LoadToolTool {
@@ -64,7 +71,7 @@ impl LoadToolTool {
             let registered: Vec<Arc<dyn Tool>> =
                 crate::sync::read(tools).tools().cloned().collect();
             let deferred = deferred_names(&self.deferred);
-            if let Some(matches) = render_search(
+            if let Some((matches, _)) = render_search(
                 &registered,
                 &deferred,
                 &self.permission_overrides,
@@ -95,6 +102,7 @@ impl LoadToolTool {
     ) -> String {
         let registered: Vec<String> = crate::sync::read(tools)
             .names()
+            .filter(|name| is_carried_by_wire(&self.profile, name))
             .map(str::to_string)
             .collect();
         crate::tools::did_you_mean_hint(name, registered.iter().map(String::as_str))
@@ -151,20 +159,30 @@ impl Tool for LoadToolTool {
             ));
         };
 
+        let delivery = wire_delivery(&self.profile);
+        let declares = delivery.declares();
         let mut sections: Vec<String> = Vec::new();
+        let mut references: Vec<ToolResultContent> = Vec::new();
         let mut resolved = 0usize;
+        let mut unresolved = 0usize;
         for name in &names {
             let tool = crate::sync::read(&tools)
                 .get(name)
                 .map(|entry| Arc::clone(&entry.tool));
 
             let Some(tool) = tool else {
+                unresolved += 1;
                 sections.push(match self.unavailable_server_reason(name).await {
                     Some(reason) => reason,
                     None => self.not_registered(name, &tools),
                 });
                 continue;
             };
+            if !is_carried_by_wire(&self.profile, name) {
+                unresolved += 1;
+                sections.push(not_carried_refusal(name));
+                continue;
+            }
             let definition = tool.definition();
 
             // A tool that is not deferred is already in the active set, so this is a no-op success:
@@ -194,6 +212,12 @@ impl Tool for LoadToolTool {
                 ));
                 continue;
             }
+            if declares {
+                references.push(ToolResultContent::ToolReference {
+                    tool_name: name.clone(),
+                });
+                continue;
+            }
 
             let schema = serde_json::to_string_pretty(&definition.parameters)
                 .unwrap_or_else(|_| definition.parameters.to_string());
@@ -209,6 +233,32 @@ impl Tool for LoadToolTool {
         let dropped = crate::tools::requested_tool_names(&input)
             .len()
             .saturating_sub(names.len());
+        // The wire expands a reference into the definition where the result sits, and takes a
+        // result made of references alone: text beside one is refused ("Tool definitions/code
+        // execution functions cannot be mixed with other content"). So a load the references can
+        // answer says nothing else, and one they cannot (a name that resolved to nothing, a batch
+        // past the cap) loads nothing and says why, as an error so no name is recorded as loaded.
+        if !references.is_empty() {
+            if unresolved == 0 && dropped == 0 {
+                let mut output = ToolOutput::text(String::new(), false);
+                output.content = references;
+                return Ok(output);
+            }
+            let door = load_door(delivery.loads_by_search());
+            let remedy = if dropped > 0 {
+                format!(
+                    "Nothing was loaded: a call loads at most {} names. Call `{door}` again with \
+                     at most that many.",
+                    crate::tools::MAX_LOAD_TOOL_BATCH
+                )
+            } else {
+                format!(
+                    "Nothing was loaded. Call `{door}` again with the names that are registered."
+                )
+            };
+            sections.push(remedy);
+            return Ok(ToolOutput::text(sections.join("\n\n---\n\n"), true));
+        }
         let capped = if dropped > 0 {
             format!(
                 " Only the first {} names were loaded; {} more were not. Call `tool_load` again \
@@ -236,15 +286,12 @@ impl Tool for LoadToolTool {
     }
 }
 
-/// Meta-tool that finds a tool by keyword. Held by the registry like [`LoadToolTool`], with the
-/// same `Weak` handles for the same reason.
+/// Meta-tool that finds a tool by keyword, and loads by name where the wire's own search item has
+/// one door for both.
 pub(super) struct ToolSearchTool {
-    pub(super) tools: ToolSet,
-    pub(super) deferred: DeferredSet,
-    /// See [`LoadToolTool::permission_overrides`].
-    pub(super) permission_overrides: Arc<HashMap<String, Permission>>,
-    /// See [`LoadToolTool::permission`].
-    pub(super) permission: SharedPermission,
+    /// The loader this search answers `names` through, and whose handles it searches with: the
+    /// Responses wire's search item takes `names` where meka's function tool takes `tool_load`.
+    pub(super) loader: LoadToolTool,
 }
 
 #[async_trait]
@@ -259,16 +306,8 @@ impl Tool for ToolSearchTool {
                  whether your current permission level allows a call and whether the tool is \
                  deferred. Use `tool_load` when its schema is absent from the API catalog."
             ),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Words to look for in tool names and descriptions.",
-                    }
-                },
-                "required": ["query"]
-            }),
+            // Read at call time, as dispatch reads it for the advisory: the shape is the wire's.
+            parameters: search_tool_parameters(wire_delivery(&self.loader.profile)),
             ..Default::default()
         }
     }
@@ -280,32 +319,62 @@ impl Tool for ToolSearchTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _context: crate::tools::ToolContext,
+        context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
+        let delivery = wire_delivery(&self.loader.profile);
+        // Where the endpoint's own search item is the one door that loads, a call naming tools is
+        // a load, whatever else it says; elsewhere `names` is not declared and `tool_load` loads.
+        if delivery == DeferredToolDelivery::Searched
+            && let Some(names) = input
+                .get("names")
+                .filter(|names| names.as_array().is_some_and(|names| !names.is_empty()))
+        {
+            return self
+                .loader
+                .execute(serde_json::json!({ "name": names }), context)
+                .await;
+        }
         // `require_str` refuses a missing or blank query, so the matcher never sees an empty one.
         let query = require_str(&input, "query", SEARCH_TOOL_NAME)?
             .trim()
             .to_string();
-        let Some(tools) = self.tools.upgrade() else {
+        let Some(tools) = self.loader.tools.upgrade() else {
             return Ok(ToolOutput::text(
                 "Error: tool registry is no longer available.".to_string(),
                 true,
             ));
         };
-        let registered: Vec<Arc<dyn Tool>> = crate::sync::read(&tools).tools().cloned().collect();
-        let deferred = deferred_names(&self.deferred);
-        Ok(
-            match render_search(
-                &registered,
-                &deferred,
-                &self.permission_overrides,
-                &self.permission,
-                &query,
-            ) {
-                Some(text) => ToolOutput::text(text, false),
-                None => ToolOutput::text(format!("No tool matches '{query}'."), true),
-            },
-        )
+        let registered: Vec<Arc<dyn Tool>> = crate::sync::read(&tools)
+            .iter()
+            .filter(|entry| is_carried_by_wire(&self.loader.profile, &entry.definition.name))
+            .map(|entry| Arc::clone(&entry.tool))
+            .collect();
+        let deferred = deferred_names(&self.loader.deferred);
+        let Some((text, matched_deferred)) = render_search(
+            &registered,
+            &deferred,
+            &self.loader.permission_overrides,
+            &self.loader.permission,
+            &query,
+        ) else {
+            return Ok(ToolOutput::text(
+                format!("No tool matches '{query}'."),
+                true,
+            ));
+        };
+        // On a wire that declares its deferred tools, every deferred match is loaded with the
+        // answer, as a reference the wire expands into the definition: a search is then one round
+        // trip, not two. The references stand alone, since the wire refuses text beside them; an
+        // active match is in the model's catalog already.
+        if delivery.declares() && !matched_deferred.is_empty() {
+            let mut output = ToolOutput::text(String::new(), false);
+            output.content = matched_deferred
+                .into_iter()
+                .map(|tool_name| ToolResultContent::ToolReference { tool_name })
+                .collect();
+            return Ok(output);
+        }
+        Ok(ToolOutput::text(text, false))
     }
 }
 
@@ -460,22 +529,27 @@ fn term_score(term: &str, name: &str, description: &str) -> usize {
 
 /// The `tool_search` result for `query` over `tools`, or `None` when nothing matched: the
 /// `[Tool discovery]` line per match, then what a call would do now and whether the tool is
-/// deferred, the top [`TOOL_SEARCH_MAX_RESULTS`] with the rest counted.
+/// deferred, the top [`TOOL_SEARCH_MAX_RESULTS`] with the rest counted. Beside the text, the
+/// deferred tools among the matches shown, for a wire that loads what a search finds.
 fn render_search(
     tools: &[Arc<dyn Tool>],
     deferred: &HashSet<String>,
     overrides: &HashMap<String, Permission>,
     permission: &SharedPermission,
     query: &str,
-) -> Option<String> {
+) -> Option<(String, Vec<String>)> {
     let matches = match_tools(tools, query);
     if matches.is_empty() {
         return None;
     }
     let shown = matches.len().min(TOOL_SEARCH_MAX_RESULTS);
     let mut out = format!("Tools matching '{query}':\n");
+    let mut matched_deferred = Vec::new();
     for found in &matches[..shown] {
         let name = &found.definition.name;
+        if deferred.contains(name) {
+            matched_deferred.push(name.clone());
+        }
         let required =
             crate::tools::effective_permission(overrides, name, found.tool.required_permission());
         let summary = crate::prompt::short_description(&found.definition.description);
@@ -501,20 +575,24 @@ fn render_search(
     if hidden > 0 {
         out.push_str(&format!("\n{hidden} more match; narrow the query.\n"));
     }
-    Some(out)
+    Some((out, matched_deferred))
 }
 
-/// Walk events and collect the names of tools loaded via successful `tool_load` calls. The only
-/// door for this question: a scan of the materialized slice cannot see a load whose exchange a
-/// compaction has summarized away or a repair has emptied, so this absorbs
-/// [`Event::CompactBoundary::loaded_tools_snapshot`] at a boundary and clears the pending uses
-/// inside the summarized window, whose results are below the view's logical start.
+/// Walk events and collect the names of tools loaded via successful `tool_load` calls and the
+/// tool references in successful results, which is how a declaring wire's `tool_search` loads.
+/// The only door for this question: a scan of the materialized slice cannot see a load whose
+/// exchange a compaction has summarized away or a repair has emptied, so this clears the pending
+/// uses inside the summarized window, whose results are below the view's logical start, and at
+/// the boundary absorbs [`Event::CompactBoundary::loaded_tools_snapshot`] under an appending
+/// `delivery`, whose array carries a load, or forgets every earlier load under a declaring one,
+/// whose references carried them and went with the window.
 ///
-/// Returns names in load order, de-duplicated. The order is what makes the tools array a stable
-/// cache prefix: `tool_load` calls only ever append to the conversation, so the array can only
-/// grow at the end, whereas the registry's own order would reinsert an earlier-registered tool
-/// ahead of one loaded first and re-cache the whole conversation behind it.
-pub(crate) fn extract_loaded_tool_names_from_events(events: &[Event]) -> Vec<String> {
+/// Returns names in load order, de-duplicated, so a resumed conversation builds the array its
+/// live turns built rather than one in the registry's order.
+pub(crate) fn extract_loaded_tool_names_from_events(
+    events: &[Event],
+    delivery: DeferredToolDelivery,
+) -> Vec<String> {
     use std::collections::HashMap;
     let mut loaded: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -536,18 +614,23 @@ pub(crate) fn extract_loaded_tool_names_from_events(events: &[Event]) -> Vec<Str
                 }
                 ContentBlock::ToolResult {
                     tool_use_id,
+                    content,
                     is_error,
-                    ..
                 } => {
-                    if let Some(loaded_names) = pending.remove(tool_use_id)
-                        && !is_error
-                    {
-                        // A batch load appends its names in call order, keeping the tools array's
-                        // growth append-only exactly as a sequence of single loads would.
-                        for loaded_name in loaded_names {
-                            if seen.insert(loaded_name.clone()) {
-                                loaded.push(loaded_name);
-                            }
+                    if *is_error {
+                        pending.remove(tool_use_id);
+                        continue;
+                    }
+                    // A batch load appends its names in call order, keeping the tools array's
+                    // growth append-only exactly as a sequence of single loads would.
+                    let by_call = pending.remove(tool_use_id).unwrap_or_default();
+                    let by_reference = content.iter().filter_map(|item| match item {
+                        ToolResultContent::ToolReference { tool_name } => Some(tool_name.clone()),
+                        _ => None,
+                    });
+                    for loaded_name in by_call.into_iter().chain(by_reference) {
+                        if seen.insert(loaded_name.clone()) {
+                            loaded.push(loaded_name);
                         }
                     }
                 }
@@ -578,6 +661,13 @@ pub(crate) fn extract_loaded_tool_names_from_events(events: &[Event]) -> Vec<Str
                 // Pending uses inside the summarized window are gone from the model's view; their
                 // would-be results are also gone. Drop them and absorb the snapshot.
                 pending.clear();
+                if delivery.declares() {
+                    // The references that showed the model each schema went with the window; the
+                    // catalog still lists the tool as deferred, so the model loads it again.
+                    loaded.clear();
+                    seen.clear();
+                    continue;
+                }
                 // The snapshot is an unordered set, so sort it for a deterministic tail. Continuity
                 // with the pre-boundary order isn't needed: compaction rewrites the head of the
                 // conversation and re-caches everything anyway. What matters is that every turn
@@ -691,12 +781,10 @@ mod tests {
             mcp_manager: std::sync::Weak::new(),
             permission_overrides: Arc::clone(&overrides),
             permission: permission.clone(),
+            profile: Arc::new(std::sync::OnceLock::new()),
         };
         let tool_search = ToolSearchTool {
-            tools: Arc::downgrade(&tools),
-            deferred: Arc::downgrade(&deferred),
-            permission_overrides: overrides,
-            permission,
+            loader: tool_load.clone(),
         };
         Fixture {
             tools: Some(tools),
@@ -781,6 +869,262 @@ mod tests {
 
     fn read_level() -> SharedPermission {
         SharedPermission::new(Permission::Read, crate::permission::EnabledPermissions::ALL)
+    }
+
+    /// Put the fixture's tools on a wire with `delivery`; both tools share the one cell.
+    fn deliver(fixture: &Fixture, delivery: crate::provider::DeferredToolDelivery) {
+        let published =
+            crate::provider::PublishedProfile::detached(&crate::provider::ResolvedProfile {
+                provider: Arc::new(
+                    crate::provider::mock::MockProvider::from_rounds(Vec::new())
+                        .delivering(delivery),
+                ),
+                profile: "test".to_string(),
+                context_window: 1_000,
+                vision: true,
+            });
+        let _already_set = fixture.tool_load.profile.set(published);
+    }
+
+    /// Put the fixture's tools on a wire that refuses `name`; both tools share the one cell.
+    fn refuse(fixture: &Fixture, name: &str) {
+        let published =
+            crate::provider::PublishedProfile::detached(&crate::provider::ResolvedProfile {
+                provider: Arc::new(
+                    crate::provider::mock::MockProvider::from_rounds(Vec::new()).refusing(name),
+                ),
+                profile: "test".to_string(),
+                context_window: 1_000,
+                vision: true,
+            });
+        let _already_set = fixture.tool_load.profile.set(published);
+    }
+
+    /// A name the wire refuses is not loadable and not searchable, while the rest of a batch
+    /// still loads: the refusal is a sentence per name, not a failed call.
+    #[tokio::test]
+    async fn a_name_the_wire_refuses_is_neither_loaded_nor_found() {
+        let fixture = build_test_tool(vec![fake_tool("mcp_probe"), fake_tool("fixture_alpha")], &[
+            "mcp_probe",
+            "fixture_alpha",
+        ]);
+        refuse(&fixture, "mcp_probe");
+        let alone = fixture
+            .tool_load
+            .execute(
+                serde_json::json!({"name": "mcp_probe"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("answers");
+        assert!(alone.is_error);
+        let text = crate::conversation::ContentBlock::tool_result_text_content(&alone.content);
+        assert_eq!(text, not_carried_refusal("mcp_probe"));
+
+        let batch = fixture
+            .tool_load
+            .execute(
+                serde_json::json!({"name": ["mcp_probe", "fixture_alpha"]}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("answers");
+        assert!(!batch.is_error, "the other name still loads");
+        let text = crate::conversation::ContentBlock::tool_result_text_content(&batch.content);
+        assert!(text.contains(&not_carried_refusal("mcp_probe")), "{text}");
+        assert!(text.contains("# fixture_alpha"), "{text}");
+
+        let found = search(&fixture, "probe").await;
+        assert!(found.is_error, "nothing the wire carries matches");
+        let found = search(&fixture, "fixture").await;
+        let text = crate::conversation::ContentBlock::tool_result_text_content(&found.content);
+        assert!(
+            text.contains("fixture_alpha") && !text.contains("mcp_probe"),
+            "{text}"
+        );
+    }
+
+    fn references_in(output: &ToolOutput) -> Vec<String> {
+        output
+            .content
+            .iter()
+            .filter_map(|item| match item {
+                ToolResultContent::ToolReference { tool_name } => Some(tool_name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// On a wire that declares its deferred tools, a load names the tool for the wire to expand
+    /// and carries no schema text of its own; on a wire that appends, the schema is the text.
+    #[tokio::test]
+    async fn a_load_on_a_declaring_wire_answers_with_a_reference_and_no_schema() {
+        let appending = build_test_tool(vec![fake_tool("fixture_alpha")], &["fixture_alpha"]);
+        let output = appending
+            .tool_load
+            .execute(
+                serde_json::json!({"name": "fixture_alpha"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("loads");
+        let text = crate::conversation::ContentBlock::tool_result_text_content(&output.content);
+        assert!(text.contains("## Schema"), "{text}");
+        assert!(references_in(&output).is_empty());
+
+        let declaring = build_test_tool(vec![fake_tool("fixture_alpha")], &["fixture_alpha"]);
+        deliver(
+            &declaring,
+            crate::provider::DeferredToolDelivery::Referenced,
+        );
+        let output = declaring
+            .tool_load
+            .execute(
+                serde_json::json!({"name": "fixture_alpha"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("loads");
+        assert!(
+            !output
+                .content
+                .iter()
+                .any(|item| matches!(item, ToolResultContent::Text { .. })),
+            "a reference rides alone: {:?}",
+            output.content
+        );
+        assert!(!output.is_error);
+        assert_eq!(references_in(&output), vec!["fixture_alpha"]);
+    }
+
+    /// A load the references cannot answer whole, because a name resolved to nothing or the batch
+    /// passed the cap, loads nothing and says so as an error, so the scan records no name from it;
+    /// text cannot ride beside a reference, and a partial load with no word about the rest would
+    /// leave the model believing it holds a schema it never saw.
+    #[tokio::test]
+    async fn a_load_a_reference_cannot_answer_whole_loads_nothing_on_a_declaring_wire() {
+        let fixture = build_test_tool(vec![fake_tool("fixture_alpha")], &["fixture_alpha"]);
+        deliver(&fixture, crate::provider::DeferredToolDelivery::Referenced);
+        let output = fixture
+            .tool_load
+            .execute(
+                serde_json::json!({"name": ["fixture_alpha", "fixture_missing"]}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("answers");
+        assert!(output.is_error);
+        assert!(references_in(&output).is_empty());
+        let text = crate::conversation::ContentBlock::tool_result_text_content(&output.content);
+        assert!(text.contains("fixture_missing"), "{text}");
+        assert!(
+            text.contains("Nothing was loaded") && text.contains("Call `tool_load` again"),
+            "{text}"
+        );
+
+        let over_the_cap: Vec<String> = (0..=crate::tools::MAX_LOAD_TOOL_BATCH)
+            .map(|index| format!("fixture_{index}"))
+            .collect();
+        let many = build_test_tool(
+            over_the_cap.iter().map(|name| fake_tool(name)).collect(),
+            &over_the_cap.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        deliver(&many, crate::provider::DeferredToolDelivery::Searched);
+        let output = many
+            .tool_search
+            .execute(
+                serde_json::json!({"names": over_the_cap}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("answers");
+        assert!(output.is_error);
+        assert!(references_in(&output).is_empty());
+        let text = crate::conversation::ContentBlock::tool_result_text_content(&output.content);
+        assert!(
+            text.contains("at most") && text.contains("Call `tool_search` again"),
+            "the remedy names the door this wire loads through: {text}"
+        );
+    }
+
+    /// A search on a declaring wire loads what it shows, as references; `names` on a search is a
+    /// load, which is how the Responses wire's one search item does both jobs.
+    #[tokio::test]
+    async fn a_search_on_a_declaring_wire_loads_its_matches_and_names_load_outright() {
+        let fixture = build_test_tool(
+            vec![fake_tool("fixture_alpha"), fake_tool("fixture_beta")],
+            &["fixture_alpha"],
+        );
+        let before = search(&fixture, "fixture").await;
+        assert!(
+            references_in(&before).is_empty(),
+            "appending wires reference nothing"
+        );
+        let function = fixture.tool_search.definition().parameters;
+        assert!(
+            function["properties"].get("names").is_none()
+                && function["required"] == serde_json::json!(["query"]),
+            "meka's own function takes a query and nothing else: {function}"
+        );
+        let by_names = serde_json::json!({"names": ["fixture_alpha"]});
+        assert!(
+            fixture
+                .tool_search
+                .execute(
+                    by_names.clone(),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
+                .await
+                .is_err(),
+            "names load nothing where the function is meka's: the query is required"
+        );
+
+        deliver(&fixture, crate::provider::DeferredToolDelivery::Searched);
+        let item = fixture.tool_search.definition().parameters;
+        assert!(
+            item["properties"].get("names").is_some() && item.get("required").is_none(),
+            "the endpoint's item takes names beside the query: {item}"
+        );
+        let found = search(&fixture, "fixture").await;
+        assert_eq!(
+            references_in(&found),
+            vec!["fixture_alpha"],
+            "only the deferred match is a reference; the active one needs none"
+        );
+        assert!(
+            !found
+                .content
+                .iter()
+                .any(|item| matches!(item, ToolResultContent::Text { .. })),
+            "the references stand alone: {:?}",
+            found.content
+        );
+        let named = fixture
+            .tool_search
+            .execute(
+                by_names,
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("loads by name");
+        assert_eq!(references_in(&named), vec!["fixture_alpha"]);
+        let empty = fixture
+            .tool_search
+            .execute(
+                serde_json::json!({"names": []}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("an empty list is no load, so the query is required");
+        assert!(empty.to_string().contains("query"), "{empty}");
+        assert!(
+            !named
+                .content
+                .iter()
+                .any(|item| matches!(item, ToolResultContent::Text { .. })),
+            "{:?}",
+            named.content
+        );
     }
 
     #[tokio::test]

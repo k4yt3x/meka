@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::responses_wire::{build_request_body, drop_replayed_reasoning};
+use super::responses_wire::{build_request_body_for, drop_replayed_reasoning};
 use crate::{
     conversation::Message,
     error::Result,
@@ -43,6 +43,9 @@ pub(crate) struct OpenAiResponsesProvider {
     max_output_tokens: Option<u64>,
     /// See [`crate::config::ProfileConfig::max_request_bytes`]; unset means no ceiling here.
     max_request_bytes: Option<usize>,
+    /// See `ProfileConfig::deferred_tools`: whether deferred tools are declared with
+    /// `defer_loading` and loaded through the endpoint's own `tool_search`.
+    deferred_tools: crate::config::DeferredTools,
 }
 
 impl OpenAiResponsesProvider {
@@ -54,6 +57,7 @@ impl OpenAiResponsesProvider {
             effort: reasoning_effort,
             max_output_tokens,
             max_request_bytes,
+            deferred_tools,
             ..
         } = settings;
         let resolved_effort = crate::provider::resolve_effort_level(reasoning_effort.as_deref());
@@ -73,6 +77,7 @@ impl OpenAiResponsesProvider {
             resolved_effort,
             max_output_tokens,
             max_request_bytes,
+            deferred_tools,
         })
     }
 
@@ -97,8 +102,11 @@ impl OpenAiResponsesProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
+        deferred_tools: &[ToolDefinition],
     ) -> serde_json::Value {
-        let mut body = build_request_body(
+        let mut body = build_request_body_for(
+            self.deferred_tool_delivery(),
+            deferred_tools,
             &self.model,
             system_prompt,
             messages,
@@ -132,9 +140,10 @@ impl super::responses_wire::ResponsesBackend for OpenAiResponsesProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
+        deferred_tools: &[ToolDefinition],
         _attribution: &crate::provider::Attribution,
     ) -> serde_json::Value {
-        self.build_body(system_prompt, messages, tools)
+        self.build_body(system_prompt, messages, tools, deferred_tools)
     }
 
     fn max_request_bytes(&self) -> Option<usize> {
@@ -154,6 +163,13 @@ impl super::responses_wire::ResponsesBackend for OpenAiResponsesProvider {
 
 #[async_trait]
 impl Provider for OpenAiResponsesProvider {
+    fn deferred_tool_delivery(&self) -> crate::provider::DeferredToolDelivery {
+        match self.deferred_tools {
+            crate::config::DeferredTools::Native => crate::provider::DeferredToolDelivery::Searched,
+            crate::config::DeferredTools::Append => crate::provider::DeferredToolDelivery::Appended,
+        }
+    }
+
     async fn complete(
         &self,
         request: CompletionRequest<'_>,
@@ -269,7 +285,7 @@ mod tests {
     #[test]
     fn an_openai_extension_is_never_sent_to_an_endpoint_that_may_not_know_it() {
         // Even with effort set, which is the condition that pulls `reasoning` in.
-        let body = provider(Some("high"), None).build_body("s", &[Message::user("hi")], &[]);
+        let body = provider(Some("high"), None).build_body("s", &[Message::user("hi")], &[], &[]);
         assert_eq!(body["reasoning"]["effort"], "high");
         assert!(body.get("include").is_none(), "{body}");
         assert!(body["reasoning"].get("summary").is_none(), "{body}");
@@ -308,7 +324,7 @@ mod tests {
             },
             Message::user("go on"),
         ];
-        let body = provider(Some("high"), None).build_body("s", &history, &[]);
+        let body = provider(Some("high"), None).build_body("s", &history, &[], &[]);
         let serialized = serde_json::to_string(&body).expect("serialize");
 
         assert!(!serialized.contains("CHATGPT_SEALED"), "{serialized}");
@@ -328,7 +344,7 @@ mod tests {
     /// Effort follows the same rule as every other backend: sent only when the profile asks.
     #[test]
     fn an_unconfigured_effort_omits_the_reasoning_block() {
-        let body = provider(None, None).build_body("", &[Message::user("hi")], &[]);
+        let body = provider(None, None).build_body("", &[Message::user("hi")], &[], &[]);
         assert!(body.get("reasoning").is_none(), "{body}");
         assert!(body.get("include").is_none(), "{body}");
         // An empty system prompt sends no `instructions` rather than an empty one.

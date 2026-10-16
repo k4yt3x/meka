@@ -16,9 +16,8 @@ use uuid::Uuid;
 
 use super::shared::{
     self, DEFAULT_EFFORT, convert_messages_to_claude_content, convert_tools_to_claude_tools,
-    model_is_haiku, model_supports_effort, model_supports_mid_conversation_system,
-    model_supports_mid_conversation_tool_changes, model_supports_modern_features,
-    model_supports_per_turn_effort, model_supports_temperature,
+    model_is_haiku, model_supports_effort, model_supports_mid_conversation_tool_changes,
+    model_supports_modern_features, model_supports_per_turn_effort, model_supports_temperature,
 };
 use crate::{
     config::ThinkingMode,
@@ -95,6 +94,10 @@ pub(crate) struct ClaudeSubscriptionProvider {
     /// When true, request `redacted_thinking` blocks via the `redact-thinking-2026-02-12` beta
     /// header.
     thinking_display: crate::config::ThinkingDisplay,
+    /// See `ProfileConfig::deferred_tools`: whether deferred tools are declared with
+    /// `defer_loading` and loaded in place. The beta they need is already on every request that
+    /// carries tools, as Claude Code's is.
+    deferred_tools: crate::config::DeferredTools,
     /// The profile's window; a million or more asks for the 1M-context beta.
     context_window: Option<u64>,
     /// Per-request output token cap from the profile; `None` keeps the built-in default.
@@ -119,6 +122,7 @@ impl ClaudeSubscriptionProvider {
             device_id,
             effort,
             thinking_display,
+            deferred_tools,
             context_window,
             max_output_tokens,
             max_request_bytes,
@@ -168,6 +172,7 @@ impl ClaudeSubscriptionProvider {
             thinking_budget_tokens,
             resolved_effort,
             thinking_display,
+            deferred_tools,
             context_window,
             max_output_tokens,
             max_request_bytes,
@@ -192,7 +197,7 @@ impl ClaudeSubscriptionProvider {
         self.resolved_effort.is_some()
     }
 
-    /// Mirrors Claude Code 2.1.284's beta assembly for a first-party OAuth turn, validated against
+    /// Mirrors Claude Code 2.1.301's beta assembly for a first-party OAuth turn, validated against
     /// live captures of its interactive CLI: Opus 5.5 and Opus 5 with tools, thinking on and
     /// display updates, fifteen betas in this order on Opus 5.5.
     ///
@@ -236,6 +241,8 @@ impl ClaudeSubscriptionProvider {
         compaction: bool,
         worker: bool,
     ) -> Option<String> {
+        // A deferred declaration needs the beta as much as an active tool does; `has_tools` here
+        // already covers both, as `authenticated_request` folds them before calling.
         let model = self.model.as_str();
         let mut parts: Vec<&'static str> = Vec::with_capacity(17);
 
@@ -258,9 +265,8 @@ impl ClaudeSubscriptionProvider {
 
         parts.push("prompt-caching-scope-2026-01-05");
 
-        if model_supports_mid_conversation_system(model) {
-            parts.push("mid-conversation-system-2026-04-07");
-        }
+        // No `mid-conversation-system-2026-04-07`: the feature is generally available, and Claude
+        // Code 2.1.301 refuses to send that header even when `ANTHROPIC_BETAS` names it.
         if model_supports_per_turn_effort(model) {
             parts.push("per-turn-control-2026-07-01");
         }
@@ -644,18 +650,21 @@ impl shared::ClaudeBackend for ClaudeSubscriptionProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
+        deferred_tools: &[ToolDefinition],
         stream: bool,
         thinking: ThinkingOverride,
         attribution: &crate::provider::Attribution,
     ) -> serde_json::Value {
-        self.build_request_body(
+        let mut body = self.build_request_body(
             system_prompt,
             messages,
             tools,
             stream,
             thinking,
             attribution,
-        )
+        );
+        shared::declare_deferred_tools(&mut body, deferred_tools);
+        body
     }
 
     fn finish_body(&self, system_prompt: &str, body_json: String) -> Result<String> {
@@ -670,6 +679,7 @@ impl shared::ClaudeBackend for ClaudeSubscriptionProvider {
         &self,
         request: reqwest::RequestBuilder,
         has_tools: bool,
+        declares_deferred: bool,
         _stream: bool,
         thinking: ThinkingOverride,
         attribution: &crate::provider::Attribution,
@@ -681,7 +691,7 @@ impl shared::ClaudeBackend for ClaudeSubscriptionProvider {
             &auth_header_value,
             &self.session_id,
             self.compute_betas(
-                has_tools,
+                has_tools || declares_deferred,
                 self.effective_thinking(thinking).is_on(),
                 attribution.compaction.is_some(),
                 attribution.worker.is_some(),
@@ -702,6 +712,23 @@ impl shared::ClaudeBackend for ClaudeSubscriptionProvider {
 
 #[async_trait]
 impl Provider for ClaudeSubscriptionProvider {
+    fn deferred_tool_delivery(&self) -> crate::provider::DeferredToolDelivery {
+        match self.deferred_tools {
+            crate::config::DeferredTools::Native => {
+                crate::provider::DeferredToolDelivery::Referenced
+            }
+            crate::config::DeferredTools::Append => crate::provider::DeferredToolDelivery::Appended,
+        }
+    }
+
+    /// The endpoint answers a request declaring a tool named `mcp_<x>` with 400 "You're out of
+    /// extra usage", whatever the tool's definition carries, while a server's
+    /// `mcp__<server>__<tool>` names pass; so meka's MCP meta-tools are never put on this wire.
+    /// Established by replaying captured requests with the name as the one variable, 2026-10-16.
+    fn refuses_tool_name(&self, name: &str) -> bool {
+        name.starts_with("mcp_") && !name.starts_with("mcp__")
+    }
+
     async fn complete(
         &self,
         request: CompletionRequest<'_>,
@@ -1983,7 +2010,7 @@ mod tests {
 
     #[test]
     fn betas_modern_thinking_model_full_set() {
-        // Tools + thinking + the default display: matches the live Claude Code 2.1.284 interactive
+        // Tools + thinking + the default display: matches the live Claude Code 2.1.301 interactive
         // CLI wire capture on Opus 5.5 exactly, minus `context-1m-2025-08-07`, which this profile's
         // window does not ask for. Display updates replace the redaction beta on a turn with
         // thinking on.
@@ -2005,7 +2032,6 @@ mod tests {
                 "thinking-token-count-2026-05-13",
                 "context-management-2025-06-27",
                 "prompt-caching-scope-2026-01-05",
-                "mid-conversation-system-2026-04-07",
                 "per-turn-control-2026-07-01",
                 "mid-conversation-tool-changes-2026-07-01",
                 "advanced-tool-use-2025-11-20",
@@ -2015,14 +2041,14 @@ mod tests {
                 "extended-cache-ttl-2025-04-11",
                 "cache-diagnosis-2026-04-07",
             ],
-            "Claude Code 2.1.284 CLI beta set"
+            "Claude Code 2.1.301 CLI beta set"
         );
     }
 
     #[test]
     fn the_two_model_gated_2026_07_betas_follow_the_catalog() {
-        // The Opus 5 capture of the same build carries tool changes but not per-turn control, and
-        // Sonnet 5 is the one catalog entry with mid-conversation system and not tool changes.
+        // Opus 5's catalog entry carries tool changes but not per-turn control; Sonnet 5's carries
+        // neither, while Sonnet 5.5 and Haiku 5.5 carry both.
         let betas = provider_with("claude-opus-5", true)
             .compute_betas(true, true, false, false)
             .unwrap();
@@ -2031,13 +2057,23 @@ mod tests {
             betas.contains("mid-conversation-tool-changes-2026-07-01"),
             "{betas}"
         );
+        for model in ["claude-sonnet-5-5", "claude-haiku-5-5"] {
+            let betas = provider_with(model, true)
+                .compute_betas(true, true, false, false)
+                .unwrap();
+            assert!(
+                betas.contains("per-turn-control-2026-07-01"),
+                "{model}: {betas}"
+            );
+            assert!(
+                betas.contains("mid-conversation-tool-changes-2026-07-01"),
+                "{model}: {betas}"
+            );
+        }
         let betas = provider_with("claude-sonnet-5", true)
             .compute_betas(true, true, false, false)
             .unwrap();
-        assert!(
-            betas.contains("mid-conversation-system-2026-04-07"),
-            "{betas}"
-        );
+        assert!(!betas.contains("per-turn-control-2026-07-01"), "{betas}");
         assert!(
             !betas.contains("mid-conversation-tool-changes-2026-07-01"),
             "{betas}"
@@ -2375,41 +2411,48 @@ mod tests {
     }
 
     #[test]
-    fn betas_mid_conversation_system_gated_on_model() {
-        // The gate is a denylist, so the newer models get it and the named older ones do not
-        // (mirrors Claude Code 2.1.263's own list).
+    fn mid_conversation_tool_changes_follow_the_catalog_s_denylist() {
+        // The gate is a denylist over Claude Code 2.1.301's catalog: every entry with the
+        // capability gets it, the named older ones and Sonnet 5 do not.
         for model in [
             "claude-opus-4-8",
             "claude-opus-5",
             "claude-opus-5-5",
-            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-1",
         ] {
             assert!(
                 provider_with(model, true)
                     .compute_betas(true, true, false, false)
                     .unwrap()
-                    .contains("mid-conversation-system-2026-04-07"),
-                "{model} must send mid-conversation-system"
+                    .contains("mid-conversation-tool-changes-2026-07-01"),
+                "{model} must send mid-conversation-tool-changes"
             );
         }
-        for model in ["claude-opus-4-6-20250514", "claude-haiku-4-5-20251001"] {
+        for model in [
+            "claude-opus-4-6-20250514",
+            "claude-opus-4-7",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+            "claude-haiku-4-5-20251001",
+        ] {
             assert!(
                 !provider_with(model, true)
                     .compute_betas(true, true, false, false)
                     .unwrap()
-                    .contains("mid-conversation-system-2026-04-07"),
-                "{model} must not send mid-conversation-system"
+                    .contains("mid-conversation-tool-changes-2026-07-01"),
+                "{model} must not send mid-conversation-tool-changes"
             );
         }
     }
 
     #[test]
-    fn a_model_newer_than_the_denylist_still_gets_mid_conversation_system() {
-        // The direction of the gate, not a fact about these names: Claude Code's own list excludes
-        // the older models and sends the beta to everything else, so a model meka has never heard
-        // of has to come out on the sending side. Flipping the gate to an allowlist passes every
-        // other test in this file and silently drops mid-conversation system messages the first
-        // time Anthropic ships a model.
+    fn a_model_newer_than_the_denylist_still_gets_mid_conversation_tool_changes() {
+        // The direction of the gate, not a fact about these names: Claude Code sends the beta to
+        // a model its catalog does not list, so a model meka has never heard of has to come out
+        // on the sending side. Flipping the gate to an allowlist passes every other test in this
+        // file and silently drops the beta the first time Anthropic ships a model.
         for model in [
             "claude-opus-6",
             "claude-sonnet-7-20270101",
@@ -2419,8 +2462,8 @@ mod tests {
                 provider_with(model, true)
                     .compute_betas(true, true, false, false)
                     .unwrap()
-                    .contains("mid-conversation-system-2026-04-07"),
-                "{model} is newer than the denylist and must still send mid-conversation-system"
+                    .contains("mid-conversation-tool-changes-2026-07-01"),
+                "{model} is newer than the denylist and must still send the beta"
             );
         }
     }
@@ -2721,10 +2764,96 @@ mod tests {
         assert!(turn["system"][1].get("cache_control").is_none());
     }
 
-    /// Claude Code 2.1.284 with `showThinkingSummaries` on, captured on Opus 5.5: the same set
+    /// A request whose only tools are deferred declarations still needs the beta the declarations
+    /// ride under, so the header follows the declarations as much as the active tools.
+    #[tokio::test]
+    async fn a_request_that_only_declares_deferred_tools_still_sends_the_beta() {
+        // An OAuth token rather than the API key the other tests use: this backend refuses an API
+        // key before it builds a request. Its expiry is a day out so no refresh is attempted.
+        let provider = ClaudeSubscriptionProvider::new(
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::ClaudeSubscription,
+                AuthCredential::OAuthToken {
+                    access_token: "access-test".to_string(),
+                    refresh_token: Some("refresh-test".to_string()),
+                    expires_at: Some(crate::oauth::now_epoch_millis() + 86_400_000),
+                    account_id: Some("workspace-test".to_string()),
+                },
+                "claude-opus-5-5".to_string(),
+            )
+            .base_url(None)
+            .client_id(None)
+            .oauth_token_url(None)
+            .token_store(None)
+            .credential_key(Some("test".to_string()))
+            .thinking(ThinkingMode::Off, 10000)
+            .device_id("a".repeat(64))
+            .effort(Some("high".to_string()))
+            .thinking_display(crate::config::ThinkingDisplay::Summarized)
+            .max_output_tokens(None)
+            .max_request_bytes(None),
+        )
+        .expect("build test provider");
+        let client = reqwest::Client::new();
+        let betas_for = |has_tools: bool, declares: bool| {
+            let client = client.clone();
+            let provider = &provider;
+            async move {
+                let request = shared::ClaudeBackend::authenticated_request(
+                    provider,
+                    client.post("http://127.0.0.1:9/v1/messages"),
+                    has_tools,
+                    declares,
+                    false,
+                    ThinkingOverride::Inherit,
+                    &crate::provider::Attribution::default(),
+                )
+                .await
+                .expect("builds")
+                .build()
+                .expect("a request");
+                request
+                    .headers()
+                    .get("anthropic-beta")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("")
+                    .to_string()
+            }
+        };
+        assert!(
+            betas_for(false, true)
+                .await
+                .contains("advanced-tool-use-2025-11-20")
+        );
+        assert!(
+            !betas_for(false, false)
+                .await
+                .contains("advanced-tool-use-2025-11-20")
+        );
+    }
+
+    /// The reservation is the single-underscore prefix and nothing wider: a server's namespaced
+    /// tool and a name that merely contains the letters pass.
+    #[test]
+    fn the_endpoint_s_name_reservation_is_mirrored_by_prefix() {
+        let provider = provider_for_test();
+        for refused in ["mcp_resource_list", "mcp_prompt_get", "mcp_anything"] {
+            assert!(provider.refuses_tool_name(refused), "{refused}");
+        }
+        for carried in [
+            "mcp__kv_probe__kv_probe_fetch",
+            "mcpx_anything",
+            "resource_list",
+            "file_read",
+        ] {
+            assert!(!provider.refuses_tool_name(carried), "{carried}");
+        }
+    }
+
+    /// Claude Code 2.1.301 with `showThinkingSummaries` on, captured on Opus 5.5: the same set
     /// as the default display minus the display-updates beta, and `display: "summarized"`.
     #[test]
-    fn betas_under_summaries_match_the_2_1_284_capture() {
+    fn betas_under_summaries_match_the_2_1_301_capture() {
         let provider = provider_full(
             "claude-opus-5-5",
             true,
@@ -2739,7 +2868,6 @@ mod tests {
             "thinking-token-count-2026-05-13",
             "context-management-2025-06-27",
             "prompt-caching-scope-2026-01-05",
-            "mid-conversation-system-2026-04-07",
             "per-turn-control-2026-07-01",
             "mid-conversation-tool-changes-2026-07-01",
             "advanced-tool-use-2025-11-20",
@@ -3655,7 +3783,10 @@ mod tests {
             }],
         });
 
-        let pre_loaded = extract_loaded_tool_names_from_events(log.events());
+        let pre_loaded = extract_loaded_tool_names_from_events(
+            log.events(),
+            crate::provider::DeferredToolDelivery::Appended,
+        );
         assert!(pre_loaded.iter().any(|name| name == "fixture_deferred"));
         let pre_tools = registry.definitions_active_with_loaded(&pre_loaded);
         assert!(pre_tools.iter().any(|t| t.name == "fixture_deferred"));
@@ -3669,7 +3800,10 @@ mod tests {
         );
 
         // The materialized view shrank, but events are append-only.
-        let post_loaded = extract_loaded_tool_names_from_events(log.events());
+        let post_loaded = extract_loaded_tool_names_from_events(
+            log.events(),
+            crate::provider::DeferredToolDelivery::Appended,
+        );
         assert!(
             post_loaded.iter().any(|name| name == "fixture_deferred"),
             "compaction must preserve the loaded-tools active set via the snapshot"
