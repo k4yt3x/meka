@@ -482,8 +482,8 @@ mod tests {
         let rendered = export_memory(&memory);
         let (frontmatter, body) =
             crate::entry::split_frontmatter(&rendered).expect("must have frontmatter");
-        let parsed: serde_norway::Value =
-            serde_norway::from_str(frontmatter).expect("frontmatter must parse");
+        let parsed: yaml_serde::Value =
+            yaml_serde::from_str(frontmatter).expect("frontmatter must parse");
         assert_eq!(
             parsed["description"].as_str(),
             Some("a description: with a colon")

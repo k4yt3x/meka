@@ -661,7 +661,7 @@ mod tests {
             allowed_tools: None,
             priority: crate::entry::DEFAULT_PRIORITY,
             metadata: None,
-            extra: serde_norway::Mapping::new(),
+            extra: yaml_serde::Mapping::new(),
             conformance: crate::skills::Conformance::default(),
             body_path: std::path::PathBuf::from("/tmp/SKILL.md"),
             root: std::path::PathBuf::from("/tmp"),

@@ -1439,7 +1439,7 @@ mod tests {
         let alpha = std::fs::read_to_string(directory.join("alpha.md")).expect("alpha");
         let (frontmatter, body) =
             crate::entry::split_frontmatter(&alpha).expect("must have frontmatter");
-        let parsed: serde_norway::Value = serde_norway::from_str(frontmatter).expect("parses");
+        let parsed: yaml_serde::Value = yaml_serde::from_str(frontmatter).expect("parses");
         assert_eq!(parsed["description"].as_str(), Some("first note"));
         assert_eq!(parsed["priority"].as_i64(), Some(2));
         assert_eq!(parsed["tags"][0].as_str(), Some("infra"));

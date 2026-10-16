@@ -87,7 +87,7 @@ pub(crate) struct Skill {
     /// `Skill`, so any key this struct cannot hold is a key a rewrite destroys: an agent asked to
     /// refine an imported skill's description would have silently stripped its `license`.
     ///
-    /// One raw [`serde_norway::Value`] rather than a map plus a "but it wasn't a map" escape
+    /// One raw [`yaml_serde::Value`] rather than a map plus a "but it wasn't a map" escape
     /// hatch: the pair spelling puts the same key in two places that both feed the renderer, and
     /// `Mapping::insert` replaces, so one would silently overwrite the other. One field cannot
     /// disagree with itself. It also keeps the values as parsed YAML: the spec calls this a map of
@@ -97,7 +97,7 @@ pub(crate) struct Skill {
     /// `BTreeMap` would re-sort someone else's frontmatter on every edit.
     ///
     /// meka reads keys out of it only when it *is* a mapping; see [`Self::metadata_text`].
-    pub(crate) metadata: Option<serde_norway::Value>,
+    pub(crate) metadata: Option<yaml_serde::Value>,
     /// Top-level frontmatter keys the spec does not define and meka does not model.
     ///
     /// Kept as parsed YAML and written back verbatim. Skills authored for Claude Code carry
@@ -109,11 +109,11 @@ pub(crate) struct Skill {
     /// `metadata` is a named field, so `flatten` can never route it here: the two key sets are
     /// disjoint by construction, which is what makes the renderer's replay of this map safe.
     ///
-    /// A [`serde_norway::Mapping`], matching [`Self::metadata`], because it keeps the file's own
+    /// A [`yaml_serde::Mapping`], matching [`Self::metadata`], because it keeps the file's own
     /// key order. A `BTreeMap` would alphabetize keys meka does not model on every rewrite:
     /// nothing is lost, but skills are files people keep in version control, so each
     /// `skill_write` would produce a diff that is not a change.
-    pub(crate) extra: serde_norway::Mapping,
+    pub(crate) extra: yaml_serde::Mapping,
     /// What the raw file said, for `meka skill add --from-file`. See [`Conformance`].
     pub(crate) conformance: Conformance,
     pub(crate) body_path: PathBuf,
@@ -295,7 +295,7 @@ impl Skill {
     /// type. See [`Self::metadata`].
     pub(crate) fn metadata_text(&self, key: &str) -> Option<String> {
         self.metadata_map()?
-            .get(serde_norway::Value::from(key))
+            .get(yaml_serde::Value::from(key))
             .map(yaml_value_to_string)
     }
 
@@ -303,7 +303,7 @@ impl Skill {
     ///
     /// The single place that answers "may meka read keys out of this?", so the rest of the code
     /// does not each decide for itself what a non-mapping `metadata` means.
-    pub(crate) fn metadata_map(&self) -> Option<&serde_norway::Mapping> {
+    pub(crate) fn metadata_map(&self) -> Option<&yaml_serde::Mapping> {
         self.metadata.as_ref()?.as_mapping()
     }
 }
@@ -325,9 +325,9 @@ struct Frontmatter {
     /// again. Coercing it to an empty map here loses it: `metadata` is a named field, so serde
     /// consumes it before `flatten` sees it, and an empty map renders as no key at all.
     #[serde(default)]
-    metadata: Option<serde_norway::Value>,
+    metadata: Option<yaml_serde::Value>,
     #[serde(flatten)]
-    extra: serde_norway::Mapping,
+    extra: yaml_serde::Mapping,
 }
 
 /// Walk several roots and merge them, first occurrence of a name winning.
@@ -873,7 +873,7 @@ pub(crate) fn parse_skill_definition(
     let (frontmatter_str, _body) =
         split_frontmatter(content).ok_or_else(|| "missing YAML frontmatter".to_string())?;
 
-    let frontmatter: Frontmatter = serde_norway::from_str(frontmatter_str)
+    let frontmatter: Frontmatter = yaml_serde::from_str(frontmatter_str)
         .map_err(|error| format!("invalid frontmatter: {error}"))?;
 
     let description = frontmatter
@@ -966,9 +966,9 @@ pub(crate) fn parse_skill_definition(
 ///
 /// A bare top-level `priority:` is not a rank. It belongs to whoever wrote it, so it stays in
 /// [`Skill::extra`] and is replayed verbatim like any other key meka does not model.
-fn take_priority(metadata: &mut Option<serde_norway::Value>, name: &str) -> Option<i64> {
-    let key = serde_norway::Value::from(META_PRIORITY);
-    let serde_norway::Value::Mapping(map) = metadata.as_mut()? else {
+fn take_priority(metadata: &mut Option<yaml_serde::Value>, name: &str) -> Option<i64> {
+    let key = yaml_serde::Value::from(META_PRIORITY);
+    let yaml_serde::Value::Mapping(map) = metadata.as_mut()? else {
         return None;
     };
     let text = map.get(&key).map(yaml_value_to_string)?;
@@ -994,11 +994,11 @@ fn take_priority(metadata: &mut Option<serde_norway::Value>, name: &str) -> Opti
 /// map held nothing but a rank [`take_priority`] took. They render identically, so nothing is wrong
 /// on disk, but two spellings of one state make `a.metadata == b.metadata` stop meaning what a
 /// reader assumes, and the round-trip test compares exactly that.
-fn canonicalize_empty_metadata(metadata: &mut Option<serde_norway::Value>) {
+fn canonicalize_empty_metadata(metadata: &mut Option<yaml_serde::Value>) {
     if metadata
         .as_ref()
-        .and_then(serde_norway::Value::as_mapping)
-        .is_some_and(serde_norway::Mapping::is_empty)
+        .and_then(yaml_serde::Value::as_mapping)
+        .is_some_and(yaml_serde::Mapping::is_empty)
     {
         *metadata = None;
     }
@@ -1013,18 +1013,18 @@ fn canonicalize_empty_metadata(metadata: &mut Option<serde_norway::Value>) {
 /// treating the list form as a parse error would make a working skill disappear over a field meka
 /// deliberately never acts on. A sequence is joined on the separator the spec chose.
 ///
-/// Written against [`serde_norway::Value`] rather than an untagged enum of the two shapes it
+/// Written against [`yaml_serde::Value`] rather than an untagged enum of the two shapes it
 /// expects, because that enum is a third shape away from the same defect: `allowed-tools: 42`
 /// would match neither variant, so serde would fail the whole frontmatter and the skill would
 /// vanish from every index, while `license: 2024` beside it coerces fine, since a plain
-/// `Option<String>` gets serde_norway's scalar coercion and a custom deserializer does not. The
+/// `Option<String>` gets yaml_serde's scalar coercion and a custom deserializer does not. The
 /// file would then be unrepairable, because `write_skill` refuses to clobber a file that does not
 /// parse. Failing is not an option this field has earned; every value becomes text.
 fn string_or_list<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(Option::<serde_norway::Value>::deserialize(deserializer)?
+    Ok(Option::<yaml_serde::Value>::deserialize(deserializer)?
         .filter(|value| !value.is_null())
         .map(|value| yaml_value_to_string(&value)))
 }
@@ -1035,18 +1035,18 @@ where
 /// `meka skill get`, and the two frontmatter keys that must accept any shape rather than cost the
 /// file its whole header ([`string_or_list`] here, [`crate::memory::Memory::tags`] there). The
 /// file's own copy keeps its type; see [`Skill::metadata`].
-pub(crate) fn yaml_value_to_string(value: &serde_norway::Value) -> String {
+pub(crate) fn yaml_value_to_string(value: &yaml_serde::Value) -> String {
     match value {
-        serde_norway::Value::String(text) => text.clone(),
-        serde_norway::Value::Bool(flag) => flag.to_string(),
-        serde_norway::Value::Number(number) => number.to_string(),
-        serde_norway::Value::Null => String::new(),
-        serde_norway::Value::Sequence(items) => items
+        yaml_serde::Value::String(text) => text.clone(),
+        yaml_serde::Value::Bool(flag) => flag.to_string(),
+        yaml_serde::Value::Number(number) => number.to_string(),
+        yaml_serde::Value::Null => String::new(),
+        yaml_serde::Value::Sequence(items) => items
             .iter()
             .map(yaml_value_to_string)
             .collect::<Vec<_>>()
             .join(" "),
-        other => serde_norway::to_string(other)
+        other => yaml_serde::to_string(other)
             .unwrap_or_default()
             .trim_end()
             .to_string(),
@@ -2164,7 +2164,7 @@ mod tests {
 
     /// `allowed-tools` holding a plain scalar must not cost the whole skill.
     ///
-    /// The custom deserializer bypasses serde_norway's scalar coercion, so where `license: 2024`
+    /// The custom deserializer bypasses yaml_serde's scalar coercion, so where `license: 2024`
     /// beside it reads fine, `allowed-tools: 42` would match neither variant of an untagged
     /// `String | Vec<String>` and fail the entire frontmatter. The skill would then vanish from
     /// every index and `write_skill`'s clobber guard would refuse to repair it: unreachable and
@@ -2361,7 +2361,7 @@ mod tests {
     /// The map behind `extra` accepts what a `BTreeMap<String, _>` did, and no more of it reaches
     /// the file than round-trips.
     ///
-    /// Moving `extra` to a `serde_norway::Mapping` widened its key type from `String` to `Value`,
+    /// Moving `extra` to a `yaml_serde::Mapping` widened its key type from `String` to `Value`,
     /// which is a real behavior change and not obviously a safe one: the renderer replays every
     /// key straight back into the file, so a key the serializer cannot represent, or one that
     /// re-parses as something else, would corrupt a skill on the next edit rather than merely
@@ -2685,37 +2685,37 @@ mod tests {
             matches!(
                 after
                     .metadata_map()
-                    .and_then(|map| map.get(serde_norway::Value::from("tags"))),
-                Some(serde_norway::Value::Sequence(_))
+                    .and_then(|map| map.get(yaml_serde::Value::from("tags"))),
+                Some(yaml_serde::Value::Sequence(_))
             ),
             "the sequence became a {:?}: {content}",
             after
                 .metadata_map()
-                .and_then(|map| map.get(serde_norway::Value::from("tags")))
+                .and_then(|map| map.get(yaml_serde::Value::from("tags")))
         );
         assert!(
             matches!(
                 after
                     .metadata_map()
-                    .and_then(|map| map.get(serde_norway::Value::from("origin"))),
-                Some(serde_norway::Value::Mapping(_))
+                    .and_then(|map| map.get(yaml_serde::Value::from("origin"))),
+                Some(yaml_serde::Value::Mapping(_))
             ),
             "the nested map became a {:?}: {content}",
             after
                 .metadata_map()
-                .and_then(|map| map.get(serde_norway::Value::from("origin")))
+                .and_then(|map| map.get(yaml_serde::Value::from("origin")))
         );
         assert!(
             matches!(
                 after
                     .metadata_map()
-                    .and_then(|map| map.get(serde_norway::Value::from("count"))),
-                Some(serde_norway::Value::Number(_))
+                    .and_then(|map| map.get(yaml_serde::Value::from("count"))),
+                Some(yaml_serde::Value::Number(_))
             ),
             "the number became a {:?}: {content}",
             after
                 .metadata_map()
-                .and_then(|map| map.get(serde_norway::Value::from("count")))
+                .and_then(|map| map.get(yaml_serde::Value::from("count")))
         );
     }
 

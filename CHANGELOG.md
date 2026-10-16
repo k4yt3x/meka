@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `openai-responses` and `chatgpt-subscription` let the model call several tools in one round.
+- The YAML frontmatter parser is `yaml_serde`, the YAML organization's maintained `serde_yaml` fork.
 
 ## [0.76.0] - 2026-10-15
 

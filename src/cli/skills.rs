@@ -168,7 +168,7 @@ fn get_fields(skill: &skills::Skill, body_bytes: u64) -> Vec<(Cow<'static, str>,
     ];
     // Both halves sanitized: a key is arbitrary YAML text from a file meka may not have written,
     // and an escape or a newline in one reaches the terminal or fakes an extra output line.
-    let sanitized = |value: &serde_norway::Value| {
+    let sanitized = |value: &yaml_serde::Value| {
         crate::entry::sanitize_stored_description(&skills::yaml_value_to_string(value))
     };
     match skill.metadata_map() {
@@ -1397,10 +1397,10 @@ mod tests {
     }
 
     fn sample_skill(name: &str, root: &Path, author: &str) -> skills::Skill {
-        let mut map = serde_norway::Mapping::new();
+        let mut map = yaml_serde::Mapping::new();
         map.insert("author".into(), author.into());
         map.insert("version".into(), "1.0".into());
-        let metadata = Some(serde_norway::Value::Mapping(map));
+        let metadata = Some(yaml_serde::Value::Mapping(map));
         skills::Skill {
             name: name.to_string(),
             source_dir: root.join(name),
@@ -1411,7 +1411,7 @@ mod tests {
             priority: crate::entry::DEFAULT_PRIORITY,
             metadata,
 
-            extra: serde_norway::Mapping::new(),
+            extra: yaml_serde::Mapping::new(),
             conformance: skills::Conformance {
                 declares_name: true,
                 ..Default::default()

@@ -50,7 +50,6 @@ rmcp = { version = "3.5", features = ["client", "transport-child-process", "tran
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-serde_norway = "0.9.42"
 sha2 = "0.11"
 similar = "2"
 strsim = "0.11"
@@ -72,6 +71,7 @@ url = "2"
 utoipa = { version = "6", features = ["axum_extras", "chrono", "uuid"], optional = true }
 utoipa-swagger-ui = { version = "10", features = ["axum", "vendored"], optional = true }
 uuid = { version = "1", features = ["v4", "serde"] }
+yaml_serde = "0.10.7"
 zune-core = "0.5"
 zune-jpeg = "0.5"
 

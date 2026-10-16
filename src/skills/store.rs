@@ -244,7 +244,7 @@ pub(crate) fn write_skill(
             allowed_tools: None,
             priority,
             metadata: None,
-            extra: serde_norway::Mapping::new(),
+            extra: yaml_serde::Mapping::new(),
             conformance: Conformance::default(),
             body_path: skill_file.clone(),
             root: root.to_path_buf(),
@@ -261,11 +261,11 @@ pub(crate) fn write_skill(
     let claims_an_author = merged.author().is_some();
     if let Some(author) = author
         && !claims_an_author
-        && let serde_norway::Value::Mapping(map) = merged
+        && let yaml_serde::Value::Mapping(map) = merged
             .metadata
-            .get_or_insert_with(|| serde_norway::Value::Mapping(serde_norway::Mapping::new()))
+            .get_or_insert_with(|| yaml_serde::Value::Mapping(yaml_serde::Mapping::new()))
     {
-        map.insert(serde_norway::Value::from(META_AUTHOR), author.into());
+        map.insert(yaml_serde::Value::from(META_AUTHOR), author.into());
     }
 
     let rendered = render_skill_file(&merged, &body);
@@ -337,7 +337,7 @@ pub(crate) fn delete_skill(root: &Path, name: &str) -> Result<PathBuf, String> {
 /// rank is omitted at its default, so a minimal skill renders as exactly the spec's minimal
 /// example: `name` and `description` and nothing else.
 pub(super) fn render_skill_file(skill: &Skill, body: &str) -> String {
-    use serde_norway::{Mapping, Value};
+    use yaml_serde::{Mapping, Value};
 
     let mut front = Mapping::new();
     front.insert("name".into(), skill.name.as_str().into());
@@ -385,7 +385,7 @@ pub(super) fn render_skill_file(skill: &Skill, body: &str) -> String {
     // A serializer failure here would mean a YAML value that cannot be represented as YAML, which
     // this map cannot hold. The empty string it degrades to is caught by `write_skill`'s
     // parse-back guard rather than reaching disk.
-    out.push_str(&serde_norway::to_string(&Value::Mapping(front)).unwrap_or_default());
+    out.push_str(&yaml_serde::to_string(&Value::Mapping(front)).unwrap_or_default());
     out.push_str("---\n\n");
     if body.trim().is_empty() {
         out.push_str(&format!("# {}\n", skill.name));
@@ -410,7 +410,7 @@ pub(crate) fn render_template(
     // an empty map when nothing was given, so a minimal skill renders as the spec's minimal
     // example.
     let metadata = (!metadata.is_empty()).then(|| {
-        serde_norway::Value::Mapping(
+        yaml_serde::Value::Mapping(
             metadata
                 .into_iter()
                 .map(|(key, value)| (key.as_str().into(), value.as_str().into()))
@@ -427,7 +427,7 @@ pub(crate) fn render_template(
         priority,
         metadata,
 
-        extra: serde_norway::Mapping::new(),
+        extra: yaml_serde::Mapping::new(),
         conformance: Conformance {
             declares_name: true,
             ..Default::default()
