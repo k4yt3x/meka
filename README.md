@@ -79,7 +79,8 @@ The agent has access to the following built-in tools, grouped by class:
 - `scratchpad_*`: session-scoped working memory, kept out of the context window
 - `checklist_*`: keep its own list of what it has committed to finish before the turn ends
 - `memory_*`: keep durable notes that outlive the session
-- `conversation_*`: search and re-read this session's full conversation
+- `conversation_*`: search and read a session's full conversation
+- `session_*`: list sessions, or find one by what was said in it
 - `context_*`: measure the live context window, or compact it
 - `agent_*`: delegate work to sub-agents and manage them
 - `skill_*`: read and search skills, or write and delete them when `agent_managed` is set

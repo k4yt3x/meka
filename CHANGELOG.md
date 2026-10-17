@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GET /v1/sessions/{id}/turns/{turn_id}`: one turn, the resource a detached request names.
 - Session capability `answers_prompts_on_return`: a prompt nobody attends waits for the client.
 - A turn stopped because its client left ends with `reason: "abandoned"`, on its row as well.
+- The conversation tools take a session: a sub-agent's, or any session at `unrestricted`.
+- `session_list` and `session_search`: the sessions an agent may read, and which of them said what.
 
 ### Changed
 

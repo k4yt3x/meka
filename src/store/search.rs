@@ -21,8 +21,7 @@ use super::{
     Store,
     memory::{Terms, canonical_trigger_sql},
     sessions::{
-        COMPACT_BOUNDARY_KIND, SessionSummary, StoredMessage, decode_event_from_row,
-        spawned_session_sql,
+        COMPACT_BOUNDARY_KIND, SessionReach, SessionSummary, StoredMessage, decode_event_from_row,
     },
 };
 use crate::{
@@ -412,12 +411,12 @@ impl Store {
     /// A session whose set title holds every term comes first, newest first among those. The rest
     /// are ranked by their best-matching message, through the tiers the memory search uses: every
     /// term, then any term, then any term as a prefix, stopping at the first tier that finds
-    /// anything. Sub-agent sessions are left out unless `include_children`.
+    /// anything. `reach` says which sessions are searched at all.
     pub(crate) async fn search_sessions(
         &self,
         query: &str,
         limit: usize,
-        include_children: bool,
+        reach: SessionReach,
     ) -> Result<Vec<SessionMatch>> {
         let terms = Terms::parse(&[query.to_string()]);
         if terms.is_empty() {
@@ -433,21 +432,23 @@ impl Store {
         let (titled, ranked) = self
             .connection
             .call(move |connection| -> rusqlite::Result<_> {
-                let spawned = spawned_session_sql("s.");
-                let children = if include_children {
-                    String::new()
-                } else {
-                    format!("AND NOT {spawned}")
-                };
+                let (within_reach, root) = reach.sql_term();
+                // Bound only when the term names it: SQLite refuses a parameter the statement
+                // has no placeholder for.
+                let root_parameter = root
+                    .as_ref()
+                    .map(|root| (":root", root as &dyn rusqlite::ToSql));
                 // Matched here rather than in SQL: the set titles are few, `Terms::parse` folded
                 // the words with Unicode case rules, and SQLite's `lower()` folds ASCII alone.
                 let titled: Vec<String> = {
                     let mut statement = connection.prepare(&format!(
                         "SELECT s.id, s.title FROM sessions s
-                         WHERE s.title IS NOT NULL {children}
+                         WHERE s.title IS NOT NULL AND {within_reach}
                          ORDER BY s.updated_at DESC, s.id DESC"
                     ))?;
-                    let rows = statement.query_map([], |row| {
+                    let parameters: Vec<(&str, &dyn rusqlite::ToSql)> =
+                        root_parameter.into_iter().collect();
+                    let rows = statement.query_map(parameters.as_slice(), |row| {
                         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                     })?;
                     let mut titled = Vec::new();
@@ -471,23 +472,26 @@ impl Store {
                 // `m.id` beside `min()`, which SQLite guarantees is the row of the minimum.
                 let mut statement = connection.prepare(&format!(
                     "WITH hits AS MATERIALIZED (
-                         SELECT rowid AS id, rank FROM messages_fts WHERE messages_fts MATCH ?1
+                         SELECT rowid AS id, rank FROM messages_fts
+                         WHERE messages_fts MATCH :expression
                      )
                      SELECT m.session_id, m.id, min(hits.rank)
                      FROM hits
                      JOIN messages m ON m.id = hits.id
                      JOIN sessions s ON s.id = m.session_id
-                     WHERE 1 {children}
+                     WHERE {within_reach}
                      GROUP BY m.session_id
                      ORDER BY 3 ASC, s.updated_at DESC
-                     LIMIT ?2"
+                     LIMIT :limit"
                 ))?;
                 let mut ranked: Vec<(String, i64)> = Vec::new();
                 for expression in &expressions {
-                    let rows = statement
-                        .query_map(rusqlite::params![expression, sql_limit], |row| {
-                            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                        })?;
+                    let mut parameters: Vec<(&str, &dyn rusqlite::ToSql)> =
+                        vec![(":expression", expression), (":limit", &sql_limit)];
+                    parameters.extend(root_parameter);
+                    let rows = statement.query_map(parameters.as_slice(), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })?;
                     ranked = rows.collect::<rusqlite::Result<_>>()?;
                     if !ranked.is_empty() {
                         break;
@@ -614,6 +618,60 @@ mod tests {
         id
     }
 
+    /// A tree reaches the root and its direct children: not a grandchild, and not another root,
+    /// however well they match and whatever their title says.
+    #[tokio::test]
+    async fn a_tree_search_reaches_the_root_and_its_children_only() {
+        let store = Store::for_test().await;
+        let root = session_saying(&store, &["the root speaks of herons"]).await;
+        let spawn = |parent: Uuid, line: &'static str| {
+            let store = store.clone();
+            async move {
+                let (id, _lock) = store
+                    .create_child_session(
+                        parent,
+                        None,
+                        Vec::new(),
+                        None,
+                        "read".to_string(),
+                        "test-profile".to_string(),
+                    )
+                    .await
+                    .expect("child");
+                store
+                    .save_event(id, &Event::Append(Message::user(line)), None)
+                    .await
+                    .expect("save");
+                id
+            }
+        };
+        let child = spawn(root, "the child speaks of herons").await;
+        let grandchild = spawn(child, "the grandchild speaks of herons").await;
+        let stranger = session_saying(&store, &["a stranger speaks of herons"]).await;
+        store
+            .update_session(stranger, super::super::SessionPatch {
+                title: Some(Some("herons".to_string())),
+                ..Default::default()
+            })
+            .await
+            .expect("title");
+
+        let mut found: Vec<Uuid> = store
+            .search_sessions("herons", 10, SessionReach::Tree(root))
+            .await
+            .expect("search")
+            .iter()
+            .map(|found| found.session.id)
+            .collect();
+        found.sort();
+        let mut expected = vec![root, child];
+        expected.sort();
+        assert_eq!(
+            found, expected,
+            "grandchild {grandchild} and stranger {stranger} are out"
+        );
+    }
+
     /// What meka wrote to send the model back to work is nobody's words: a search for a word the
     /// nudge quoted from the list must not find the session by the nudge.
     #[tokio::test]
@@ -642,7 +700,9 @@ mod tests {
 
     async fn ids_found(store: &Store, query: &str) -> Vec<Uuid> {
         store
-            .search_sessions(query, 10, false)
+            .search_sessions(query, 10, SessionReach::Store {
+                include_children: false,
+            })
             .await
             .expect("search")
             .into_iter()
@@ -658,12 +718,16 @@ mod tests {
             session_saying(&store, &["egrets by the water"]).await;
         }
         let found = store
-            .search_sessions("egrets", 0, false)
+            .search_sessions("egrets", 0, SessionReach::Store {
+                include_children: false,
+            })
             .await
             .expect("search");
         assert_eq!(found.len(), 3);
         let found = store
-            .search_sessions("egrets", 2, false)
+            .search_sessions("egrets", 2, SessionReach::Store {
+                include_children: false,
+            })
             .await
             .expect("search");
         assert_eq!(found.len(), 2);
@@ -742,7 +806,9 @@ mod tests {
 
         assert_eq!(ids_found(&store, "giraffes").await, vec![spoken]);
         let found = store
-            .search_sessions("giraffes", 10, false)
+            .search_sessions("giraffes", 10, SessionReach::Store {
+                include_children: false,
+            })
             .await
             .expect("search");
         assert_eq!(
@@ -789,7 +855,9 @@ mod tests {
         store.mark_spawned_for_test(spawned, body).await;
 
         let found = store
-            .search_sessions("kestrel", 10, false)
+            .search_sessions("kestrel", 10, SessionReach::Store {
+                include_children: false,
+            })
             .await
             .expect("search");
         let ids: Vec<Uuid> = found.iter().map(|found| found.session.id).collect();
@@ -798,7 +866,9 @@ mod tests {
         assert!(
             ids_found(&store, "kestrel").await.len() == 2
                 && store
-                    .search_sessions("kestrel", 10, true)
+                    .search_sessions("kestrel", 10, SessionReach::Store {
+                        include_children: true
+                    })
                     .await
                     .expect("search")
                     .len()
@@ -847,7 +917,9 @@ mod tests {
             sentence
         ]);
         let found = store
-            .search_sessions("深圳", 10, false)
+            .search_sessions("深圳", 10, SessionReach::Store {
+                include_children: false,
+            })
             .await
             .expect("search");
         assert_eq!(
@@ -1103,7 +1175,9 @@ mod tests {
             .await
             .expect("save");
         let found = store
-            .search_sessions("pelicans", 10, false)
+            .search_sessions("pelicans", 10, SessionReach::Store {
+                include_children: false,
+            })
             .await
             .expect("search");
         assert_eq!(found[0].session.id, session);

@@ -262,7 +262,9 @@ pub(crate) async fn search_sessions(
     format: cli::OutputFormat,
 ) -> anyhow::Result<()> {
     let found = store
-        .search_sessions(query, limit as usize, include_children)
+        .search_sessions(query, limit as usize, crate::store::SessionReach::Store {
+            include_children,
+        })
         .await?;
     if format == cli::OutputFormat::Json {
         let views: Vec<crate::view::SessionMatchView> = found
@@ -890,7 +892,9 @@ mod tests {
         assert_eq!(rows[1][3], "plain words about herons");
 
         let found = store
-            .search_sessions("herons", 10, false)
+            .search_sessions("herons", 10, crate::store::SessionReach::Store {
+                include_children: false,
+            })
             .await
             .expect("search");
         let ids: Vec<String> = found

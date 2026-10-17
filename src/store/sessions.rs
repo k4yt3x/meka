@@ -167,6 +167,37 @@ pub(crate) fn spawned_session_sql(qualifier: &str) -> String {
         "({qualifier}parent_session_id IS NOT NULL OR {qualifier}subagent_spec_json IS NOT NULL)"
     )
 }
+/// How far a search over sessions reaches.
+///
+/// A session's own tools read its tree below `unrestricted` and the store at it; the operator's
+/// surfaces read the store. One value for the question, so the SQL that keeps a row within reach is
+/// written once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionReach {
+    /// One session and its direct children.
+    Tree(Uuid),
+    /// Every session, the sub-agents' too when `include_children`.
+    Store { include_children: bool },
+}
+
+impl SessionReach {
+    /// The `WHERE` term keeping rows of the `sessions` alias `s` within reach, and the id a tree
+    /// binds as `:root`. The term is `1` when nothing is excluded, so a caller can `AND` it on.
+    pub(super) fn sql_term(self) -> (String, Option<String>) {
+        match self {
+            Self::Tree(root) => (
+                "(s.id = :root OR s.parent_session_id = :root)".to_string(),
+                Some(root.to_string()),
+            ),
+            Self::Store {
+                include_children: true,
+            } => ("1".to_string(), None),
+            Self::Store {
+                include_children: false,
+            } => (format!("NOT {}", spawned_session_sql("s.")), None),
+        }
+    }
+}
 #[derive(Debug, Clone)]
 pub(crate) struct SessionSummary {
     pub(crate) id: Uuid,
@@ -9186,7 +9217,9 @@ mod tests {
         boundary(&store, session).await;
         assert_eq!(
             store
-                .search_sessions("xylophone", 10, false)
+                .search_sessions("xylophone", 10, SessionReach::Store {
+                    include_children: false,
+                })
                 .await
                 .expect("search")
                 .len(),
@@ -9208,7 +9241,9 @@ mod tests {
 
         assert!(
             store
-                .search_sessions("xylophone", 10, false)
+                .search_sessions("xylophone", 10, SessionReach::Store {
+                    include_children: false,
+                })
                 .await
                 .expect("search")
                 .is_empty()

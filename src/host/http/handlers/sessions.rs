@@ -1038,7 +1038,9 @@ pub(crate) async fn search_sessions(
         .search_sessions(
             &query.q,
             limit as usize,
-            query.include_children.unwrap_or(false),
+            crate::store::SessionReach::Store {
+                include_children: query.include_children.unwrap_or(false),
+            },
         )
         .await
         .map_err(|error| ProblemDetail::internal_sanitized("failed to search sessions", error))?;

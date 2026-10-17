@@ -386,6 +386,8 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "scratchpad_rename",
     "scratchpad_save_file",
     "scratchpad_write",
+    "session_list",
+    "session_search",
     "shell_execute",
     "skill_delete",
     "skill_read",
@@ -1336,6 +1338,14 @@ impl ToolRegistry {
             site: site.clone(),
         }));
         self.register_builtin(Arc::new(conversation::ConversationReadTool {
+            store: store.clone(),
+            site: site.clone(),
+        }));
+        self.register_builtin(Arc::new(conversation::SessionListTool {
+            store: store.clone(),
+            site: site.clone(),
+        }));
+        self.register_builtin(Arc::new(conversation::SessionSearchTool {
             store: store.clone(),
             site: site.clone(),
         }));

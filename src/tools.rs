@@ -987,6 +987,7 @@ pub(crate) const BUILTINS_WITHOUT_ARGUMENTS: &[&str] = &[
     "mcp_resource_updates_list",
     "schedule_list",
     "scratchpad_list",
+    "session_list",
     "task_list",
 ];
 /// The argument a tool-call indicator shows next to the tool's name.
@@ -1065,6 +1066,7 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         "scratchpad_load_file" => "path",
         "scratchpad_merge" => "sources",
         "scratchpad_rename" => "old",
+        "session_search" => "query",
         "shell_execute" => "command",
         "skill_delete" | "skill_read" | "skill_write" => "name",
         "skill_search" => "pattern",

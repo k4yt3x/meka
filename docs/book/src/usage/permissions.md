@@ -11,7 +11,7 @@ control over the agent's capabilities and prevent accidental modifications.
 | **None** | green | No tools without approval. |
 | **Read** | yellow | Read-only tools: `file_read`, `file_find`, `file_search`, `web_fetch`, `shell_execute` (sandboxed read-only), `checklist_*`, `agent_spawn`, scratchpad tools |
 | **Workspace** | orange | File and shell writes stay inside the workspace. Unconfined MCP calls may need approval or be refused; the shell needs an available sandbox |
-| **Unrestricted** | red | Every tool, no boundary. `shell_execute` runs with no sandbox at all |
+| **Unrestricted** | red | Every tool, no boundary. `shell_execute` runs with no sandbox at all, and the [conversation tools](../tools/overview.md#conversation_search--conversation_read) read every session in the store |
 
 The ladder is ordered by **reach**: each level contains the ones below it, and a tool call that
 needs more than the session's level is refused. With [approvals](#approvals) on, it is put to you

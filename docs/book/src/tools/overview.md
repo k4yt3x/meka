@@ -43,6 +43,8 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`context_compact`](./overview.md#context_check--context_compact) | Read | Ask for a compaction before the next step of this turn |
 | [`conversation_search`](./overview.md#conversation_search--conversation_read) | Read | Search the full conversation history, including compacted turns |
 | [`conversation_read`](./overview.md#conversation_search--conversation_read) | Read | Read conversation turns by index |
+| [`session_list`](./overview.md#session_list--session_search) | Read | List the sessions the agent may read |
+| [`session_search`](./overview.md#session_list--session_search) | Read | Find a readable session by what was said in it |
 | [`schedule_create`](../usage/scheduling.md) | Read | Schedule a future turn for this session |
 | [`schedule_list`](../usage/scheduling.md) | Read | List this session's scheduled jobs |
 | [`schedule_cancel`](../usage/scheduling.md) | Read | Cancel a scheduled job |
@@ -63,7 +65,7 @@ Tools are grouped by the minimum permission level required:
 - `checklist_add`, `checklist_edit`, `checklist_read`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_steer`, `agent_delete`, `image_render`
 - All skill tools, including `skill_write` and `skill_delete` when they are enabled: like memory,
   skills live in meka's own config directory, not your working tree
-- `conversation_search`, `conversation_read`, `context_check`, `context_compact`
+- `conversation_search`, `conversation_read`, `session_list`, `session_search`, `context_check`, `context_compact`
 - Every scratchpad tool except `scratchpad_save_file`, which writes to a path you name and so sits at `workspace` with `file_write`
 - All memory tools. Writing a memory needs only read permission: memories live in the store,
   which is meka's own, not your working tree.
@@ -258,6 +260,8 @@ A sub-agent is not a one-shot. Its conversation persists under its own session, 
 
 `agent_followup`, `agent_steer` and `agent_delete` take the full id, or any prefix that is unique among this session's sub-agents; a prefix two of them share is refused and both are named. All three refuse an id that isn't a child of the current session, so one session can never drive, steer or delete another's sub-agents.
 
+A parent can also read a sub-agent's conversation directly, without spending a turn on it: [`conversation_search` and `conversation_read`](#conversation_search--conversation_read) take a sub-agent's id, and `session_list` shows the ids.
+
 **All five go together.** Denying `agent_spawn` in [`[tools].disabled_tools`](../configuration/config-file.md#tools-built-in-tool-filters), or setting [`session.subagent_max_depth = 0`](../configuration/config-file.md#sessionsubagent_max_depth), removes the four lifecycle tools too: an agent that cannot delegate has no sub-agents for them to act on, and leaving them behind would let it drive the ones a previous run left in the store. `meka tool list` reports all five as `disabled` in either case. Denying only `agent_list` removes just that one.
 
 **A follow-up runs under the terms of the spawn, not your current ones.** The permission level, the scope, the four tool lists, the memory level and the inherited scratchpad names are recorded when the sub-agent is created and replayed on every follow-up. If you spawned a sub-agent at `read` and have since switched to `unrestricted`, following up on it still runs it at `read`. That is deliberate: otherwise a second question would be a way to escalate a sub-agent you deliberately restricted. A sub-agent spawned with nothing named keeps the working directory it was spawned in and follows the rest of your scope; one with a scope of its own keeps that scope. Either way a follow-up re-admits what the sub-agent holds against your reach at that moment, at the level it runs at then: a directory you can no longer grant refuses the follow-up, and a level you have dropped to narrows it.
@@ -303,7 +307,7 @@ Only call `image_render` when the current model supports vision input.
 
 ## `conversation_search` / `conversation_read`
 
-Search and re-read this session's **full** conversation, including earlier turns that [compaction](../usage/interactive-mode.md#compact) summarized and removed from the model's context. Compaction never deletes turns (it appends a boundary and hides the older ones); these tools read straight from the on-disk event log, so a detail the compaction summary dropped is still recoverable, within [`[session].turn_retention`](../configuration/config-file.md#sessionturn_retention) when that is set.
+Search and read a session's **full** conversation, including earlier turns that [compaction](../usage/interactive-mode.md#compact) summarized and removed from the model's context. Compaction never deletes turns (it appends a boundary and hides the older ones); these tools read straight from the on-disk event log, so a detail the compaction summary dropped is still recoverable, within [`[session].turn_retention`](../configuration/config-file.md#sessionturn_retention) when that is set.
 
 `conversation_search` searches and returns matching lines, each tagged with a message index (`#N`) and role:
 
@@ -312,8 +316,9 @@ conversation_search({"query": "auth token", "is_regex": false, "limit": 20})
 ```
 
 - `query` (required): text to search for; a literal substring (case-insensitive) unless `is_regex` is set.
+- `sessions`: session ids to search instead of this session, up to 20; a single id may be passed bare. Matches are grouped by session, and the read hint names the session beside the index.
 - `is_regex`: treat `query` as a case-sensitive regular expression. Default: `false`.
-- `limit`: maximum matches to return (capped at 100). Default: 20.
+- `limit`: maximum matches to return (capped at 100), shared across the sessions searched. Default: 20.
 
 `conversation_read` reads turns by the `#N` index that `conversation_search` reports:
 
@@ -322,10 +327,31 @@ conversation_read({"start": 47, "limit": 3})
 ```
 
 - `start` (required): 1-based message index to read from.
+- `session`: the session to read instead of this one.
 - `limit`: number of consecutive messages to read (max 20). Default: 1.
 - `scratchpad`: save the output to a scratchpad entry instead of returning it inline.
 
 After a compaction, the summary message reminds the agent that these tools exist. Large tool outputs appear as `<large-output>` references in both `conversation_search` and `conversation_read` results (rather than inlining the full payload); read their full content with `scratchpad_read`.
+
+**Which sessions a call may read** is one rule, shared with `session_list` and `session_search` below: the calling session and its direct sub-agents, by full id or by a prefix unique among them, or every session in the store when the session runs at [`unrestricted`](../usage/permissions.md), the level at which the shell reaches the store anyway. The level is the live one, so a sub-agent at `unrestricted` reads its parent and its siblings; below it the read is one way, parent to sub-agent, because a parent's log may hold reads from outside the sub-agent's boundary. Below `unrestricted`, an id that is not readable gets the same refusal whether or not it exists, so the tool does not reveal which sessions are there. With approvals on this refusal is not put to you, as a path refusal is not.
+
+## `session_list` / `session_search`
+
+The sessions the agent may read, so it can find one before reading it. Both follow the rule above and never refuse: they show what is in reach, which below `unrestricted` is the session itself and its sub-agents, and at `unrestricted` the store.
+
+`session_list` takes no arguments. It lists the calling session first and then its sub-agents, or at `unrestricted` the store's 50 most recent root sessions, one row each with the full id, the last update, a sub-agent's parent, and the title. A listing cut at that count says so. It ends with `This session: <id>`, the one place the agent is told its own id.
+
+`session_search` is [`meka session search`](../usage/sessions.md#searching-sessions) for the agent: the same index, over the sessions in reach.
+
+```text
+session_search({"query": "blind spot timestamp", "limit": 10, "include_children": false})
+```
+
+- `query` (required): the words to find. What was said is matched, user and assistant text and compaction summaries, not tool calls, tool results or thinking; `conversation_search` covers those within a session.
+- `limit`: maximum sessions to return (capped at 100). Default: 10.
+- `include_children`: at `unrestricted`, sub-agent sessions too; within a tree they are always in. Default: `false`.
+
+A session whose title holds every word is listed first, the rest by their best-matching message, each row with the id, the last update, the title and the line it was found by. Neither tool is available to a [checkpoint turn](../usage/sessions.md#compacting-a-session), which may save but not read other sessions.
 
 ## `context_check` / `context_compact`
 

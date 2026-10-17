@@ -484,8 +484,10 @@ ID        Updated                  Title                             Match
 
 What is searched is what was said: your messages, the assistant's replies and compaction summaries.
 Tool calls, tool results and the model's thinking are not, so a file the agent read does not make
-its session a match for every word in it; `conversation_search`, which the agent runs within one
-session, still covers those. A session whose title holds every word is listed first, newest first
+its session a match for every word in it; `conversation_search`, which the agent runs over the
+sessions it names, still covers those. The agent has this search too, as
+[`session_search`](../tools/overview.md#session_list--session_search), over the sessions it may
+read. A session whose title holds every word is listed first, newest first
 among those; the rest are ranked by how well their best message matches. Every word must appear;
 when nothing holds them all, the words are tried as prefixes, so `zebra okap` still finds the
 session about zebras and okapis; then sessions holding any of the words are listed, then any as a

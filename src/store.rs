@@ -58,7 +58,8 @@ pub(crate) use self::{
     search::SessionMatch,
     sessions::{
         ForkOverrides, ImportSessionRecord, LogPage, LogRow, SessionFilter, SessionMetaRow,
-        SessionPatch, SessionSummary, SessionSweep, SourceLock, SpawnTerms, normalize_title,
+        SessionPatch, SessionReach, SessionSummary, SessionSweep, SourceLock, SpawnTerms,
+        normalize_title,
     },
 };
 use crate::error::{MekaError, Result};
