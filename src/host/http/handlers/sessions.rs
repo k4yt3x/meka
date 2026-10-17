@@ -1630,7 +1630,8 @@ pub(crate) struct PatchSessionRequest {
     ///
     /// Switching mid-conversation is allowed and is the client's call. Thinking blocks are tagged
     /// with the profile that produced them and are not replayed to a different one, so the
-    /// reasoning recorded so far stops being visible to the model from the next turn onward.
+    /// reasoning recorded so far stops being visible to the model from the next turn onward. A
+    /// profile with `vision = false` refuses the next turn while the session holds an image.
     #[serde(default)]
     pub(crate) profile: Option<String>,
     /// The session's title, as every listing shows it. Empty clears it, so the session is labeled

@@ -100,21 +100,6 @@ pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long to wait for the TCP + TLS handshake before giving up on a provider endpoint.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The context window meka assumes when a profile doesn't state one.
-///
-/// meka does not look this up, probe for it, or cache it. The window is a local budgeting number
-/// (it drives compaction timing, the keep-budget and the `/status` gauge, and is never sent on the
-/// wire), so a wrong value cannot fail a request, and the user can state the real one via
-/// `[profiles.<name>].context_window`.
-///
-/// 1M is right for the current flagships on both vendors and too generous for the smaller and older
-/// models. That direction is deliberate but not free: planned compaction never fires when the real
-/// window is smaller, so those turns hit the provider's own limit and recover through the
-/// `ContextOverflow` compact-and-retry path instead, paying one rejected round trip each time. The
-/// opposite default would make the common case compact at a fraction of its real window, which is
-/// worse every day rather than occasionally.
-pub(crate) const DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
-
 /// How often an HTTP/2 connection with a request in flight pings its peer, and how long an
 /// unanswered PING is waited for before the connection is declared dead.
 ///
@@ -1074,7 +1059,7 @@ mod tests {
         );
         assert_eq!(
             profile_context_window(&registry, "silent"),
-            Some(DEFAULT_CONTEXT_WINDOW),
+            Some(crate::config::DEFAULT_CONTEXT_WINDOW),
             "one that states none reports the documented default, not its neighbor's value"
         );
         assert_eq!(

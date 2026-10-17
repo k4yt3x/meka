@@ -556,6 +556,30 @@ impl Drop for TurnScope<'_> {
 }
 
 impl Agent {
+    /// Refuse a turn on a profile with `vision` off while the history holds an image, before any
+    /// request leaves. The history is sent whole, so the alternative is a model answering about
+    /// images it was never shown, or the provider's own 400 after the send. Reached by a switch
+    /// onto such a profile, a resume or import that names one, or a config edit under a live
+    /// session; never by a fallback, since a chain's profiles share their `vision`
+    /// (`config::validate_fallback_chains`). Asked ahead of the session row and `TurnStarted`, as
+    /// the MCP gate is, so the refusal leaves no trace.
+    fn refuse_images_the_profile_cannot_read(&self, messages: &Conversation) -> Result<()> {
+        let serving = self.cells.profile.current();
+        if serving.vision {
+            return Ok(());
+        }
+        let images = crate::conversation::count_images(messages.as_slice());
+        if images == 0 {
+            return Ok(());
+        }
+        Err(MekaError::Config(format!(
+            "profile '{}' does not read images and this session holds {images} image{}; switch to \
+             a profile with vision",
+            serving.profile,
+            if images == 1 { "" } else { "s" }
+        )))
+    }
+
     /// The turn this agent is running, or none between turns.
     pub(super) fn current_turn(&self) -> Option<Uuid> {
         *crate::sync::lock(&self.current_turn)
@@ -1052,6 +1076,7 @@ impl Agent {
         // Gate on MCP readiness BEFORE touching session state / message history so a rejected turn
         // leaves no trace in the conversation.
         self.await_mcp_ready().await?;
+        self.refuse_images_the_profile_cannot_read(messages)?;
 
         let session_id = match self.cells.session_id.get() {
             Some(session_id) => session_id,
@@ -4517,6 +4542,78 @@ mod tests {
                 .expect("events")
                 .is_empty()
         );
+    }
+
+    /// A profile with `vision` off is refused a turn over a history that holds an image before
+    /// any request leaves, with the remedy, and the same history runs again on a profile that
+    /// reads images.
+    #[tokio::test]
+    async fn a_profile_without_vision_is_refused_a_turn_over_a_history_with_images() {
+        use crate::provider::mock::MockStopReason;
+        let answer = |text: &str| {
+            vec![
+                MockEvent::Text {
+                    text: text.to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ]
+        };
+        let (agent, provider, store, session_id, _frontend) =
+            agent_with_session(vec![answer("seen"), answer("seen again")]).await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("look at this".to_string(), vec![
+                    image_source(),
+                ])
+                .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("a profile that reads images runs the turn");
+        let events_before = store.load_events(session_id).await.expect("events").len();
+
+        let text_only = |vision: bool| crate::provider::ResolvedProfile {
+            provider: provider.clone(),
+            profile: "text-only".to_string(),
+            context_window: 200_000,
+            vision,
+        };
+        agent.set_provider(text_only(false));
+        let refused = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("and now?".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect_err("a profile without vision is refused the history's image");
+        assert!(
+            matches!(&refused, MekaError::Config(message) if message.contains("'text-only' does not read images") && message.contains("1 image;")),
+            "{refused}"
+        );
+        assert_eq!(provider.streams().len(), 1, "no request went out");
+        assert_eq!(
+            store.load_events(session_id).await.expect("events").len(),
+            events_before,
+            "the refusal leaves no trace"
+        );
+
+        agent.set_provider(text_only(true));
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("and now?".to_string(), Vec::new())
+                    .expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("a profile that reads images runs the same history");
+        assert_eq!(provider.streams().len(), 2);
     }
 
     /// A repair riding a request an interrupt cut was never judged, so the tier is tried again on

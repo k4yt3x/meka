@@ -191,7 +191,7 @@ pub(crate) async fn run_interactive(
     let context_window_gauge = Arc::new(std::sync::atomic::AtomicU64::new(
         config
             .session_context_window
-            .unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW),
+            .unwrap_or(crate::config::DEFAULT_CONTEXT_WINDOW),
     ));
     let context_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Seeded with an estimate on a resume, so the gauge is not blank until the first turn measures.

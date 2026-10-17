@@ -162,6 +162,11 @@ produced it and is not replayed to a different one, so from the switch the model
 reasoning recorded under the earlier profile, which is the same loss a `PATCH` to another profile
 takes.
 
+A fallback must be able to carry what the session holds: the same `vision`, and a window and a
+request cap no smaller ([`fallbacks`](../configuration/config-file.md#fallbacks)). While a fallback
+serves, the session keeps gauging against its own profile's window. A profile with `vision` off,
+reached by a switch rather than a fallback, refuses a turn while the history holds an image.
+
 ## Storage location
 
 Sessions live in the store, a SQLite file at a platform-specific location:

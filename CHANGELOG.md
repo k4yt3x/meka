@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** a blocking `POST /turn` holds its turn: a dropped request stops it after the grace.
 - A detached request's `Idempotency-Key` is committed at admission; a replay gets the same `202`.
 - A 402 or a 429 naming a quota or the subscription window is `provider-exhausted`, not retried.
+- A fallback must match its profile's `vision` and have a window and request cap no smaller.
+- A turn on a `vision = false` profile is refused before sending while the session holds an image.
 - Session archives are `format_version` 14; a 0.77 archive is read as it is.
 
 ## [0.77.0] - 2026-10-16

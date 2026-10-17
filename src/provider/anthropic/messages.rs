@@ -207,7 +207,7 @@ impl shared::ClaudeBackend for AnthropicMessagesProvider {
 
     fn max_request_bytes(&self) -> usize {
         self.max_request_bytes
-            .unwrap_or(super::shared::MAX_REQUEST_BYTES)
+            .unwrap_or(crate::config::ANTHROPIC_MAX_REQUEST_BYTES)
     }
 
     fn request_body(

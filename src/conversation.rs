@@ -671,6 +671,23 @@ fn redact_image(message: &mut Message, image: &RedactedImage) {
     }
 }
 
+/// How many images `messages` hold, attached to a message or inside a tool result: what a profile
+/// that does not read images would be sent, and so what a turn on one is refused over.
+pub(crate) fn count_images(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .map(|block| match block {
+            ContentBlock::Image { .. } => 1,
+            ContentBlock::ToolResult { content, .. } => content
+                .iter()
+                .filter(|item| matches!(item, ToolResultContent::Image { .. }))
+                .count(),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// The replayed log with, for each message, when it was written and whether it is a compaction
 /// summary. Three vectors of one length, which every arm of the replay maintains.
 pub(crate) struct AnnotatedView<Stamp> {
@@ -1716,6 +1733,38 @@ pub(crate) const REDACTED_THINKING: &str = "[redacted thinking]";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An image counts wherever it sits, attached or inside a tool result, and a tool reference is
+    /// not one.
+    #[test]
+    fn count_images_counts_attached_and_tool_result_images() {
+        let image = || ImageSource::Base64 {
+            media_type: "image/png".to_string(),
+            data: "QUJD".to_string(),
+        };
+        let messages = [
+            Message::user_with_images("look at this", vec![image()]),
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: vec![
+                        ToolResultContent::Text {
+                            text: "[Image: a.png]".to_string(),
+                        },
+                        ToolResultContent::Image { source: image() },
+                        ToolResultContent::ToolReference {
+                            tool_name: "file_read".to_string(),
+                        },
+                    ],
+                    is_error: false,
+                }],
+            },
+            Message::user("plain"),
+        ];
+        assert_eq!(count_images(&messages), 2);
+        assert_eq!(count_images(&messages[2..]), 0);
+    }
 
     /// The title is the user's words and nothing that rode in front of them, flattened and cut the
     /// same way for every surface that labels a session.

@@ -52,11 +52,6 @@ pub(crate) fn normalize_claude_base_url(url: &str) -> String {
     }
 }
 
-/// The Messages API request size limit documented by Anthropic is 32 MiB; ~2 MiB is held back for
-/// headers, URL, attestation patches, and serialization slack. Bodies above this threshold are
-/// reactively shrunk by `redact_oldest_images` in `crate::provider::budget` before they're posted.
-pub(super) const MAX_REQUEST_BYTES: usize = 30 * crate::text::MIB;
-
 // The redaction itself, its stopping point and the refusal live in `crate::provider::budget`, since
 // every backend applies them; the constant above is the Anthropic default ceiling they run against.
 // The redaction tests live beside the downscale tests, hence the test-only import.
@@ -761,7 +756,7 @@ pub(super) trait ClaudeBackend: crate::oauth::RefreshesCredential + Send + Sync 
     /// The URL a completion is posted to.
     fn endpoint(&self) -> String;
     /// Largest request body this backend sends before redacting old images: the profile's
-    /// `max_request_bytes`, else [`MAX_REQUEST_BYTES`].
+    /// `max_request_bytes`, else [`crate::config::ANTHROPIC_MAX_REQUEST_BYTES`].
     fn max_request_bytes(&self) -> usize;
     /// The request body for one completion, before serialization.
     #[allow(
@@ -2963,15 +2958,16 @@ mod tests {
             call_count.set(n + 1);
             if n == 0 {
                 // First serialization: oversize. Use a slim payload so the test stays cheap; the
-                // function only cares about `.len() > MAX_REQUEST_BYTES`.
-                Ok("X".repeat(MAX_REQUEST_BYTES + 1024))
+                // function only cares about `.len() > crate::config::ANTHROPIC_MAX_REQUEST_BYTES`.
+                Ok("X".repeat(crate::config::ANTHROPIC_MAX_REQUEST_BYTES + 1024))
             } else {
                 Ok("{}".to_string())
             }
         };
 
-        let (body, notice) = build_body_within_budget(&messages, MAX_REQUEST_BYTES, build)
-            .expect("redaction should succeed");
+        let (body, notice) =
+            build_body_within_budget(&messages, crate::config::ANTHROPIC_MAX_REQUEST_BYTES, build)
+                .expect("redaction should succeed");
         assert_eq!(body, "{}");
         let notice = notice.expect("redaction must surface a Notice");
         assert_eq!(notice.level, crate::frontend::NoticeLevel::Info);
@@ -2997,7 +2993,8 @@ mod tests {
         let messages = vec![assistant_text("hi")];
         let build = |_msgs: &[Message]| -> Result<String> { Ok("{}".to_string()) };
         let (body, notice) =
-            build_body_within_budget(&messages, MAX_REQUEST_BYTES, build).expect("happy path");
+            build_body_within_budget(&messages, crate::config::ANTHROPIC_MAX_REQUEST_BYTES, build)
+                .expect("happy path");
         assert_eq!(body, "{}");
         assert!(notice.is_none());
     }

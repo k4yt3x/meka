@@ -30,6 +30,28 @@ pub(crate) enum Backend {
     /// An OpenAI-compatible Responses endpoint, billed to an API key.
     OpenAiResponses,
 }
+
+/// The context window meka assumes when a profile doesn't state one.
+///
+/// meka does not look this up, probe for it, or cache it. The window is a local budgeting number
+/// (it drives compaction timing, the keep-budget and the `/status` gauge, and is never sent on the
+/// wire), so a wrong value cannot fail a request, and the user can state the real one via
+/// `[profiles.<name>].context_window`.
+///
+/// 1M is right for the current flagships on both vendors and too generous for the smaller and older
+/// models. That direction is deliberate but not free: planned compaction never fires when the real
+/// window is smaller, so those turns hit the provider's own limit and recover through the
+/// `ContextOverflow` compact-and-retry path instead, paying one rejected round trip each time. The
+/// opposite default would make the common case compact at a fraction of its real window, which is
+/// worse every day rather than occasionally.
+pub(crate) const DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
+
+/// The request body ceiling the Anthropic wires apply when the profile states no
+/// `max_request_bytes`: the Messages API's documented 32 MiB less ~2 MiB held back for headers,
+/// URL, attestation patches and serialization slack. Bodies above it have their oldest images
+/// redacted before they are posted. The OpenAI wires apply none, since their endpoints' caps are
+/// the endpoints' own facts; [`Backend::default_max_request_bytes`] says which is which.
+pub(crate) const ANTHROPIC_MAX_REQUEST_BYTES: usize = 30 * crate::text::MIB;
 /// One named account from `[accounts.<name>]`: where a request goes and who meka is when it
 /// arrives. Holds only non-secret settings; the credential (API key or OAuth bundle) is stored in
 /// the DB keyed by the account name and is acquired via `meka account add` / `login`.
@@ -81,7 +103,7 @@ pub(crate) struct ProfileConfig {
     pub(crate) fallbacks: Vec<String>,
     /// The model's context window (total tokens it can hold), used for the context gauge and
     /// auto-compaction. Falls back to `[session].context_window`, then to
-    /// [`crate::provider::DEFAULT_CONTEXT_WINDOW`]. meka never infers this from the model name or
+    /// [`DEFAULT_CONTEXT_WINDOW`]. meka never infers this from the model name or
     /// asks the provider for it, so this is where a model smaller than the default gets stated.
     pub(crate) context_window: Option<u64>,
     /// Override the per-request output (completion) token cap. When unset, each backend keeps its
@@ -301,7 +323,7 @@ pub(crate) fn account_for<'a>(
 /// `session_context_window` is `[session].context_window` and `default_thinking_budget` is
 /// `[thinking].budget`; a profile's own value takes precedence over either. The two are spelled
 /// differently on the way out because they are consumed differently: the call sites in `main.rs`
-/// apply [`crate::provider::DEFAULT_CONTEXT_WINDOW`] when the window is still unset, while the
+/// apply [`DEFAULT_CONTEXT_WINDOW`] when the window is still unset, while the
 /// budget is defaulted here because every consumer needs a number.
 pub(crate) fn resolve_profile(
     profile: &ProfileConfig,

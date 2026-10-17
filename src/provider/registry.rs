@@ -841,7 +841,9 @@ pub(crate) async fn resolved_profile(
         provider,
         // The documented default, not a guess at the model: meka does not infer a window from a
         // model name, so a profile that states none gets the one value the docs name.
-        context_window: settings.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW),
+        context_window: settings
+            .context_window
+            .unwrap_or(crate::config::DEFAULT_CONTEXT_WINDOW),
         vision: settings.vision,
         profile,
     })
@@ -855,10 +857,11 @@ pub(crate) async fn resolved_profile(
 /// session's next turn is going to be refused by name, and answering `1000000` beside a refusal
 /// invites a client to divide by a number meka has no reason to believe.
 pub(crate) fn profile_context_window(providers: &ProviderRegistry, profile: &str) -> Option<u64> {
-    providers
-        .settings(profile)
-        .ok()
-        .map(|settings| settings.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW))
+    providers.settings(profile).ok().map(|settings| {
+        settings
+            .context_window
+            .unwrap_or(crate::config::DEFAULT_CONTEXT_WINDOW)
+    })
 }
 
 /// What a session runs on, published for the collaborators that outlive a single turn.
@@ -973,18 +976,17 @@ impl PublishedProfile {
         self.publish_window(resolved.context_window);
     }
 
-    /// Serve from `fallback` until [`Self::restore`], keeping the named profile to go back to.
+    /// Serve from `fallback` until [`Self::restore`], keeping the named profile to go back to. The
+    /// window stays the named profile's: a fallback carries the session and does not resize it, so
+    /// when the session compacts is decided by its own profile alone. Its fallbacks' windows are no
+    /// smaller, by `config::validate_fallback_chains`, so the extra room is simply never drawn on.
     pub(crate) fn serve(&self, fallback: &ResolvedProfile) {
         crate::sync::write(&self.published).serving = Some(fallback.clone());
-        self.publish_window(fallback.context_window);
     }
 
     /// Put the named profile back in charge, at the end of whatever a fallback served.
     pub(crate) fn restore(&self) {
-        let mut published = crate::sync::write(&self.published);
-        if published.serving.take().is_some() {
-            self.publish_window(published.named.context_window);
-        }
+        crate::sync::write(&self.published).serving = None;
     }
 
     fn publish_window(&self, window: u64) {
@@ -1052,6 +1054,26 @@ mod tests {
                 .expect("resolves");
 
         assert_eq!(resolved, "openaiprof");
+    }
+
+    /// A fallback carries the session without resizing it: the window a session gauges against
+    /// stays its own profile's while a fallback serves, and follows a repin.
+    #[test]
+    fn serving_a_fallback_keeps_the_session_s_window() {
+        let profile = |name: &str, window: u64| crate::provider::ResolvedProfile {
+            provider: std::sync::Arc::new(super::Unbound),
+            profile: name.to_string(),
+            context_window: window,
+            vision: true,
+        };
+        let cell = super::PublishedProfile::detached(&profile("main", 1_000));
+        cell.serve(&profile("backup", 5_000));
+        assert_eq!(cell.current().profile, "backup");
+        assert_eq!(cell.context_window(), 1_000);
+        cell.restore();
+        assert_eq!(cell.context_window(), 1_000);
+        cell.store(&profile("other", 3_000));
+        assert_eq!(cell.context_window(), 3_000);
     }
 
     /// A session that does not exist yet is the only case the configured default answers.

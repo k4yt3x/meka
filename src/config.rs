@@ -25,9 +25,10 @@ mod serve;
 #[cfg(test)]
 pub(crate) use profile::PROFILE_KEY_ORDER;
 pub(crate) use profile::{
-    AccountConfig, Backend, ProfileConfig, ProfileRequest, ProfileSettings, account_for,
-    default_profile_on_disk, require_model, require_profile, resolve_device_id, resolve_profile,
-    select_profile, sort_account_keys, sort_profile_keys, validate_max_output_tokens,
+    ANTHROPIC_MAX_REQUEST_BYTES, AccountConfig, Backend, DEFAULT_CONTEXT_WINDOW, ProfileConfig,
+    ProfileRequest, ProfileSettings, account_for, default_profile_on_disk, require_model,
+    require_profile, resolve_device_id, resolve_profile, select_profile, sort_account_keys,
+    sort_profile_keys, validate_max_output_tokens,
 };
 
 pub(crate) use self::{mcp::*, serve::*};
@@ -1152,16 +1153,18 @@ impl Backend {
             _ => true,
         }
     }
+
+    /// The request body ceiling this backend applies when the profile states none:
+    /// [`ANTHROPIC_MAX_REQUEST_BYTES`] on the Anthropic wires, none on the OpenAI wires, whose
+    /// endpoints' caps are the endpoints' own facts.
+    pub(crate) fn default_max_request_bytes(self) -> Option<usize> {
+        match self {
+            Self::AnthropicMessages | Self::ClaudeSubscription => Some(ANTHROPIC_MAX_REQUEST_BYTES),
+            Self::ChatGptSubscription | Self::OpenAiChatCompletions | Self::OpenAiResponses => None,
+        }
+    }
 }
 
-/// Say so for every profile or account key its backend never reads.
-///
-/// The CLI write doors refuse or drop such a key, but a hand-written `config.toml` is another door
-/// with no check at all, and AGENTS.md's profile rule is that no field may state a mismatch
-/// silently: a profile on an `openai-responses` account with `thinking = "off"` read as reasoning
-/// turned off while the backend ignored the key. Asked once at load, not in `resolve_profile`,
-/// which runs per request. An unrecognized `backend`, and a profile whose account is missing, are
-/// reported elsewhere and skipped here.
 /// Whether `fallbacks` on profile `name` names other configured profiles, each once: the one rule
 /// for the list, asked at startup over the whole file and by every write door over the value it
 /// is about to write, so the file never holds a list a run would refuse.
@@ -1192,6 +1195,130 @@ pub(crate) fn validate_fallback_names<'a>(
     Ok(())
 }
 
+/// A profile's request cap as the chain rule compares it: the profile's own `max_request_bytes`,
+/// else what its backend applies, or unknown when its account is missing or unrecognized, which is
+/// reported on its own and compared to nothing here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestCap {
+    Unknown,
+    Unlimited,
+    Bytes(usize),
+}
+
+/// What a fallback must carry for the sessions of the profile it backs, resolved the way a session
+/// resolves them: `vision` as [`resolve_profile`] reads it, the window through
+/// `[session].context_window` and [`DEFAULT_CONTEXT_WINDOW`], the request cap through the
+/// backend's own default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FallbackFit {
+    vision: bool,
+    context_window: u64,
+    max_request_bytes: RequestCap,
+}
+
+impl FallbackFit {
+    /// `profile`'s fit, with `backend` the one its account names when that account is configured
+    /// and recognized.
+    fn of(
+        profile: &ProfileConfig,
+        backend: Option<Backend>,
+        session_context_window: Option<u64>,
+    ) -> Self {
+        let stated = profile
+            .max_request_bytes
+            .and_then(|bytes| usize::try_from(bytes).ok());
+        Self {
+            vision: profile.vision.unwrap_or(true),
+            context_window: profile
+                .context_window
+                .or(session_context_window)
+                .unwrap_or(DEFAULT_CONTEXT_WINDOW),
+            max_request_bytes: match (stated, backend) {
+                (Some(bytes), _) => RequestCap::Bytes(bytes),
+                (None, Some(backend)) => backend
+                    .default_max_request_bytes()
+                    .map_or(RequestCap::Unlimited, RequestCap::Bytes),
+                (None, None) => RequestCap::Unknown,
+            },
+        }
+    }
+
+    /// Why `fallback` cannot carry what a session of `name` may hold, or `None` when it can: the
+    /// same `vision`, since a difference either way leaves the session with images one of the two
+    /// cannot read, and a window and a request cap no smaller, since a smaller one would compact
+    /// or redact the session for good during a turn its own profile only lent out. Larger is
+    /// never drawn on: the session keeps gauging against its own profile's window.
+    fn refuses(self, name: &str, fallback_name: &str, fallback: Self) -> Option<String> {
+        let setting = |on: bool| if on { "true" } else { "false" };
+        if fallback.vision != self.vision {
+            return Some(format!(
+                "'{fallback_name}' has `vision = {}` and '{name}' has `vision = {}`; set them alike",
+                setting(fallback.vision),
+                setting(self.vision)
+            ));
+        }
+        if fallback.context_window < self.context_window {
+            return Some(format!(
+                "'{fallback_name}' has a context window of {} tokens and '{name}' one of {}; a \
+                 fallback's may not be smaller",
+                fallback.context_window, self.context_window
+            ));
+        }
+        match (self.max_request_bytes, fallback.max_request_bytes) {
+            (RequestCap::Unlimited, RequestCap::Bytes(cap)) => Some(format!(
+                "'{fallback_name}' caps requests at {} and '{name}' caps none; a fallback's cap may \
+                 not be smaller",
+                crate::text::format_size(cap)
+            )),
+            (RequestCap::Bytes(own), RequestCap::Bytes(cap)) if cap < own => Some(format!(
+                "'{fallback_name}' caps requests at {} and '{name}' at {}; a fallback's cap may not \
+                 be smaller",
+                crate::text::format_size(cap),
+                crate::text::format_size(own)
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Whether every profile's `fallbacks` names other configured profiles, each once, that can carry
+/// its sessions ([`FallbackFit`]): the one rule for the chains, asked at startup over the whole
+/// file and by every profile write door over the file it is about to write, so the file never
+/// holds a chain a run would refuse. `session_context_window` is `[session].context_window`.
+pub(crate) fn validate_fallback_chains(
+    accounts: &std::collections::BTreeMap<String, AccountConfig>,
+    profiles: &std::collections::BTreeMap<String, ProfileConfig>,
+    session_context_window: Option<u64>,
+) -> std::result::Result<(), String> {
+    let fit = |profile: &ProfileConfig| {
+        let backend = accounts
+            .get(&profile.account)
+            .and_then(|account| account.backend.parse::<Backend>().ok());
+        FallbackFit::of(profile, backend, session_context_window)
+    };
+    for (name, profile) in profiles {
+        validate_fallback_names(name, &profile.fallbacks, profiles.keys())?;
+        let own = fit(profile);
+        for fallback in &profile.fallbacks {
+            let Some(candidate) = profiles.get(fallback) else {
+                continue;
+            };
+            if let Some(reason) = own.refuses(name, fallback, fit(candidate)) {
+                return Err(format!("`[profiles.{name}].fallbacks`: {reason}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Say so for every profile or account key its backend never reads.
+///
+/// The CLI write doors refuse or drop such a key, but a hand-written `config.toml` is another door
+/// with no check at all, and AGENTS.md's profile rule is that no field may state a mismatch
+/// silently: a profile on an `openai-responses` account with `thinking = "off"` read as reasoning
+/// turned off while the backend ignored the key. Asked once at load, not in `resolve_profile`,
+/// which runs per request. An unrecognized `backend`, and a profile whose account is missing, are
+/// reported elsewhere and skipped here.
 fn warn_about_inert_profile_keys(
     accounts: &std::collections::BTreeMap<String, AccountConfig>,
     profiles: &std::collections::BTreeMap<String, ProfileConfig>,
@@ -2623,10 +2750,8 @@ impl ResolvedConfig {
             return Err(crate::error::MekaError::Config(error.clone()));
         }
         self.validate_default_profile()?;
-        for (name, profile) in &self.profiles {
-            validate_fallback_names(name, &profile.fallbacks, self.profiles.keys())
-                .map_err(crate::error::MekaError::Config)?;
-        }
+        validate_fallback_chains(&self.accounts, &self.profiles, self.session_context_window)
+            .map_err(crate::error::MekaError::Config)?;
         warn_about_inert_profile_keys(&self.accounts, &self.profiles);
         // `retention = "0s"` means "delete anything not updated in the last zero seconds", i.e.
         // every session, on every startup. Nobody means that, and the cost of guessing wrong is
@@ -4795,9 +4920,6 @@ claim_lease = {lease}
         assert!(error.contains("not_a_key"), "{error}");
     }
 
-    /// Carrying the parse failure is only half of it: `validate` is what turns it into an exit.
-    /// Without this, deleting the `config_error` arm leaves the whole suite green while meka goes
-    /// back to silently running the agent on defaults.
     /// A `fallbacks` list names other configured profiles, each once; the startup check and the
     /// write doors share the predicate, so the three refusals are pinned here once.
     #[test]
@@ -4834,6 +4956,89 @@ claim_lease = {lease}
         assert!(error.to_string().contains("nowhere"), "{error}");
     }
 
+    /// A fallback carries what a session of its profile may hold: the same `vision`, a window and
+    /// a request cap no smaller, each resolved as a session resolves it, through
+    /// `[session].context_window`, the documented window default and the backend's own cap.
+    #[test]
+    fn a_fallback_must_carry_what_its_profile_holds() {
+        let chains = |main: &str, backup: &str, session: &str| {
+            resolve_with_config(&format!(
+                "default_profile = \"main\"\n\n[accounts.a]\nbackend = \"anthropic-messages\"\n\n\
+                 [accounts.o]\nbackend = \"openai-responses\"\n\n[profiles.main]\n\
+                 fallbacks = [\"backup\"]\nmodel = \"m\"\n{main}\n\n[profiles.backup]\n\
+                 model = \"m\"\n{backup}\n{session}"
+            ))
+            .validate()
+            .map_err(|error| error.to_string())
+        };
+        let anthropic = "account = \"a\"";
+        let openai = "account = \"o\"";
+        chains(anthropic, anthropic, "").expect("alike");
+
+        let error =
+            chains(anthropic, "account = \"a\"\nvision = false", "").expect_err("vision off");
+        assert!(error.contains("`vision = false`"), "{error}");
+        let error =
+            chains("account = \"a\"\nvision = false", anthropic, "").expect_err("vision on");
+        assert!(error.contains("`vision = true`"), "{error}");
+
+        let error = chains(anthropic, "account = \"a\"\ncontext_window = 200000", "")
+            .expect_err("200k behind the 1M default");
+        assert!(
+            error.contains("200000") && error.contains("1000000"),
+            "{error}"
+        );
+        chains("account = \"a\"\ncontext_window = 200000", anthropic, "")
+            .expect("the 1M default behind 200k");
+        chains(
+            anthropic,
+            "account = \"a\"\ncontext_window = 200000",
+            "\n[session]\ncontext_window = 200000\n",
+        )
+        .expect("the session window is what the primary gauges against");
+
+        let error = chains(openai, anthropic, "").expect_err("30 MiB behind no cap");
+        assert!(error.contains("caps none"), "{error}");
+        chains(anthropic, openai, "").expect("no cap behind 30 MiB");
+        let error = chains(
+            anthropic,
+            "account = \"a\"\nmax_request_bytes = 8388608",
+            "",
+        )
+        .expect_err("8 MiB behind 30 MiB");
+        assert!(
+            error.contains("8.0 MiB") && error.contains("30.0 MiB"),
+            "{error}"
+        );
+
+        // A profile whose account is missing has no cap to compare: that account is reported on
+        // its own, and the chain rule must not dress it up as an uncapped wire.
+        let account = |backend: &str| AccountConfig {
+            backend: backend.to_string(),
+            ..Default::default()
+        };
+        let profile = |account: &str, fallbacks: &[&str]| ProfileConfig {
+            account: account.to_string(),
+            model: Some("m".to_string()),
+            fallbacks: fallbacks.iter().map(|name| name.to_string()).collect(),
+            ..Default::default()
+        };
+        let accounts = [("a".to_string(), account("anthropic-messages"))]
+            .into_iter()
+            .collect();
+        let profiles = [
+            ("main".to_string(), profile("ghost", &["backup"])),
+            ("backup".to_string(), profile("a", &[])),
+        ]
+        .into_iter()
+        .collect();
+        validate_fallback_chains(&accounts, &profiles, None)
+            .expect("an unknown wire is compared to nothing");
+    }
+
+    /// Carrying the parse failure is only half of it: `validate` is what turns it into an exit.
+    /// Without this, deleting the `config_error` arm leaves the whole suite green while meka goes
+    /// back to silently running the agent on defaults.
     #[test]
     fn validate_rejects_an_unparseable_config() {
         let resolved = resolve_with_config("[session]\nnot_a_key = 1\n");

@@ -612,12 +612,6 @@ fn run_set(name: &str, key: &str, value: Option<&str>, unset: bool) -> anyhow::R
     if value.is_some() {
         refuse_an_inert_key(&document, name, key)?;
     }
-    if key == "fallbacks"
-        && let Some(value) = value
-    {
-        refuse_bad_fallbacks(&document, name, &fallback_names(value))?;
-    }
-
     // Asked of the document this command is about to write, not of the one on disk, so neither
     // write door can leave behind a profile the other would have refused. Checked here rather than
     // at the next run because a config that fails to start is a worse answer than a command that
@@ -897,7 +891,6 @@ fn write_profile(
     {
         return Err(unknown_account(account, table_names(&document, "accounts")));
     }
-    refuse_bad_fallbacks(&document, name, &tuning.fallbacks)?;
     let before = document.to_string();
     upsert_profile_document(&mut document, name, account, model, tuning)?;
     let after = document.to_string();
@@ -919,17 +912,6 @@ fn fallback_names(value: &str) -> Vec<String> {
         .filter(|name| !name.is_empty())
         .map(str::to_string)
         .collect()
-}
-
-/// The rule `validate()` applies to a `fallbacks` list at startup, asked of the document this
-/// command is about to write, so the file never holds a list a run would refuse.
-fn refuse_bad_fallbacks(
-    document: &toml_edit::DocumentMut,
-    name: &str,
-    fallbacks: &[String],
-) -> anyhow::Result<()> {
-    let profiles = table_names(document, "profiles");
-    config::validate_fallback_names(name, fallbacks, profiles.iter()).map_err(anyhow::Error::msg)
 }
 
 /// The profiles whose `fallbacks` name `name`, which is what keeps `name` from being removed.
@@ -1009,7 +991,29 @@ fn refuse_a_profile_that_cannot_run(before: &str, after: &str, name: &str) -> an
                 .unwrap_or(config::DEFAULT_THINKING_BUDGET_TOKENS),
         )?;
     }
+    // The chains, over the whole file rather than `name` alone: an edit to one profile's window or
+    // `vision` changes the answer for every chain that names it, which no per-profile check sees.
+    // A chain the file already broke by hand is not blamed on an edit that leaves it as it was,
+    // since the run refuses either way and the repair has to come through this door.
+    if let Err(reason) = fallback_chains_of(&candidate)
+        && toml::from_str::<config::ConfigFile>(before)
+            .is_ok_and(|previous| fallback_chains_of(&previous).is_ok())
+    {
+        anyhow::bail!(reason);
+    }
     Ok(())
+}
+
+/// The startup rule for every `fallbacks` chain, asked of a parsed file.
+fn fallback_chains_of(config_file: &config::ConfigFile) -> Result<(), String> {
+    config::validate_fallback_chains(
+        &config_file.accounts,
+        &config_file.profiles,
+        config_file
+            .session
+            .as_ref()
+            .and_then(|session| session.context_window),
+    )
 }
 
 /// Point `default_profile` at `name`, refusing a name that is not a profile.
@@ -1090,7 +1094,7 @@ fn resolve_tuning(
     // What an unset profile would actually budget against: `[session].context_window` if the user
     // already set one, else the built-in default. Showing the constant unconditionally would state
     // a window the run is not going to use.
-    let effective_window = session_window.unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW);
+    let effective_window = session_window.unwrap_or(crate::config::DEFAULT_CONTEXT_WINDOW);
     // The same question one field over: a budget prompt showing the built-in constant while the
     // profile falls back to `[thinking].budget` would make pressing Enter to "accept the default"
     // produce a different number from typing the one on screen.
@@ -2526,23 +2530,46 @@ account = "work"
         assert!(error.to_string().contains("--unset"), "{error}");
     }
 
-    /// The write doors apply the startup rule: a list may not name the profile itself, a profile
-    /// the file does not have, or one name twice.
+    /// The write doors apply the startup rule to the file they are about to write: a list may not
+    /// name the profile itself, a profile the file does not have, or one name twice, and a
+    /// fallback must carry what its profile holds. A chain the file already broke is not blamed on
+    /// an edit that leaves it as it was.
     #[test]
-    fn a_bad_fallbacks_list_is_refused_at_the_write_door() {
-        let document: toml_edit::DocumentMut =
-            "[profiles.main]\naccount = \"a\"\n\n[profiles.backup]\naccount = \"a\"\n"
-                .parse()
-                .expect("a document");
-        refuse_bad_fallbacks(&document, "main", &["backup".to_string()]).expect("a good list");
-        for (list, word) in [
-            (vec!["main".to_string()], "itself"),
-            (vec!["nowhere".to_string()], "nowhere"),
-            (vec!["backup".to_string(), "backup".to_string()], "twice"),
+    fn a_bad_chain_is_refused_at_the_write_door() {
+        let file = |main_extra: &str, backup_extra: &str| {
+            format!(
+                "[accounts.a]\nbackend = \"anthropic-messages\"\n\n[profiles.main]\naccount = \
+                 \"a\"\nmodel = \"m\"\n{main_extra}\n[profiles.backup]\naccount = \"a\"\nmodel = \
+                 \"m\"\n{backup_extra}"
+            )
+        };
+        let before = file("", "");
+        refuse_a_profile_that_cannot_run(&before, &file("fallbacks = [\"backup\"]\n", ""), "main")
+            .expect("a good chain");
+        for (after, word) in [
+            (file("fallbacks = [\"main\"]\n", ""), "itself"),
+            (file("fallbacks = [\"nowhere\"]\n", ""), "nowhere"),
+            (file("fallbacks = [\"backup\", \"backup\"]\n", ""), "twice"),
+            (
+                file("fallbacks = [\"backup\"]\n", "vision = false\n"),
+                "vision",
+            ),
+            (
+                file("fallbacks = [\"backup\"]\n", "context_window = 200000\n"),
+                "200000",
+            ),
         ] {
-            let error = refuse_bad_fallbacks(&document, "main", &list).expect_err(word);
+            let error = refuse_a_profile_that_cannot_run(&before, &after, "main").expect_err(word);
             assert!(error.to_string().contains(word), "{error}");
         }
+
+        let broken = file("fallbacks = [\"backup\"]\n", "vision = false\n");
+        let unrelated = file(
+            "fallbacks = [\"backup\"]\neffort = \"high\"\n",
+            "vision = false\n",
+        );
+        refuse_a_profile_that_cannot_run(&broken, &unrelated, "main")
+            .expect("a chain broken on disk is not this edit's to answer for");
     }
 
     /// A profile another's `fallbacks` names is found by the removal door, and a rename moves the
