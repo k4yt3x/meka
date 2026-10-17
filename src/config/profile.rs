@@ -73,6 +73,12 @@ pub(crate) struct ProfileConfig {
     /// reported against the profile, by [`account_for`], rather than failing the whole file.
     pub(crate) account: String,
     pub(crate) model: Option<String>,
+    /// Profiles to serve a turn from when this one cannot, in order: its upstream still failing
+    /// once the retry budget is spent, or refusing for quota or billing. Each is a whole other
+    /// profile, so no field of this one is ever overridden. The session's row keeps naming this
+    /// profile; the turn that fell back records which one served it.
+    #[serde(default)]
+    pub(crate) fallbacks: Vec<String>,
     /// The model's context window (total tokens it can hold), used for the context gauge and
     /// auto-compaction. Falls back to `[session].context_window`, then to
     /// [`crate::provider::DEFAULT_CONTEXT_WINDOW`]. meka never infers this from the model name or
@@ -139,6 +145,7 @@ pub(crate) const ACCOUNT_KEY_ORDER: &[&str] = &[
 pub(crate) const PROFILE_KEY_ORDER: &[&str] = &[
     "account",
     "model",
+    "fallbacks",
     "context_window",
     "max_output_tokens",
     "effort",
@@ -211,6 +218,8 @@ pub(crate) struct ProfileSettings {
     pub(crate) interleaved_thinking: bool,
     pub(crate) device_id: String,
     pub(crate) model: Option<String>,
+    /// See [`ProfileConfig::fallbacks`].
+    pub(crate) fallbacks: Vec<String>,
     pub(crate) context_window: Option<u64>,
     pub(crate) max_output_tokens: Option<u64>,
     pub(crate) effort: Option<String>,
@@ -322,6 +331,7 @@ pub(crate) fn resolve_profile(
         interleaved_thinking: account.interleaved_thinking.unwrap_or(true),
         device_id,
         model: profile.model.clone(),
+        fallbacks: profile.fallbacks.clone(),
         context_window: profile.context_window.or(session_context_window),
         max_output_tokens: profile.max_output_tokens,
         max_request_bytes: profile
@@ -983,6 +993,7 @@ mod tests {
             "[profiles.work]\n",
             "account = \"work\"\n",
             "model = \"claude-opus-5-5\"\n",
+            "fallbacks = [\"backup\"]\n",
             "context_window = 200000\n",
             "max_output_tokens = 64000\n",
             "effort = \"high\"\n",

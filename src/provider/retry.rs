@@ -76,6 +76,23 @@ const RETRY_AFTER_CAP: Duration = Duration::from_secs(60);
 /// the whole answer: see [`outage_reprieve`].
 pub(crate) const OUTAGE_REPRIEVE: Duration = BACKOFF_CAP;
 
+/// How long a profile that failed a turn over to a fallback is skipped at the start of later
+/// turns when its upstream stated no reset: long enough that an outage is not probed on every
+/// turn, short enough that a recovered upstream is back within one.
+pub(crate) const FALLBACK_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+/// Ceiling on a cooldown the upstream stated. A reset hours away would hide a recovery the
+/// upstream makes early, and a probe an hour later costs one retry sequence.
+pub(crate) const FALLBACK_COOLDOWN_CAP: Duration = Duration::from_secs(60 * 60);
+
+/// How long a failed profile's breaker stays open: what the upstream said access resumes in,
+/// within the cap, else the default.
+pub(crate) fn fallback_cooldown(stated: Option<Duration>) -> Duration {
+    stated.map_or(FALLBACK_COOLDOWN, |stated| {
+        stated.min(FALLBACK_COOLDOWN_CAP)
+    })
+}
+
 // `Duration::clamp` panics on an inverted range, and the floor and the ceiling in
 // `outage_reprieve` are two independent constants that nothing else relates: `OUTAGE_REPRIEVE`
 // tracks `BACKOFF_CAP`, tuned for interactive latency, while `RETRY_AFTER_CAP` bounds what a
@@ -149,6 +166,21 @@ mod tests {
         assert!(
             RETRY_BUDGET < window * attempts,
             "a budget of {RETRY_BUDGET:?} can never fire before the {attempts}-attempt cap does"
+        );
+    }
+
+    /// The breaker takes the upstream's own reset within the cap, and the default when it stated
+    /// none.
+    #[test]
+    fn a_fallback_cooldown_is_the_stated_reset_within_the_cap() {
+        assert_eq!(fallback_cooldown(None), FALLBACK_COOLDOWN);
+        assert_eq!(
+            fallback_cooldown(Some(Duration::from_secs(10))),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            fallback_cooldown(Some(Duration::from_secs(3 * 60 * 60))),
+            FALLBACK_COOLDOWN_CAP
         );
     }
 

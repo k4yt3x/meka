@@ -1599,10 +1599,11 @@ impl Store {
                             "INSERT INTO turns (id, session_id, source, started_at, ended_at, \
                              status, stop_reason, error_type, detail, input_tokens, \
                              output_tokens, cache_creation_input_tokens, \
-                             cache_read_input_tokens, cancel_reason)
+                             cache_read_input_tokens, cancel_reason, profile)
                              SELECT ?1, ?2, source, started_at, ended_at, status, stop_reason, \
                              error_type, detail, input_tokens, output_tokens, \
-                             cache_creation_input_tokens, cache_read_input_tokens, cancel_reason
+                             cache_creation_input_tokens, cache_read_input_tokens, cancel_reason, \
+                             profile
                              FROM turns WHERE id = ?3",
                             rusqlite::params![new, new_id_string, old],
                         )?;
@@ -4221,6 +4222,83 @@ mod tests {
         assert_eq!(copied.len(), 1);
         assert_eq!(copied[0].status, Some(TurnStatus::Canceled));
         assert_eq!(copied[0].reason, Some(CancelReason::Abandoned));
+    }
+
+    /// A turn a fallback served says so on its row, in its archive form, and on a fork's copy;
+    /// one the session's own profile served says nothing.
+    #[tokio::test]
+    async fn a_turn_records_the_profile_that_served_it() {
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "words").await;
+        let turn = Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(id, turn, "client", "2026-10-17T10:00:00+00:00")
+            .await
+            .expect("open");
+        store
+            .turn_store()
+            .close_turn(
+                turn,
+                &TurnEnding::succeeded("end_turn", TurnUsage::default())
+                    .served_by(Some("backup".to_string())),
+            )
+            .await
+            .expect("close");
+        let own = Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(id, own, "client", "2026-10-17T10:01:00+00:00")
+            .await
+            .expect("open");
+        store
+            .turn_store()
+            .close_turn(
+                own,
+                &TurnEnding::succeeded("end_turn", TurnUsage::default()),
+            )
+            .await
+            .expect("close");
+        let record = store
+            .turn_store()
+            .get_turn(id, turn)
+            .await
+            .expect("get")
+            .expect("the row");
+        assert_eq!(record.profile.as_deref(), Some("backup"));
+        let json = serde_json::to_value(&record).expect("json");
+        assert_eq!(json["profile"], "backup");
+        let own_record = store
+            .turn_store()
+            .get_turn(id, own)
+            .await
+            .expect("get")
+            .expect("the row");
+        assert_eq!(own_record.profile, None);
+        assert!(
+            serde_json::to_value(&own_record)
+                .expect("json")
+                .get("profile")
+                .is_none(),
+            "absent, not null, on a turn the session's profile served"
+        );
+        assert_eq!(
+            super::export::ExportedTurn::from(record).profile.as_deref(),
+            Some("backup")
+        );
+
+        let (forked, _lock) = store
+            .fork_session_locked(id, ForkOverrides::default(), SourceLock::Probe)
+            .await
+            .expect("fork")
+            .expect("the source exists");
+        let copied = store
+            .turn_store()
+            .load_turns(forked.id)
+            .await
+            .expect("turns");
+        assert_eq!(copied[0].profile.as_deref(), Some("backup"));
+        assert_eq!(copied[1].profile, None);
     }
 
     /// `revision` is defined by the replay, and the rows have to count the same number: a

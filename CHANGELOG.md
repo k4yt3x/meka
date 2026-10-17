@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.78.0] - 2026-10-17
 
 ### Added
 
@@ -16,12 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A turn stopped because its client left ends with `reason: "abandoned"`, on its row as well.
 - The conversation tools take a session: a sub-agent's, or any session at `unrestricted`.
 - `session_list` and `session_search`: the sessions an agent may read, and which of them said what.
+- Profiles take `fallbacks`: when one cannot serve a turn, the next profile listed does.
+- `GET /v1/profiles` carries each profile's `fallbacks`.
+- `/errors/provider-exhausted`: a quota or billing refusal, its reset relayed as `Retry-After`.
+- A turn's record and its terminal event carry `profile` when a fallback profile served the turn.
 
 ### Changed
 
 - **Breaking:** a blocking `POST /turn` holds its turn: a dropped request stops it after the grace.
-- A detached request's `Idempotency-Key` is committed at admission; a replay answers the same `202`.
-- Session archives are `format_version` 13; a 0.77 archive is read as it is.
+- A detached request's `Idempotency-Key` is committed at admission; a replay gets the same `202`.
+- A 402 or a 429 naming a quota or the subscription window is `provider-exhausted`, not retried.
+- Session archives are `format_version` 14; a 0.77 archive is read as it is.
 
 ## [0.77.0] - 2026-10-16
 
@@ -2777,7 +2782,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.77.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.78.0...HEAD
+[0.78.0]: https://github.com/k4yt3x/meka/compare/0.77.0...0.78.0
 [0.77.0]: https://github.com/k4yt3x/meka/compare/0.76.0...0.77.0
 [0.76.0]: https://github.com/k4yt3x/meka/compare/0.75.0...0.76.0
 [0.75.0]: https://github.com/k4yt3x/meka/compare/0.74.0...0.75.0

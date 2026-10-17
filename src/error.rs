@@ -108,6 +108,16 @@ pub(crate) enum MekaError {
         /// store as proven-good.
         server_error_on_completion: bool,
     },
+    /// The account behind the profile cannot pay for the request right now: a quota or credit
+    /// exhausted, a spend limit reached. Identified by status, documented codes and headers alone,
+    /// never by message text; see [`exhaustion`]. Never retried in place, since nothing changes
+    /// until the reset; a profile with fallbacks hands the turn to one instead.
+    #[error("provider quota exhausted: {message}")]
+    ProviderExhausted {
+        message: String,
+        /// How long until the provider said access resumes, when it said.
+        resets_after: Option<Duration>,
+    },
 
     #[error("tool execution error: {tool_name}: {message}")]
     ToolExecution { tool_name: String, message: String },
@@ -309,6 +319,14 @@ pub(crate) enum ErrorKind {
     /// `should_retry_provider_error` declines to retry at all once any output has reached the
     /// stream or the retry budget is spent, so this can arrive after three attempts or after none.
     ProviderUnavailable,
+    /// The upstream refused the request for quota or billing, by a signal it documents: a 402, a
+    /// quota code on a 429, or the Claude subscription's exhausted window.
+    ///
+    /// A 502 like [`Self::Provider`], and a distinct `type` because the remedy differs from both
+    /// neighbors: not a resend after a pause, which [`Self::ProviderUnavailable`] invites, and not
+    /// a shorter conversation. Nothing changes until the reset, which rides as `Retry-After` when
+    /// the upstream stated one.
+    ProviderExhausted,
     /// The conversation no longer fits the model's context window, and meka could not compact it
     /// down far enough (or `auto_compact` is off).
     ///
@@ -337,7 +355,7 @@ pub(crate) enum ErrorKind {
 
 impl ErrorKind {
     /// Every entry of the catalog, for a reader that holds a `type` and wants the kind back.
-    pub(crate) const ALL: [Self; 28] = [
+    pub(crate) const ALL: [Self; 29] = [
         Self::Auth,
         Self::AuthScope,
         Self::SessionNotFound,
@@ -363,6 +381,7 @@ impl ErrorKind {
         Self::ConcurrencyLimit,
         Self::Provider,
         Self::ProviderUnavailable,
+        Self::ProviderExhausted,
         Self::ContextOverflow,
         Self::McpUnavailable,
         Self::Internal,
@@ -402,6 +421,7 @@ impl ErrorKind {
             Self::ConcurrencyLimit => "concurrency-limit",
             Self::Provider => "provider",
             Self::ProviderUnavailable => "provider-unavailable",
+            Self::ProviderExhausted => "provider-exhausted",
             Self::ContextOverflow => "context-overflow",
             Self::McpUnavailable => "mcp-unavailable",
             Self::Internal => "internal",
@@ -436,6 +456,7 @@ impl ErrorKind {
             Self::ConcurrencyLimit => "https://meka.run/errors/concurrency-limit",
             Self::Provider => "https://meka.run/errors/provider",
             Self::ProviderUnavailable => "https://meka.run/errors/provider-unavailable",
+            Self::ProviderExhausted => "https://meka.run/errors/provider-exhausted",
             Self::ContextOverflow => "https://meka.run/errors/context-overflow",
             Self::McpUnavailable => "https://meka.run/errors/mcp-unavailable",
             Self::Internal => "https://meka.run/errors/internal",
@@ -470,6 +491,7 @@ impl ErrorKind {
             Self::ConcurrencyLimit => "Process-wide concurrency limit reached",
             Self::Provider => "Provider call failed",
             Self::ProviderUnavailable => "Provider temporarily unavailable",
+            Self::ProviderExhausted => "Provider quota exhausted",
             Self::ContextOverflow => "Conversation exceeds the model's context window",
             Self::McpUnavailable => "Required MCP server is not ready",
             Self::Internal => "Internal server error",
@@ -518,6 +540,7 @@ impl MekaError {
             // being skipped with a warning, so nothing here resends into a body the provider
             // would reject identically forever.
             Self::StreamError(_) | Self::RetryableProvider { .. } => ErrorKind::ProviderUnavailable,
+            Self::ProviderExhausted { .. } => ErrorKind::ProviderExhausted,
             Self::ContextOverflow(_) => ErrorKind::ContextOverflow,
             // A fully classified pre-flight refusal: answering "internal server error" would send
             // an operator looking for a bug in meka instead of at the subprocess that did not
@@ -566,6 +589,13 @@ impl MekaError {
             Self::StreamError(_) | Self::RetryableProvider { .. } => {
                 PROVIDER_UNAVAILABLE_SENTENCE.to_string()
             }
+            Self::ProviderExhausted { resets_after, .. } => match resets_after {
+                Some(after) => format!(
+                    "the profile's quota or credit is exhausted; access resumes in {}",
+                    crate::text::format_duration_words(*after)
+                ),
+                None => "the profile's quota or credit is exhausted".to_string(),
+            },
             Self::ContextOverflow(_) => {
                 "the conversation exceeds the model's context window; compact it before retrying"
                     .to_string()
@@ -597,6 +627,27 @@ impl MekaError {
         }
     }
 
+    /// Whether this failure says the profile cannot serve a request right now, which is what a
+    /// fallback profile is for: the transient class once its retries are spent, and a refusal for
+    /// quota or billing. Not a request the upstream judged wrong, which another profile would
+    /// judge the same, and not a credential it refused, which only the operator can fix.
+    pub(crate) fn is_profile_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::RetryableProvider { .. } | Self::StreamError(_) | Self::ProviderExhausted { .. }
+        )
+    }
+
+    /// When the upstream said the profile would serve again, for the breaker that skips the
+    /// profile until then; `None` when it said nothing.
+    pub(crate) fn resumes_after(&self) -> Option<Duration> {
+        match self {
+            Self::RetryableProvider { retry_after, .. } => *retry_after,
+            Self::ProviderExhausted { resets_after, .. } => *resets_after,
+            _ => None,
+        }
+    }
+
     /// The provider's own response text, when this error carries one. Every surface logs it;
     /// only one configured to relay it shows it, since it can name the operator's account, its
     /// rate-limit posture and, on one backend, a fragment of the request that triggered it. A
@@ -608,6 +659,7 @@ impl MekaError {
             | Self::InvalidRequest(message)
             | Self::StreamError(message)
             | Self::RetryableProvider { message, .. }
+            | Self::ProviderExhausted { message, .. }
             | Self::ContextOverflow(message) => Some(message),
             _ => None,
         }
@@ -738,11 +790,16 @@ pub(crate) enum ProviderRequest {
 /// **That tolerance is why `request` exists.** It holds only where there is turn content to degrade
 /// and a loop that will put it back. A usage probe answering 400 has neither, so `Auxiliary` keeps
 /// it out of that bucket; see [`ProviderRequest`].
+///
+/// `window_reset` is the Claude subscription's statement of when its exhausted usage window
+/// reopens, read off the response headers by the caller ([`parse_window_reset`]); `None` from every
+/// other endpoint.
 pub(crate) fn provider_http_error(
     status: reqwest::StatusCode,
     body: &str,
     retry_after: Option<Duration>,
     request: ProviderRequest,
+    window_reset: Option<Duration>,
 ) -> MekaError {
     let lower = body.to_ascii_lowercase();
     // The body is consulted only on a 4xx that is not a 429, because a provider may echo the
@@ -766,6 +823,13 @@ pub(crate) fn provider_http_error(
     let message = format!("API returned status {status}: {}", render_error_body(body));
     if overflow {
         MekaError::ContextOverflow(message)
+    } else if let Some(Exhaustion { resets_after }) =
+        exhaustion(status, body, retry_after, window_reset)
+    {
+        MekaError::ProviderExhausted {
+            message,
+            resets_after,
+        }
     } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
         MekaError::RetryableProvider {
             message,
@@ -901,6 +965,126 @@ async fn read_whole_reply_within(
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
+/// What a provider's error object says, read off an HTTP error body. Anthropic and OpenAI wrap it
+/// as `{"error": {...}}`; a bare object is read too.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProviderErrorBody {
+    /// The `type` of the error object.
+    error_type: Option<String>,
+    /// The `code`, when it is a string.
+    code: Option<String>,
+    /// When the ChatGPT backend says access resumes, as unix seconds, beside
+    /// `usage_limit_reached`.
+    resets_at: Option<i64>,
+}
+
+impl ProviderErrorBody {
+    /// The error object in `body`, or an empty one for a body that is not JSON or carries none.
+    fn parse(body: &str) -> Self {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return Self::default();
+        };
+        let object = value.get("error").unwrap_or(&value);
+        Self {
+            error_type: object
+                .get("type")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            code: object
+                .get("code")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            resets_at: object.get("resets_at").and_then(|value| value.as_i64()),
+        }
+    }
+
+    /// Whether the object's `type` or `code` is one a backend documents as quota or billing.
+    fn names_exhaustion(&self) -> bool {
+        [&self.error_type, &self.code]
+            .into_iter()
+            .flatten()
+            .any(|word| is_exhaustion_code(word))
+    }
+}
+
+/// The codes a backend documents as "the account cannot pay for this now": what the Codex client
+/// reads off a 429 (`references/codex/codex-rs/codex-api/src/api_bridge.rs`), which covers the
+/// OpenAI platform's `insufficient_quota` as well. A message's words are never read: an
+/// Anthropic API key over its limit answers a 400 `invalid_request_error` with the reset in prose
+/// alone, and that stays a permanent error.
+fn is_exhaustion_code(word: &str) -> bool {
+    matches!(
+        word,
+        "usage_limit_reached"
+            | "usage_not_included"
+            | "insufficient_quota"
+            | "credit_balance_exhausted"
+            | "organization_spend_limit_exceeded"
+            | "project_spend_limit_exceeded"
+            | "organization_usage_limit_exceeded"
+    )
+}
+
+/// A refusal for quota or billing, and when the upstream said access resumes.
+struct Exhaustion {
+    resets_after: Option<Duration>,
+}
+
+/// Whether a refused response is a documented statement that the account cannot pay for the
+/// request now. Three rules, each structured, none reading message text:
+///
+/// - a 402 on any endpoint, since Payment Required is the status's own meaning;
+/// - a 429 whose error object names a quota code, with the body's `resets_at` as the reset when it
+///   carries one;
+/// - a 429 beside the Claude subscription's `anthropic-ratelimit-unified-reset`, which Claude Code
+///   reads off the refused response to wait for the window (`withRetry.ts`,
+///   `getRateLimitResetDelayMs`). A 429 without it is an ordinary rate limit.
+fn exhaustion(
+    status: reqwest::StatusCode,
+    body: &str,
+    retry_after: Option<Duration>,
+    window_reset: Option<Duration>,
+) -> Option<Exhaustion> {
+    if status == reqwest::StatusCode::PAYMENT_REQUIRED {
+        return Some(Exhaustion {
+            resets_after: retry_after,
+        });
+    }
+    if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    let object = ProviderErrorBody::parse(body);
+    if object.names_exhaustion() {
+        return Some(Exhaustion {
+            resets_after: object
+                .resets_at
+                .and_then(duration_until_unix_seconds)
+                .or(retry_after),
+        });
+    }
+    window_reset.map(|reset| Exhaustion {
+        resets_after: Some(reset),
+    })
+}
+
+/// How long until the instant `seconds` after the epoch; `None` once it has passed, since a reset
+/// in the past says nothing about when access resumes.
+fn duration_until_unix_seconds(seconds: i64) -> Option<Duration> {
+    let at = std::time::UNIX_EPOCH + Duration::from_secs(u64::try_from(seconds).ok()?);
+    at.duration_since(std::time::SystemTime::now()).ok()
+}
+
+/// The Claude subscription's `anthropic-ratelimit-unified-reset`, unix seconds, as how long until
+/// the window reopens: `None` when the header is absent, unreadable, or already past. Only that
+/// endpoint sends it, so on every other response this reads nothing.
+pub(crate) fn parse_window_reset(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get("anthropic-ratelimit-unified-reset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .and_then(duration_until_unix_seconds)
+}
+
 /// A mid-stream error event, classified by the code the backend put on it. The codes each backend
 /// documents as transient are retryable; anything else, including a code this build does not know,
 /// is permanent, so a real problem surfaces at once instead of burning the retry budget first.
@@ -909,6 +1093,12 @@ async fn read_whole_reply_within(
 /// on the stream, where an overload cannot be told from a failure to handle the body, so it does
 /// not license deleting content.
 pub(crate) fn provider_stream_error(code: &str, message: String) -> MekaError {
+    if is_exhaustion_code(code) {
+        return MekaError::ProviderExhausted {
+            message,
+            resets_after: None,
+        };
+    }
     match code {
         // Anthropic `error.type`.
         "overloaded_error" | "rate_limit_error" | "api_error"
@@ -1257,9 +1447,10 @@ mod tests {
         assert!(matches!(
             provider_http_error(
                 reqwest::StatusCode::BAD_REQUEST,
-                r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#,
+                r#"{"error":{"type":"invalid_request_error", "message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#,
                 None,
                 ProviderRequest::Completion,
+                None
             ),
             MekaError::ContextOverflow(_)
         ));
@@ -1270,6 +1461,7 @@ mod tests {
                 r#"{"error":{"code":"context_length_exceeded"}}"#,
                 None,
                 ProviderRequest::Completion,
+                None
             ),
             MekaError::ContextOverflow(_)
         ));
@@ -1280,6 +1472,7 @@ mod tests {
                 "Request Entity Too Large",
                 None,
                 ProviderRequest::Completion,
+                None
             ),
             MekaError::ContextOverflow(_)
         ));
@@ -1301,6 +1494,7 @@ mod tests {
             "upstream said no",
             None,
             request,
+            None,
         ) {
             MekaError::RetryableProvider {
                 server_error_on_completion,
@@ -1343,6 +1537,185 @@ mod tests {
         );
     }
 
+    /// Payment Required is the status's own meaning, so it is exhaustion from any endpoint and
+    /// for any request class, with `Retry-After` as the reset when there is one.
+    #[test]
+    fn a_402_is_exhausted_on_any_endpoint() {
+        for request in [ProviderRequest::Completion, ProviderRequest::Auxiliary] {
+            match provider_http_error(
+                reqwest::StatusCode::PAYMENT_REQUIRED,
+                r#"{"error":{"message":"Insufficient credits","code":402}}"#,
+                Some(Duration::from_secs(90)),
+                request,
+                None,
+            ) {
+                MekaError::ProviderExhausted { resets_after, .. } => {
+                    assert_eq!(resets_after, Some(Duration::from_secs(90)));
+                }
+                other => panic!("{request:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// The codes the Codex client reads off a 429, as `type` or as `code`, are exhaustion, and a
+    /// body's `resets_at` is the reset; a 429 naming none of them is the rate limit it always was,
+    /// whatever its message says.
+    #[test]
+    fn a_documented_quota_code_on_a_429_is_exhausted_with_its_reset() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs();
+        for code in [
+            "usage_limit_reached",
+            "usage_not_included",
+            "insufficient_quota",
+            "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "organization_usage_limit_exceeded",
+        ] {
+            for key in ["type", "code"] {
+                let body = format!(
+                    r#"{{"error":{{"{key}":"{code}","message":"x","resets_at":{}}}}}"#,
+                    now + 600
+                );
+                match provider_http_error(
+                    reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    &body,
+                    Some(Duration::from_secs(5)),
+                    ProviderRequest::Completion,
+                    None,
+                ) {
+                    MekaError::ProviderExhausted {
+                        resets_after: Some(after),
+                        ..
+                    } => assert!(
+                        (Duration::from_secs(590)..=Duration::from_secs(600)).contains(&after),
+                        "{code} as {key}: the body's reset wins over Retry-After, got {after:?}"
+                    ),
+                    other => panic!("{code} as {key}: {other:?}"),
+                }
+            }
+        }
+        // Without `resets_at`, `Retry-After` is what the provider said.
+        assert!(matches!(
+            provider_http_error(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"type":"insufficient_quota","message":"x"}}"#,
+                Some(Duration::from_secs(5)),
+                ProviderRequest::Completion,
+                None,
+            ),
+            MekaError::ProviderExhausted { resets_after: Some(after), .. } if after == Duration::from_secs(5)
+        ));
+        assert!(matches!(
+            provider_http_error(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"type":"rate_limit_error","message":"You have exceeded your quota of requests"}}"#,
+                None,
+                ProviderRequest::Completion,
+                None,
+            ),
+            MekaError::RetryableProvider { .. }
+        ));
+    }
+
+    /// The Claude subscription states its window's reset in a header on the refused 429; a 429
+    /// without it is an ordinary rate limit.
+    #[test]
+    fn a_429_beside_the_window_reset_is_exhausted() {
+        assert!(matches!(
+            provider_http_error(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"type":"rate_limit_error","message":"limit reached"}}"#,
+                None,
+                ProviderRequest::Completion,
+                Some(Duration::from_secs(300)),
+            ),
+            MekaError::ProviderExhausted { resets_after: Some(after), .. } if after == Duration::from_secs(300)
+        ));
+        assert!(matches!(
+            provider_http_error(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"type":"rate_limit_error","message":"limit reached"}}"#,
+                None,
+                ProviderRequest::Completion,
+                None,
+            ),
+            MekaError::RetryableProvider { .. }
+        ));
+    }
+
+    /// Captured on 2026-10-17 from a depleted Anthropic API key: the limit is stated in prose
+    /// alone, on a 400 `invalid_request_error`, and no words are read, so it stays what its
+    /// status says.
+    #[test]
+    fn a_usage_limit_stated_in_prose_alone_stays_what_its_status_says() {
+        const CAPTURED: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"You have reached your specified API usage limits. You will regain access on 2026-11-01 at 00:00 UTC."},"request_id":"req_x"}"#;
+        assert!(matches!(
+            provider_http_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                CAPTURED,
+                None,
+                ProviderRequest::Completion,
+                None,
+            ),
+            MekaError::InvalidRequest(_)
+        ));
+        assert!(matches!(
+            provider_http_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                CAPTURED,
+                None,
+                ProviderRequest::Auxiliary,
+                None,
+            ),
+            MekaError::Provider(_)
+        ));
+    }
+
+    /// A gateway relaying a quota code inside a 200 stream is read the way the status would be.
+    #[test]
+    fn a_stream_error_naming_a_quota_code_is_exhausted() {
+        assert!(matches!(
+            provider_stream_error("insufficient_quota", "out".to_string()),
+            MekaError::ProviderExhausted { ref message, resets_after: None } if message == "out"
+        ));
+        assert!(matches!(
+            provider_stream_error_object(
+                &serde_json::json!({"type": "usage_limit_reached", "message": "out"}),
+                "fallback"
+            ),
+            MekaError::ProviderExhausted { .. }
+        ));
+        assert_eq!(
+            ErrorKind::from_name("provider-exhausted"),
+            Some(ErrorKind::ProviderExhausted)
+        );
+    }
+
+    #[test]
+    fn the_window_reset_header_is_read_as_time_remaining() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs();
+        let header = |value: String| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                "anthropic-ratelimit-unified-reset",
+                value.parse().expect("a header value"),
+            );
+            headers
+        };
+        let remaining = parse_window_reset(&header((now + 1_800).to_string())).expect("future");
+        assert!((Duration::from_secs(1_790)..=Duration::from_secs(1_800)).contains(&remaining));
+        assert_eq!(parse_window_reset(&header((now - 10).to_string())), None);
+        assert_eq!(parse_window_reset(&header("soon".to_string())), None);
+        assert_eq!(parse_window_reset(&reqwest::header::HeaderMap::new()), None);
+    }
+
     #[test]
     fn provider_http_error_maps_other_as_provider() {
         // Nothing the agent loop can repair: the credentials or the endpoint are wrong.
@@ -1352,6 +1725,7 @@ mod tests {
                 r#"{"error":{"type":"authentication_error"}}"#,
                 None,
                 ProviderRequest::Completion,
+                None
             ),
             MekaError::Provider(_)
         ));
@@ -1360,7 +1734,8 @@ mod tests {
                 reqwest::StatusCode::NOT_FOUND,
                 "not found",
                 None,
-                ProviderRequest::Completion
+                ProviderRequest::Completion,
+                None
             ),
             MekaError::Provider(_)
         ));
@@ -1371,9 +1746,10 @@ mod tests {
         assert!(matches!(
             provider_http_error(
                 reqwest::StatusCode::BAD_REQUEST,
-                r#"{"error":{"type":"invalid_request_error","message":"messages.34.content.0.tool_result.content.1.image.source.base64: The image was specified using the image/png media type, but the image appears to be a image/jpeg image"}}"#,
+                r#"{"error":{"type":"invalid_request_error", "message":"messages.34.content.0.tool_result.content.1.image.source.base64: The image was specified using the image/png media type, but the image appears to be a image/jpeg image"}}"#,
                 None,
                 ProviderRequest::Completion,
+                None
             ),
             MekaError::InvalidRequest(_)
         ));
@@ -1382,7 +1758,8 @@ mod tests {
                 reqwest::StatusCode::UNPROCESSABLE_ENTITY,
                 "invalid",
                 None,
-                ProviderRequest::Completion
+                ProviderRequest::Completion,
+                None
             ),
             MekaError::InvalidRequest(_)
         ));
@@ -1395,9 +1772,10 @@ mod tests {
         assert!(matches!(
             provider_http_error(
                 reqwest::StatusCode::BAD_REQUEST,
-                r#"{"error":{"type":"invalid_request_error","message":"prompt is too long"}}"#,
+                r#"{"error":{"type":"invalid_request_error", "message":"prompt is too long"}}"#,
                 None,
                 ProviderRequest::Completion,
+                None
             ),
             MekaError::ContextOverflow(_)
         ));
@@ -1422,14 +1800,26 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    provider_http_error(status, "malformed", None, ProviderRequest::Completion),
+                    provider_http_error(
+                        status,
+                        "malformed",
+                        None,
+                        ProviderRequest::Completion,
+                        None
+                    ),
                     MekaError::InvalidRequest(_)
                 ),
                 "{status} on a completion is the repair path's whole trigger"
             );
             assert!(
                 matches!(
-                    provider_http_error(status, "malformed", None, ProviderRequest::Auxiliary),
+                    provider_http_error(
+                        status,
+                        "malformed",
+                        None,
+                        ProviderRequest::Auxiliary,
+                        None
+                    ),
                     MekaError::Provider(_)
                 ),
                 "{status} on a probe has nothing to degrade and must stay terminal"
@@ -1445,6 +1835,7 @@ mod tests {
                     "prompt is too long",
                     None,
                     request,
+                    None
                 ),
                 MekaError::ContextOverflow(_)
             ));
@@ -1454,6 +1845,7 @@ mod tests {
                     "Overloaded",
                     None,
                     request,
+                    None,
                 ),
                 MekaError::RetryableProvider { .. }
             ));
@@ -1793,6 +2185,7 @@ mod tests {
                 "rate limit exceeded",
                 None,
                 ProviderRequest::Completion,
+                None
             ),
             MekaError::RetryableProvider { .. }
         ));
@@ -1801,7 +2194,13 @@ mod tests {
             let status = reqwest::StatusCode::from_u16(status).expect("valid status");
             assert!(
                 matches!(
-                    provider_http_error(status, "Overloaded", None, ProviderRequest::Completion),
+                    provider_http_error(
+                        status,
+                        "Overloaded",
+                        None,
+                        ProviderRequest::Completion,
+                        None
+                    ),
                     MekaError::RetryableProvider { .. }
                 ),
                 "status {status} should be retryable"
@@ -1817,6 +2216,7 @@ mod tests {
             "rate limited",
             Some(delay),
             ProviderRequest::Completion,
+            None,
         ) {
             MekaError::RetryableProvider { retry_after, .. } => {
                 assert_eq!(retry_after, Some(delay));
@@ -1850,6 +2250,7 @@ mod tests {
                     "context_length_exceeded",
                     None,
                     ProviderRequest::Completion,
+                    None
                 ),
                 MekaError::RetryableProvider {
                     server_error_on_completion: true,
@@ -1865,6 +2266,7 @@ mod tests {
                     "context_length_exceeded",
                     None,
                     ProviderRequest::Completion,
+                    None
                 ),
                 MekaError::RetryableProvider { .. }
             ),
@@ -1886,6 +2288,7 @@ mod tests {
                         phrase,
                         None,
                         ProviderRequest::Completion,
+                        None
                     ),
                     MekaError::ContextOverflow(_)
                 ),
@@ -1899,6 +2302,7 @@ mod tests {
                     "no useful body",
                     None,
                     ProviderRequest::Completion,
+                    None
                 ),
                 MekaError::ContextOverflow(_)
             ),
@@ -1914,6 +2318,7 @@ mod tests {
             "{\"error\":\"model not found\"}\n\n",
             None,
             ProviderRequest::Completion,
+            None,
         );
         let rendered = error.to_string();
         assert!(
@@ -1930,6 +2335,7 @@ mod tests {
             "\n",
             None,
             ProviderRequest::Completion,
+            None,
         );
         assert!(
             error

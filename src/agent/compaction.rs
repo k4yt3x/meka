@@ -442,6 +442,7 @@ impl Agent {
                 "no active session to compact".to_string(),
             ));
         };
+        let _serving = super::fallback::RestoreWhenIdle { agent: self };
 
         if messages.is_empty() {
             return Err(MekaError::Config("no messages to compact".to_string()));
@@ -894,15 +895,15 @@ impl Agent {
                 tracing::warn!("checkpoint turn interrupted; summarizing instead");
                 return Ok(None);
             }
-            let completed = match complete_with_retry(
-                "the checkpoint's provider call",
-                &self.provider(),
-                CompletionRequest::new(&system_prompt, &checkpoint_messages, &definitions)
-                    .attributed(attribution.clone()),
-                &cancellation,
-                &cancellation,
-            )
-            .await
+            let completed = match self
+                .complete_with_retry(
+                    "the checkpoint's provider call",
+                    CompletionRequest::new(&system_prompt, &checkpoint_messages, &definitions)
+                        .attributed(attribution.clone()),
+                    &cancellation,
+                    &cancellation,
+                )
+                .await
             {
                 Ok(completed) => completed,
                 // A stop that landed on the reply itself rather than between rounds: the same
@@ -1080,18 +1081,18 @@ impl Agent {
             usage,
             notices,
             ..
-        } = complete_with_retry(
-            "the summarizer's provider call",
-            &self.provider(),
-            CompletionRequest::new(&system_prompt, &compact_messages, &[])
-                .attributed(self.compaction_attribution(request))
-                .without_thinking(),
-            cancellation,
-            // Sent under a token nothing fires: the caller's may already have, and the summary is
-            // the one thing a stop must not deny. See `complete_with_retry`.
-            &CancellationToken::new(),
-        )
-        .await?;
+        } = self
+            .complete_with_retry(
+                "the summarizer's provider call",
+                CompletionRequest::new(&system_prompt, &compact_messages, &[])
+                    .attributed(self.compaction_attribution(request))
+                    .without_thinking(),
+                cancellation,
+                // Sent under a token nothing fires: the caller's may already have, and the
+                // summary is the one thing a stop must not deny. See `complete_with_retry`.
+                &CancellationToken::new(),
+            )
+            .await?;
         tracing::debug!(
             "summary usage: input={} cache_creation={} cache_read={} output={}",
             usage.input_tokens,
@@ -1220,16 +1221,17 @@ mod tests {
             ],
         ]));
         let provider: Arc<dyn Provider> = mock.clone();
+        let (agent, _store) = agent_for_test(provider).await;
 
-        let error = complete_with_retry(
-            "a test call",
-            &provider,
-            CompletionRequest::new("system", &[], &[]),
-            &CancellationToken::new(),
-            &CancellationToken::new(),
-        )
-        .await
-        .expect_err("three failures spend the cap, so the fourth round is never asked for");
+        let error = agent
+            .complete_with_retry(
+                "a test call",
+                CompletionRequest::new("system", &[], &[]),
+                &CancellationToken::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("three failures spend the cap, so the fourth round is never asked for");
         assert!(
             matches!(error, MekaError::RetryableProvider { .. }),
             "the provider's own last refusal is what the caller has to see: {error}"
@@ -1280,16 +1282,17 @@ mod tests {
                 cancellation.cancel();
             }
         });
+        let (agent, _store) = agent_for_test(provider).await;
         let started = std::time::Instant::now();
-        let error = complete_with_retry(
-            "a test call",
-            &provider,
-            CompletionRequest::new("system", &[], &[]),
-            &cancellation,
-            &cancellation,
-        )
-        .await
-        .expect_err("a canceled turn does not wait out the provider's hint");
+        let error = agent
+            .complete_with_retry(
+                "a test call",
+                CompletionRequest::new("system", &[], &[]),
+                &cancellation,
+                &cancellation,
+            )
+            .await
+            .expect_err("a canceled turn does not wait out the provider's hint");
 
         assert!(
             matches!(error, MekaError::Interrupted),

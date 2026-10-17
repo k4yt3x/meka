@@ -576,6 +576,7 @@ pub(crate) async fn succeeded(
         ))));
     }
     let retry_after = crate::error::parse_retry_after(response.headers());
+    let window_reset = crate::error::parse_window_reset(response.headers());
     // Under the token, as every body read is: the client runs no clock on a reply, so a peer that
     // sends the status and withholds the body would otherwise hold a canceled turn for as long as
     // it pleased. A body that fails to arrive for any other reason leaves the error to describe
@@ -594,6 +595,7 @@ pub(crate) async fn succeeded(
         &response_text,
         retry_after,
         request,
+        window_reset,
     ))
 }
 

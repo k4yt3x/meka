@@ -131,6 +131,10 @@ pub(crate) struct ProfileView {
     pub(crate) backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) model: Option<String>,
+    /// The profiles a turn falls back to when this one cannot serve it, in order; absent when the
+    /// profile names none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) fallbacks: Vec<String>,
     /// Whether a session on this profile accepts image attachments, so a client can tell whether
     /// attaching one is worth the base64 payload instead of discovering it from a 422. Per
     /// profile, because `POST /turn` asks the session's own profile.
@@ -151,6 +155,7 @@ impl ProfileView {
             account: summary.account.clone(),
             backend: summary.backend.clone(),
             model: summary.model.clone(),
+            fallbacks: summary.fallbacks.clone(),
             vision: summary.vision,
             active,
         }
@@ -171,6 +176,7 @@ impl ProfileView {
                 .get(&profile.account)
                 .map(|account| account.backend.clone()),
             model: profile.model.clone(),
+            fallbacks: profile.fallbacks.clone(),
             vision: profile.vision.unwrap_or(true),
             active,
         }
@@ -706,6 +712,7 @@ mod tests {
     #[test]
     fn a_profile_view_omits_the_backend_of_a_missing_account_however_it_is_built() {
         let summary = ProfileSummary {
+            fallbacks: Vec::new(),
             name: "orphan".to_string(),
             account: "gone".to_string(),
             backend: None,

@@ -472,6 +472,7 @@ impl HttpFrontend {
                 stop_reason: None,
                 error: None,
                 reason: None,
+                profile: None,
                 usage: crate::store::turns::TurnUsage::default(),
             });
         drop(guard);
@@ -1085,6 +1086,9 @@ pub(crate) fn subagent_terminal(
         "turn_id": turn_id.to_string(),
         "session_id": session_id.to_string(),
     });
+    if let Some(profile) = &ending.profile {
+        data["profile"] = serde_json::Value::from(profile.as_str());
+    }
     match ending.status {
         TurnStatus::Succeeded => {
             data["stop_reason"] = serde_json::Value::from(ending.stop_reason.clone());

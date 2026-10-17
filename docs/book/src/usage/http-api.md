@@ -204,7 +204,9 @@ message it added names; `source` is who opened it (`client`, `inbox`, `schedule`
 `parent` for a sub-agent's turn); `started_at` is when. Once the turn has ended, `ended_at` says
 when and `status` how: `succeeded`, with its `stop_reason` (`end_turn`, `max_tokens` or `refusal`),
 `failed`, with an `error` carrying the same `type` and `detail` a Problem Detail would (never the
-provider's own text), or `canceled`; and `usage` is what every round of it spent. A turn that began
+provider's own text), or `canceled`; `profile` names the fallback that served the turn when the
+session's own profile could not ([Fallback profiles](sessions.md#fallback-profiles)), and is absent
+otherwise; and `usage` is what every round of it spent. A turn that began
 and shows no `ended_at` is either in flight, which `turn_in_flight` says, or one the process died
 under. Whether a turn is running now is a live fact of the process that no row stores. Together they
 answer the one question a session list asks: running, waiting on a person (`approvals_pending` above
@@ -679,9 +681,9 @@ Every resident session has one event feed. Everything a turn emits goes on it, w
 | Event | Payload | When |
 |-------|---------|------|
 | `turn.started` | `turn_id`, `session_id`, `started_at`, `source` (`"client"`, `"inbox"` with `item_ids`, `"schedule"` with `job_id`, `"background"`, `"compaction"` for the checkpoint turn `POST /compact` runs, or `"parent"` with `parent_id` and `tool_call_id` on a sub-agent's feed) | Turn begins |
-| `turn.finished` | `turn_id`, `session_id`, `stop_reason`, `usage`, `revision`, optional `refusal_text` | Turn completed successfully |
-| `turn.failed` | `turn_id`, `session_id`, `error` (Problem Detail shape), `revision`, `message_withdrawn` when the turn began | Turn failed mid-stream |
-| `turn.canceled` | `turn_id`, `session_id`, `reason` (`"client"` for `POST /cancel`, `"server_shutdown"`, `"abandoned"` when a held turn's request had been gone for the grace with nobody else listening, `"sse_lag"` when the only consumer fell behind and the turn was stopped for it, or `"parent"` on a sub-agent's feed, whose turn stops with its parent's), `revision`, `message_withdrawn` when the turn began | Turn was canceled |
+| `turn.finished` | `turn_id`, `session_id`, `stop_reason`, `usage`, `revision`, optional `refusal_text`, `profile` when a [fallback profile](sessions.md#fallback-profiles) served the turn | Turn completed successfully |
+| `turn.failed` | `turn_id`, `session_id`, `error` (Problem Detail shape), `revision`, `message_withdrawn` when the turn began, `profile` when a fallback profile served the turn | Turn failed mid-stream |
+| `turn.canceled` | `turn_id`, `session_id`, `reason` (`"client"` for `POST /cancel`, `"server_shutdown"`, `"abandoned"` when a held turn's request had been gone for the grace with nobody else listening, `"sse_lag"` when the only consumer fell behind and the turn was stopped for it, or `"parent"` on a sub-agent's feed, whose turn stops with its parent's), `revision`, `message_withdrawn` when the turn began, `profile` when a fallback profile served the turn | Turn was canceled |
 | `turn.nudged` | `kind`, `text`, `turn_id`, `session_id` | The turn went on past the model's reply: meka wrote `text` into the conversation as a user-role message to send the model back to work, `kind` `visible_reply` after a reply with no visible text, `checklist` after one that left checklist items open |
 | `task.reported` | `task_ids`, `text`, `turn_id`, `session_id` | A turn in flight read finished background work at a tool-round boundary: meka wrote `text`, the report the model reads, into the round's user-role message behind its results |
 
@@ -1125,6 +1127,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/stream-detached` | 500 | SSE-only. A re-attached stream ended with no recorded outcome because the turn's task died; read `GET /messages` for what completed |
 | `/errors/provider` | 502 | An upstream call failed for a reason meka could not classify as transient. Usually permanent (a revoked credential, a `base_url` that is not the API), but it is a catch-all, so treat it as "no reason to expect a retry to help" rather than "a retry cannot help" |
 | `/errors/provider-unavailable` | 502 | The upstream failed in a way meka's classifier had already labeled transient. **Worth one backed-off resend.** Carries a `Retry-After` when the upstream gave one, which most of the time it did not |
+| `/errors/provider-exhausted` | 502 | The upstream refused the request for quota or billing, by a signal it documents: a 402, a quota code on a 429, or the Claude subscription's exhausted usage window. **Nothing changes until the reset**, which rides as `Retry-After` when the upstream stated one. A profile with [`fallbacks`](../configuration/config-file.md#fallbacks) hands the turn to the next one instead of answering this |
 | `/errors/context-overflow` | 502 | The conversation exceeds the model's context window, and auto-compaction was off, already spent, or could not shorten it enough. **Do not retry unchanged**; `POST /compact` or send less first. Carries `provider_response` like the two above, since the upstream is what refused it |
 | `/errors/mcp-unavailable` | 503 | An MCP server marked `required` was not connected, so the turn was refused before reaching the provider. The `servers` extension names them; each one's reason is in the server log |
 | `/errors/internal` | 500 | Unhandled server error |
@@ -1175,7 +1178,7 @@ These endpoints help clients inspect the server's capabilities at runtime.
 |----------|------|-------------|
 | `GET /v1/health/live` | None | Liveness probe: 200 if the process is up |
 | `GET /v1/health/ready` | None | Readiness probe: 200 if the store is healthy, at least one profile is configured, and no `required` MCP server has failed. A failed *optional* server doesn't affect readiness, since it can't stop a turn either. Returns `status`, `session_db`, `profile_configured`, and `mcp_servers_healthy` (boolean, no server names). **`profile_configured` means a profile exists in `config.toml`, not that it has a usable credential**: a profile's credential is checked when a session first needs it, so a server can be ready and still answer 422 to `POST /v1/sessions`. |
-| `GET /v1/profiles` | Any read scope | Configured profiles, as `{"profiles": [...]}`. Each carries `name`, `account`, `backend` (omitted when the profile names an account that is not configured), `model` (omitted when the profile names none), `vision`, whether a session on it accepts [image attachments](#image-attachments), and `active: true` on the one a session gets when it names none. Read-only; profiles come from `config.toml` |
+| `GET /v1/profiles` | Any read scope | Configured profiles, as `{"profiles": [...]}`. Each carries `name`, `account`, `backend` (omitted when the profile names an account that is not configured), `model` (omitted when the profile names none), `fallbacks`, the profiles a turn moves to when this one cannot serve it (omitted when it names none), `vision`, whether a session on it accepts [image attachments](#image-attachments), and `active: true` on the one a session gets when it names none. Read-only; profiles come from `config.toml` |
 | `GET /v1/info` | Any read scope | Server version and permission surface, and `scopes`, the ones the calling token holds, so a client can show only the controls it may use. Carries no profile, model or capability of one: `GET /v1/profiles` reports those per profile and marks the default with `active` |
 | `GET /v1/skills` | Any read scope | Installed skills |
 | `GET /v1/mcp` | Any read scope | MCP server connection status |

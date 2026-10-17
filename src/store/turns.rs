@@ -43,6 +43,11 @@ pub(crate) struct TurnRecord {
     #[cfg_attr(feature = "serve", schema(value_type = Option<String>))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reason: Option<CancelReason>,
+    /// The profile that served the turn when it was not the session's own: one of its
+    /// `fallbacks`, after the session's profile could not. Absent on a turn the session's profile
+    /// served.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) profile: Option<String>,
     /// What the turn spent, every round of it.
     pub(crate) usage: TurnUsage,
 }
@@ -240,6 +245,8 @@ pub(crate) struct TurnEnding {
     pub(crate) stop_reason: Option<String>,
     pub(crate) error: Option<TurnError>,
     pub(crate) reason: Option<CancelReason>,
+    /// See [`TurnRecord::profile`].
+    pub(crate) profile: Option<String>,
     pub(crate) usage: TurnUsage,
 }
 
@@ -251,8 +258,15 @@ impl TurnEnding {
             stop_reason: Some(stop_reason.to_string()),
             error: None,
             reason: None,
+            profile: None,
             usage,
         }
+    }
+
+    /// The same ending, served by `profile` when that is not the session's own.
+    pub(crate) fn served_by(mut self, profile: Option<String>) -> Self {
+        self.profile = profile;
+        self
     }
 
     /// A turn that ended on an error, recorded under the one classification the HTTP surface
@@ -266,6 +280,7 @@ impl TurnEnding {
                 detail: error.sentence(),
             }),
             reason: None,
+            profile: None,
             usage,
         }
     }
@@ -277,6 +292,7 @@ impl TurnEnding {
             stop_reason: None,
             error: None,
             reason: Some(reason),
+            profile: None,
             usage,
         }
     }
@@ -285,7 +301,7 @@ impl TurnEnding {
 /// The columns of one turn, aliased `t`, in the order [`turn_from_row`] reads them.
 pub(super) const TURN_COLUMNS: &str = "t.id, t.source, t.started_at, t.ended_at, t.status, \
      t.stop_reason, t.error_type, t.detail, t.input_tokens, t.output_tokens, \
-     t.cache_creation_input_tokens, t.cache_read_input_tokens, t.cancel_reason";
+     t.cache_creation_input_tokens, t.cache_read_input_tokens, t.cancel_reason, t.profile";
 
 /// The join that puts a session's latest turn beside its row as `t`, every column NULL for a
 /// session no turn has begun on. The latest by when it began, whatever its state: a turn the
@@ -348,6 +364,7 @@ pub(super) fn turn_from_row(
         stop_reason: row.get(offset + 5)?,
         error,
         reason,
+        profile: row.get(offset + 13)?,
         usage: TurnUsage {
             input_tokens: row.get::<_, i64>(offset + 8)?.max(0) as u64,
             output_tokens: row.get::<_, i64>(offset + 9)?.max(0) as u64,
@@ -428,7 +445,8 @@ impl TurnStore {
                          output_tokens = ?8,
                          cache_creation_input_tokens = ?9,
                          cache_read_input_tokens = ?10,
-                         cancel_reason = ?11
+                         cancel_reason = ?11,
+                         profile = ?12
                      WHERE id = ?1",
                     rusqlite::params![
                         turn_id.to_string(),
@@ -442,6 +460,7 @@ impl TurnStore {
                         ending.usage.cache_creation_input_tokens as i64,
                         ending.usage.cache_read_input_tokens as i64,
                         ending.reason.map(CancelReason::name),
+                        ending.profile,
                     ],
                 )?;
                 Ok(())
@@ -530,8 +549,8 @@ pub(super) fn insert_turn_row(
     transaction.execute(
         "INSERT INTO turns (id, session_id, source, started_at, ended_at, status, stop_reason, \
          error_type, detail, input_tokens, output_tokens, cache_creation_input_tokens, \
-         cache_read_input_tokens, cancel_reason)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         cache_read_input_tokens, cancel_reason, profile)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         rusqlite::params![
             turn.id,
             session_id,
@@ -547,6 +566,7 @@ pub(super) fn insert_turn_row(
             turn.usage.cache_creation_input_tokens as i64,
             turn.usage.cache_read_input_tokens as i64,
             turn.cancel_reason,
+            turn.profile,
         ],
     )?;
     Ok(())

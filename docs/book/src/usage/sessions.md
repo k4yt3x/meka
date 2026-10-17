@@ -108,6 +108,60 @@ Only one meka instance can be attached to a session at a time. This prevents rac
 - If the locking process has exited (crashed or was killed), meka detects this and allows you to take over the lock.
 - Under ACP (`meka acp`), the lock is released as soon as the editor disconnects: closing the connection (stdin EOF) or sending SIGTERM/Ctrl-C makes `meka acp` exit, so the session can be reopened immediately.
 
+## Fallback profiles
+
+A session runs on the profile its row names, and that is where every turn starts. A profile can name
+other profiles to serve a turn from when it cannot, in order, with
+[`fallbacks`](../configuration/config-file.md#fallbacks):
+
+```toml
+[profiles.main]
+account   = "anthropic"
+model     = "claude-opus-5-5"
+fallbacks = ["backup"]
+```
+
+A turn falls back when the profile's upstream is still failing once the retry budget is spent (an
+outage, a rate limit, a dropped stream), or when it refuses for quota or billing by a signal it
+documents (a 402, a quota code on a 429, the Claude subscription's exhausted usage window). It does
+not fall back on a context overflow, an invalid request, a tool refusal or an authentication
+failure, which another profile would not fix, and never once any of the reply has been shown, the
+same guard a retry has. The request is re-sent unchanged to the next profile, and the rest of the
+turn stays there, so a turn never alternates between backends.
+
+The fallback serves one turn. The session keeps naming its own profile, `meka session list` and
+`GET /v1/sessions/{id}` keep saying so, and the next turn starts on it again, unless its breaker is
+open: a profile that failed over is skipped at the start of later turns for a cooldown the upstream
+set (`Retry-After`, a quota reset, up to an hour) or five minutes when it set none, and the turn
+starts on the first fallback whose breaker is closed, or on the session's own when every profile in
+the chain is skipped. The breaker decides only where a turn starts. Once a turn is running and its
+profile fails, it moves to the next profile in the chain it has not tried, breaker or not, wrapping
+round to the ones its start skipped, so a turn fails only once every profile in the chain has
+refused it, and an answer from any profile closes that profile's breaker. The breaker lives in the
+process, shared by every session and sub-agent it runs, and is gone with it. A sub-agent spawned
+while its parent's turn is on a fallback is bound to the parent's own profile, as any spawn is, and
+its turns start by the same breaker.
+
+The list is a preference order. Every turn starts on the first profile in it, the session's own
+included, whose breaker is closed, so a session comes back to the profile you would rather run on
+as soon as it answers again, rather than staying where the last turn happened to land. Each switch
+rebuilds the prompt cache at the new profile once, and since a turn never alternates, that cost
+falls at a turn boundary and never inside one.
+
+Every fallback is visible: a warning in the log naming both profiles and the error, a notice on the
+screen and the session feed (`Profile 'main' is unavailable; this turn runs on 'backup'.`), and the
+turn's record carrying the profile that served it, on
+[`GET /v1/sessions/{id}/turns`](http-api.md#turns), on the turn's terminal event, and in an export,
+so a cost question later has an answer. A turn the session's own profile served records
+nothing. When the whole chain refuses, the turn fails on the last profile tried with that profile's
+error. A compaction's checkpoint and summarizer fall back the same way, and a compaction run between
+turns puts the named profile back when it ends.
+
+A fallback crosses backends when the profiles do. A thinking block is tagged with the backend that
+produced it and is not replayed to a different one, so from the switch the model no longer sees the
+reasoning recorded under the earlier profile, which is the same loss a `PATCH` to another profile
+takes.
+
 ## Storage location
 
 Sessions live in the store, a SQLite file at a platform-specific location:
@@ -539,7 +593,7 @@ Pass `--format json` for a structured export instead of rendered Markdown:
 meka session export 550e8400-e29b-41d4-a716-446655440000 --format json
 ```
 
-This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, and scratchpad entries. The archive carries `format_version: 13`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 12), which is brought forward as it is read. Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
+This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, and scratchpad entries. The archive carries `format_version: 14`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 13), which is brought forward as it is read. Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
 
 ## Importing a session
 

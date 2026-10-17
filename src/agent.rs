@@ -24,6 +24,7 @@ use crate::{
 
 mod compaction;
 mod dispatch;
+mod fallback;
 mod recovery;
 mod turn;
 
@@ -132,6 +133,12 @@ pub(crate) struct Agent {
     /// Atomic rather than `&mut` because `run_turn` takes `&self`; never shared between agents
     /// (sub-agents construct their own through [`Self::new`]).
     last_accepted_len: std::sync::atomic::AtomicUsize,
+    /// Every profile the process configured, for the fallbacks a turn may move to and the breaker
+    /// that says which of them failed lately.
+    providers: Arc<crate::provider::ProviderRegistry>,
+    /// The profiles this turn has already sent its request to, so a turn asks each profile in its
+    /// chain at most once; forgotten when the turn's routing ends. See `fallback`.
+    profiles_tried: std::sync::Mutex<Vec<String>>,
 }
 
 /// What a worker descends from: the prompt its spawning call answered, so its requests bill to
@@ -213,6 +220,8 @@ impl Agent {
             previous_message: crate::provider::PreviousMessageSlot::default(),
             context_compacted: std::sync::Mutex::new(None),
             last_accepted_len: std::sync::atomic::AtomicUsize::new(LAST_ACCEPTED_UNKNOWN),
+            providers: Arc::clone(&materials.providers),
+            profiles_tried: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -248,7 +257,8 @@ impl Agent {
     /// ACP's `session/set_config_option`. All three parts move together because all three describe
     /// one profile: a profile that disagreed with the provider beside it would make the row a lie,
     /// and a context window left behind would gauge the new model against the old one's size and
-    /// compact at the wrong point (or never).
+    /// compact at the wrong point (or never). A fallback serving in the old profile's place ends
+    /// with the move; see `fallback`.
     pub(crate) fn set_provider(&self, resolved: ResolvedProfile) {
         self.cells.profile.store(&resolved);
     }
@@ -313,7 +323,8 @@ impl Agent {
     /// What this agent runs on, for a host that has to report it.
     ///
     /// The session's own profile, which is not the process default once a resume or a switch has
-    /// happened, and the only thing a status display may read if it is to agree with the turn.
+    /// happened, or the fallback serving this turn in its place; the only thing a status display
+    /// may read if it is to agree with the turn.
     pub(crate) fn profile(&self) -> String {
         self.cells.profile.current().profile
     }
@@ -748,6 +759,27 @@ mod tests {
         registry: crate::tools::ToolRegistry,
         store: &Store,
     ) -> Agent {
+        build_test_agent_on(
+            crate::session::SessionMaterials::for_test(store.clone()),
+            ResolvedProfile {
+                provider,
+                profile: "test-profile".to_string(),
+                context_window: 0,
+                vision: true,
+            },
+            Arc::new(crate::frontend::SilentFrontend),
+            registry,
+        )
+    }
+
+    /// [`build_test_agent`] over the materials, the profile and the frontend a test chooses: the
+    /// one constructor behind every harness, so a test on another registry builds the same agent.
+    pub(super) fn build_test_agent_on(
+        materials: crate::session::SessionMaterials,
+        resolved: ResolvedProfile,
+        frontend: Arc<dyn crate::frontend::Frontend>,
+        registry: crate::tools::ToolRegistry,
+    ) -> Agent {
         let options = AgentOptions {
             streaming: true,
             one_shot: false,
@@ -767,7 +799,7 @@ mod tests {
             &crate::session::SessionMaterials {
                 skills: crate::skills::SkillCache::disabled(),
                 memories: crate::store::memory::MemoryStore::disabled(),
-                ..crate::session::SessionMaterials::for_test(store.clone())
+                ..materials
             },
             crate::session::SessionCells::new(
                 SharedPermission::new(
@@ -776,13 +808,8 @@ mod tests {
                 ),
                 crate::workspace::SharedCwd::new(std::env::temp_dir()),
                 crate::workspace::SharedRoots::default(),
-                PublishedProfile::detached(&ResolvedProfile {
-                    provider,
-                    profile: "test-profile".to_string(),
-                    context_window: 0,
-                    vision: true,
-                }),
-                Arc::new(crate::frontend::SilentFrontend),
+                PublishedProfile::detached(&resolved),
+                frontend,
             ),
             registry,
             options,

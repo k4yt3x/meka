@@ -2063,6 +2063,7 @@ mod tests {
             stop_reason: None,
             error: None,
             reason: None,
+            profile: None,
             usage: crate::store::turns::TurnUsage::default(),
         }
     }

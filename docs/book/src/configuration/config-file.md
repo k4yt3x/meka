@@ -239,6 +239,27 @@ The model identifier to send to the provider, forwarded verbatim. Optional in th
 
 Change it with `meka profile set <name> model <value>`.
 
+### `fallbacks`
+
+Profiles to serve a turn from when this one cannot, in order of preference: list the profile you would rather run on first, since every turn starts on the first profile, this one included, whose upstream is not known to be down, and a switch rebuilds the prompt cache at the new profile once. A turn falls back when the profile's upstream is still failing once the retry budget is spent (an outage, a rate limit, a dropped stream), or when it refuses for quota or billing by a signal it documents (a 402, a quota code on a 429, the Claude subscription's exhausted window). It does not fall back on a context overflow, an invalid request, a tool refusal or an authentication failure, which another profile would not fix. The whole profile is swapped, so no setting of this one is ever mixed with another's.
+
+The session keeps naming this profile. A fallback serves one turn, the rest of that turn stays on it, and the next turn starts here again, or on the first fallback whose upstream is not known to be down: a profile that failed over is skipped for a cooldown the upstream set (`Retry-After`, a quota reset) or five minutes when it set none, capped at an hour. Once a turn is running, a failure moves it to the next profile in the list it has not tried, so it fails only when every one has refused it. What served a turn is on its record (`profile` on [`GET /v1/sessions/{id}/turns`](../usage/http-api.md#turns) and on `turn.finished`) and in a notice on the feed and the screen. See [Fallback profiles](../usage/sessions.md#fallback-profiles).
+
+Each entry must name another configured profile, once. `meka profile remove` refuses a profile another's `fallbacks` names, and `meka profile rename` moves the name.
+
+```toml
+[profiles.main]
+account   = "anthropic"
+model     = "claude-opus-5-5"
+fallbacks = ["backup"]
+
+[profiles.backup]
+account = "openrouter"
+model   = "anthropic/claude-sonnet-4-5"
+```
+
+Change it with `meka profile set <name> fallbacks backup,last-resort` (comma-separated), or `--unset` to remove it. `meka profile add` takes `--fallback <name>`, repeatable.
+
 ### `context_window`
 
 The model's context window (total tokens it can hold), used for the `/status` gauge and auto-compaction. Takes precedence over [`[session].context_window`](#sessioncontext_window); when neither is set, meka assumes **1000000**.

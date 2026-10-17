@@ -911,6 +911,7 @@ async fn run_json_turn(
             state.config.relay_provider_errors,
             message_withdrawn(&recorder),
             revision_for_terminal(&state.shared.store, session_id).await,
+            served_by_for_terminal(&state.shared.store, session_id, turn_id).await,
         );
         entry.frontend.record_terminal(event_type, data);
 
@@ -1073,6 +1074,7 @@ async fn run_streaming_turn(
             relay_for_task,
             message_withdrawn(&recorder),
             revision_for_terminal(&store_for_task, session_id).await,
+            served_by_for_terminal(&store_for_task, session_id, turn_id).await,
         );
         notify_turn_end(&webhooks_for_task, event_type, turn_id, session_id);
         entry_for_task.frontend.record_terminal(event_type, data)
@@ -1254,6 +1256,7 @@ pub(crate) fn terminal_event_parts(
     relay_provider_errors: bool,
     message_withdrawn: Option<bool>,
     revision: Option<u64>,
+    served_by: Option<String>,
 ) -> (crate::host::http::sse::SseEventType, serde_json::Value) {
     let (event_type, mut data) = match turn_result {
         Ok(Ok(outcome)) => finished_parts(outcome, usage, turn_id, session_id),
@@ -1303,7 +1306,28 @@ pub(crate) fn terminal_event_parts(
     if let Some(revision) = revision {
         data["revision"] = serde_json::Value::from(revision);
     }
+    // The fallback that served the turn, when one did: the row's fact, carried so a client need
+    // not fetch the record to learn what the turn cost and whom it billed.
+    if let Some(profile) = served_by {
+        data["profile"] = serde_json::Value::from(profile);
+    }
     (event_type, data)
+}
+
+/// The fallback profile that served a turn, off its row, or `None` when the session's own did or
+/// the store could not say. Never fails the turn: the terminal still has to be recorded.
+pub(crate) async fn served_by_for_terminal(
+    store: &crate::store::Store,
+    session_id: Uuid,
+    turn_id: Uuid,
+) -> Option<String> {
+    match store.turn_store().get_turn(session_id, turn_id).await {
+        Ok(record) => record.and_then(|record| record.profile),
+        Err(error) => {
+            tracing::warn!("failed to read turn {turn_id}'s record for its terminal: {error}");
+            None
+        }
+    }
 }
 
 /// The conversation's revision for a terminal event, or `None` when the store could not say; a
@@ -1384,6 +1408,7 @@ fn panic_terminal(panic: tokio::task::JoinError, turn_id: Uuid, session_id: Uuid
             turn_id,
             session_id,
             false,
+            None,
             None,
             None,
         );

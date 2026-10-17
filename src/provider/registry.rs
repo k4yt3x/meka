@@ -347,12 +347,22 @@ pub(crate) struct ProviderRegistry {
     pub(super) device_ids: std::sync::Mutex<std::collections::HashMap<String, String>>,
     pub(super) token_store: Arc<TokenStore>,
     pub(super) built: std::sync::Mutex<std::collections::HashMap<ProviderKey, CachedProvider>>,
+    /// Profiles whose upstream failed a turn over to a fallback, and until when each is skipped
+    /// at the start of a turn. In the process and nowhere else: it is a fact about the upstream
+    /// right now, shared by every session and sub-agent the process runs, and worth nothing to a
+    /// process started later.
+    pub(super) unavailable: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// Debug-only: a scripted provider that stands in for every profile.
     ///
     /// Set by `host::build_shared_deps` when the config asks for one. One override here covers
     /// every profile, which is what a harness driving a session on any profile wants.
     #[cfg(any(debug_assertions, feature = "mock-provider"))]
     pub(super) scripted: std::sync::Mutex<Option<Arc<dyn Provider>>>,
+    /// Test-only: a scripted provider per profile, consulted ahead of `scripted`, so a test can
+    /// give a profile and its fallback different answers.
+    #[cfg(test)]
+    pub(super) scripted_by_profile:
+        std::sync::Mutex<std::collections::HashMap<String, Arc<dyn Provider>>>,
 }
 impl ProviderRegistry {
     pub(crate) fn new(config: &crate::config::ResolvedConfig, token_store: TokenStore) -> Self {
@@ -364,9 +374,40 @@ impl ProviderRegistry {
             device_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
             token_store: Arc::new(token_store),
             built: std::sync::Mutex::new(std::collections::HashMap::new()),
+            unavailable: std::sync::Mutex::new(std::collections::HashMap::new()),
             #[cfg(any(debug_assertions, feature = "mock-provider"))]
             scripted: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            scripted_by_profile: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// The profiles `profile` falls back to, in order; empty for one that names none or that is
+    /// not configured, which its own resolution reports.
+    pub(crate) fn fallbacks_of(&self, profile: &str) -> Vec<String> {
+        self.settings(profile)
+            .map(|settings| settings.fallbacks)
+            .unwrap_or_default()
+    }
+
+    /// Skip `profile` at the start of later turns for `cooldown`: its upstream has just failed a
+    /// turn over to a fallback, and spending the retry budget on it at every turn of an outage
+    /// would make each one that much slower to answer.
+    pub(crate) fn mark_unavailable(&self, profile: &str, cooldown: std::time::Duration) {
+        crate::sync::lock(&self.unavailable)
+            .insert(profile.to_string(), std::time::Instant::now() + cooldown);
+    }
+
+    /// `profile`'s upstream answered, so it is not skipped any longer, whatever its cooldown said.
+    pub(crate) fn mark_available(&self, profile: &str) {
+        crate::sync::lock(&self.unavailable).remove(profile);
+    }
+
+    /// Whether `profile` failed over within its cooldown and is skipped at the start of a turn.
+    pub(crate) fn is_unavailable(&self, profile: &str) -> bool {
+        crate::sync::lock(&self.unavailable)
+            .get(profile)
+            .is_some_and(|until| *until > std::time::Instant::now())
     }
 
     /// Resolve every `claude-subscription` account's device id ahead of the first ask, on a
@@ -483,6 +524,10 @@ impl ProviderRegistry {
     ) -> Result<(Arc<dyn Provider>, crate::config::ProfileSettings)> {
         let settings = self.settings(profile)?;
 
+        #[cfg(test)]
+        if let Some(scripted) = crate::sync::lock(&self.scripted_by_profile).get(profile) {
+            return Ok((Arc::clone(scripted), settings));
+        }
         #[cfg(any(debug_assertions, feature = "mock-provider"))]
         if let Some(scripted) = crate::sync::lock(&self.scripted).as_ref() {
             return Ok((Arc::clone(scripted), settings));
@@ -666,9 +711,16 @@ impl ProviderRegistry {
             device_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
             token_store: Arc::new(token_store),
             built: std::sync::Mutex::new(std::collections::HashMap::new()),
+            unavailable: std::sync::Mutex::new(std::collections::HashMap::new()),
             #[cfg(any(debug_assertions, feature = "mock-provider"))]
             scripted: std::sync::Mutex::new(None),
+            scripted_by_profile: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Install a scripted provider for one profile alone.
+    pub(crate) fn install_scripted_for(&self, profile: &str, provider: Arc<dyn Provider>) {
+        crate::sync::lock(&self.scripted_by_profile).insert(profile.to_string(), provider);
     }
 }
 /// A session's profile, resolved into everything that follows from it.
@@ -821,12 +873,25 @@ pub(crate) fn profile_context_window(providers: &ProviderRegistry, profile: &str
 /// session was assembled would be left behind by `/profile`, `PATCH /v1/sessions/{id}` and ACP's
 /// `session/set_config_option`: a sub-agent spawned afterwards would run on, and bill, the profile
 /// the user had just left, while the child's own row recorded the new one.
+///
+/// It also holds the one fact a fallback adds. While one of the session's `fallbacks` serves a
+/// turn in its place, the cell publishes that profile as what runs now and keeps the session's own
+/// as what it names, and the two are read apart on purpose: a request goes to [`Self::current`],
+/// a worker spawned mid-turn is bound to [`Self::named`], because a fallback is one turn's
+/// substitution and the worker's own turn routes by the breaker like any other, and a repin
+/// through [`Self::store`] ends the substitution, so the explicit act wins over it.
 #[derive(Clone)]
 pub(crate) struct PublishedProfile {
-    resolved: Arc<std::sync::RwLock<ResolvedProfile>>,
-    /// Held separately from `resolved` because `ContextGauge` reads it on every `context_check`
+    published: Arc<std::sync::RwLock<Published>>,
+    /// Held separately from `published` because `ContextGauge` reads it on every `context_check`
     /// and has no business knowing what a provider is.
     window: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// The session's own profile and, while a fallback serves a turn in its place, that fallback.
+struct Published {
+    named: ResolvedProfile,
+    serving: Option<ResolvedProfile>,
 }
 impl PublishedProfile {
     /// `window` is supplied rather than made here, for the reason
@@ -848,7 +913,10 @@ impl PublishedProfile {
             std::sync::atomic::Ordering::Release,
         );
         Self {
-            resolved: Arc::new(std::sync::RwLock::new(resolved.clone())),
+            published: Arc::new(std::sync::RwLock::new(Published {
+                named: resolved.clone(),
+                serving: None,
+            })),
             window,
         }
     }
@@ -858,10 +926,30 @@ impl PublishedProfile {
         Self::new(resolved, Arc::new(std::sync::atomic::AtomicU64::new(0)))
     }
 
-    /// A poisoned lock costs nothing here: the guarded value is one owner's `ResolvedProfile`, and
-    /// a writer that panicked mid-store left it whole either way.
+    /// What requests go to now: the fallback serving this turn, else the session's own profile.
+    ///
+    /// A poisoned lock costs nothing here: the guarded value is one owner's profiles, and a writer
+    /// that panicked mid-store left them whole either way.
     pub(crate) fn current(&self) -> ResolvedProfile {
-        crate::sync::read(&self.resolved).clone()
+        let published = crate::sync::read(&self.published);
+        published
+            .serving
+            .as_ref()
+            .unwrap_or(&published.named)
+            .clone()
+    }
+
+    /// The profile the session names, whether or not a fallback serves in its place.
+    pub(crate) fn named(&self) -> ResolvedProfile {
+        crate::sync::read(&self.published).named.clone()
+    }
+
+    /// The fallback serving now, by name; `None` while the session's own profile serves.
+    pub(crate) fn serving_fallback(&self) -> Option<String> {
+        crate::sync::read(&self.published)
+            .serving
+            .as_ref()
+            .map(|serving| serving.profile.clone())
     }
 
     /// The handle [`crate::tools::context::ContextGauge`] holds.
@@ -874,12 +962,34 @@ impl PublishedProfile {
         self.window.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Move the session onto `resolved`: a repin, which also ends a fallback serving in the old
+    /// profile's place, so nothing later puts back the profile the user just left.
     pub(crate) fn store(&self, resolved: &ResolvedProfile) {
-        *crate::sync::write(&self.resolved) = resolved.clone();
-        self.window.store(
-            resolved.context_window,
-            std::sync::atomic::Ordering::Release,
-        );
+        {
+            let mut published = crate::sync::write(&self.published);
+            published.named = resolved.clone();
+            published.serving = None;
+        }
+        self.publish_window(resolved.context_window);
+    }
+
+    /// Serve from `fallback` until [`Self::restore`], keeping the named profile to go back to.
+    pub(crate) fn serve(&self, fallback: &ResolvedProfile) {
+        crate::sync::write(&self.published).serving = Some(fallback.clone());
+        self.publish_window(fallback.context_window);
+    }
+
+    /// Put the named profile back in charge, at the end of whatever a fallback served.
+    pub(crate) fn restore(&self) {
+        let mut published = crate::sync::write(&self.published);
+        if published.serving.take().is_some() {
+            self.publish_window(published.named.context_window);
+        }
+    }
+
+    fn publish_window(&self, window: u64) {
+        self.window
+            .store(window, std::sync::atomic::Ordering::Release);
     }
 }
 

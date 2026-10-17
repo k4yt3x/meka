@@ -116,7 +116,13 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
    and whether the host can deliver later turns. `admit_tool_call` lives in `tools`, where
    `tool_search` and `tool_load` consult it to say what a call would do before the model makes it.
 4. **Recovery.** A failed request goes through `TurnRecovery`, which decides between a retry, a
-   degraded resend and a reported failure. Compaction runs when the context gauge says so, when the
+   degraded resend and a reported failure. Once a profile's retries are spent on an error that says
+   the profile cannot serve (`MekaError::is_profile_unavailable`), `agent::fallback` opens that
+   profile's breaker in the `ProviderRegistry`, binds the next profile in its chain the turn has not
+   tried, breaker or not, and re-sends under the retry's own no-output guard; the turn's end restores the named
+   profile and its row records the one that served. The published profile cell holds both the named
+   profile and the one serving, so a worker spawned mid-turn binds to the named one and a repin ends
+   the substitution. Compaction runs when the context gauge says so, when the
    model asks through `context_compact`, or when the user asks. Checkpoint guidance is built from
    that request's actual tool set. Every summary, from the checkpoint or the summarizer, has the
    same four sections: rules and authorizations, commitments and their state, facts established,

@@ -1162,6 +1162,36 @@ impl Backend {
 /// turned off while the backend ignored the key. Asked once at load, not in `resolve_profile`,
 /// which runs per request. An unrecognized `backend`, and a profile whose account is missing, are
 /// reported elsewhere and skipped here.
+/// Whether `fallbacks` on profile `name` names other configured profiles, each once: the one rule
+/// for the list, asked at startup over the whole file and by every write door over the value it
+/// is about to write, so the file never holds a list a run would refuse.
+pub(crate) fn validate_fallback_names<'a>(
+    name: &str,
+    fallbacks: &[String],
+    profiles: impl Iterator<Item = &'a String> + Clone,
+) -> std::result::Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for fallback in fallbacks {
+        if fallback == name {
+            return Err(format!(
+                "`[profiles.{name}].fallbacks` names the profile itself; remove it"
+            ));
+        }
+        if !profiles.clone().any(|profile| profile == fallback) {
+            return Err(format!(
+                "`[profiles.{name}].fallbacks`: {}",
+                crate::text::unknown_name("profile", fallback, profiles)
+            ));
+        }
+        if !seen.insert(fallback) {
+            return Err(format!(
+                "`[profiles.{name}].fallbacks` names '{fallback}' twice; name it once"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn warn_about_inert_profile_keys(
     accounts: &std::collections::BTreeMap<String, AccountConfig>,
     profiles: &std::collections::BTreeMap<String, ProfileConfig>,
@@ -1463,6 +1493,8 @@ pub(crate) struct ProfileSummary {
     pub(crate) account: String,
     pub(crate) backend: Option<String>,
     pub(crate) model: Option<String>,
+    /// See [`ProfileConfig::fallbacks`].
+    pub(crate) fallbacks: Vec<String>,
     /// Whether a session on this profile accepts image attachments: `[profiles.<name>].vision`,
     /// on unless the profile says otherwise.
     pub(crate) vision: bool,
@@ -2346,6 +2378,7 @@ impl ResolvedConfig {
                     .get(&profile.account)
                     .map(|account| account.backend.clone()),
                 model: profile.model.clone(),
+                fallbacks: profile.fallbacks.clone(),
                 vision: profile.vision.unwrap_or(true),
             })
             .collect();
@@ -2590,6 +2623,10 @@ impl ResolvedConfig {
             return Err(crate::error::MekaError::Config(error.clone()));
         }
         self.validate_default_profile()?;
+        for (name, profile) in &self.profiles {
+            validate_fallback_names(name, &profile.fallbacks, self.profiles.keys())
+                .map_err(crate::error::MekaError::Config)?;
+        }
         warn_about_inert_profile_keys(&self.accounts, &self.profiles);
         // `retention = "0s"` means "delete anything not updated in the last zero seconds", i.e.
         // every session, on every startup. Nobody means that, and the cost of guessing wrong is
@@ -4761,6 +4798,42 @@ claim_lease = {lease}
     /// Carrying the parse failure is only half of it: `validate` is what turns it into an exit.
     /// Without this, deleting the `config_error` arm leaves the whole suite green while meka goes
     /// back to silently running the agent on defaults.
+    /// A `fallbacks` list names other configured profiles, each once; the startup check and the
+    /// write doors share the predicate, so the three refusals are pinned here once.
+    #[test]
+    fn fallbacks_must_name_another_configured_profile_once() {
+        let profiles = ["main".to_string(), "backup".to_string()];
+        let check = |list: &[&str]| {
+            validate_fallback_names(
+                "main",
+                &list.iter().map(|name| name.to_string()).collect::<Vec<_>>(),
+                profiles.iter(),
+            )
+        };
+        check(&["backup"]).expect("a good list");
+        check(&[]).expect("an empty list");
+        assert!(check(&["main"]).expect_err("itself").contains("itself"));
+        assert!(
+            check(&["nowhere"])
+                .expect_err("unknown")
+                .contains("nowhere")
+        );
+        assert!(
+            check(&["backup", "backup"])
+                .expect_err("twice")
+                .contains("twice")
+        );
+
+        let resolved = resolve_with_config(
+            "[accounts.a]\nbackend = \"anthropic-messages\"\n\n[profiles.main]\naccount = \"a\"\n\
+             model = \"m\"\nfallbacks = [\"nowhere\"]\n",
+        );
+        let error = resolved
+            .validate()
+            .expect_err("a list naming nothing must not start the agent");
+        assert!(error.to_string().contains("nowhere"), "{error}");
+    }
+
     #[test]
     fn validate_rejects_an_unparseable_config() {
         let resolved = resolve_with_config("[session]\nnot_a_key = 1\n");

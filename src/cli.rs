@@ -428,6 +428,9 @@ pub(crate) enum ProfileAction {
         /// Model name
         #[arg(long)]
         model: Option<String>,
+        /// Profile to serve a turn from when this one cannot; repeatable, tried in order
+        #[arg(long = "fallback", value_name = "NAME")]
+        fallback: Vec<String>,
         /// Context window in tokens (default: `[session].context_window`, else 1000000)
         #[arg(long = "context-window", value_name = "TOKENS")]
         context_window: Option<u64>,

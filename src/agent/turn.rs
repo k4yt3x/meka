@@ -550,12 +550,14 @@ struct TurnScope<'a> {
 impl Drop for TurnScope<'_> {
     fn drop(&mut self) {
         *crate::sync::lock(&self.agent.current_turn) = None;
+        // A fallback serves one turn; the session's own profile is what the next one starts on.
+        self.agent.restore_named_profile();
     }
 }
 
 impl Agent {
     /// The turn this agent is running, or none between turns.
-    fn current_turn(&self) -> Option<Uuid> {
+    pub(super) fn current_turn(&self) -> Option<Uuid> {
         *crate::sync::lock(&self.current_turn)
     }
 
@@ -1063,6 +1065,8 @@ impl Agent {
             .frontend
             .emit(FrontendEvent::TurnStarted { turn_id })
             .await;
+        // After the turn is announced, so the notice a fallback raises lands inside it.
+        self.bind_serving_profile().await;
 
         let mut compacted_before_the_loop = self
             .compact_before_the_loop(messages, cancellation.token())
@@ -2005,16 +2009,16 @@ impl Agent {
             // Non-streaming is fully atomic (nothing is visible until this returns `Ok`), so
             // `content_started` is always `false` here, and every retryable failure is retried up
             // to the cap regardless of prior attempts.
-            match complete_with_retry(
-                "the turn's provider call",
-                &self.provider(),
-                CompletionRequest::new(&run.system_prompt, api_messages, &tools)
-                    .declaring(&deferred_tools)
-                    .attributed(request_attribution),
-                round,
-                round,
-            )
-            .await
+            match self
+                .complete_with_retry(
+                    "the turn's provider call",
+                    CompletionRequest::new(&run.system_prompt, api_messages, &tools)
+                        .declaring(&deferred_tools)
+                        .attributed(request_attribution),
+                    round,
+                    round,
+                )
+                .await
             {
                 Ok(crate::provider::Completion {
                     message,
@@ -2402,7 +2406,9 @@ impl Agent {
                 cancellation.reason().unwrap_or(CancelReason::Client),
             ),
             Err(error) => crate::store::turns::TurnEnding::failed(error, usage),
-        };
+        }
+        // Read before the turn's scope drops and the named profile comes back.
+        .served_by(self.serving_fallback());
         if let Err(error) = self.store.turn_store().close_turn(turn_id, &ending).await {
             tracing::warn!("failed to record the turn's ending: {error}");
         }
@@ -2746,7 +2752,7 @@ impl Agent {
         progress: &mut StreamProgress,
     ) -> Result<(Message, StopReason, crate::stats::TokenUsage)> {
         let mut retries = 0u32;
-        let started = std::time::Instant::now();
+        let mut started = std::time::Instant::now();
         loop {
             // Reported back out as well as read here, because `run_turn` needs the same fact for
             // the same reason: whatever it does with a failure, it must not re-send a request whose
@@ -2764,7 +2770,10 @@ impl Agent {
                 )
                 .await
             {
-                Ok(value) => return Ok(value),
+                Ok(value) => {
+                    self.providers.mark_available(&self.profile());
+                    return Ok(value);
+                }
                 Err(error) => match should_retry_provider_error(
                     &error,
                     progress.content_started,
@@ -2783,7 +2792,16 @@ impl Agent {
                             _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
                         }
                     }
-                    None => return Err(error),
+                    None => {
+                        // The profile's retries are spent; a fallback starts the sequence over on
+                        // a budget of its own.
+                        if self.fall_back(&error, progress.content_started).await {
+                            retries = 0;
+                            started = std::time::Instant::now();
+                            continue;
+                        }
+                        return Err(error);
+                    }
                 },
             }
         }

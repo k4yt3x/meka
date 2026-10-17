@@ -21,8 +21,9 @@ a connection for the length of a turn sends `detach: true` and reads the turn fr
 `202` names, or follows the session feed; see [Holding a turn](../usage/http-api.md#holding-a-turn).
 A feed subscriber counts as a listener, so a client that keeps the feed open is unaffected.
 
-**Session archives are `format_version` 13.** A 0.77 archive imports as it is; a 0.78 archive
-names why a canceled turn stopped, which 0.77 refuses to read.
+**Session archives are `format_version` 14.** A 0.77 archive imports as it is; a 0.78 archive
+names why a canceled turn stopped and which fallback profile served a turn, which 0.77 refuses to
+read.
 
 ## 0.76 to 0.77
 

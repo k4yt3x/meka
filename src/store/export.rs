@@ -8,7 +8,7 @@ use super::*;
 /// away included: the reader takes this version's shape alone, and an older archive the migration
 /// module knows is brought forward before it is read. `meka session import` refuses any other
 /// version.
-pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 13;
+pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 14;
 /// Decode an archive, refusing one written for another `format_version` before its shape is read.
 ///
 /// The version is read on its own first, because a release that changed the shape also changed
@@ -170,6 +170,8 @@ pub(crate) struct ExportedTurn {
     pub(crate) error_type: Option<String>,
     pub(crate) detail: Option<String>,
     pub(crate) cancel_reason: Option<String>,
+    /// The profile that served the turn when it was not the session's own.
+    pub(crate) profile: Option<String>,
     pub(crate) usage: crate::store::turns::TurnUsage,
 }
 impl From<crate::store::turns::TurnRecord> for ExportedTurn {
@@ -188,6 +190,7 @@ impl From<crate::store::turns::TurnRecord> for ExportedTurn {
             error_type,
             detail,
             cancel_reason: turn.reason.map(|reason| reason.name().to_string()),
+            profile: turn.profile,
             usage: turn.usage,
         }
     }

@@ -22,6 +22,7 @@ pub(crate) async fn run(
             name,
             account,
             model,
+            fallback,
             context_window,
             max_output_tokens,
             effort,
@@ -33,6 +34,7 @@ pub(crate) async fn run(
             thinking_display,
             deferred_tools,
         } => run_add(name, account.as_deref(), model.clone(), ProfileTuning {
+            fallbacks: fallback.clone(),
             context_window: *context_window,
             max_output_tokens: *max_output_tokens,
             effort: effort.clone(),
@@ -72,6 +74,7 @@ pub(crate) async fn run(
 /// (`account`, `model`).
 #[derive(Default)]
 struct ProfileTuning {
+    fallbacks: Vec<String>,
     context_window: Option<u64>,
     max_output_tokens: Option<u64>,
     effort: Option<String>,
@@ -213,6 +216,16 @@ async fn run_remove(name: &str, store: &crate::store::Store) -> anyhow::Result<(
             .get("default_profile")
             .and_then(|item| item.as_str())
             == Some(name);
+        // A profile another's `fallbacks` names could not be removed without leaving that list
+        // naming nothing, which the next run refuses; refused here, where the name is in front
+        // of the user, as `account remove` refuses an account a profile names.
+        let naming = profiles_naming_as_fallback(&document, name);
+        if !naming.is_empty() {
+            anyhow::bail!(
+                "profile(s) {} name '{name}' in `fallbacks`; remove it from them first",
+                naming.join(", ")
+            );
+        }
         // Written even with no profile to remove: `default_profile` can still point at the name,
         // and dropping that dangling pointer is exactly the cleanup this case is for.
         let removed = remove_profile_document(&mut document, name);
@@ -329,6 +342,7 @@ fn rename_profile_under_lock(name: &str, new_name: &str) -> anyhow::Result<()> {
     let (_lock, path, mut document) = open_document()?;
     refuse_an_unrenameable_profile(&document, name, new_name)?;
     rename_table_entry(&mut document, "profiles", name, new_name)?;
+    repoint_fallbacks(&mut document, name, new_name);
     if document
         .get("default_profile")
         .and_then(|item| item.as_str())
@@ -349,6 +363,7 @@ fn rename_profile_under_lock(name: &str, new_name: &str) -> anyhow::Result<()> {
 /// be able to do; a new profile on that account is one command away.
 pub(super) const SETTABLE_PROFILE_KEYS: &[&str] = &[
     "model",
+    "fallbacks",
     "context_window",
     "max_output_tokens",
     "effort",
@@ -390,6 +405,16 @@ fn parse_profile_value(name: &str, key: &str, value: &str) -> anyhow::Result<tom
             name,
             Some(value),
         )?)),
+        "fallbacks" => {
+            let names = fallback_names(value);
+            if names.is_empty() {
+                anyhow::bail!(
+                    "fallbacks must name at least one profile, comma-separated; pass `--unset` to \
+                     remove the setting"
+                );
+            }
+            Ok(toml_edit::Value::Array(fallbacks_array(&names)))
+        }
         "effort" => Ok(toml_edit::Value::from(value)),
         "context_window" => integer("context_window"),
         "max_output_tokens" => integer("max_output_tokens"),
@@ -587,6 +612,11 @@ fn run_set(name: &str, key: &str, value: Option<&str>, unset: bool) -> anyhow::R
     if value.is_some() {
         refuse_an_inert_key(&document, name, key)?;
     }
+    if key == "fallbacks"
+        && let Some(value) = value
+    {
+        refuse_bad_fallbacks(&document, name, &fallback_names(value))?;
+    }
 
     // Asked of the document this command is about to write, not of the one on disk, so neither
     // write door can leave behind a profile the other would have refused. Checked here rather than
@@ -611,11 +641,12 @@ fn run_use(name: &str) -> anyhow::Result<()> {
 
 /// The listing's columns: the name `--profile` and `/profile` take, the account and the model for
 /// information, and the two facts.
-const PROFILE_COLUMNS: [crate::text::Column; 5] = [
+const PROFILE_COLUMNS: [crate::text::Column; 6] = [
     crate::text::Column::content("Name"),
     crate::text::Column::capped("Account", crate::text::NAME_WIDTH),
     crate::text::Column::content("Backend"),
     crate::text::Column::remainder("Model"),
+    crate::text::Column::capped("Fallbacks", crate::text::NAME_WIDTH),
     crate::text::Column::content("Default"),
 ];
 
@@ -636,6 +667,11 @@ fn run_list(format: crate::cli::OutputFormat) -> anyhow::Result<()> {
                         view.account.clone(),
                         view.backend.clone().unwrap_or_else(|| "-".to_string()),
                         view.model.clone().unwrap_or_else(|| "-".to_string()),
+                        if view.fallbacks.is_empty() {
+                            "-".to_string()
+                        } else {
+                            view.fallbacks.join(", ")
+                        },
                         if view.active { "yes" } else { "no" }.to_string(),
                     ]
                 })
@@ -745,6 +781,12 @@ fn upsert_profile_document(
     // what the user actually chose and a later change to a default reaches existing profiles.
     profile.insert("account", toml_edit::value(account));
     profile.insert("model", toml_edit::value(model));
+    if !tuning.fallbacks.is_empty() {
+        profile.insert(
+            "fallbacks",
+            toml_edit::value(fallbacks_array(&tuning.fallbacks)),
+        );
+    }
     if let Some(window) = tuning.context_window {
         profile.insert(
             "context_window",
@@ -855,12 +897,87 @@ fn write_profile(
     {
         return Err(unknown_account(account, table_names(&document, "accounts")));
     }
+    refuse_bad_fallbacks(&document, name, &tuning.fallbacks)?;
     let before = document.to_string();
     upsert_profile_document(&mut document, name, account, model, tuning)?;
     let after = document.to_string();
     refuse_a_profile_that_cannot_run(&before, &after, name)?;
     crate::fs::write_file_atomic(&path, &after)?;
     Ok(())
+}
+
+/// The TOML array a `fallbacks` list is written as.
+fn fallbacks_array(fallbacks: &[String]) -> toml_edit::Array {
+    fallbacks.iter().map(String::as_str).collect()
+}
+
+/// The names a `fallbacks` value on the command line carries: comma-separated, blanks dropped.
+fn fallback_names(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The rule `validate()` applies to a `fallbacks` list at startup, asked of the document this
+/// command is about to write, so the file never holds a list a run would refuse.
+fn refuse_bad_fallbacks(
+    document: &toml_edit::DocumentMut,
+    name: &str,
+    fallbacks: &[String],
+) -> anyhow::Result<()> {
+    let profiles = table_names(document, "profiles");
+    config::validate_fallback_names(name, fallbacks, profiles.iter()).map_err(anyhow::Error::msg)
+}
+
+/// The profiles whose `fallbacks` name `name`, which is what keeps `name` from being removed.
+fn profiles_naming_as_fallback(document: &toml_edit::DocumentMut, name: &str) -> Vec<String> {
+    let Some(profiles) = document
+        .get("profiles")
+        .and_then(|item| item.as_table_like())
+    else {
+        return Vec::new();
+    };
+    profiles
+        .iter()
+        .filter(|(_, profile)| {
+            profile
+                .as_table_like()
+                .and_then(|profile| profile.get("fallbacks"))
+                .and_then(|item| item.as_array())
+                .is_some_and(|array| array.iter().any(|value| value.as_str() == Some(name)))
+        })
+        .map(|(profile, _)| profile.to_string())
+        .collect()
+}
+
+/// Point every `fallbacks` entry naming `name` at `new_name`, keeping whatever comment sat beside
+/// it: a rename moves the name everywhere it is recorded.
+fn repoint_fallbacks(document: &mut toml_edit::DocumentMut, name: &str, new_name: &str) {
+    let Some(profiles) = document
+        .get_mut("profiles")
+        .and_then(|item| item.as_table_like_mut())
+    else {
+        return;
+    };
+    for (_, profile) in profiles.iter_mut() {
+        let Some(array) = profile
+            .as_table_like_mut()
+            .and_then(|profile| profile.get_mut("fallbacks"))
+            .and_then(|item| item.as_array_mut())
+        else {
+            continue;
+        };
+        for value in array.iter_mut() {
+            if value.as_str() == Some(name) {
+                let decor = value.decor().clone();
+                *value = toml_edit::Value::from(new_name);
+                *value.decor_mut() = decor;
+            }
+        }
+    }
 }
 
 /// Refuse a write that would leave `name` unusable, before the file is touched.
@@ -1092,6 +1209,7 @@ fn resolve_tuning(
         thinking_budget,
         // Flag-only, so they pass through whatever the caller set. Prompting for them would make
         // the advanced step twice as long for settings that are stated far less often.
+        fallbacks: flags.fallbacks,
         vision: flags.vision,
         max_output_tokens: flags.max_output_tokens,
         thinking_display: flags.thinking_display,
@@ -2146,6 +2264,7 @@ account = "work"
                 "thinking_display" => "updates",
                 "thinking" => "adaptive",
                 "deferred_tools" => "native",
+                "fallbacks" => "backup",
                 _ => "value",
             };
             assert!(
@@ -2366,6 +2485,88 @@ account = "work"
         assert_eq!(profile.thinking, Some(config::ThinkingMode::Budgeted));
         assert_eq!(profile.context_window, Some(262_144));
         assert_eq!(profile.effort.as_deref(), Some("medium"));
+    }
+
+    /// `fallbacks` is written as an array in the canonical place, after `model`, and reads back
+    /// as the list it was given.
+    #[test]
+    fn upsert_profile_document_writes_fallbacks_after_model() {
+        let mut document = toml_edit::DocumentMut::new();
+        upsert_profile_document(&mut document, "main", "a", "m", &ProfileTuning {
+            fallbacks: vec!["backup".to_string(), "last".to_string()],
+            context_window: Some(1_024),
+            ..Default::default()
+        })
+        .expect("upsert");
+        let rendered = document.to_string();
+        let model_at = rendered.find("model").expect("model");
+        let fallbacks_at = rendered.find("fallbacks").expect("fallbacks");
+        let window_at = rendered.find("context_window").expect("window");
+        assert!(
+            model_at < fallbacks_at && fallbacks_at < window_at,
+            "{rendered}"
+        );
+        let config: config::ConfigFile = toml::from_str(&rendered).expect("re-parse config");
+        assert_eq!(config.profiles["main"].fallbacks, vec!["backup", "last"]);
+    }
+
+    /// A `fallbacks` value on the command line is comma-separated, blanks dropped, and an empty
+    /// one is refused rather than written as `[]`.
+    #[test]
+    fn a_fallbacks_value_is_a_comma_separated_list() {
+        let parsed = parse_profile_value("main", "fallbacks", " backup, last ,").expect("list");
+        let names: Vec<&str> = parsed
+            .as_array()
+            .expect("an array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert_eq!(names, vec!["backup", "last"]);
+        let error = parse_profile_value("main", "fallbacks", " , ").expect_err("empty");
+        assert!(error.to_string().contains("--unset"), "{error}");
+    }
+
+    /// The write doors apply the startup rule: a list may not name the profile itself, a profile
+    /// the file does not have, or one name twice.
+    #[test]
+    fn a_bad_fallbacks_list_is_refused_at_the_write_door() {
+        let document: toml_edit::DocumentMut =
+            "[profiles.main]\naccount = \"a\"\n\n[profiles.backup]\naccount = \"a\"\n"
+                .parse()
+                .expect("a document");
+        refuse_bad_fallbacks(&document, "main", &["backup".to_string()]).expect("a good list");
+        for (list, word) in [
+            (vec!["main".to_string()], "itself"),
+            (vec!["nowhere".to_string()], "nowhere"),
+            (vec!["backup".to_string(), "backup".to_string()], "twice"),
+        ] {
+            let error = refuse_bad_fallbacks(&document, "main", &list).expect_err(word);
+            assert!(error.to_string().contains(word), "{error}");
+        }
+    }
+
+    /// A profile another's `fallbacks` names is found by the removal door, and a rename moves the
+    /// name inside every list, comment and all.
+    #[test]
+    fn fallback_lists_follow_a_remove_and_a_rename() {
+        let mut document: toml_edit::DocumentMut = "[profiles.main]\naccount = \"a\"\n\
+             fallbacks = [\"backup\", \"last\"] # in order\n\n[profiles.other]\naccount = \"a\"\n\
+             fallbacks = [\"backup\"]\n\n[profiles.backup]\naccount = \"a\"\n"
+            .parse()
+            .expect("a document");
+        assert_eq!(profiles_naming_as_fallback(&document, "backup"), vec![
+            "main", "other"
+        ]);
+        assert!(profiles_naming_as_fallback(&document, "main").is_empty());
+
+        repoint_fallbacks(&mut document, "backup", "reserve");
+        let rendered = document.to_string();
+        assert!(
+            rendered.contains("fallbacks = [\"reserve\", \"last\"] # in order"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("fallbacks = [\"reserve\"]"), "{rendered}");
+        assert!(profiles_naming_as_fallback(&document, "backup").is_empty());
     }
 
     #[test]

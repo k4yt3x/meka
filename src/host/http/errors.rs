@@ -163,9 +163,10 @@ pub(crate) fn status_of(kind: ErrorKind) -> StatusCode {
             StatusCode::UNPROCESSABLE_ENTITY
         }
         ErrorKind::ConcurrencyLimit => StatusCode::TOO_MANY_REQUESTS,
-        ErrorKind::Provider | ErrorKind::ProviderUnavailable | ErrorKind::ContextOverflow => {
-            StatusCode::BAD_GATEWAY
-        }
+        ErrorKind::Provider
+        | ErrorKind::ProviderUnavailable
+        | ErrorKind::ProviderExhausted
+        | ErrorKind::ContextOverflow => StatusCode::BAD_GATEWAY,
         ErrorKind::McpUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         ErrorKind::StreamDetached | ErrorKind::SseLag | ErrorKind::Internal => {
             StatusCode::INTERNAL_SERVER_ERROR
@@ -223,7 +224,8 @@ impl ProblemDetail {
             MekaError::Provider(message)
             | MekaError::InvalidRequest(message)
             | MekaError::StreamError(message)
-            | MekaError::RetryableProvider { message, .. } => {
+            | MekaError::RetryableProvider { message, .. }
+            | MekaError::ProviderExhausted { message, .. } => {
                 tracing::warn!("provider error: {message}");
             }
             MekaError::ContextOverflow(message) => tracing::warn!("context overflow: {message}"),
@@ -249,6 +251,10 @@ impl ProblemDetail {
         match error {
             MekaError::RetryableProvider {
                 retry_after: Some(delay),
+                ..
+            }
+            | MekaError::ProviderExhausted {
+                resets_after: Some(delay),
                 ..
             // Worth relaying because it is fresh rather than spent: read from the headers of the
             // final attempt, after which the agent loop gives up rather than sleeping again, so
@@ -557,6 +563,34 @@ mod tests {
             silent.retry_after_seconds, None,
             "a transport failure has no header to relay, so meka must not invent one"
         );
+    }
+
+    /// A quota or billing refusal is 502 under its own type, with the upstream's reset as
+    /// `Retry-After` when it stated one and no header invented when it did not.
+    #[test]
+    fn a_quota_refusal_is_502_under_its_own_type_with_its_reset() {
+        let problem = ProblemDetail::for_error(
+            &MekaError::ProviderExhausted {
+                message: "402 insufficient credits".into(),
+                resets_after: Some(std::time::Duration::from_secs(600)),
+            },
+            false,
+        );
+        assert_eq!(problem.status, 502);
+        assert_eq!(
+            problem.type_uri,
+            "https://meka.run/errors/provider-exhausted"
+        );
+        assert_eq!(problem.retry_after_seconds, Some(600));
+
+        let silent = ProblemDetail::for_error(
+            &MekaError::ProviderExhausted {
+                message: "402 insufficient credits".into(),
+                resets_after: None,
+            },
+            false,
+        );
+        assert_eq!(silent.retry_after_seconds, None);
     }
 
     /// A conversation that will not fit is 502 like its neighbors but says so under its own type.

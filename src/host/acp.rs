@@ -157,6 +157,10 @@ fn acp_error_for(error: &MekaError, relay_provider_errors: bool) -> agent_client
                 message,
             )
         }
+        MekaError::ProviderExhausted { message, .. } => withhold_or_relay(
+            &format!("{}; its response is in the meka log", error.sentence()),
+            message,
+        ),
         MekaError::ContextOverflow(message) => withhold_or_relay(
             "the conversation exceeds the model's context window; shorten it before retrying",
             message,
@@ -762,6 +766,10 @@ mod tests {
                 message: leaky.to_string(),
                 retry_after: None,
                 server_error_on_completion: false,
+            },
+            MekaError::ProviderExhausted {
+                message: leaky.to_string(),
+                resets_after: None,
             },
             MekaError::ContextOverflow(leaky.to_string()),
         ] {

@@ -111,6 +111,13 @@ pub(crate) enum MockEvent {
         message: String,
         retry_after_secs: Option<u64>,
     },
+    /// Synthetic quota or billing refusal. The stream returns
+    /// `Err(MekaError::ProviderExhausted { .. })` at once, which is never retried in place, so a
+    /// profile with fallbacks hands the turn to the next one and the next round is theirs.
+    FailExhausted {
+        message: String,
+        resets_after_secs: Option<u64>,
+    },
     /// Synthetic *malformed-request* failure. The stream returns
     /// `Err(MekaError::InvalidRequest(message))` immediately, exercising `Agent::run_turn`'s
     /// degrade-and-retry path. Each attempt consumes one round, so
@@ -404,6 +411,15 @@ impl Provider for MockProvider {
                         server_error_on_completion: true,
                     });
                 }
+                MockEvent::FailExhausted {
+                    message,
+                    resets_after_secs,
+                } => {
+                    return Err(crate::error::MekaError::ProviderExhausted {
+                        message,
+                        resets_after: resets_after_secs.map(std::time::Duration::from_secs),
+                    });
+                }
                 MockEvent::FailInvalidRequest { message } => {
                     return Err(crate::error::MekaError::InvalidRequest(message));
                 }
@@ -579,6 +595,16 @@ impl Provider for MockProvider {
                         server_error_on_completion: true,
                     });
                 }
+                MockEvent::FailExhausted {
+                    message,
+                    resets_after_secs,
+                } => {
+                    send_stream_error(&event_sender, &message).await;
+                    return Err(crate::error::MekaError::ProviderExhausted {
+                        message,
+                        resets_after: resets_after_secs.map(std::time::Duration::from_secs),
+                    });
+                }
                 MockEvent::FailInvalidRequest { message } => {
                     send_stream_error(&event_sender, &message).await;
                     return Err(crate::error::MekaError::InvalidRequest(message));
@@ -638,6 +664,7 @@ impl Provider for MockProvider {
                         | MockEvent::ExpectSystemPrompt { .. }
                         | MockEvent::FailStream { .. }
                         | MockEvent::FailRetryable { .. }
+                        | MockEvent::FailExhausted { .. }
                         | MockEvent::FailInvalidRequest { .. }
                         | MockEvent::FailContextOverflow { .. } => {
                             unreachable!("handled above")

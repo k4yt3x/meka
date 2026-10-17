@@ -294,8 +294,8 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         cancellation: &crate::agent::TurnCancellation,
     ) {
         use crate::host::http::handlers::turn::{
-            message_withdrawn, notify_turn_end, revision_for_terminal, terminal_event_parts,
-            usage_from,
+            message_withdrawn, notify_turn_end, revision_for_terminal, served_by_for_terminal,
+            terminal_event_parts, usage_from,
         };
         // Drained here rather than in `finished`, which runs after and finds it empty: the usage
         // and the withdrawal ride the terminal.
@@ -311,6 +311,7 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
             self.state.config.relay_provider_errors,
             message_withdrawn(&recorder),
             revision_for_terminal(&self.state.shared.store, entry.id).await,
+            served_by_for_terminal(&self.state.shared.store, entry.id, turn_id).await,
         );
         entry.frontend.record_terminal(event_type, data);
         entry.frontend.end_turn();

@@ -17042,6 +17042,94 @@ fn wait_for_turn_ending(harness: &ServeTestHarness, id: &str, turn_id: &str) -> 
     }
 }
 
+/// A profile whose upstream refuses for quota hands the turn to its fallback: the feed says so, the
+/// terminal and the turn's record name the profile that served it, the session keeps naming its
+/// own, and the next turn starts on the fallback while the breaker is open.
+#[test]
+fn a_turn_falls_back_to_the_profile_s_fallback_and_says_so() {
+    // The scripted provider stands in for both profiles, so the rounds are consumed in the order
+    // the profiles are asked: `main` takes the refusal, `mock` the answers.
+    let script = serde_json::json!([
+        [{ "type": "fail_exhausted", "message": "insufficient_quota", "resets_after_secs": 600 }],
+        [
+            { "type": "text", "text": "served by the fallback" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "and again" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn_with_prelude(
+        "default_profile = \"mock\"\n\n[profiles.main]\naccount = \"mock\"\nmodel = \"m\"\n\
+         fallbacks = [\"mock\"]\n",
+        "",
+        script,
+    );
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "working_directory": std::env::temp_dir().to_string_lossy(),
+            "profile": "main",
+        }))
+        .send()
+        .expect("create");
+    assert_eq!(create.status(), 201, "{}", create.text().expect("body"));
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "go"}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200, "{}", response.text().expect("body"));
+    let body: serde_json::Value = response.json().expect("parse");
+    assert!(
+        assistant_text(&body).contains("served by the fallback"),
+        "{body}"
+    );
+
+    let events = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+    let notice = sse_event_data(&events, "notice").unwrap_or_else(|| panic!("{events}"));
+    assert_eq!(notice["level"], "warn", "{notice}");
+    assert_eq!(
+        notice["text"], "Profile 'main' is unavailable; this turn runs on 'mock'.",
+        "{notice}"
+    );
+    let finished = sse_event_data(&events, "turn.finished").unwrap_or_else(|| panic!("{events}"));
+    assert_eq!(finished["profile"], "mock", "{finished}");
+    let turn_id = finished["turn_id"].as_str().expect("turn id");
+    let record = wait_for_turn_ending(&harness, &id, turn_id);
+    assert_eq!(record["profile"], "mock", "{record}");
+    assert_eq!(record["status"], "succeeded", "{record}");
+    let session: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(session["profile"], "main", "the row never moves: {session}");
+
+    // The breaker: the second turn starts on the fallback without asking `main` again, which is
+    // why the script's third round is the one it consumes.
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "once more"}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200, "{}", response.text().expect("body"));
+    let body: serde_json::Value = response.json().expect("parse");
+    assert!(assistant_text(&body).contains("and again"), "{body}");
+    let events = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+    let finished = sse_event_data(&events, "turn.finished").unwrap_or_else(|| panic!("{events}"));
+    assert_eq!(finished["profile"], "mock", "{finished}");
+}
+
 /// A detached request is answered at admission with the turn as a record and where to read it,
 /// and the resource reports the ending once there is one. A turn nobody began under an id is a
 /// 404.

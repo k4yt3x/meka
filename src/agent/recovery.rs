@@ -954,55 +954,6 @@ pub(super) fn should_retry_provider_error(
         _ => None,
     }
 }
-/// Run [`Provider::complete`] under the same retry policy a streamed turn gets, so one transient
-/// 429 mid-compaction is not terminal.
-///
-/// `content_started` is `false` by construction: nothing streamed, so a retry cannot double-emit.
-/// `cancellation` gates the *waits*, as the loops in `run_streaming` and `run_turn` do, or a
-/// `Retry-After` could hold Ctrl+C for a minute; `attempt_cancellation` gates the request itself,
-/// and the two differ on purpose. The checkpoint hands its turn's token to both, so a stop drops a
-/// reply it is still waiting on. The summarizer hands `attempt_cancellation` a token nothing fires:
-/// a canceled token there means the checkpoint was interrupted and `compact_session` has fallen
-/// back to [`Agent::summarize_via_provider`], the tier that guarantees the window shrinks, so
-/// refusing to send would leave a `/compact` the user just pressed Ctrl+C on with the window as
-/// full as before. `an_interrupt_ends_the_checkpoint_and_falls_back` pins it.
-pub(super) async fn complete_with_retry(
-    what: &str,
-    provider: &Arc<dyn Provider>,
-    request: CompletionRequest<'_>,
-    cancellation: &CancellationToken,
-    attempt_cancellation: &CancellationToken,
-) -> Result<crate::provider::Completion> {
-    let started = std::time::Instant::now();
-    let mut retries = 0_u32;
-    loop {
-        match provider
-            .complete(request.clone(), attempt_cancellation.clone())
-            .await
-        {
-            Ok(completed) => return Ok(completed),
-            Err(error) => {
-                let Some(delay) =
-                    should_retry_provider_error(&error, false, retries, started.elapsed())
-                else {
-                    return Err(error);
-                };
-                let ceiling = crate::provider::retry::MAX_PROVIDER_RETRIES;
-                tracing::warn!(
-                    "{what} failed transiently (attempt {}/{ceiling}), retrying in {delay:?}: \
-                     {error}",
-                    retries + 1
-                );
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
-                }
-                retries += 1;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

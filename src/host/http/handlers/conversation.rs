@@ -231,6 +231,12 @@ pub(crate) async fn compact(
                         id,
                     )
                     .await,
+                    crate::host::http::handlers::turn::served_by_for_terminal(
+                        &state.shared.store,
+                        id,
+                        turn_id,
+                    )
+                    .await,
                 );
                 entry.frontend.record_terminal(event_type, data);
             }

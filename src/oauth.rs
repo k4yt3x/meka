@@ -137,6 +137,7 @@ where
             continue;
         }
         let retry_after = crate::error::parse_retry_after(response.headers());
+        let window_reset = crate::error::parse_window_reset(response.headers());
         let text = crate::error::read_whole_reply(response, retry_after, cancellation).await?;
         return Err(
             refresher.with_login_remedy(crate::error::provider_http_error(
@@ -144,6 +145,7 @@ where
                 &text,
                 retry_after,
                 request,
+                window_reset,
             )),
         );
     }

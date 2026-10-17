@@ -378,6 +378,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "turns_record_why_they_were_canceled",
         step: Step::Rust(turns_record_why_they_were_canceled),
     },
+    // 0.78 records the profile that served a turn when it was not the session's own, one of its
+    // `fallbacks`; a row closed before the column reads as served by the session's profile.
+    Migration {
+        name: "turns_record_the_profile_that_served_them",
+        step: Step::Rust(turns_record_the_profile_that_served_them),
+    },
 ];
 
 /// The position of the last turn a session opened, beside the eight cumulative counters: `NULL`
@@ -550,6 +556,17 @@ fn turns_record_why_they_were_canceled(
     // every step after the baseline, and a bare `ADD COLUMN` would then refuse it forever.
     if !columns.iter().any(|column| column == "cancel_reason") {
         transaction.execute_batch("ALTER TABLE turns ADD COLUMN cancel_reason TEXT")?;
+    }
+    Ok(())
+}
+
+/// `turns.profile`, nullable: the fallback that served the turn, absent when the session's own
+/// profile did. Guarded on the column set for the reason the module docs give.
+fn turns_record_the_profile_that_served_them(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    if !table_has_column(transaction, "turns", "profile")? {
+        transaction.execute_batch("ALTER TABLE turns ADD COLUMN profile TEXT")?;
     }
     Ok(())
 }
@@ -769,7 +786,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 4_209_813_241_915_938_653;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 3_284_728_608_954_377_463;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -2812,6 +2829,9 @@ const ARCHIVE_FORMAT_0_76_DEVELOPMENT: u64 = 10;
 const ARCHIVE_FORMAT_0_76: u64 = 11;
 /// The archive `format_version` 0.77 wrote, whose turns say nothing about why one was canceled.
 const ARCHIVE_FORMAT_0_77: u64 = 12;
+/// The archive `format_version` the 0.78 development line wrote, whose turns say nothing about a
+/// fallback profile having served one.
+const ARCHIVE_FORMAT_0_78_DEVELOPMENT: u64 = 13;
 
 /// How the text meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
@@ -3361,7 +3381,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_75)
         | Some(ARCHIVE_FORMAT_0_76_DEVELOPMENT)
         | Some(ARCHIVE_FORMAT_0_76)
-        | Some(ARCHIVE_FORMAT_0_77) => {}
+        | Some(ARCHIVE_FORMAT_0_77)
+        | Some(ARCHIVE_FORMAT_0_78_DEVELOPMENT) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -4523,6 +4544,10 @@ mod tests {
             (
                 "turns_record_why_they_were_canceled",
                 8514104273109450752_u64,
+            ),
+            (
+                "turns_record_the_profile_that_served_them",
+                16857558564953777198_u64,
             ),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
@@ -8264,5 +8289,71 @@ mod tests {
         let turn = &export.sessions[0].turns[0];
         assert_eq!(turn.status.as_deref(), Some("canceled"));
         assert_eq!(turn.cancel_reason, None);
+    }
+
+    /// A format 13 archive's turns carry every column but the serving profile, which is optional
+    /// on the row too, so it is read as it is: every turn reads as the session's own profile's.
+    #[test]
+    fn a_format_13_archive_is_read_as_it_is() {
+        let mut document = serde_json::json!({
+            "format_version": 13,
+            "meka_version": "0.78.0-dev",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "blobs": [],
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "working_directory": "/w",
+                "permission": "read",
+                "capabilities_json": null,
+                "approvals": false,
+                "additional_workspace_directories": [],
+                "subagent_spec_json": null,
+                "profile": "work",
+                "stats": {
+                    "turns": 1,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "redactions": 0,
+                    "redacted_images": 0,
+                    "redacted_bytes": 0,
+                    "turn_position": {"prompt_index": 1, "turn_index": 1},
+                },
+                "turns": [{
+                    "id": "22222222-2222-4222-8222-222222222222",
+                    "source": "client",
+                    "started_at": "2020-01-01T00:00:00Z",
+                    "ended_at": "2020-01-01T00:00:01Z",
+                    "status": "succeeded",
+                    "stop_reason": "end_turn",
+                    "error_type": null,
+                    "detail": null,
+                    "cancel_reason": null,
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                    },
+                }],
+                "events": [],
+                "scratchpad_entries": {},
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        let mut before = document.clone();
+        before["format_version"] = current.into();
+        assert!(bring_archive_forward(&mut document, current));
+        assert_eq!(document, before, "nothing to convert but the version stamp");
+        let export = crate::store::export::parse_session_export(document.to_string().as_bytes())
+            .expect("a format 13 archive reads");
+        let turn = &export.sessions[0].turns[0];
+        assert_eq!(turn.status.as_deref(), Some("succeeded"));
+        assert_eq!(turn.profile, None);
     }
 }

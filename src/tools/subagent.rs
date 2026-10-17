@@ -32,11 +32,11 @@ const SUBAGENT_ABSOLUTE_MAX_DEPTH: usize = 16;
 #[derive(Clone)]
 pub(crate) struct ToolBuilderParams {
     pub(crate) materials: crate::session::SessionMaterials,
-    /// The spawning agent's own cells. `cells.profile` is what the parent runs on *now*, which is
-    /// what a worker whose spawn named no profile runs on; read at spawn time rather than at
-    /// registration, because a worker spawned after a `/profile` switch went to the profile the
-    /// user had just left, billing that account, while its own row recorded the new one.
-    /// `cells.cwd` is snapshotted per spawn so a parent `/cd` mid-turn cannot move a
+    /// The spawning agent's own cells. `cells.profile` is the profile the parent names *now*,
+    /// which is what a worker whose spawn named no profile runs on; read at spawn time rather
+    /// than at registration, because a worker spawned after a `/profile` switch went to the
+    /// profile the user had just left, billing that account, while its own row recorded the
+    /// new one. `cells.cwd` is snapshotted per spawn so a parent `/cd` mid-turn cannot move a
     /// running worker; the roots are shared, because nothing mutates them after construction. A
     /// worker whose spawn stated a scope takes neither: its directory and roots are its own.
     pub(crate) cells: crate::session::SessionCells,
@@ -1956,7 +1956,7 @@ struct WorkerPlacement {
     binding: crate::provider::ResolvedProfile,
 }
 
-/// What a worker runs on: `pinned`, or what its parent runs on now when there is none.
+/// What a worker runs on: `pinned`, or the profile its parent names now when there is none.
 ///
 /// One door for `agent_spawn` and `agent_followup`. The spawn passes the profile its call chose;
 /// the follow-up passes what a pinned worker's own row names, because a session runs on the profile
@@ -1979,7 +1979,10 @@ async fn worker_binding(
                     message: format!("cannot run the sub-agent on profile '{name}': {error}"),
                 })
         }
-        None => Ok(params.cells.profile.current()),
+        // The named profile, not what serves the parent's turn now: a fallback is one turn's
+        // substitution, and the worker's own turn routes by the breaker like any other, so its row
+        // names the profile the parent's does and its turn's row says who served it.
+        None => Ok(params.cells.profile.named()),
     }
 }
 
@@ -5811,8 +5814,8 @@ mod tests {
     }
 
     /// The one door both `agent_spawn` and `agent_followup` build from: a chosen profile resolves
-    /// by name, an unnamed one is whatever the parent runs on now, and a name the installation
-    /// does not configure is refused by name.
+    /// by name, an unnamed one is the parent's own profile, a fallback serving the parent's turn
+    /// notwithstanding, and a name the installation does not configure is refused by name.
     #[tokio::test]
     async fn a_worker_binding_follows_the_spec_then_the_parent() {
         let store = store_for_test().await;
@@ -5833,6 +5836,16 @@ mod tests {
             .await
             .expect("the parent's own profile resolves");
         assert_eq!(following.profile, "test-profile");
+
+        params.cells.profile.serve(&pinned);
+        let during_a_fallback = worker_binding(&params, None, "agent_spawn")
+            .await
+            .expect("the parent's own profile resolves");
+        assert_eq!(
+            during_a_fallback.profile, "test-profile",
+            "a fallback serving the parent's turn is not what a worker is bound to"
+        );
+        params.cells.profile.restore();
 
         let refused = match worker_binding(&params, Some("missing"), "agent_followup").await {
             Ok(binding) => panic!(
