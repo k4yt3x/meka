@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 pub(crate) use assembly::*;
 pub(crate) use session::*;
-use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::Agent,

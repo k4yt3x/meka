@@ -372,6 +372,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "background_reports_name_only_their_tasks",
         step: Step::Rust(background_reports_name_only_their_tasks),
     },
+    // 0.78 records why a canceled turn stopped beside how it ended, the word its `turn.canceled`
+    // carries; a row closed before the column reads as canceled by nobody in particular.
+    Migration {
+        name: "turns_record_why_they_were_canceled",
+        step: Step::Rust(turns_record_why_they_were_canceled),
+    },
 ];
 
 /// The position of the last turn a session opened, beside the eight cumulative counters: `NULL`
@@ -528,6 +534,22 @@ fn sessions_record_their_context_tokens(
     // every step after the baseline, and a bare `ADD COLUMN` would then refuse it forever.
     if !columns.iter().any(|column| column == "context_tokens") {
         transaction.execute_batch("ALTER TABLE sessions ADD COLUMN context_tokens INTEGER")?;
+    }
+    Ok(())
+}
+
+fn turns_record_why_they_were_canceled(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let columns = {
+        let mut statement = transaction.prepare("SELECT name FROM pragma_table_info(?1)")?;
+        let rows = statement.query_map(["turns"], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>()?
+    };
+    // Guarded for the reason the module docs give: a store that lost its `user_version` replays
+    // every step after the baseline, and a bare `ADD COLUMN` would then refuse it forever.
+    if !columns.iter().any(|column| column == "cancel_reason") {
+        transaction.execute_batch("ALTER TABLE turns ADD COLUMN cancel_reason TEXT")?;
     }
     Ok(())
 }
@@ -747,7 +769,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 2_276_857_717_155_333_933;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 4_209_813_241_915_938_653;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -2788,6 +2810,8 @@ const ARCHIVE_FORMAT_0_76_DEVELOPMENT: u64 = 10;
 /// The archive `format_version` 0.76 wrote, whose thinking blocks carry a Claude signature or
 /// sealed Responses reasoning and never a Chat Completions endpoint's own text.
 const ARCHIVE_FORMAT_0_76: u64 = 11;
+/// The archive `format_version` 0.77 wrote, whose turns say nothing about why one was canceled.
+const ARCHIVE_FORMAT_0_77: u64 = 12;
 
 /// How the text meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
@@ -3336,7 +3360,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_70_DEVELOPMENT_2)
         | Some(ARCHIVE_FORMAT_0_75)
         | Some(ARCHIVE_FORMAT_0_76_DEVELOPMENT)
-        | Some(ARCHIVE_FORMAT_0_76) => {}
+        | Some(ARCHIVE_FORMAT_0_76)
+        | Some(ARCHIVE_FORMAT_0_77) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -4494,6 +4519,10 @@ mod tests {
             (
                 "background_reports_name_only_their_tasks",
                 14970459526399045671_u64,
+            ),
+            (
+                "turns_record_why_they_were_canceled",
+                8514104273109450752_u64,
             ),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
@@ -8169,5 +8198,71 @@ mod tests {
                     opaque: Some(crate::conversation::OpaqueReasoning::Signed { .. }), ..
                 })
         ));
+    }
+
+    /// A 0.77 archive's turns carry every column but the cancel reason, which is optional on the
+    /// row too, so it is read as it is: a canceled turn comes back canceled by nobody in
+    /// particular.
+    #[test]
+    fn a_format_12_archive_is_read_as_it_is() {
+        let mut document = serde_json::json!({
+            "format_version": 12,
+            "meka_version": "0.77.0",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "blobs": [],
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "working_directory": "/w",
+                "permission": "read",
+                "capabilities_json": null,
+                "approvals": false,
+                "additional_workspace_directories": [],
+                "subagent_spec_json": null,
+                "profile": "work",
+                "stats": {
+                    "turns": 1,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "redactions": 0,
+                    "redacted_images": 0,
+                    "redacted_bytes": 0,
+                    "turn_position": {"prompt_index": 1, "turn_index": 1},
+                },
+                "turns": [{
+                    "id": "22222222-2222-4222-8222-222222222222",
+                    "source": "client",
+                    "started_at": "2020-01-01T00:00:00Z",
+                    "ended_at": "2020-01-01T00:00:01Z",
+                    "status": "canceled",
+                    "stop_reason": null,
+                    "error_type": null,
+                    "detail": null,
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                    },
+                }],
+                "events": [],
+                "scratchpad_entries": {},
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        let mut before = document.clone();
+        before["format_version"] = current.into();
+        assert!(bring_archive_forward(&mut document, current));
+        assert_eq!(document, before, "nothing to convert but the version stamp");
+        let export = crate::store::export::parse_session_export(document.to_string().as_bytes())
+            .expect("a 0.77 archive reads");
+        let turn = &export.sessions[0].turns[0];
+        assert_eq!(turn.status.as_deref(), Some("canceled"));
+        assert_eq!(turn.cancel_reason, None);
     }
 }

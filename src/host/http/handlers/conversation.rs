@@ -24,7 +24,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -172,7 +171,7 @@ pub(crate) async fn compact(
     //
     // Publishing it keeps `POST /cancel` and the shutdown drain working: both fire whatever token
     // is in this cell, which is now this compaction's.
-    let cancellation = CancellationToken::new();
+    let cancellation = crate::agent::TurnCancellation::new();
     let turn_id = Uuid::new_v4();
     let published = entry
         .cancel
@@ -183,7 +182,7 @@ pub(crate) async fn compact(
     let (_feed, _ids) = entry.frontend.begin_turn(
         turn_id,
         crate::host::scheduler::TurnSource::Compaction,
-        false,
+        crate::host::http::feed::Opener::DRIVER,
         state.config.stream_reattach_grace,
         state.config.stream_replay_events,
     );
@@ -206,7 +205,7 @@ pub(crate) async fn compact(
             );
             let outcome = entry
                 .agent
-                .compact_session(&mut conversation, request, cancellation)
+                .compact_session(&mut conversation, request, cancellation.token().clone())
                 .await;
             let messages_after = conversation.len();
             // The checkpoint turn emits provider notices and the `Compacted` event into the
@@ -215,18 +214,13 @@ pub(crate) async fn compact(
             // accumulate across repeated compactions and surface in whichever turn drains next.
             let recorder = entry.frontend.drain();
             {
-                use crate::host::http::handlers::turn::{
-                    CancelReason, terminal_event_parts, usage_from,
-                };
+                use crate::host::http::handlers::turn::{terminal_event_parts, usage_from};
                 let compacted = crate::agent::TurnOutcome::EndTurn;
-                let cancel_reason = if state.shutdown.is_cancelled() {
-                    CancelReason::ServerShutdown
-                } else {
-                    CancelReason::Client
-                };
                 let (event_type, data) = terminal_event_parts(
                     Ok(outcome.as_ref().map(|_| &compacted)),
-                    cancel_reason,
+                    cancellation
+                        .reason()
+                        .unwrap_or(crate::store::turns::CancelReason::Client),
                     usage_from(&recorder),
                     turn_id,
                     id,
@@ -848,6 +842,64 @@ pub(crate) async fn turns(
         turns,
         next_before,
     }))
+}
+
+/// `GET /v1/sessions/{id}/turns/{turn_id}`: one turn, the resource a detached request's
+/// `Location` names.
+#[utoipa::path(
+    get,
+    path = "/v1/sessions/{id}/turns/{turn_id}",
+    tag = "conversation",
+    params(
+        ("id" = Uuid, Path, description = "Session UUID"),
+        ("turn_id" = Uuid, Path, description = "Turn UUID, as `turn.started` and the 202 of a detached request name it"),
+    ),
+    responses(
+        (status = 200, description = "The turn, with its ending once it has one", body = crate::store::turns::TurnRecord),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 404, description = "Session not found (`/errors/session-not-found`), or no turn of it has this id (`/errors/not-found`)", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["sessions:r"]))
+)]
+pub(crate) async fn turn(
+    State(state): State<ServerState>,
+    _scoped: scope::Scoped<scope::SessionsRead>,
+    Path((id, turn_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<crate::store::turns::TurnRecord>, ProblemDetail> {
+    // Read-only, like the listing: never revives a session.
+    require_session_exists(&state, id).await?;
+    let stored = state
+        .shared
+        .store
+        .turn_store()
+        .get_turn(id, turn_id)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to load the turn", error)
+                .with("session_id", id.to_string())
+        })?;
+    if let Some(turn) = stored {
+        return Ok(Json(turn));
+    }
+    // The turn writes its own row a moment after it is admitted, and a detached request's 202
+    // names it before then: until the row exists, the feed answers for the turn it is running.
+    let live = state
+        .sessions
+        .read()
+        .await
+        .get(&id)
+        .and_then(|entry| entry.frontend.in_flight_turn())
+        .filter(|turn| turn.id == turn_id);
+    live.map(Json).ok_or_else(|| {
+        ProblemDetail::new(
+            ErrorKind::NotFound,
+            StatusCode::NOT_FOUND,
+            format!("no turn {turn_id} began on session {id}"),
+        )
+        .with("session_id", id.to_string())
+    })
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]

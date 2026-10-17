@@ -254,8 +254,11 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
             .may_deliver()
     }
 
-    fn cancellation(&self) -> tokio_util::sync::CancellationToken {
-        self.state.shutdown.child_token()
+    fn cancellation(&self) -> crate::agent::TurnCancellation {
+        crate::agent::TurnCancellation::child_of(
+            &self.state.shutdown,
+            crate::store::turns::CancelReason::ServerShutdown,
+        )
     }
 
     fn shutting_down(&self) -> bool {
@@ -272,7 +275,7 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         let (_feed, _ids) = entry.frontend.begin_turn(
             turn_id,
             source,
-            false,
+            crate::host::http::feed::Opener::DRIVER,
             self.state.config.stream_reattach_grace,
             self.state.config.stream_replay_events,
         );
@@ -288,22 +291,20 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         turn_id: uuid::Uuid,
         origin: &crate::host::scheduler::TurnSource,
         outcome: &Result<crate::agent::TurnOutcome, crate::error::MekaError>,
+        cancellation: &crate::agent::TurnCancellation,
     ) {
         use crate::host::http::handlers::turn::{
-            CancelReason, message_withdrawn, notify_turn_end, revision_for_terminal,
-            terminal_event_parts, usage_from,
+            message_withdrawn, notify_turn_end, revision_for_terminal, terminal_event_parts,
+            usage_from,
         };
         // Drained here rather than in `finished`, which runs after and finds it empty: the usage
         // and the withdrawal ride the terminal.
         let recorder = entry.frontend.drain();
-        let cancel_reason = if self.state.shutdown.is_cancelled() {
-            CancelReason::ServerShutdown
-        } else {
-            CancelReason::Client
-        };
         let (event_type, data) = terminal_event_parts(
             Ok(outcome.as_ref()),
-            cancel_reason,
+            cancellation
+                .reason()
+                .unwrap_or(crate::store::turns::CancelReason::Client),
             usage_from(&recorder),
             turn_id,
             entry.id,

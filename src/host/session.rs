@@ -198,8 +198,11 @@ mod tests {
     fn a_cancel_during_admission_still_stops_the_turn() {
         let cell = CancelCell::default();
         let admission = cell.admit();
-        assert!(!cell.cancel(), "nothing is live yet");
-        let token = tokio_util::sync::CancellationToken::new();
+        assert!(
+            !cell.cancel(crate::store::turns::CancelReason::Client),
+            "nothing is live yet"
+        );
+        let token = crate::agent::TurnCancellation::new();
         let _published = cell.publish(token.clone(), admission);
         assert!(
             token.is_cancelled(),
@@ -211,7 +214,7 @@ mod tests {
     fn a_turn_admitted_with_no_cancel_pending_is_left_alone() {
         let cell = CancelCell::default();
         let admission = cell.admit();
-        let token = tokio_util::sync::CancellationToken::new();
+        let token = crate::agent::TurnCancellation::new();
         let _published = cell.publish(token.clone(), admission);
         assert!(!token.is_cancelled());
     }
@@ -219,9 +222,9 @@ mod tests {
     #[test]
     fn a_cancel_from_before_admission_does_not_abort_the_next_turn() {
         let cell = CancelCell::default();
-        cell.cancel();
+        cell.cancel(crate::store::turns::CancelReason::Client);
         let admission = cell.admit();
-        let token = tokio_util::sync::CancellationToken::new();
+        let token = crate::agent::TurnCancellation::new();
         let _published = cell.publish(token.clone(), admission);
         assert!(
             !token.is_cancelled(),
@@ -229,17 +232,54 @@ mod tests {
         );
     }
 
+    /// A stop carries its reason to the turn, the first reason given is the one kept, and a
+    /// cancel that lands during admission carries the reason it was asked with.
+    #[test]
+    fn a_cancel_carries_its_reason_to_the_turn() {
+        use crate::store::turns::CancelReason;
+        let cell = CancelCell::default();
+        let cancellation = crate::agent::TurnCancellation::new();
+        let published = cell.publish(cancellation.clone(), cell.admit());
+        assert_eq!(
+            cancellation.reason(),
+            None,
+            "a running turn has no reason yet"
+        );
+        assert!(cell.cancel(CancelReason::ServerShutdown));
+        assert_eq!(cancellation.reason(), Some(CancelReason::ServerShutdown));
+        cell.cancel(CancelReason::Client);
+        assert_eq!(
+            cancellation.reason(),
+            Some(CancelReason::ServerShutdown),
+            "a second stop does not rewrite why"
+        );
+        drop(published);
+
+        let admission = cell.admit();
+        cell.cancel(CancelReason::ServerShutdown);
+        let late = crate::agent::TurnCancellation::new();
+        let _published = cell.publish(late.clone(), admission);
+        assert_eq!(
+            late.reason(),
+            Some(CancelReason::ServerShutdown),
+            "the cancel that moved the epoch is honored with its reason"
+        );
+    }
+
     #[test]
     fn a_cancel_reaches_the_live_turn_and_no_turn_after_it() {
         let cell = CancelCell::default();
-        let token = tokio_util::sync::CancellationToken::new();
+        let token = crate::agent::TurnCancellation::new();
         let published = cell.publish(token.clone(), cell.admit());
-        assert!(cell.cancel(), "the live turn is what a cancel stops");
+        assert!(
+            cell.cancel(crate::store::turns::CancelReason::Client),
+            "the live turn is what a cancel stops"
+        );
         assert!(token.is_cancelled());
         drop(published);
         assert!(cell.live().is_none(), "the cell empties when the turn ends");
         assert!(
-            !cell.cancel(),
+            !cell.cancel(crate::store::turns::CancelReason::Client),
             "and a cancel between turns has nothing to stop"
         );
     }
@@ -275,9 +315,12 @@ pub(crate) struct Sessions<K, E>(Arc<tokio::sync::RwLock<std::collections::HashM
 /// nothing and says so.
 #[derive(Clone, Default)]
 pub(crate) struct CancelCell {
-    /// The live turn's id and token, or `None` between turns.
-    token: Arc<std::sync::RwLock<Option<(uuid::Uuid, tokio_util::sync::CancellationToken)>>>,
+    /// The live turn's id and stop signal, or `None` between turns.
+    token: Arc<std::sync::RwLock<Option<(uuid::Uuid, crate::agent::TurnCancellation)>>>,
     epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Why the last cancel was asked, for a turn admitted before it and published after, which
+    /// the epoch stops before it runs.
+    asked: Arc<std::sync::RwLock<Option<crate::store::turns::CancelReason>>>,
     /// Woken when a turn ends, whoever ran it. The one place every turn on a session passes
     /// through on its way out, which is what lets a host wait for "the session went idle" without
     /// polling and without each door remembering to say so.
@@ -485,7 +528,9 @@ where
     pub(crate) async fn cancel_every_turn(&self) {
         let sessions = self.0.read().await;
         for entry in sessions.values() {
-            entry.cancel.cancel();
+            entry
+                .cancel
+                .cancel(crate::store::turns::CancelReason::ServerShutdown);
         }
     }
 
@@ -582,7 +627,7 @@ impl CancelCell {
         }
     }
 
-    fn store(&self, token: Option<(uuid::Uuid, tokio_util::sync::CancellationToken)>) {
+    fn store(&self, token: Option<(uuid::Uuid, crate::agent::TurnCancellation)>) {
         *crate::sync::write(&self.token) = token;
     }
 
@@ -597,37 +642,40 @@ impl CancelCell {
     /// the caller of that cancel was told the turn was canceled, so it is.
     pub(crate) fn publish(
         &self,
-        token: tokio_util::sync::CancellationToken,
+        cancellation: crate::agent::TurnCancellation,
         admission: Admission,
     ) -> Published {
-        self.publish_turn(token, admission, uuid::Uuid::new_v4())
+        self.publish_turn(cancellation, admission, uuid::Uuid::new_v4())
     }
 
     /// [`Self::publish`] under the id the host gave the turn, so a cancel aimed at that id can be
     /// told from one aimed at whatever runs next.
     pub(crate) fn publish_turn(
         &self,
-        token: tokio_util::sync::CancellationToken,
+        cancellation: crate::agent::TurnCancellation,
         admission: Admission,
         turn_id: uuid::Uuid,
     ) -> Published {
-        self.store(Some((turn_id, token.clone())));
+        self.store(Some((turn_id, cancellation.clone())));
         if self.epoch.load(std::sync::atomic::Ordering::SeqCst) != admission.epoch {
             tracing::debug!(
                 "a cancel arrived while this turn was being admitted; honoring it before the turn runs"
             );
-            token.cancel();
+            let reason =
+                crate::sync::read(&self.asked).unwrap_or(crate::store::turns::CancelReason::Client);
+            cancellation.cancel(reason);
         }
         Published { cell: self.clone() }
     }
 
-    /// Cancel the live turn, and record the cancel for a turn being admitted. Returns whether a
-    /// turn was live to cancel.
-    pub(crate) fn cancel(&self) -> bool {
+    /// Cancel the live turn for `reason`, and record the cancel for a turn being admitted.
+    /// Returns whether a turn was live to cancel.
+    pub(crate) fn cancel(&self, reason: crate::store::turns::CancelReason) -> bool {
+        *crate::sync::write(&self.asked) = Some(reason);
         self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         match self.live() {
-            Some(token) => {
-                token.cancel();
+            Some(cancellation) => {
+                cancellation.cancel(reason);
                 true
             }
             None => false,
@@ -636,12 +684,17 @@ impl CancelCell {
 
     /// Cancel the live turn only if it is `turn_id`. The epoch moves only on a hit: a caller that
     /// named a turn is not asking for whatever is admitted next.
-    pub(crate) fn cancel_turn(&self, turn_id: uuid::Uuid) -> CancelOutcome {
+    pub(crate) fn cancel_turn(
+        &self,
+        turn_id: uuid::Uuid,
+        reason: crate::store::turns::CancelReason,
+    ) -> CancelOutcome {
         let live = crate::sync::read(&self.token).clone();
         match live {
-            Some((id, token)) if id == turn_id => {
+            Some((id, cancellation)) if id == turn_id => {
+                *crate::sync::write(&self.asked) = Some(reason);
                 self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                token.cancel();
+                cancellation.cancel(reason);
                 CancelOutcome::Canceled
             }
             Some(_) => CancelOutcome::Mismatch,
@@ -649,12 +702,12 @@ impl CancelCell {
         }
     }
 
-    /// The live turn's token, or `None` between turns. A poisoned lock still answers: a panicking
-    /// turn has to stay cancelable.
-    pub(crate) fn live(&self) -> Option<tokio_util::sync::CancellationToken> {
+    /// The live turn's stop signal, or `None` between turns. A poisoned lock still answers: a
+    /// panicking turn has to stay cancelable.
+    pub(crate) fn live(&self) -> Option<crate::agent::TurnCancellation> {
         crate::sync::read(&self.token)
             .as_ref()
-            .map(|(_, token)| token.clone())
+            .map(|(_, cancellation)| cancellation.clone())
     }
 
     /// The live turn's id, or `None` between turns.

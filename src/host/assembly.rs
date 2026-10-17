@@ -455,7 +455,9 @@ pub(crate) async fn release_agent(
     cancel: &CancelCell,
     mcp_manager: Option<&Arc<crate::mcp::McpClientManager>>,
 ) -> usize {
-    cancel.cancel();
+    // A release that still finds a turn is one a client asked for (`session/close`, a screen
+    // leaving); a shutdown stops every turn as the server's own ahead of releasing anything.
+    cancel.cancel(crate::store::turns::CancelReason::Client);
     let stopped = agent.background_tasks().cancel_all().await;
     if let Some(manager) = mcp_manager {
         crate::tools::mcp_adapter::detach_session_registry(manager, agent.tool_registry()).await;

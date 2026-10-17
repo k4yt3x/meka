@@ -876,7 +876,9 @@ pub(super) async fn handle_close_session(
     };
     // Fire cancel via the sibling cell first; it never blocks on the conversation mutex (which an
     // in-flight prompt may hold for the whole turn).
-    entry.cancel.cancel();
+    entry
+        .cancel
+        .cancel(crate::store::turns::CancelReason::Client);
     // Waits on the conversation mutex, which an in-flight prompt holds for the whole turn. That is
     // safe only because the handler is `cx.spawn`ed: on the dispatch loop it would starve the very
     // response the turn is waiting for. The cancel above does not make the wait short either --

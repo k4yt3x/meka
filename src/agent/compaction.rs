@@ -2139,7 +2139,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("carry on".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("a turn after compaction");
@@ -3309,12 +3309,12 @@ mod tests {
                 .expect("create session"),
         );
 
-        let cancellation = CancellationToken::new();
+        let cancellation = crate::agent::TurnCancellation::new();
         let stop = tokio::spawn({
             let cancellation = cancellation.clone();
             async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                cancellation.cancel();
+                cancellation.cancel(crate::store::turns::CancelReason::Client);
             }
         });
         let started = std::time::Instant::now();
@@ -3322,7 +3322,7 @@ mod tests {
             .compact_session(
                 &mut messages,
                 CompactRequest::new(CompactOrigin::Manual),
-                cancellation,
+                cancellation.token().clone(),
             )
             .await
             .expect("compaction still completes");
@@ -3571,7 +3571,7 @@ mod tests {
                     .run_turn(
                         &mut messages,
                         TurnInput::from_parts(body.clone(), Vec::new()).expect("prompt"),
-                        CancellationToken::new(),
+                        crate::agent::TurnCancellation::new(),
                     )
                     .await
                     .expect("turn");
@@ -3652,7 +3652,7 @@ mod tests {
                 .run_turn(
                     &mut messages,
                     TurnInput::from_parts("continue".into(), Vec::new()).expect("prompt"),
-                    CancellationToken::new(),
+                    crate::agent::TurnCancellation::new(),
                 )
                 .await
                 .expect("next turn");

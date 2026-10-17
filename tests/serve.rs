@@ -17017,3 +17017,444 @@ fn a_rewind_announces_the_list_it_leaves() {
         "{record}"
     );
 }
+
+/// Poll the turn resource until it reports an ending.
+fn wait_for_turn_ending(harness: &ServeTestHarness, id: &str, turn_id: &str) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let record: serde_json::Value = harness
+            .request(
+                reqwest::Method::GET,
+                &format!("/v1/sessions/{id}/turns/{turn_id}"),
+            )
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        if record.get("status").is_some() {
+            return record;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "turn {turn_id} never ended: {record}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A detached request is answered at admission with the turn as a record and where to read it,
+/// and the resource reports the ending once there is one. A turn nobody began under an id is a
+/// 404.
+#[test]
+fn a_detached_turn_is_accepted_at_admission_and_read_from_its_resource() {
+    let script = serde_json::json!([[
+        { "type": "sleep", "ms": 1500 },
+        { "type": "text", "text": "done later" },
+        { "type": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = create_session_id(&harness);
+
+    let started = Instant::now();
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "go", "detach": true}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 202, "{}", response.text().expect("body"));
+    assert!(
+        started.elapsed() < Duration::from_millis(1000),
+        "the 202 came after the turn ended, {:?} in",
+        started.elapsed()
+    );
+    let location = response
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .expect("a Location header")
+        .to_string();
+    let record: serde_json::Value = response.json().expect("parse");
+    let turn_id = record["id"].as_str().expect("id").to_string();
+    assert_eq!(location, format!("/v1/sessions/{id}/turns/{turn_id}"));
+    assert_eq!(record["source"], "client", "{record}");
+    assert!(record["started_at"].is_string(), "{record}");
+    assert!(record.get("status").is_none(), "not ended yet: {record}");
+
+    // Readable at once, whether or not the turn has written its row yet.
+    let early: serde_json::Value = harness
+        .request(reqwest::Method::GET, &location)
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(early["id"], turn_id, "{early}");
+
+    let ended = wait_for_turn_ending(&harness, &id, &turn_id);
+    assert_eq!(ended["status"], "succeeded", "{ended}");
+    assert_eq!(ended["stop_reason"], "end_turn", "{ended}");
+    assert!(ended.get("reason").is_none(), "{ended}");
+
+    let unknown = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{id}/turns/{}", uuid::Uuid::new_v4()),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(unknown.status(), 404);
+    let problem: serde_json::Value = unknown.json().expect("parse");
+    assert_eq!(
+        problem["type"], "https://meka.run/errors/not-found",
+        "{problem}"
+    );
+}
+
+/// A detached request's key is committed with its admission: a replay answers the same 202,
+/// during the turn and after it, and starts nothing; the same key with another body conflicts.
+#[test]
+fn a_detached_request_s_key_answers_the_same_202_whatever_became_of_the_turn() {
+    let script = serde_json::json!([[
+        { "type": "sleep", "ms": 800 },
+        { "type": "text", "text": "once" },
+        { "type": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = create_session_id(&harness);
+    let body = serde_json::json!({"message": "go", "detach": true});
+
+    let first: serde_json::Value = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .header("Idempotency-Key", "detached-once")
+        .json(&body)
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let turn_id = first["id"].as_str().expect("id").to_string();
+
+    let during = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .header("Idempotency-Key", "detached-once")
+        .json(&body)
+        .send()
+        .expect("send");
+    assert_eq!(
+        during.status(),
+        202,
+        "a replay mid-turn is the same admission"
+    );
+    assert_eq!(
+        during.json::<serde_json::Value>().expect("parse")["id"],
+        turn_id
+    );
+
+    wait_for_turn_ending(&harness, &id, &turn_id);
+    let after = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .header("Idempotency-Key", "detached-once")
+        .json(&body)
+        .send()
+        .expect("send");
+    assert_eq!(
+        after.status(),
+        202,
+        "a replay after the end is the same admission"
+    );
+    assert_eq!(
+        after.json::<serde_json::Value>().expect("parse")["id"],
+        turn_id
+    );
+    let listed: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/turns"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        listed["turns"].as_array().expect("turns").len(),
+        1,
+        "the replays started nothing: {listed}"
+    );
+
+    let other = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .header("Idempotency-Key", "detached-once")
+        .json(&serde_json::json!({"message": "something else", "detach": true}))
+        .send()
+        .expect("send");
+    assert_eq!(other.status(), 409, "{}", other.text().expect("body"));
+}
+
+/// A detached stream is a reader the turn does not wait for: dropped at once under a zero grace,
+/// the turn runs on, and the feed catches the client up from the stream's own position.
+#[test]
+fn a_detached_stream_keeps_running_when_dropped() {
+    let script = serde_json::json!([
+        [
+            { "type": "sleep", "ms": 1200 },
+            { "type": "tool_use_start", "id": "tu_1", "name": "list_directory" },
+            { "type": "tool_use_end", "input": {"path": std::env::temp_dir().to_string_lossy()} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "finished without a listener" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("stream_reattach_grace = \"0s\"\n", script);
+    let id = create_session_id(&harness);
+
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "go", "stream": true, "detach": true}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+    let (opening, response) =
+        read_feed_until_open(response, |text| text.contains("event: turn.started"));
+    let started = sse_event_data(&opening, "turn.started").expect("turn.started");
+    let turn_id = started["turn_id"].as_str().expect("turn id").to_string();
+    let started_id: u64 = opening
+        .lines()
+        .find_map(|line| line.strip_prefix("id: "))
+        .and_then(|id| id.trim().parse().ok())
+        .expect("the stream's events are numbered");
+    drop(response);
+
+    let ended = wait_for_turn_ending(&harness, &id, &turn_id);
+    assert_eq!(
+        ended["status"], "succeeded",
+        "a detached turn is not stopped for its reader leaving: {ended}"
+    );
+
+    let feed = open_feed(&harness, &id, Some(started_id), Duration::from_secs(10));
+    let caught_up = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+    assert!(
+        caught_up.contains("event: tool_call.completed"),
+        "the feed replays what the dropped stream missed: {caught_up}"
+    );
+    assert!(
+        !caught_up.contains("event: feed.gap"),
+        "the stream's position is a valid feed position: {caught_up}"
+    );
+}
+
+/// A held blocking request whose client leaves stops its turn at the next round boundary, and
+/// the row and the terminal say it was abandoned rather than stopped by someone. A feed reader
+/// is a listener, so with one attached the same turn runs to its end.
+#[test]
+fn a_held_blocking_request_that_leaves_stops_its_turn_as_abandoned() {
+    let script = || {
+        serde_json::json!([
+            [
+                { "type": "sleep", "ms": 1200 },
+                { "type": "tool_use_start", "id": "tu_1", "name": "list_directory" },
+                { "type": "tool_use_end", "input": {"path": std::env::temp_dir().to_string_lossy()} },
+                { "type": "message_end", "stop_reason": "tool_use" }
+            ],
+            [
+                { "type": "text", "text": "ran to the end" },
+                { "type": "message_end", "stop_reason": "end_turn" }
+            ]
+        ])
+    };
+    let impatient = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(400))
+        .build()
+        .expect("client");
+
+    let harness = ServeTestHarness::spawn("stream_reattach_grace = \"0s\"\n", script());
+    let id = create_session_id(&harness);
+    let left = impatient
+        .post(format!("{}/v1/sessions/{id}/turn", harness.base_url))
+        .header("Authorization", format!("Bearer {}", harness.token))
+        .json(&serde_json::json!({"message": "go"}))
+        .send();
+    assert!(left.is_err(), "the client gave up on the held request");
+    let turn_id = {
+        harness.wait_until_in_flight(&id);
+        let listed: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/turns"))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        listed["turns"][0]["id"]
+            .as_str()
+            .expect("the turn's row")
+            .to_string()
+    };
+    let ended = wait_for_turn_ending(&harness, &id, &turn_id);
+    assert_eq!(ended["status"], "canceled", "{ended}");
+    assert_eq!(ended["reason"], "abandoned", "{ended}");
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(5));
+    let terminal = read_feed_until(feed, |text| text.contains("event: turn.canceled"));
+    assert!(
+        terminal.contains("\"reason\":\"abandoned\""),
+        "the terminal says why: {terminal}"
+    );
+
+    let harness = ServeTestHarness::spawn("stream_reattach_grace = \"0s\"\n", script());
+    let id = create_session_id(&harness);
+    let listener = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let left = impatient
+        .post(format!("{}/v1/sessions/{id}/turn", harness.base_url))
+        .header("Authorization", format!("Bearer {}", harness.token))
+        .json(&serde_json::json!({"message": "go"}))
+        .send();
+    assert!(left.is_err(), "the client gave up on the held request");
+    let finished = read_feed_until(listener, |text| {
+        text.contains("event: turn.finished") || text.contains("event: turn.canceled")
+    });
+    assert!(
+        finished.contains("event: turn.finished"),
+        "a feed reader keeps the turn running: {finished}"
+    );
+}
+
+/// On a session whose client answers prompts on return, a prompt raised with nobody attending
+/// parks and outlives the grace, and the client that comes back is handed it and answers it. On a
+/// session that said no such thing, the same call is refused without asking.
+#[test]
+fn a_session_whose_client_returns_parks_a_prompt_nobody_attends() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let path = workspace.path().join("returned.txt");
+    let script = || {
+        serde_json::json!([
+            [
+                { "type": "tool_use_start", "id": "tu_1", "name": "file_write" },
+                { "type": "tool_use_end", "input": {"path": path, "content": "hi"} },
+                { "type": "message_end", "stop_reason": "tool_use" }
+            ],
+            [
+                { "type": "text", "text": "written" },
+                { "type": "message_end", "stop_reason": "end_turn" }
+            ]
+        ])
+    };
+    let create = |harness: &ServeTestHarness, returns: bool| -> String {
+        let create = harness
+            .request(reqwest::Method::POST, "/v1/sessions")
+            .json(&serde_json::json!({
+                "working_directory": workspace.path().to_string_lossy(),
+                "permission": "read",
+                "approvals": true,
+                "capabilities": {"answers_prompts_on_return": returns},
+            }))
+            .send()
+            .expect("create");
+        assert_eq!(create.status(), 201);
+        create.json::<serde_json::Value>().expect("parse")["id"]
+            .as_str()
+            .expect("id")
+            .to_string()
+    };
+    let record = |harness: &ServeTestHarness, id: &str| -> serde_json::Value {
+        harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse")
+    };
+
+    let harness = ServeTestHarness::spawn("stream_reattach_grace = \"0s\"\n", script());
+    let id = create(&harness, true);
+    let accepted: serde_json::Value = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "write it", "detach": true}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let turn_id = accepted["id"].as_str().expect("id").to_string();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while record(&harness, &id)["approvals_pending"] != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "the prompt parks with nobody attending: {}",
+            record(&harness, &id)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Past the grace and the disconnect poll, with nobody ever attending.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        record(&harness, &id)["approvals_pending"],
+        1,
+        "the prompt waits for the client to return"
+    );
+    let feed = open_feed_with(&harness, &id, "?attend=true", None, Duration::from_secs(30));
+    let (until_prompt, feed) =
+        read_feed_until_open(feed, |text| text.contains("event: permission_required"));
+    let prompt = sse_event_data(&until_prompt, "permission_required").expect("the parked prompt");
+    let request_id = prompt["request_id"].as_str().expect("request id");
+    let answered = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{id}/responses/{request_id}"),
+        )
+        .json(&serde_json::json!({"outcome": "allow"}))
+        .send()
+        .expect("send");
+    assert_eq!(answered.status(), 204);
+    let rest = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+    assert!(rest.contains("event: turn.finished"), "{rest}");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the approved write landed"),
+        "hi"
+    );
+    assert_eq!(
+        wait_for_turn_ending(&harness, &id, &turn_id)["status"],
+        "succeeded"
+    );
+
+    std::fs::remove_file(&path).expect("remove");
+    let harness = ServeTestHarness::spawn("stream_reattach_grace = \"0s\"\n", script());
+    let id = create(&harness, false);
+    let accepted: serde_json::Value = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "write it", "detach": true}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let turn_id = accepted["id"].as_str().expect("id").to_string();
+    let ended = wait_for_turn_ending(&harness, &id, &turn_id);
+    assert_eq!(
+        ended["status"], "succeeded",
+        "refused without asking, the turn goes on: {ended}"
+    );
+    assert!(!path.exists(), "the gated write was refused");
+    assert_eq!(record(&harness, &id)["approvals_pending"], 0);
+}
+
+/// `POST /cancel` on a detached turn records who stopped it.
+#[test]
+fn a_canceled_detached_turn_records_the_client_as_its_reason() {
+    let script = serde_json::json!([[
+        { "type": "sleep", "ms": 5000 },
+        { "type": "text", "text": "never" },
+        { "type": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = create_session_id(&harness);
+    let accepted: serde_json::Value = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "go", "detach": true}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let turn_id = accepted["id"].as_str().expect("id").to_string();
+    harness.wait_until_in_flight(&id);
+    let canceled = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/cancel"))
+        .json(&serde_json::json!({"turn_id": turn_id}))
+        .send()
+        .expect("send");
+    assert_eq!(canceled.status(), 204);
+    let ended = wait_for_turn_ending(&harness, &id, &turn_id);
+    assert_eq!(ended["status"], "canceled", "{ended}");
+    assert_eq!(ended["reason"], "client", "{ended}");
+}

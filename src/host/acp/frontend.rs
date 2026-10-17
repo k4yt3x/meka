@@ -216,7 +216,10 @@ impl AcpFrontend {
         if let Some(call) = crate::frontend::current_call_cancellation() {
             return call;
         }
-        self.cancel.live().unwrap_or_default()
+        self.cancel
+            .live()
+            .map(|cancellation| cancellation.token().clone())
+            .unwrap_or_default()
     }
 
     /// Await a client round-trip, giving up if the turn is canceled.

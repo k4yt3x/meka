@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `POST /turn` takes `detach`: the request is only the trigger, and the turn runs for the session.
+- A detached JSON request answers `202 Accepted` at admission with the turn record and `Location`.
+- `GET /v1/sessions/{id}/turns/{turn_id}`: one turn, the resource a detached request names.
+- Session capability `answers_prompts_on_return`: a prompt nobody attends waits for the client.
+- A turn stopped because its client left ends with `reason: "abandoned"`, on its row as well.
+
+### Changed
+
+- **Breaking:** a blocking `POST /turn` holds its turn: a dropped request stops it after the grace.
+- A detached request's `Idempotency-Key` is committed at admission; a replay answers the same `202`.
+- Session archives are `format_version` 13; a 0.77 archive is read as it is.
+
 ## [0.77.0] - 2026-10-16
 
 ### Added

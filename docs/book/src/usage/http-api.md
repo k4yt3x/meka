@@ -98,6 +98,19 @@ data: {"turn_id":"...","session_id":"...","stop_reason":"end_turn","usage":{"inp
 
 Every payload carries `turn_id` and `session_id`; the later events above elide them.
 
+### Detached turn
+
+```bash
+curl -s -X POST http://localhost:8080/v1/sessions/$SESSION_ID/turn \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "refactor the parser", "detach": true}'
+# → 202 Accepted, Location: /v1/sessions/.../turns/...
+# → {"id":"...","source":"client","started_at":"2026-10-17T09:12:03Z","usage":{...}}
+```
+
+The turn runs whether or not this client stays. Its events are on the [session feed](#the-session-feed), and its ending on the resource `Location` names; see [Holding a turn](#holding-a-turn).
+
 ## Core concepts
 
 ### Sessions
@@ -264,6 +277,7 @@ Sessions persist server-side until explicitly deleted or evicted by the idle tim
 |------------|---------|---------|
 | `supports_reasoning_stream` | `false` | Include `thinking.delta` events in the SSE stream |
 | `supports_permission_prompts` | `true` | The client can answer a mid-turn `permission_required` event |
+| `answers_prompts_on_return` | `false` | A prompt in a turn no request holds waits for this session's client to come back and answer it |
 
 Enabling `supports_reasoning_stream` costs a *streaming* turn its retry on a transient provider failure: the deltas have already reached you and a second attempt would repeat them, and reasoning is the first thing a turn produces. Blocking turns on the same session are unaffected, since they carry whole blocks rather than deltas.
 
@@ -274,6 +288,15 @@ tools are then denied immediately with an explanatory `notice`, the same as bloc
 apart from a hang. Better still, create the session with `permission: "workspace"` so nothing is gated.
 The flag speaks for the streaming client: a feed reader that opened the stream with `attend=true`
 is asked regardless, since attending is that declaration made per connection.
+
+Set `answers_prompts_on_return: true` on a session a person drives through a client that comes and
+goes, a browser tab say. A gated call in a turn no request holds, a detached turn, an inbox turn, a
+scheduled fire, then parks whether or not anyone is attending, survives the last attending reader
+leaving, and closes only on an answer, the turn's cancellation or its 30-minute expiry; the client
+that comes back is handed it with the feed's replay and answers it. The session is busy for as
+long as the prompt waits. A held turn keeps the grace rule, since its request leaving stops the
+turn anyway. Leave it `false` for a script or a service with no interface to show a prompt on,
+where the default refusal is the right answer.
 
 #### Forking a session
 
@@ -374,16 +397,17 @@ match character by character. `limit` is how many at most (default 20, clamped t
 #### Detecting an in-flight turn
 
 Session responses carry `turn_in_flight`, a boolean saying whether a turn is running right now. It
-exists so a client whose SSE stream dropped can tell "my turn is still running" from "my turn died"
-without submitting a speculative turn and reading the `409`. A dropped stream does not cancel the
-turn; the work continues server-side and resubmitting would duplicate a reply the user is about to
-receive. Poll `GET /v1/sessions/{id}` and wait for it to go `false` rather than retrying blind.
+exists so a client whose connection dropped can tell "my turn is still running" from "my turn died"
+without submitting a speculative turn and reading the `409`. A dropped connection does not cancel
+the turn at once: a held turn runs until its next round boundary after the grace, a detached one to
+its end, and resubmitting would duplicate a reply the user is about to receive. Poll
+`GET /v1/sessions/{id}` and wait for it to go `false` rather than retrying blind.
 
-The same holds for a **blocking** turn whose client gives up: a request timeout on your side does
-not stop the turn. It runs to completion, persists its messages, and fires its webhook; you just
-never see the response body. Read the reply from `GET /v1/sessions/{id}/messages`. This is why a
-client timeout shorter than your longest turn is safe, and why retrying on one duplicates work
-rather than recovering it.
+The same holds for a held JSON turn whose client gives up: a request timeout on your side does not
+stop the turn until the grace is out, and a turn with a single round that is already under way ends
+as it would have. Read what completed from `GET /v1/sessions/{id}/messages`, and the turn's ending
+from `GET /v1/sessions/{id}/turns/{turn_id}`. A client whose timeout is shorter than its longest
+turn sends `detach: true` instead; see [Holding a turn](#holding-a-turn).
 
 `turn_in_flight` answers for this process: a session it holds, and a sub-agent it is running under
 a parent. A session another process is running, a screen open on it say, reads as idle, because only
@@ -395,28 +419,43 @@ ended, `last_turn` on the record says how.
 A turn is one round-trip: you send a user message, the agent processes it (potentially calling tools in a loop), and returns a result. Every turn that began is a row: `GET /v1/sessions/{id}/turns` lists them, newest first, each with its `id`, `source`, when it began and ended, how it ended and what it spent, in the shape `last_turn` on the session record shows for the latest one. `limit` is how many at most (default 50, clamped to 1..200), and when more remain the response carries `next_before`, the id to pass back as `before` for the page of turns older than it. Every message a turn added names it in `turn_id`, which is also the id its `turn.started` announced.
 
 ```
-POST   /v1/sessions/{id}/turn     Submit a turn
-POST   /v1/sessions/{id}/cancel   Cancel an in-flight turn
-GET    /v1/sessions/{id}/turns    The turns that began, newest first
+POST   /v1/sessions/{id}/turn              Submit a turn
+POST   /v1/sessions/{id}/cancel            Cancel an in-flight turn
+GET    /v1/sessions/{id}/turns             The turns that began, newest first
+GET    /v1/sessions/{id}/turns/{turn_id}   One turn, with its ending once it has one
 ```
 
 **One turn at a time per session.** A second `POST /turn` while another is running returns `409 Conflict`. Across sessions, turns run fully concurrently. A client that would rather hand the message over and be told when the model read it uses the [inbox](#the-inbox) instead of waiting for the session to be free.
 
 `POST /cancel` takes an optional body `{"turn_id": "..."}`. Without one it stops whatever is running, as it always did. With one it stops only that turn, and answers `409` `turn-mismatch` naming the turn actually in flight when it is another, so a client that watched a turn cannot stop the scheduled fire or the inbox turn that replaced it. Every `turn.started` on the [session feed](#the-session-feed) carries the id to name.
 
-The turn request body accepts five fields:
+The turn request body accepts six fields:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `message` | string | *(required)* | The user message. May be empty when `images` is non-empty |
 | `images` | array | `[]` | Image attachments; see [Image attachments](#image-attachments) |
-| `stream` | bool | `false` | `false` → single JSON response; `true` → SSE stream |
+| `stream` | bool | `false` | How the response is encoded: `false` → JSON; `true` → SSE stream |
+| `detach` | bool | `false` | Whether this request holds the turn; see [Holding a turn](#holding-a-turn) |
 | `options.skill` | string \| null | `null` | When set, activates the named [skill](./skills.md) for this turn (equivalent to `/skill <name>` on the screen). With an empty `message` the skill body runs alone, as `--skill` does; a turn with no text, no image and no skill is a `422` |
 | `options.unanswered_message` | string | `keep` | What becomes of `message` if the turn ends, failed or canceled, before anything from the model reached the conversation. `keep` leaves it in place, as the screen does with a typed prompt. `withdraw` takes it back, for a client that resends a failed turn; see [Resending a failed turn](#resending-a-failed-turn) |
 
+### Holding a turn
+
+`stream` and `detach` are independent. `stream` says how the response is encoded. `detach` says whether the request holds the turn: a held turn's response ends with the turn, and the turn is stopped at its next round boundary once nobody has been listening for [`[serve] stream_reattach_grace`](../configuration/config-file.md#servestream_reattach_grace), 30 seconds by default. A detached turn's request is only the trigger: the turn runs for the session like an inbox turn, and only `POST /cancel`, a shutdown or its own failure ends it early.
+
+| | `detach: false` (held) | `detach: true` |
+|---|---|---|
+| `stream: false` | `200` with the assembled turn once it ends. A dropped request stops the turn after the grace. | `202 Accepted` at admission. The body is the turn record and `Location` names it under `/turns/{turn_id}`. |
+| `stream: true` | SSE through the terminal. A dropped stream stops the turn after the grace. | SSE from admission. Drop it any time; the turn runs on. |
+
+A held request is for a client that is there for the turn: a killed `curl` should stop spending tokens whichever encoding it used. A detached request is for a client that cannot hold a connection open or does not want to, a browser tab that may close, a job runner behind a proxy with a short read timeout. The turn record a detached request is answered with is the row `GET /v1/sessions/{id}/turns` lists, with no ending yet; read `GET /v1/sessions/{id}/turns/{turn_id}` for the ending, or take it from the feed's terminal event. The feed may announce `turn.started` before the 202 reaches you; correlate by `turn_id`.
+
+A listener is any reader of the session feed, so a held turn with a feed subscriber attached is not stopped for its own request leaving. A detached stream is a feed reader narrowed to one turn: dropping it has no effect on the turn, and a reader that fell behind is caught up from the ring rather than ending the turn, as a feed reader is.
+
 ### The inbox
 
-`POST /turn` is synchronous: one request, one turn, the response scoped to it, and a `409` while the session is busy. The inbox is the asynchronous door beside it, for a client that lives with a session rather than driving one turn at a time: a chat bridge, a UI, a parent process with something to say while the agent works.
+`POST /turn` runs one turn for one request, the response scoped to it, and answers `409` while the session is busy. The inbox is the asynchronous door beside it, for a client that lives with a session rather than driving one turn at a time: a chat bridge, a UI, a parent process with something to say while the agent works.
 
 ```
 POST   /v1/sessions/{id}/inbox              Enqueue a message
@@ -642,7 +681,7 @@ Every resident session has one event feed. Everything a turn emits goes on it, w
 | `turn.started` | `turn_id`, `session_id`, `started_at`, `source` (`"client"`, `"inbox"` with `item_ids`, `"schedule"` with `job_id`, `"background"`, `"compaction"` for the checkpoint turn `POST /compact` runs, or `"parent"` with `parent_id` and `tool_call_id` on a sub-agent's feed) | Turn begins |
 | `turn.finished` | `turn_id`, `session_id`, `stop_reason`, `usage`, `revision`, optional `refusal_text` | Turn completed successfully |
 | `turn.failed` | `turn_id`, `session_id`, `error` (Problem Detail shape), `revision`, `message_withdrawn` when the turn began | Turn failed mid-stream |
-| `turn.canceled` | `turn_id`, `session_id`, `reason` (`"client"`, `"server_shutdown"`, `"sse_lag"` when the only consumer fell behind and the turn was stopped for it, or `"parent"` on a sub-agent's feed, whose turn stops with its parent's), `revision`, `message_withdrawn` when the turn began | Turn was canceled |
+| `turn.canceled` | `turn_id`, `session_id`, `reason` (`"client"` for `POST /cancel`, `"server_shutdown"`, `"abandoned"` when a held turn's request had been gone for the grace with nobody else listening, `"sse_lag"` when the only consumer fell behind and the turn was stopped for it, or `"parent"` on a sub-agent's feed, whose turn stops with its parent's), `revision`, `message_withdrawn` when the turn began | Turn was canceled |
 | `turn.nudged` | `kind`, `text`, `turn_id`, `session_id` | The turn went on past the model's reply: meka wrote `text` into the conversation as a user-role message to send the model back to work, `kind` `visible_reply` after a reply with no visible text, `checklist` after one that left checklist items open |
 | `task.reported` | `task_ids`, `text`, `turn_id`, `session_id` | A turn in flight read finished background work at a tool-round boundary: meka wrote `text`, the report the model reads, into the round's user-role message behind its results |
 
@@ -757,7 +796,7 @@ Three limits, all deliberate:
 
 - **The replay buffer is bounded** by `[serve] stream_replay_events` (default 256). If your `Last-Event-ID` is older than the oldest retained event, the stream opens with a `feed.gap` rather than a transcript that silently skips; see [Falling behind](#falling-behind). Read `GET /messages` to fill it.
 - **Only the most recent turn's terminal is retained** past the ring. Everything else a late client needs is in `GET /messages`.
-- **A turn opened by `POST /turn` with `stream: true` is not canceled immediately when its client disconnects.** It keeps running for `[serve] stream_reattach_grace` (default 30s) waiting for the client to come back; after that the agent loop stops, since nobody is listening. Set `"0s"` to restore the older behavior where a dropped stream cancels the turn at once. The rule is only for turns a streaming client opened: a turn the server started for a fire, an outcome or an inbox item runs for the session and is never stopped for want of a reader.
+- **A held turn is not canceled immediately when its client disconnects.** It keeps running for `[serve] stream_reattach_grace` (default 30s) waiting for a listener to come back; after that the agent loop stops at its next round boundary, since nobody is listening, and the turn ends with `turn.canceled` and `reason: "abandoned"`. Set `"0s"` to stop it at the first boundary after the drop. The rule is only for turns a request holds, `POST /turn` without `detach` in either encoding: a detached turn, or one the server started for a fire, an outcome or an inbox item, runs for the session and is never stopped for want of a reader. A feed subscriber is a listener, so a held turn with one attached runs on.
 
 A session with a live feed subscriber is not idle, so the [idle sweep](#idle-timeout-and-gc) leaves it resident. Opening the feed loads the session if it was not, exactly as submitting a turn does, so a `sessions:r` token can bring one into memory and keep it there, and the route answers `409` `session-locked` where `POST /turn` would. A sub-agent's id is the one id the route never loads: it is the sub-agent's own feed while its parent runs it, below.
 
@@ -889,7 +928,7 @@ Both apply during a turn: the next tool call is checked against the new level an
 
 ### Approvals
 
-With `approvals: true`, a tool call above the session's level parks as a `permission_required` SSE event whenever someone is there to answer it: the client of a `POST /turn` with `stream: true`, or a feed reader that opened `GET /v1/sessions/{id}/stream?attend=true` (which needs `sessions:w`, the scope that answers). Any turn qualifies, an inbox turn, a scheduled fire or a background outcome included, so a UI that submits through the inbox and watches the feed is asked like a streaming client is. With nobody attending, the call is refused without asking and a `notice` says so. The stream stays open while waiting. Your client resolves it by POSTing to the responses endpoint:
+With `approvals: true`, a tool call above the session's level parks as a `permission_required` SSE event whenever someone is there to answer it: the client of a `POST /turn` with `stream: true`, held or detached, or a feed reader that opened `GET /v1/sessions/{id}/stream?attend=true` (which needs `sessions:w`, the scope that answers). Any turn qualifies, an inbox turn, a scheduled fire or a background outcome included, so a UI that submits through the inbox and watches the feed is asked like a streaming client is. With nobody attending, the call is refused without asking and a `notice` says so, unless the session declared [`answers_prompts_on_return`](#capabilities), in which case a prompt in a turn no request holds parks and waits for the client to come back. The stream stays open while waiting. Your client resolves it by POSTing to the responses endpoint:
 
 ```
 POST /v1/sessions/{id}/responses/{request_id}
@@ -907,17 +946,17 @@ Possible outcomes:
 | `allow_always` | Allow this and all future calls to this tool (session-scoped) |
 | `deny_always` | Deny this and all future calls to this tool (session-scoped) |
 
-`input` is every argument the call was made with, and a prompt should show it: `tool_name` alone asks you to approve a write without showing what is written. If no response arrives within 30 minutes the request is denied; `expires_in_seconds` on the event carries that figure, counted from when the prompt was parked, and `expires_at` carries the deadline itself, which is the one to show when the event reached you from the replay ring minutes after it was parked. It is the same backstop an ACP client's prompt gets. When the last client that could answer disconnects, the prompt waits out [`[serve] stream_reattach_grace`](../configuration/config-file.md#servestream_reattach_grace), the window a streaming turn already gives its reader, and is canceled only if nobody is attending by then: a browser tab reloading or waking from suspension finds its prompt still parked, and a closed one costs the call after the window rather than at once. An approved call still runs at the session's level: approval never widens reach, so an approved write at `read` lands only inside the session's workspace.
+`input` is every argument the call was made with, and a prompt should show it: `tool_name` alone asks you to approve a write without showing what is written. If no response arrives within 30 minutes the request is denied; `expires_in_seconds` on the event carries that figure, counted from when the prompt was parked, and `expires_at` carries the deadline itself, which is the one to show when the event reached you from the replay ring minutes after it was parked. It is the same backstop an ACP client's prompt gets. When the last client that could answer disconnects, the prompt waits out [`[serve] stream_reattach_grace`](../configuration/config-file.md#servestream_reattach_grace), the window a held turn already gives its reader, and is canceled only if nobody is attending by then: a browser tab reloading or waking from suspension finds its prompt still parked, and a closed one costs the call after the window rather than at once. On a session with `answers_prompts_on_return`, a prompt in a turn no request holds is not canceled for absence at all; it waits out its expiry. An approved call still runs at the session's level: approval never widens reach, so an approved write at `read` lands only inside the session's workspace.
 
 However a prompt closes, answered by you or another client, expired, or canceled because the turn ended or nobody was left to answer, the feed says so with `permission_resolved`, carrying the `request_id` and the `outcome`, so a second client showing the same prompt can take it down rather than learn of it from a `404`. While a prompt is parked, the session record counts it in `approvals_pending`, on the listing too, which is how a list of sessions says which ones are waiting on a person; the prompts themselves are on the feed, which hands every one still parked to a client that joins. A call a sub-agent makes is asked through its parent's feed and answered on the parent's `responses` route; the event names the sub-agent in `subagent_id`.
 
-### Approvals with blocking turns
+### Approvals with JSON responses
 
-When `stream: false` and approvals are on, and no feed reader is attending, there is no channel for permission prompts. Every call that would need approval is **refused without asking**; each refused tool appends a `notice` to the response saying so and pointing at `stream: true` and `attend=true`.
+A request with `stream: false` never sees a `permission_required` event, so it is not an answerer. With approvals on, no feed reader attending, and no `answers_prompts_on_return` on the session, every call that would need approval is **refused without asking**; each refused tool appends a `notice` saying so and pointing at `attend=true` and the capability.
 
 **MCP elicitations** (interactive form prompts from MCP servers) are always auto-declined over HTTP; there is no channel for interactive input. A `notice` event is emitted when this happens.
 
-**Recommendation:** non-interactive callers (bots, bridges, scripts) should leave approvals off and create sessions at the level they need, so nothing is refused without asking. Use `stream: true`, or attend the feed, with approvals on if you need approval flow.
+**Recommendation:** non-interactive callers (bots, bridges, scripts) should leave approvals off and create sessions at the level they need, so nothing is refused without asking. Use `stream: true`, or attend the feed, with approvals on if you need approval flow; declare `answers_prompts_on_return` on a session a person returns to.
 
 ## Authentication
 
@@ -988,7 +1027,7 @@ CORS is the browser's policy on sharing a response, not authorization: an allowe
 
 ## Idempotency
 
-Blocking turn submissions (`stream: false`) support Stripe-style idempotency via the `Idempotency-Key` header:
+A held JSON turn (`stream: false`, `detach: false`) and a detached request in either encoding support Stripe-style idempotency via the `Idempotency-Key` header:
 
 ```bash
 curl -X POST http://localhost:8080/v1/sessions/$ID/turn \
@@ -1002,19 +1041,22 @@ If the same key is replayed, the server returns the cached response. If the same
 
 Keys are scoped per-token **and per-session**, and expire after 24 hours. The session is part of the scope because an `Idempotency-Key` names *your* unit of work: sending the same key to two sessions is a reasonable thing to do, and it now runs both turns instead of answering the second with the first's transcript.
 
-A turn that was canceled is not cached, so the retry the cancellation invites can actually run. Neither is a 5xx, for the same reason. Either retry re-executes the turn, and unless the turn was sent with `options.unanswered_message` set to `withdraw` it runs above the message the failed one left behind; see [Resending a failed turn](#resending-a-failed-turn).
+A held turn that was canceled is not cached, so the retry the cancellation invites can actually run. Neither is a 5xx, for the same reason. Either retry re-executes the turn, and unless the turn was sent with `options.unanswered_message` set to `withdraw` it runs above the message the failed one left behind; see [Resending a failed turn](#resending-a-failed-turn).
+
+A detached request commits its key at admission, with the `202` it was answered. A replay answers that same record for the key's lifetime whatever became of the turn, canceled included, and starts nothing: the client chose not to wait, so the outcome is the turn resource's to report. A detached stream's replay is answered the record too, not a stream.
 
 The cache is bounded per token by both entry count and total bytes; a response too large to keep is not cached, and its retry re-executes.
 
-Idempotency keys are **ignored for streaming responses**; streaming clients should reconnect by submitting a new turn.
+Idempotency keys are **ignored for a held stream**; such a client reconnects through the [session feed](#the-session-feed) or submits a new turn.
 
 ### Which endpoints are safe to retry
 
-`Idempotency-Key` covers blocking turns only. For everything else, know what a blind retry does before you configure one:
+`Idempotency-Key` covers held JSON turns and detached requests. For everything else, know what a blind retry does before you configure one:
 
 | Endpoint | Retry-safe | On a duplicate |
 |---|---|---|
-| `POST /turn` (blocking, with a key) | yes | cached response returned |
+| `POST /turn` (held JSON, with a key) | yes | cached response returned |
+| `POST /turn` (detached, with a key) | yes | the same `202` and turn record; the turn ran once |
 | `POST /v1/sessions/{id}/inbox` (with a key) | yes | the earlier item is answered, `replayed: true`; the key is on the row, so this holds across a restart |
 | `POST /cancel`, `DELETE /v1/sessions/{id}`, `DELETE /v1/sessions/{id}/tasks/{task_id}`, `DELETE /v1/sessions/{id}/inbox/{item_id}` | yes | already-done is the same state; a withdrawn item answers **404** on the retry |
 | `DELETE /v1/skills/{name}`, `/v1/memory/{name}`, `/v1/schedule/{job_id}` | yes, but | the resource is gone, so the retry answers **404**. Expected, not a failure; treat it as success if you are retrying blind |
@@ -1062,7 +1104,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/auth-scope` | 403 | Token lacks the required scope |
 | `/errors/session-permission` | 403 | The token is fine; the *session* sits too low. Raise it with `PATCH /v1/sessions/{id}`; a better token will not help |
 | `/errors/session-not-found` | 404 | Unknown session id |
-| `/errors/not-found` | 404 | Unknown skill, memory, MCP server, background task, scheduled job, image blob, or inbox item; also a skill or memory store that is disabled, or a server with `[schedule] enabled = false`, since there is nowhere to write |
+| `/errors/not-found` | 404 | Unknown skill, memory, MCP server, background task, scheduled job, image blob, inbox item, or turn; also a skill or memory store that is disabled, or a server with `[schedule] enabled = false`, since there is nowhere to write |
 | `/errors/session-not-loaded` | 409 | The session exists but is not in memory; submit a turn to load it. Do **not** retry `POST /cancel`: there is no turn to cancel |
 | `/errors/session-locked` | 409 | Another meka process holds the session's lock (e.g. two `meka serve` instances sharing one store); wait or restart the other process |
 | `/errors/turn-in-flight` | 409 | A turn is already running on this session within *this* process; cancel it via `POST /cancel` first |

@@ -10,6 +10,20 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.77 to 0.78
+
+**A blocking `POST /turn` holds its turn.** A request with `stream: false` whose client disconnects
+now stops the turn at its next round boundary once the connection has been gone for
+[`[serve] stream_reattach_grace`](../configuration/config-file.md#servestream_reattach_grace), the
+way a dropped stream always did, and the turn ends with `reason: "abandoned"`. Until 0.77 such a
+turn ran to its end and the client read the reply out of `GET /messages`. A client that cannot hold
+a connection for the length of a turn sends `detach: true` and reads the turn from the resource the
+`202` names, or follows the session feed; see [Holding a turn](../usage/http-api.md#holding-a-turn).
+A feed subscriber counts as a listener, so a client that keeps the feed open is unaffected.
+
+**Session archives are `format_version` 13.** A 0.77 archive imports as it is; a 0.78 archive
+names why a canceled turn stopped, which 0.77 refuses to read.
+
 ## 0.76 to 0.77
 
 Nothing is renamed and no key is refused; three things change what a running deployment does.

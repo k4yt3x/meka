@@ -1630,7 +1630,9 @@ impl Screen {
     /// Leave, as an interrupt when the ladder's last press asked. A `!command` still running is
     /// killed too: nothing shows it once the screen is gone, and the process is about to exit.
     fn leave_with(&mut self, interrupted: bool) {
-        self.launch.cancel.cancel();
+        self.launch
+            .cancel
+            .cancel(crate::store::turns::CancelReason::Client);
         if let Some(mut run) = self.shell.take() {
             run.kill();
         }

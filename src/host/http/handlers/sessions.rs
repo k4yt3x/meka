@@ -125,6 +125,11 @@ pub(crate) struct CapabilitiesBody {
     /// `true`, so a client that says nothing keeps the chance to approve.
     #[serde(default = "default_true")]
     pub(crate) supports_permission_prompts: bool,
+    /// When `true`, a prompt raised in a turn no request holds waits for this session's client to
+    /// come back and answer it, instead of being refused with nobody attending or canceled when
+    /// the last attending reader leaves. Default `false`.
+    #[serde(default)]
+    pub(crate) answers_prompts_on_return: bool,
 }
 
 /// `#[serde(default)]` on a `bool` yields `false`; this is for the fields that default to `true`.
@@ -137,6 +142,7 @@ impl Default for CapabilitiesBody {
         Self {
             supports_reasoning_stream: false,
             supports_permission_prompts: true,
+            answers_prompts_on_return: false,
         }
     }
 }
@@ -146,6 +152,7 @@ impl From<CapabilitiesBody> for SessionCapabilities {
         Self {
             supports_reasoning_stream: body.supports_reasoning_stream,
             supports_permission_prompts: body.supports_permission_prompts,
+            answers_prompts_on_return: body.answers_prompts_on_return,
         }
     }
 }
@@ -173,8 +180,9 @@ pub(crate) struct SessionResponse {
     ///
     /// Exists so a client whose SSE stream dropped mid-turn can tell "my turn is still running"
     /// from "my turn died" without submitting a speculative turn and reading the 409. A dropped
-    /// stream does not cancel the turn: the spawned task keeps the runtime lock and dropping the
-    /// `JoinHandle` detaches rather than aborts, so the work completes and resubmitting would
+    /// request does not cancel the turn at once: the spawned task keeps the runtime lock and
+    /// dropping the `JoinHandle` detaches rather than aborts, so a held turn runs until its next
+    /// round boundary after the grace, and a detached one to its end; resubmitting would
     /// duplicate a reply the user is about to receive anyway.
     ///
     /// `false` for a GC-evicted session, since eviction requires an idle session, and `true` for

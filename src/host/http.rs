@@ -268,6 +268,10 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
             "/v1/sessions/{id}/turns",
             get(handlers::conversation::turns),
         )
+        .route(
+            "/v1/sessions/{id}/turns/{turn_id}",
+            get(handlers::conversation::turn),
+        )
         .route("/v1/sessions/{id}/tasks", get(handlers::jobs::list_tasks))
         .route("/v1/tasks", get(handlers::jobs::list_all_tasks))
         .route(

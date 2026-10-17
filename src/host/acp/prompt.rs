@@ -422,7 +422,7 @@ pub(super) async fn run_prompt_turn(
     // Install a fresh cancellation token inside the locked scope so the cancel handler (which reads
     // the sibling cell) always sees the token for the turn currently using the runtime. The guard
     // lives to the end of this function, which is the end of the turn.
-    let cancellation = CancellationToken::new();
+    let cancellation = crate::agent::TurnCancellation::new();
     // Admitted when the prompt was dispatched, so a `session/cancel` sent straight after it stops
     // this turn rather than the next one the user submits. A turn no dispatcher admitted (a
     // scheduled fire, a resumed one) is admitted here, with no window to close.

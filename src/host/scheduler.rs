@@ -162,10 +162,10 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
     /// the transcript shows what the turn answered; the others show nothing.
     fn show_prompt(&self, _entry: &Self::Entry, _prompt: OutOfBandPrompt<'_>) {}
 
-    /// The token an out-of-band turn runs under. `serve` derives it from shutdown so a stopping
-    /// server ends the turn.
-    fn cancellation(&self) -> CancellationToken {
-        CancellationToken::new()
+    /// The stop signal an out-of-band turn runs under. `serve` derives it from shutdown so a
+    /// stopping server ends the turn, and the turn then says it was the server.
+    fn cancellation(&self) -> crate::agent::TurnCancellation {
+        crate::agent::TurnCancellation::new()
     }
 
     /// An out-of-band turn is about to run under `turn_id`. `serve` opens it on the session feed;
@@ -181,6 +181,7 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
         _turn_id: uuid::Uuid,
         _origin: &TurnSource,
         _outcome: &Result<crate::agent::TurnOutcome, MekaError>,
+        _cancellation: &crate::agent::TurnCancellation,
     ) {
     }
 
@@ -339,10 +340,12 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
     hooks.begin_turn(&entry, turn_id, origin.clone());
     let outcome = entry
         .agent
-        .run_turn(&mut conversation, input, cancellation)
+        .run_turn(&mut conversation, input, cancellation.clone())
         .await;
     entry.touch();
-    hooks.turn_closed(&entry, turn_id, &origin, &outcome).await;
+    hooks
+        .turn_closed(&entry, turn_id, &origin, &outcome, &cancellation)
+        .await;
     let outcome = outcome.map(|_| ());
     // Before `finished`, not after: a fire the drain cut short is deferred and fires again on the
     // next start, so telling a webhook it failed announced one occurrence twice.
@@ -515,11 +518,17 @@ where
         hooks.begin_turn(&entry, turn_id, TurnSource::Background);
         let outcome = entry
             .agent
-            .run_turn(&mut conversation, input, cancellation)
+            .run_turn(&mut conversation, input, cancellation.clone())
             .await;
         entry.touch();
         hooks
-            .turn_closed(&entry, turn_id, &TurnSource::Background, &outcome)
+            .turn_closed(
+                &entry,
+                turn_id,
+                &TurnSource::Background,
+                &outcome,
+                &cancellation,
+            )
             .await;
         let outcome = outcome.map(|_| ());
         hooks.finished(&entry, None, &outcome).await;
@@ -613,7 +622,7 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
         let cancellation = hooks.cancellation();
         let mut conversation = tokio::select! {
             guard = entry.conversation.lock() => guard,
-            _ = cancellation.cancelled() => return InboxDrain::Done,
+            _ = cancellation.token().cancelled() => return InboxDrain::Done,
         };
         if !hooks.still_resident(&entry).await {
             return InboxDrain::Done;
@@ -720,10 +729,12 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
         hooks.begin_turn(&entry, turn_id, origin.clone());
         let outcome = entry
             .agent
-            .run_turn(&mut conversation, input, cancellation)
+            .run_turn(&mut conversation, input, cancellation.clone())
             .await;
         entry.touch();
-        hooks.turn_closed(&entry, turn_id, &origin, &outcome).await;
+        hooks
+            .turn_closed(&entry, turn_id, &origin, &outcome, &cancellation)
+            .await;
         let outcome = outcome.map(|_| ());
         if hooks.shutting_down() {
             return InboxDrain::Done;

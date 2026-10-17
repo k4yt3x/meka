@@ -1568,10 +1568,10 @@ impl Store {
                             "INSERT INTO turns (id, session_id, source, started_at, ended_at, \
                              status, stop_reason, error_type, detail, input_tokens, \
                              output_tokens, cache_creation_input_tokens, \
-                             cache_read_input_tokens)
+                             cache_read_input_tokens, cancel_reason)
                              SELECT ?1, ?2, source, started_at, ended_at, status, stop_reason, \
                              error_type, detail, input_tokens, output_tokens, \
-                             cache_creation_input_tokens, cache_read_input_tokens
+                             cache_creation_input_tokens, cache_read_input_tokens, cancel_reason
                              FROM turns WHERE id = ?3",
                             rusqlite::params![new, new_id_string, old],
                         )?;
@@ -4061,6 +4061,57 @@ mod tests {
 
     /// A fork keeps the turns its copied messages name, under ids of its own, and a row that
     /// named no turn still names none in the copy, even with the source's turn left open.
+    /// A canceled turn's row says why, the lookup by id answers it for its own session alone, and
+    /// an archive carries the word.
+    #[tokio::test]
+    async fn a_canceled_turn_s_row_says_why() {
+        use super::turns::CancelReason;
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "words").await;
+        let turn = Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(id, turn, "client", "2026-10-17T10:00:00+00:00")
+            .await
+            .expect("open");
+        store
+            .turn_store()
+            .close_turn(
+                turn,
+                &TurnEnding::canceled(TurnUsage::default(), CancelReason::Abandoned),
+            )
+            .await
+            .expect("close");
+        let record = store
+            .turn_store()
+            .get_turn(id, turn)
+            .await
+            .expect("get")
+            .expect("the row");
+        assert_eq!(record.status, Some(TurnStatus::Canceled));
+        assert_eq!(record.reason, Some(CancelReason::Abandoned));
+        assert!(
+            store
+                .turn_store()
+                .get_turn(id, Uuid::new_v4())
+                .await
+                .expect("get")
+                .is_none()
+        );
+        let other = plain_session(&store, "other").await;
+        assert!(
+            store
+                .turn_store()
+                .get_turn(other, turn)
+                .await
+                .expect("get")
+                .is_none(),
+            "a turn is its session's"
+        );
+        let exported = super::export::ExportedTurn::from(record);
+        assert_eq!(exported.cancel_reason.as_deref(), Some("abandoned"));
+    }
+
     #[tokio::test]
     async fn a_fork_copies_the_turns_its_messages_name() {
         use crate::conversation::{Event, Message};
@@ -4104,6 +4155,41 @@ mod tests {
             .map(|(stamp, _)| stamp.turn_id)
             .collect();
         assert_eq!(stamps, vec![None, Some(copied.id), None]);
+    }
+
+    /// A fork copies a turn's ending whole, the reason a canceled one stopped included.
+    #[tokio::test]
+    async fn a_fork_copies_why_a_turn_was_canceled() {
+        use super::turns::CancelReason;
+        let store = Store::for_test().await;
+        let id = plain_session(&store, "words").await;
+        let turn = Uuid::new_v4();
+        store
+            .turn_store()
+            .open_turn(id, turn, "client", "2026-10-17T10:00:00+00:00")
+            .await
+            .expect("open");
+        store
+            .turn_store()
+            .close_turn(
+                turn,
+                &TurnEnding::canceled(TurnUsage::default(), CancelReason::Abandoned),
+            )
+            .await
+            .expect("close");
+        let (forked, _lock) = store
+            .fork_session_locked(id, ForkOverrides::default(), SourceLock::Probe)
+            .await
+            .expect("fork")
+            .expect("the source exists");
+        let copied = store
+            .turn_store()
+            .load_turns(forked.id)
+            .await
+            .expect("turns");
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].status, Some(TurnStatus::Canceled));
+        assert_eq!(copied[0].reason, Some(CancelReason::Abandoned));
     }
 
     /// `revision` is defined by the replay, and the rows have to count the same number: a

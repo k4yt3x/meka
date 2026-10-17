@@ -1,18 +1,20 @@
-//! `POST /v1/sessions/{id}/turn`: submit a turn. Two response shapes:
+//! `POST /v1/sessions/{id}/turn`: submit a turn. Two independent choices shape the response:
 //!
-//! - **Blocking** (default, `stream: false`): `application/json` with the assembled
-//!   [`TurnResponse`] once `Agent::run_turn` returns. The client gets the full transcript, tool
-//!   calls, usage counters, and stop reason in one body.
-//! - **Streaming** (`stream: true`): `text/event-stream` carrying live `turn.started` /
-//!   `assistant_text.delta` / `tool_call.*` / `turn.finished` events (the full taxonomy is in the
-//!   HTTP API docs § SSE events). Lifecycle events are 0-based and monotonic per turn.
+//! - `stream`: how it is encoded. `false` is `application/json`; `true` is `text/event-stream`
+//!   carrying live `turn.started` / `assistant_text.delta` / `tool_call.*` / `turn.finished` events
+//!   (the full taxonomy is in the HTTP API docs § SSE events).
+//! - `detach`: whether the request holds the turn. Held, the response ends with the turn, as the
+//!   assembled [`TurnResponse`] or the terminal event, and the turn is stopped once nobody has been
+//!   listening for the reattach grace. Detached, the request is only the trigger and the turn runs
+//!   for the session like an inbox turn: a JSON response is a `202` at admission with the turn
+//!   record, and an SSE response streams from admission and can be dropped at any time.
 //!
-//! Both modes share an idempotency cache (Stripe-style, `Idempotency-Key` header). The cache
-//! key is `(token_id, session_id, key)` and stores the *blocking* JSON envelope, so a replay of a
-//! previously-streaming request returns the cached blocking body. Mid-turn permission gates
-//! are handled out-of-band via `POST /v1/responses/{request_id}` on a side channel; the
-//! streaming client sees a `permission_required` event and resolves via that endpoint without
-//! interrupting the SSE response.
+//! The idempotency cache (Stripe-style, `Idempotency-Key` header) is keyed by
+//! `(token_id, session_id, key)`. A held JSON turn commits its envelope when the turn ends; a
+//! detached request commits its `202` at admission, in either encoding; a held stream ignores the
+//! key. Mid-turn permission gates are handled out-of-band via `POST /v1/responses/{request_id}`
+//! on a side channel; a client that renders the turn sees a `permission_required` event and
+//! resolves it there without interrupting the SSE response.
 
 use std::{convert::Infallible, sync::Arc};
 
@@ -40,6 +42,7 @@ use crate::{
         TurnGuard,
         http::{
             errors::{ErrorKind, ProblemDetail},
+            feed::Opener,
             handlers::sessions::turn_in_flight_conflict,
             http_frontend::Recorder,
             idempotency::{LookupOutcome, hash_body},
@@ -48,6 +51,7 @@ use crate::{
             state::ServerState,
         },
     },
+    store::turns::CancelReason,
 };
 
 /// Live broadcast capacity for a streaming turn. A consumer that falls this far behind is killed
@@ -63,9 +67,16 @@ pub(crate) struct TurnRequest {
     /// profile to have vision enabled; see [`resolve_turn_images`].
     #[serde(default)]
     pub(crate) images: Vec<ImageInput>,
-    /// `false` (default) → blocking JSON response. `true` → SSE.
+    /// `false` (default) → a JSON response. `true` → SSE.
     #[serde(default)]
     pub(crate) stream: bool,
+    /// `false` (default): this request holds the turn, so the response ends with it and the turn
+    /// is stopped once nobody has been listening for `[serve] stream_reattach_grace`. `true`: the
+    /// request is only the trigger, and the turn runs for the session whether or not anybody
+    /// reads; a JSON response is then a `202` at admission, and an SSE response streams from
+    /// admission and can be dropped without effect on the turn.
+    #[serde(default)]
+    pub(crate) detach: bool,
     /// Per-turn knobs. See [`TurnOptions`]. Omitting the field is the same as `{}`.
     #[serde(default)]
     pub(crate) options: TurnOptions,
@@ -150,7 +161,8 @@ pub(crate) struct UsageView {
     ),
     request_body = TurnRequest,
     responses(
-        (status = 200, description = "Blocking turn response (stream=false) or live SSE stream (stream=true). The application/json schema applies only to blocking mode.", body = TurnResponse),
+        (status = 200, description = "A held turn's response: the assembled turn (stream=false) or its live SSE stream (stream=true). The application/json schema applies only to the former.", body = TurnResponse),
+        (status = 202, description = "A detached request's turn was admitted (detach=true, stream=false): the body is the turn record and `Location` names it under `/turns/{turn_id}`", body = crate::store::turns::TurnRecord),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
@@ -178,8 +190,8 @@ pub(crate) async fn submit_turn(
     let body: TurnRequest = serde_json::from_slice(&raw_body)
         .map_err(|error| ProblemDetail::invalid_body("turn", error))?;
 
-    // Streaming turns can't be replayed (no envelope to cache), so the key is silently ignored
-    // there.
+    // A held stream can't be replayed (no envelope to cache), so the key is silently ignored
+    // there. A detached request's envelope is its 202, in either encoding.
     //
     // `lookup_and_mark` atomically inserts a `Pending` sentinel on miss and hands us a
     // ticket; concurrent same-keyed requests see `InFlight` and 409.  The ticket commits on
@@ -189,7 +201,11 @@ pub(crate) async fn submit_turn(
     // unit of work, so reusing one across two sessions is the natural thing to do, and without the
     // scope the second request replayed the first session's transcript and never ran its turn.
     let idempotency_scope = session_id.to_string();
-    let cacheable_key = if body.stream { None } else { idempotency_key };
+    let cacheable_key = if body.stream && !body.detach {
+        None
+    } else {
+        idempotency_key
+    };
     let idempotency_ticket: Option<crate::host::http::idempotency::IdempotencyTicket> =
         if let Some(key) = cacheable_key.as_deref() {
             match state
@@ -379,27 +395,40 @@ pub(crate) async fn submit_turn(
         .await;
     let input = input.riding(outcomes);
 
+    let opener = Opener {
+        holds: !body.detach,
+        renders: body.stream,
+    };
     if body.stream {
-        // SSE responses are streamed live and aren't a single envelope we can cache.
-        run_streaming_turn(state, entry, conversation, session_id, input, turn_guard)
-    } else {
-        // The ticket travels *into* the turn, and is committed by the task that runs it rather
-        // than here. The turn now outlives a client that hangs up, so leaving the commit on this
-        // side would mean a request timeout drops the ticket, rolls the `Pending` slot back, and
-        // lets the documented retry run a second full turn over work the first one already
-        // committed -- duplicating its tool calls and its provider bill. Committing where the work
-        // finishes is what makes the key mean what the retry-safety table says it means.
-        run_blocking_turn(
+        run_streaming_turn(
             state,
             entry,
             conversation,
             session_id,
             input,
             turn_guard,
+            opener,
             idempotency_ticket,
         )
         .await
-        .map(IntoResponse::into_response)
+    } else {
+        // The ticket travels *into* a held turn, and is committed by the task that runs it rather
+        // than here. The turn outlives a client that hangs up, so leaving the commit on this side
+        // would mean a request timeout drops the ticket, rolls the `Pending` slot back, and lets
+        // the documented retry run a second full turn over work the first one already committed,
+        // duplicating its tool calls and its provider bill. Committing where the work finishes is
+        // what makes the key mean what the retry-safety table says it means.
+        run_json_turn(
+            state,
+            entry,
+            conversation,
+            session_id,
+            input,
+            turn_guard,
+            opener,
+            idempotency_ticket,
+        )
+        .await
     }
 }
 
@@ -459,12 +488,11 @@ async fn hold_before_admission(hold: Option<&std::path::Path>) {
 /// has sends this client to retry into a 409 `turn-in-flight`.
 fn cancel_if_nobody_else_is_reading(
     frontend: &crate::host::http::http_frontend::HttpFrontend,
-    cancellation: &CancellationToken,
+    cancellation: &crate::agent::TurnCancellation,
 ) -> bool {
     let remaining = frontend.subscriber_count();
     if remaining <= 1 {
-        frontend.note_canceled_for_lag();
-        cancellation.cancel();
+        cancellation.cancel(CancelReason::SseLag);
         true
     } else {
         tracing::debug!(
@@ -754,37 +782,71 @@ impl Drop for StreamGuard {
     }
 }
 
-// Eight now that the relay policy travels with the turn. Bundling them into a struct would hide
-// which ones the spawned task actually captures, and taking `ServerState` whole would hand this
-// function the session map and the idempotency cache it has no business touching.
-async fn run_blocking_turn(
+/// The `202 Accepted` a detached request is answered with: the turn as its record, and where to
+/// read it from now on.
+fn accepted_response(session_id: Uuid, record: &crate::store::turns::TurnRecord) -> Response {
+    let location = format!("/v1/sessions/{session_id}/turns/{}", record.id);
+    (
+        StatusCode::ACCEPTED,
+        [(axum::http::header::LOCATION, location)],
+        Json(record),
+    )
+        .into_response()
+}
+
+/// Record a detached request's admission against its `Idempotency-Key`, if it had one. The
+/// admission is the whole of what the request was answered, so a replay answers the same 202
+/// whatever became of the turn: the client chose not to wait, and the outcome is the turn
+/// resource's to report.
+async fn commit_accepted(
+    ticket: Option<crate::host::http::idempotency::IdempotencyTicket>,
+    record: &crate::store::turns::TurnRecord,
+) {
+    let Some(ticket) = ticket else {
+        return;
+    };
+    match serde_json::to_vec(record) {
+        Ok(bytes) => ticket.commit(StatusCode::ACCEPTED.as_u16(), bytes).await,
+        // Dropped uncommitted, so the `Pending` entry goes and a retry re-executes rather than
+        // meeting a permanent 409.
+        Err(error) => tracing::warn!("failed to serialize the turn record for the key: {error}"),
+    }
+}
+
+// Nine now that the opener travels with the turn. Bundling them into a struct would hide which
+// ones the spawned task actually captures, and taking `ServerState` whole would hand this function
+// the session map and the idempotency cache it has no business touching.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every fact the turn runs under is a parameter, so no caller can leave one out"
+)]
+async fn run_json_turn(
     state: ServerState,
     entry: crate::host::http::state::SessionEntry,
     mut conversation: tokio::sync::OwnedMutexGuard<crate::conversation::Conversation>,
     session_id: Uuid,
     input: crate::agent::TurnInput,
     turn_guard: TurnGuard,
+    opener: Opener,
     idempotency_ticket: Option<crate::host::http::idempotency::IdempotencyTicket>,
-) -> Result<Json<TurnResponse>, ProblemDetail> {
+) -> Result<Response, ProblemDetail> {
     // The turn runs on a spawned task, for the same reason the streaming path does it: axum drops
     // a handler's future when the client disconnects, and a turn is not a computation that can be
     // abandoned halfway. The runtime guard comes from `submit_turn`, which takes it as the
     // admission check before anything is written.
     //
-    // A blocking turn outlives most client timeouts -- the default request has no SSE to keep the
-    // connection warm, so a 30s reqwest timeout against a turn that runs a build is the ordinary
-    // case, not an exotic one. Dropped mid-`execute_tool_calls` the future would take the running
-    // command's future with it, orphaning its process group (nothing calls `kill_child_tree` on
-    // the drop path), leave the in-memory conversation holding an assistant `tool_use` whose
-    // result was never appended, and skip `notify_turn_end` so a webhook subscriber never hears
-    // the turn end at all. The DB stays consistent, since `run_turn` commits each round trip as it
-    // completes, but the resident session then sends a dangling `tool_use` on its next turn and
-    // eats a provider rejection to repair it.
+    // Dropped mid-`execute_tool_calls` the future would take the running command's future with
+    // it, orphaning its process group (nothing calls `kill_child_tree` on the drop path), leave
+    // the in-memory conversation holding an assistant `tool_use` whose result was never appended,
+    // and skip `notify_turn_end` so a webhook subscriber never hears the turn end at all. The DB
+    // stays consistent, since `run_turn` commits each round trip as it completes, but the
+    // resident session then sends a dangling `tool_use` on its next turn and eats a provider
+    // rejection to repair it.
     //
-    // Spawning makes a dropped response detach rather than abort, which is exactly what
-    // `SessionResponse::turn_in_flight` already documents for the streaming path: the work
-    // completes, and a client that reconnects reads the reply out of `GET /messages`. It also
-    // turns a panic inside the turn into a clean 500 instead of a reset connection.
+    // Spawning makes a dropped request detach rather than abort. A held turn is then stopped at
+    // its next round boundary once its request has been gone for the grace, the way a held
+    // stream is; a detached one runs on for the session. It also turns a panic inside the turn
+    // into a clean 500 instead of a reset connection.
 
     let _stale = entry.frontend.drain();
 
@@ -793,22 +855,40 @@ async fn run_blocking_turn(
     // running Turn A's token, making Turn A uncancelable. The window between the acquire and this
     // publish is harmless whatever its length: `POST /cancel` reading the old (session-creation or
     // prior-turn) token is a no-op on an already-finished turn.
-    let cancellation = CancellationToken::new();
+    let cancellation = crate::agent::TurnCancellation::new();
     let turn_id = uuid::Uuid::new_v4();
     let input = input.identified(turn_id);
     let published = entry
         .cancel
         .publish_turn(cancellation.clone(), turn_guard.admission, turn_id);
-    // On the feed like every other turn, so a subscriber sees a blocking client's turn as it
-    // runs. Unattended: the client waits on the response, not on a stream, so a feed with no
-    // readers says nothing about whether anyone is still waiting.
-    let (_feed, _ids) = entry.frontend.begin_turn(
+    // On the feed like every other turn, so a subscriber sees the turn as it runs.
+    let (listening, _ids) = entry.frontend.begin_turn(
         turn_id,
         crate::host::http::http_frontend::TurnSource::Client,
-        false,
+        opener,
         state.config.stream_reattach_grace,
         state.config.stream_replay_events,
     );
+    // A detached request is answered with the turn as the feed knows it, and its key is committed
+    // with that answer now: nothing of this request waits on the turn. Taken ahead of the spawn,
+    // so a record that cannot be built refuses the request before the turn has run anything.
+    let (accepted, ticket_for_task) = if opener.holds {
+        (None, idempotency_ticket)
+    } else {
+        let Some(record) = entry.frontend.in_flight_turn() else {
+            // The feed closed under the turn, which only a session leaving the process does; the
+            // turn it announced is closed on the feed again, so no reader waits on a terminal.
+            entry.frontend.end_turn();
+            return Err(ProblemDetail::new(
+                ErrorKind::Internal,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the turn was not on the session's feed on admission",
+            )
+            .with("session_id", session_id.to_string()));
+        };
+        commit_accepted(idempotency_ticket, &record).await;
+        (Some(record), None)
+    };
 
     let join = tokio::spawn(async move {
         let _turn_guard = turn_guard;
@@ -816,20 +896,15 @@ async fn run_blocking_turn(
         let _stream_guard = StreamGuard::new(Arc::clone(&entry.frontend));
         let outcome = entry
             .agent
-            .run_turn(&mut conversation, input, cancellation)
+            .run_turn(&mut conversation, input, cancellation.clone())
             .await;
 
         let recorder = entry.frontend.drain();
         entry.touch();
         // The same terminal a streaming turn records, for the same readers.
-        let cancel_reason = if state.shutdown.is_cancelled() {
-            CancelReason::ServerShutdown
-        } else {
-            CancelReason::Client
-        };
         let (event_type, data) = terminal_event_parts(
             Ok(outcome.as_ref()),
-            cancel_reason,
+            cancellation.reason().unwrap_or(CancelReason::Client),
             usage_from(&recorder),
             turn_id,
             session_id,
@@ -839,10 +914,10 @@ async fn run_blocking_turn(
         );
         entry.frontend.record_terminal(event_type, data);
 
-        // Announced from the blocking path too, and from inside the task so it still fires when
-        // the client that asked has gone. The requester has its answer in the response body, but
-        // it is not necessarily the only party interested in the session, and a webhook subscriber
-        // should not have to care which transport a turn happened to use.
+        // Announced from inside the task so it still fires when the client that asked has gone.
+        // The requester has its answer in the response body, but it is not necessarily the only
+        // party interested in the session, and a webhook subscriber should not have to care which
+        // transport a turn happened to use.
         let response = match outcome {
             Ok(turn_outcome) => {
                 notify_turn_end(
@@ -876,14 +951,21 @@ async fn run_blocking_turn(
             }
         };
         // Inside the task, so a client that hung up still records its outcome against the key.
-        commit_idempotency(idempotency_ticket, session_id, &response).await;
+        commit_idempotency(ticket_for_task, session_id, &response).await;
         response
     });
 
+    if let Some(record) = accepted {
+        return Ok(accepted_response(session_id, &record));
+    }
+    // The receiver is this request's presence on the feed for as long as it waits: axum drops this
+    // future when the client hangs up, the receiver with it, and `client_disconnected` then counts
+    // the turn's listeners down to whoever else is reading.
+    let _listening = listening;
     match join.await {
-        Ok(result) => result,
+        Ok(result) => result.map(IntoResponse::into_response),
         Err(panic) => {
-            tracing::error!("blocking turn task panicked: {panic:?}");
+            tracing::error!("turn task panicked: {panic:?}");
             Err(ProblemDetail::new(
                 ErrorKind::Internal,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -896,14 +978,21 @@ async fn run_blocking_turn(
 
 /// Run a turn with `stream: true`. Returns an SSE response that emits events live as the agent
 /// produces them, plus a terminal `turn.finished` (or `turn.failed` / `turn.canceled`) event
-/// before closing.
-fn run_streaming_turn(
+/// before closing. Held, the response owns the turn; detached, it is a reader the turn does not
+/// wait for, and its key is committed with the admission.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every fact the turn runs under is a parameter, so no caller can leave one out"
+)]
+async fn run_streaming_turn(
     state: ServerState,
     entry: crate::host::http::state::SessionEntry,
     owned_conversation: tokio::sync::OwnedMutexGuard<crate::conversation::Conversation>,
     session_id: Uuid,
     input: crate::agent::TurnInput,
     turn_guard: TurnGuard,
+    opener: Opener,
+    idempotency_ticket: Option<crate::host::http::idempotency::IdempotencyTicket>,
 ) -> Result<Response, ProblemDetail> {
     // Subscribe to the broadcast BEFORE installing: install_stream returns a receiver that
     // captures the first event onwards.
@@ -912,10 +1001,10 @@ fn run_streaming_turn(
     // re-attaching client reads the id back to confirm it rejoined the turn it thought it had.
     let turn_id = uuid::Uuid::new_v4();
     let input = input.identified(turn_id);
-    // Publish after the lock succeeds, same rationale as `run_blocking_turn`, and before the
+    // Publish after the lock succeeds, same rationale as `run_json_turn`, and before the
     // stream announces the id: a client that answers `turn.started` with a cancel naming it
     // must find the turn there to cancel.
-    let cancellation = CancellationToken::new();
+    let cancellation = crate::agent::TurnCancellation::new();
     let published = entry
         .cancel
         .publish_turn(cancellation.clone(), turn_guard.admission, turn_id);
@@ -924,7 +1013,22 @@ fn run_streaming_turn(
         state.config.stream_replay_events,
         state.config.stream_reattach_grace,
         turn_id,
+        opener,
     );
+    // The response renders the turn, and answers its prompts when the session said its
+    // streaming client does: an attendee, as a feed reader that asked to be is one.
+    let attendance = if entry.capabilities.supports_permission_prompts {
+        entry.frontend.attend()
+    } else {
+        None
+    };
+    // A detached request is answered with its admission whatever the encoding: the key, if any,
+    // is committed with the record now, since nothing of this request waits on the turn.
+    if !opener.holds
+        && let Some(record) = entry.frontend.in_flight_turn()
+    {
+        commit_accepted(idempotency_ticket, &record).await;
+    }
     // Where the stream stands before it has received anything: just ahead of the turn's own
     // `turn.started`, which was published after the receiver subscribed. Read now, while the live
     // turn is certainly this one, rather than at the stream's first poll.
@@ -935,7 +1039,6 @@ fn run_streaming_turn(
 
     let entry_for_task = entry.clone();
     let cancel_for_task = cancellation.clone();
-    let shutdown_for_task = state.shutdown.clone();
     let relay_for_task = state.config.relay_provider_errors;
     let store_for_task = state.shared.store.clone();
     let webhooks_for_task = state.webhooks;
@@ -953,7 +1056,7 @@ fn run_streaming_turn(
         let _stream_guard = StreamGuard::new(Arc::clone(&entry_for_task.frontend));
         let outcome = entry_for_task
             .agent
-            .run_turn(&mut conversation, input, cancel_for_task)
+            .run_turn(&mut conversation, input, cancel_for_task.clone())
             .await;
         entry_for_task.touch();
         let recorder = entry_for_task.frontend.drain();
@@ -961,16 +1064,9 @@ fn run_streaming_turn(
         // In the case re-attach exists for, the client's connection has already dropped and axum
         // has discarded that stream, so a terminal event computed there would be computed for
         // nobody and a reconnecting client would wait forever for an end that never comes.
-        let cancel_reason = if shutdown_for_task.is_cancelled() {
-            CancelReason::ServerShutdown
-        } else if entry_for_task.frontend.canceled_for_lag() {
-            CancelReason::SseLag
-        } else {
-            CancelReason::Client
-        };
         let (event_type, data) = terminal_event_parts(
             Ok(outcome.as_ref()),
-            cancel_reason,
+            cancel_for_task.reason().unwrap_or(CancelReason::Client),
             usage_from(&recorder),
             turn_id,
             session_id,
@@ -983,10 +1079,9 @@ fn run_streaming_turn(
     });
 
     // Build the SSE stream. Emits the per-FrontendEvent events from the broadcast, then the
-    // terminal event the spawned task recorded when the join handle resolves. The loop no longer
-    // watches either token itself: the drain fires every session's cancellation token directly
-    // (`host::http::drain_active_sessions`), and the task reads the shutdown token to decide
-    // whether its terminal says `server_shutdown` or `client`.
+    // terminal event the spawned task recorded when the join handle resolves. The loop watches no
+    // token itself: the drain fires every session's stop signal, and the signal carries the reason
+    // its terminal reports.
     let stream = build_sse_stream(
         turn_id,
         session_id,
@@ -996,6 +1091,8 @@ fn run_streaming_turn(
         cancellation,
         ids,
         Arc::clone(&entry.frontend),
+        opener.holds,
+        attendance,
     );
     let sse = Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -1027,11 +1124,15 @@ fn build_sse_stream(
     mut receiver: tokio::sync::broadcast::Receiver<crate::host::http::sse::SseEvent>,
     joined_after: Option<u64>,
     join: tokio::task::JoinHandle<crate::host::http::sse::SseEvent>,
-    cancellation: CancellationToken,
+    cancellation: crate::agent::TurnCancellation,
     ids: Arc<crate::host::http::sse::EventIdGenerator>,
     frontend: Arc<crate::host::http::http_frontend::HttpFrontend>,
+    holds: bool,
+    attendance: Option<crate::host::http::feed::Attendance>,
 ) -> impl Stream<Item = Result<Event, Infallible>> + Send {
     async_stream::stream! {
+        // Held for the life of the response: the client attends until it hangs up.
+        let _attendance = attendance;
         // Per spec §SSE production-concerns: hint clients to reconnect after 3s on disconnect.
         // Must be the first thing on the wire (before any `id:`/`event:` lines). The `retry:`
         // field has no `id:` by SSE spec.
@@ -1059,10 +1160,11 @@ fn build_sse_stream(
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                             // Stop burning provider tokens for a consumer that has fallen behind,
-                            // but only when nobody else is still reading. For one that is, the
-                            // turn goes on and this reader is caught up from the ring, the way a
-                            // reconnect would be, so the lag is a pause and not a hole.
-                            if cancel_if_nobody_else_is_reading(&frontend, &cancellation) {
+                            // but only when the turn is run for it and nobody else is still
+                            // reading. Otherwise the turn goes on and this reader is caught up
+                            // from the ring, the way a reconnect would be, so the lag is a pause
+                            // and not a hole.
+                            if holds && cancel_if_nobody_else_is_reading(&frontend, &cancellation) {
                                 tracing::warn!(
                                     "SSE consumer lagged, skipped {skipped} events; terminating stream"
                                 );
@@ -1123,28 +1225,6 @@ fn build_sse_stream(
     }
 }
 
-/// Why a turn that ended `Interrupted` was stopped, for the recorded `turn.canceled` event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CancelReason {
-    /// `POST /cancel`.
-    Client,
-    /// The graceful drain.
-    ServerShutdown,
-    /// The only SSE consumer fell behind and the turn was stopped for it. Recorded as `client`, a
-    /// re-attaching reader would conclude a human had stopped it.
-    SseLag,
-}
-
-impl CancelReason {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Client => "client",
-            Self::ServerShutdown => "server_shutdown",
-            Self::SseLag => "sse_lag",
-        }
-    }
-}
-
 /// Resolve a finished turn into the `(event type, envelope)` of its terminal SSE event.
 ///
 /// Returns the parts rather than a rendered `Event` because the terminal has to be *stored* as
@@ -1180,12 +1260,7 @@ pub(crate) fn terminal_event_parts(
         Ok(Err(crate::error::MekaError::Interrupted)) => {
             // Every stop surfaces as `Interrupted` by the time the agent loop unwinds; who asked
             // for it is carried alongside.
-            canceled_parts(
-                cancel_reason.as_str(),
-                message_withdrawn,
-                turn_id,
-                session_id,
-            )
+            canceled_parts(cancel_reason.name(), message_withdrawn, turn_id, session_id)
         }
         Ok(Err(error)) => {
             let instance = format!("/v1/sessions/{session_id}/turn");
@@ -1662,9 +1737,9 @@ pub(crate) async fn cancel_turn(
     if let Some(entry) = entry {
         match turn_id {
             None => {
-                entry.cancel.cancel();
+                entry.cancel.cancel(CancelReason::Client);
             }
-            Some(turn_id) => match entry.cancel.cancel_turn(turn_id) {
+            Some(turn_id) => match entry.cancel.cancel_turn(turn_id, CancelReason::Client) {
                 crate::host::CancelOutcome::Canceled | crate::host::CancelOutcome::NoTurn => {}
                 crate::host::CancelOutcome::Mismatch => {
                     let mut problem = ProblemDetail::new(
@@ -2100,12 +2175,16 @@ mod tests {
             16,
             std::time::Duration::from_secs(1),
             Uuid::from_u128(0xfeed),
+            Opener {
+                holds: true,
+                renders: true,
+            },
         );
         let _reattached = frontend
             .attach_stream(None, false)
             .expect("a live stream accepts a re-attach");
 
-        let cancellation = CancellationToken::new();
+        let cancellation = crate::agent::TurnCancellation::new();
         let canceled = cancel_if_nobody_else_is_reading(&frontend, &cancellation);
         assert!(
             !cancellation.is_cancelled(),
@@ -2127,9 +2206,13 @@ mod tests {
             16,
             std::time::Duration::from_secs(1),
             Uuid::from_u128(0xfeed),
+            Opener {
+                holds: true,
+                renders: true,
+            },
         );
 
-        let cancellation = CancellationToken::new();
+        let cancellation = crate::agent::TurnCancellation::new();
         let canceled = cancel_if_nobody_else_is_reading(&frontend, &cancellation);
         assert!(
             cancellation.is_cancelled(),

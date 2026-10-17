@@ -167,14 +167,35 @@ pub(crate) struct SessionFeed {
     pub(super) server: Option<SharedServerFeed>,
 }
 
+/// What the request that opened a turn is to it. A turn a driver opened, a fire, the inbox, an
+/// outcome, a compaction or a parent's spawn, has no request: nothing holds it and nothing
+/// renders it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Opener {
+    /// The request's response ends with the turn, and the turn is stopped once nobody has been
+    /// listening for the grace: nobody reading means nobody waiting.
+    pub(crate) holds: bool,
+    /// The request's own response shows the turn's events, reasoning deltas included.
+    pub(crate) renders: bool,
+}
+
+impl Opener {
+    /// A turn the server opened for the session, which runs whether or not anybody reads.
+    pub(crate) const DRIVER: Self = Self {
+        holds: false,
+        renders: false,
+    };
+}
+
 /// What the feed knows about the turn in flight.
 pub(super) struct LiveTurn {
     pub(super) turn_id: uuid::Uuid,
     /// Who started it, for the `turn.started` a client attaching mid-turn is given.
     pub(super) source: TurnSource,
-    /// Whether a streaming client opened this turn, which is the only case where nobody reading
-    /// means nobody waiting: a turn a driver started runs for the session, not for a connection.
-    pub(super) attended: bool,
+    /// When it began, as its `turn.started` said: what a record of the turn answers before the
+    /// turn has written its row.
+    pub(super) started_at: String,
+    pub(super) opener: Opener,
     pub(super) disconnected_since: Option<std::time::Instant>,
     pub(super) reattach_grace: Duration,
     /// The id of its `turn.started`, the position a stream opened on the turn stands at before

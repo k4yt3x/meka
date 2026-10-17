@@ -69,9 +69,6 @@ pub(crate) struct HttpFrontend {
     /// The `allow_always` and `deny_always` answers given this session, which short-circuit
     /// `request_permission` without re-emitting the SSE pause event.
     sticky: StickyApprovals,
-    /// Set when the turn was canceled because its only SSE consumer fell behind, so the recorded
-    /// terminal says so rather than blaming a client that never asked.
-    canceled_for_lag: std::sync::atomic::AtomicBool,
     /// Output a running command has produced that the feed has not been sent yet, per tool call.
     /// See [`Self::wire_events`].
     live_output: Mutex<HashMap<String, crate::host::LiveOutput>>,
@@ -114,6 +111,14 @@ pub(crate) struct SessionCapabilities {
     /// Defaults to `true`, so a client that declares nothing and an imported `capabilities_json`
     /// that omits the flag both park rather than refuse without asking.
     pub(crate) supports_permission_prompts: bool,
+    /// When `true`, a prompt raised in a turn no request holds parks whether or not anyone is
+    /// attending, and closes only on an answer, the turn's cancellation or its expiry: the
+    /// session's client comes and goes and answers what it finds parked on return. A held turn
+    /// keeps the grace rule, since absence stops it anyway.
+    ///
+    /// Defaults to `false`: a session nobody declared this for refuses a gated call with nobody
+    /// attending rather than holding the session for the prompt's lifetime.
+    pub(crate) answers_prompts_on_return: bool,
 }
 
 impl Default for SessionCapabilities {
@@ -121,12 +126,13 @@ impl Default for SessionCapabilities {
         Self {
             supports_reasoning_stream: false,
             supports_permission_prompts: true,
+            answers_prompts_on_return: false,
         }
     }
 }
 
 use super::feed::{
-    Attendance, CaughtUp, FEED_BROADCAST_CAPACITY, LiveTurn, SessionFeed, StreamAttachment,
+    Attendance, CaughtUp, FEED_BROADCAST_CAPACITY, LiveTurn, Opener, SessionFeed, StreamAttachment,
 };
 pub(crate) use crate::host::scheduler::TurnSource;
 
@@ -209,22 +215,9 @@ impl HttpFrontend {
             pending: Arc::new(Mutex::new(HashMap::new())),
             capabilities,
             sticky: StickyApprovals::default(),
-            canceled_for_lag: std::sync::atomic::AtomicBool::new(false),
             live_output: Mutex::new(HashMap::new()),
             ids: Arc::new(EventIdGenerator::default()),
         }
-    }
-
-    /// Record that this turn is being canceled for a lagging consumer, before the token fires.
-    pub(crate) fn note_canceled_for_lag(&self) {
-        self.canceled_for_lag
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Whether the last cancel was for a lagging consumer. Cleared when a new turn begins.
-    pub(crate) fn canceled_for_lag(&self) -> bool {
-        self.canceled_for_lag
-            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     #[cfg(test)]
@@ -232,18 +225,18 @@ impl HttpFrontend {
         self.sticky.remembered(tool_name) == Some(PermissionOutcome::Allow)
     }
 
-    /// True while a streaming client's turn is in flight. A feed subscriber that did not attend is
-    /// not one: it may be a bridge or a UI that shows no prompts, which is what
-    /// [`Self::prompt_answerable`] asks about.
-    fn is_streaming(&self) -> bool {
+    /// What the request that opened the live turn is to it. With no turn in flight, or one a
+    /// driver opened, nothing holds it and nothing renders it.
+    fn opener(&self) -> Opener {
         let guard = crate::sync::lock(&self.feed);
         guard
             .as_ref()
             .and_then(|feed| feed.turn.as_ref())
-            .is_some_and(|turn| turn.attended)
+            .map_or(Opener::DRIVER, |turn| turn.opener)
     }
 
-    /// How many feed readers are attending the session right now.
+    /// How many readers are attending the session right now: the SSE response of a `POST /turn`
+    /// on a session that said it shows prompts, and every feed reader that said so itself.
     fn attending(&self) -> usize {
         let guard = crate::sync::lock(&self.feed);
         guard.as_ref().map_or(0, |feed| {
@@ -251,31 +244,27 @@ impl HttpFrontend {
         })
     }
 
-    /// Whether the turn in flight has a streaming client that can answer a prompt: one opened it
-    /// over SSE, and the session said such a client shows prompts (`supports_permission_prompts`).
-    /// The one place the flag is read, so parking and giving up agree about whom they are waiting
-    /// on.
-    fn streaming_client_answers(&self) -> bool {
-        self.is_streaming() && self.capabilities.supports_permission_prompts
+    /// Whether a prompt parked now waits for a client to come back: the session said its client
+    /// answers prompts on return, and no request holds the turn. A held turn is stopped for
+    /// absence anyway, and a prompt kept past that would park the turn for the whole timeout on
+    /// a client that is not coming back to it.
+    fn waits_for_return(&self) -> bool {
+        self.capabilities.answers_prompts_on_return && !self.opener().holds
     }
 
-    /// Whether anyone could answer a prompt parked now: the streaming client, if it can, or a feed
-    /// reader attending the session, which is that declaration made per connection and so needs
-    /// no session-level one. Decides park-or-deny; [`Self::prompt_abandoned`] decides, polled, when
-    /// a parked prompt is given up on.
+    /// Whether anyone will answer a prompt parked now: a reader attending the session, or the
+    /// client the session promised will return. Decides park-or-deny; [`Self::prompt_abandoned`]
+    /// decides, polled, when a parked prompt is given up on.
     fn prompt_answerable(&self) -> bool {
-        self.streaming_client_answers() || self.attending() > 0
+        self.attending() > 0 || self.waits_for_return()
     }
 
-    /// Whether everyone who could have answered a parked prompt has gone: no attendee is left and
-    /// none has been for the reattach grace, and the streaming client either cannot answer or has
-    /// been away past that same grace. Asked separately from [`Self::prompt_answerable`] because
-    /// a reader inside its grace is neither: it cannot answer yet, and the prompt has to wait for
-    /// it, as it always has. A client that declared it shows no prompts is not waited on at all:
-    /// a prompt parked for an attendee that has since left would otherwise sit out the whole
-    /// timeout on a client that never looks.
+    /// Whether everyone who could have answered a parked prompt has gone, on a session that does
+    /// not wait for them to return: no attendee is left and none has been for the reattach grace.
+    /// Asked separately from [`Self::prompt_answerable`] because a reader inside its grace is
+    /// neither: it cannot answer yet, and the prompt has to wait for it, as it always has.
     fn prompt_abandoned(&self) -> bool {
-        self.attenders_gone() && (!self.streaming_client_answers() || self.client_disconnected())
+        self.attenders_gone() && !self.waits_for_return()
     }
 
     /// Whether no attending reader is left, and none has been for the feed's reattach grace,
@@ -394,19 +383,17 @@ impl HttpFrontend {
     /// the subscription sees first. The receiver is taken before the announcement so a streaming
     /// handler misses nothing between the two.
     ///
-    /// `attended` is whether a streaming client opened the turn; only then does
-    /// [`Self::client_disconnected`] apply. Installs a feed if none is, since a turn on a
-    /// frontend nobody installed one on would otherwise publish nowhere.
+    /// `opener` is what the request that opened the turn is to it; only a held turn is subject to
+    /// [`Self::client_disconnected`]. Installs a feed if none is, since a turn on a frontend
+    /// nobody installed one on would otherwise publish nowhere.
     pub(crate) fn begin_turn(
         &self,
         turn_id: uuid::Uuid,
         source: TurnSource,
-        attended: bool,
+        opener: Opener,
         reattach_grace: Duration,
         replay_capacity: usize,
     ) -> (broadcast::Receiver<SseEvent>, Arc<EventIdGenerator>) {
-        self.canceled_for_lag
-            .store(false, std::sync::atomic::Ordering::SeqCst);
         let mut guard = crate::sync::lock(&self.feed);
         // A frontend nobody installed a feed on gets one here rather than publishing nowhere;
         // every resident session's was installed with its session id when it was loaded.
@@ -421,15 +408,17 @@ impl HttpFrontend {
                 reattach_grace,
             )
         });
+        let started_at = chrono::Utc::now().to_rfc3339();
         let mut data = serde_json::json!({
             "turn_id": turn_id.to_string(),
-            "started_at": chrono::Utc::now().to_rfc3339(),
+            "started_at": started_at,
         });
         source.describe(&mut data);
         feed.turn = Some(LiveTurn {
             turn_id,
             source,
-            attended,
+            started_at,
+            opener,
             disconnected_since: None,
             reattach_grace,
             started_id: None,
@@ -451,6 +440,7 @@ impl HttpFrontend {
         replay_capacity: usize,
         reattach_grace: Duration,
         turn_id: uuid::Uuid,
+        opener: Opener,
     ) -> (broadcast::Receiver<SseEvent>, Arc<EventIdGenerator>) {
         self.install_feed(
             uuid::Uuid::nil(),
@@ -459,10 +449,51 @@ impl HttpFrontend {
         self.begin_turn(
             turn_id,
             TurnSource::Client,
-            true,
+            opener,
             reattach_grace,
             replay_capacity,
         )
+    }
+
+    /// The live turn as the record `GET /turns` would show, for the window between its admission
+    /// and the row the turn writes for itself: what a detached request's 202 carries, and what
+    /// its `Location` answers until the row exists. `None` between turns.
+    pub(crate) fn in_flight_turn(&self) -> Option<crate::store::turns::TurnRecord> {
+        let guard = crate::sync::lock(&self.feed);
+        let record = guard
+            .as_ref()
+            .and_then(|feed| feed.turn.as_ref())
+            .map(|turn| crate::store::turns::TurnRecord {
+                id: turn.turn_id,
+                source: turn.source.name().to_string(),
+                started_at: turn.started_at.clone(),
+                ended_at: None,
+                status: None,
+                stop_reason: None,
+                error: None,
+                reason: None,
+                usage: crate::store::turns::TurnUsage::default(),
+            });
+        drop(guard);
+        record
+    }
+
+    /// Count a reader in as one that answers approval prompts, for as long as the guard lives.
+    /// `None` when no feed is installed.
+    pub(crate) fn attend(&self) -> Option<Attendance> {
+        let guard = crate::sync::lock(&self.feed);
+        guard.as_ref().map(Self::attendance_of)
+    }
+
+    fn attendance_of(feed: &SessionFeed) -> Attendance {
+        feed.attending
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // A reader back inside the window is a reconnect, not a new departure to wait on.
+        *crate::sync::lock(&feed.unattended_since) = None;
+        Attendance {
+            attending: Arc::clone(&feed.attending),
+            unattended_since: Arc::clone(&feed.unattended_since),
+        }
     }
 
     /// Record and broadcast a turn's terminal event. Kept as the feed's terminal for a client
@@ -580,16 +611,7 @@ impl HttpFrontend {
             Some(_) => None,
             None => feed.terminal.as_ref().map(|(_, event)| event.clone()),
         };
-        let attendance = attend.then(|| {
-            feed.attending
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            // A reader back inside the window is a reconnect, not a new departure to wait on.
-            *crate::sync::lock(&feed.unattended_since) = None;
-            Attendance {
-                attending: Arc::clone(&feed.attending),
-                unattended_since: Arc::clone(&feed.unattended_since),
-            }
-        });
+        let attendance = attend.then(|| Self::attendance_of(feed));
         let attachment = StreamAttachment {
             turn_id,
             turn_source,
@@ -810,12 +832,13 @@ impl Frontend for HttpFrontend {
 
         if !self.prompt_answerable() {
             // A streaming client that declared it shows no prompts, or nobody at all.
-            let reason = if self.is_streaming() {
+            let reason = if self.opener().renders && !self.capabilities.supports_permission_prompts
+            {
                 "the session declared supports_permission_prompts=false; raise its permission \
                  with `PATCH /v1/sessions/{id}`, or attend the feed with `attend=true`"
             } else {
-                "no client is attending this turn; use `stream: true` or open the feed with \
-                 `attend=true`"
+                "no client is attending this turn; open the feed with `attend=true`, or create \
+                 the session with `answers_prompts_on_return: true`"
             };
             self.record_warn_notice(Notice::approval_refused_without_asking_because(
                 &request.tool_name,
@@ -955,13 +978,14 @@ impl Frontend for HttpFrontend {
     /// one re-emits a whole message only once the provider call has returned `Ok`, past its own
     /// retry loop.
     ///
-    /// The second half is [`Self::is_streaming`] or an attending feed reader: both declared that
-    /// they render what they are sent. A subscriber that did not attend does not count, because
-    /// the feed is always there and a bridge holding it open may well be reading whole blocks off
-    /// `GET /messages` afterwards; costing every turn its retry for that reader would be paying
-    /// for a duplicate it never sees.
+    /// The second half is a response that renders the turn or an attending feed reader: both
+    /// declared that they render what they are sent. A subscriber that did not attend does not
+    /// count, because the feed is always there and a bridge holding it open may well be reading
+    /// whole blocks off `GET /messages` afterwards; costing every turn its retry for that reader
+    /// would be paying for a duplicate it never sees.
     fn retains_reasoning(&self) -> bool {
-        self.capabilities.supports_reasoning_stream && (self.is_streaming() || self.attending() > 0)
+        self.capabilities.supports_reasoning_stream
+            && (self.opener().renders || self.attending() > 0)
     }
 
     /// SSE-mode disconnect detection, with a reconnect grace period.
@@ -973,10 +997,10 @@ impl Frontend for HttpFrontend {
     /// are the same observation until the window expires. A reconnect through
     /// [`Self::attach_stream`] clears the stamp on its next poll.
     ///
-    /// Only an attended turn can be disconnected from. A blocking turn has no transport-level
-    /// disconnect to observe until the response writes complete, and a turn a driver started runs
-    /// for the session whether or not anybody is reading, so the trait default `false` stands for
-    /// both.
+    /// Only a held turn can be disconnected from: a turn a driver started, or one a detached
+    /// request opened, runs for the session whether or not anybody is reading, so the trait
+    /// default `false` stands for it. A held blocking request counts as a listener through the
+    /// receiver its handler holds for as long as it waits.
     fn client_disconnected(&self) -> bool {
         let mut guard = crate::sync::lock(&self.feed);
         let Some(feed) = guard.as_mut() else {
@@ -986,7 +1010,7 @@ impl Frontend for HttpFrontend {
         let Some(turn) = feed.turn.as_mut() else {
             return false;
         };
-        if !turn.attended {
+        if !turn.opener.holds {
             return false;
         }
         if receivers > 0 {
@@ -1079,8 +1103,11 @@ pub(crate) fn subagent_terminal(
             (SseEventType::TurnFailed, data)
         }
         TurnStatus::Canceled => {
-            // A worker stops when its parent's turn stops, whoever stopped that.
-            data["reason"] = serde_json::Value::from("parent");
+            // A worker stops when its parent's turn stops, whoever stopped that; the row says so.
+            let reason = ending
+                .reason
+                .unwrap_or(crate::store::turns::CancelReason::Parent);
+            data["reason"] = serde_json::Value::from(reason.name());
             (SseEventType::TurnCanceled, data)
         }
     }
@@ -1097,7 +1124,7 @@ impl Frontend for SubagentFeed {
                         parent_id: self.parent_id,
                         tool_call_id: self.tool_call_id.clone(),
                     },
-                    false,
+                    Opener::DRIVER,
                     self.reattach_grace,
                     self.replay_capacity,
                 );
@@ -1219,6 +1246,10 @@ mod tests {
             16,
             Duration::from_secs(1),
             uuid::Uuid::from_u128(0xfeed),
+            Opener {
+                holds: true,
+                renders: true,
+            },
         );
         assert_eq!(frontend.subscriber_count(), 1, "the turn's own consumer");
 
@@ -1257,7 +1288,7 @@ mod tests {
             TurnSource::Inbox {
                 item_ids: Vec::new(),
             },
-            false,
+            Opener::DRIVER,
             Duration::from_secs(30),
             16,
         );
@@ -1315,7 +1346,7 @@ mod tests {
             TurnSource::Inbox {
                 item_ids: Vec::new(),
             },
-            false,
+            Opener::DRIVER,
             Duration::from_secs(30),
             16,
         );
@@ -1362,7 +1393,7 @@ mod tests {
         let (mut receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0x6),
             TurnSource::Client,
-            false,
+            Opener::DRIVER,
             Duration::from_secs(30),
             16,
         );
@@ -1420,7 +1451,10 @@ mod tests {
         }));
         // The streaming client's own turn, with its stream held open for the whole test.
         let (_client, _ids) =
-            frontend.install_stream(16, 16, Duration::ZERO, uuid::Uuid::from_u128(0x7));
+            frontend.install_stream(16, 16, Duration::ZERO, uuid::Uuid::from_u128(0x7), Opener {
+                holds: true,
+                renders: true,
+            });
         let attendee = frontend.attach_stream(None, true).expect("feed installed");
         let asked = tokio::spawn({
             let frontend = Arc::clone(&frontend);
@@ -1445,7 +1479,7 @@ mod tests {
         let (_receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0x2),
             TurnSource::Background,
-            false,
+            Opener::DRIVER,
             Duration::ZERO,
             16,
         );
@@ -1476,7 +1510,7 @@ mod tests {
         let (_receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0x2),
             TurnSource::Background,
-            false,
+            Opener::DRIVER,
             Duration::from_secs(30),
             16,
         );
@@ -1605,8 +1639,16 @@ mod tests {
             children: Some(Arc::clone(&children)),
             ..FeedWiring::bare(16, 16, Duration::from_secs(30))
         });
-        let (_client, _ids) =
-            root.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::from_u128(0x7));
+        let (_client, _ids) = root.install_stream(
+            16,
+            16,
+            Duration::from_secs(30),
+            uuid::Uuid::from_u128(0x7),
+            Opener {
+                holds: true,
+                renders: true,
+            },
+        );
         let child = uuid::Uuid::from_u128(0x2);
         let root_as_frontend: Arc<dyn Frontend> = Arc::clone(&root) as Arc<dyn Frontend>;
         let _child_frontend = root.for_subagent(root_as_frontend, child, Some("tu_1".into()));
@@ -1614,7 +1656,7 @@ mod tests {
         let (_receiver, _ids) = root.begin_turn(
             uuid::Uuid::from_u128(0x8),
             TurnSource::Client,
-            false,
+            Opener::DRIVER,
             Duration::from_secs(30),
             16,
         );
@@ -1656,7 +1698,7 @@ mod tests {
         let (_receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0x3),
             TurnSource::Background,
-            false,
+            Opener::DRIVER,
             Duration::from_secs(30),
             16,
         );
@@ -1684,7 +1726,7 @@ mod tests {
         let (mut receiver, _ids) = frontend.begin_turn(
             uuid::Uuid::from_u128(0x4),
             TurnSource::Client,
-            false,
+            Opener::DRIVER,
             Duration::from_secs(30),
             16,
         );
@@ -1788,7 +1830,7 @@ mod tests {
                     FrontendEvent::Notice(notice)
                         if notice.text.contains("shell_execute")
                             && notice.text.contains("refused without asking")
-                            && notice.text.contains("`stream: true`")
+                            && notice.text.contains("`attend=true`")
                 )
             })
             .count();
@@ -1809,7 +1851,10 @@ mod tests {
             ..Default::default()
         }));
         let (_receiver, _ids) =
-            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
+            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil(), Opener {
+                holds: true,
+                renders: true,
+            });
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
@@ -1906,7 +1951,11 @@ mod tests {
         let frontend = HttpFrontend::new();
         // Install a stream so request_permission parks instead of blocking-mode short-circuit.
         let (_receiver, _ids) =
-            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
+            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil(), Opener {
+                holds: true,
+                renders: true,
+            });
+        let _attendance = frontend.attend();
 
         let pending_handle = {
             let frontend_clone = Arc::new(frontend);
@@ -1949,7 +1998,10 @@ mod tests {
     async fn thinking_delta_is_filtered_when_capability_is_off() {
         let frontend = HttpFrontend::with_capabilities(SessionCapabilities::default());
         let (mut receiver, _ids) =
-            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
+            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil(), Opener {
+                holds: true,
+                renders: true,
+            });
         // The delta is what carries reasoning onto the wire, so it is what the capability has to
         // gate. Emitting only the block would leave this passing with the filter deleted, since
         // `sse::translate` drops the block whatever the capability says.
@@ -1994,7 +2046,10 @@ mod tests {
             ..Default::default()
         });
         let (mut receiver, _ids) =
-            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
+            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil(), Opener {
+                holds: true,
+                renders: true,
+            });
         frontend
             .emit(FrontendEvent::ThinkingDelta("musing".into()))
             .await;
@@ -2015,7 +2070,12 @@ mod tests {
     #[tokio::test]
     async fn a_reply_that_arrives_too_late_grants_nothing() {
         let frontend = Arc::new(HttpFrontend::new());
-        let (_receiver, _ids) = frontend.install_stream(16, 16, Duration::ZERO, uuid::Uuid::nil());
+        let (_receiver, _ids) =
+            frontend.install_stream(16, 16, Duration::ZERO, uuid::Uuid::nil(), Opener {
+                holds: true,
+                renders: true,
+            });
+        let _attendance = frontend.attend();
 
         let frontend_inner = Arc::clone(&frontend);
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -2075,7 +2135,11 @@ mod tests {
     async fn a_parked_permission_event_carries_the_arguments_and_the_shared_timeout() {
         let frontend = Arc::new(HttpFrontend::new());
         let (mut receiver, _ids) =
-            frontend.install_stream(16, 16, Duration::ZERO, uuid::Uuid::nil());
+            frontend.install_stream(16, 16, Duration::ZERO, uuid::Uuid::nil(), Opener {
+                holds: true,
+                renders: true,
+            });
+        let _attendance = frontend.attend();
         let cancellation = tokio_util::sync::CancellationToken::new();
         let join = tokio::spawn({
             let frontend = Arc::clone(&frontend);
@@ -2126,8 +2190,14 @@ mod tests {
     #[tokio::test]
     async fn request_permission_detects_sse_disconnect() {
         let frontend = Arc::new(HttpFrontend::new());
-        // Install a stream so request_permission takes the streaming (park) path.
-        let (receiver, _ids) = frontend.install_stream(16, 16, Duration::ZERO, uuid::Uuid::nil());
+        // A held stream on a session that shows prompts: the response attends, as the handler
+        // makes it, so request_permission takes the park path.
+        let (receiver, _ids) =
+            frontend.install_stream(16, 16, Duration::ZERO, uuid::Uuid::nil(), Opener {
+                holds: true,
+                renders: true,
+            });
+        let attendance = frontend.attend();
 
         let frontend_inner = Arc::clone(&frontend);
         let join = tokio::spawn(async move {
@@ -2153,8 +2223,9 @@ mod tests {
             "one pending permission request should be registered"
         );
 
-        // Simulate SSE client disconnect by dropping the broadcast receiver.
+        // Simulate SSE client disconnect by dropping the response's receiver and attendance.
         drop(receiver);
+        drop(attendance);
         assert!(
             frontend.client_disconnected(),
             "client_disconnected() should return true after receiver is dropped"
@@ -2189,8 +2260,16 @@ mod tests {
     #[tokio::test]
     async fn client_disconnected_waits_out_the_reattach_grace() {
         let frontend = HttpFrontend::new();
-        let (receiver, _ids) =
-            frontend.install_stream(16, 16, Duration::from_millis(150), uuid::Uuid::nil());
+        let (receiver, _ids) = frontend.install_stream(
+            16,
+            16,
+            Duration::from_millis(150),
+            uuid::Uuid::nil(),
+            Opener {
+                holds: true,
+                renders: true,
+            },
+        );
         assert!(
             !frontend.client_disconnected(),
             "a live consumer is attached"
@@ -2213,8 +2292,16 @@ mod tests {
     #[tokio::test]
     async fn reattaching_cancels_a_pending_disconnect() {
         let frontend = HttpFrontend::new();
-        let (receiver, _ids) =
-            frontend.install_stream(16, 16, Duration::from_millis(100), uuid::Uuid::nil());
+        let (receiver, _ids) = frontend.install_stream(
+            16,
+            16,
+            Duration::from_millis(100),
+            uuid::Uuid::nil(),
+            Opener {
+                holds: true,
+                renders: true,
+            },
+        );
         drop(receiver);
         assert!(!frontend.client_disconnected(), "grace period starts");
 
@@ -2235,7 +2322,10 @@ mod tests {
     async fn replay_ring_is_bounded_and_resumes_after_the_given_id() {
         let frontend = HttpFrontend::new();
         let (_receiver, _ids) =
-            frontend.install_stream(64, 3, Duration::from_secs(30), uuid::Uuid::nil());
+            frontend.install_stream(64, 3, Duration::from_secs(30), uuid::Uuid::nil(), Opener {
+                holds: true,
+                renders: true,
+            });
         for index in 0..5 {
             frontend
                 .emit(FrontendEvent::AssistantTextDelta(format!("chunk{index}")))
@@ -2290,7 +2380,10 @@ mod tests {
     async fn attach_after_the_turn_ends_yields_the_terminal() {
         let frontend = HttpFrontend::new();
         let (_receiver, _ids) =
-            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
+            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil(), Opener {
+                holds: true,
+                renders: true,
+            });
         frontend
             .emit(FrontendEvent::AssistantTextDelta("hi".into()))
             .await;
@@ -2325,7 +2418,11 @@ mod tests {
     async fn replay_drops_permission_prompts_that_are_no_longer_pending() {
         let frontend = Arc::new(HttpFrontend::new());
         let (_receiver, _ids) =
-            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
+            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil(), Opener {
+                holds: true,
+                renders: true,
+            });
+        let _attendance = frontend.attend();
 
         let asking = Arc::clone(&frontend);
         let join = tokio::spawn(async move {
@@ -2376,18 +2473,188 @@ mod tests {
         );
     }
 
-    /// A finished-but-retained stream must not read as "streaming", or the next blocking turn
-    /// would park its permission prompt on a channel nobody is listening to.
+    /// On a session whose client answers prompts on return, a turn no request holds parks its
+    /// prompt with nobody attending and keeps it through attenders leaving; only an answer, the
+    /// turn's end or the expiry closes it.
     #[tokio::test]
-    async fn a_retained_stream_is_not_reported_as_streaming() {
-        let frontend = HttpFrontend::new();
+    async fn a_turn_nobody_holds_parks_its_prompt_for_a_client_that_returns() {
+        let frontend = Arc::new(HttpFrontend::with_capabilities(SessionCapabilities {
+            answers_prompts_on_return: true,
+            ..Default::default()
+        }));
+        frontend.install_feed(uuid::Uuid::nil(), &FeedWiring::bare(16, 16, Duration::ZERO));
+        let (_receiver, _ids) = frontend.begin_turn(
+            uuid::Uuid::from_u128(0x9),
+            TurnSource::Client,
+            Opener {
+                holds: false,
+                renders: false,
+            },
+            Duration::ZERO,
+            16,
+        );
+        let asked = tokio::spawn({
+            let frontend = Arc::clone(&frontend);
+            async move { frontend.request_permission(prompt_for_test()).await }
+        });
+        wait_for_pending(&frontend, 1).await;
+        // An attendee comes and goes. Under a zero grace its leaving abandons the prompt on any
+        // other session.
+        let attendee = frontend.attach_stream(None, true).expect("feed installed");
+        drop(attendee);
+        tokio::time::sleep(DISCONNECT_POLL_INTERVAL * 3).await;
+        assert!(
+            !asked.is_finished(),
+            "the prompt waits for the client to return"
+        );
+        let request_id = frontend
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .next()
+            .cloned()
+            .expect("the prompt is still parked");
+        assert!(frontend.resolve_permission(&request_id, PermissionResolution::Allow));
+        assert_eq!(asked.await.expect("join"), PermissionOutcome::Allow);
+    }
+
+    /// The same session does not wait on a held turn: its request is what the turn runs for, and
+    /// absence stops the turn, so a prompt its attendee left behind closes after the grace as it
+    /// always did rather than parking the turn for the whole timeout.
+    #[tokio::test]
+    async fn a_held_turn_s_prompt_is_abandoned_though_the_session_answers_on_return() {
+        let frontend = Arc::new(HttpFrontend::with_capabilities(SessionCapabilities {
+            answers_prompts_on_return: true,
+            ..Default::default()
+        }));
         let (_receiver, _ids) =
-            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
-        assert!(frontend.is_streaming());
+            frontend.install_stream(16, 16, Duration::ZERO, uuid::Uuid::nil(), Opener {
+                holds: true,
+                renders: true,
+            });
+        let attendance = frontend.attend();
+        let asked = tokio::spawn({
+            let frontend = Arc::clone(&frontend);
+            async move { frontend.request_permission(prompt_for_test()).await }
+        });
+        wait_for_pending(&frontend, 1).await;
+        drop(attendance);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), asked)
+            .await
+            .expect("a held turn's prompt is not sat out")
+            .expect("join");
+        assert_eq!(outcome, PermissionOutcome::Canceled);
+    }
+
+    /// A held blocking request never sees a `permission_required`, so it is not an answerer:
+    /// with nobody attending, its gated call is refused without asking rather than parked on a
+    /// client that cannot look.
+    #[tokio::test]
+    async fn a_held_blocking_request_is_not_an_answerer() {
+        let frontend = HttpFrontend::new();
+        frontend.install_feed(
+            uuid::Uuid::nil(),
+            &FeedWiring::bare(16, 16, Duration::from_secs(30)),
+        );
+        let (_receiver, _ids) = frontend.begin_turn(
+            uuid::Uuid::from_u128(0xb),
+            TurnSource::Client,
+            Opener {
+                holds: true,
+                renders: false,
+            },
+            Duration::from_secs(30),
+            16,
+        );
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            frontend.request_permission(prompt_for_test()),
+        )
+        .await
+        .expect("must not park on a request that cannot answer");
+        assert_eq!(outcome, PermissionOutcome::Deny);
+    }
+
+    /// Only a held turn is disconnected from: with no listener for the grace, a held blocking
+    /// turn reports its client gone, and a detached one, rendered or not, never does.
+    #[tokio::test]
+    async fn only_a_held_turn_is_disconnected_from() {
+        let cases = [
+            (
+                Opener {
+                    holds: true,
+                    renders: false,
+                },
+                true,
+            ),
+            (
+                Opener {
+                    holds: false,
+                    renders: true,
+                },
+                false,
+            ),
+            (Opener::DRIVER, false),
+        ];
+        for (opener, expected) in cases {
+            let frontend = HttpFrontend::new();
+            frontend.install_feed(uuid::Uuid::nil(), &FeedWiring::bare(16, 16, Duration::ZERO));
+            let (receiver, _ids) = frontend.begin_turn(
+                uuid::Uuid::from_u128(0xc),
+                TurnSource::Client,
+                opener,
+                Duration::ZERO,
+                16,
+            );
+            drop(receiver);
+            assert_eq!(frontend.client_disconnected(), expected, "{opener:?}");
+        }
+    }
+
+    /// The live turn answers as a record, with the id and source its `turn.started` carried and
+    /// no ending, until the turn ends.
+    #[tokio::test]
+    async fn the_live_turn_is_a_record_until_it_ends() {
+        let frontend = HttpFrontend::new();
+        frontend.install_feed(
+            uuid::Uuid::nil(),
+            &FeedWiring::bare(16, 16, Duration::from_secs(30)),
+        );
+        let turn_id = uuid::Uuid::from_u128(0xa);
+        let (_receiver, _ids) = frontend.begin_turn(
+            turn_id,
+            TurnSource::Client,
+            Opener::DRIVER,
+            Duration::from_secs(30),
+            16,
+        );
+        let record = frontend.in_flight_turn().expect("a turn is live");
+        assert_eq!(record.id, turn_id);
+        assert_eq!(record.source, "client");
+        assert!(record.status.is_none() && record.ended_at.is_none());
+        frontend.end_turn();
+        assert!(frontend.in_flight_turn().is_none());
+    }
+
+    /// A finished-but-retained stream must not read as rendering, or the next turn on the
+    /// session would pay a renderer's price for reasoning nobody is shown.
+    #[tokio::test]
+    async fn a_retained_stream_no_longer_renders() {
+        let frontend = HttpFrontend::with_capabilities(SessionCapabilities {
+            supports_reasoning_stream: true,
+            ..Default::default()
+        });
+        let (_receiver, _ids) =
+            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil(), Opener {
+                holds: true,
+                renders: true,
+            });
+        assert!(frontend.retains_reasoning());
         frontend.end_turn();
         assert!(
-            !frontend.is_streaming(),
-            "the ring outlives the turn; the streaming mode must not"
+            !frontend.retains_reasoning(),
+            "the ring outlives the turn; the renderer must not"
         );
     }
 
@@ -2475,8 +2742,16 @@ mod tests {
     #[tokio::test]
     async fn a_reader_that_fell_behind_is_caught_up_from_the_ring() {
         let frontend = HttpFrontend::new();
-        let (mut receiver, _ids) =
-            frontend.install_stream(4, 16, Duration::from_secs(30), uuid::Uuid::from_u128(0x7));
+        let (mut receiver, _ids) = frontend.install_stream(
+            4,
+            16,
+            Duration::from_secs(30),
+            uuid::Uuid::from_u128(0x7),
+            Opener {
+                holds: true,
+                renders: true,
+            },
+        );
         for index in 0..10 {
             frontend
                 .emit(FrontendEvent::AssistantTextDelta(format!("chunk{index}")))
@@ -2513,8 +2788,16 @@ mod tests {
         assert_eq!(next.id, Some(11), "and continues where the backlog ended");
 
         let short = HttpFrontend::new();
-        let (_receiver, _ids) =
-            short.install_stream(4, 4, Duration::from_secs(30), uuid::Uuid::from_u128(0x8));
+        let (_receiver, _ids) = short.install_stream(
+            4,
+            4,
+            Duration::from_secs(30),
+            uuid::Uuid::from_u128(0x8),
+            Opener {
+                holds: true,
+                renders: true,
+            },
+        );
         for index in 0..10 {
             short
                 .emit(FrontendEvent::AssistantTextDelta(format!("chunk{index}")))

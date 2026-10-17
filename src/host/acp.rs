@@ -618,7 +618,9 @@ pub(crate) async fn run_acp(
                         sessions.get(notif.session_id.0.as_ref()).cloned()
                     };
                     if let Some(entry) = entry {
-                        entry.cancel.cancel();
+                        entry
+                            .cancel
+                            .cancel(crate::store::turns::CancelReason::Client);
                     }
                     Ok(())
                 }

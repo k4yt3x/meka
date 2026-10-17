@@ -49,7 +49,7 @@ impl InterruptRelay {
     /// turn: nothing, then the background tasks, then the process.
     pub(crate) fn count_press(&self, cancel: &crate::host::CancelCell) -> usize {
         use std::sync::atomic::Ordering::SeqCst;
-        let found_turn = cancel.cancel();
+        let found_turn = cancel.cancel(crate::store::turns::CancelReason::Client);
         if !found_turn && self.ladder_had_turn.swap(false, SeqCst) {
             self.presses.store(0, SeqCst);
         }
@@ -144,7 +144,7 @@ pub(crate) fn install_interrupt_handler(
                 _ = hangup.recv() => {}
                 _ = terminate.recv() => {}
             }
-            cancel.cancel();
+            cancel.cancel(crate::store::turns::CancelReason::ServerShutdown);
             leave();
         }
     });
@@ -215,7 +215,7 @@ pub(crate) async fn cancel_background_tasks(
 fn publish_for_interrupts(
     cancel: &crate::host::CancelCell,
     admission: crate::host::Admission,
-    cancellation: CancellationToken,
+    cancellation: crate::agent::TurnCancellation,
 ) -> crate::host::Published {
     let published = cancel.publish(cancellation, admission);
     reset_interrupt_escalation();
@@ -242,9 +242,11 @@ pub(crate) async fn compact_interruptible(
     messages: &mut crate::conversation::Conversation,
     request: crate::session::CompactRequest,
 ) -> crate::error::Result<crate::agent::CompactOutcome> {
-    let cancellation = CancellationToken::new();
+    let cancellation = crate::agent::TurnCancellation::new();
     let _published = publish_for_interrupts(cancel, admission, cancellation.clone());
-    let outcome = agent.compact_session(messages, request, cancellation).await;
+    let outcome = agent
+        .compact_session(messages, request, cancellation.token().clone())
+        .await;
     *session_id = agent.session_id();
     outcome
 }
@@ -260,7 +262,7 @@ pub(crate) async fn run_turn_interruptible(
     messages: &mut crate::conversation::Conversation,
     input: crate::agent::TurnInput,
 ) -> crate::error::Result<crate::agent::TurnOutcome> {
-    let cancellation = CancellationToken::new();
+    let cancellation = crate::agent::TurnCancellation::new();
     let _published = publish_for_interrupts(cancel, admission, cancellation.clone());
     // The screen does not surface a stop reason; `--oneshot --format json` reports it.
     let outcome = agent.run_turn(messages, input, cancellation).await;
@@ -307,7 +309,7 @@ mod tests {
         };
         let cancel = crate::host::CancelCell::default();
 
-        let token = CancellationToken::new();
+        let token = crate::agent::TurnCancellation::new();
         let published = cancel.publish(token.clone(), cancel.admit());
         assert_eq!(relay.count_press(&cancel), 1);
         assert!(token.is_cancelled(), "the first press cancels the turn");
@@ -329,7 +331,7 @@ mod tests {
             "a second press at a hung wait still reaches the background tasks"
         );
 
-        let token = CancellationToken::new();
+        let token = crate::agent::TurnCancellation::new();
         let _published = cancel.publish(token, cancel.admit());
         relay.reset();
         assert_eq!(

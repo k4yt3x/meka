@@ -66,7 +66,8 @@ pub(crate) struct SessionView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) pinned_at: Option<String>,
     /// The latest turn: who opened it and when, and once it has ended, how (`succeeded` with its
-    /// `stop_reason`, `failed` with its `error`, or `canceled`), when, and what it spent. Omitted
+    /// `stop_reason`, `failed` with its `error`, or `canceled` with its `reason`), when, and what
+    /// it spent. Omitted
     /// for a session no turn has begun on. A turn that began and shows no ending is either in
     /// flight, which `turn_in_flight` says, or one the process died under. The record carries it
     /// because a list of sessions is rendered from it, one row per session; the whole history of

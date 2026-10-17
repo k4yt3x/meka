@@ -53,6 +53,7 @@ use crate::host::http::{handlers, state::ServerState};
         handlers::conversation::rewind,
         handlers::conversation::export,
         handlers::conversation::turns,
+        handlers::conversation::turn,
         handlers::conversation::import,
         handlers::jobs::list_all,
         handlers::jobs::create,

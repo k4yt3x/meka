@@ -2062,6 +2062,7 @@ mod tests {
             status: Some(status),
             stop_reason: None,
             error: None,
+            reason: None,
             usage: crate::store::turns::TurnUsage::default(),
         }
     }
@@ -2128,6 +2129,7 @@ mod tests {
             turn_id: turn,
             ending: crate::store::turns::TurnEnding::canceled(
                 crate::store::turns::TurnUsage::default(),
+                crate::store::turns::CancelReason::Client,
             ),
         });
         assert_eq!(

@@ -990,6 +990,8 @@ pub(crate) mod testing {
         /// Tool names this frontend was asked to approve, in order. Lets a test assert that a gate
         /// actually ran, rather than only that its outcome was survivable.
         permission_requests: Mutex<Vec<String>>,
+        /// Whether the client this frontend stands for has gone, as the agent loop asks it.
+        disconnected: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingFrontend {
@@ -998,6 +1000,7 @@ pub(crate) mod testing {
                 events: Mutex::new(Vec::new()),
                 permission_response: Mutex::new(PermissionOutcome::Allow),
                 permission_requests: Mutex::new(Vec::new()),
+                disconnected: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -1006,7 +1009,14 @@ pub(crate) mod testing {
                 events: Mutex::new(Vec::new()),
                 permission_response: Mutex::new(response),
                 permission_requests: Mutex::new(Vec::new()),
+                disconnected: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+
+        /// Report the client gone from now on, as a dead transport would.
+        pub(crate) fn report_disconnected(&self) {
+            self.disconnected
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         pub(crate) fn events(&self) -> Vec<FrontendEvent> {
@@ -1036,6 +1046,10 @@ pub(crate) mod testing {
                 .unwrap()
                 .push(request.tool_name);
             self.permission_response.lock().unwrap().clone()
+        }
+
+        fn client_disconnected(&self) -> bool {
+            self.disconnected.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 }

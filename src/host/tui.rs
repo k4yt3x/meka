@@ -365,7 +365,7 @@ pub(crate) async fn run_interactive(
     let screen_handle = tokio::spawn(async move {
         let outcome = screen_handle.await;
         let (host, cancel) = screen_watch;
-        cancel.cancel();
+        cancel.cancel(crate::store::turns::CancelReason::Client);
         if host.send(HostEvent::Exit { interrupted: false }).is_err() {
             tracing::debug!("the host loop has already ended");
         }
@@ -753,11 +753,11 @@ impl crate::host::scheduler::HostHooks for TuiHooks {
         Ok((self.entry.id == session_id).then(|| self.entry.clone()))
     }
 
-    fn cancellation(&self) -> tokio_util::sync::CancellationToken {
+    fn cancellation(&self) -> crate::agent::TurnCancellation {
         // Published through the resident's cell by the driver, where Ctrl+C reaches it; the
         // escalation count starts over for the same reason a typed turn's does.
         crate::host::terminal::reset_interrupt_escalation();
-        tokio_util::sync::CancellationToken::new()
+        crate::agent::TurnCancellation::new()
     }
 
     /// A stage direction naming what opened the turn: the reply that follows would otherwise

@@ -925,7 +925,10 @@ impl Tool for AgentSpawnTool {
                         message: empty.to_string(),
                     }
                 })?,
-                cancellation,
+                crate::agent::TurnCancellation::child_of(
+                    &cancellation,
+                    crate::store::turns::CancelReason::Parent,
+                ),
             )
             .await?;
 
@@ -1758,7 +1761,10 @@ impl Tool for AgentFollowupTool {
                         message: empty.to_string(),
                     }
                 })?,
-                cancellation,
+                crate::agent::TurnCancellation::child_of(
+                    &cancellation,
+                    crate::store::turns::CancelReason::Parent,
+                ),
             )
             .await?;
 
@@ -6531,7 +6537,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("look into it".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the worker's turn runs");

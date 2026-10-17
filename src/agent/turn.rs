@@ -5,6 +5,7 @@ use super::*;
 use crate::{
     conversation::PromptRetention,
     session::{CompactOrigin, CompactRequest},
+    store::turns::CancelReason,
 };
 
 /// Why an [`Agent::run_turn`] invocation finished cleanly. Callers that drive a user-facing
@@ -710,10 +711,63 @@ struct TurnOpening {
 }
 
 /// The state a turn's rounds share, so the loop and the phases it calls read one thing.
+/// A turn's stop signal and why it was pulled, which is what the turn's row and its terminal
+/// event report. Firing takes a reason, so no site can stop a turn without saying why; a turn
+/// stopped through a token it was derived from reports the reason that token stands for.
+#[derive(Clone, Default)]
+pub(crate) struct TurnCancellation {
+    token: CancellationToken,
+    reason: Arc<std::sync::OnceLock<CancelReason>>,
+    /// What a stop that came down from the parent token means.
+    inherited: Option<CancelReason>,
+}
+
+impl TurnCancellation {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// A signal that fires with `parent` and then means `reason`: a sub-agent's turn stops with
+    /// its parent's, a server's out-of-band turn with the server.
+    pub(crate) fn child_of(parent: &CancellationToken, reason: CancelReason) -> Self {
+        Self {
+            token: parent.child_token(),
+            reason: Arc::default(),
+            inherited: Some(reason),
+        }
+    }
+
+    /// Stop the turn, for `reason`. The first reason given is the one kept: a second stop on a
+    /// turn already stopping changes nothing about why.
+    pub(crate) fn cancel(&self, reason: CancelReason) {
+        // A slot already taken is the earlier stop's; this one fires the same token.
+        self.reason.get_or_init(|| reason);
+        self.token.cancel();
+    }
+
+    /// The token itself, for the work the turn hands it to and the selects that race it.
+    pub(crate) fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    /// Why the turn was stopped, once it has been: the reason it was fired with, else the one its
+    /// parent token stands for. `None` while it runs.
+    pub(crate) fn reason(&self) -> Option<CancelReason> {
+        self.reason
+            .get()
+            .copied()
+            .or_else(|| self.inherited.filter(|_| self.token.is_cancelled()))
+    }
+}
+
 struct TurnRun {
     session_id: Uuid,
     turn_id: Uuid,
-    cancellation: CancellationToken,
+    cancellation: TurnCancellation,
     attribution: crate::provider::Attribution,
     system_prompt: Arc<str>,
     user_message: Message,
@@ -912,7 +966,7 @@ impl Agent {
         &self,
         messages: &mut Conversation,
         input: TurnInput,
-        cancellation: CancellationToken,
+        cancellation: TurnCancellation,
     ) -> Result<TurnOutcome> {
         self.run_attributed_turn(messages, input, cancellation)
             .await
@@ -978,7 +1032,7 @@ impl Agent {
         &self,
         messages: &mut Conversation,
         input: TurnInput,
-        cancellation: CancellationToken,
+        cancellation: TurnCancellation,
     ) -> Result<TurnOutcome> {
         let retention = input.retention;
         let request_in_flight = input.words();
@@ -1010,10 +1064,11 @@ impl Agent {
             .emit(FrontendEvent::TurnStarted { turn_id })
             .await;
 
-        let mut compacted_before_the_loop =
-            self.compact_before_the_loop(messages, &cancellation).await;
+        let mut compacted_before_the_loop = self
+            .compact_before_the_loop(messages, cancellation.token())
+            .await;
         compacted_before_the_loop |= self
-            .compact_for_retention(messages, session_id, &cancellation)
+            .compact_for_retention(messages, session_id, cancellation.token())
             .await;
         self.sweep_expired_turns(session_id).await;
 
@@ -1037,7 +1092,7 @@ impl Agent {
             None => Arc::from(prompt::build_system_prompt(self.system_prompt_inputs())),
         };
         compacted_before_the_loop |= self
-            .compact_for_projection(messages, &system_prompt, &cancellation, &mut opening)
+            .compact_for_projection(messages, &system_prompt, cancellation.token(), &mut opening)
             .await;
 
         let mut run = TurnRun {
@@ -1457,6 +1512,7 @@ impl Agent {
             // the output. The screen's frontend reports `false` here, so this is a no-op for them.
             if self.cells.frontend.client_disconnected() {
                 run.recovery.undo_rejected_repair(messages);
+                run.cancellation.cancel(CancelReason::Abandoned);
                 return Err(MekaError::Interrupted);
             }
 
@@ -1466,7 +1522,7 @@ impl Agent {
             // The round's own token, a child of the turn's: an inbox interrupt fires it, so the
             // call returns the way a stop makes it return, and `cancellation` still says which of
             // the two happened.
-            let round = run.cancellation.child_token();
+            let round = run.cancellation.token().child_token();
             let mut progress = StreamProgress::default();
             let (call_result, loaded) = self
                 .request_round(messages, run, &round, &mut progress)
@@ -1480,7 +1536,12 @@ impl Agent {
                         && run.recovery.overflow_retries < MAX_OVERFLOW_RETRIES =>
                 {
                     run.recovery
-                        .recover_from_context_overflow(self, messages, &run.cancellation, message)
+                        .recover_from_context_overflow(
+                            self,
+                            messages,
+                            run.cancellation.token(),
+                            message,
+                        )
                         .await?;
                     continue;
                 }
@@ -1537,7 +1598,7 @@ impl Agent {
                         return Err(error);
                     }
                     run.recovery
-                        .repair_rejected_content(self, messages, error, &run.cancellation)
+                        .repair_rejected_content(self, messages, error, run.cancellation.token())
                         .await?;
                     continue;
                 }
@@ -2103,7 +2164,7 @@ impl Agent {
                 assistant_message,
                 loaded,
                 &run.attribution,
-                run.cancellation.clone(),
+                run.cancellation.token().clone(),
             )
             .await;
         run.last_round_durations = tool_durations;
@@ -2218,7 +2279,7 @@ impl Agent {
             .compact_session(
                 messages,
                 request.answering(run.recovery.request_in_flight.clone()),
-                run.cancellation.clone(),
+                run.cancellation.token().clone(),
             )
             .await
         {
@@ -2272,7 +2333,7 @@ impl Agent {
                         messages,
                         CompactRequest::new(CompactOrigin::Reactive)
                             .answering(run.recovery.request_in_flight.clone()),
-                        run.cancellation.clone(),
+                        run.cancellation.token().clone(),
                     )
                     .await
                 {
@@ -2334,7 +2395,12 @@ impl Agent {
         let usage = crate::store::turns::TurnUsage::from(&turn_usage);
         let ending = match result {
             Ok(outcome) => crate::store::turns::TurnEnding::succeeded(outcome.stop_reason(), usage),
-            Err(MekaError::Interrupted) => crate::store::turns::TurnEnding::canceled(usage),
+            // Every stop goes through the signal and names itself; a bare one, which nothing
+            // fires, reads as asked for.
+            Err(MekaError::Interrupted) => crate::store::turns::TurnEnding::canceled(
+                usage,
+                cancellation.reason().unwrap_or(CancelReason::Client),
+            ),
             Err(error) => crate::store::turns::TurnEnding::failed(error, usage),
         };
         if let Err(error) = self.store.turn_store().close_turn(turn_id, &ending).await {
@@ -2445,7 +2511,10 @@ impl Agent {
             && result.is_ok()
         {
             tracing::info!("compacting at the agent's request");
-            if let Err(error) = self.compact_session(messages, request, cancellation).await {
+            if let Err(error) = self
+                .compact_session(messages, request, cancellation.token().clone())
+                .await
+            {
                 // Non-fatal, and deliberately not surfaced as a turn error: the turn itself
                 // succeeded, and its answer is what the user asked for.
                 tracing::warn!("requested compaction failed: {error}");
@@ -3102,7 +3171,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -3168,7 +3237,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -3227,7 +3296,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("typed words".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -3271,7 +3340,7 @@ mod tests {
             .run_turn(
                 &mut messages,
                 crate::agent::TurnInput::inbox(waiting).expect("items"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -3328,7 +3397,7 @@ mod tests {
                 crate::agent::TurnInput::inbox(waiting)
                     .expect("items")
                     .retaining(PromptRetention::Withdraw),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await;
         assert!(outcome.is_err(), "the provider refused: {outcome:?}");
@@ -3396,6 +3465,53 @@ mod tests {
         (agent, provider, store, session_id, frontend)
     }
 
+    /// A turn whose frontend reports its client gone stops at the next round boundary, and the
+    /// row says it was abandoned rather than stopped by someone.
+    #[tokio::test]
+    async fn a_turn_stopped_for_absence_records_abandoned() {
+        let (agent, _provider, store, session, frontend) =
+            agent_with_session(vec![text_round("first"), text_round("second")]).await;
+        frontend.report_disconnected();
+        let mut messages = Conversation::new();
+        let cancellation = crate::agent::TurnCancellation::new();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("hello".into(), Vec::new()).expect("a prompt"),
+                cancellation.clone(),
+            )
+            .await;
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "{outcome:?}"
+        );
+        assert_eq!(cancellation.reason(), Some(CancelReason::Abandoned));
+        let turns = store.turn_store().load_turns(session).await.expect("turns");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].status,
+            Some(crate::store::turns::TurnStatus::Canceled)
+        );
+        assert_eq!(turns[0].reason, Some(CancelReason::Abandoned));
+    }
+
+    /// A stop that comes down from the token a turn was derived from means what that token
+    /// stands for, and a stop of the turn's own keeps its own reason.
+    #[test]
+    fn a_derived_cancellation_means_its_parent_s_reason() {
+        let parent = CancellationToken::new();
+        let child = crate::agent::TurnCancellation::child_of(&parent, CancelReason::Parent);
+        assert_eq!(child.reason(), None, "nothing has stopped it");
+        parent.cancel();
+        assert_eq!(child.reason(), Some(CancelReason::Parent));
+
+        let parent = CancellationToken::new();
+        let own = crate::agent::TurnCancellation::child_of(&parent, CancelReason::Parent);
+        own.cancel(CancelReason::Abandoned);
+        assert_eq!(own.reason(), Some(CancelReason::Abandoned));
+        assert!(!parent.is_cancelled(), "a derived stop does not reach up");
+    }
+
     /// What the door says about the prompt is what the request reports: the scheduler restates
     /// a fired job's origin on words nobody typed, and a typed prompt is a person's.
     #[tokio::test]
@@ -3412,7 +3528,7 @@ mod tests {
                 )
                 .expect("a prompt")
                 .originating(crate::provider::TurnOrigin::Scheduled),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -3421,7 +3537,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("and now?".into(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -3460,8 +3576,8 @@ mod tests {
         let (agent, provider, store, session, _frontend) =
             agent_with_session(vec![text_round("ok")]).await;
         let mut messages = Conversation::new();
-        let canceled = CancellationToken::new();
-        canceled.cancel();
+        let canceled = crate::agent::TurnCancellation::new();
+        canceled.cancel(CancelReason::Client);
         agent
             .run_turn(
                 &mut messages,
@@ -3474,7 +3590,7 @@ mod tests {
             .run_turn(
                 &mut messages,
                 crate::agent::TurnInput::from_parts("again".into(), Vec::new()).expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the next turn runs");
@@ -3521,7 +3637,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("read it".into(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -3589,18 +3705,18 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("measure".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the measured turn runs");
         assert_eq!(agent.cells().context_occupancy(), 500);
 
-        let cancellation = CancellationToken::new();
+        let cancellation = crate::agent::TurnCancellation::new();
         let stop = tokio::spawn({
             let cancellation = cancellation.clone();
             async move {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                cancellation.cancel();
+                cancellation.cancel(CancelReason::Client);
             }
         });
         let outcome = agent
@@ -3646,7 +3762,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -3708,7 +3824,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs on");
@@ -3815,7 +3931,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs on");
@@ -3891,7 +4007,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs on");
@@ -3971,7 +4087,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs on");
@@ -4061,7 +4177,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs on");
@@ -4089,7 +4205,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -4183,7 +4299,7 @@ mod tests {
                 crate::agent::TurnInput::inbox(waiting)
                     .expect("items")
                     .retaining(PromptRetention::Withdraw),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await;
         let interrupt = enqueued.await.expect("enqueued");
@@ -4291,7 +4407,7 @@ mod tests {
                 crate::agent::TurnInput::inbox(waiting)
                     .expect("items")
                     .retaining(PromptRetention::Withdraw),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await;
         let interrupt = enqueued.await.expect("enqueued");
@@ -4367,7 +4483,7 @@ mod tests {
                 crate::agent::TurnInput::inbox(waiting)
                     .expect("items")
                     .retaining(PromptRetention::Withdraw),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await;
         assert!(
@@ -4428,7 +4544,7 @@ mod tests {
                     image_source(),
                 ])
                 .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await;
         enqueued.await.expect("enqueued");
@@ -4472,7 +4588,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("hello".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await;
         assert!(
@@ -4496,8 +4612,6 @@ mod tests {
     }
 
     use std::sync::Arc;
-
-    use tokio_util::sync::CancellationToken;
 
     use super::PromptRetention;
     use crate::{
@@ -4540,7 +4654,7 @@ mod tests {
                     )
                     .expect("a prompt")
                     .retaining(PromptRetention::Withdraw),
-                    CancellationToken::new(),
+                    crate::agent::TurnCancellation::new(),
                 )
                 .await
                 .expect_err("the provider is unreachable");
@@ -4586,7 +4700,7 @@ mod tests {
                 )
                 .expect("a prompt")
                 .retaining(PromptRetention::Keep),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect_err("the provider is unreachable");
@@ -4648,7 +4762,7 @@ mod tests {
                 )
                 .expect("a prompt")
                 .retaining(PromptRetention::Keep),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect_err("the provider is unreachable");
@@ -4731,7 +4845,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("hello".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await;
         restore.await.expect("the table was restored");
@@ -4824,7 +4938,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("the prompt".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn succeeds once the store is back");
@@ -4928,7 +5042,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("read it".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn");
@@ -5071,7 +5185,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -5173,7 +5287,7 @@ mod tests {
                     Vec::new(),
                 )
                 .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -5227,7 +5341,7 @@ mod tests {
                     Vec::new(),
                 )
                 .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the compacted retry succeeds");
@@ -5286,7 +5400,7 @@ mod tests {
                     },
                 ])
                 .expect("an image is a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -5363,7 +5477,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect_err("the round's save fails");
@@ -5401,7 +5515,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("more".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the next turn is not refused for an unanswered tool call");
@@ -5449,7 +5563,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("hello".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect_err("the nudge's save fails");
@@ -5515,7 +5629,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("plan and do it".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect_err("the nudge's save fails");
@@ -5588,12 +5702,12 @@ mod tests {
         store.inline_blobs(&mut events).await.expect("inline");
         let mut messages = Conversation::from_events(events);
 
-        let cancellation = CancellationToken::new();
+        let cancellation = crate::agent::TurnCancellation::new();
         let stop = tokio::spawn({
             let cancellation = cancellation.clone();
             async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                cancellation.cancel();
+                cancellation.cancel(CancelReason::Client);
             }
         });
         let outcome = agent
@@ -5623,7 +5737,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("more".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the next turn completes");
@@ -5663,12 +5777,12 @@ mod tests {
         agent.cells().session_id.set(session_id);
         let mut messages = Conversation::new();
 
-        let cancellation = CancellationToken::new();
+        let cancellation = crate::agent::TurnCancellation::new();
         let stop = tokio::spawn({
             let cancellation = cancellation.clone();
             async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                cancellation.cancel();
+                cancellation.cancel(CancelReason::Client);
             }
         });
         let started = std::time::Instant::now();
@@ -5700,8 +5814,8 @@ mod tests {
     async fn a_fire_interrupted_before_it_began_withdraws_its_prompt() {
         let (agent, _store) = agent_for_test(unreachable_provider(1)).await;
         let mut messages = Conversation::new();
-        let canceled = CancellationToken::new();
-        canceled.cancel();
+        let canceled = crate::agent::TurnCancellation::new();
+        canceled.cancel(CancelReason::Client);
 
         let error = agent
             .run_turn(
@@ -5758,7 +5872,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("first".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("first turn");
@@ -5780,7 +5894,7 @@ mod tests {
                 crate::agent::TurnInput::from_parts("doomed".to_string(), Vec::new())
                     .expect("a prompt")
                     .retaining(PromptRetention::Withdraw),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect_err("the provider is unreachable");
@@ -5798,7 +5912,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("third".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("third turn");
@@ -5832,7 +5946,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("kept".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect_err("the provider is unreachable");
@@ -5849,7 +5963,7 @@ mod tests {
                 crate::agent::TurnInput::from_parts("withdrawn".to_string(), Vec::new())
                     .expect("a prompt")
                     .retaining(PromptRetention::Withdraw),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect_err("the provider is unreachable");
@@ -5873,7 +5987,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("check the news".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect_err("the provider is unreachable");
@@ -5916,7 +6030,7 @@ mod tests {
                 )
                 .expect("a prompt")
                 .retaining(PromptRetention::Withdraw),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect_err("the retry fails");
@@ -5967,7 +6081,7 @@ mod tests {
                 )
                 .expect("a prompt")
                 .retaining(PromptRetention::Withdraw),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect_err("the second round fails");
@@ -6039,7 +6153,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("hello".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn succeeds");
@@ -6084,7 +6198,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("hello".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn succeeds");
@@ -6149,7 +6263,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("first".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -6166,7 +6280,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("second".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -6209,7 +6323,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("and now this".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -6286,7 +6400,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -6373,7 +6487,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("first".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("first turn");
@@ -6402,7 +6516,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("second".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("second turn");
@@ -6475,7 +6589,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("hello".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -6514,7 +6628,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("hello".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -6554,7 +6668,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("summarize the log".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect_err("an overflow nothing can shrink must reach the caller");
@@ -6634,7 +6748,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn must retry past a notice-then-drop, not fail");
@@ -6693,7 +6807,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the retry carries the turn");
@@ -6740,7 +6854,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn completes");
@@ -6785,7 +6899,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect_err("the second round fails the turn");
@@ -6825,7 +6939,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("hello there".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn completes");
@@ -6936,7 +7050,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn completes");
@@ -6971,7 +7085,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("more".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the second turn completes");
@@ -7019,7 +7133,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn completes");
@@ -7078,7 +7192,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("summarize the log".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the compacted retry must succeed");
@@ -7140,7 +7254,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("read the chart".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn survives a first attempt that got no response");
@@ -7196,7 +7310,7 @@ mod tests {
                     image_source(),
                 ])
                 .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn recovers instead of dying");
@@ -7256,12 +7370,12 @@ mod tests {
         let (mut agent, store) = agent_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
         agent.options.streaming = true;
         let mut messages = Conversation::new();
-        let cancellation = CancellationToken::new();
+        let cancellation = crate::agent::TurnCancellation::new();
         let stop = tokio::spawn({
             let cancellation = cancellation.clone();
             async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                cancellation.cancel();
+                cancellation.cancel(CancelReason::Client);
             }
         });
         let outcome = agent
@@ -7360,7 +7474,7 @@ mod tests {
                     image_source(),
                 ])
                 .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("a spent retry budget degrades rather than ending the turn");
@@ -7424,7 +7538,7 @@ mod tests {
                     image_source(),
                 ])
                 .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the re-sent request succeeded");
@@ -7506,7 +7620,7 @@ mod tests {
                 &mut Conversation::new(),
                 crate::agent::TurnInput::from_parts("read my notes".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn recovers");
@@ -7582,7 +7696,7 @@ mod tests {
                     image_source(),
                 ])
                 .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the degrade has to be reachable after the compaction");
@@ -7635,7 +7749,7 @@ mod tests {
                     image_source(),
                 ])
                 .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect_err("nothing the turn tried satisfied the provider");
@@ -7699,7 +7813,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("read my notes".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the second tier gets the turn through");
@@ -7758,7 +7872,7 @@ mod tests {
                     &mut Conversation::new(),
                     crate::agent::TurnInput::from_parts("look at this".to_string(), attachments)
                         .expect("a prompt"),
-                    CancellationToken::new(),
+                    crate::agent::TurnCancellation::new(),
                 )
                 .await
                 .expect_err("every attempt was refused");
@@ -7804,7 +7918,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("first".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("first turn");
@@ -7825,7 +7939,7 @@ mod tests {
                 &mut resumed,
                 crate::agent::TurnInput::from_parts("second".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn after resume");
@@ -7843,7 +7957,7 @@ mod tests {
                 &mut resumed,
                 crate::agent::TurnInput::from_parts("third".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("third turn");
@@ -7893,7 +8007,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("first".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("first turn");
@@ -7908,7 +8022,7 @@ mod tests {
                     &mut resumed,
                     crate::agent::TurnInput::from_parts("doomed".to_string(), Vec::new())
                         .expect("a prompt"),
-                    CancellationToken::new()
+                    crate::agent::TurnCancellation::new()
                 )
                 .await
                 .is_err(),
@@ -7929,7 +8043,7 @@ mod tests {
                 &mut resumed,
                 crate::agent::TurnInput::from_parts("retry".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("retry");
@@ -7964,7 +8078,7 @@ mod tests {
                     image_source(),
                 ])
                 .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect_err("both attempts were refused");
@@ -8022,7 +8136,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("first".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("first turn succeeds");
@@ -8037,7 +8151,7 @@ mod tests {
                     image_source(),
                 ])
                 .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the recovery must still fire on a rewound conversation");
@@ -8102,7 +8216,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("send the picture".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn succeeds");
@@ -8153,7 +8267,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("send the picture".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn succeeds");
@@ -8208,7 +8322,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("hello".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn succeeds");
@@ -8264,7 +8378,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("hello".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn succeeds");
@@ -8312,7 +8426,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("hello".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await;
         assert!(outcome.is_err(), "the turn is supposed to fail here");
@@ -8357,7 +8471,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("hello".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn succeeds");
@@ -8417,7 +8531,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("read it".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn succeeds");
@@ -8561,7 +8675,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("run the suite".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn must not block on the task");
@@ -8748,7 +8862,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("run the suite".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -8864,7 +8978,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("run the suite".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn must not block on the task");
@@ -8922,7 +9036,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("run the suite".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn succeeds");
@@ -8977,7 +9091,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("run the suite".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn succeeds");
@@ -9065,7 +9179,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("run it".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn succeeds");
@@ -9111,7 +9225,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("start three".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn succeeds");
@@ -9180,7 +9294,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("build".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn succeeds");
@@ -9257,7 +9371,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("build".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn succeeds");
@@ -9317,7 +9431,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("send the picture".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("turn succeeds");
@@ -9368,7 +9482,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("plain text only".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect_err("nothing to repair, so the turn fails");
@@ -9406,7 +9520,7 @@ mod tests {
                     image_source(),
                 ])
                 .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the degrade got the turn through");
@@ -9630,7 +9744,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn runs");
@@ -9674,7 +9788,7 @@ mod tests {
                 .run_turn(
                     &mut conversation,
                     TurnInput::from_parts("continue".into(), Vec::new()).expect("prompt"),
-                    CancellationToken::new(),
+                    crate::agent::TurnCancellation::new(),
                 )
                 .await
                 .expect("turn");
@@ -9865,7 +9979,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("plan and do it".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn ends");
@@ -9915,7 +10029,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("do x".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn ends");
@@ -9971,7 +10085,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("ask Sam".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn ends");
@@ -10050,7 +10164,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("build and read".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the deferring turn ends");
@@ -10076,7 +10190,7 @@ mod tests {
             .run_turn(
                 &mut messages,
                 crate::agent::TurnInput::outcomes(vec![task]),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the reporting turn ends");
@@ -10159,7 +10273,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("build and report".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the first turn ends");
@@ -10189,7 +10303,7 @@ mod tests {
             .run_turn(
                 &mut messages,
                 crate::agent::TurnInput::outcomes(vec![task]),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the outcome turn ends");
@@ -10338,7 +10452,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("build and read".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the deferring turn ends");
@@ -10363,7 +10477,7 @@ mod tests {
             .run_turn(
                 &mut messages,
                 crate::agent::TurnInput::outcomes(vec![task]),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the reporting turn ends");
@@ -10430,7 +10544,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("build and read".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the deferring turn ends");
@@ -10458,7 +10572,7 @@ mod tests {
             .run_turn(
                 &mut messages,
                 crate::agent::TurnInput::outcomes(vec![task]),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the reporting turn ends");
@@ -10508,7 +10622,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("build and report".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the first turn ends");
@@ -10522,7 +10636,7 @@ mod tests {
             .run_turn(
                 &mut messages,
                 crate::agent::TurnInput::outcomes(vec![task]),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the reporting turn ends");
@@ -10598,7 +10712,7 @@ mod tests {
                     &mut messages,
                     crate::agent::TurnInput::from_parts("build and report".to_string(), Vec::new())
                         .expect("a prompt"),
-                    CancellationToken::new(),
+                    crate::agent::TurnCancellation::new(),
                 )
                 .await
                 .expect("the first turn ends");
@@ -10623,7 +10737,7 @@ mod tests {
                     crate::agent::TurnInput::from_parts("anything else?".to_string(), Vec::new())
                         .expect("a prompt")
                         .riding(vec![task]),
-                    CancellationToken::new(),
+                    crate::agent::TurnCancellation::new(),
                 )
                 .await
                 .expect("the carrying turn ends");
@@ -10672,7 +10786,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("build both".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the deferring turn ends");
@@ -10688,7 +10802,7 @@ mod tests {
             .run_turn(
                 &mut messages,
                 crate::agent::TurnInput::outcomes(vec![task]),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("A's turn ends");
@@ -10741,7 +10855,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("build both".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the deferring turn ends");
@@ -10763,7 +10877,7 @@ mod tests {
             .run_turn(
                 &mut messages,
                 crate::agent::TurnInput::outcomes(batch),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the batch's turn ends");
@@ -10810,7 +10924,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("plan and do it".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn ends");
@@ -10932,7 +11046,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("do x".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn ends");
@@ -10998,7 +11112,7 @@ mod tests {
                 &mut messages,
                 crate::agent::TurnInput::from_parts("carry on".to_string(), Vec::new())
                     .expect("a prompt"),
-                CancellationToken::new(),
+                crate::agent::TurnCancellation::new(),
             )
             .await
             .expect("the turn ends");

@@ -1639,13 +1639,13 @@ Matches the live broadcast channel's capacity: retaining more than the channel c
 
 ### `serve.stream_reattach_grace`
 
-How long a streaming turn keeps running after its SSE consumer disconnects, waiting for a reconnect, and how long a parked approval prompt waits after its last attending reader disconnects before it is canceled. Accepts duration strings.
+How long a held turn keeps running after its request's client disconnects, waiting for a listener to come back, and how long a parked approval prompt waits after its last attending reader disconnects before it is canceled. Accepts duration strings.
 
 | Type | Default |
 |------|---------|
 | `string` (duration) | `"30s"` |
 
-Zero subscribers means nobody is listening, and a turn with no audience is spending provider tokens for nothing. That is the right instinct and the wrong deadline: a client whose connection just dropped and one that is never coming back are the same observation until the window expires. Set `"0s"` to cancel a turn the moment its stream drops, which spends less on abandoned work and makes re-attach useful only for turns that already finished.
+Zero subscribers means nobody is listening, and a turn with no audience is spending provider tokens for nothing. That is the right instinct and the wrong deadline: a client whose connection just dropped and one that is never coming back are the same observation until the window expires. Set `"0s"` to stop a turn at the first round boundary after its request drops, which spends less on abandoned work and makes re-attach useful only for turns that already finished. A turn a request opened with `detach: true`, and one the server opened, is never stopped for want of a reader; see [Holding a turn](../usage/http-api.md#holding-a-turn).
 
 ### `serve.idle_timeout`
 
