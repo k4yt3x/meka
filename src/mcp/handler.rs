@@ -10,13 +10,14 @@
 use std::sync::Arc;
 
 use rmcp::{
-    ErrorData as McpError, Peer, RoleClient,
+    ClientLifecycleMode, ErrorData as McpError, Peer, RoleClient,
     handler::client::ClientHandler,
     model::{
         CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientRequest,
-        ConstString, CustomNotification, ElicitRequestParams, ElicitResult, ElicitationAction,
-        ElicitationResponseNotificationMethod, ProgressNotificationParam, RequestMetaObject,
-        ServerResult,
+        ConstString, CustomNotification, DEFAULT_MRTR_MAX_ROUNDS, ElicitRequestParams,
+        ElicitResult, ElicitationAction, ElicitationResponseNotificationMethod, InputRequest,
+        InputRequests, InputRequiredResult, InputResponses, ProgressNotificationParam,
+        ProtocolVersion, RequestMetaObject, ServerResult,
     },
     service::{NotificationContext, PeerRequestOptions, RequestContext, ServiceError},
 };
@@ -24,7 +25,7 @@ use rmcp::{
 use super::{ALLOWED_IMAGE_MIME_TYPES, MAX_MCP_IMAGE_BYTES, McpClientContext, ServerEntry};
 use crate::{
     error::{MekaError, Result},
-    frontend::ElicitationResponse,
+    frontend::{ElicitationResponse, Frontend},
     permission::Permission,
 };
 
@@ -41,6 +42,36 @@ impl ElicitationResponse {
             ElicitationResponse::Decline => ElicitResult::new(ElicitationAction::Decline),
             ElicitationResponse::Cancel => ElicitResult::new(ElicitationAction::Cancel),
         }
+    }
+}
+
+/// The protocol version the probe asks for first: the one with `server/discover`, per-request
+/// `_meta` and `subscriptions/listen`.
+pub(super) const MODERN_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
+
+/// The version `initialize` names when the probe finds a server from before the handshake went:
+/// the newest one that still has an `initialize`.
+pub(super) const LEGACY_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
+
+/// How an HTTP connect opens: probe with `server/discover` and fall back to `initialize` on the
+/// same connection, the dual-era client the spec's compatibility matrix describes. A server of
+/// either era is served, and the version a connection speaks is the server's answer rather than
+/// meka's assumption. An HTTP server answers an unknown method one way or another, so the
+/// fallback can ride the probe's connection; a stdio server may not, see [`stdio_probe`].
+pub(super) fn http_lifecycle() -> ClientLifecycleMode {
+    ClientLifecycleMode::Auto {
+        preferred_versions: vec![MODERN_PROTOCOL_VERSION],
+        legacy_version: Some(LEGACY_PROTOCOL_VERSION),
+    }
+}
+
+/// How a stdio connect probes: `server/discover` alone, on a child of its own, which the connector
+/// keeps when the child answers as a modern server and discards otherwise. The legacy handshake
+/// gets a fresh child, because a server from before the probe existed may swallow a method it does
+/// not know and answer nothing afterwards, `initialize` included.
+pub(super) fn stdio_probe() -> ClientLifecycleMode {
+    ClientLifecycleMode::Discover {
+        preferred_versions: vec![MODERN_PROTOCOL_VERSION],
     }
 }
 
@@ -63,13 +94,16 @@ impl MekaClientHandler {
 }
 
 impl ClientHandler for MekaClientHandler {
-    /// What the `initialize` request says about this client. Left to rmcp's default, it names the
-    /// SDK as the client, floats the protocol version with the SDK's release, and declares no
-    /// capabilities at all, so a server that checks before it elicits never does.
+    /// What this client says about itself: on `initialize` to a legacy server, and in every
+    /// request's `_meta` to a modern one. Left to rmcp's default, it names the SDK as the client,
+    /// floats the protocol version with the SDK's release, and declares no capabilities at all, so
+    /// a server that checks before it elicits never does. The version here is the one a bare
+    /// `initialize` names; [`http_lifecycle`] and [`stdio_probe`] decide which era a connection
+    /// ends in.
     fn get_info(&self) -> rmcp::model::ClientConfig {
         use rmcp::model::{
             ClientCapabilities, ElicitationCapability, FormElicitationCapability, Implementation,
-            ProtocolVersion, UrlElicitationCapability,
+            UrlElicitationCapability,
         };
         let mut capabilities = ClientCapabilities::default();
         capabilities.elicitation = Some(
@@ -81,42 +115,16 @@ impl ClientHandler for MekaClientHandler {
             capabilities,
             Implementation::new("meka", env!("CARGO_PKG_VERSION")),
         )
-        .with_protocol_version(ProtocolVersion::V_2025_11_25)
+        .with_protocol_version(LEGACY_PROTOCOL_VERSION)
     }
 
     fn on_tool_list_changed(
         &self,
         _context: NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        let server_name: String = self.server_name.as_ref().to_string();
-        let manager = self.context.manager().and_then(|weak| weak.upgrade());
-
-        async move {
-            tracing::debug!("MCP server '{server_name}' sent tools/list_changed");
-            let Some(manager) = manager else {
-                tracing::debug!(
-                    "tool list refresh skipped: manager not yet wired for '{server_name}'"
-                );
-                return;
-            };
-
-            // Tool-permission resolution reads the server config and `mcp_default_permission` from
-            // the manager itself; no explicit permission needs to be threaded here.
-            match manager.discover_tools_for_server(&server_name).await {
-                Ok(adapters) => {
-                    // The same door the initial registration goes through, so a refresh cannot
-                    // classify a tool differently from the listing it replaces. Routes through
-                    // every attached registry so all active sessions observe the updated tool set.
-                    manager.register_server_tools(&server_name, adapters).await;
-                    tracing::info!("MCP server '{server_name}' tool registry refreshed");
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "failed to refresh tools for MCP server '{server_name}': {error}"
-                    );
-                }
-            }
-        }
+        let server = Arc::clone(&self.server_name);
+        let context = Arc::clone(&self.context);
+        async move { refresh_tools_after_list_changed(&server, &context).await }
     }
 
     fn on_resource_list_changed(
@@ -146,15 +154,7 @@ impl ClientHandler for MekaClientHandler {
     ) -> impl Future<Output = ()> + Send + '_ {
         let server = Arc::clone(&self.server_name);
         let context = Arc::clone(&self.context);
-        async move {
-            tracing::info!(
-                "MCP server '{server}' reported resource updated: {uri}",
-                uri = params.uri
-            );
-            context
-                .resource_updates
-                .record(server.as_ref(), &params.uri);
-        }
+        async move { record_resource_update(&server, &context, &params.uri) }
     }
 
     #[allow(
@@ -166,9 +166,10 @@ impl ClientHandler for MekaClientHandler {
         params: ProgressNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
+        let server = Arc::clone(&self.server_name);
         let context = Arc::clone(&self.context);
         async move {
-            context.progress.dispatch(params).await;
+            context.progress.dispatch(server.as_ref(), params).await;
         }
     }
 
@@ -205,37 +206,6 @@ impl ClientHandler for MekaClientHandler {
         let server = Arc::clone(&self.server_name);
         let context = Arc::clone(&self.context);
         async move {
-            use crate::frontend::{ElicitationKind, ElicitationPrompt};
-
-            let (kind, message) = match &request {
-                ElicitRequestParams::FormElicitationParams {
-                    message,
-                    requested_schema,
-                    ..
-                } => {
-                    let schema = serde_json::to_value(requested_schema)
-                        .unwrap_or(serde_json::json!({"type": "object", "properties": {}}));
-                    (ElicitationKind::Form { schema }, message.clone())
-                }
-                ElicitRequestParams::UrlElicitationParams { message, url, .. } => {
-                    (ElicitationKind::Url { url: url.clone() }, message.clone())
-                }
-                // Forward-compat: an elicitation kind this build doesn't recognize falls back to a
-                // generic form prompt rather than failing the request.
-                _ => (
-                    ElicitationKind::Form {
-                        schema: serde_json::json!({"type": "object", "properties": {}}),
-                    },
-                    "unsupported elicitation request".to_string(),
-                ),
-            };
-
-            let prompt = ElicitationPrompt {
-                server_name: server.as_ref().to_string(),
-                kind,
-                message,
-            };
-
             // The frontend is the in-flight call's, found through the progress registry. With no
             // call from `server` in flight (the server elicited outside a tool call, or the
             // progress guard already dropped) there is no human to ask, and with calls from two
@@ -258,30 +228,218 @@ impl ClientHandler for MekaClientHandler {
                     return Ok(ElicitationResponse::Decline.into_result());
                 }
             };
-
-            // Bounded so an unanswered prompt cannot stall an MCP tool call forever; an approval
-            // prompt waits longer because the turn is already paused on it. An elicitation is an
-            // MCP *request*, so a `Decline` is how the server learns the user did not answer;
-            // `notifications/cancelled` is for requests meka started.
-            const ELICITATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-            let response = match tokio::time::timeout(
-                ELICITATION_TIMEOUT,
-                frontend.handle_elicitation(prompt),
-            )
-            .await
-            {
-                Ok(response) => response,
-                Err(_) => {
-                    tracing::warn!(
-                        "MCP server '{server}' elicitation timed out after {seconds}s; declining",
-                        seconds = ELICITATION_TIMEOUT.as_secs()
-                    );
-                    ElicitationResponse::Decline
-                }
-            };
-
-            Ok(response.into_result())
+            Ok(elicit(server.as_ref(), frontend.as_ref(), request).await)
         }
+    }
+}
+
+/// Re-list a server's tools after it said they changed, whichever way it said so: a legacy
+/// server's unsolicited notification reaches [`ClientHandler::on_tool_list_changed`], a modern
+/// one's arrives on the listen stream `subscriptions.rs` drains, and both end here.
+pub(super) async fn refresh_tools_after_list_changed(
+    server_name: &str,
+    context: &McpClientContext,
+) {
+    tracing::debug!("MCP server '{server_name}' sent tools/list_changed");
+    let Some(manager) = context.manager().and_then(|weak| weak.upgrade()) else {
+        tracing::debug!("tool list refresh skipped: manager not yet wired for '{server_name}'");
+        return;
+    };
+
+    // Tool-permission resolution reads the server config and `mcp_default_permission` from the
+    // manager itself; no explicit permission needs to be threaded here.
+    match manager.discover_tools_for_server(server_name).await {
+        Ok(adapters) => {
+            // The same door the initial registration goes through, so a refresh cannot classify a
+            // tool differently from the listing it replaces. Routes through every attached
+            // registry so all active sessions observe the updated tool set.
+            manager.register_server_tools(server_name, adapters).await;
+            tracing::info!("MCP server '{server_name}' tool registry refreshed");
+        }
+        Err(error) => {
+            tracing::warn!("failed to refresh tools for MCP server '{server_name}': {error}");
+        }
+    }
+}
+
+/// Record that `uri` on `server_name` changed, for `mcp_resource_updates_list`; the counterpart
+/// of [`refresh_tools_after_list_changed`] for `resources/updated`, reached from both eras too.
+pub(super) fn record_resource_update(server_name: &str, context: &McpClientContext, uri: &str) {
+    tracing::info!("MCP server '{server_name}' reported resource updated: {uri}");
+    context.resource_updates.record(server_name, uri);
+}
+
+/// Put a server's elicitation to `frontend` and answer with what the user said, or a decline when
+/// the user did not answer in time.
+///
+/// One body for both eras: a legacy server sends `elicitation/create` as a request of its own,
+/// which [`ClientHandler::create_elicitation`] routes here, and a modern one embeds it in an
+/// `input_required` result, which [`fulfill_input_requests`] routes here.
+pub(super) async fn elicit(
+    server: &str,
+    frontend: &dyn Frontend,
+    request: ElicitRequestParams,
+) -> ElicitResult {
+    use crate::frontend::{ElicitationKind, ElicitationPrompt};
+
+    let (kind, message) = match &request {
+        ElicitRequestParams::FormElicitationParams {
+            message,
+            requested_schema,
+            ..
+        } => {
+            let schema = serde_json::to_value(requested_schema)
+                .unwrap_or(serde_json::json!({"type": "object", "properties": {}}));
+            (ElicitationKind::Form { schema }, message.clone())
+        }
+        ElicitRequestParams::UrlElicitationParams { message, url, .. } => {
+            (ElicitationKind::Url { url: url.clone() }, message.clone())
+        }
+        // Forward-compat: an elicitation kind this build doesn't recognize falls back to a
+        // generic form prompt rather than failing the request.
+        _ => (
+            ElicitationKind::Form {
+                schema: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            "unsupported elicitation request".to_string(),
+        ),
+    };
+
+    let prompt = ElicitationPrompt {
+        server_name: server.to_string(),
+        kind,
+        message,
+    };
+
+    // Bounded so an unanswered prompt cannot stall an MCP tool call forever; an approval prompt
+    // waits longer because the turn is already paused on it. An elicitation is an MCP *request*,
+    // so a `Decline` is how the server learns the user did not answer; `notifications/cancelled`
+    // is for requests meka started.
+    const ELICITATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    let response = match tokio::time::timeout(
+        ELICITATION_TIMEOUT,
+        frontend.handle_elicitation(prompt),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            tracing::warn!(
+                "MCP server '{server}' elicitation timed out after {seconds}s; declining",
+                seconds = ELICITATION_TIMEOUT.as_secs()
+            );
+            ElicitationResponse::Decline
+        }
+    };
+
+    response.into_result()
+}
+
+/// Answer the input requests an `input_required` result carried, for the retry that follows.
+///
+/// Only an elicitation can be answered, and only when the call has a frontend to put it to. meka
+/// declares no sampling or roots capability, and a server may not ask for what the client did not
+/// declare, so one that does has left the protocol and the call fails naming what it asked rather
+/// than retrying with a hole the server would ask to fill again.
+pub(super) async fn fulfill_input_requests(
+    server: &str,
+    frontend: Option<&Arc<dyn Frontend>>,
+    requests: InputRequests,
+) -> std::result::Result<InputResponses, ServiceError> {
+    let mut responses = InputResponses::new();
+    for (key, request) in requests {
+        let asked = match request {
+            InputRequest::Elicitation(request) => match frontend {
+                Some(frontend) => elicit(server, frontend.as_ref(), request.params).await,
+                None => {
+                    tracing::warn!(
+                        "MCP server '{server}' requested elicitation on a call with no prompt to \
+                         show it in; declining"
+                    );
+                    ElicitationResponse::Decline.into_result()
+                }
+            },
+            InputRequest::CreateMessage(_) => return Err(undeclared_input(server, "sampling")),
+            InputRequest::ListRoots(_) => return Err(undeclared_input(server, "roots")),
+            _ => return Err(undeclared_input(server, "an input of an unknown kind")),
+        };
+        let answer = serde_json::to_value(asked).map_err(|error| {
+            ServiceError::McpError(McpError::internal_error(
+                format!("failed to serialize the elicitation's answer: {error}"),
+                None,
+            ))
+        })?;
+        responses.insert(key, answer);
+    }
+    Ok(responses)
+}
+
+fn undeclared_input(server: &str, what: &str) -> ServiceError {
+    ServiceError::McpError(McpError::invalid_request(
+        format!("MCP server '{server}' asked for {what}, which this client does not declare"),
+        None,
+    ))
+}
+
+/// A round that carried no request is the server waiting on something out of band, a URL the
+/// user is still at; retrying at once would spend the round cap in a millisecond.
+const STATE_ONLY_ROUND_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The rounds one request goes through on a modern server: each `input_required` answer is
+/// fulfilled through the frontend and the request sent again with the answers and the server's
+/// opaque `requestState`, until a result arrives or [`DEFAULT_MRTR_MAX_ROUNDS`] requests have
+/// gone. A legacy server, which never answers `input_required`, costs one round.
+///
+/// The caller owns the request and the sending: it takes [`Self::carry`] into the request before
+/// each send and hands an `input_required` answer to [`Self::absorb`] after it.
+pub(super) struct Rounds<'a> {
+    server: &'a str,
+    frontend: Option<&'a Arc<dyn Frontend>>,
+    input_responses: Option<InputResponses>,
+    request_state: Option<String>,
+    sent: usize,
+}
+
+impl<'a> Rounds<'a> {
+    pub(super) fn new(server: &'a str, frontend: Option<&'a Arc<dyn Frontend>>) -> Self {
+        Self {
+            server,
+            frontend,
+            input_responses: None,
+            request_state: None,
+            sent: 0,
+        }
+    }
+
+    /// What the next send carries: the answers to the last round's requests, and the server's
+    /// state exactly as it gave it.
+    pub(super) fn carry(&mut self) -> (Option<InputResponses>, Option<String>) {
+        self.sent += 1;
+        (self.input_responses.take(), self.request_state.take())
+    }
+
+    /// Take in an `input_required` answer so the next [`Self::carry`] has what the retry needs.
+    /// An error when the server asked for what meka cannot give, sent an answer a retry could
+    /// carry nothing of, or has asked on every round the cap allows.
+    pub(super) async fn absorb(
+        &mut self,
+        result: InputRequiredResult,
+    ) -> std::result::Result<(), ServiceError> {
+        if self.sent >= DEFAULT_MRTR_MAX_ROUNDS {
+            return Err(ServiceError::InputRequiredRoundsExceeded {
+                max_rounds: DEFAULT_MRTR_MAX_ROUNDS,
+            });
+        }
+        // rmcp refuses to parse a result carrying neither, so one with no requests has state.
+        let requests = result.input_requests.unwrap_or_default();
+        if requests.is_empty() {
+            tokio::time::sleep(STATE_ONLY_ROUND_PAUSE).await;
+        } else {
+            self.input_responses =
+                Some(fulfill_input_requests(self.server, self.frontend, requests).await?);
+        }
+        self.request_state = result.request_state;
+        Ok(())
     }
 }
 
@@ -330,28 +488,15 @@ impl McpTool {
         self.entry.server_name()
     }
 
+    /// One attempt at the call on the connection as it stands: every round the server asks for,
+    /// under one deadline. A closed transport is the caller's to reopen.
     async fn call_tool_once(
         &self,
         mut params: CallToolRequestParams,
         context: &CallContext,
     ) -> std::result::Result<rmcp::model::CallToolResult, ServiceError> {
-        let cancellation = context.cancellation.clone();
-        // Per-call progress token: allows the server to emit `notifications/progress` updates that
-        // route back to our shell UI. The frontend snapshot is taken from the task-local installed
-        // by `Agent::run_tool` and stored on the registry entry so the rmcp notification handler
-        // (which runs on a separately-spawned task; see `rmcp::service::spawn_service_task`) can
-        // look it up by token. `None` outside an agent-driven call site falls through to a debug
-        // log in `dispatch`.
-        let tool_use_id = context.tool_call_id.clone();
-        let (progress_token, _progress_guard) = self.entry.client_context.progress.register(
-            self.entry.server_name().to_string(),
-            self.remote_tool_name.clone(),
-            tool_use_id.clone(),
-            Some(Arc::clone(&context.frontend)),
-        );
         let mut meta = RequestMetaObject::new();
-        meta.set_progress_token(progress_token);
-        if let Some(id) = &tool_use_id {
+        if let Some(id) = &context.tool_call_id {
             meta.0
                 .insert("meka/toolUseId".to_string(), serde_json::json!(id));
         }
@@ -374,13 +519,68 @@ impl McpTool {
             .require_connected()
             .await
             .map_err(|_| ServiceError::TransportClosed)?;
-        let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
+
+        // One deadline for every round: a server that asks and asks again is still one tool call
+        // to the turn, and the model's wait is what the timeout bounds.
+        let deadline = tokio::time::Instant::now() + self.entry.tool_call_timeout;
+        let mut rounds = Rounds::new(self.entry.server_name(), Some(&context.frontend));
+        loop {
+            (params.input_responses, params.request_state) = rounds.carry();
+            let request = ClientRequest::CallToolRequest(CallToolRequest::new(params.clone()));
+            match self.send_bounded(&peer, request, context, deadline).await? {
+                ServerResult::CallToolResult(result) => return Ok(result),
+                // The wait for the user's answer is the call's too: an interrupt or the deadline
+                // ends it, and the asker's end dropping is what withdraws the question from the
+                // screen.
+                ServerResult::InputRequiredResult(result) => tokio::select! {
+                    biased;
+                    _ = context.cancellation.cancelled() => {
+                        return Err(ServiceError::Cancelled {
+                            reason: Some("user interrupt".to_string()),
+                        });
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        return Err(ServiceError::Cancelled {
+                            reason: Some(format!(
+                                "timed out after {}s",
+                                self.entry.tool_call_timeout.as_secs()
+                            )),
+                        });
+                    }
+                    absorbed = rounds.absorb(result) => absorbed?,
+                },
+                _ => return Err(ServiceError::UnexpectedResponse),
+            }
+        }
+    }
+
+    /// Send one request and wait for its answer under the call's cancellation and `deadline`;
+    /// whichever of the two fires first tells the server to stop before this returns.
+    async fn send_bounded(
+        &self,
+        peer: &Peer<RoleClient>,
+        request: ClientRequest,
+        context: &CallContext,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<ServerResult, ServiceError> {
         let handle = peer
             .send_cancellable_request(request, PeerRequestOptions::no_options())
             .await?;
         let request_id = handle.id.clone();
+        // The call's entry in the progress registry, under the token rmcp minted for the request:
+        // rmcp stamps its own `progressToken` over anything `_meta` carried, so that token is the
+        // one the server echoes and the only one a notification can be found by, and it exists
+        // only once the request is sent. The frontend is the calling session's, kept on the entry
+        // because the rmcp notification handler runs on a separately-spawned task (see
+        // `rmcp::service::spawn_service_task`) and cannot read the caller's task-local.
+        let _progress_guard = self.entry.client_context.progress.register(
+            &handle.progress_token,
+            self.entry.server_name().to_string(),
+            self.remote_tool_name.clone(),
+            context.tool_call_id.clone(),
+            Some(Arc::clone(&context.frontend)),
+        );
 
-        let timeout = self.entry.tool_call_timeout;
         // Cap how long we wait on the best-effort cancellation notification so a hung transport
         // can't block Ctrl-C handling or shutdown.
         const CANCEL_NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -411,22 +611,20 @@ impl McpTool {
         };
 
         tokio::select! {
-            response = handle.await_response() => {
-                match response? {
-                    ServerResult::CallToolResult(result) => Ok(result),
-                    _ => Err(ServiceError::UnexpectedResponse),
-                }
-            }
-            _ = cancellation.cancelled() => {
+            response = handle.await_response() => response,
+            _ = context.cancellation.cancelled() => {
                 notify_cancel("user interrupt").await;
                 Err(ServiceError::Cancelled {
                     reason: Some("user interrupt".to_string()),
                 })
             }
-            _ = tokio::time::sleep(timeout) => {
+            _ = tokio::time::sleep_until(deadline) => {
                 notify_cancel("timeout").await;
                 Err(ServiceError::Cancelled {
-                    reason: Some(format!("timed out after {}s", timeout.as_secs())),
+                    reason: Some(format!(
+                        "timed out after {}s",
+                        self.entry.tool_call_timeout.as_secs()
+                    )),
                 })
             }
         }
@@ -905,5 +1103,150 @@ mod tests {
             .elicitation
             .expect("elicitation is declared");
         assert!(elicitation.form.is_some() && elicitation.url.is_some());
+    }
+
+    fn input_required(value: serde_json::Value) -> InputRequiredResult {
+        serde_json::from_value(value).expect("an input_required result")
+    }
+
+    /// A round carrying only state is retried with the state and nothing else; one asking for what
+    /// meka does not declare fails the call; an elicitation on a call with no frontend is
+    /// declined, not failed; and the cap counts requests sent.
+    #[tokio::test]
+    async fn rounds_carry_state_refuse_undeclared_asks_and_stop_at_the_cap() {
+        let mut rounds = Rounds::new("srv", None);
+        assert_eq!(rounds.carry(), (None, None));
+        rounds
+            .absorb(input_required(serde_json::json!({
+                "resultType": "input_required", "requestState": "s1"
+            })))
+            .await
+            .expect("a state-only round is retried");
+        assert_eq!(rounds.carry(), (None, Some("s1".to_string())));
+
+        let sampling = input_required(serde_json::json!({
+            "resultType": "input_required",
+            "inputRequests": {"k": {
+                "method": "sampling/createMessage",
+                "params": {"messages": [], "maxTokens": 1}
+            }}
+        }));
+        let error = rounds
+            .absorb(sampling)
+            .await
+            .expect_err("sampling is not declared");
+        assert!(error.to_string().contains("sampling"), "{error}");
+        let roots = input_required(serde_json::json!({
+            "resultType": "input_required",
+            "inputRequests": {"k": {"method": "roots/list", "params": {}}}
+        }));
+        let error = rounds
+            .absorb(roots)
+            .await
+            .expect_err("roots are not declared");
+        assert!(error.to_string().contains("roots"), "{error}");
+
+        let elicitation = input_required(serde_json::json!({
+            "resultType": "input_required",
+            "inputRequests": {"q": {
+                "method": "elicitation/create",
+                "params": {
+                    "mode": "form", "message": "?",
+                    "requestedSchema": {"type": "object", "properties": {}}
+                }
+            }}
+        }));
+        rounds
+            .absorb(elicitation)
+            .await
+            .expect("with no one to ask, the elicitation is declined rather than failed");
+        let (answers, state) = rounds.carry();
+        assert_eq!(
+            answers.expect("an answer per request")["q"]["action"],
+            "decline"
+        );
+        assert_eq!(state, None);
+
+        let mut capped = Rounds::new("srv", None);
+        for _ in 0..DEFAULT_MRTR_MAX_ROUNDS {
+            capped.carry();
+        }
+        let again = input_required(serde_json::json!({
+            "resultType": "input_required", "requestState": "s"
+        }));
+        assert!(matches!(
+            capped.absorb(again).await,
+            Err(ServiceError::InputRequiredRoundsExceeded { .. })
+        ));
+    }
+
+    /// A frontend that keeps the last prompt it was shown and accepts it.
+    #[derive(Default)]
+    struct CapturingFrontend(std::sync::Mutex<Option<crate::frontend::ElicitationPrompt>>);
+
+    impl CapturingFrontend {
+        fn shown(&self) -> crate::frontend::ElicitationPrompt {
+            crate::sync::lock(&self.0)
+                .take()
+                .expect("a prompt was put to the frontend")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Frontend for CapturingFrontend {
+        async fn emit(&self, _event: crate::frontend::FrontendEvent) {}
+
+        async fn request_permission(
+            &self,
+            _request: crate::frontend::PermissionRequest,
+        ) -> crate::frontend::PermissionOutcome {
+            crate::frontend::PermissionOutcome::Allow
+        }
+
+        async fn handle_elicitation(
+            &self,
+            prompt: crate::frontend::ElicitationPrompt,
+        ) -> ElicitationResponse {
+            *crate::sync::lock(&self.0) = Some(prompt);
+            ElicitationResponse::Accept { content: None }
+        }
+    }
+
+    /// A form elicitation reaches the frontend as the form it is, message and schema intact, and
+    /// a URL one as the URL to open; neither as the placeholder an unknown kind gets.
+    #[tokio::test]
+    async fn an_elicitation_reaches_the_frontend_as_the_kind_it_is() {
+        use crate::frontend::ElicitationKind;
+
+        let frontend = CapturingFrontend::default();
+        let form: ElicitRequestParams = serde_json::from_value(serde_json::json!({
+            "mode": "form", "message": "Name?",
+            "requestedSchema": {"type": "object", "properties": {"name": {"type": "string"}}}
+        }))
+        .expect("a form request");
+        elicit("srv", &frontend, form).await;
+        let prompt = frontend.shown();
+        assert_eq!(prompt.server_name, "srv");
+        assert_eq!(prompt.message, "Name?");
+        match prompt.kind {
+            ElicitationKind::Form { schema } => {
+                assert!(schema["properties"]["name"].is_object(), "{schema}");
+            }
+            other => panic!("a form was expected: {other:?}"),
+        }
+
+        let url: ElicitRequestParams = serde_json::from_value(serde_json::json!({
+            "mode": "url", "message": "Sign in", "url": "https://example.test/login",
+            "elicitationId": "e1"
+        }))
+        .expect("a url request");
+        elicit("srv", &frontend, url).await;
+        let prompt = frontend.shown();
+        assert_eq!(prompt.message, "Sign in");
+        assert!(
+            matches!(prompt.kind, ElicitationKind::Url { ref url } if url == "https://example.test/login"),
+            "{:?}",
+            prompt.kind
+        );
     }
 }

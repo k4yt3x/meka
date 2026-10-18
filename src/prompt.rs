@@ -400,7 +400,7 @@ impl WorldSnapshot {
     /// Separate from [`Self::new`] rather than another parameter on it because answering needs the
     /// live permission and a tool resolver, which most callers of `new` (every test, and the
     /// compaction paths) have no business holding. A snapshot built without this reports no job as
-    /// held, which is the same thing it said before the field existed.
+    /// held.
     pub(crate) fn with_gate_authority(
         mut self,
         memory: &crate::schedule::SchedulerMemory,

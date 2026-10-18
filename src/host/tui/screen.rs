@@ -94,6 +94,23 @@ const SHELL_OUTPUT_KEEP_LINES: usize = 10_000;
 /// A question takes no answer this soon after opening: a key already on its way to the composer,
 /// Enter above all, would otherwise land on the first choice, which allows.
 const QUESTION_GRACE: Duration = Duration::from_millis(350);
+
+/// Whether a key is held back because the question it would reach, when `asking` says one is on
+/// screen, opened less than [`QUESTION_GRACE`] ago. The safe keys pass. So does text typed into a
+/// form's field: it is not an answer, it shows in the field and can be taken back, where a key
+/// swallowed here is gone, and the Enter that would send it is the one that waits. A panel's
+/// letters are its picks, so on a panel every key but the safe ones waits.
+fn held_by_question_grace(
+    asking: bool,
+    opened: Option<Instant>,
+    focus: Focus,
+    action: Action,
+) -> bool {
+    asking
+        && opened.is_some_and(|opened| opened.elapsed() < QUESTION_GRACE)
+        && !matches!(action, Action::Escape | Action::Interrupt | Action::Redraw)
+        && !matches!((focus, action), (Focus::Question, Action::Edit))
+}
 /// A listing shown in a panel is cut to its last bytes past this; a task's outcome is the one
 /// that can run to its 64 MiB bound.
 const PANEL_TEXT_KEEP_BYTES: usize = crate::text::MIB;
@@ -1410,19 +1427,16 @@ impl Screen {
         self.dirty = true;
         self.selection = None;
         let focus = self.focus();
-        // Within the grace a question takes no answer but the safe ones.
-        if self.overlay_is_question()
-            && self
-                .question_opened
-                .is_some_and(|opened| opened.elapsed() < QUESTION_GRACE)
-            && !matches!(
-                action_for(&key, focus, self.composer_state()),
-                Action::Escape | Action::Interrupt | Action::Redraw
-            )
-        {
+        let action = action_for(&key, focus, self.composer_state());
+        if held_by_question_grace(
+            self.overlay_is_question(),
+            self.question_opened,
+            focus,
+            action,
+        ) {
             return;
         }
-        match action_for(&key, focus, self.composer_state()) {
+        match action {
             Action::Submit => match focus {
                 Focus::Panel | Focus::Filtering => self.pick_panel().await,
                 Focus::Question => self.answer_elicitation(),
@@ -3275,6 +3289,42 @@ pub(crate) async fn run_screen(launch: ScreenLaunch) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Within the grace a question takes no answer, but a form's field takes its text: a key
+    /// swallowed there is gone, while the Enter that would send it is the one that waits. A
+    /// panel's letters are picks, and wait like the Enter. With no question on screen, nothing
+    /// is held.
+    #[test]
+    fn the_grace_holds_a_question_s_answer_and_not_a_form_s_text() {
+        let just_opened = Some(Instant::now());
+        let held = |focus, action| held_by_question_grace(true, just_opened, focus, action);
+        assert!(held(Focus::Question, Action::Submit));
+        assert!(!held(Focus::Question, Action::Edit));
+        assert!(held(Focus::Panel, Action::Edit));
+        assert!(held(Focus::Panel, Action::Submit));
+        assert!(!held(Focus::Question, Action::Escape));
+        assert!(!held(Focus::Panel, Action::Interrupt));
+        assert!(!held_by_question_grace(
+            false,
+            just_opened,
+            Focus::Question,
+            Action::Submit
+        ));
+
+        let long_ago = Some(Instant::now() - QUESTION_GRACE * 2);
+        assert!(!held_by_question_grace(
+            true,
+            long_ago,
+            Focus::Question,
+            Action::Submit
+        ));
+        assert!(!held_by_question_grace(
+            true,
+            None,
+            Focus::Panel,
+            Action::Submit
+        ));
+    }
 
     /// A paste that is one path to an existing image file names the file, quoted or escaped as
     /// a file manager drops it; words, a missing file or a file that is not an image do not.

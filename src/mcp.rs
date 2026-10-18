@@ -11,6 +11,7 @@ pub(crate) mod policy;
 pub(crate) mod progress;
 pub(crate) mod resource_updates;
 pub(crate) mod sanitize;
+pub(crate) mod subscriptions;
 pub(crate) mod transport;
 
 use std::{
@@ -27,8 +28,8 @@ pub(crate) use policy::{
 use rmcp::{
     Peer, RoleClient,
     model::{
-        GetPromptRequestParams, GetPromptResult, Prompt, ReadResourceRequestParams,
-        ReadResourceResult, Resource,
+        GetPromptRequestParams, GetPromptResponse, GetPromptResult, Prompt, ProtocolVersion,
+        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
     },
     service::ServiceError,
 };
@@ -97,6 +98,82 @@ pub(crate) type McpRunningService =
 /// `CLOSE_TIMEOUT` per server would otherwise make exit latency scale with how many of them hang.
 pub(crate) const SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a shutdown waits for the connects in flight to unwind once it has ended them. Each
+/// ends at its next await, and the child it was spawning dies with its transport, so this is the
+/// scheduling of a few threads, plus at most one [`CLOSE_TIMEOUT`] for a connection that landed
+/// as the stop fired and is closed rather than adopted.
+const CONNECT_UNWIND_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long `RunningService::close` is given: by a shutdown once the shared references are
+/// released, and by [`ServerEntry::adopt_connection`] for a connection it refuses.
+const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The connects in flight across one manager's servers, and the token that ends them.
+///
+/// A connect runs its future on a blocking thread, which nothing can drop from outside: at exit
+/// the thread is detached and the process ends with the child it was spawning still owned by a
+/// transport nobody dropped, so the child outlives meka. Every connect path selects on the token
+/// and counts itself here, so a shutdown can end them all and know when the last has unwound.
+pub(crate) struct Connects {
+    stopping: CancellationToken,
+    in_flight: tokio::sync::watch::Sender<usize>,
+}
+
+/// One connect in flight; dropping it is the connect ending, however it ended.
+pub(crate) struct Connecting(Arc<Connects>);
+
+impl Connects {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stopping: CancellationToken::new(),
+            in_flight: tokio::sync::watch::Sender::new(0),
+        })
+    }
+
+    /// The token a connect in flight ends on.
+    pub(crate) fn stopping(&self) -> &CancellationToken {
+        &self.stopping
+    }
+
+    /// Count a connect that is starting, until the returned guard drops.
+    pub(crate) fn connecting(self: &Arc<Self>) -> Connecting {
+        self.in_flight.send_modify(|count| *count += 1);
+        Connecting(Arc::clone(self))
+    }
+
+    /// End every connect in flight and wait up to `grace` for the last to unwind. `true` when
+    /// none remains.
+    pub(crate) async fn stop(&self, grace: std::time::Duration) -> bool {
+        self.stopping.cancel();
+        let mut in_flight = self.in_flight.subscribe();
+        tokio::time::timeout(grace, in_flight.wait_for(|count| *count == 0))
+            .await
+            .is_ok_and(|waited| waited.is_ok())
+    }
+}
+
+impl Drop for Connecting {
+    fn drop(&mut self) {
+        self.0
+            .in_flight
+            .send_modify(|count| *count = count.saturating_sub(1));
+    }
+}
+
+/// Close `service` within [`CLOSE_TIMEOUT`]; what does not close in time is left to its drop
+/// guard, and said so.
+async fn close_service(server_name: &str, mut service: McpRunningService) {
+    match service.close_with_timeout(CLOSE_TIMEOUT).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::warn!("MCP server '{server_name}' shutdown timed out after {CLOSE_TIMEOUT:?}");
+        }
+        Err(error) => {
+            tracing::warn!("failed to shut down MCP server '{server_name}': {error}");
+        }
+    }
+}
+
 pub(crate) struct McpClientManager {
     servers: HashMap<String, Arc<ServerEntry>>,
     /// The context every server's handler reports into; the ledgers a tool reads live on it.
@@ -132,6 +209,8 @@ pub(crate) struct McpClientManager {
     /// the connect did. Set by [`Self::start_connector`]; a manager that never started one
     /// (tests) falls back to [`DEFAULT_MCP_REQUEST_TIMEOUT`].
     connect_timeout: OnceLock<std::time::Duration>,
+    /// The connects in flight on every entry, which [`Self::shutdown`] ends first.
+    connects: Arc<Connects>,
 }
 
 /// What one server's latest `tools/list` produced: the tools, and which of them ship deferred.
@@ -184,7 +263,8 @@ pub(crate) trait ServerToolsObserver: Send + Sync {
 /// Lifecycle state of a single MCP server. Transitions:
 /// - Built as `Disabled` (config says so) or `Pending` (will be connected by the background
 ///   connector).
-/// - `Pending` → `Connected` on successful `initialize` + `list_tools`.
+/// - `Pending` → `Connected` once the probe or `initialize` has settled the era, through
+///   [`ServerEntry::adopt_connection`].
 /// - `Pending` → `Failed` on connect error or connect-timeout.
 /// - `Connected` → `Connected` (with a new `service` Arc) on reconnect.
 #[derive(Clone)]
@@ -289,7 +369,9 @@ pub(crate) struct ServerEntry {
     /// alone is not enough: the connector takes every non-disabled entry, and the retry loop would
     /// keep sending the literal for the life of the process.
     pub(crate) refused: Option<String>,
-    /// Optional `InitializeResult.instructions`, restamped on every `Connected` transition.
+    /// The instructions the handshake carried (`InitializeResult.instructions`, or
+    /// `DiscoverResult.instructions` on a modern connection), restamped on every `Connected`
+    /// transition.
     ///
     /// Not a `OnceLock`: the MCP spec's "instructions are immutable for the lifetime of the
     /// connection" is about the connection, and a reconnect *is* a new connection with a new
@@ -315,6 +397,17 @@ pub(crate) struct ServerEntry {
     /// what the server offers and what meka registered is indistinguishable, from the outside,
     /// from a tool the server never had.
     pub(crate) dropped_tools: std::sync::atomic::AtomicUsize,
+    /// What the model subscribed to on this server, carried onto every connection the entry
+    /// adopts; see `subscriptions.rs`.
+    pub(crate) subscriptions: subscriptions::Subscriptions,
+    /// Whether this stdio server has completed a legacy handshake after not answering the probe,
+    /// so a later connect skips the probe and its wait. Kept for the life of the process, which
+    /// the spec allows a client across restarts of one server configuration. Set only by a
+    /// handshake that succeeded: one that fails, or that the connect's bound cuts short, leaves
+    /// no verdict, so a server replaced or merely slow in the meantime is probed again.
+    pub(crate) legacy_era: std::sync::atomic::AtomicBool,
+    /// The manager's [`Connects`], which every connect of this entry counts itself in and ends on.
+    pub(crate) connects: Arc<Connects>,
 }
 
 impl ServerEntry {
@@ -407,6 +500,65 @@ impl ServerEntry {
         })
     }
 
+    /// The refusal a connect ended by a shutdown answers with.
+    pub(crate) fn shutdown_refusal(&self) -> MekaError {
+        MekaError::McpConnection {
+            server_name: self.server_name.clone(),
+            message: "is shutting down".to_string(),
+        }
+    }
+
+    /// The protocol version this entry's connection speaks, when it has one: the server's answer
+    /// to the probe, or the one `initialize` settled on.
+    pub(crate) async fn protocol_version(&self) -> Option<ProtocolVersion> {
+        match &*self.state.read().await {
+            ServerState::Connected { service } => service
+                .peer()
+                .peer_info()
+                .map(|info| info.protocol_version.clone()),
+            _ => None,
+        }
+    }
+
+    /// Make `service` this entry's connection: the state, the instructions the handshake or the
+    /// discover carried, and what the model subscribed to, carried over onto it.
+    ///
+    /// The one door onto `Connected`, for the first connect, the cold-start retry and a reconnect
+    /// alike, so none of them can leave a subscription behind on the connection that closed, and
+    /// none can bring a server up behind a shutdown: a connect that lands once the stop has fired
+    /// is refused here, under the state lock the shutdown takes after firing it, and `service`
+    /// is closed, child and all. The set is carried over beside the connection rather
+    /// than ahead of it, so a server slow to acknowledge its stream delays no tool discovery and
+    /// no call waiting on a reconnect.
+    pub(crate) async fn adopt_connection(
+        self: &Arc<Self>,
+        service: McpRunningService,
+    ) -> Result<()> {
+        let mut state = self.state.write().await;
+        if self.connects.stopping().is_cancelled() {
+            drop(state);
+            // Closed rather than dropped: a drop leaves the transport to a task the runtime may
+            // never poll again on its way out, and with it the child a stdio transport owns.
+            close_service(&self.server_name, service).await;
+            return Err(self.shutdown_refusal());
+        }
+        self.record_instructions(
+            service
+                .peer()
+                .peer_info()
+                .and_then(|info| info.instructions.clone()),
+        );
+        *state = ServerState::Connected {
+            service: Arc::new(service),
+        };
+        drop(state);
+        tokio::spawn({
+            let entry = Arc::clone(self);
+            async move { subscriptions::resume(&entry).await }
+        });
+        Ok(())
+    }
+
     /// Transport-close check used by [`Self::reconnect`]. Returns false if the server isn't
     /// `Connected` (there's nothing to reconnect).
     async fn needs_reconnect(&self) -> bool {
@@ -424,9 +576,8 @@ impl ServerEntry {
     /// it to the background retry, so `meka mcp list` says what is true and a later call is
     /// refused in the state's words rather than paying the whole backoff again.
     ///
-    /// Schedule: 1s, 2s, 4s, 8s, 16s, capped at 30s, max 5 attempts. Only remote (HTTP) transports
-    /// go through backoff; a dead stdio child has to be respawned and retry-after-sleep doesn't
-    /// help.
+    /// Schedule: five attempts, 1 s, 2 s, 4 s and 8 s apart. Only remote (HTTP) transports go
+    /// through backoff; a dead stdio child has to be respawned and retry-after-sleep doesn't help.
     pub(crate) async fn reconnect(
         self: &Arc<Self>,
         cancellation: &tokio_util::sync::CancellationToken,
@@ -459,7 +610,8 @@ impl ServerEntry {
     /// The connect future is `!Send` for an OAuth-authenticated server (rmcp's auth module holds a
     /// `!Sync` closure slot across an await), so each attempt is driven on a `spawn_blocking`
     /// thread with the outer runtime's `Handle` to keep `Tool::execute`'s `Send` bound satisfied.
-    /// A bound or a stop that fires leaves that thread to its own end; nothing waits on it.
+    /// The caller's stop leaves that thread to its own end; the bound and a shutdown end it from
+    /// inside its own future.
     async fn reconnect_attempts(
         self: &Arc<Self>,
         cancellation: &tokio_util::sync::CancellationToken,
@@ -472,43 +624,50 @@ impl ServerEntry {
         let mut last_error: Option<MekaError> = None;
         for attempt in 0..max_attempts {
             if attempt > 0 {
-                // 1s, 2s, 4s, 8s, 16s, capped at 30s.
+                // 1 s, 2 s, 4 s, 8 s between the five attempts.
                 let delay_secs = std::cmp::min(30u64, 1u64 << (attempt - 1));
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
                     _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
+                    _ = self.connects.stopping().cancelled() => return Err(self.shutdown_refusal()),
                 }
             }
             let handle = tokio::runtime::Handle::current();
-            let server_name = self.server_name.clone();
-            let config = self.config.clone();
-            let token_store = self.token_store.clone();
-            let client_context = Arc::clone(&self.client_context);
-
+            let entry = Arc::clone(self);
+            let connecting = self.connects.connecting();
+            // The bound and the stop sit inside the blocking thread's own future, which is the
+            // one thing that can end it: dropping the join handle out here abandons the thread,
+            // and with it the child the connect was spawning.
             let connect = tokio::task::spawn_blocking(move || {
-                handle.block_on(connector::connect_server(
-                    &server_name,
-                    &config,
-                    token_store.as_ref(),
-                    &client_context,
-                ))
+                let _connecting = connecting;
+                handle.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = entry.connects.stopping().cancelled() => None,
+                        result = tokio::time::timeout(bound, connector::connect_server(&entry)) => {
+                            Some(result.unwrap_or_else(|_elapsed| Err(MekaError::McpConnection {
+                                server_name: entry.server_name.clone(),
+                                message: format!("reconnect timed out after {bound:?}"),
+                            })))
+                        }
+                    }
+                })
             });
+            // Counted until the service is adopted or refused: the thread's own count ends when
+            // its future returns, and a shutdown must not pass between the two.
+            let landing = self.connects.connecting();
             let result = tokio::select! {
-                result = tokio::time::timeout(bound, connect) => result,
+                result = connect => result,
                 _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
             };
 
             match result {
-                Ok(Ok(Ok(new_service))) => {
-                    self.record_instructions(
-                        new_service
-                            .peer()
-                            .peer_info()
-                            .and_then(|info| info.instructions.clone()),
-                    );
-                    *self.state.write().await = ServerState::Connected {
-                        service: Arc::new(new_service),
-                    };
+                // Ended by a shutdown: the entry is about to be closed, so nothing is recorded
+                // against it and no retry spawned.
+                Ok(None) => return Err(self.shutdown_refusal()),
+                Ok(Some(Ok(new_service))) => {
+                    self.adopt_connection(new_service).await?;
+                    drop(landing);
                     tracing::info!(
                         "reconnected to MCP server '{server_name}' on attempt {attempt}",
                         server_name = self.server_name,
@@ -517,7 +676,7 @@ impl ServerEntry {
                     self.relist_after_reconnect().await;
                     return Ok(());
                 }
-                Ok(Ok(Err(error))) => {
+                Ok(Some(Err(error))) => {
                     let error = redact_mcp_error(error);
                     tracing::warn!(
                         "MCP server '{server_name}' reconnect attempt {attempt} failed: {error}",
@@ -526,7 +685,7 @@ impl ServerEntry {
                     );
                     last_error = Some(error);
                 }
-                Ok(Err(join_error)) => {
+                Err(join_error) => {
                     tracing::warn!(
                         "MCP server '{server_name}' reconnect task join error on attempt {attempt}: {join_error}",
                         server_name = self.server_name,
@@ -535,17 +694,6 @@ impl ServerEntry {
                     last_error = Some(MekaError::McpConnection {
                         server_name: self.server_name.clone(),
                         message: format!("reconnect task join error: {join_error}"),
-                    });
-                }
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        "MCP server '{server_name}' reconnect attempt {attempt} timed out after {bound:?}",
-                        server_name = self.server_name,
-                        attempt = attempt + 1
-                    );
-                    last_error = Some(MekaError::McpConnection {
-                        server_name: self.server_name.clone(),
-                        message: format!("reconnect timed out after {bound:?}"),
                     });
                 }
             }
@@ -621,7 +769,7 @@ impl ServerEntry {
 /// Runtime tuning for the background MCP connector. Pulled from `ResolvedConfig` by the binary; the
 /// manager uses it directly.
 pub(crate) struct McpRuntimeConfig {
-    /// Per-server wrap around connect + `initialize` + `list_tools`.
+    /// Per-server wrap around connect + the probe or `initialize` + `list_tools`.
     pub(crate) connect_timeout: std::time::Duration,
     /// Max concurrent stdio spawns, from `[mcp].stdio_concurrency`.
     pub(crate) stdio_concurrency: usize,
@@ -658,6 +806,7 @@ impl McpClientManager {
     ) -> Result<Arc<Self>> {
         let mut servers = HashMap::new();
         let mut pending: Vec<Arc<ServerEntry>> = Vec::new();
+        let connects = Connects::new();
 
         for original_config in configs {
             // Apply env-var substitution (`${VAR}` / `${VAR:-default}`) once, up-front, so the rest
@@ -755,6 +904,9 @@ impl McpClientManager {
                 request_timeout: OnceLock::new(),
                 background_retry: OnceLock::new(),
                 dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+                subscriptions: subscriptions::Subscriptions::default(),
+                legacy_era: std::sync::atomic::AtomicBool::new(false),
+                connects: Arc::clone(&connects),
             });
             // A refused entry is not pending: it is failed for good, and the connector's
             // post-settle retry only looks at what it was handed.
@@ -780,6 +932,7 @@ impl McpClientManager {
             tools_snapshot: tokio::sync::RwLock::new(HashMap::new()),
             observers: tokio::sync::RwLock::new(Vec::new()),
             connect_timeout: OnceLock::new(),
+            connects,
         });
         Ok(manager)
     }
@@ -1268,18 +1421,22 @@ impl McpClientManager {
     /// entry is left `Disabled` so a tool call arriving during teardown is refused rather than
     /// handed a service that is closing.
     ///
-    /// This does *not* stop a racing connect. `connect_one` and `reconnect` write `Connected`
-    /// unconditionally, and a `Pending` entry is left `Pending` here because it has nothing to
-    /// close, so a connector still working through its queue at exit can bring a server up behind
-    /// this loop and leave that child running. Shutting the connector down first is the fix, and is
-    /// not attempted here.
+    /// The connects in flight are ended first, and waited for: a connect runs on a blocking thread
+    /// the process would otherwise abandon at exit with the child it was spawning still alive. A
+    /// connect that ends on the token drops its transport, which kills the child, and leaves the
+    /// entry as it was; a connector still working through its queue finds every connect ending at
+    /// once and drains.
     pub(crate) async fn shutdown(&self) {
         /// Max time to wait for in-flight tool calls to complete before we drop the shared service
         /// Arc and let the drop-guard cancel it.
         const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
-        /// Max time to wait for `RunningService::close` to finish after the shared references are
-        /// released.
-        const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
+
+        if !self.connects.stop(CONNECT_UNWIND_GRACE).await {
+            tracing::warn!(
+                "an MCP connect did not end within {CONNECT_UNWIND_GRACE:?}; its child may outlive \
+                 this process"
+            );
+        }
 
         for (server_name, entry) in &self.servers {
             // Only Connected entries have a service to close; Pending / Failed / Disabled entries
@@ -1307,21 +1464,7 @@ impl McpClientManager {
             }
 
             match Arc::try_unwrap(service) {
-                Ok(mut owned_service) => {
-                    match owned_service.close_with_timeout(CLOSE_TIMEOUT).await {
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            tracing::warn!(
-                                "MCP server '{server_name}' shutdown timed out after {CLOSE_TIMEOUT:?}"
-                            );
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                "failed to shut down MCP server '{server_name}': {error}"
-                            );
-                        }
-                    }
-                }
+                Ok(owned_service) => close_service(server_name, owned_service).await,
                 Err(_arc) => {
                     tracing::debug!(
                         "MCP server '{server_name}' still had in-flight calls after {SHUTDOWN_GRACE:?}; \
@@ -1424,7 +1567,7 @@ pub(crate) fn truncate(text: &str, max_chars: usize) -> String {
 ///
 /// `biased` so a token already fired wins over a response arriving in the same instant: once the
 /// user has stopped the turn, the answer is not wanted whichever got there first.
-async fn bounded<T>(
+pub(super) async fn bounded<T>(
     entry: &Arc<ServerEntry>,
     what: &str,
     cancellation: &CancellationToken,
@@ -1479,27 +1622,41 @@ pub(crate) async fn read_resource(
     uri: String,
     cancellation: &CancellationToken,
 ) -> Result<ReadResourceResult> {
+    /// One attempt on the connection as it stands, through the rounds a modern server may ask
+    /// for. No frontend: a read has no call in flight to route an elicitation to, on either era.
+    async fn rounds(
+        entry: &Arc<ServerEntry>,
+        peer: Peer<RoleClient>,
+        mut params: ReadResourceRequestParams,
+    ) -> std::result::Result<ReadResourceResult, ServiceError> {
+        let mut rounds = handler::Rounds::new(&entry.server_name, None);
+        loop {
+            (params.input_responses, params.request_state) = rounds.carry();
+            match peer.read_resource_once(params.clone()).await? {
+                ReadResourceResponse::Complete(result) => return Ok(result),
+                ReadResourceResponse::InputRequired(result) => rounds.absorb(result).await?,
+                _ => return Err(ServiceError::UnexpectedResponse),
+            }
+        }
+    }
+
     bounded(entry, "resources/read", cancellation, async {
         let params = ReadResourceRequestParams::new(uri.clone());
+        let failed = |error: ServiceError| MekaError::McpConnection {
+            server_name: entry.server_name.clone(),
+            message: format!("failed to read resource '{uri}': {error}"),
+        };
         let peer = entry.require_connected().await?;
-        match peer.read_resource(params.clone()).await {
+        match rounds(entry, peer, params.clone()).await {
             Ok(result) => Ok(result),
             Err(ServiceError::TransportClosed) => {
                 entry
                     .reconnect(&tokio_util::sync::CancellationToken::new())
                     .await?;
                 let peer = entry.require_connected().await?;
-                peer.read_resource(params)
-                    .await
-                    .map_err(|error| MekaError::McpConnection {
-                        server_name: entry.server_name.clone(),
-                        message: format!("failed to read resource '{uri}': {error}"),
-                    })
+                rounds(entry, peer, params).await.map_err(failed)
             }
-            Err(error) => Err(MekaError::McpConnection {
-                server_name: entry.server_name.clone(),
-                message: format!("failed to read resource '{uri}': {error}"),
-            }),
+            Err(error) => Err(failed(error)),
         }
     })
     .await
@@ -1534,89 +1691,48 @@ pub(crate) async fn list_prompts(
     .await
 }
 
-// rmcp 3.1 deprecates `subscribe` / `unsubscribe` in favor of `Peer::listen`, but that is a
-// 2026-07-28 mechanism and meka negotiates 2025-11-25: `handler.rs`'s `get_info` pins that version.
-// rmcp gates its 2026-07-28 features on the *server's* reported version being at least that, so at
-// the version meka actually speaks `resources/subscribe` is the mechanism rather than a fallback,
-// and reaching for `listen` here would ask servers for a method they never negotiated.
-//
-// Switching is not a local edit either: notifications routed to a `Subscription` are deliberately
-// not delivered through `ClientHandler`, so `on_resource_updated` would stop firing and the
-// updates a poll would read would need a per-server pump task feeding them instead. That
-// belongs with the move to 2026-07-28, not ahead of it.
-#[allow(
-    deprecated,
-    reason = "`resources/subscribe` is the mechanism at the protocol version meka negotiates; see above"
-)]
-pub(crate) async fn subscribe_resource(
-    entry: &Arc<ServerEntry>,
-    uri: String,
-    cancellation: &CancellationToken,
-) -> Result<()> {
-    bounded(entry, "resources/subscribe", cancellation, async {
-        let peer = entry.require_connected().await?;
-        let params = rmcp::model::SubscribeRequestParams::new(uri.clone());
-        peer.subscribe(params)
-            .await
-            .map_err(|error| MekaError::McpConnection {
-                server_name: entry.server_name.clone(),
-                message: format!("failed to subscribe to '{uri}': {error}"),
-            })
-    })
-    .await
-}
-
-#[allow(
-    deprecated,
-    reason = "`resources/unsubscribe` is the mechanism at the protocol version meka negotiates; see `subscribe_resource`"
-)]
-pub(crate) async fn unsubscribe_resource(
-    entry: &Arc<ServerEntry>,
-    uri: String,
-    cancellation: &CancellationToken,
-) -> Result<()> {
-    bounded(entry, "resources/unsubscribe", cancellation, async {
-        let peer = entry.require_connected().await?;
-        let params = rmcp::model::UnsubscribeRequestParams::new(uri.clone());
-        peer.unsubscribe(params)
-            .await
-            .map_err(|error| MekaError::McpConnection {
-                server_name: entry.server_name.clone(),
-                message: format!("failed to unsubscribe from '{uri}': {error}"),
-            })
-    })
-    .await
-}
-
 pub(crate) async fn get_prompt(
     entry: &Arc<ServerEntry>,
     name: String,
     arguments: Option<serde_json::Map<String, serde_json::Value>>,
     cancellation: &CancellationToken,
 ) -> Result<GetPromptResult> {
+    /// One attempt on the connection as it stands, through the rounds a modern server may ask
+    /// for; no frontend, as for [`read_resource`].
+    async fn rounds(
+        entry: &Arc<ServerEntry>,
+        peer: Peer<RoleClient>,
+        mut params: GetPromptRequestParams,
+    ) -> std::result::Result<GetPromptResult, ServiceError> {
+        let mut rounds = handler::Rounds::new(&entry.server_name, None);
+        loop {
+            (params.input_responses, params.request_state) = rounds.carry();
+            match peer.get_prompt_once(params.clone()).await? {
+                GetPromptResponse::Complete(result) => return Ok(result),
+                GetPromptResponse::InputRequired(result) => rounds.absorb(result).await?,
+                _ => return Err(ServiceError::UnexpectedResponse),
+            }
+        }
+    }
+
     bounded(entry, "prompts/get", cancellation, async {
         let mut params = GetPromptRequestParams::new(name.clone());
         params.arguments = arguments;
-
+        let failed = |error: ServiceError| MekaError::McpConnection {
+            server_name: entry.server_name.clone(),
+            message: format!("failed to render prompt '{name}': {error}"),
+        };
         let peer = entry.require_connected().await?;
-        match peer.get_prompt(params.clone()).await {
+        match rounds(entry, peer, params.clone()).await {
             Ok(result) => Ok(result),
             Err(ServiceError::TransportClosed) => {
                 entry
                     .reconnect(&tokio_util::sync::CancellationToken::new())
                     .await?;
                 let peer = entry.require_connected().await?;
-                peer.get_prompt(params)
-                    .await
-                    .map_err(|error| MekaError::McpConnection {
-                        server_name: entry.server_name.clone(),
-                        message: format!("failed to render prompt '{name}': {error}"),
-                    })
+                rounds(entry, peer, params).await.map_err(failed)
             }
-            Err(error) => Err(MekaError::McpConnection {
-                server_name: entry.server_name.clone(),
-                message: format!("failed to render prompt '{name}': {error}"),
-            }),
+            Err(error) => Err(failed(error)),
         }
     })
     .await
@@ -2177,8 +2293,12 @@ mod tests {
     fn pending_entry(name: &str, transport: McpTransport) -> Arc<ServerEntry> {
         let mut config = McpServerConfig::for_test(name);
         config.transport = transport;
+        pending_entry_for(config)
+    }
+
+    fn pending_entry_for(config: McpServerConfig) -> Arc<ServerEntry> {
         Arc::new(ServerEntry {
-            server_name: name.to_string(),
+            server_name: config.name.clone(),
             config,
             token_store: None,
             client_context: McpClientContext::new(),
@@ -2190,6 +2310,9 @@ mod tests {
             request_timeout: OnceLock::new(),
             background_retry: OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+            subscriptions: subscriptions::Subscriptions::default(),
+            legacy_era: std::sync::atomic::AtomicBool::new(false),
+            connects: Connects::new(),
         })
     }
 
@@ -2774,6 +2897,9 @@ mod tests {
             request_timeout: OnceLock::new(),
             background_retry: OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+            subscriptions: subscriptions::Subscriptions::default(),
+            legacy_era: std::sync::atomic::AtomicBool::new(false),
+            connects: Connects::new(),
         })
     }
 
@@ -3259,6 +3385,1091 @@ mod tests {
             matches!(state, ServerState::Failed { ref error, .. } if error.contains("MEKA_TEST_UNSET_SECRET_TOKEN")),
             "expected a refusal naming the variable, got: {}",
             state.label()
+        );
+    }
+
+    /// A frontend that accepts every elicitation with one answer, the way a user filling the form
+    /// would.
+    #[cfg(unix)]
+    struct AcceptingFrontend(serde_json::Value);
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl crate::frontend::Frontend for AcceptingFrontend {
+        async fn emit(&self, _event: crate::frontend::FrontendEvent) {}
+
+        async fn request_permission(
+            &self,
+            _request: crate::frontend::PermissionRequest,
+        ) -> crate::frontend::PermissionOutcome {
+            crate::frontend::PermissionOutcome::Allow
+        }
+
+        async fn handle_elicitation(
+            &self,
+            _prompt: crate::frontend::ElicitationPrompt,
+        ) -> crate::frontend::ElicitationResponse {
+            crate::frontend::ElicitationResponse::Accept {
+                content: Some(self.0.clone()),
+            }
+        }
+    }
+
+    /// One stdio entry driving the stub under `tests/fixtures`, prepared and attached to a
+    /// registry but not connected, with the state the stub is to serve and a log of what it is
+    /// sent.
+    #[cfg(unix)]
+    struct StubServer {
+        state: std::path::PathBuf,
+        log: std::path::PathBuf,
+        context: Arc<McpClientContext>,
+        manager: Arc<McpClientManager>,
+        entry: Arc<ServerEntry>,
+        registry: crate::tools::ToolRegistry,
+        _temp: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl StubServer {
+        async fn prepare(state: serde_json::Value) -> Self {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path = temp.path().join("stub.json");
+            let log = temp.path().join("requests.jsonl");
+            let mut config = McpServerConfig::for_test("stub");
+            config.transport = McpTransport::Stdio;
+            config.url = None;
+            config.command = Some("python3".to_string());
+            config.args = Some(vec![
+                format!(
+                    "{}/tests/fixtures/mcp_stub_server.py",
+                    env!("CARGO_MANIFEST_DIR")
+                ),
+                path.display().to_string(),
+            ]);
+            let context = McpClientContext::new();
+            let manager = McpClientManager::prepare(
+                &[config],
+                None,
+                None,
+                Arc::clone(&context),
+                crate::config::DEFAULT_MCP_TOOL_TIMEOUT,
+            )
+            .await
+            .expect("prepare");
+            context.set_manager(Arc::downgrade(&manager));
+            let registry = crate::tools::ToolRegistry::new();
+            crate::tools::mcp_adapter::attach_session_registry(&manager, registry.clone()).await;
+            let entry = manager
+                .servers
+                .get("stub")
+                .cloned()
+                .expect("the configured entry");
+            let stub = Self {
+                state: path,
+                log,
+                context,
+                manager,
+                entry,
+                registry,
+                _temp: temp,
+            };
+            stub.write_state(state);
+            stub
+        }
+
+        /// Connect through the connector's door, as every host does.
+        async fn connect(&self) {
+            connector::connect_one(
+                Arc::clone(&self.entry),
+                Arc::clone(&self.manager),
+                None,
+                std::time::Duration::from_secs(20),
+            )
+            .await;
+        }
+
+        /// Give the stub new state. Written whole and renamed into place, so the stub's watcher
+        /// never reads half a file.
+        fn write_state(&self, mut state: serde_json::Value) {
+            state["log"] = serde_json::Value::String(self.log.display().to_string());
+            let staged = self.state.with_extension("tmp");
+            std::fs::write(&staged, state.to_string()).expect("write the stub's state");
+            std::fs::rename(&staged, &self.state).expect("move the stub's state into place");
+        }
+
+        /// The methods the stub has been sent so far, in order.
+        fn logged_methods(&self) -> Vec<String> {
+            let Ok(log) = std::fs::read_to_string(&self.log) else {
+                return Vec::new();
+            };
+            log.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter_map(|request| request["method"].as_str().map(str::to_string))
+                .collect()
+        }
+
+        fn sent(&self, method: &str) -> usize {
+            self.logged_methods()
+                .iter()
+                .filter(|sent| *sent == method)
+                .count()
+        }
+
+        async fn version(&self) -> String {
+            self.entry
+                .protocol_version()
+                .await
+                .map(|version| version.to_string())
+                .unwrap_or_default()
+        }
+
+        async fn tool(&self, name: &str) -> Arc<McpTool> {
+            self.manager
+                .tool_by_name(&format!("mcp__stub__{name}"))
+                .await
+                .expect("the stub's tool is registered")
+        }
+    }
+
+    /// Wait for `condition` to hold, up to `wait`.
+    #[cfg(unix)]
+    async fn eventually(
+        wait: std::time::Duration,
+        mut condition: impl AsyncFnMut() -> bool,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + wait;
+        while tokio::time::Instant::now() < deadline {
+            if condition().await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        condition().await
+    }
+
+    #[cfg(unix)]
+    fn call_context(frontend: Arc<dyn crate::frontend::Frontend>) -> CallContext {
+        CallContext {
+            session_id: None,
+            tool_call_id: Some("tu-1".to_string()),
+            frontend,
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn text_of(result: &rmcp::model::CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                rmcp::model::ContentBlock::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The probe settles the era with each server: one that answers `server/discover` is spoken
+    /// to as 2026-07-28 and never sent an `initialize`, one that does not know the method gets
+    /// the `initialize` of 2025-11-25 on the same process. Both carry their instructions.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_probe_settles_the_era_with_each_server() {
+        let modern = StubServer::prepare(serde_json::json!({
+            "tools": ["search"], "instructions": "call search first"
+        }))
+        .await;
+        modern.connect().await;
+        assert_eq!(modern.version().await, "2026-07-28");
+        assert_eq!(
+            modern.entry.instructions().as_deref(),
+            Some("call search first")
+        );
+        assert!(modern.registry.get("mcp__stub__search").is_some());
+        let sent = modern.logged_methods();
+        assert_eq!(sent.first().map(String::as_str), Some("server/discover"));
+        assert!(
+            !sent.iter().any(|method| method == "initialize"),
+            "{sent:?}"
+        );
+        assert!(
+            eventually(std::time::Duration::from_secs(5), async || modern
+                .sent("subscriptions/listen")
+                == 1)
+            .await,
+            "{:?}",
+            modern.logged_methods()
+        );
+
+        let legacy = StubServer::prepare(serde_json::json!({
+            "tools": ["search"], "instructions": "legacy", "legacy_only": true
+        }))
+        .await;
+        legacy.connect().await;
+        assert_eq!(legacy.version().await, "2025-11-25");
+        assert_eq!(legacy.entry.instructions().as_deref(), Some("legacy"));
+        assert!(legacy.registry.get("mcp__stub__search").is_some());
+        assert_eq!(&legacy.logged_methods()[..2], [
+            "server/discover",
+            "initialize"
+        ]);
+        assert_eq!(legacy.sent("subscriptions/listen"), 0);
+    }
+
+    /// A child that exits on the probe takes the transport the fallback needed, so it is spawned
+    /// once more for the legacy handshake alone: the probe on one process, `initialize` first on
+    /// the next.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_server_that_dies_on_the_probe_is_spawned_again_as_legacy() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": ["search"], "exit_on_probe": true
+        }))
+        .await;
+        stub.connect().await;
+        assert_eq!(
+            stub.version().await,
+            "2025-11-25",
+            "{:?}",
+            stub.entry.state().await.label()
+        );
+        assert_eq!(&stub.logged_methods()[..2], [
+            "server/discover",
+            "initialize"
+        ]);
+        assert!(stub.registry.get("mcp__stub__search").is_some());
+    }
+
+    /// A server that swallows the probe and everything after it is taken for legacy once the
+    /// window passes, and spoken to on a child of its own; the verdict is kept, so the next connect
+    /// sends `initialize` first and pays no window.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_server_that_swallows_the_probe_is_legacy_after_the_window_and_stays_so() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": ["search"], "ignore_probe": true
+        }))
+        .await;
+        // Half of this is the probe's window.
+        stub.entry
+            .request_timeout
+            .set(std::time::Duration::from_secs(2))
+            .expect("unset until now");
+        let started = std::time::Instant::now();
+        stub.connect().await;
+        assert_eq!(
+            stub.version().await,
+            "2025-11-25",
+            "{:?}",
+            stub.entry.state().await.label()
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(1),
+            "the probe is given its window before the server is taken for legacy"
+        );
+        assert_eq!(&stub.logged_methods()[..2], [
+            "server/discover",
+            "initialize"
+        ]);
+
+        let again = connector::connect_server(&stub.entry)
+            .await
+            .expect("the second connect");
+        drop(again);
+        assert_eq!(
+            stub.sent("server/discover"),
+            1,
+            "{:?}",
+            stub.logged_methods()
+        );
+        assert_eq!(stub.sent("initialize"), 2);
+    }
+
+    /// A connect still in flight when the manager shuts down ends with it, and the child it was
+    /// spawning dies: the thread the connect runs on would otherwise be abandoned at exit with
+    /// the child alive and nothing left to kill it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shutdown_ends_a_connect_in_flight_and_its_child() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": ["search"], "ignore_probe": true
+        }))
+        .await;
+        // The stub's processes are the ones whose command line names this test's state file.
+        let marker = stub.state.display().to_string();
+        let children = move || -> usize {
+            std::process::Command::new("pgrep")
+                .args(["-f", &marker])
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).lines().count())
+                .unwrap_or(0)
+        };
+
+        let connecting = tokio::spawn({
+            let entry = Arc::clone(&stub.entry);
+            let manager = Arc::clone(&stub.manager);
+            async move {
+                connector::connect_one(entry, manager, None, std::time::Duration::from_secs(60))
+                    .await;
+            }
+        });
+        assert!(
+            eventually(std::time::Duration::from_secs(5), async || children() >= 1).await,
+            "the probe child was never spawned"
+        );
+
+        stub.manager.shutdown_within(SHUTDOWN_BUDGET).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), connecting)
+            .await
+            .expect("the connect ends with the shutdown rather than running its course")
+            .expect("the connect task");
+        assert!(
+            eventually(std::time::Duration::from_secs(3), async || children() == 0).await,
+            "the child outlived the shutdown"
+        );
+        assert!(
+            matches!(stub.entry.state().await, ServerState::Pending),
+            "nothing is recorded against a server that was never given its chance"
+        );
+    }
+
+    /// A reconnect still in flight when the manager shuts down ends with it too, child included:
+    /// it runs on a blocking thread of its own, bounded by the request timeout, which a shutdown
+    /// would otherwise wait out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shutdown_ends_a_reconnect_in_flight_and_its_child() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": ["search"], "legacy_only": true, "exit_after": 1
+        }))
+        .await;
+        let marker = stub.state.display().to_string();
+        let children = move || -> usize {
+            std::process::Command::new("pgrep")
+                .args(["-f", &marker])
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).lines().count())
+                .unwrap_or(0)
+        };
+        stub.connect().await;
+        assert!(
+            eventually(std::time::Duration::from_secs(10), async || stub
+                .entry
+                .needs_reconnect()
+                .await)
+            .await,
+            "the stub was supposed to exit after its first listing"
+        );
+        // The process the reconnect spawns answers nothing, so the reconnect sits in its bound.
+        stub.write_state(serde_json::json!({"tools": ["search"], "mute": true}));
+        let reconnecting = tokio::spawn({
+            let entry = Arc::clone(&stub.entry);
+            async move { entry.reconnect(&CancellationToken::new()).await }
+        });
+        assert!(
+            eventually(std::time::Duration::from_secs(5), async || children() >= 1).await,
+            "the reconnect never spawned its child"
+        );
+
+        stub.manager.shutdown_within(SHUTDOWN_BUDGET).await;
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), reconnecting)
+            .await
+            .expect("the reconnect ends with the shutdown rather than waiting out its bound")
+            .expect("the reconnect task");
+        assert!(
+            outcome.is_err(),
+            "a reconnect the shutdown ended did not succeed"
+        );
+        assert!(
+            eventually(std::time::Duration::from_secs(3), async || children() == 0).await,
+            "the child outlived the shutdown"
+        );
+    }
+
+    /// A frontend that never answers, as a user who has stepped away.
+    #[cfg(unix)]
+    struct AbsentFrontend;
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl crate::frontend::Frontend for AbsentFrontend {
+        async fn emit(&self, _event: crate::frontend::FrontendEvent) {}
+
+        async fn request_permission(
+            &self,
+            _request: crate::frontend::PermissionRequest,
+        ) -> crate::frontend::PermissionOutcome {
+            crate::frontend::PermissionOutcome::Allow
+        }
+
+        async fn handle_elicitation(
+            &self,
+            _prompt: crate::frontend::ElicitationPrompt,
+        ) -> crate::frontend::ElicitationResponse {
+            std::future::pending().await
+        }
+    }
+
+    /// An interrupt while a modern server's question is on screen ends the call at once, as it
+    /// does with the request in flight; the round is not the user's wait to sit out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_interrupt_during_a_form_ends_the_call_at_once() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": ["search"],
+            "elicit": {"message": "Name?", "schema": {"type": "object", "properties": {}}}
+        }))
+        .await;
+        stub.connect().await;
+        let tool = stub.tool("search").await;
+        let cancellation = CancellationToken::new();
+        let calling = tokio::spawn({
+            let tool = Arc::clone(&tool);
+            let cancellation = cancellation.clone();
+            async move {
+                let context = CallContext {
+                    session_id: None,
+                    tool_call_id: Some("tu-1".to_string()),
+                    frontend: Arc::new(AbsentFrontend),
+                    cancellation,
+                };
+                tool.call(None, &context).await
+            }
+        });
+        assert!(
+            eventually(std::time::Duration::from_secs(5), async || stub
+                .sent("tools/call")
+                == 1)
+            .await,
+            "the first round was never sent"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancellation.cancel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), calling)
+            .await
+            .expect("the call ends on the interrupt, not on the form's timeout")
+            .expect("the call task");
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "an interrupted call is interrupted: {outcome:?}"
+        );
+    }
+
+    /// A resource read and a prompt render take the rounds a modern server asks for too, with no
+    /// one to ask: the elicitation is declined and the server answers the retry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_resource_read_and_a_prompt_render_take_the_rounds_a_modern_server_asks_for() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": [], "resources": ["file:///a"], "prompts": ["p"],
+            "elicit_reads": true, "elicit_prompts": true,
+            "elicit": {"message": "Name?", "schema": {"type": "object", "properties": {}}}
+        }))
+        .await;
+        stub.connect().await;
+        let cancellation = CancellationToken::new();
+
+        let read = read_resource(&stub.entry, "file:///a".to_string(), &cancellation)
+            .await
+            .expect("the read completes on the second round");
+        let text = match &read.contents[0] {
+            rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.clone(),
+            other => panic!("text was expected: {other:?}"),
+        };
+        assert!(
+            text.contains(r#""action": "decline""#) && text.contains("after round-1"),
+            "{text}"
+        );
+        assert_eq!(stub.sent("resources/read"), 2);
+
+        let rendered = get_prompt(&stub.entry, "p".to_string(), None, &cancellation)
+            .await
+            .expect("the render completes on the second round");
+        let text = match &rendered.messages[0].content {
+            rmcp::model::ContentBlock::Text(text) => text.text.clone(),
+            other => panic!("text was expected: {other:?}"),
+        };
+        assert!(
+            text.contains(r#""action": "decline""#) && text.contains("after round-1"),
+            "{text}"
+        );
+        assert_eq!(stub.sent("prompts/get"), 2);
+    }
+
+    /// A modern server pushes nothing on its own: its tool changes arrive on the stream meka
+    /// opened at connect, and reach the registry the way a legacy server's notification does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_modern_server_s_tool_changes_arrive_on_its_stream() {
+        let stub = StubServer::prepare(serde_json::json!({"tools": ["search"]})).await;
+        stub.connect().await;
+        assert!(stub.registry.get("mcp__stub__search").is_some());
+        assert!(
+            eventually(std::time::Duration::from_secs(5), async || stub
+                .sent("subscriptions/listen")
+                == 1)
+            .await,
+            "{:?}",
+            stub.logged_methods()
+        );
+
+        stub.write_state(serde_json::json!({
+            "tools": ["search", "create_page"],
+            "notify": {"seq": 1, "tools_list_changed": true}
+        }));
+        assert!(
+            eventually(std::time::Duration::from_secs(10), async || stub
+                .registry
+                .get("mcp__stub__create_page")
+                .is_some())
+            .await,
+            "the tool the server added never reached the registry: {:?}",
+            stub.logged_methods()
+        );
+    }
+
+    /// On a modern server a subscription is the stream's filter: accepted when the acknowledgment
+    /// names the URI, refused when it leaves it out. The set keeps only what was accepted, so the
+    /// updates arrive for the one and the other is not asked for again; every change re-issues
+    /// the stream.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_modern_subscription_is_the_stream_s_filter() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": [], "resources": ["file:///a"]
+        }))
+        .await;
+        stub.connect().await;
+        let cancellation = CancellationToken::new();
+
+        subscriptions::subscribe(&stub.entry, "file:///a".to_string(), &cancellation)
+            .await
+            .expect("a URI the server offers is accepted");
+        let refused =
+            subscriptions::subscribe(&stub.entry, "file:///nope".to_string(), &cancellation)
+                .await
+                .expect_err("a URI the server does not offer is refused");
+        assert!(
+            refused
+                .to_string()
+                .contains("does not accept a subscription to 'file:///nope'"),
+            "{refused}"
+        );
+        assert_eq!(stub.entry.subscriptions.uris(), vec!["file:///a"]);
+
+        stub.write_state(serde_json::json!({
+            "tools": [], "resources": ["file:///a"],
+            "notify": {"seq": 1, "resources_updated": ["file:///a"]}
+        }));
+        assert!(
+            eventually(std::time::Duration::from_secs(10), async || stub
+                .context
+                .resource_updates
+                .snapshot()
+                .iter()
+                .any(|(server, uri, _)| server == "stub" && uri == "file:///a"))
+            .await,
+            "the update never reached the ledger: {:?}",
+            stub.logged_methods()
+        );
+
+        subscriptions::unsubscribe(&stub.entry, "file:///a".to_string(), &cancellation)
+            .await
+            .expect("unsubscribed");
+        assert!(stub.entry.subscriptions.uris().is_empty());
+        assert!(
+            eventually(std::time::Duration::from_secs(5), async || stub
+                .sent("subscriptions/listen")
+                == 4)
+            .await,
+            "one stream at connect and one per change: {:?}",
+            stub.logged_methods()
+        );
+        assert_eq!(stub.sent("resources/subscribe"), 0);
+    }
+
+    /// A legacy subscription is a request the server forgets with the connection, so the set is
+    /// asked for again on the next one and the updates keep coming.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_legacy_subscription_is_made_again_on_the_next_connection() {
+        let state = serde_json::json!({
+            "tools": ["search"], "resources": ["file:///a"], "legacy_only": true, "exit_after": 2
+        });
+        let stub = StubServer::prepare(state.clone()).await;
+        stub.connect().await;
+        assert_eq!(stub.version().await, "2025-11-25");
+        subscriptions::subscribe(
+            &stub.entry,
+            "file:///a".to_string(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("subscribed");
+        assert_eq!(stub.sent("resources/subscribe"), 1);
+
+        // A second listing is the stub's cue to exit, which closes the transport under meka.
+        let _closing = stub
+            .entry
+            .list_tools_bounded(std::time::Duration::from_secs(5))
+            .await;
+        assert!(
+            eventually(std::time::Duration::from_secs(10), async || stub
+                .entry
+                .needs_reconnect()
+                .await)
+            .await,
+            "the stub was supposed to exit and close the transport"
+        );
+        stub.entry
+            .reconnect(&CancellationToken::new())
+            .await
+            .expect("reconnect");
+
+        assert!(
+            eventually(std::time::Duration::from_secs(5), async || stub
+                .sent("resources/subscribe")
+                == 2)
+            .await,
+            "the new connection was not asked for the subscription: {:?}",
+            stub.logged_methods()
+        );
+        assert_eq!(stub.entry.subscriptions.uris(), vec!["file:///a"]);
+
+        let mut notifying = state;
+        notifying["notify"] = serde_json::json!({"seq": 1, "resources_updated": ["file:///a"]});
+        stub.write_state(notifying);
+        assert!(
+            eventually(std::time::Duration::from_secs(10), async || stub
+                .context
+                .resource_updates
+                .snapshot()
+                .iter()
+                .any(|(server, uri, _)| server == "stub" && uri == "file:///a"))
+            .await,
+            "the update never reached the ledger on the new connection"
+        );
+
+        subscriptions::unsubscribe(
+            &stub.entry,
+            "file:///a".to_string(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("unsubscribed");
+        assert_eq!(
+            stub.sent("resources/unsubscribe"),
+            1,
+            "a legacy server is told the subscription is over: {:?}",
+            stub.logged_methods()
+        );
+        assert!(stub.entry.subscriptions.uris().is_empty());
+    }
+
+    /// A modern server asks for input in its answer rather than with a request of its own, and
+    /// the call's own frontend answers: an accepting one puts the content in the retry, a
+    /// declining one its decline, and the server's state goes back as it came.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_input_required_answer_is_fulfilled_through_the_call_s_frontend() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": ["search"],
+            "elicit": {"message": "Name?", "schema": {
+                "type": "object", "properties": {"name": {"type": "string"}}
+            }}
+        }))
+        .await;
+        stub.connect().await;
+        let tool = stub.tool("search").await;
+
+        let accepting = Arc::new(AcceptingFrontend(serde_json::json!({"name": "octocat"})));
+        let result = tool
+            .call(None, &call_context(accepting))
+            .await
+            .expect("the call completes on the second round");
+        let text = text_of(&result);
+        assert!(
+            text.contains(r#""name": "octocat""#) && text.contains("after round-1"),
+            "{text}"
+        );
+        assert_eq!(stub.sent("tools/call"), 2);
+
+        let declining = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        let text = text_of(
+            &tool
+                .call(None, &call_context(declining))
+                .await
+                .expect("a decline is an answer too"),
+        );
+        assert!(text.contains(r#""action": "decline""#), "{text}");
+    }
+
+    /// A server that asks on every round is cut off at the cap rather than asked forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_server_that_never_stops_asking_is_cut_off_at_the_round_cap() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": ["search"],
+            "elicit": {"message": "Again?", "repeat": true, "schema": {
+                "type": "object", "properties": {}
+            }}
+        }))
+        .await;
+        stub.connect().await;
+        let tool = stub.tool("search").await;
+        let accepting = Arc::new(AcceptingFrontend(serde_json::json!({})));
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tool.call(None, &call_context(accepting)),
+        )
+        .await
+        .expect("the cap ends the call long before the tool's timeout would")
+        .expect_err("the cap ends the call");
+        assert!(error.to_string().contains("round"), "{error}");
+        assert_eq!(
+            stub.sent("tools/call"),
+            rmcp::model::DEFAULT_MRTR_MAX_ROUNDS,
+            "{:?}",
+            stub.logged_methods()
+        );
+    }
+
+    /// Progress is found by the token rmcp mints, the one the server echoes: a token chosen here
+    /// matches no notification, and the frontend never sees the line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_progress_notification_reaches_the_call_s_frontend() {
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": ["search"], "progress": true
+        }))
+        .await;
+        stub.connect().await;
+        let tool = stub.tool("search").await;
+        let recorder = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        tool.call(
+            None,
+            &call_context(Arc::clone(&recorder) as Arc<dyn crate::frontend::Frontend>),
+        )
+        .await
+        .expect("the call completes");
+        assert!(
+            eventually(std::time::Duration::from_secs(5), async || recorder
+                .events()
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    crate::frontend::FrontendEvent::McpProgress(update)
+                        if update.message.as_deref() == Some("halfway")
+                            && update.tool_use_id.as_deref() == Some("tu-1")
+                )))
+            .await,
+            "no progress reached the frontend: {:?}",
+            recorder.events()
+        );
+    }
+
+    /// A shutdown ends a reconnect's attempts at once, whether it has begun before the one attempt
+    /// a stdio server gets or lands in the backoff between two of an HTTP server's: no backoff is
+    /// slept out, nothing is recorded over the state the shutdown leaves, and no background retry
+    /// is spawned for an entry about to be closed.
+    #[tokio::test]
+    async fn a_shutdown_ends_a_reconnect_s_attempts_at_once() {
+        async fn ended_at_once(entry: &Arc<ServerEntry>) {
+            let started = std::time::Instant::now();
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                entry.reconnect_attempts(&tokio_util::sync::CancellationToken::new()),
+            )
+            .await
+            .expect("the stop ends the attempts, not their backoff");
+            assert!(
+                matches!(
+                    outcome,
+                    Err(MekaError::McpConnection { ref message, .. }) if message == "is shutting down"
+                ),
+                "{outcome:?}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "{:?}",
+                started.elapsed()
+            );
+            assert!(
+                matches!(entry.state().await, ServerState::Pending),
+                "nothing is recorded against an entry the shutdown is closing"
+            );
+        }
+
+        let local = pending_entry("local", McpTransport::Stdio);
+        local.connects.stopping().cancel();
+        ended_at_once(&local).await;
+
+        // The first attempt is refused at once by a port nothing listens on, and the stop lands
+        // in the second's backoff: late enough that five refusals in a row, were there no
+        // backoff, would have ended the reconnect with the refusal instead.
+        let mut config = McpServerConfig::for_test("remote");
+        config.url = Some("http://127.0.0.1:9/mcp".to_string());
+        let remote = pending_entry_for(config);
+        let stop = tokio::spawn({
+            let connects = Arc::clone(&remote.connects);
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                connects.stopping().cancel();
+            }
+        });
+        ended_at_once(&remote).await;
+        stop.await.expect("the stop landed");
+    }
+
+    /// A connect that lands once the shutdown has begun is refused at the one door onto
+    /// `Connected`, and the child it brought up dies with its service: the shutdown's own loop
+    /// may already have passed the entry, and a server brought up behind it would outlive meka.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_connect_that_lands_after_the_shutdown_began_is_refused() {
+        let stub = StubServer::prepare(serde_json::json!({"tools": ["search"]})).await;
+        let marker = stub.state.display().to_string();
+        let children = move || -> usize {
+            std::process::Command::new("pgrep")
+                .args(["-f", &marker])
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).lines().count())
+                .unwrap_or(0)
+        };
+        let service = connector::connect_server(&stub.entry)
+            .await
+            .expect("the connect itself succeeds");
+        assert!(children() >= 1, "the connected child is alive");
+
+        stub.entry.connects.stopping().cancel();
+        let refused = stub.entry.adopt_connection(service).await;
+        assert!(
+            matches!(
+                refused,
+                Err(MekaError::McpConnection { ref message, .. }) if message == "is shutting down"
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            matches!(stub.entry.state().await, ServerState::Pending),
+            "the entry stays as the shutdown found it"
+        );
+        assert!(
+            eventually(std::time::Duration::from_secs(3), async || children() == 0).await,
+            "the child outlived the refused connect"
+        );
+    }
+
+    /// A connect bound that cuts the legacy handshake leaves no verdict: the next connect probes
+    /// again, so a server that was only slow once, or that speaks only 2026-07-28, is not sent
+    /// `initialize` first for the rest of the process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_bound_that_cuts_the_legacy_handshake_leaves_no_verdict() {
+        let stub =
+            StubServer::prepare(serde_json::json!({"tools": ["search"], "mute": true})).await;
+        // Half of this is the probe's window, which the second connect below has to answer the
+        // probe within; the bound cuts the handshake that follows the first probe.
+        stub.entry
+            .request_timeout
+            .set(std::time::Duration::from_secs(6))
+            .expect("unset until now");
+        connector::connect_one(
+            Arc::clone(&stub.entry),
+            Arc::clone(&stub.manager),
+            None,
+            std::time::Duration::from_secs(7),
+        )
+        .await;
+        assert!(
+            matches!(stub.entry.state().await, ServerState::Failed { .. }),
+            "{:?}",
+            stub.entry.state().await.label()
+        );
+        assert!(
+            !stub
+                .entry
+                .legacy_era
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "a handshake the bound cut is no verdict"
+        );
+
+        stub.write_state(serde_json::json!({"tools": ["search"]}));
+        let service = connector::connect_server(&stub.entry)
+            .await
+            .expect("the next connect");
+        assert_eq!(
+            service
+                .peer()
+                .peer_info()
+                .map(|info| info.protocol_version.to_string())
+                .as_deref(),
+            Some("2026-07-28"),
+            "the next connect probed again and found a modern server"
+        );
+        assert_eq!(
+            stub.sent("server/discover"),
+            2,
+            "{:?}",
+            stub.logged_methods()
+        );
+        drop(service);
+    }
+
+    /// A modern server may end the stream it was asked for, as one about to restart does, and a
+    /// proxy may cut the long request it rides on; the connection stands either way, and the
+    /// server sends nothing again until asked, so meka asks again and the changes keep arriving.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stream_the_server_ends_is_opened_again_while_the_connection_lives() {
+        let stub = StubServer::prepare(serde_json::json!({"tools": ["search"]})).await;
+        stub.connect().await;
+        assert!(
+            eventually(std::time::Duration::from_secs(5), async || stub
+                .sent("subscriptions/listen")
+                == 1)
+            .await,
+            "{:?}",
+            stub.logged_methods()
+        );
+
+        stub.write_state(serde_json::json!({
+            "tools": ["search"],
+            "notify": {"seq": 1, "end_streams": true}
+        }));
+        assert!(
+            eventually(std::time::Duration::from_secs(10), async || stub
+                .sent("subscriptions/listen")
+                == 2)
+            .await,
+            "no stream was opened in place of the one the server ended: {:?}",
+            stub.logged_methods()
+        );
+
+        stub.write_state(serde_json::json!({
+            "tools": ["search", "create_page"],
+            "notify": {"seq": 2, "tools_list_changed": true}
+        }));
+        assert!(
+            eventually(std::time::Duration::from_secs(10), async || stub
+                .registry
+                .get("mcp__stub__create_page")
+                .is_some())
+            .await,
+            "the change after the server's end never arrived: {:?}",
+            stub.logged_methods()
+        );
+        assert!(
+            matches!(stub.entry.state().await, ServerState::Connected { .. }),
+            "the connection stood throughout"
+        );
+    }
+
+    /// A stop waits for the connects in flight to unwind, and no longer than its grace: one that
+    /// ends while it waits is waited for, one that does not is given up on and said so.
+    #[tokio::test]
+    async fn a_stop_waits_for_the_connects_in_flight_and_no_longer_than_its_grace() {
+        let connects = Connects::new();
+        let in_flight = connects.connecting();
+        let ending = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            drop(in_flight);
+        });
+        let started = std::time::Instant::now();
+        assert!(
+            connects.stop(std::time::Duration::from_secs(5)).await,
+            "the one connect in flight ended within the grace"
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(150),
+            "the stop returned before the connect had ended: {:?}",
+            started.elapsed()
+        );
+        ending.await.expect("the connect's task");
+
+        let stuck = Connects::new();
+        let _never_ends = stuck.connecting();
+        let started = std::time::Instant::now();
+        assert!(
+            !stuck.stop(std::time::Duration::from_millis(100)).await,
+            "a connect that does not end is given up on"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+    }
+
+    /// The subscribe and unsubscribe tools reach the server the model named through its entry:
+    /// each changes the set, sends what the era calls for, and answers in its own words.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_subscription_tools_reach_the_server_the_model_named() {
+        use crate::{
+            conversation::ToolResultContent,
+            tools::{Tool, ToolContext},
+        };
+
+        fn text_of(output: &crate::tools::ToolOutput) -> String {
+            output
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ToolResultContent::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let stub = StubServer::prepare(serde_json::json!({
+            "tools": [], "resources": ["file:///a"]
+        }))
+        .await;
+        stub.connect().await;
+        let scope = Arc::new(crate::tools::ToolScope::new(
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+        ));
+        let arguments = serde_json::json!({"server": "stub", "uri": "file:///a"});
+
+        let subscribe = crate::tools::mcp_resources::SubscribeMcpResourceTool {
+            manager: Arc::clone(&stub.manager),
+            tool_scope: Arc::clone(&scope),
+        };
+        let output = subscribe
+            .execute(
+                arguments.clone(),
+                ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("subscribed");
+        assert!(
+            text_of(&output).contains("subscribed to 'file:///a' on server 'stub'"),
+            "{}",
+            text_of(&output)
+        );
+        assert_eq!(stub.entry.subscriptions.uris(), vec!["file:///a"]);
+
+        let unsubscribe = crate::tools::mcp_resources::UnsubscribeMcpResourceTool {
+            manager: Arc::clone(&stub.manager),
+            tool_scope: scope,
+        };
+        let output = unsubscribe
+            .execute(arguments, ToolContext::detached(CancellationToken::new()))
+            .await
+            .expect("unsubscribed");
+        assert!(
+            text_of(&output).contains("unsubscribed from 'file:///a' on server 'stub'"),
+            "{}",
+            text_of(&output)
+        );
+        assert!(stub.entry.subscriptions.uris().is_empty());
+        assert!(
+            eventually(std::time::Duration::from_secs(5), async || stub
+                .sent("subscriptions/listen")
+                == 3)
+            .await,
+            "one stream at connect and one per change: {:?}",
+            stub.logged_methods()
         );
     }
 }

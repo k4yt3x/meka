@@ -102,6 +102,10 @@ pub(crate) struct McpServerStateView {
     pub(crate) name: String,
     /// `pending`, `connected`, `failed` or `disabled`.
     pub(crate) state: String,
+    /// The MCP protocol version a `connected` server's connection speaks, such as `2026-07-28`;
+    /// absent in every other state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) protocol_version: Option<String>,
 }
 
 /// `GET /v1/mcp`: configured MCP servers and their current connection state.
@@ -127,13 +131,20 @@ pub(crate) async fn mcp(
     let names = manager.server_names();
     let mut servers = Vec::with_capacity(names.len());
     for name in names {
-        let server_state = match manager.server_entry(&name) {
-            Some(entry) => entry.state().await.label().to_string(),
-            None => "unknown".to_string(),
+        let (server_state, protocol_version) = match manager.server_entry(&name) {
+            Some(entry) => (
+                entry.state().await.label().to_string(),
+                entry
+                    .protocol_version()
+                    .await
+                    .map(|version| version.to_string()),
+            ),
+            None => ("unknown".to_string(), None),
         };
         servers.push(McpServerStateView {
             name,
             state: server_state,
+            protocol_version,
         });
     }
     Ok(Json(servers))

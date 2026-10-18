@@ -47,16 +47,24 @@ pub(crate) async fn list_servers(
     }
 
     // Resolve state once up front so the table output stays consistent even if a server connects
-    // mid-print.
-    let mut states: std::collections::HashMap<&str, &'static str> =
+    // mid-print. The protocol column is a connected server's negotiated version, and empty for
+    // every other state.
+    let mut states: std::collections::HashMap<&str, (String, String)> =
         std::collections::HashMap::new();
     if let Some(manager) = manager {
         for config in servers {
-            let label = match manager.server_entry(&config.name) {
-                Some(entry) => entry.state().await.label(),
-                None => "(unknown)",
+            let columns = match manager.server_entry(&config.name) {
+                Some(entry) => (
+                    entry.state().await.label().to_string(),
+                    entry
+                        .protocol_version()
+                        .await
+                        .map(|version| version.to_string())
+                        .unwrap_or_default(),
+                ),
+                None => ("(unknown)".to_string(), String::new()),
             };
-            states.insert(config.name.as_str(), label);
+            states.insert(config.name.as_str(), columns);
         }
     }
 
@@ -100,11 +108,12 @@ pub(crate) async fn list_servers(
 
             let mut row = vec![config.name.clone(), transport_label.to_string()];
             if with_state {
-                let state_label = states
+                let (state_label, protocol_version) = states
                     .get(config.name.as_str())
-                    .copied()
-                    .unwrap_or("(unknown)");
-                row.push(state_label.to_string());
+                    .cloned()
+                    .unwrap_or_else(|| ("(unknown)".to_string(), String::new()));
+                row.push(state_label);
+                row.push(protocol_version);
             }
             row.push(required_label.to_string());
             row.push(perm_label.to_string());
@@ -121,6 +130,7 @@ pub(crate) async fn list_servers(
     ];
     if with_state {
         columns.push(crate::text::Column::content("State"));
+        columns.push(crate::text::Column::content("Protocol"));
     }
     columns.extend([
         crate::text::Column::content("Required"),
@@ -512,7 +522,16 @@ pub(crate) async fn run_reconnect(
         connect_alone(&config, None, token_store, Arc::clone(&context)).await?;
 
     if connected {
-        tracing::info!("connected to '{name}'", name = config.name);
+        let version = match manager.server_entry(&config.name) {
+            Some(entry) => entry.protocol_version().await,
+            None => None,
+        };
+        match version {
+            Some(version) => {
+                tracing::info!("connected to '{name}' on MCP {version}", name = config.name)
+            }
+            None => tracing::info!("connected to '{name}'", name = config.name),
+        }
         manager.shutdown_arc().await;
         Ok(())
     } else {

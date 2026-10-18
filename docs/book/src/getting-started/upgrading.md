@@ -10,6 +10,21 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.78 to 0.79
+
+Nothing is renamed and no key is refused; two things change what a running deployment does.
+
+**Every MCP connect opens with a protocol probe.** A server that answers it is spoken to as MCP
+2026-07-28; one that does not gets the `initialize` handshake it had. A stdio server from before
+the probe existed may swallow it and answer nothing afterwards, so such a server is given up to
+ten seconds, or half of [`[mcp].connect_timeout`](../configuration/config-file.md#mcp-top-level-table)
+when that is less, on its first connect in a meka process before a fresh child gets `initialize`;
+the verdict is kept for the process, so later connects pay nothing. See
+[Connection lifecycle](../usage/mcp.md#connection-lifecycle).
+
+**Session archives are `format_version` 15.** A 0.78 archive imports as it is; a 0.79 archive
+carries the allow-list keys on every sub-agent spec, which 0.78 refuses to read by its version.
+
 ## 0.77 to 0.78
 
 **A blocking `POST /turn` holds its turn.** A request with `stream: false` whose client disconnects

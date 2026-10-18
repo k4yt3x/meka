@@ -1113,7 +1113,7 @@ pub(crate) enum ContentBlock {
     /// words under it, `body` the words alone. Its own block, so every reader shows the words as
     /// the person's, labeled by `class` and `source` rather than read back from the header, and a
     /// replay builds the prompt the live screen showed. `item_id` and `class` are absent on an
-    /// item recorded before the block existed.
+    /// item whose id and class are not known.
     Inbox {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<uuid::Uuid>,

@@ -91,9 +91,10 @@ pub(crate) struct SubagentSpec {
     pub(crate) denied_servers: Vec<String>,
     #[serde(default)]
     pub(crate) denied_tools: Vec<String>,
-    /// The allow-lists in force, sorted, or `None` for a side the spawn left unrestricted: the
-    /// one reading of an absent field that does not strip every worker spawned before the field
-    /// existed, and safe because an allow-list only ever narrows what the deny lists leave.
+    /// The allow-lists in force, sorted, or `None` for a side the spawn left unrestricted, which
+    /// is what a spec that lost the key reads as too: the one default here that is not the
+    /// restrictive one, and safe because an allow-list only ever narrows what the deny lists
+    /// leave, so a lost key widens nothing past them.
     #[serde(default)]
     pub(crate) allowed_servers: Option<Vec<String>>,
     #[serde(default)]
@@ -137,8 +138,7 @@ pub(crate) struct SubagentSpec {
     pub(crate) additional_readable_directories: Vec<PathBuf>,
     /// What the worker's shell and `web_fetch` may reach, never wider than its parent's at the
     /// spawn, and narrowed to the parent's setting now on a follow-up. A spec that lost the field
-    /// holds `none`, the restrictive reading; the ledger stamps `host` on every spec written
-    /// before the field existed, which is what those workers held.
+    /// holds `none`, the restrictive reading.
     #[serde(default = "crate::config::Network::none")]
     pub(crate) network: crate::config::Network,
     /// The profile the spawn call chose, when it chose one. Absent for a worker that runs on what

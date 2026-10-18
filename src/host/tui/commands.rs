@@ -305,6 +305,12 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                                 "failed: {}",
                                 crate::text::sanitize_to_line(&error, usize::MAX)
                             ),
+                            state @ crate::mcp::ServerState::Connected { .. } => {
+                                match entry.protocol_version().await {
+                                    Some(version) => format!("{}, MCP {version}", state.label()),
+                                    None => state.label().to_string(),
+                                }
+                            }
                             state => state.label().to_string(),
                         },
                         None => "(unknown)".to_string(),

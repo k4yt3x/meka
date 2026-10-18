@@ -598,7 +598,7 @@ Pass `--format json` for a structured export instead of rendered Markdown:
 meka session export 550e8400-e29b-41d4-a716-446655440000 --format json
 ```
 
-This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, and scratchpad entries. The archive carries `format_version: 14`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 13), which is brought forward as it is read. Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
+This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, and scratchpad entries. The archive carries `format_version: 15`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 14), which is brought forward as it is read. Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
 
 ## Importing a session
 

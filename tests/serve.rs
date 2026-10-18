@@ -8915,6 +8915,8 @@ fn mcp_routes_report_a_connected_server_and_its_tools() {
         std::thread::sleep(Duration::from_millis(100));
     };
     assert_eq!(servers.as_array().map(Vec::len), Some(1));
+    // The stub answers the probe, so the connection is modern, and the status says which era.
+    assert_eq!(servers[0]["protocol_version"], "2026-07-28", "{servers}");
 
     let tools: serde_json::Value = harness
         .request(reqwest::Method::GET, "/v1/mcp/stub/tools")

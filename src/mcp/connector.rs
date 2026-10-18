@@ -5,21 +5,23 @@
 //! Entries that fail their initial connect are retried here in the background until they come up;
 //! see [`retry_until_connected`].
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
 
 use super::{
-    MAX_MCP_DESCRIPTION_CHARS, McpClientContext, McpClientManager, McpRunningService,
-    McpRuntimeConfig, ServerEntry, ServerState,
+    MAX_MCP_DESCRIPTION_CHARS, McpClientManager, McpRunningService, McpRuntimeConfig, ServerEntry,
+    ServerState,
     handler::{McpTool, MekaClientHandler},
     resolve_tool_permission, tool_is_allowed,
     transport::{build_http_transport_config, build_stdio_command},
     truncate, warn_on_stale_tool_config,
 };
 use crate::{
-    config::{McpServerConfig, McpTransport},
+    config::McpTransport,
     error::{MekaError, Result},
     permission::Permission,
-    store::TokenStore,
 };
 
 /// First delay after a failed initial connect. Doubles per attempt up to [`MAX_RETRY_BACKOFF`].
@@ -29,6 +31,17 @@ pub(super) const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 /// rather than abandoned, because the alternative is a meka that stays broken until someone
 /// restarts it.
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(300);
+
+/// How long a stdio server has to answer the protocol probe before it is taken for legacy: rmcp's
+/// own allowance for the same wait on an HTTP connect, which it does not export. Bounded by half
+/// the connect timeout as well, so the legacy handshake that follows has the other half.
+const PROTOCOL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a stdio server's probe waits: [`PROTOCOL_PROBE_TIMEOUT`], or half of the connect
+/// timeout when that is less, so the legacy handshake that may follow has the other half.
+fn probe_window(request_timeout: Duration) -> Duration {
+    PROTOCOL_PROBE_TIMEOUT.min(request_timeout / 2)
+}
 
 /// Drive the actual connect work for every `Pending` entry, split into a stdio stream and an HTTP
 /// stream, each bounded by its own concurrency cap. Runs in a spawned task so
@@ -136,7 +149,10 @@ pub(super) async fn retry_until_connected(
 ) {
     let mut backoff = initial_backoff;
     loop {
-        tokio::time::sleep(backoff).await;
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = entry.connects.stopping().cancelled() => return,
+        }
 
         // Nothing holds the manager any more, so there is no registry left to heal into.
         let Some(manager) = manager.upgrade() else {
@@ -251,29 +267,33 @@ pub(crate) async fn connect_one(
     // with the outer runtime's `Handle`, as `reconnect` does.
     let handle = tokio::runtime::Handle::current();
     let entry_for_connect = Arc::clone(&entry);
-    let server_name_for_task = server_name.clone();
+    let connecting = entry.connects.connecting();
+    // The stop sits inside the blocking thread's own future, the one thing that can end it:
+    // dropping the join handle out here abandons the thread, and with it the child the connect
+    // was spawning.
     let connect_task = tokio::task::spawn_blocking(move || {
-        handle.block_on(async move {
-            tokio::time::timeout(
-                connect_timeout,
-                connect_server(
-                    &server_name_for_task,
-                    &entry_for_connect.config,
-                    entry_for_connect.token_store.as_ref(),
-                    &entry_for_connect.client_context,
-                ),
-            )
-            .await
+        let _connecting = connecting;
+        handle.block_on(async {
+            tokio::select! {
+                biased;
+                _ = entry_for_connect.connects.stopping().cancelled() => None,
+                result = tokio::time::timeout(connect_timeout, connect_server(&entry_for_connect)) => {
+                    Some(result)
+                }
+            }
         })
     });
 
+    // Counted until the service is adopted or refused: the thread's own count ends when its
+    // future returns, and a shutdown must not pass between the two.
+    let landing = entry.connects.connecting();
     let connected = match connect_task.await {
-        Ok(Ok(Ok(service))) => service,
+        Ok(Some(Ok(Ok(service)))) => service,
         // Store the bare cause. `MekaError::McpConnection` renders as
         // "MCP connection error: <server>: <message>", and every consumer of this string
         // (`meka mcp list`, the turn-gate summary, the agent-facing tool error) already names the
         // server, so keeping the prefix would say it twice.
-        Ok(Ok(Err(error))) => {
+        Ok(Some(Ok(Err(error)))) => {
             let cause = match &error {
                 MekaError::McpConnection { message, .. } => message.clone(),
                 other => other.to_string(),
@@ -281,11 +301,14 @@ pub(crate) async fn connect_one(
             record_connect_failure(&entry, &server_name, cause).await;
             return;
         }
-        Ok(Err(_elapsed)) => {
+        Ok(Some(Err(_elapsed))) => {
             let cause = format!("connect timed out after {connect_timeout:?}");
             record_connect_failure(&entry, &server_name, cause).await;
             return;
         }
+        // Ended by a shutdown: the entry is about to be closed, and a failure recorded now would
+        // announce a server that was never given its chance.
+        Ok(None) => return,
         Err(join_error) => {
             let cause = format!("connect task join error: {join_error}");
             record_connect_failure(&entry, &server_name, cause).await;
@@ -293,21 +316,20 @@ pub(crate) async fn connect_one(
         }
     };
 
-    tracing::info!("connected to MCP server '{server_name}'");
-
-    entry.record_instructions(
-        connected
-            .peer()
-            .peer_info()
-            .and_then(|info| info.instructions.clone()),
-    );
-
-    // Flip state to Connected BEFORE tool registration so `list_all_tools` below goes through the
-    // live peer via `require_connected`.
-    let service_arc = Arc::new(connected);
-    *entry.state.write().await = ServerState::Connected {
-        service: Arc::clone(&service_arc),
-    };
+    let version = connected
+        .peer()
+        .peer_info()
+        .map(|info| info.protocol_version.to_string())
+        .unwrap_or_default();
+    // Adopted before tool registration so `list_all_tools` below goes through the live peer via
+    // `require_connected`; refused once a shutdown has begun, when there is nothing left to
+    // register into.
+    if let Err(error) = entry.adopt_connection(connected).await {
+        tracing::debug!("MCP server '{server_name}' connected as meka was shutting down: {error}");
+        return;
+    }
+    drop(landing);
+    tracing::info!("connected to MCP server '{server_name}' on MCP {version}");
 
     // A failure here does not undo `Connected`: the server is reachable, only its tool list
     // failed, so it is warned about and the tool set left empty.
@@ -583,14 +605,15 @@ fn bearer_for_transport(
 /// The returned future is `!Send` when the server config uses OAuth, because rmcp's auth module
 /// holds a `!Sync` closure across an await. Callers that need a `Send` future (e.g. `Tool::execute`
 /// during reconnect) drive this on a `spawn_blocking` thread via [`ServerEntry::reconnect`].
-pub(super) async fn connect_server(
-    server_name: &str,
-    config: &McpServerConfig,
-    token_store: Option<&TokenStore>,
-    client_context: &Arc<McpClientContext>,
-) -> Result<McpRunningService> {
-    use rmcp::ServiceExt;
+pub(super) async fn connect_server(entry: &ServerEntry) -> Result<McpRunningService> {
+    use rmcp::{ClientServiceExt, ServiceExt, service::ClientInitializeError};
 
+    use super::handler::{http_lifecycle, stdio_probe};
+
+    let server_name = entry.server_name.as_str();
+    let config = &entry.config;
+    let token_store = entry.token_store.as_ref();
+    let client_context = &entry.client_context;
     let handler = MekaClientHandler::new(server_name.to_string(), Arc::clone(client_context));
 
     match config.transport {
@@ -605,57 +628,92 @@ pub(super) async fn connect_server(
                     })?;
 
             let args_vec: Vec<String> = config.args.clone().unwrap_or_default();
-            let command = build_stdio_command(command_str, &args_vec);
-            let mut command = command;
-            // Scrub the environment before layering the server's own `env` on top.
-            //
-            // A stdio MCP server is a child process that talks to the network, and an inherited
-            // environment hands it every variable meka was started with: `ANTHROPIC_API_KEY`,
-            // `AWS_*`, `GITHUB_TOKEN`, the lot. Configuring a server is a decision to run its code,
-            // not a decision to hand it every credential on the machine. What survives is the same
-            // curated base a read-mode shell gets (`PATH`, `HOME`, locale), so servers still
-            // resolve their own binaries; a server that genuinely needs a secret asks for it by
-            // name, and `${VAR}` in the `env` table still reads it from meka's environment.
-            command.env_clear();
-            command.envs(crate::sandbox::sandbox_child_env());
-            if let Some(env) = &config.env {
-                command.envs(env);
-            }
+            let spawn = || {
+                let mut command = build_stdio_command(command_str, &args_vec);
+                // Scrub the environment before layering the server's own `env` on top.
+                //
+                // A stdio MCP server is a child process that talks to the network, and an
+                // inherited environment hands it every variable meka was started with:
+                // `ANTHROPIC_API_KEY`, `AWS_*`, `GITHUB_TOKEN`, the lot. Configuring a server is a
+                // decision to run its code, not a decision to hand it every credential on the
+                // machine. What survives is the same curated base a read-mode shell gets (`PATH`,
+                // `HOME`, locale), so servers still resolve their own binaries; a server that
+                // genuinely needs a secret asks for it by name, and `${VAR}` in the `env` table
+                // still reads it from meka's environment.
+                command.env_clear();
+                command.envs(crate::sandbox::sandbox_child_env());
+                if let Some(env) = &config.env {
+                    command.envs(env);
+                }
+                // The child dies with its transport, synchronously. rmcp's own guard kills it from
+                // a task it spawns, which a runtime in teardown never runs, and a transport dropped
+                // there is otherwise the one way a server that ignores a closed stdin outlives
+                // meka.
+                command.kill_on_drop(true);
 
-            // No bound on an incoming line: rmcp 3.1's `TokioChildProcess` builds its transport
-            // with no seam to configure, and that transport's `receive` reads until newline into
-            // an unbounded `Vec` (`JsonRpcMessageCodec::max_length` applies to the write side
-            // only). Bounding it means spawning the child and building the transport here, which
-            // also means reimplementing the `ChildWithCleanup` drop guard that kills the child;
-            // getting that wrong is worse than the exposure, which is a buggy server the user chose
-            // to run rather than a hostile one. Revisit when rmcp exposes the read length.
-            //
-            // Stderr is piped rather than inherited because an MCP server that logs to stderr
-            // would otherwise write straight onto meka's terminal and corrupt the screen display.
-            let (transport, stderr) = rmcp::transport::TokioChildProcess::builder(command)
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .map_err(|error| MekaError::McpConnection {
-                    server_name: server_name.to_string(),
-                    // `NotFound` from spawn means the program isn't on PATH, which reads as a
-                    // bare "No such file or directory" without saying which file. Name it.
-                    message: if error.kind() == std::io::ErrorKind::NotFound {
-                        format!("failed to spawn process: '{command_str}' not found")
-                    } else {
-                        format!("failed to spawn process: {error}")
-                    },
-                })?;
-            if let Some(stderr) = stderr {
-                forward_child_stderr(server_name.to_string(), stderr);
-            }
+                // No bound on an incoming line: rmcp 3.1's `TokioChildProcess` builds its
+                // transport with no seam to configure, and that transport's `receive` reads until
+                // newline into an unbounded `Vec` (`JsonRpcMessageCodec::max_length` applies to
+                // the write side only). Bounding it means spawning the child and building the
+                // transport here, which also means reimplementing the `ChildWithCleanup` drop
+                // guard that kills the child; getting that wrong is worse than the exposure,
+                // which is a buggy server the user chose to run rather than a hostile one.
+                // Revisit when rmcp exposes the read length.
+                //
+                // Stderr is piped rather than inherited because an MCP server that logs to
+                // stderr would otherwise write straight onto meka's terminal and corrupt the
+                // screen display.
+                let (transport, stderr) = rmcp::transport::TokioChildProcess::builder(command)
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .map_err(|error| MekaError::McpConnection {
+                        server_name: server_name.to_string(),
+                        // `NotFound` from spawn means the program isn't on PATH, which reads as
+                        // a bare "No such file or directory" without saying which file. Name it.
+                        message: if error.kind() == std::io::ErrorKind::NotFound {
+                            format!("failed to spawn process: '{command_str}' not found")
+                        } else {
+                            format!("failed to spawn process: {error}")
+                        },
+                    })?;
+                if let Some(stderr) = stderr {
+                    forward_child_stderr(server_name.to_string(), stderr);
+                }
+                Ok::<_, MekaError>(transport)
+            };
+            let handshake_failed = |error: ClientInitializeError| MekaError::McpConnection {
+                server_name: server_name.to_string(),
+                message: format!("handshake failed: {error}"),
+            };
 
-            handler
-                .serve(transport)
-                .await
-                .map_err(|error| MekaError::McpConnection {
-                    server_name: server_name.to_string(),
-                    message: format!("handshake failed: {error}"),
-                })
+            // The probe gets a child of its own, and the legacy handshake another. A server from
+            // before the probe existed may swallow a method it does not know rather than refuse
+            // it, and one that has swallowed a request answers nothing afterwards, `initialize`
+            // included (rmcp 2.x servers do), so the fallback cannot ride the probe's transport.
+            // The verdict is kept on the entry once the legacy handshake has succeeded, so such a
+            // server costs the window once per process rather than on every reconnect; a
+            // handshake that fails or that the connect's bound cuts leaves none, so a server
+            // replaced or merely slow in the meantime is probed again.
+            if !entry.legacy_era.load(Ordering::Relaxed) {
+                let window = probe_window(entry.request_timeout());
+                let probe = handler
+                    .clone()
+                    .serve_with_lifecycle(spawn()?, stdio_probe());
+                match tokio::time::timeout(window, probe).await {
+                    Ok(Ok(service)) => return Ok(service),
+                    Ok(Err(error)) => tracing::debug!(
+                        "MCP server '{server_name}' did not answer the probe as a modern server \
+                         ({error}); it gets a legacy handshake on a child of its own"
+                    ),
+                    Err(_elapsed) => tracing::debug!(
+                        "MCP server '{server_name}' left the probe unanswered for {window:?}; it \
+                         gets a legacy handshake on a child of its own"
+                    ),
+                }
+            }
+            let service = handler.serve(spawn()?).await.map_err(handshake_failed)?;
+            entry.legacy_era.store(true, Ordering::Relaxed);
+            Ok(service)
         }
         McpTransport::Http => {
             let url = config
@@ -698,7 +756,7 @@ pub(super) async fn connect_server(
                     rmcp::transport::StreamableHttpClientTransport::from_config(transport_config);
 
                 handler
-                    .serve(transport)
+                    .serve_with_lifecycle(transport, http_lifecycle())
                     .await
                     .map_err(|error| MekaError::McpConnection {
                         server_name: server_name.to_string(),
@@ -716,7 +774,24 @@ mod tests {
     use tokio::sync::{Mutex, RwLock};
 
     use super::*;
-    use crate::config::{McpAuthConfig, McpServerConfig};
+    use crate::{
+        config::{McpAuthConfig, McpServerConfig},
+        mcp::McpClientContext,
+    };
+
+    /// The probe gets half the connect timeout, and never more than ten seconds of it.
+    #[test]
+    fn the_probe_window_is_half_the_connect_timeout_up_to_ten_seconds() {
+        assert_eq!(probe_window(Duration::from_secs(2)), Duration::from_secs(1));
+        assert_eq!(
+            probe_window(Duration::from_secs(20)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            probe_window(Duration::from_secs(60)),
+            Duration::from_secs(10)
+        );
+    }
 
     /// A stored bearer and an `[auth]` block cannot both be honored, and rmcp resolves the tie the
     /// wrong way round: it consults the authorization flow only when the transport carries no
@@ -847,6 +922,9 @@ mod tests {
             request_timeout: std::sync::OnceLock::new(),
             background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+            subscriptions: crate::mcp::subscriptions::Subscriptions::default(),
+            legacy_era: std::sync::atomic::AtomicBool::new(false),
+            connects: crate::mcp::Connects::new(),
         })
     }
 
@@ -877,6 +955,9 @@ mod tests {
             request_timeout: std::sync::OnceLock::new(),
             background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+            subscriptions: crate::mcp::subscriptions::Subscriptions::default(),
+            legacy_era: std::sync::atomic::AtomicBool::new(false),
+            connects: crate::mcp::Connects::new(),
         });
         let manager = McpClientManager::prepare(
             &[],
@@ -943,6 +1024,9 @@ mod tests {
             request_timeout: std::sync::OnceLock::new(),
             background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+            subscriptions: crate::mcp::subscriptions::Subscriptions::default(),
+            legacy_era: std::sync::atomic::AtomicBool::new(false),
+            connects: crate::mcp::Connects::new(),
         });
         let manager = McpClientManager::prepare(
             &[],
@@ -998,6 +1082,9 @@ mod tests {
             request_timeout: OnceLock::new(),
             background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+            subscriptions: crate::mcp::subscriptions::Subscriptions::default(),
+            legacy_era: std::sync::atomic::AtomicBool::new(false),
+            connects: crate::mcp::Connects::new(),
         });
 
         // The test never reaches tool discovery (the connect itself times out), so the manager
@@ -1058,6 +1145,9 @@ mod tests {
             request_timeout: OnceLock::new(),
             background_retry: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+            subscriptions: crate::mcp::subscriptions::Subscriptions::default(),
+            legacy_era: std::sync::atomic::AtomicBool::new(false),
+            connects: crate::mcp::Connects::new(),
         });
         let manager = McpClientManager::prepare(
             &[],

@@ -644,7 +644,7 @@ impl Tool for SubscribeMcpResourceTool {
             &self.tool_scope,
             &server,
         )?;
-        crate::mcp::subscribe_resource(&entry, uri.clone(), &cancellation)
+        crate::mcp::subscriptions::subscribe(&entry, uri.clone(), &cancellation)
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "mcp_resource_subscribe".to_string(),
@@ -698,7 +698,7 @@ impl Tool for UnsubscribeMcpResourceTool {
             &self.tool_scope,
             &server,
         )?;
-        crate::mcp::unsubscribe_resource(&entry, uri.clone(), &cancellation)
+        crate::mcp::subscriptions::unsubscribe(&entry, uri.clone(), &cancellation)
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "mcp_resource_unsubscribe".to_string(),

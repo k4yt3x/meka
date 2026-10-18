@@ -1,7 +1,7 @@
 //! Plumbing for forwarding MCP `notifications/progress` updates from servers up into the active
-//! frontend. The MCP protocol requires the client to announce a per-request `progressToken`; the
-//! server then emits progress notifications carrying that token. The [`McpClientContext`] keeps a
-//! map from token to (entry, frontend) so the rmcp notification dispatch (which runs on a
+//! frontend. rmcp announces a `progressToken` on every request it sends; the server then emits
+//! progress notifications carrying that token. The [`McpClientContext`] keeps a map from the
+//! server and token to the call's frontend so the rmcp notification dispatch (which runs on a
 //! separately-spawned task; see `rmcp::service::spawn_service_task`) can find the per-session UI
 //! even though it can't read the caller's task-local. RAII guards remove the entry when the
 //! in-flight call finishes so orphaned tokens don't pile up.
@@ -17,17 +17,25 @@ use rmcp::model::{NumberOrString, ProgressNotificationParam, ProgressToken};
 
 use crate::frontend::{Frontend, FrontendEvent, ProgressUpdate};
 
-/// The in-flight calls of one MCP client context. Per-call entries are keyed by progress token;
-/// the entry also owns the per-session frontend so the dispatch path can route events to the
-/// correct UI without relying on task-local propagation (which doesn't survive rmcp's
-/// spawned-handler tasks).
+/// The in-flight calls of one MCP client context. Per-call entries are keyed by the server and
+/// its progress token; the entry also owns the per-session frontend so the dispatch path can route
+/// events to the correct UI without relying on task-local propagation (which doesn't survive
+/// rmcp's spawned-handler tasks).
 #[derive(Default)]
 pub(crate) struct ProgressRegistry {
-    entries: Arc<Mutex<HashMap<String, Entry>>>,
+    entries: Arc<Mutex<HashMap<Key, Entry>>>,
+}
+
+/// What one in-flight request is found by. rmcp mints the token from a counter that starts at
+/// zero on every connection, so two servers with calls in flight hand out the same numbers and a
+/// token names a request only beside the server whose connection minted it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Key {
+    server_name: String,
+    token: String,
 }
 
 struct Entry {
-    server_name: String,
     tool_name: String,
     tool_use_id: Option<String>,
     /// The session's frontend that initiated this tool call. `None` outside an agent-driven call
@@ -37,58 +45,63 @@ struct Entry {
 }
 
 impl ProgressRegistry {
-    /// Register a freshly-generated progress token for an in-flight tool call. The frontend is
-    /// the calling session's, stored alongside the call context so the rmcp notification handler
-    /// can later look it up by token. Returns a [`ProgressGuard`] that removes the entry when
-    /// dropped, the standard `_progress_guard` binding the MCP tool adapter holds for the duration
-    /// of `peer.call_tool().await`.
+    /// Register an in-flight request to `server_name` under `token`, the one rmcp minted for it
+    /// and the server echoes. The frontend is the calling session's, stored alongside the call
+    /// context so the rmcp notification handler can later look it up by token. Returns a
+    /// [`ProgressGuard`] that removes the entry when dropped, the `_progress_guard` binding the
+    /// MCP tool adapter holds while the request is in flight.
     pub(crate) fn register(
         &self,
+        token: &ProgressToken,
         server_name: String,
         tool_name: String,
         tool_use_id: Option<String>,
         frontend: Option<Arc<dyn Frontend>>,
-    ) -> (ProgressToken, ProgressGuard) {
-        let token_str = format!("meka-{}", uuid::Uuid::new_v4());
-        let token = ProgressToken(NumberOrString::String(token_str.clone().into()));
-        crate::sync::lock(&self.entries).insert(token_str.clone(), Entry {
+    ) -> ProgressGuard {
+        let key = Key {
             server_name,
+            token: token_key(token),
+        };
+        crate::sync::lock(&self.entries).insert(key.clone(), Entry {
             tool_name,
             tool_use_id,
             frontend,
         });
-        (token, ProgressGuard {
+        ProgressGuard {
             entries: Arc::clone(&self.entries),
-            key: Some(token_str),
-        })
+            key: Some(key),
+        }
     }
 
     /// Called from `MekaClientHandler::on_progress` (the `ClientHandler` trait impl in
-    /// `src/mcp/handler.rs`). Looks up the registered context by token, forwards the update to
-    /// the per-session frontend, and emits an `info!` log line for the off-frontend audience
-    /// (e.g. a tail on the meka stderr).
-    pub(crate) async fn dispatch(&self, params: ProgressNotificationParam) {
-        let key = match &params.progress_token.0 {
-            NumberOrString::String(s) => s.to_string(),
-            NumberOrString::Number(n) => n.to_string(),
+    /// `src/mcp/handler.rs`) with the server the notification came from. Looks up the registered
+    /// context by server and token, forwards the update to the per-session frontend, and emits an
+    /// `info!` log line for the off-frontend audience (e.g. a tail on the meka stderr).
+    pub(crate) async fn dispatch(&self, server_name: &str, params: ProgressNotificationParam) {
+        let key = Key {
+            server_name: server_name.to_string(),
+            token: token_key(&params.progress_token),
         };
         let snapshot = {
             let entries = crate::sync::lock(&self.entries);
             entries.get(&key).map(|e| {
                 (
-                    e.server_name.clone(),
                     e.tool_name.clone(),
                     e.tool_use_id.clone(),
                     e.frontend.clone(),
                 )
             })
         };
-        let Some((server_name, tool_name, tool_use_id, frontend)) = snapshot else {
-            tracing::debug!("MCP progress for unknown token '{key}' (likely canceled); ignored");
+        let Some((tool_name, tool_use_id, frontend)) = snapshot else {
+            tracing::debug!(
+                "MCP '{server_name}' progress for unknown token '{token}' (likely canceled); \
+                 ignored",
+                token = key.token
+            );
             return;
         };
         let update = ProgressUpdate {
-            server_name,
+            server_name: server_name.to_string(),
             tool_name,
             tool_use_id,
             progress: params.progress,
@@ -110,7 +123,6 @@ impl ProgressRegistry {
             .unwrap_or_default();
         tracing::info!(
             "MCP '{server_name}' {tool_name} progress: {progress}{total}{message}",
-            server_name = update.server_name,
             tool_name = update.tool_name,
             progress = update.progress,
         );
@@ -128,9 +140,9 @@ impl ProgressRegistry {
     /// prompt in the wrong editor and answer the other session's call with what this one typed.
     pub(crate) fn elicitation_route(&self, server_name: &str) -> ElicitationRoute {
         let frontends: Vec<Arc<dyn Frontend>> = crate::sync::lock(&self.entries)
-            .values()
-            .filter(|entry| entry.server_name == server_name)
-            .filter_map(|entry| entry.frontend.clone())
+            .iter()
+            .filter(|(key, _entry)| key.server_name == server_name)
+            .filter_map(|(_key, entry)| entry.frontend.clone())
             .collect();
         let mut route = ElicitationRoute::Nobody;
         for frontend in frontends {
@@ -147,10 +159,22 @@ impl ProgressRegistry {
         route
     }
 
-    /// Test helper: check whether a specific progress-token key is in the registry.
+    /// Test helper: whether a request to `server_name` is registered under `token`.
     #[cfg(test)]
-    pub(crate) fn is_registered(&self, key: &str) -> bool {
-        crate::sync::lock(&self.entries).contains_key(key)
+    pub(crate) fn is_registered(&self, server_name: &str, token: &ProgressToken) -> bool {
+        crate::sync::lock(&self.entries).contains_key(&Key {
+            server_name: server_name.to_string(),
+            token: token_key(token),
+        })
+    }
+}
+
+/// The registry's spelling of a token: rmcp mints numbers, and a number and its decimal string
+/// are one token however a server writes it back.
+fn token_key(token: &ProgressToken) -> String {
+    match &token.0 {
+        NumberOrString::String(text) => text.to_string(),
+        NumberOrString::Number(number) => number.to_string(),
     }
 }
 
@@ -165,10 +189,10 @@ pub(crate) enum ElicitationRoute {
     Ambiguous,
 }
 
-/// RAII guard that removes the progress-token entry when dropped.
+/// RAII guard that removes the registry entry when dropped.
 pub(crate) struct ProgressGuard {
-    entries: Arc<Mutex<HashMap<String, Entry>>>,
-    key: Option<String>,
+    entries: Arc<Mutex<HashMap<Key, Entry>>>,
+    key: Option<Key>,
 }
 
 impl Drop for ProgressGuard {
@@ -186,24 +210,39 @@ mod tests {
     use super::*;
     use crate::frontend::{Frontend, FrontendEvent, testing::RecordingFrontend};
 
+    /// A token as rmcp mints it for a request: a number.
+    fn minted(number: i64) -> ProgressToken {
+        ProgressToken(NumberOrString::Number(number))
+    }
+
+    /// The progress messages `recorder` was shown, in order.
+    fn progress_messages(recorder: &RecordingFrontend) -> Vec<(String, Option<String>)> {
+        recorder
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                FrontendEvent::McpProgress(update) => {
+                    Some((update.tool_name.clone(), update.message.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn guard_cleans_up_on_drop() {
         let registry = ProgressRegistry::default();
-        let token_key: String;
+        let token = minted(1);
         {
-            let (token, _guard) = registry.register("srv".into(), "tool".into(), None, None);
-            token_key = match &token.0 {
-                NumberOrString::String(s) => s.to_string(),
-                NumberOrString::Number(n) => n.to_string(),
-            };
+            let _guard = registry.register(&token, "srv".into(), "tool".into(), None, None);
             assert!(
-                registry.is_registered(&token_key),
-                "token missing from registry while guard is still alive: {token_key}"
+                registry.is_registered("srv", &token),
+                "token missing from registry while guard is still alive"
             );
         }
         assert!(
-            !registry.is_registered(&token_key),
-            "token '{token_key}' lingered after guard dropped: ProgressGuard::drop didn't clean up"
+            !registry.is_registered("srv", &token),
+            "the token lingered after the guard dropped: ProgressGuard::drop didn't clean up"
         );
     }
 
@@ -211,10 +250,13 @@ mod tests {
     async fn dispatch_without_registration_is_noop() {
         let registry = ProgressRegistry::default();
         registry
-            .dispatch(ProgressNotificationParam::new(
-                ProgressToken(NumberOrString::String(Arc::from("unknown"))),
-                1.0,
-            ))
+            .dispatch(
+                "srv",
+                ProgressNotificationParam::new(
+                    ProgressToken(NumberOrString::String(Arc::from("unknown"))),
+                    1.0,
+                ),
+            )
             .await;
         // If it didn't panic we're fine.
     }
@@ -228,25 +270,21 @@ mod tests {
         let frontend: Arc<dyn Frontend> = recorder.clone();
 
         let registry = ProgressRegistry::default();
-        let (token, _guard) = registry.register(
+        let _guard = registry.register(
+            &minted(7),
             "srv".into(),
             "tool".into(),
             Some("tu-1".into()),
             Some(frontend),
         );
-        let key = match &token.0 {
-            NumberOrString::String(s) => s.to_string(),
-            NumberOrString::Number(n) => n.to_string(),
-        };
 
+        // The token as a server echoes it: the number rmcp minted, unchanged.
         registry
             .dispatch(
-                ProgressNotificationParam::new(
-                    ProgressToken(NumberOrString::String(Arc::from(key))),
-                    0.5,
-                )
-                .with_total(1.0)
-                .with_message("halfway"),
+                "srv",
+                ProgressNotificationParam::new(minted(7), 0.5)
+                    .with_total(1.0)
+                    .with_message("halfway"),
             )
             .await;
 
@@ -275,75 +313,107 @@ mod tests {
         let frontend_b: Arc<dyn Frontend> = recorder_b.clone();
 
         let registry = ProgressRegistry::default();
-        let (token_a, _guard_a) = registry.register(
-            "srv-a".into(),
+        let _guard_a = registry.register(
+            &minted(1),
+            "srv".into(),
             "tool-a".into(),
             Some("ta".into()),
             Some(frontend_a),
         );
-        let (token_b, _guard_b) = registry.register(
-            "srv-b".into(),
+        let _guard_b = registry.register(
+            &minted(2),
+            "srv".into(),
             "tool-b".into(),
             Some("tb".into()),
             Some(frontend_b),
         );
 
-        let key_a = match &token_a.0 {
-            NumberOrString::String(s) => s.to_string(),
-            NumberOrString::Number(n) => n.to_string(),
-        };
-        let key_b = match &token_b.0 {
-            NumberOrString::String(s) => s.to_string(),
-            NumberOrString::Number(n) => n.to_string(),
-        };
-
         registry
             .dispatch(
-                ProgressNotificationParam::new(
-                    ProgressToken(NumberOrString::String(Arc::from(key_a))),
-                    1.0,
-                )
-                .with_message("for-a"),
+                "srv",
+                ProgressNotificationParam::new(minted(1), 1.0).with_message("for-a"),
             )
             .await;
+        // A server that writes the number back as a string names the same call.
         registry
             .dispatch(
+                "srv",
                 ProgressNotificationParam::new(
-                    ProgressToken(NumberOrString::String(Arc::from(key_b))),
+                    ProgressToken(NumberOrString::String(Arc::from("2"))),
                     2.0,
                 )
                 .with_message("for-b"),
             )
             .await;
 
-        let events_a = recorder_a.events();
-        let events_b = recorder_b.events();
-
-        // A received exactly one progress event for itself.
-        let a_progress: Vec<_> = events_a
-            .iter()
-            .filter_map(|event| match event {
-                FrontendEvent::McpProgress(update) => Some(update.message.as_deref()),
-                _ => None,
-            })
-            .collect();
         assert_eq!(
-            a_progress,
-            vec![Some("for-a")],
+            progress_messages(&recorder_a),
+            vec![("tool-a".to_string(), Some("for-a".to_string()))],
             "frontend A must receive only its own update"
         );
-
-        let b_progress: Vec<_> = events_b
-            .iter()
-            .filter_map(|event| match event {
-                FrontendEvent::McpProgress(update) => Some(update.message.as_deref()),
-                _ => None,
-            })
-            .collect();
         assert_eq!(
-            b_progress,
-            vec![Some("for-b")],
+            progress_messages(&recorder_b),
+            vec![("tool-b".to_string(), Some("for-b".to_string()))],
             "frontend B must receive only its own update"
+        );
+    }
+
+    /// rmcp mints tokens from a counter that starts at zero on every connection, so two servers
+    /// with calls in flight share numbers. Each server's call keeps its own entry: a notification
+    /// finds the call on the server it came from, an elicitation finds that server's frontend,
+    /// and one call ending leaves the other's entry standing.
+    #[tokio::test]
+    async fn a_token_names_a_request_only_beside_its_server() {
+        let recorder_a: Arc<RecordingFrontend> = Arc::new(RecordingFrontend::new());
+        let recorder_b: Arc<RecordingFrontend> = Arc::new(RecordingFrontend::new());
+        let frontend_a: Arc<dyn Frontend> = recorder_a.clone();
+        let frontend_b: Arc<dyn Frontend> = recorder_b.clone();
+
+        let registry = ProgressRegistry::default();
+        let guard_a = registry.register(
+            &minted(1),
+            "srv-a".into(),
+            "tool-a".into(),
+            Some("ta".into()),
+            Some(Arc::clone(&frontend_a)),
+        );
+        let _guard_b = registry.register(
+            &minted(1),
+            "srv-b".into(),
+            "tool-b".into(),
+            Some("tb".into()),
+            Some(frontend_b),
+        );
+
+        registry
+            .dispatch(
+                "srv-a",
+                ProgressNotificationParam::new(minted(1), 1.0).with_message("for-a"),
+            )
+            .await;
+        assert_eq!(
+            progress_messages(&recorder_a),
+            vec![("tool-a".to_string(), Some("for-a".to_string()))],
+            "server A's progress is A's call's, shown to A's frontend"
+        );
+        assert!(
+            progress_messages(&recorder_b).is_empty(),
+            "server B's frontend saw a notification from server A"
+        );
+        assert!(
+            matches!(
+                registry.elicitation_route("srv-a"),
+                ElicitationRoute::To(ref found)
+                    if std::ptr::addr_eq(Arc::as_ptr(found), Arc::as_ptr(&frontend_a))
+            ),
+            "server A's elicitation goes to the frontend of A's call"
+        );
+
+        drop(guard_a);
+        assert!(!registry.is_registered("srv-a", &minted(1)));
+        assert!(
+            registry.is_registered("srv-b", &minted(1)),
+            "server A's call ending took server B's entry with it"
         );
     }
 
@@ -354,7 +424,8 @@ mod tests {
         let recorder: Arc<RecordingFrontend> = Arc::new(RecordingFrontend::new());
         let frontend: Arc<dyn Frontend> = recorder.clone();
         let registry = ProgressRegistry::default();
-        let (_token, _guard) = registry.register(
+        let _guard = registry.register(
+            &minted(3),
             "unique-srv-for-test".into(),
             "tool".into(),
             None,
@@ -390,13 +461,15 @@ mod tests {
             ElicitationRoute::Nobody
         ));
 
-        let (_token_a, _guard_a) = registry.register(
+        let _guard_a = registry.register(
+            &minted(4),
             "srv".into(),
             "tool".into(),
             Some("ta".into()),
             Some(Arc::clone(&frontend_a)),
         );
-        let (_token_a2, _guard_a2) = registry.register(
+        let _guard_a2 = registry.register(
+            &minted(5),
             "srv".into(),
             "tool".into(),
             Some("ta2".into()),
@@ -411,7 +484,8 @@ mod tests {
             "parallel calls from one frontend route to it"
         );
 
-        let (_token_b, _guard_b) = registry.register(
+        let _guard_b = registry.register(
+            &minted(6),
             "srv".into(),
             "tool".into(),
             Some("tb".into()),

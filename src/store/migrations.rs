@@ -395,6 +395,13 @@ const MIGRATIONS: &[Migration] = &[
         name: "inbox_items_record_errors_as_objects",
         step: Step::Rust(inbox_items_record_errors_as_objects),
     },
+    // 0.76 lets a spawn call state the servers and the tools a worker may see; a spec written
+    // before the fields states neither, which the wire writes as `null` for a side left
+    // unrestricted, and it takes that here, so a reader meets one shape.
+    Migration {
+        name: "subagent_specs_name_their_allow_lists",
+        step: Step::Rust(subagent_specs_name_their_allow_lists),
+    },
 ];
 
 /// The position of the last turn a session opened, beside the eight cumulative counters: `NULL`
@@ -2776,6 +2783,56 @@ fn network_0_76_in_spec(spec: &str) -> Option<String> {
     serde_json::to_string(&value).ok()
 }
 
+/// Every sub-agent spec without `allowed_servers` or `allowed_tools` takes `null` for the one it
+/// lacks, the wire's spelling of a side the spawn call left unrestricted, which is all a spawn
+/// before the fields could state. A spec that has both is left alone, so a replay changes nothing.
+fn subagent_specs_name_their_allow_lists(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let specs: Vec<(String, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT id, subagent_spec_json FROM sessions WHERE subagent_spec_json IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, spec) in specs {
+        if let Some(stamped) = allow_lists_0_76_in_spec(&spec) {
+            transaction.execute(
+                "UPDATE sessions SET subagent_spec_json = ?1 WHERE id = ?2",
+                rusqlite::params![stamped, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Give a spec the two allow-list keys 0.76 records, `null` each, where it lacks them, reporting
+/// whether it did.
+fn allow_lists_0_76(spec: &mut serde_json::Value) -> bool {
+    let Some(object) = spec.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for key in ["allowed_servers", "allowed_tools"] {
+        if !object.contains_key(key) {
+            object.insert(key.to_string(), serde_json::Value::Null);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// [`allow_lists_0_76`] over a spec held as a JSON string. `None` when nothing changed or the
+/// string is not JSON.
+fn allow_lists_0_76_in_spec(spec: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(spec).ok()?;
+    if !allow_lists_0_76(&mut value) {
+        return None;
+    }
+    serde_json::to_string(&value).ok()
+}
+
 /// [`scope_fields_0_76`] over a sub-agent spec held as a JSON string, as the session row and the
 /// archive both hold it. `None` when nothing changed or the string is not JSON.
 fn scope_fields_0_76_in_spec(spec: &str, working_directory: Option<&str>) -> Option<String> {
@@ -2835,6 +2892,29 @@ fn name_working_directories_0_76(document: &mut serde_json::Value) {
     }
 }
 
+/// Every session's spec takes the two allow-list keys of [`allow_lists_0_76`] where it lacks
+/// them, as the ledger gives a store's.
+fn name_allow_lists_0_76(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        let Some(fields) = session.as_object_mut() else {
+            continue;
+        };
+        let stamped = fields
+            .get("subagent_spec_json")
+            .and_then(|spec| spec.as_str())
+            .and_then(allow_lists_0_76_in_spec);
+        if let Some(stamped) = stamped {
+            fields.insert("subagent_spec_json".to_string(), stamped.into());
+        }
+    }
+}
+
 /// The archive `format_version` 0.59 wrote.
 const ARCHIVE_FORMAT_0_59: u64 = 3;
 /// The archive `format_version` 0.60 through 0.64 wrote. Those releases added fields to the
@@ -2867,6 +2947,9 @@ const ARCHIVE_FORMAT_0_77: u64 = 12;
 /// The archive `format_version` the 0.78 development line wrote, whose turns say nothing about a
 /// fallback profile having served one.
 const ARCHIVE_FORMAT_0_78_DEVELOPMENT: u64 = 13;
+/// The archive `format_version` 0.78 wrote, whose sub-agent specs from before 0.76 name no
+/// allow-lists.
+const ARCHIVE_FORMAT_0_78: u64 = 14;
 
 /// How the text meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
@@ -3385,7 +3468,8 @@ fn background_reports_name_only_their_tasks(
 /// [`name_working_directories_0_76`], and every version before the release of 0.76 the blocks
 /// 0.76 gives an inbox item, a scheduled fire and a background report, by
 /// [`type_user_events_0_76`], in a repair's messages too and with a report naming only its
-/// tasks, by [`type_repairs_and_name_report_tasks_0_76`].
+/// tasks, by [`type_repairs_and_name_report_tasks_0_76`]. Every version before 0.79 then gives a
+/// spec from before 0.76 the two allow-list keys it lacks, by [`name_allow_lists_0_76`].
 pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u64) -> bool {
     match document
         .get("format_version")
@@ -3417,7 +3501,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_76_DEVELOPMENT)
         | Some(ARCHIVE_FORMAT_0_76)
         | Some(ARCHIVE_FORMAT_0_77)
-        | Some(ARCHIVE_FORMAT_0_78_DEVELOPMENT) => {}
+        | Some(ARCHIVE_FORMAT_0_78_DEVELOPMENT)
+        | Some(ARCHIVE_FORMAT_0_78) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -3441,6 +3526,7 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
     snapshot_checklists_0_70(document);
     block_nudges_0_70(document);
     name_working_directories_0_76(document);
+    name_allow_lists_0_76(document);
     type_user_events_0_76(document);
     type_repairs_and_name_report_tasks_0_76(document);
     document["format_version"] = current.into();
@@ -4592,6 +4678,10 @@ mod tests {
                 "inbox_items_record_errors_as_objects",
                 1342041145199385063_u64,
             ),
+            (
+                "subagent_specs_name_their_allow_lists",
+                7456634420440402148_u64,
+            ),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
         /// every column-zero function it calls, recursively. What a Rust step does is its body and
@@ -5173,7 +5263,7 @@ mod tests {
             .expect("the spec");
         assert_eq!(
             spec_after,
-            r#"{"permission":"read","denied_tools":["file_write","checklist_edit","checklist_read","checklist_add","memory_read"],"network":"host"}"#
+            r#"{"permission":"read","denied_tools":["file_write","checklist_edit","checklist_read","checklist_add","memory_read"],"network":"host","allowed_servers":null,"allowed_tools":null}"#
         );
         let task_tool: String = connection
             .query_row(
@@ -5314,7 +5404,7 @@ mod tests {
         assert_eq!(
             export.sessions[0].subagent_spec_json.as_deref(),
             Some(
-                r#"{"permission":"read","denied_tools":["file_write","checklist_edit","checklist_read","checklist_add"],"network":"host"}"#
+                r#"{"permission":"read","denied_tools":["file_write","checklist_edit","checklist_read","checklist_add"],"network":"host","allowed_servers":null,"allowed_tools":null}"#
             )
         );
         // And the fields 0.59 never wrote arrive with what their absence meant.
@@ -5825,7 +5915,7 @@ mod tests {
         );
         assert_eq!(
             session["subagent_spec_json"],
-            "{\"permission\":\"read\",\"denied_tools\":[\"checklist_read\",\"mcp__x__todo_read\"],\"network\":\"host\"}",
+            "{\"permission\":\"read\",\"denied_tools\":[\"checklist_read\",\"mcp__x__todo_read\"],\"network\":\"host\",\"allowed_servers\":null,\"allowed_tools\":null}",
             "a name is matched whole"
         );
         let once = document.clone();
@@ -7570,8 +7660,9 @@ mod tests {
     /// three scope fields, the first writable root the working directory and the rest the
     /// additional workspace directories, the readable roots the additional readable directories
     /// beside the row's directory, a bare spec staying bare and an empty or null old key dropped,
-    /// and stamp `host` on every spec that names no network while one that does is left alone. A
-    /// replay over the converted store changes nothing.
+    /// and stamp `host` on every spec that names no network while one that does is left alone,
+    /// and `null` for each allow-list a spec lacks while one it has is kept. A replay over the
+    /// converted store changes nothing.
     #[tokio::test]
     async fn sessions_name_their_working_directory_renames_the_columns_and_restates_every_spec() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -7585,6 +7676,8 @@ mod tests {
                     "working_directory": "/w/a",
                     "additional_workspace_directories": ["/w/b"],
                     "network": "host",
+                    "allowed_servers": null,
+                    "allowed_tools": null,
                 }),
             ),
             (
@@ -7595,22 +7688,33 @@ mod tests {
                     "working_directory": "/w",
                     "additional_readable_directories": ["/r"],
                     "network": "host",
+                    "allowed_servers": null,
+                    "allowed_tools": null,
                 }),
             ),
             (
                 "c",
                 r#"{"permission":"read"}"#,
-                serde_json::json!({ "permission": "read", "network": "host" }),
+                serde_json::json!({
+                    "permission": "read", "network": "host",
+                    "allowed_servers": null, "allowed_tools": null,
+                }),
             ),
             (
                 "d",
                 r#"{"permission":"read","writable_roots":[],"readable_roots":null}"#,
-                serde_json::json!({ "permission": "read", "network": "host" }),
+                serde_json::json!({
+                    "permission": "read", "network": "host",
+                    "allowed_servers": null, "allowed_tools": null,
+                }),
             ),
             (
                 "e",
-                r#"{"permission":"read","network":"none"}"#,
-                serde_json::json!({ "permission": "read", "network": "none" }),
+                r#"{"permission":"read","network":"none","allowed_tools":["file_read"]}"#,
+                serde_json::json!({
+                    "permission": "read", "network": "none",
+                    "allowed_servers": null, "allowed_tools": ["file_read"],
+                }),
             ),
         ];
         {
@@ -7675,6 +7779,7 @@ mod tests {
         let transaction = connection.transaction().expect("transaction");
         sessions_name_their_working_directory(&transaction).expect("a replay");
         subagent_specs_name_their_network(&transaction).expect("a replay");
+        subagent_specs_name_their_allow_lists(&transaction).expect("a replay");
         transaction.commit().expect("commit");
         let after: Vec<(String, String, String)> = specs
             .iter()
@@ -7685,7 +7790,8 @@ mod tests {
 
     /// A format-9 archive, the one 0.70 through 0.75 wrote, takes 0.76's names for a session's
     /// directories and the three scope fields for its spec, with the session's own directory as
-    /// the row's; a replay is a no-op, and the converted archive reads.
+    /// the row's; a replay is a no-op, and the converted archive reads. A format-14 archive, the
+    /// one 0.78 wrote, takes the allow-list keys its older specs lack and nothing else.
     #[test]
     fn a_format_9_archive_takes_the_working_directory_names() {
         let mut document = serde_json::json!({
@@ -7741,6 +7847,8 @@ mod tests {
                 "working_directory": "/w",
                 "additional_readable_directories": ["/r"],
                 "network": "host",
+                "allowed_servers": null,
+                "allowed_tools": null,
             })
         );
         let once = document.clone();
@@ -7752,6 +7860,21 @@ mod tests {
         assert_eq!(
             export.sessions[0].working_directory.as_deref(),
             Some(std::path::Path::new("/w"))
+        );
+
+        // 0.78 wrote format 14 with the names above, and a spec of a worker from before 0.76
+        // without the allow-list keys, which nothing had stamped by then; the door gives them.
+        let mut later = once.clone();
+        later["format_version"] = 14.into();
+        later["sessions"][0]["subagent_spec_json"] = concat!(
+            r#"{"permission":"read","working_directory":"/w","#,
+            r#""additional_readable_directories":["/r"],"network":"host"}"#
+        )
+        .into();
+        assert!(bring_archive_forward(&mut later, current));
+        assert_eq!(
+            later, once,
+            "a 0.78 archive's spec takes the keys at the door"
         );
     }
 

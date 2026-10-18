@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use rmcp::{
-    ServiceExt,
+    ClientServiceExt,
     transport::{
         AuthClient, AuthError, AuthorizationManager, ClientCredentialsConfig, CredentialStore,
         StoredCredentials, auth::OAuthState,
@@ -463,7 +463,7 @@ pub(super) async fn connect_http_with_oauth(
         rmcp::transport::StreamableHttpClientTransport::with_client(auth_client, transport_config);
 
     handler
-        .serve(transport)
+        .serve_with_lifecycle(transport, super::handler::http_lifecycle())
         .await
         .map_err(|error| MekaError::McpConnection {
             server_name: server_name.to_string(),

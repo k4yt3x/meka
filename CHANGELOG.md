@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.79.0] - 2026-10-18
+
+### Added
+
+- MCP 2026-07-28 is spoken to a server that answers the probe; the others keep `initialize`.
+- An elicitation inside a 2026-07-28 tool call's answer is put to the user and the call retried.
+- `mcp_resource_subscribe` is refused when a 2026-07-28 server's acknowledgment leaves the URI out.
+- `GET /v1/mcp` and the screen's `/mcp` picker show the protocol version a connected server speaks.
+
+### Changed
+
+- A legacy stdio MCP server is spawned twice on its first connect: once for the probe, once to talk.
+- Session archives are `format_version` 15; a 0.78 archive is read as it is.
+
+### Fixed
+
+- A reconnect dropped every resource subscription the model had made; they are made again.
+- An MCP server's progress notifications reach the screen; the token meka listened on never matched.
+- A stdio MCP server still connecting when meka exited outlived it; the connect ends and it dies.
+- The screen dropped text typed into an MCP elicitation form within 350 ms of its opening.
+
 ## [0.78.0] - 2026-10-18
 
 ### Added
@@ -2798,7 +2819,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.78.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.79.0...HEAD
+[0.79.0]: https://github.com/k4yt3x/meka/compare/0.78.0...0.79.0
 [0.78.0]: https://github.com/k4yt3x/meka/compare/0.77.0...0.78.0
 [0.77.0]: https://github.com/k4yt3x/meka/compare/0.76.0...0.77.0
 [0.76.0]: https://github.com/k4yt3x/meka/compare/0.75.0...0.76.0

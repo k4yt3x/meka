@@ -1197,7 +1197,7 @@ These endpoints help clients inspect the server's capabilities at runtime.
 | `GET /v1/profiles` | Any read scope | Configured profiles, as `{"profiles": [...]}`. Each carries `name`, `account`, `backend` (omitted when the profile names an account that is not configured), `model` (omitted when the profile names none), `fallbacks`, the profiles a turn moves to when this one cannot serve it (omitted when it names none), `vision`, whether a session on it accepts [image attachments](#image-attachments), and `active: true` on the one a session gets when it names none. Read-only; profiles come from `config.toml` |
 | `GET /v1/info` | Any read scope | Server version and permission surface, and `scopes`, the ones the calling token holds, so a client can show only the controls it may use. Carries no profile, model or capability of one: `GET /v1/profiles` reports those per profile and marks the default with `active` |
 | `GET /v1/skills` | Any read scope | Installed skills |
-| `GET /v1/mcp` | Any read scope | MCP server connection status |
+| `GET /v1/mcp` | Any read scope | MCP server connection status, with the protocol version a connected one speaks |
 | `GET /v1/openapi.json` | None, and off unless `[serve].docs` is set | OpenAPI 3 spec |
 | `GET /v1/docs` | None, and off unless `[serve].docs` is set | Swagger UI |
 
@@ -1434,7 +1434,7 @@ Key points:
 | GET | `/v1/health/ready` | None | Readiness probe |
 | GET | `/v1/info` | read | Server version, permission surface, and the caller's scopes |
 | GET | `/v1/skills` | read | Installed skills |
-| GET | `/v1/mcp` | read | MCP server status |
+| GET | `/v1/mcp` | read | MCP server status: `state`, and `protocol_version` while `connected` |
 | POST | `/v1/sessions` | `sessions:w` | Create session |
 | GET | `/v1/sessions` | `sessions:r` | List sessions |
 | GET | `/v1/sessions/{id}` | `sessions:r` | Get session |
@@ -1507,6 +1507,8 @@ A `schedule:*`-only token can still plant ordinary prompt-only jobs; it cannot r
 `GET /v1/tasks` lists every session's background tasks, newest first, and `?status=running` (or `completed`, `failed`, `canceled`, `interrupted`) keeps one status; a status that is none of those is a `422`. A task that is a backgrounded `agent_spawn` carries `subagent_id`, the session it runs, once the spawn has made one, so a dashboard connects the task to the sub-agent's record without parsing the task's label.
 
 Canceling a background task records the cancellation and signals the running task, but only `meka serve` can signal work `meka serve` started. If the session is open in another process (a `meka -r` screen, say), the row is marked `canceled` and the command keeps running there until it ends on its own; its result is then discarded, because the row is no longer `running`.
+
+A `connected` server in `GET /v1/mcp` carries `protocol_version`, the MCP revision its connection speaks: `2026-07-28` when the server answered meka's probe, otherwise the version the `initialize` handshake settled on (`2025-11-25` for a current server). The field is absent in every other state.
 
 `POST /v1/mcp/{name}/reconnect` answers 200 with where the server now stands, which is not the same as "it worked": **read `state`, not the status code**. An attempt that ran and failed is a 200 carrying `state: "failed"`, not a 502. A server the startup sweep is still connecting comes back as `state: "pending"` with no attempt made, so a dashboard polling `GET /v1/mcp` during startup does not mistake "still coming up" for "down". The two non-200s are narrow: 422 when the server is `disabled` in config, and 502 when an already-connected server's transport could not be re-established within `[mcp] connect_timeout`. Neither carries the reason, which is in the meka log: a connector's reason has quoted a spawn command line and a URL with its key.
 
