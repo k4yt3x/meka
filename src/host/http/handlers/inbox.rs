@@ -64,19 +64,23 @@ pub(crate) struct InboxItemView {
     pub(crate) delivered_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) withdrawn_at: Option<String>,
+    /// When meka stops retrying it: its enqueue plus `[serve] inbox_retry_ceiling`.
+    pub(crate) retry_until: String,
     /// Why it was given up on, when it was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) failure: Option<String>,
     /// When its next attempt may run, while it waits after a failed turn or a held session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) not_before: Option<String>,
-    /// Why the last turn opened on it failed, while it waits to be tried again.
+    /// Why the last turn opened on it failed, as a Problem Detail (`type`, `title`, `status`,
+    /// `detail`), while it waits to be tried again or once it was given up on for it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) last_error: Option<String>,
+    pub(crate) last_error: Option<serde_json::Value>,
 }
 
-impl From<InboxItem> for InboxItemView {
-    fn from(item: InboxItem) -> Self {
+impl InboxItemView {
+    /// The item as the API shows it, with the deadline `ceiling` sets from its enqueue.
+    pub(crate) fn new(item: InboxItem, ceiling: std::time::Duration) -> Self {
         Self {
             id: item.id,
             session_id: item.session_id,
@@ -87,23 +91,58 @@ impl From<InboxItem> for InboxItemView {
             appended_at: item.appended_at.map(|at| at.to_rfc3339()),
             delivered_at: item.delivered_at.map(|at| at.to_rfc3339()),
             withdrawn_at: item.withdrawn_at.map(|at| at.to_rfc3339()),
+            retry_until: crate::host::scheduler::inbox_deadline(&item, ceiling).to_rfc3339(),
             failure: item.failure,
             not_before: item.not_before.map(|at| at.to_rfc3339()),
-            last_error: item.last_error,
+            // The row holds the object this host wrote; anything else is not one, and is shown
+            // as nothing rather than as prose a client would have to parse.
+            last_error: item
+                .last_error
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .filter(serde_json::Value::is_object),
         }
     }
 }
 
-/// The answer to `POST /v1/sessions/{id}/inbox`.
+/// The answer to `POST /v1/sessions/{id}/inbox`: the item's identity and state, and what a
+/// producer that holds the key needs to know about its fate without listing the inbox.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct InboxResponse {
     pub(crate) item_id: Uuid,
     pub(crate) session_id: Uuid,
     pub(crate) class: String,
-    /// `pending` on a fresh item. A replayed `Idempotency-Key` answers the earlier item's state.
+    /// The item's state as answered: `pending` on a fresh item, unless a turn already running
+    /// read it in the meantime. A replayed `Idempotency-Key` answers the earlier item's.
     pub(crate) state: String,
     /// Whether the `Idempotency-Key` had been used before, so the item is the earlier one.
     pub(crate) replayed: bool,
+    /// When meka stops retrying it: its enqueue plus `[serve] inbox_retry_ceiling`.
+    pub(crate) retry_until: String,
+    /// On a replayed item, as `GET /v1/sessions/{id}/inbox` shows them: when its next attempt
+    /// may run and why the last one failed while it waits, or why it was given up on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) not_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_error: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) failure: Option<String>,
+}
+
+impl InboxResponse {
+    fn new(item: InboxItemView, replayed: bool) -> Self {
+        Self {
+            item_id: item.id,
+            session_id: item.session_id,
+            class: item.class,
+            state: item.state,
+            replayed,
+            retry_until: item.retry_until,
+            not_before: item.not_before,
+            last_error: item.last_error,
+            failure: item.failure,
+        }
+    }
 }
 
 /// The answer to `GET /v1/sessions/{id}/inbox`: the items the model has not been shown, oldest
@@ -162,53 +201,47 @@ pub(crate) async fn enqueue(
             ProblemDetail::internal_sanitized("failed to enqueue inbox item", error)
                 .with("session_id", session_id.to_string())
         })?;
-    let (class_name, state_name) = if enqueued.replayed {
-        // The key names the earlier item, and it answers with what that item is; a retry that
-        // carries other words under the same key is the contract `POST /turn` refuses too.
-        let item = state
-            .shared
-            .store
-            .inbox_store()
-            .get(enqueued.id)
-            .await
-            .map_err(|error| {
-                ProblemDetail::internal_sanitized("failed to read the inbox item", error)
-                    .with("session_id", session_id.to_string())
-            })?
-            .ok_or_else(|| {
-                ProblemDetail::new(
-                    ErrorKind::Internal,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "the replayed inbox item is missing".to_string(),
-                )
+    // The row as written, fresh or replayed: the answer is the item, and a replayed key answers
+    // with what the earlier item has become.
+    let item = state
+        .shared
+        .store
+        .inbox_store()
+        .get(enqueued.id)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to read the inbox item", error)
                 .with("session_id", session_id.to_string())
-            })?;
-        if item.body != body.message || item.class != body.class {
-            return Err(ProblemDetail::new(
-                ErrorKind::Idempotency,
-                StatusCode::CONFLICT,
-                "Idempotency-Key was used with another message on this session".to_string(),
+        })?
+        .ok_or_else(|| {
+            ProblemDetail::new(
+                ErrorKind::Internal,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the enqueued inbox item is missing".to_string(),
             )
             .with("session_id", session_id.to_string())
-            .with("item_id", item.id.to_string()));
-        }
-        (item.class.name(), item.state().name())
-    } else {
-        (body.class.name(), "pending")
-    };
+        })?;
+    // A retry that carries other words under the same key is the contract `POST /turn` refuses
+    // too.
+    if enqueued.replayed && (item.body != body.message || item.class != body.class) {
+        return Err(ProblemDetail::new(
+            ErrorKind::Idempotency,
+            StatusCode::CONFLICT,
+            "Idempotency-Key was used with another message on this session".to_string(),
+        )
+        .with("session_id", session_id.to_string())
+        .with("item_id", item.id.to_string()));
+    }
     entry.touch();
     // Whether or not a turn is running: a running one reads the inbox itself at its next
     // boundary, and the driver finds the session busy and leaves it to that.
     state.inbox_wake.notify_one();
     Ok((
         StatusCode::ACCEPTED,
-        Json(InboxResponse {
-            item_id: enqueued.id,
-            session_id,
-            class: class_name.to_string(),
-            state: state_name.to_string(),
-            replayed: enqueued.replayed,
-        }),
+        Json(InboxResponse::new(
+            InboxItemView::new(item, state.config.inbox_retry_ceiling),
+            enqueued.replayed,
+        )),
     ))
 }
 
@@ -259,9 +292,13 @@ pub(crate) async fn list(
             ProblemDetail::internal_sanitized("failed to list inbox items", error)
                 .with("session_id", session_id.to_string())
         })?;
+    let ceiling = state.config.inbox_retry_ceiling;
     Ok(Json(InboxListResponse {
         session_id,
-        items: items.into_iter().map(InboxItemView::from).collect(),
+        items: items
+            .into_iter()
+            .map(|item| InboxItemView::new(item, ceiling))
+            .collect(),
     }))
 }
 
@@ -307,7 +344,7 @@ pub(crate) async fn withdraw(
         Some(item) if item.session_id == session_id => {}
         _ => return Err(not_found()),
     }
-    match inbox.withdraw(item_id, None).await.map_err(|error| {
+    match inbox.withdraw(item_id, None, None).await.map_err(|error| {
         ProblemDetail::internal_sanitized("failed to withdraw inbox item", error)
             .with("session_id", session_id.to_string())
     })? {

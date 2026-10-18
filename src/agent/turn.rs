@@ -61,12 +61,13 @@ pub(crate) struct TurnInput {
 
 enum Prompt {
     Typed(String),
-    /// A scheduled job's fire: the job, its words, and the text the model reads, header and gate
-    /// output included.
+    /// A scheduled job's fire: the job, its words, the text the model reads, header and gate
+    /// output included, and how late it was when that is worth announcing.
     Scheduled {
         job_id: String,
         prompt: String,
         text: String,
+        late: Option<crate::frontend::FireLateness>,
     },
     Outcomes(Vec<crate::store::background::BackgroundTask>),
 }
@@ -94,12 +95,14 @@ impl TurnInput {
     }
 
     /// A scheduled job's fire: `job_id` the job, `prompt` its words, `text` what the model reads
-    /// (the fire's header, the words, the gate's output when it had one). Refused when the words
-    /// are blank, for the reason [`Self::from_parts`] refuses them.
+    /// (the fire's header, the words, the gate's output when it had one), `late` its lateness
+    /// when that is worth announcing. Refused when the words are blank, for the reason
+    /// [`Self::from_parts`] refuses them.
     pub(crate) fn scheduled(
         job_id: String,
         prompt: String,
         text: String,
+        late: Option<crate::frontend::FireLateness>,
     ) -> crate::error::Result<Self> {
         if prompt.trim().is_empty() {
             return Err(MekaError::EmptyPrompt);
@@ -109,6 +112,7 @@ impl TurnInput {
                 job_id,
                 prompt,
                 text,
+                late,
             },
             images: Vec::new(),
             retention: PromptRetention::Keep,
@@ -210,12 +214,30 @@ impl TurnInput {
                 job_id,
                 prompt,
                 text,
+                ..
             } => Some(ContentBlock::Scheduled {
                 job_id: job_id.clone(),
                 prompt: prompt.clone(),
                 text: text.clone(),
             }),
             Prompt::Outcomes(_) => None,
+        }
+    }
+
+    /// How late a fire was, for the announcement of the message that carries it.
+    fn lateness(&self) -> Option<crate::frontend::FireLateness> {
+        match &self.prompt {
+            Prompt::Scheduled { late, .. } => *late,
+            Prompt::Typed(_) | Prompt::Outcomes(_) => None,
+        }
+    }
+
+    /// The rows behind the report block [`Self::report`] builds, for the announcement of the
+    /// message that carries it.
+    fn outcome_rows(&self) -> Vec<crate::store::background::BackgroundTask> {
+        match &self.prompt {
+            Prompt::Outcomes(outcomes) => outcomes.clone(),
+            Prompt::Typed(_) | Prompt::Scheduled { .. } => self.riding.clone(),
         }
     }
 
@@ -536,6 +558,10 @@ struct TurnMaterials {
     inbox: Vec<crate::store::inbox::InboxItem>,
     /// The finished background work the turn delivers; see [`TurnInput::report`].
     report: Option<ContentBlock>,
+    /// The rows behind `report`, for the announcement of the opening.
+    outcomes: Vec<crate::store::background::BackgroundTask>,
+    /// How late a fire was, for the same announcement.
+    late: Option<crate::frontend::FireLateness>,
     turn_id: Uuid,
     /// Who opened the turn, in the API's words, for its row.
     source: &'static str,
@@ -1064,6 +1090,8 @@ impl Agent {
         let request_in_flight = input.words();
         let spoken = input.spoken();
         let report = input.report();
+        let outcomes = input.outcome_rows();
+        let late = input.lateness();
         let TurnInput {
             images,
             inbox,
@@ -1107,6 +1135,8 @@ impl Agent {
                 images,
                 inbox,
                 report,
+                outcomes,
+                late,
                 turn_id,
                 // A worker's turns are opened by its parent, through a spawn or a follow-up.
                 source: if self.role.is_worker() {
@@ -1323,6 +1353,8 @@ impl Agent {
             images,
             inbox,
             report,
+            outcomes,
+            late,
             turn_id,
             source,
         } = materials;
@@ -1436,6 +1468,17 @@ impl Agent {
                 false
             }
         };
+        // Announced here, where every door's opening passes, and after the save, so an attached
+        // image's bytes are usually already where a reader of the announcement fetches them; a
+        // save that failed files them with the first provider response instead.
+        self.cells
+            .frontend
+            .emit(FrontendEvent::MessageAppended {
+                message: user_message.clone(),
+                outcomes,
+                late,
+            })
+            .await;
         Ok(TurnOpening {
             user_message,
             inbox_ids,
@@ -2613,6 +2656,20 @@ impl Agent {
         }
     }
 
+    /// Announce the message an interrupt appended whole, as the opening is announced. Items that
+    /// joined the cut opening instead are not: that message was announced already, and the items
+    /// are announced when the provider reads them.
+    async fn announce_arrived(&self, arrived: Message, arrivals: &Arrivals) {
+        self.cells
+            .frontend
+            .emit(FrontendEvent::MessageAppended {
+                message: arrived,
+                outcomes: arrivals.outcomes().to_vec(),
+                late: None,
+            })
+            .await;
+    }
+
     /// Put the inbox items that cut a provider call into the conversation, after whatever had
     /// streamed, so the next request carries them.
     ///
@@ -2662,6 +2719,10 @@ impl Agent {
             .as_slice()
             .last()
             .is_some_and(|last| last.role == Role::User);
+        // The message appended whole, announced after the notice of the cut, as the message it
+        // carries is read after the reason for it; items joined onto the opening are announced
+        // by the events that name blocks added to a message, below.
+        let mut appended_whole: Option<Message> = None;
         match (partial, tail_is_user) {
             (Some(partial), _) => {
                 let arrived = Message {
@@ -2678,7 +2739,8 @@ impl Agent {
                 )
                 .await?;
                 messages.append(partial);
-                messages.append(arrived);
+                messages.append(arrived.clone());
+                appended_whole = Some(arrived);
             }
             (None, true) => {
                 let mut joined = messages
@@ -2728,7 +2790,8 @@ impl Agent {
                     &ids,
                 )
                 .await?;
-                messages.append(arrived);
+                messages.append(arrived.clone());
+                appended_whole = Some(arrived);
             }
         }
         let count = arrivals.items().len();
@@ -2749,7 +2812,12 @@ impl Agent {
                 .emit(FrontendEvent::Notice(crate::frontend::Notice::info(text)))
                 .await;
         }
-        arrivals.announce(&self.cells.frontend).await;
+        // A report inside a message appended whole is announced with that message; one joined
+        // onto the opening is a block added to a message, and `task.reported` names it.
+        match appended_whole {
+            Some(arrived) => self.announce_arrived(arrived, &arrivals).await,
+            None => arrivals.announce(&self.cells.frontend).await,
+        }
         Ok(())
     }
 
@@ -3506,6 +3574,61 @@ mod tests {
             .expect("create session");
         agent.cells().session_id.set(session_id);
         (agent, provider, store, session_id, frontend)
+    }
+
+    /// The opening is announced once, as the message the conversation holds, after the turn
+    /// began and before the provider is asked: what a feed reader that did not open the turn is
+    /// shown above the reply.
+    #[tokio::test]
+    async fn a_turn_announces_the_message_it_opens_with() {
+        let (agent, _provider, _store, _session, frontend) =
+            agent_with_session(vec![text_round("reply")]).await;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("hello".into(), Vec::new()).expect("a prompt"),
+                crate::agent::TurnCancellation::new(),
+            )
+            .await
+            .expect("turn");
+        let events = frontend.events();
+        let position = |wanted: fn(&FrontendEvent) -> bool| {
+            events
+                .iter()
+                .position(wanted)
+                .unwrap_or_else(|| panic!("missing from {events:?}"))
+        };
+        let started = position(|event| matches!(event, FrontendEvent::TurnStarted { .. }));
+        let announced = position(|event| matches!(event, FrontendEvent::MessageAppended { .. }));
+        let replied = position(|event| matches!(event, FrontendEvent::AssistantTextDelta(_)));
+        assert!(
+            started < announced && announced < replied,
+            "began at {started}, announced at {announced}, replied at {replied}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, FrontendEvent::MessageAppended { .. }))
+                .count(),
+            1
+        );
+        let FrontendEvent::MessageAppended {
+            message,
+            outcomes,
+            late,
+        } = &events[announced]
+        else {
+            unreachable!()
+        };
+        let opening = messages.as_slice().first().expect("the opening");
+        assert_eq!(
+            serde_json::to_value(message).expect("json"),
+            serde_json::to_value(opening).expect("json"),
+            "the announcement is the message the conversation holds"
+        );
+        assert_eq!(message.text_content(), "hello");
+        assert!(outcomes.is_empty() && late.is_none());
     }
 
     /// A turn whose frontend reports its client gone stops at the next round boundary, and the
@@ -4518,7 +4641,7 @@ mod tests {
             .await
             .expect("pending");
         // Between the driver's read and the turn's own: the window a DELETE can land in.
-        inbox.withdraw(id, None).await.expect("withdraw");
+        inbox.withdraw(id, None, None).await.expect("withdraw");
         let mut messages = Conversation::new();
         let outcome = agent
             .run_turn(

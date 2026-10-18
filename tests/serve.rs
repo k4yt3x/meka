@@ -3054,6 +3054,25 @@ fn blocking_turn_accepts_inline_image_attachment() {
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().expect("parse");
     assert_eq!(assistant_text(&body), "hello from agent");
+    // The response begins with the opening as the history reads it back, and the image on it is
+    // named by the hash the store filed its bytes under, not sent again.
+    let opening = &body["messages"][0];
+    assert_eq!(opening["role"], "user", "{body}");
+    let image = opening["content"]
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .find(|block| block["type"] == "image")
+        .unwrap_or_else(|| panic!("the image rides the opening: {body}"));
+    let hash = image["hash"].as_str().expect("named by its hash");
+    let blob = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{id}/blobs/{hash}"),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(blob.status(), 200, "the hash names bytes the store holds");
 }
 
 /// Where a held turn waits, under the install: the path the server's `MEKA_MOCK_TURN_HOLD` names.
@@ -5745,12 +5764,17 @@ fn blocking_turn_with_reasoning_stream_includes_thinking() {
         .expect("turn");
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().expect("parse");
-    let content = &body["messages"][0]["content"];
-    let blocks = content.as_array().expect("content array");
+    let reply = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("the reply follows the opening");
+    let blocks = reply["content"].as_array().expect("content array");
     let thinking = blocks
         .iter()
         .find(|block| block["type"] == "thinking")
-        .expect("messages[0].content must include a thinking block when capability is on");
+        .expect("the reply must include a thinking block when capability is on");
     assert_eq!(thinking["thinking"], "let me reason about this");
     let text = blocks
         .iter()
@@ -9036,6 +9060,31 @@ fn read_feed_until_open(
     (text, response)
 }
 
+/// Every event of an SSE body in order, as its name and its parsed `data:` payload.
+fn sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
+    let mut events = Vec::new();
+    let mut lines = body.lines();
+    while let Some(line) = lines.next() {
+        if let Some(name) = line.strip_prefix("event: ") {
+            let data = lines
+                .next()
+                .and_then(|data| data.strip_prefix("data: "))
+                .and_then(|data| serde_json::from_str(data).ok())
+                .unwrap_or(serde_json::Value::Null);
+            events.push((name.trim().to_string(), data));
+        }
+    }
+    events
+}
+
+/// The position of the first event of `name` in `events`, or a panic quoting the body.
+fn sse_position(events: &[(String, serde_json::Value)], name: &str, body: &str) -> usize {
+    events
+        .iter()
+        .position(|(event, _)| event == name)
+        .unwrap_or_else(|| panic!("no {name} on the feed: {body}"))
+}
+
 /// Parse the `data:` payload of the first event of `name` in an SSE body.
 fn sse_event_data(body: &str, name: &str) -> Option<serde_json::Value> {
     let mut lines = body.lines();
@@ -9911,6 +9960,26 @@ fn an_inbox_turn_refused_for_quota_waits_and_says_so() {
         sse_event_data(&body, "inbox.failed").is_none(),
         "nothing was given up: {body}"
     );
+    // The attempt announced its opening, and its terminal took it back: a client that mirrors
+    // the conversation drops it, or every attempt would leave a copy.
+    let events = sse_events(&body);
+    let opening_at = sse_position(&events, "message.appended", &body);
+    let failed_at = sse_position(&events, "turn.failed", &body);
+    assert!(opening_at < failed_at, "{body}");
+    assert_eq!(
+        events[opening_at].1["content"]
+            .as_array()
+            .expect("blocks")
+            .iter()
+            .find(|block| block["type"] == "inbox")
+            .map(|block| block["item_id"].clone()),
+        Some(serde_json::json!(item_id)),
+        "{body}"
+    );
+    assert_eq!(
+        events[failed_at].1["message_withdrawn"], true,
+        "the terminal says the opening left again: {body}"
+    );
     let open: serde_json::Value = harness
         .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/inbox"))
         .send()
@@ -9921,13 +9990,47 @@ fn an_inbox_turn_refused_for_quota_waits_and_says_so() {
     assert_eq!(item["id"], item_id, "{open}");
     assert_eq!(item["state"], "pending", "{open}");
     assert!(item["not_before"].is_string(), "{open}");
-    assert!(
-        item["last_error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("quota"),
+    // The error as the API states one, so a reader of the item classifies it without parsing
+    // prose, and never the upstream's text, since anyone who lists the inbox reads it.
+    assert_eq!(
+        item["last_error"]["type"], "https://meka.run/errors/provider-exhausted",
         "{open}"
     );
+    assert!(item["last_error"]["title"].is_string(), "{open}");
+    assert!(item["last_error"]["status"].is_number(), "{open}");
+    assert!(item["last_error"]["detail"].is_string(), "{open}");
+    assert!(
+        item["last_error"].get("provider_response").is_none(),
+        "{open}"
+    );
+    // The deadline is the enqueue plus the ceiling, an hour by default.
+    let created_at =
+        chrono::DateTime::parse_from_rfc3339(item["created_at"].as_str().expect("created_at"))
+            .expect("rfc3339");
+    let retry_until =
+        chrono::DateTime::parse_from_rfc3339(item["retry_until"].as_str().expect("retry_until"))
+            .expect("rfc3339");
+    assert_eq!((retry_until - created_at).num_seconds(), 3600, "{open}");
+}
+
+/// `enqueue_inbox_item` under an `Idempotency-Key`, answering the whole response.
+fn enqueue_inbox_item_keyed(
+    harness: &ServeTestHarness,
+    session_id: &str,
+    message: &str,
+    key: &str,
+) -> serde_json::Value {
+    let accepted = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{session_id}/inbox"),
+        )
+        .header("Idempotency-Key", key)
+        .json(&serde_json::json!({"message": message, "class": "steer"}))
+        .send()
+        .expect("send");
+    assert_eq!(accepted.status(), 202);
+    accepted.json().expect("parse")
 }
 
 /// With the ceiling at zero the first failure fails the item, reset or not, and the reason says
@@ -9940,7 +10043,13 @@ fn with_a_zero_retry_ceiling_an_inbox_item_fails_on_its_first_failure() {
     let harness = ServeTestHarness::spawn("inbox_retry_ceiling = \"0s\"\n", script);
     let id = start_streaming_session(&harness);
     let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
-    let item_id = enqueue_inbox_item(&harness, &id, "are you there?");
+    let enqueued = enqueue_inbox_item_keyed(&harness, &id, "are you there?", "zero-ceiling-1");
+    let item_id = enqueued["item_id"].as_str().expect("item id").to_string();
+    assert_eq!(enqueued["state"], "pending", "{enqueued}");
+    assert!(
+        enqueued["retry_until"].is_string() && enqueued.get("failure").is_none(),
+        "a fresh item carries its deadline and nothing of a fate it has not met: {enqueued}"
+    );
 
     let body = read_feed_until(feed, |text| text.contains("event: inbox.failed"));
     let failed = sse_event_data(&body, "inbox.failed").expect("inbox.failed on the feed");
@@ -9960,6 +10069,27 @@ fn with_a_zero_retry_ceiling_an_inbox_item_fails_on_its_first_failure() {
         sse_event_data(&body, "inbox.deferred").is_none(),
         "nothing was deferred: {body}"
     );
+
+    // A producer that lost its place posts again under its key, and the answer is the item's
+    // fate: withdrawn, why, and the error that decided it, as the API states one. The inbox
+    // listing no longer shows the item, so this is where it is read.
+    let replayed = enqueue_inbox_item_keyed(&harness, &id, "are you there?", "zero-ceiling-1");
+    assert_eq!(replayed["item_id"], item_id, "{replayed}");
+    assert_eq!(replayed["replayed"], true, "{replayed}");
+    assert_eq!(replayed["state"], "withdrawn", "{replayed}");
+    assert!(
+        replayed["failure"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("inbox_retry_ceiling"),
+        "{replayed}"
+    );
+    assert_eq!(
+        replayed["last_error"]["type"], "https://meka.run/errors/provider-exhausted",
+        "{replayed}"
+    );
+    assert!(replayed["retry_until"].is_string(), "{replayed}");
+    assert!(replayed.get("not_before").is_none(), "{replayed}");
 }
 
 /// A webhook payload carries no content: the feed's copy of an inbox event carries the upstream's
@@ -10198,6 +10328,27 @@ fn an_interrupt_cuts_the_streaming_answer_and_the_turn_carries_on() {
         .iter()
         .position(|name| name == "turn.finished")
         .expect("finished");
+    // The message the interrupt appended after the kept half is announced whole, between the
+    // notice of the cut and the provider reading it; the opening was announced before either.
+    let events = sse_events(&body);
+    let announced: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, (event, _))| event == "message.appended")
+        .map(|(at, _)| at)
+        .collect();
+    let [opening_at, arrived_at] = announced[..] else {
+        panic!("the opening and the arrival: {body}");
+    };
+    assert!(
+        opening_at < notice && notice < arrived_at && arrived_at < delivered,
+        "opened at {opening_at}, cut at {notice}, arrived at {arrived_at}, read at {delivered}: \
+         {body}"
+    );
+    let arrived = &events[arrived_at].1;
+    assert_eq!(arrived["content"][0]["type"], "inbox", "{arrived}");
+    assert_eq!(arrived["content"][0]["item_id"], item_id, "{arrived}");
+    assert_eq!(arrived["content"][0]["class"], "interrupt", "{arrived}");
     assert!(
         notice < delivered && delivered < finished,
         "cut, then read, then the turn ends: {names:?}"
@@ -10248,6 +10399,104 @@ fn an_interrupt_cuts_the_streaming_answer_and_the_turn_carries_on() {
         messages[2]
     );
     assert_eq!(text_of(&messages[3]), "carrying on with your message");
+}
+
+/// An interrupt that lands before anything from the model reached the conversation joins the
+/// unanswered opening rather than appending a message of its own, so nothing is announced whole
+/// a second time: the opening was announced, and the item is announced when the model reads it.
+#[test]
+fn an_interrupt_joined_onto_an_unanswered_opening_is_not_announced_again() {
+    let script = serde_json::json!([
+        [
+            { "type": "sleep", "ms": 5000 },
+            { "type": "text", "text": "never sent" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "carrying on with your message" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = start_streaming_session(&harness);
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let session = id.clone();
+    let turn = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{base_url}/v1/sessions/{session}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"message": "write it", "stream": true}))
+            .send()
+            .expect("send")
+            .text()
+            .expect("body")
+    });
+    harness.wait_until_in_flight(&id);
+    wait_until_prompt_saved(&harness, &id, "write it");
+    let accepted: serde_json::Value = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
+        .json(&serde_json::json!({"message": "stop, do this instead", "class": "interrupt"}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let item_id = accepted["item_id"].as_str().expect("item id").to_string();
+
+    let body = turn.join().expect("turn thread");
+    let events = sse_events(&body);
+    let announced: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|(event, _)| event == "message.appended")
+        .map(|(_, data)| data)
+        .collect();
+    assert_eq!(
+        announced.len(),
+        1,
+        "the opening alone; the item joined it: {body}"
+    );
+    assert!(
+        !announced[0]["content"]
+            .as_array()
+            .expect("blocks")
+            .iter()
+            .any(|block| block["type"] == "inbox"),
+        "announced before the item arrived: {body}"
+    );
+    let delivered = sse_event_data(&body, "inbox.delivered").expect("the item is read");
+    assert_eq!(
+        delivered["item_ids"],
+        serde_json::json!([item_id]),
+        "{body}"
+    );
+    assert!(body.contains("carrying on with your message"), "{body}");
+
+    // The history shows one opening carrying the item, which is what the feed described.
+    let transcript: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let openings: Vec<&serde_json::Value> = transcript["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .collect();
+    assert_eq!(openings.len(), 1, "{transcript}");
+    let kinds: Vec<&str> = openings[0]["content"]
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .filter_map(|block| block["type"].as_str())
+        .collect();
+    assert_eq!(kinds, ["turn_context", "text", "inbox"], "{transcript}");
 }
 
 /// Canceling the turn the inbox opened withdraws the items it opened on, the way a canceled
@@ -10496,6 +10745,154 @@ fn a_scheduled_fire_appears_on_the_feed() {
         body.matches("event: turn.finished").count() >= 2,
         "the client's turn and the fire's both end on the feed: {body}"
     );
+
+    // The fire's words reach a reader that did not open the turn as the message the turn opened
+    // with, typed as a fire, under the fire's id and ahead of its reply; they ride no notice.
+    let events = sse_events(&body);
+    let of_the_fire = |name: &str| {
+        events
+            .iter()
+            .position(|(event, data)| event == name && data["turn_id"] == fired["turn_id"])
+            .unwrap_or_else(|| panic!("no {name} for the fire's turn: {body}"))
+    };
+    let started_at = of_the_fire("turn.started");
+    let opening_at = of_the_fire("message.appended");
+    let reply_at = of_the_fire("assistant_text.delta");
+    assert!(
+        started_at < opening_at && opening_at < reply_at,
+        "started at {started_at}, opened at {opening_at}, replied at {reply_at}: {body}"
+    );
+    let opening = &events[opening_at].1;
+    assert_eq!(opening["role"], "user", "{opening}");
+    let scheduled = opening["content"]
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .find(|block| block["type"] == "scheduled")
+        .unwrap_or_else(|| panic!("typed as a fire: {opening}"));
+    assert_eq!(scheduled["job_id"], fired["job_id"], "{opening}");
+    assert_eq!(scheduled["prompt"], "DELIVERED_PROMPT_MARKER", "{opening}");
+    assert!(
+        scheduled["text"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("[Scheduled job "),
+        "{opening}"
+    );
+    assert!(
+        !events.iter().any(|(event, data)| event == "notice"
+            && data["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("DELIVERED_PROMPT_MARKER")),
+        "the prompt rides no notice: {body}"
+    );
+}
+
+/// A report that rides a client's turn is announced as a fire's is: the opening carries a
+/// `background_report` block naming the task ahead of the words, and the stream of the turn that
+/// carried it says so between its start and its reply.
+#[test]
+fn a_report_riding_a_client_turn_is_announced_on_the_feed() {
+    let harness = ServeTestHarness::spawn("\n[background]\nenabled = true\n", mock_simple_turn());
+    let id = start_streaming_session(&harness);
+    let task = seed_finished_task(&harness, &id);
+
+    let body = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "and now?", "stream": true}))
+        .send()
+        .expect("send")
+        .text()
+        .expect("body");
+    let events = sse_events(&body);
+    let started_at = sse_position(&events, "turn.started", &body);
+    let opening_at = sse_position(&events, "message.appended", &body);
+    let reply_at = sse_position(&events, "assistant_text.delta", &body);
+    assert!(
+        started_at < opening_at && opening_at < reply_at,
+        "started at {started_at}, opened at {opening_at}, replied at {reply_at}: {body}"
+    );
+    let opening = &events[opening_at].1;
+    let kinds: Vec<&str> = opening["content"]
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .filter_map(|block| block["type"].as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["turn_context", "background_report", "text"],
+        "{opening}"
+    );
+    assert_eq!(opening["content"][1]["task_ids"], serde_json::json!([task]));
+    assert!(
+        opening["content"][1]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("[Background task reporting"),
+        "{opening}"
+    );
+    assert_eq!(opening["content"][2]["text"], "and now?", "{opening}");
+}
+
+/// A turn the inbox driver opens on an idle session is announced like any other: the opening
+/// carries the item as an `inbox` block behind the report that rode it, and says the item was
+/// appended; `inbox.delivered` follows once the model has read it.
+#[test]
+fn an_inbox_turn_announces_the_message_it_opens_with() {
+    let harness = ServeTestHarness::spawn("\n[background]\nenabled = true\n", mock_simple_turn());
+    let id = start_streaming_session(&harness);
+    let task = seed_finished_task(&harness, &id);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let item_id = enqueue_inbox_item(&harness, &id, "are you there?");
+
+    let body = read_feed_until(feed, |text| text.contains("event: turn.finished"));
+    let events = sse_events(&body);
+    let opening_at = sse_position(&events, "message.appended", &body);
+    let delivered_at = sse_position(&events, "inbox.delivered", &body);
+    assert!(opening_at < delivered_at, "appended before read: {body}");
+    let opening = &events[opening_at].1;
+    let kinds: Vec<&str> = opening["content"]
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .filter_map(|block| block["type"].as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["turn_context", "background_report", "inbox"],
+        "{opening}"
+    );
+    assert_eq!(opening["content"][1]["task_ids"], serde_json::json!([task]));
+    assert_eq!(opening["content"][2]["item_id"], item_id, "{opening}");
+    assert_eq!(opening["content"][2]["body"], "are you there?", "{opening}");
+    assert_eq!(opening["content"][2]["class"], "steer", "{opening}");
+    assert!(
+        !events.iter().any(|(event, data)| event == "notice"
+            && data["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Background task")),
+        "the report rides no notice: {body}"
+    );
+}
+
+/// A finished, undelivered task on `session_id`, the row a backgrounded call leaves when it ends
+/// while nothing runs; its id, which the report names.
+fn seed_finished_task(harness: &ServeTestHarness, session_id: &str) -> String {
+    let task = uuid::Uuid::new_v4().to_string();
+    let store =
+        rusqlite::Connection::open(harness.install.database()).expect("open the server's store");
+    store
+        .execute(
+            "INSERT INTO background_tasks \
+             (id, session_id, tool, label, status, outcome, started_at, finished_at) \
+             VALUES (?1, ?2, 'shell_execute', 'cargo test', 'completed', 'ok', ?3, ?3)",
+            rusqlite::params![task, session_id, chrono::Utc::now().to_rfc3339()],
+        )
+        .expect("a finished task");
+    task
 }
 
 /// A cancel that names a turn stops only that turn, so a client that watched one cannot stop the
@@ -11116,6 +11513,132 @@ fn reattach_mid_turn_follows_the_live_stream() {
     assert!(
         rejoined.contains("after"),
         "the rejoin must receive text emitted after it attached: {rejoined}"
+    );
+
+    // The ring still holds the turn's opening, so the rejoin reads it from the replay, once, after
+    // the resumed `turn.started` and before the text; nothing is re-issued on top of it.
+    let events = sse_events(&rejoined);
+    let started_at = events
+        .iter()
+        .position(|(event, data)| event == "turn.started" && data["resumed"] == true)
+        .expect("resumed turn.started");
+    let opening_at = sse_position(&events, "message.appended", &rejoined);
+    let reply_at = sse_position(&events, "assistant_text.delta", &rejoined);
+    assert!(
+        started_at < opening_at && opening_at < reply_at,
+        "started at {started_at}, opened at {opening_at}, replied at {reply_at}: {rejoined}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(event, _)| event == "message.appended")
+            .count(),
+        1,
+        "replayed, not replayed and re-issued: {rejoined}"
+    );
+    let opening = &events[opening_at].1;
+    assert!(opening.get("resumed").is_none(), "{opening}");
+    assert!(
+        opening["content"]
+            .as_array()
+            .expect("blocks")
+            .iter()
+            .any(|block| block["type"] == "text" && block["text"] == "hi"),
+        "{opening}"
+    );
+}
+
+/// A client that joins mid-turn after the ring has let the opening go is handed it anyway, after
+/// the resumed `turn.started` and marked like it, so the text it then receives has its question
+/// above it rather than arriving under nothing.
+#[test]
+fn a_client_joining_mid_turn_past_the_ring_is_handed_the_opening() {
+    let script = serde_json::json!([
+        [
+            { "type": "text", "text": "before " },
+            { "type": "sleep", "ms": 1500 },
+            { "type": "text", "text": "after" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    // A ring of one holds only the latest event, so the opening is gone by the time the text
+    // that precedes the stall has been published.
+    let harness = ServeTestHarness::spawn("stream_replay_events = 1\n", script);
+    let id = start_streaming_session(&harness);
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let session = id.clone();
+    let original = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{base_url}/v1/sessions/{session}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"message": "hi", "stream": true}))
+            .send()
+            .expect("send")
+            .text()
+            .expect("body")
+    });
+    // A probe reader says when the first text has been published, which is when the ring of one
+    // has let the opening go; the late reader attaches then, inside the stall.
+    let (_, _probe) = read_feed_until_open(
+        open_feed(&harness, &id, None, Duration::from_secs(30)),
+        |text| text.contains("before "),
+    );
+    let rejoined = read_feed_until(
+        open_feed(&harness, &id, None, Duration::from_secs(30)),
+        |text| text.contains("event: turn.finished"),
+    );
+    original.join().expect("original stream thread");
+
+    let events = sse_events(&rejoined);
+    let started_at = events
+        .iter()
+        .position(|(event, data)| event == "turn.started" && data["resumed"] == true)
+        .unwrap_or_else(|| panic!("the rejoin opens with the resumed turn.started: {rejoined}"));
+    let opening_at = events
+        .iter()
+        .position(|(event, data)| event == "message.appended" && data["resumed"] == true)
+        .unwrap_or_else(|| panic!("the opening is re-issued, marked resumed: {rejoined}"));
+    let reply_at = sse_position(&events, "assistant_text.delta", &rejoined);
+    assert!(
+        started_at < opening_at && opening_at < reply_at,
+        "started at {started_at}, opened at {opening_at}, replied at {reply_at}: {rejoined}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(event, _)| event == "message.appended")
+            .count(),
+        1,
+        "{rejoined}"
+    );
+    let opening = &events[opening_at].1;
+    assert_eq!(
+        opening["turn_id"], events[started_at].1["turn_id"],
+        "{opening}"
+    );
+    assert!(
+        opening["content"]
+            .as_array()
+            .expect("blocks")
+            .iter()
+            .any(|block| block["type"] == "text" && block["text"] == "hi"),
+        "{opening}"
+    );
+    // Synthesized, so it carries no id: the line before its `event:` is not an `id:` line.
+    let lines: Vec<&str> = rejoined.lines().collect();
+    let event_line = lines
+        .iter()
+        .position(|line| *line == "event: message.appended")
+        .expect("the event line");
+    assert!(
+        !lines[event_line - 1].starts_with("id: "),
+        "a re-issued opening has no position in the ring: {rejoined}"
     );
 }
 
@@ -16796,8 +17319,9 @@ fn a_turn_that_stops_with_an_open_item_continues_and_the_feed_says_so() {
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().expect("parse");
     assert_eq!(body["stop_reason"], "end_turn");
-    // The messages are what the turn added, as `GET /messages` shows them: the reply the nudge
-    // answered, the nudge as a user-role message, the round it caused, and the reply after it.
+    // The messages are what the turn added, as `GET /messages` shows them: the opening, the
+    // reply the nudge answered, the nudge as a user-role message, the round it caused, and the
+    // reply after it.
     let shape: Vec<(String, String)> = body["messages"]
         .as_array()
         .expect("messages")
@@ -16815,6 +17339,7 @@ fn a_turn_that_stops_with_an_open_item_continues_and_the_feed_says_so() {
     assert_eq!(
         shape,
         [
+            ("user", "turn_context"),
             ("assistant", "tool_use"),
             ("user", "tool_result"),
             ("assistant", "text"),
@@ -16827,15 +17352,15 @@ fn a_turn_that_stops_with_an_open_item_continues_and_the_feed_says_so() {
         "{body}"
     );
     assert_eq!(
-        message_text(&body["messages"][2]),
+        message_text(&body["messages"][3]),
         "I have planned it.",
         "{body}"
     );
     assert!(
-        message_text(&body["messages"][3]).starts_with("[Checklist:"),
+        message_text(&body["messages"][4]).starts_with("[Checklist:"),
         "{body}"
     );
-    assert_eq!(message_text(&body["messages"][6]), "Done.", "{body}");
+    assert_eq!(message_text(&body["messages"][7]), "Done.", "{body}");
     assert_eq!(
         body["notices"],
         serde_json::json!([{"level": "info", "text": "Checklist: 1 open item, continuing, nudge 1 of 3"}]),
@@ -17068,6 +17593,11 @@ fn a_task_an_item_waits_on_reports_as_a_turn_the_item_holds_open() {
         .find("\"source\":\"background\"")
         .expect("the report opened a turn of its own");
     let delivery = &feed_body[at..];
+    assert!(
+        delivery.contains("event: message.appended")
+            && delivery.contains("\"type\":\"background_report\""),
+        "the report's turn opens with the report, announced as the message it is: {feed_body}"
+    );
     let nudge_at = delivery
         .find("Checklist: 1 open item, continuing, nudge 1 of 3")
         .unwrap_or_else(|| panic!("the report's turn is held by the item: {feed_body}"));

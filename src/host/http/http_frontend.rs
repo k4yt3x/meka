@@ -422,6 +422,7 @@ impl HttpFrontend {
             disconnected_since: None,
             reattach_grace,
             started_id: None,
+            opening: None,
         });
         let receiver = feed.sender.subscribe();
         let started = feed.publish(SseEventType::TurnStarted, data);
@@ -605,6 +606,21 @@ impl HttpFrontend {
         drop(still_pending);
         let turn_id = feed.turn.as_ref().map(|turn| turn.turn_id);
         let turn_source = feed.turn.as_ref().map(|turn| turn.source.clone());
+        // Re-issued only to a reader that has not had it: one resuming from past its id was
+        // delivered it, and one the replay reaches back to is handed it there, so either would
+        // otherwise be handed the opening twice.
+        let turn_opening = feed
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.opening.as_ref())
+            .filter(|opening| {
+                let behind_it = match (replay.resume_from, opening.id) {
+                    (Some(position), Some(id)) => position < id,
+                    _ => true,
+                };
+                behind_it && !replay.backlog.iter().any(|event| event.id == opening.id)
+            })
+            .map(|opening| opening.data.clone());
         // Handed over only when no turn is running: with one in flight, the live subscription is
         // where its terminal will arrive, and the previous turn's is history the ring already
         // replays.
@@ -616,6 +632,7 @@ impl HttpFrontend {
         let attachment = StreamAttachment {
             turn_id,
             turn_source,
+            turn_opening,
             attendance,
             backlog: replay.backlog,
             receiver: feed.sender.subscribe(),
@@ -1630,6 +1647,76 @@ mod tests {
             "a reader attached at the time still gets the terminal: {seen:?}"
         );
         drop(child_frontend);
+    }
+
+    /// The opening is re-issued to a reader that has not had it and to no other: one joining or
+    /// resuming from behind it once the ring has let it go, never one the replay hands it to or
+    /// one resuming from past it.
+    #[tokio::test]
+    async fn a_turn_s_opening_is_re_issued_only_to_a_reader_that_has_not_had_it() {
+        let opening = || FrontendEvent::MessageAppended {
+            message: crate::conversation::Message::turn_opening(
+                "[Context]",
+                vec![crate::conversation::ContentBlock::Text { text: "hi".into() }],
+                Vec::new(),
+            ),
+            outcomes: Vec::new(),
+            late: None,
+        };
+        let frontend_with_ring = |ring: usize| {
+            let frontend = HttpFrontend::new();
+            frontend.install_feed(
+                uuid::Uuid::from_u128(0x1),
+                &FeedWiring::bare(16, ring, Duration::from_secs(30)),
+            );
+            frontend.begin_turn(
+                uuid::Uuid::from_u128(0x20),
+                TurnSource::Client,
+                Opener::DRIVER,
+                Duration::from_secs(30),
+                ring,
+            );
+            frontend
+        };
+        let handed = |frontend: &HttpFrontend, last: Option<u64>| {
+            frontend
+                .attach_stream(last, false)
+                .expect("feed installed")
+                .turn_opening
+                .is_some()
+        };
+
+        // Ids: 0 the turn.started, 1 the opening, 2 a delta.
+        let roomy = frontend_with_ring(16);
+        roomy.push_event(opening());
+        roomy.push_event(FrontendEvent::AssistantTextDelta("a".into()));
+        assert!(!handed(&roomy, None), "the replay carries it to a joiner");
+        assert!(
+            !handed(&roomy, Some(0)),
+            "and to a reader resuming from behind it"
+        );
+        assert!(!handed(&roomy, Some(1)), "a reader resuming from it has it");
+        assert!(
+            !handed(&roomy, Some(2)),
+            "and so has one resuming from past it"
+        );
+
+        let tight = frontend_with_ring(1);
+        tight.push_event(opening());
+        tight.push_event(FrontendEvent::AssistantTextDelta("a".into()));
+        assert!(
+            handed(&tight, None),
+            "the ring let it go, so a joiner is handed it"
+        );
+        assert!(
+            handed(&tight, Some(0)),
+            "and so is a reader resuming from behind it"
+        );
+        assert!(!handed(&tight, Some(1)), "a reader resuming from it has it");
+        assert!(
+            !handed(&tight, Some(2)),
+            "and so has one resuming from past it"
+        );
     }
 
     /// A streaming client's turn installs its stream on the session's frontend, and a sub-agent

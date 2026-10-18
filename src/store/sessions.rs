@@ -9183,7 +9183,10 @@ mod tests {
             .await
             .expect("append");
         inbox.mark_delivered(session).await.expect("deliver");
-        inbox.withdraw(withdrawn_old, None).await.expect("withdraw");
+        inbox
+            .withdraw(withdrawn_old, None, None)
+            .await
+            .expect("withdraw");
         for (column, id) in [
             ("delivered_at", delivered_old),
             ("withdrawn_at", withdrawn_old),

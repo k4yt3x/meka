@@ -68,7 +68,9 @@ pub(crate) struct InboxItem {
     pub(crate) attempts: u32,
     /// When its next attempt may run, while it waits after a failure or a held session.
     pub(crate) not_before: Option<DateTime<Utc>>,
-    /// Why the last turn opened on it failed, while it waits to be tried again.
+    /// Why the last turn opened on it failed, as the host that runs the driver states an error
+    /// (the API's error object, as JSON), while it waits to be tried again or once it was given
+    /// up on for it. Opaque here: written and read by the host.
     pub(crate) last_error: Option<String>,
     pub(crate) appended_at: Option<DateTime<Utc>>,
     pub(crate) delivered_at: Option<DateTime<Utc>>,
@@ -423,7 +425,8 @@ impl InboxStore {
     }
 
     /// Hold pending items back until `not_before` after a turn on them failed, counting the
-    /// attempt and keeping `last_error`, why it failed, for whoever reads the item while it waits.
+    /// attempt and keeping `last_error`, the host's record of why, for whoever reads the item
+    /// while it waits.
     /// Answers the ids it held back. Rows already in the conversation are left alone and are not
     /// among them: they are not waiting to be appended, and their turn did not fail on their
     /// account.
@@ -493,7 +496,12 @@ impl InboxStore {
     }
 
     /// Take a pending item back, from outside or because meka gave up on it.
-    pub(crate) async fn withdraw(&self, id: Uuid, reason: Option<String>) -> Result<Withdrawal> {
+    pub(crate) async fn withdraw(
+        &self,
+        id: Uuid,
+        reason: Option<String>,
+        last_error: Option<String>,
+    ) -> Result<Withdrawal> {
         let id = id.to_string();
         let withdrawn_at = Utc::now().to_rfc3339();
         self.connection
@@ -513,9 +521,14 @@ impl InboxStore {
                     Some((_, Some(_), _) | (_, _, Some(_))) => Withdrawal::Closed,
                     Some((Some(_), None, None)) => Withdrawal::AlreadyAppended,
                     Some((None, None, None)) => {
+                        // `last_error` is what the caller says decided it: a give-up's error,
+                        // or nothing for a withdrawal no failure decided (a client's `DELETE`, a
+                        // canceled turn), so an earlier attempt's error is not read as the
+                        // reason. No next attempt remains, so none is scheduled.
                         transaction.execute(
-                            "UPDATE inbox_items SET withdrawn_at = ?2, failure = ?3 WHERE id = ?1",
-                            rusqlite::params![id, withdrawn_at, reason],
+                            "UPDATE inbox_items SET withdrawn_at = ?2, failure = ?3, \
+                             last_error = ?4, not_before = NULL WHERE id = ?1",
+                            rusqlite::params![id, withdrawn_at, reason, last_error],
                         )?;
                         Withdrawal::Withdrawn
                     }
@@ -942,12 +955,9 @@ mod tests {
             .await
             .expect("stamp");
         let not_before = Utc::now() + chrono::Duration::minutes(5);
+        let record = r#"{"type":"https://meka.run/errors/provider-exhausted","status":503}"#;
         let deferred = inbox
-            .defer_pending(
-                &[id, carried],
-                not_before,
-                Some("the profile's quota or credit is exhausted"),
-            )
+            .defer_pending(&[id, carried], not_before, Some(record))
             .await
             .expect("defer");
         assert_eq!(
@@ -961,10 +971,7 @@ mod tests {
             waiting.not_before.map(|at| at.timestamp()),
             Some(not_before.timestamp())
         );
-        assert_eq!(
-            waiting.last_error.as_deref(),
-            Some("the profile's quota or credit is exhausted")
-        );
+        assert_eq!(waiting.last_error.as_deref(), Some(record));
 
         inbox
             .stamp_appended_after_rewrite(&[id])
@@ -978,6 +985,79 @@ mod tests {
         assert_eq!(
             appended.not_before, None,
             "and when it would have been tried next"
+        );
+    }
+
+    /// A withdrawal records the error its caller says decided it, and nothing otherwise: a
+    /// give-up hands in the failed turn's, or the last attempt's when the ceiling decided, and a
+    /// cancel hands in none, so an earlier attempt's error is not read as the reason.
+    #[tokio::test]
+    async fn a_give_up_keeps_the_error_that_decided_it() {
+        let (store, session_id) = store_with_session().await;
+        let inbox = store.inbox_store();
+        let at_once = inbox
+            .enqueue(item(session_id, InboxClass::Steer, "first"))
+            .await
+            .expect("enqueue")
+            .id;
+        let decided = r#"{"type":"https://meka.run/errors/provider","status":502}"#;
+        inbox
+            .withdraw(
+                at_once,
+                Some("waiting would not change that".to_string()),
+                Some(decided.to_string()),
+            )
+            .await
+            .expect("withdraw");
+        let failed = inbox.get(at_once).await.expect("get").expect("row");
+        assert_eq!(failed.last_error.as_deref(), Some(decided));
+        assert_eq!(
+            failed.failure.as_deref(),
+            Some("waiting would not change that")
+        );
+
+        let at_the_ceiling = inbox
+            .enqueue(item(session_id, InboxClass::Steer, "second"))
+            .await
+            .expect("enqueue")
+            .id;
+        let deferred_for = r#"{"type":"https://meka.run/errors/provider-exhausted"}"#;
+        inbox
+            .defer_pending(&[at_the_ceiling], Utc::now(), Some(deferred_for))
+            .await
+            .expect("defer");
+        inbox
+            .withdraw(
+                at_the_ceiling,
+                Some("past the ceiling".to_string()),
+                Some(deferred_for.to_string()),
+            )
+            .await
+            .expect("withdraw");
+        let expired = inbox.get(at_the_ceiling).await.expect("get").expect("row");
+        assert_eq!(expired.last_error.as_deref(), Some(deferred_for));
+        assert_eq!(
+            expired.not_before, None,
+            "and no next attempt is scheduled for an item given up on"
+        );
+
+        let canceled = inbox
+            .enqueue(item(session_id, InboxClass::Steer, "third"))
+            .await
+            .expect("enqueue")
+            .id;
+        inbox
+            .defer_pending(&[canceled], Utc::now(), Some(deferred_for))
+            .await
+            .expect("defer");
+        inbox
+            .withdraw(canceled, Some("canceled".to_string()), None)
+            .await
+            .expect("withdraw");
+        let canceled = inbox.get(canceled).await.expect("get").expect("row");
+        assert_eq!(
+            canceled.last_error, None,
+            "a cancel decided nothing about the error, so none is shown as the reason"
         );
     }
 
@@ -1040,7 +1120,7 @@ mod tests {
             "an item the turn already carries is not news"
         );
         inbox
-            .withdraw(interrupt, None)
+            .withdraw(interrupt, None, None)
             .await
             .expect("withdraw the interrupt");
         assert!(
@@ -1267,19 +1347,22 @@ mod tests {
         assert_eq!(inbox.pending_count(session_id).await.expect("count"), 1);
 
         assert_eq!(
-            inbox.withdraw(appended, None).await.expect("withdraw"),
+            inbox
+                .withdraw(appended, None, None)
+                .await
+                .expect("withdraw"),
             Withdrawal::Closed
         );
         assert_eq!(
             inbox
-                .withdraw(waiting, Some("gave up".to_string()))
+                .withdraw(waiting, Some("gave up".to_string()), None)
                 .await
                 .expect("withdraw"),
             Withdrawal::Withdrawn
         );
         assert_eq!(
             inbox
-                .withdraw(Uuid::new_v4(), None)
+                .withdraw(Uuid::new_v4(), None, None)
                 .await
                 .expect("withdraw"),
             Withdrawal::Missing

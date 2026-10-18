@@ -648,6 +648,13 @@ impl Transcript {
         }
     }
 
+    /// Whether an inbox item is already drawn, by the id the screen gave it when it enqueued it.
+    fn draws_inbox_item(&self, id: Uuid) -> bool {
+        self.tail.iter().any(|entry| {
+            matches!(&entry.item, Item::Prompt { inbox_id: Some(drawn), .. } if *drawn == id)
+        })
+    }
+
     /// Mark the prompt items the loop has read.
     pub(crate) fn mark_delivered(&mut self, ids: &[Uuid]) {
         for index in 0..self.tail.len() {
@@ -873,6 +880,55 @@ impl Transcript {
                     level: NoticeLevel::Info,
                     text: crate::background::report_direction(&tasks),
                 });
+            }
+            // The message a turn opens with, whichever door opened it. The person's own words are
+            // drawn as they are typed and the context block is meka's; a fire and a report are
+            // said as the stage directions a replay of the log says, so the two read alike.
+            FrontendEvent::MessageAppended {
+                message,
+                outcomes,
+                late,
+            } => {
+                self.remember_background_tasks(outcomes.clone());
+                for block in &message.content {
+                    let item = match block {
+                        ContentBlock::Scheduled { job_id, prompt, .. } => {
+                            Item::note(crate::render::fire_direction(job_id, prompt, late))
+                        }
+                        ContentBlock::BackgroundReport { .. } => {
+                            Item::note(crate::background::report_direction(&outcomes))
+                        }
+                        // Words another client posted to the inbox, read by the model with this
+                        // turn: drawn as a replay draws them, unless the screen drew them when it
+                        // enqueued them itself; the delivery mark then reaches either.
+                        ContentBlock::Inbox {
+                            item_id,
+                            class,
+                            body,
+                            ..
+                        } => {
+                            if item_id.is_some_and(|id| self.draws_inbox_item(id)) {
+                                continue;
+                            }
+                            Item::Prompt {
+                                text: body.trim().to_string(),
+                                class: *class,
+                                inbox_id: *item_id,
+                                delivered: false,
+                            }
+                        }
+                        ContentBlock::Text { .. }
+                        | ContentBlock::TurnContext { .. }
+                        | ContentBlock::Nudge { .. }
+                        | ContentBlock::Image { .. }
+                        | ContentBlock::Thinking { .. }
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::ToolUse { .. }
+                        | ContentBlock::ToolResult { .. } => continue,
+                    };
+                    self.close_streams();
+                    self.push(item);
+                }
             }
             FrontendEvent::AssistantTextDelta(text) => self.append_text(&text),
             FrontendEvent::ThinkingProgress { estimated_tokens } => {
@@ -1250,8 +1306,8 @@ impl Transcript {
                     }
                     // meka's words: a replay says the stage direction the live screen said.
                     ContentBlock::Scheduled { job_id, prompt, .. } => {
-                        let entry = self.entry(Item::note(crate::render::replayed_fire_direction(
-                            job_id, prompt,
+                        let entry = self.entry(Item::note(crate::render::fire_direction(
+                            job_id, prompt, None,
                         )));
                         out.push(entry);
                     }
@@ -2416,5 +2472,140 @@ mod tests {
             texts[0].starts_with("Finished") && texts[1].starts_with("Interrupted"),
             "the oldest page went, the middle one kept its row and the newest closed itself: {texts:?}"
         );
+    }
+    /// The message a turn opens with is said as the stage directions a replay of the log says:
+    /// what reported, then the fire with its lateness, which only the live announcement knows.
+    /// The person's words are drawn as typed and the context block is meka's, so neither says
+    /// anything here.
+    #[test]
+    fn a_turn_s_opening_says_its_report_and_its_fire_as_directions() {
+        use crate::{
+            conversation::{ContentBlock, Role},
+            store::background::{BackgroundTask, TaskStatus},
+        };
+        let finished_at = Utc::now();
+        let task = BackgroundTask {
+            id: "7f3a1c22-0000-4000-8000-000000000000".to_string(),
+            session_id: Uuid::nil(),
+            tool: "shell_execute".to_string(),
+            label: "cargo test".to_string(),
+            status: TaskStatus::Completed,
+            outcome: Some("ok".to_string()),
+            scratchpad_entry: None,
+            started_at: finished_at - chrono::Duration::seconds(30),
+            finished_at: Some(finished_at),
+            announced_at: None,
+            delivered_at: Some(finished_at),
+            subagent_id: None,
+        };
+        let mut transcript = transcript();
+        transcript.apply(FrontendEvent::MessageAppended {
+            message: Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::TurnContext {
+                        text: "[Context]".to_string(),
+                    },
+                    ContentBlock::BackgroundReport {
+                        task_ids: vec![task.id.clone()],
+                        text: "[Background task reporting]\nok".to_string(),
+                    },
+                    ContentBlock::Scheduled {
+                        job_id: "1a2b3c4d-0000-4000-8000-000000000000".to_string(),
+                        prompt: "stretch".to_string(),
+                        text: "[Scheduled job 1a2b3c4d fired]\n\nstretch".to_string(),
+                    },
+                    ContentBlock::Text {
+                        text: "typed".to_string(),
+                    },
+                ],
+            },
+            outcomes: vec![task],
+            late: Some(crate::frontend::FireLateness {
+                late_by: chrono::Duration::hours(2),
+                coalesced: 0,
+            }),
+        });
+        let drawn = items(&transcript);
+        let notes: Vec<&str> = drawn
+            .iter()
+            .filter_map(|item| match item {
+                Item::Notice { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes, [
+            "Background task 7f3a1c22 finished after 30s",
+            "Scheduled job 1a2b3c4d fired 2h late, replacing 1 missed occurrence: stretch",
+        ]);
+        assert!(
+            !drawn
+                .iter()
+                .any(|item| matches!(item, Item::Prompt { text, .. } if text == "typed")),
+            "the words are drawn as typed, not again on their announcement: {drawn:?}"
+        );
+    }
+    /// An inbox item another client posted is drawn when the model reads it with a turn's
+    /// opening, as a replay draws it, and the delivery mark reaches it as it reaches the
+    /// screen's own; one the screen enqueued itself is not drawn a second time.
+    #[test]
+    fn an_inbox_item_from_elsewhere_is_drawn_when_the_opening_carries_it() {
+        use crate::conversation::{ContentBlock, InboxClass, Role};
+        let mut transcript = transcript();
+        let own = Uuid::new_v4();
+        transcript.push(Item::Prompt {
+            text: "mine".to_string(),
+            class: Some(InboxClass::Steer),
+            inbox_id: Some(own),
+            delivered: false,
+        });
+        let foreign = Uuid::new_v4();
+        let inbox = |id: Uuid, body: &str| ContentBlock::Inbox {
+            item_id: Some(id),
+            class: Some(InboxClass::Steer),
+            source: Some("telegram".to_string()),
+            body: body.to_string(),
+            text: format!("[Message from telegram, arrived now]\n{body}"),
+        };
+        transcript.apply(FrontendEvent::MessageAppended {
+            message: Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::TurnContext {
+                        text: "[Context]".to_string(),
+                    },
+                    inbox(own, "mine"),
+                    inbox(foreign, "from afar"),
+                ],
+            },
+            outcomes: Vec::new(),
+            late: None,
+        });
+        let prompts = |transcript: &Transcript| -> Vec<(String, bool)> {
+            items(transcript)
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Prompt {
+                        text, delivered, ..
+                    } => Some((text.clone(), *delivered)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            prompts(&transcript),
+            [
+                ("mine".to_string(), false),
+                ("from afar".to_string(), false)
+            ],
+            "the screen's own once, the other client's drawn as its words"
+        );
+        transcript.apply(FrontendEvent::InboxDelivered {
+            item_ids: vec![own, foreign],
+        });
+        assert_eq!(prompts(&transcript), [
+            ("mine".to_string(), true),
+            ("from afar".to_string(), true)
+        ]);
     }
 }

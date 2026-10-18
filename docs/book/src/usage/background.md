@@ -51,8 +51,9 @@ test result: ok. 1674 passed; 0 failed
 
 That is the model's prompt. The screen does not echo it, any more than it prints a tool's output:
 a stage direction above the reply says what reported, `Background task 7f3a1c22 finished after
-12m 4s`, and the reply carries the result. Under `meka serve` the text rides the feed
-as a `notice`, and an ACP editor shows it as the user turn it is.
+12m 4s`, and the reply carries the result. Under `meka serve` the message reaches the feed as
+`message.appended` with a `background_report` block, and an ACP editor shows it as the user turn
+it is.
 
 When the task ends while a turn is running, the outcome lands inside that turn instead, at its
 next tool-round boundary: behind the results of the round that was running, in the same message,

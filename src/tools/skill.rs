@@ -260,8 +260,9 @@ impl Tool for SkillWriteTool {
             name: "skill_write".to_string(),
             description: "Create or update a skill: a reusable procedure a later session or \
                 sub-agent can follow without being told again. Writing to an existing name \
-                updates it; omit `body` to keep what it already documents. Prefer a skill over a \
-                memory for a *method* rather than a fact, especially one to hand to `agent_spawn`."
+                updates it: omitted fields keep their values, and a given `body` replaces the \
+                whole body. Prefer a skill over a memory for a *method* rather than a fact, \
+                especially one to hand to `agent_spawn`."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -283,13 +284,15 @@ impl Tool for SkillWriteTool {
                         "default": crate::entry::DEFAULT_PRIORITY,
                         "description": "Lower sorts higher in the index and survives truncation. \
                                         0-2 procedures you reach for constantly, 5 default, 6-9 \
-                                        rarely relevant."
+                                        rarely relevant. Omit it to leave an existing skill's \
+                                        priority untouched."
                     },
                     "body": {
                         "type": "string",
                         "description": "The procedure itself, loaded only when skill_read is \
-                                        called or the skill is spawned. Omit it to leave an \
-                                        existing skill's body untouched."
+                                        called or the skill is spawned. Replaces the existing \
+                                        body whole; omit it to leave it untouched, or pass an \
+                                        empty string to clear it."
                     }
                 },
                 "required": ["name"]

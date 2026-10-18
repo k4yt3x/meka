@@ -276,7 +276,7 @@ Skills are knowledge packages stored in `~/.config/meka/skills/<name>/SKILL.md`.
 
 - `skill_read({"name": "<skill-name>"})` returns the full body, prefixed with the skill's base directory.
 - `skill_search({"pattern": "<regex>"})` matches each line of every skill, bodies included. This is what reaches skills the capped index did not list, and what answers "which of my skills covers this" when the one-line descriptions do not.
-- `skill_write({"name": ..., "description": ..., "priority": ..., "body": ...})` creates or updates a skill. Omitting `body` keeps the existing one.
+- `skill_write({"name": ..., "description": ..., "priority": ..., "body": ...})` creates or updates a skill. Omitted fields keep their values; a given `body` replaces the existing one whole.
 - `skill_delete({"name": ...})` removes the skill's whole directory, bundled files included.
 
 The last two are registered only when [`[skills] agent_managed`](../configuration/config-file.md#skills) is on, and never for a sub-agent. See [Skills](../usage/skills.md) for how to author skills and [Letting the agent manage skills](../usage/skills.md#letting-the-agent-manage-skills) for when to hand authoring to the agent.

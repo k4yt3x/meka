@@ -201,6 +201,10 @@ pub(super) struct LiveTurn {
     /// The id of its `turn.started`, the position a stream opened on the turn stands at before
     /// it has received anything; `None` until the event is published.
     pub(super) started_id: Option<u64>,
+    /// Its `message.appended` as published, id included, for a client attaching mid-turn from
+    /// behind it, which is handed the turn's opening after the `turn.started` it is handed;
+    /// `None` until it is published.
+    pub(super) opening: Option<SseEvent>,
 }
 
 impl SessionFeed {
@@ -256,6 +260,13 @@ impl SessionFeed {
             event_type,
             data,
         };
+        // The first message of the turn is its opening; one an interrupt appends later is not.
+        if event_type == SseEventType::MessageAppended
+            && let Some(turn) = self.turn.as_mut()
+            && turn.opening.is_none()
+        {
+            turn.opening = Some(event.clone());
+        }
         if !transient {
             self.ring.record(event.clone());
         }
@@ -288,6 +299,10 @@ pub(crate) struct StreamAttachment {
     pub(crate) turn_id: Option<uuid::Uuid>,
     /// Who started that turn, so the synthesized `turn.started` can say.
     pub(crate) turn_source: Option<TurnSource>,
+    /// That turn's opening as it was announced, re-issued after the synthesized `turn.started`
+    /// for a client that has not had it: one joining, or one resuming from behind it after the
+    /// ring let it go. A reader the replay hands it to, or one resuming from past it, has it.
+    pub(crate) turn_opening: Option<serde_json::Value>,
     /// Held while the client attends the session; dropping the attachment counts it out.
     pub(crate) attendance: Option<Attendance>,
     /// Buffered events with an id greater than the client's `Last-Event-ID`, oldest first.

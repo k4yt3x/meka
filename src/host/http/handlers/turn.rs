@@ -1599,6 +1599,18 @@ impl TurnMessages {
         }
     }
 
+    /// A user-role message the turn appended whole: its opening, or the message an interrupt
+    /// adds after a cut answer. Closes whatever was open, since it is a message of its own.
+    fn user_message(
+        &mut self,
+        content: Vec<crate::host::http::handlers::messages::ContentBlockView>,
+    ) {
+        self.close_assistant();
+        self.close_results();
+        self.messages
+            .push(turn_message(self.turn_id, "user", content));
+    }
+
     fn close_assistant(&mut self) {
         if !self.assistant.is_empty() {
             let content = std::mem::take(&mut self.assistant);
@@ -1679,6 +1691,9 @@ fn assemble_response(
                 messages
                     .background_report(tasks.iter().map(|task| task.id.clone()).collect(), text);
             }
+            FrontendEvent::MessageAppended { message, .. } => messages.user_message(
+                crate::host::http::handlers::messages::message_view(&message).content,
+            ),
             FrontendEvent::TokenUsage(token_usage) => {
                 // Last-wins assignment: the agent emits exactly one `TokenUsage` per turn
                 // (accumulated total). If that ever changes, switch to `saturating_add`.
@@ -2084,6 +2099,18 @@ fn build_reattach_stream(
                 .event("turn.started")
                 .json_data(data)
                 .unwrap_or_else(|_| Event::default().comment("resumed turn.started serialize-failed")));
+            // The opening as it was announced, marked as the `turn.started` above is: a client
+            // that joins mid-turn would otherwise read the reply under nothing. Synthesized like
+            // it, so it carries no id; what the turn appended since is read from `GET /messages`.
+            if let Some(mut opening) = attachment.turn_opening {
+                if let Some(object) = opening.as_object_mut() {
+                    object.insert("resumed".to_string(), serde_json::Value::Bool(true));
+                }
+                yield Ok(Event::default()
+                    .event("message.appended")
+                    .json_data(opening)
+                    .unwrap_or_else(|_| Event::default().comment("resumed message.appended serialize-failed")));
+            }
         }
 
         if let Some(gap) = attachment.gap {
@@ -2292,6 +2319,57 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The response lays the turn out as the history does, so it begins with the message the
+    /// turn opened with, the context block and the words, and the reply follows it; a message an
+    /// interrupt appends mid-turn closes the reply it cut.
+    #[test]
+    fn assemble_response_begins_with_the_opening_message() {
+        use crate::host::http::handlers::messages::ContentBlockView;
+        let user = |text: &str| {
+            crate::conversation::Message::turn_opening(
+                "[Context]",
+                vec![crate::conversation::ContentBlock::Text {
+                    text: text.to_string(),
+                }],
+                Vec::new(),
+            )
+        };
+        let appended = |message| FrontendEvent::MessageAppended {
+            message,
+            outcomes: Vec::new(),
+            late: None,
+        };
+        let recorder: Recorder = vec![
+            appended(user("hi")),
+            FrontendEvent::AssistantTextDelta("the first half".into()),
+            appended(user("stop")),
+            FrontendEvent::AssistantTextDelta("carrying on".into()),
+        ];
+        let response = assemble_response(
+            Uuid::nil(),
+            Uuid::nil(),
+            TurnOutcome::EndTurn,
+            recorder,
+            crate::host::http::http_frontend::SessionCapabilities::default(),
+        );
+        let roles: Vec<&str> = response
+            .messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
+        assert!(
+            matches!(
+                response.messages[0].content.as_slice(),
+                [ContentBlockView::TurnContext { .. }, ContentBlockView::Text { text }] if text == "hi"
+            ),
+            "{:?}",
+            response.messages[0].content
+        );
+        assert_eq!(text_of(&response.messages[1]), "the first half");
+        assert_eq!(text_of(&response.messages[3]), "carrying on");
     }
 
     #[test]

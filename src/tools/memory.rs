@@ -46,7 +46,7 @@ impl Tool for MemoryWriteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "memory_write".to_string(),
-            description: "Save preferences, constraints, decisions, or facts that later sessions need. Update an existing name to refine it; omitted fields keep their values. Temporary task state and large outputs belong in the scratchpad, which later sessions do not read. Write a description that states the useful fact on its own.".to_string(),
+            description: "Save preferences, constraints, decisions, or facts that later sessions need. Update an existing name to refine it: omitted fields keep their values, and a given `body` replaces the whole body. Temporary task state and large outputs belong in the scratchpad, which later sessions do not read. Write a description that states the useful fact on its own.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -77,8 +77,8 @@ impl Tool for MemoryWriteTool {
                     "body": {
                         "type": "string",
                         "description": "Detail loaded by `memory_read`, and inlined within budget at priority 0. \
-                                        Omit it to leave an existing memory's body untouched; \
-                                        pass an empty string to clear it."
+                                        Replaces the existing body whole; omit it to leave it \
+                                        untouched, or pass an empty string to clear it."
                     }
                 },
                 "required": ["name"]

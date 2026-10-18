@@ -341,11 +341,13 @@ to the parent's frontend and drops the rest). Where they differ:
 | `Compacted` | nothing live; the log's boundary reads back as `• context compacted`, and `/compact` adds its summary as a dim row | info notice | `context.compacted` event | dropped; `GET /messages` carries the marker | dropped | dropped |
 | Approval with nobody to ask | warn `approval_refused_without_asking`, deny (the screen is gone) | asks the client; deny after `APPROVAL_TIMEOUT`, `Canceled` on cancel | `permission_required` event while a streaming client or a feed reader with `attend=true` is there; deny after `APPROVAL_TIMEOUT`, `Canceled` when the last of them leaves; refused with a warn notice otherwise, unless the session declared `answers_prompts_on_return` and no request holds the turn, in which case it parks and waits out `APPROVAL_TIMEOUT` | as HTTP stream: a feed attendee answers a JSON request's prompt too; without one, warn notice, deny, the same capability aside | warn `approval_refused_without_asking`, deny | deny; the notice goes nowhere |
 | Elicitation | asks the screen; warn `elicitation_declined` and decline when it is gone | `elicitation/create`; warn `elicitation_declined` and decline when the client lacks the mode or two sessions have calls in flight on the server | warn `elicitation_declined`, decline | same | trait default: warn `elicitation_declined`, decline | same, dropped |
-| Scheduled fire prompt | a dim `• scheduled job <id> fired: …` row | `UserMessageChunk` | info notice into the stream | info notice, drained after the turn | no scheduler | n/a |
+| `MessageAppended` (the message a turn opens with, whoever opened it, or one an interrupt appends) | a dim `• Scheduled job <id> fired: …` or `• Background task <id> …` row per fire or report block; an inbox item another client posted is drawn as `> words (steer)`, one the screen enqueued itself is already drawn; the person's words are drawn as typed | `UserMessageChunk` per `scheduled`, `background_report` or `inbox` block; the editor's own words are not echoed | `message.appended` event (`MessageView`), re-issued with `resumed: true` to a client joining mid-turn | the opening, first in `messages[]` | a paragraph break | dropped |
 | Scheduled fire failure | a red `■` row; `! interrupted` on a cancel | warn notice `scheduled job '<id>' failed: ...`; info on a cancel | `schedule.fired` webhook, `status` `completed`, `canceled`, `failed` or `not_run`; nothing on the frontend | same webhook | no scheduler | n/a |
 
-The scheduled-fire rows come from each host's `HostHooks` (`show_prompt`, `finished`) rather than
-its `Frontend`, in `host/tui.rs`, `host/acp/schedule.rs` and `host/http/schedule.rs`.
+The scheduled-fire failure row comes from each host's `HostHooks` (`finished`) rather than its
+`Frontend`, in `host/tui.rs`, `host/acp/schedule.rs` and `host/http/schedule.rs`. The fire's
+prompt takes no hook: the agent emits `MessageAppended` where it appends a turn's opening, which is
+the one place every door passes, so a report riding a client's turn is announced as a fire's is.
 
 ## Building
 

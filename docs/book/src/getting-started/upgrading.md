@@ -21,6 +21,17 @@ a connection for the length of a turn sends `detach: true` and reads the turn fr
 `202` names, or follows the session feed; see [Holding a turn](../usage/http-api.md#holding-a-turn).
 A feed subscriber counts as a listener, so a client that keeps the feed open is unaffected.
 
+**The message a turn opens with is on the feed as `message.appended`.** A scheduled fire's prompt
+and a background report that opened a turn used to reach the session feed as an `info` `notice`
+holding the text; they now arrive as `message.appended`, the message as `GET /messages` types it,
+under the turn's id, and so does every other turn's opening. A client that displayed those notices
+reads the `scheduled` and `background_report` blocks of the new event instead; a client that logs
+notices stops seeing prompt bodies in them. See [the session feed](../usage/http-api.md#the-session-feed).
+
+**A blocking `POST /turn` answers with the opening message first.** `messages` begins with the
+user-role message the turn opened with, as the history reads it back, where it used to begin with
+the assistant's first message. A client that read `messages[0]` as the reply filters by `role`.
+
 **Session archives are `format_version` 14.** A 0.77 archive imports as it is; a 0.78 archive
 names why a canceled turn stopped and which fallback profile served a turn, which 0.77 refuses to
 read.

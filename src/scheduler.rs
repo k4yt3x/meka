@@ -36,6 +36,15 @@ impl Wakeup {
         self.late_by > chrono::Duration::minutes(1)
     }
 
+    /// The lateness the fire's announcement carries: `None` when a tick explains it.
+    pub(crate) fn lateness(&self) -> Option<crate::frontend::FireLateness> {
+        self.is_materially_late()
+            .then_some(crate::frontend::FireLateness {
+                late_by: self.late_by,
+                coalesced: self.coalesced,
+            })
+    }
+
     /// Render the user-turn text delivered to the model.
     ///
     /// The header is not decoration: without it the model reads a bare instruction as if a human

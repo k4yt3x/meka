@@ -350,6 +350,15 @@ impl std::fmt::Display for FrontendError {
 
 impl std::error::Error for FrontendError {}
 
+/// How late a scheduled fire was, when that is worth saying: news as it happens, so it rides the
+/// event that announces the fire and is written nowhere a replay would read it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FireLateness {
+    pub(crate) late_by: chrono::Duration,
+    /// Occurrences this fire stands in for beyond the one delivered.
+    pub(crate) coalesced: u32,
+}
+
 /// One-way UI event emitted by the agent loop.
 #[derive(Debug, Clone)]
 pub(crate) enum FrontendEvent {
@@ -393,6 +402,17 @@ pub(crate) enum FrontendEvent {
     BackgroundReported {
         tasks: Vec<crate::store::background::BackgroundTask>,
         text: String,
+    },
+    /// A user-role message carrying words entered the conversation whole: the message a turn
+    /// opens with, whoever opened it, or the one an interrupt appends after a cut answer. Emitted
+    /// where the message is appended, so every door's opening is announced once and the turn it
+    /// belongs to is the one running. `message` is what the conversation holds, for a frontend
+    /// that mirrors it; `outcomes` are the rows behind any report block and `late` how late a
+    /// fire's block was, for a frontend that says what happened as a stage direction instead.
+    MessageAppended {
+        message: crate::conversation::Message,
+        outcomes: Vec<crate::store::background::BackgroundTask>,
+        late: Option<FireLateness>,
     },
     /// A streamed chunk of assistant text. Multiple deltas concatenate into one logical text run;
     /// any non-text event closes the run.

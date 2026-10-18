@@ -10,6 +10,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -191,11 +192,33 @@ pub(crate) enum ToolResultContentView {
     },
 }
 
-/// The hash an image view names, when the source is a reference into the store.
+/// A message as the feed announces it when it is appended: the blocks typed as this endpoint types
+/// them, with no row of its own yet. The feed stamps the turn.
+pub(crate) fn message_view(message: &Message) -> MessageView {
+    MessageView {
+        role: match message.role {
+            Role::User => "user".to_string(),
+            Role::Assistant => "assistant".to_string(),
+        },
+        content: message.content.iter().map(view_for_block).collect(),
+        created_at: None,
+        turn_id: None,
+        turn_label: None,
+        compaction: None,
+    }
+}
+
+/// The hash an image view names. A message read back holds a reference into the store; one
+/// announced as it is appended still holds the bytes, which the store is filing under the same
+/// name, so the view names it rather than sending nothing. A payload that is not base64 stays
+/// inline in the row and is named by nothing.
 fn blob_hash(source: &crate::image::ImageSource) -> Option<String> {
     match source {
         crate::image::ImageSource::Blob { hash, .. } => Some(hash.clone()),
-        crate::image::ImageSource::Base64 { .. } => None,
+        crate::image::ImageSource::Base64 { data, .. } => base64::engine::general_purpose::STANDARD
+            .decode(data.as_bytes())
+            .ok()
+            .map(|bytes| crate::store::content_hash(&bytes)),
     }
 }
 

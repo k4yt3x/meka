@@ -409,26 +409,10 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         self.state.config.inbox_retry_ceiling
     }
 
-    /// The prompt's text as a notice, since this surface has no user-message event and a client
-    /// mirroring the conversation wants the words the turn answers; the screen, which shows the
-    /// person no prompt they did not type, announces the turn's opener instead. It reaches a
-    /// stream when one is live and the recorder otherwise, where `finished` drains it.
-    fn show_prompt(
-        &self,
-        entry: &Self::Entry,
-        prompt: crate::host::scheduler::OutOfBandPrompt<'_>,
-    ) {
-        let text = match prompt {
-            crate::host::scheduler::OutOfBandPrompt::Outcomes(tasks) => {
-                crate::background::render_outcomes(tasks)
-            }
-            crate::host::scheduler::OutOfBandPrompt::Scheduled(wakeup) => wakeup.render_prompt(),
-        };
-        entry
-            .frontend
-            .push_event(crate::frontend::FrontendEvent::Notice(
-                crate::frontend::Notice::info(text),
-            ));
+    /// The error object the webhook gets, since the item is read back by anyone who lists the
+    /// inbox: the upstream's text stays off it for the reason it stays off a webhook.
+    fn inbox_error_record(&self, error: &crate::error::MekaError) -> Option<String> {
+        Some(self.event_errors(error).1.to_string())
     }
 
     async fn finished(

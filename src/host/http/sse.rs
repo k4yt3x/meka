@@ -53,6 +53,7 @@ pub(crate) enum SseEventType {
     TurnCanceled,
     Nudged,
     BackgroundReported,
+    MessageAppended,
     InboxDelivered,
     InboxDeferred,
     InboxFailed,
@@ -105,6 +106,7 @@ impl SseEventType {
             Self::TurnCanceled => "turn.canceled",
             Self::Nudged => "turn.nudged",
             Self::BackgroundReported => "task.reported",
+            Self::MessageAppended => "message.appended",
             Self::InboxDelivered => "inbox.delivered",
             Self::InboxDeferred => "inbox.deferred",
             Self::InboxFailed => "inbox.failed",
@@ -214,6 +216,14 @@ pub(crate) fn translate(
                 "task_ids": tasks.iter().map(|task| task.id.as_str()).collect::<Vec<_>>(),
                 "text": text,
             }),
+        ),
+        // The one shape a user message has on this API: what `GET /messages` reads back, so a
+        // client renders a message it watched arrive and one it read later the same way.
+        FrontendEvent::MessageAppended { message, .. } => (
+            SseEventType::MessageAppended,
+            serde_json::json!(crate::host::http::handlers::messages::message_view(
+                &message
+            )),
         ),
         FrontendEvent::AssistantTextDelta(text) => (
             SseEventType::AssistantTextDelta,
@@ -402,6 +412,49 @@ enum TextOrImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The opening is one shape on this API, the one `GET /messages` reads back, and an image
+    /// attached to it is named by the hash the store files its bytes under, though the message in
+    /// hand still holds them inline.
+    #[test]
+    fn translate_message_appended_as_the_messages_endpoint_types_it() {
+        use base64::Engine as _;
+        let bytes = b"not really a png";
+        let message = crate::conversation::Message::turn_opening(
+            "[Context]",
+            vec![crate::conversation::ContentBlock::Text {
+                text: "look".into(),
+            }],
+            vec![crate::image::ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            }],
+        );
+        let (event_type, data) = translate(
+            FrontendEvent::MessageAppended {
+                message,
+                outcomes: Vec::new(),
+                late: None,
+            },
+            SessionCapabilities::default(),
+        )
+        .expect("translates");
+        assert_eq!(event_type, SseEventType::MessageAppended);
+        assert_eq!(event_type.as_str(), "message.appended");
+        assert_eq!(data["role"], "user");
+        assert_eq!(data["content"][0]["type"], "turn_context");
+        assert_eq!(
+            data["content"][1],
+            serde_json::json!({"type": "text", "text": "look"})
+        );
+        assert_eq!(data["content"][2]["type"], "image");
+        assert_eq!(data["content"][2]["media_type"], "image/png");
+        assert_eq!(
+            data["content"][2]["hash"],
+            crate::store::content_hash(bytes),
+            "{data}"
+        );
+    }
 
     #[test]
     fn translate_text_delta() {

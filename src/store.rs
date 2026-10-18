@@ -50,6 +50,7 @@ use self::backup::*;
 // The lock vocabulary is the store's own; only the list below leaves the module.
 use self::locks::*;
 pub(crate) use self::{
+    blobs::content_hash,
     credentials::{
         AuthCredential, CredentialWrite, McpCredentialKind, StoredCredential, TokenStore,
     },

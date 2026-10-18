@@ -760,24 +760,6 @@ impl crate::host::scheduler::HostHooks for TuiHooks {
         crate::agent::TurnCancellation::new()
     }
 
-    /// A stage direction naming what opened the turn: the reply that follows would otherwise
-    /// appear under nothing, as though the model had spoken unprompted.
-    fn show_prompt(
-        &self,
-        _entry: &Self::Entry,
-        prompt: crate::host::scheduler::OutOfBandPrompt<'_>,
-    ) {
-        let direction = match prompt {
-            crate::host::scheduler::OutOfBandPrompt::Outcomes(tasks) => {
-                crate::background::report_direction(tasks)
-            }
-            crate::host::scheduler::OutOfBandPrompt::Scheduled(wakeup) => {
-                crate::render::scheduled_fire_direction(wakeup)
-            }
-        };
-        self.ui.note(direction);
-    }
-
     async fn finished(
         &self,
         entry: &Self::Entry,

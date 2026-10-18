@@ -98,9 +98,9 @@ pub(super) fn out_of_band_prompt_update(prompt: &str) -> SessionUpdate {
     ))))
 }
 
-/// `meka acp` around an out-of-band turn: only a session the editor has open can run one, the
-/// agent is moved onto the profile the row records first, and the prompt is pushed to the editor
-/// as a user-message chunk so the transcript shows what the turn answered.
+/// `meka acp` around an out-of-band turn: only a session the editor has open can run one, and the
+/// agent is moved onto the profile the row records first. The prompt reaches the editor as a
+/// user-message chunk through the frontend, as every turn's opening does.
 struct AcpHooks {
     state: Arc<super::ServerState>,
 }
@@ -145,23 +145,6 @@ impl crate::host::scheduler::HostHooks for AcpHooks {
 
     async fn prepare(&self, entry: &Self::Entry) -> anyhow::Result<()> {
         crate::host::apply_recorded_profile(&self.state.shared, &entry.agent, entry.id).await
-    }
-
-    fn show_prompt(
-        &self,
-        entry: &Self::Entry,
-        prompt: crate::host::scheduler::OutOfBandPrompt<'_>,
-    ) {
-        match prompt {
-            crate::host::scheduler::OutOfBandPrompt::Outcomes(tasks) => {
-                entry
-                    .frontend
-                    .push_out_of_band_prompt(&crate::background::render_outcomes(tasks));
-            }
-            crate::host::scheduler::OutOfBandPrompt::Scheduled(wakeup) => {
-                entry.frontend.push_scheduled_prompt(wakeup);
-            }
-        }
     }
 
     /// An out-of-band turn has no `session/prompt` response to carry its outcome, so a failure

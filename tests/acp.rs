@@ -7387,10 +7387,45 @@ enabled = true
     }
 
     let id = harness.prompt(&session_id, "what is in this CSV?");
-    let response = harness.await_response(id);
+    // Read to the response by hand, keeping the updates on the way: the report is shown to the
+    // editor during the prompt, as the user turn it is, and only there.
+    let needle = format!("\"id\":{id}");
+    let lines = read_until_with_dispatch(
+        &mut harness.reader,
+        &mut harness.stdin,
+        Instant::now() + harness.window,
+        |_| None,
+        |line| response_matches(line, &needle),
+    );
+    let response: serde_json::Value = lines
+        .iter()
+        .find(|line| response_matches(line, &needle))
+        .and_then(|line| serde_json::from_str(line).ok())
+        .unwrap_or_else(|| panic!("no response for id={id}; transcript:\n{}", lines.join("")));
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
         "the prompt must run: {response}"
+    );
+    let user_chunks: Vec<String> = lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .map(|value| value["params"]["update"].clone())
+        .filter(|update| update["sessionUpdate"] == "user_message_chunk")
+        .filter_map(|update| update["content"]["text"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        user_chunks.len(),
+        1,
+        "the report is shown once, as a user turn; transcript:\n{}",
+        lines.join("")
+    );
+    assert!(
+        user_chunks[0].contains("was canceled"),
+        "and it is the report: {user_chunks:?}"
+    );
+    assert!(
+        !user_chunks[0].contains("what is in this CSV?"),
+        "the editor's own words are not echoed back to it: {user_chunks:?}"
     );
 
     let connection = rusqlite::Connection::open(harness.database()).expect("open the store");

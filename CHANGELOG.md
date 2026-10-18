@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.78.0] - 2026-10-17
+## [0.78.0] - 2026-10-18
 
 ### Added
 
@@ -21,17 +21,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/errors/provider-exhausted`: a quota or billing refusal, its reset relayed as `Retry-After`.
 - A turn's record and its terminal event carry `profile` when a fallback profile served the turn.
 - `[serve] inbox_retry_ceiling`: how long a queued inbox item is retried; `"0s"` fails it at once.
-- `inbox.deferred`; `inbox.failed` carries `error`; waiting items show `not_before`, `last_error`.
+- `inbox.deferred`; `inbox.failed` carries `error`; a waiting item shows `not_before`, `last_error`.
+- An inbox item shows `retry_until`; its `last_error` is a Problem Detail, kept once given up on.
+- A replayed inbox `Idempotency-Key` answers the item's `not_before`, `last_error` and `failure`.
+- `message.appended`: the message a turn opens with, on the feed, typed as `GET /messages` types it.
+- A client joining a feed mid-turn is handed the turn's opening message after its `turn.started`.
 
 ### Changed
 
 - **Breaking:** a blocking `POST /turn` holds its turn: a dropped request stops it after the grace.
+- **Breaking:** a fire or an outcome report opening a turn is `message.appended`, not a `notice`.
+- **Breaking:** a blocking `POST /turn` lists the message the turn opened with first in `messages`.
+- A report riding a client's or an inbox turn is announced on the feed as the opening's block.
 - A detached request's `Idempotency-Key` is committed at admission; a replay gets the same `202`.
 - A 402 or a 429 naming a quota or the subscription window is `provider-exhausted`, not retried.
 - A fallback must match its profile's `vision` and have a window and request cap no smaller.
 - A turn on a `vision = false` profile is refused before sending while the session holds an image.
 - An inbox turn retries only when waiting can help; a stated reset pulls the next attempt earlier.
 - Session archives are `format_version` 14; a 0.77 archive is read as it is.
+
+### Fixed
+
+- The screen draws an inbox item another client posted when the model reads it, as a replay does.
 
 ## [0.77.0] - 2026-10-16
 

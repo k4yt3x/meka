@@ -88,7 +88,9 @@ fn assemble_report(
                 round_boundary = false;
                 text.push_str(&delta);
             }
-            FrontendEvent::Nudged { .. } | FrontendEvent::BackgroundReported { .. } => {
+            FrontendEvent::Nudged { .. }
+            | FrontendEvent::BackgroundReported { .. }
+            | FrontendEvent::MessageAppended { .. } => {
                 round_boundary = true;
             }
             FrontendEvent::ToolCallStarted {

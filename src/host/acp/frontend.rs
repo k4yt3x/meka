@@ -251,26 +251,6 @@ impl AcpFrontend {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Show a scheduled job's prompt in the transcript, before the turn that answers it runs.
-    ///
-    /// Goes out as a `UserMessageChunk` rather than a notice because that is what it is: the turn
-    /// has a prompt, it just came from a timer instead of a keystroke. Without it the editor shows
-    /// a reply with nothing above it explaining the question.
-    pub(crate) fn push_scheduled_prompt(&self, wakeup: &crate::scheduler::Wakeup) {
-        self.push_out_of_band_prompt(&wakeup.render_prompt());
-    }
-
-    /// Show any prompt the user did not type, for the same reason: a reply with nothing above it
-    /// explaining the question reads as the agent talking to itself. Used by scheduled jobs and by
-    /// background-task outcome reports.
-    pub(crate) fn push_out_of_band_prompt(&self, prompt: &str) {
-        send_session_update(
-            &self.connection,
-            &self.session_id,
-            crate::host::acp::schedule::out_of_band_prompt_update(prompt),
-        );
-    }
-
     /// Push one `session/update` to the client, latching the transport as dead if it fails.
     ///
     /// `send_notification` is synchronous, which is what lets the live-output path hold its buffer
@@ -552,6 +532,29 @@ impl Frontend for AcpFrontend {
             // turn of its own is.
             FrontendEvent::BackgroundReported { text, .. } => {
                 super::schedule::out_of_band_prompt_update(&text)
+            }
+            // The message a turn opens with, or one an interrupt appends. What the editor did not
+            // type is shown as the user turn it is, so the reply has its question above it; the
+            // editor's own words and images are in its transcript already, and the context block
+            // is meka's, shown nowhere.
+            FrontendEvent::MessageAppended { message, .. } => {
+                for block in &message.content {
+                    let text = match block {
+                        crate::conversation::ContentBlock::Scheduled { text, .. }
+                        | crate::conversation::ContentBlock::BackgroundReport { text, .. }
+                        | crate::conversation::ContentBlock::Inbox { text, .. } => text,
+                        crate::conversation::ContentBlock::Text { .. }
+                        | crate::conversation::ContentBlock::TurnContext { .. }
+                        | crate::conversation::ContentBlock::Nudge { .. }
+                        | crate::conversation::ContentBlock::Image { .. }
+                        | crate::conversation::ContentBlock::Thinking { .. }
+                        | crate::conversation::ContentBlock::RedactedThinking { .. }
+                        | crate::conversation::ContentBlock::ToolUse { .. }
+                        | crate::conversation::ContentBlock::ToolResult { .. } => continue,
+                    };
+                    self.send_update(super::schedule::out_of_band_prompt_update(text));
+                }
+                return;
             }
             // Screen signage. The editor named the session it created, and the `session/prompt`
             // response is what tells it the turn is over. A withdrawn prompt is a scheduled fire's,

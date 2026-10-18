@@ -350,39 +350,27 @@ const FIRE_DIRECTION_PROMPT_COLUMNS: usize = 40;
 
 /// The stage direction the screen prints where a scheduled fire's turn begins: the job, its
 /// lateness when that is material, and the opening of its prompt, which the person wrote and
-/// needs only to recognize.
-pub(crate) fn scheduled_fire_direction(wakeup: &crate::scheduler::Wakeup) -> String {
-    fire_direction(
-        wakeup.job.short_id(),
-        &wakeup.job.prompt,
-        wakeup
-            .is_materially_late()
-            .then_some((wakeup.late_by, wakeup.coalesced + 1)),
-    )
-}
-
-/// [`scheduled_fire_direction`] for a fire read back from the log, which holds the job's id and
-/// its words and nothing of how late the fire was: a lateness is news as it happens and a
-/// replay is not the time for it.
-pub(crate) fn replayed_fire_direction(job_id: &str, prompt: &str) -> String {
-    fire_direction(
-        job_id.get(..crate::text::ID_PREFIX).unwrap_or(job_id),
-        prompt,
-        None,
-    )
-}
-
-/// [`scheduled_fire_direction`] on its parts: the job's short id, its prompt, and when the fire
-/// is late, how late and how many occurrences it stands in for.
-fn fire_direction(short_id: &str, prompt: &str, late: Option<(chrono::Duration, u32)>) -> String {
+/// needs only to recognize. A fire read back from the log carries no lateness: it is news as it
+/// happens, and a replay is not the time for it.
+pub(crate) fn fire_direction(
+    job_id: &str,
+    prompt: &str,
+    late: Option<crate::frontend::FireLateness>,
+) -> String {
+    let short_id = job_id.get(..crate::text::ID_PREFIX).unwrap_or(job_id);
     let prompt = crate::text::sanitize_to_line(prompt, FIRE_DIRECTION_PROMPT_COLUMNS);
     match late {
-        Some((late_by, occurrences)) => format!(
-            "Scheduled job {short_id} fired {} late, replacing {occurrences} missed \
-             occurrence{}: {prompt}",
-            crate::scheduler::format_late(late_by),
-            if occurrences == 1 { "" } else { "s" }
-        ),
+        Some(late) => {
+            // The occurrence being delivered counts among the ones the fire stands in for, as
+            // the prompt the model gets counts it.
+            let occurrences = late.coalesced + 1;
+            format!(
+                "Scheduled job {short_id} fired {} late, replacing {occurrences} missed \
+                 occurrence{}: {prompt}",
+                crate::scheduler::format_late(late.late_by),
+                if occurrences == 1 { "" } else { "s" }
+            )
+        }
         None => format!("Scheduled job {short_id} fired: {prompt}"),
     }
 }
@@ -413,18 +401,18 @@ mod direction_tests {
             coalesced: 2,
         };
         assert_eq!(
-            scheduled_fire_direction(&late),
+            fire_direction(&job.id, &job.prompt, late.lateness()),
             "Scheduled job 1a2b3c4d fired 2h late, replacing 3 missed occurrences: remind me to \
              stretch"
         );
         let on_time = crate::scheduler::Wakeup {
-            job,
+            job: job.clone(),
             gate_output: None,
             late_by: chrono::Duration::seconds(5),
             coalesced: 0,
         };
         assert_eq!(
-            scheduled_fire_direction(&on_time),
+            fire_direction(&job.id, &job.prompt, on_time.lateness()),
             "Scheduled job 1a2b3c4d fired: remind me to stretch"
         );
     }
@@ -433,21 +421,26 @@ mod direction_tests {
     /// tick could explain, and says how late and how many occurrences otherwise.
     #[test]
     fn a_fire_direction_quotes_the_prompt_and_the_material_lateness() {
+        let late = |late_by, coalesced| Some(crate::frontend::FireLateness { late_by, coalesced });
         assert_eq!(
-            fire_direction("1a2b3c4d", "remind me to stretch", None),
+            fire_direction(
+                "1a2b3c4d-0000-4000-8000-000000000000",
+                "remind me to stretch",
+                None
+            ),
             "Scheduled job 1a2b3c4d fired: remind me to stretch"
         );
         assert_eq!(
             fire_direction(
                 "1a2b3c4d",
                 "remind me to stretch",
-                Some((chrono::Duration::hours(2), 3))
+                late(chrono::Duration::hours(2), 2)
             ),
             "Scheduled job 1a2b3c4d fired 2h late, replacing 3 missed occurrences: remind me to \
              stretch"
         );
         assert!(
-            fire_direction("1a2b3c4d", "x", Some((chrono::Duration::minutes(5), 1)))
+            fire_direction("1a2b3c4d", "x", late(chrono::Duration::minutes(5), 0))
                 .contains("1 missed occurrence:")
         );
         let long = fire_direction("1a2b3c4d", &"check the build\n".repeat(20), None);

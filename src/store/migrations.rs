@@ -389,6 +389,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "inbox_items_remember_why_their_last_turn_failed",
         step: Step::Rust(inbox_items_remember_why_their_last_turn_failed),
     },
+    // 0.78 records that error as the API's error object; a sentence a store of the same release
+    // wrote under the step above is cleared, since a reader renders the object alone.
+    Migration {
+        name: "inbox_items_record_errors_as_objects",
+        step: Step::Rust(inbox_items_record_errors_as_objects),
+    },
 ];
 
 /// The position of the last turn a session opened, beside the eight cumulative counters: `NULL`
@@ -585,6 +591,18 @@ fn inbox_items_remember_why_their_last_turn_failed(
     if !table_has_column(transaction, "inbox_items", "last_error")? {
         transaction.execute_batch("ALTER TABLE inbox_items ADD COLUMN last_error TEXT")?;
     }
+    Ok(())
+}
+
+/// `last_error` holds the API's error object as JSON; a value that is not one is cleared. Safe
+/// twice: an object is left alone and a cleared column stays cleared.
+fn inbox_items_record_errors_as_objects(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "UPDATE inbox_items SET last_error = NULL \
+         WHERE last_error IS NOT NULL AND substr(last_error, 1, 1) <> '{'",
+    )?;
     Ok(())
 }
 
@@ -4569,6 +4587,10 @@ mod tests {
             (
                 "inbox_items_remember_why_their_last_turn_failed",
                 14439600663556915070_u64,
+            ),
+            (
+                "inbox_items_record_errors_as_objects",
+                1342041145199385063_u64,
             ),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,

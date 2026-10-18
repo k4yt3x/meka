@@ -476,14 +476,17 @@ Every class rides the opening of the next turn when nothing is running, whoever 
 The answer is `202` with the item and its state:
 
 ```json
-{"item_id": "...", "session_id": "...", "class": "steer", "state": "pending", "replayed": false}
+{"item_id": "...", "session_id": "...", "class": "steer", "state": "pending", "replayed": false,
+ "retry_until": "2026-10-18T15:02:11Z"}
 ```
+
+`retry_until` is the deadline for retries, the item's enqueue plus [`[serve] inbox_retry_ceiling`](../configuration/config-file.md#serveinbox_retry_ceiling): an attempt that fails after it is not retried, and the item is given up on. An item not yet tried still runs when its turn comes, whatever the time, so under a short ceiling a fresh item can show a `retry_until` already past and be delivered all the same. A fresh item answers `pending`, unless a turn already running read it in the meantime. A replayed key answers with what the earlier item has become: beside its `state`, the `not_before` and `last_error` it shows while it waits, or the `failure` and `last_error` it was given up on with, so a producer that lost its place learns the item's fate from the same call that enqueued it, without listing an inbox that no longer shows a withdrawn item.
 
 An item is `pending` until its text is in the conversation, `appended` until the provider accepts a request carrying it, then `delivered`; `withdrawn` is a `DELETE`, a canceled turn, or meka giving up. **Delivered means the model read it**, not that it was written down: the feed's `inbox.delivered` fires when the provider accepts the request, and names the turn that carried the item. A rewind that takes an `appended` item's text out of the conversation before it was delivered offers the item again. `GET /v1/sessions/{id}` reports `inbox_pending` beside `turn_in_flight` while the session is loaded.
 
 `Idempotency-Key` works here as on `POST /turn`: the same key with another `message` or `class` is refused with `409` `idempotency`. One difference matters to a bridge: the key is recorded on the row rather than in memory, so a retry that lands after a meka restart still finds its earlier item and answers it with `replayed: true`, and the key stays bound to that item for the session's life, withdrawn or delivered. The item is durable before the `202`; a session evicted for idleness is revived to run it, and a process that restarts finds it waiting.
 
-A turn opened on inbox items that fails before anything from the model reached the conversation withdraws its prompt and offers the items again, when waiting can change the answer: the upstream could not serve the profile (an outage, a dropped stream, a quota or billing refusal), or a required MCP server was not ready. Any other failure, a rejected credential, a request the upstream judged wrong, a profile that cannot read the session's images, gives the item up at once, since every attempt would fail the same way. A retry waits 10 seconds, then twice that per attempt, up to five minutes between attempts, or less when the upstream said it would be back sooner (`Retry-After`, a quota reset); a stated time never makes it wait longer, since an account topped up early is noticed at the next attempt. Each deferral posts `inbox.deferred` on the feed and the webhook with the time of the next attempt and the error, and the item shows `not_before` and `last_error` while it waits. Retrying ends at [`[serve] inbox_retry_ceiling`](../configuration/config-file.md#serveinbox_retry_ceiling), an hour from when the item was enqueued by default: the item is given up on, withdrawn, with `inbox.failed` on the feed and the webhook carrying the reason and the last error, so whoever is waiting is told rather than left with silence; `"0s"` gives an item up on its first failure. An item a tool round already carried into the conversation is not retried: it is history, and the next turn of any kind delivers it. An item on a session another process holds (a screen open on it, say) is asked about again every ten seconds until the holder lets go, or the holder's own next turn carries it; those waits count toward the ceiling.
+A turn opened on inbox items that fails before anything from the model reached the conversation withdraws its prompt and offers the items again, when waiting can change the answer: the upstream could not serve the profile (an outage, a dropped stream, a quota or billing refusal), a required MCP server was not ready, or meka's own store or disk refused (a lock another process holds, a full disk). Any other failure, a rejected credential, a request the upstream judged wrong, a profile that cannot read the session's images, gives the item up at once, since every attempt would fail the same way. A retry waits 10 seconds, then twice that per attempt, up to five minutes between attempts, or less when the upstream said it would be back sooner (`Retry-After`, a quota reset); a stated time never makes it wait longer, since an account topped up early is noticed at the next attempt. Each deferral posts `inbox.deferred` on the feed and the webhook with the time of the next attempt and the error, and the item shows `not_before` and `last_error`, the same error as a Problem Detail (`type`, `title`, `status`, `detail`, never the upstream's text), while it waits. Retrying ends at `retry_until`, the item's enqueue plus [`[serve] inbox_retry_ceiling`](../configuration/config-file.md#serveinbox_retry_ceiling), an hour by default: the item is given up on, withdrawn, with `inbox.failed` on the feed and the webhook carrying the reason and the last error, so whoever is waiting is told rather than left with silence, and the item keeps that `failure` and `last_error` for a replayed key to answer; a canceled turn or a client's `DELETE` withdraws an item with no error on it, since none decided it; `"0s"` gives an item up on its first failure. An item a tool round already carried into the conversation is not retried: it is history, and the next turn of any kind delivers it. An item on a session another process holds (a screen open on it, say) is asked about again every ten seconds until the holder lets go, or the holder's own next turn carries it; those waits count toward the ceiling.
 
 Only a `pending` item can be withdrawn. `DELETE` on one that is already in the conversation answers `409` `inbox-appended`, since only a turn can answer it now; a delivered or withdrawn one is `404`. A `DELETE` that lands in the instant between a turn reading the item and writing it may still be read by the model. Canceling a turn the inbox opened, with `POST /cancel`, withdraws the items it opened on, the way a canceled client turn loses its prompt, and the feed reports each as `inbox.withdrawn`. The endpoint refuses a sub-agent's session exactly as `POST /turn` does: a worker's inbox is its parent's, written with the `agent_steer` tool. No images in this release.
 
@@ -631,6 +634,13 @@ With `stream: false` (the default), the server holds the connection until the tu
   "stop_reason": "end_turn",
   "messages": [
     {
+      "role": "user",
+      "content": [
+        {"type": "turn_context", "text": "[Context]\n..."},
+        {"type": "text", "text": "What is in src?"}
+      ]
+    },
+    {
       "role": "assistant",
       "content": [
         {"type": "text", "text": "Let me look."},
@@ -662,10 +672,11 @@ With `stream: false` (the default), the server holds the connection until the tu
 Key fields:
 
 - **`messages`**: the messages this turn added to the conversation, in order and in the shape
-  `GET /v1/sessions/{id}/messages` reads them back: the assistant's messages with their text, their
-  thinking when the session streams reasoning, and their tool calls, and the tool-result messages
-  that answered those calls. The user's own message is not repeated. The reply a bot shows is the
-  text blocks of the assistant messages, joined.
+  `GET /v1/sessions/{id}/messages` reads them back: first the message the turn opened with, your
+  words behind the `turn_context` block meka wrote and any report that rode them, then the
+  assistant's messages with their text, their thinking when the session streams reasoning, and
+  their tool calls, and the tool-result messages that answered those calls. The reply a bot shows
+  is the text blocks of the assistant messages, joined.
 - **`stop_reason`**: `end_turn`, `max_tokens`, or `refusal`.
 - **`notices`**: provider advisories and warnings about approvals refused without asking.
 - **`refusal_text`**: present only when `stop_reason` is `"refusal"`.
@@ -681,6 +692,7 @@ Every resident session has one event feed. Everything a turn emits goes on it, w
 | Event | Payload | When |
 |-------|---------|------|
 | `turn.started` | `turn_id`, `session_id`, `started_at`, `source` (`"client"`, `"inbox"` with `item_ids`, `"schedule"` with `job_id`, `"background"`, `"compaction"` for the checkpoint turn `POST /compact` runs, or `"parent"` with `parent_id` and `tool_call_id` on a sub-agent's feed) | Turn begins |
+| `message.appended` | `role`, `content`, `turn_id`, `session_id` | A user-role message carrying words entered the conversation: the message the turn opened with, whoever opened it, or the one an interrupt appends after a cut answer. `content` is the message's blocks as `GET /messages` types them (`turn_context`, `text`, `scheduled`, `background_report`, `inbox`, `image` by `hash`) |
 | `turn.finished` | `turn_id`, `session_id`, `stop_reason`, `usage`, `revision`, optional `refusal_text`, `profile` when a [fallback profile](sessions.md#fallback-profiles) served the turn | Turn completed successfully |
 | `turn.failed` | `turn_id`, `session_id`, `error` (Problem Detail shape), `revision`, `message_withdrawn` when the turn began, `profile` when a fallback profile served the turn | Turn failed mid-stream |
 | `turn.canceled` | `turn_id`, `session_id`, `reason` (`"client"` for `POST /cancel`, `"server_shutdown"`, `"abandoned"` when a held turn's request had been gone for the grace with nobody else listening, `"sse_lag"` when the only consumer fell behind and the turn was stopped for it, or `"parent"` on a sub-agent's feed, whose turn stops with its parent's), `revision`, `message_withdrawn` when the turn began, `profile` when a fallback profile served the turn | Turn was canceled |
@@ -688,6 +700,8 @@ Every resident session has one event feed. Everything a turn emits goes on it, w
 | `task.reported` | `task_ids`, `text`, `turn_id`, `session_id` | A turn in flight read finished background work at a tool-round boundary: meka wrote `text`, the report the model reads, into the round's user-role message behind its results |
 
 `turn.finished`, `turn.failed`, and `turn.canceled` are **terminal** for the turn: a `POST /turn` stream closes immediately after its own, and the feed carries on to the next turn. `turn.failed` and `turn.canceled` also carry `message_withdrawn` when the turn began, whether it took the message it was sent back out of the conversation; see [Resending a failed turn](#resending-a-failed-turn). All three carry `revision`, the conversation's revision as the turn ends, omitted only when the store could not say, and on [a sub-agent's feed](#a-sub-agents-feed), whose transcript is not the one the precondition guards; see [Detecting a rewritten history](#detecting-a-rewritten-history).
+
+`message.appended` is how a reader that did not open a turn learns what it answers: a scheduled job's fire, a background report, another client's words, an inbox item. It follows the turn's `turn.started` and precedes every delta, tool event and `inbox.delivered` of that turn; the message an interrupt appends follows the `notice` announcing the cut. The feed mirrors the conversation at two grains: a message that enters whole is announced whole by this event, and a block added to a message a round is still building is announced by the event that names it. `task.reported` and `turn.nudged` carry the text meka wrote; `inbox.delivered`, which also covers an interrupt joined onto an opening nothing had answered, carries the items' ids alone, since the words are the producer's, and a reader that is not the producer takes them from `GET /messages`. An `inbox` block in `message.appended` says the item was appended, as its own `appended` state says; `inbox.delivered` is the moment the model read it. A client that mirrors the conversation drops a turn's opening when the turn's terminal carries `message_withdrawn: true`: a recurring job's fire, or an inbox turn retried after a failure, appends its opening on every attempt and takes it back each time it ends with nothing from the model. The event carries the `turn_context` block as `GET /messages` does, so a reader's replay ring grows with it.
 
 #### Inbox
 
@@ -791,7 +805,7 @@ curl -N -H "Authorization: Bearer $TOKEN" \
      "http://localhost:8080/v1/sessions/$SESSION/stream"
 ```
 
-Ids run across the whole session and the ring spans turns, so an id from an earlier turn is an ordinary position: everything after it replays, the later turns' terminals included. When a turn is in flight as you attach, the feed opens with a `turn.started` carrying `"resumed": true` and the `turn_id` you joined, which is how to tell "my stream resumed" from "a newer turn started while I was away"; that event is synthesized rather than replayed, so it carries no `id:` and no `started_at`, but it names the turn's `source` (with its `item_ids` or `job_id`), and everything after it is the real thing. With no turn in flight there is nothing to re-issue, and the most recent turn's terminal is handed over when the ring no longer holds it, so a client that reconnects late still learns the outcome.
+Ids run across the whole session and the ring spans turns, so an id from an earlier turn is an ordinary position: everything after it replays, the later turns' terminals included. When a turn is in flight as you attach, the feed opens with a `turn.started` carrying `"resumed": true` and the `turn_id` you joined, which is how to tell "my stream resumed" from "a newer turn started while I was away"; that event is synthesized rather than replayed, so it carries no `id:` and no `started_at`, but it names the turn's `source` (with its `item_ids` or `job_id`). The turn's `message.appended` follows it the same way, marked `"resumed": true` and without an `id:`, for a reader that has not had it: one joining, or one resuming from behind it after the ring let it go. A reader the replay hands it to, or one resuming from past it, is not handed it again. So a client joining mid-turn reads the reply under the message it answers; it is the opening as first announced, and what the turn appended since is read from `GET /messages`. Everything after it is the real thing. With no turn in flight there is nothing to re-issue, and the most recent turn's terminal is handed over when the ring no longer holds it, so a client that reconnects late still learns the outcome.
 
 **The feed does not end with a turn.** A client that wants one turn's outcome stops reading at that turn's terminal. The old contract, a stream that closed after the turn it rejoined, is what `POST /turn` with `stream: true` still gives.
 
@@ -811,6 +825,7 @@ with its own ids, ring and `Last-Event-ID`. The feed exists for exactly as long 
 spawn or follow-up runs the sub-agent, the span its record reports `turn_in_flight`; a client
 that sees a sub-agent in flight, on a listing or from a `session.updated` on
 [the server feed](#the-server-feed), opens the feed with the same call it uses for any session.
+Its openings are announced as any session's: the `message.appended` after its first `turn.started` carries the words the parent's spawn or follow-up gave it.
 It opens with a `turn.started` whose `source` is `"parent"`, with the parent's `parent_id` and
 the `tool_call_id` of the `agent_spawn` or `agent_followup` call running it, and closes with the
 terminal, which carries no `revision`. A sub-agent's turn ends when its parent's does: a parent
@@ -1093,7 +1108,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 >
 > **`provider_response` is readable at `sessions:r`.** Submitting a turn takes `sessions:w`, but the failure also rides the terminal `turn.failed` event, which `GET /v1/sessions/{id}/stream` replays to any reader. Since an upstream refusal can name the *operator's* account with the provider and its rate-limit posture, set `[serve] relay_provider_errors = false` where read-only tokens go to people who may watch a session but are not entitled to the account behind it.
 >
-> A turn that failed or was canceled after it began carries `message_withdrawn`, whether the message it was sent is still in the conversation. It is `true` only for a turn sent with `options.unanswered_message` set to `withdraw` that ended before anything from the model reached the conversation. A turn refused before it began, such as the `503` for a required MCP server, never added the message and carries no such member; see [Resending a failed turn](#resending-a-failed-turn).
+> A turn that failed or was canceled after it began carries `message_withdrawn`, whether the message it was sent is still in the conversation. It is `true` only for a turn that ended before anything from the model reached the conversation and whose opening was to be withdrawn then: one sent with `options.unanswered_message` set to `withdraw`, or on the feed a recurring job's fire or an inbox turn, whose openings are withdrawn the same way. A turn refused before it began, such as the `503` for a required MCP server, never added the message and carries no such member; see [Resending a failed turn](#resending-a-failed-turn).
 >
 > The `503` a turn gets when a required MCP server is down is not covered by that key and never relays: the server names travel, the connector's reason does not, since it is meka's own subprocess text and has carried a command line and its path. The endpoints under `/v1/mcp` do relay their reason, since a caller naming one server and asking why it will not connect is asking *for* it.
 >

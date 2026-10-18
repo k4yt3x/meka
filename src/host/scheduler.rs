@@ -99,12 +99,17 @@ pub(crate) const DEFAULT_INBOX_RETRY_CEILING: std::time::Duration =
     std::time::Duration::from_secs(60 * 60);
 
 /// Whether waiting can change the answer a failed inbox turn got: the upstream could not serve the
-/// profile and may again (an outage, a dropped stream, a quota that resets), or a required MCP
-/// server was not ready and may reconnect. Anything else, a rejected credential, a request the
-/// upstream judged wrong, a session its profile cannot read, fails the same way on every attempt,
-/// so the item is given up on at once and the sender is told now.
+/// profile and may again (an outage, a dropped stream, a quota that resets), a required MCP
+/// server was not ready and may reconnect, or meka's own store or disk refused (a lock another
+/// process holds, a disk that is full) and may not next time. Anything else, a rejected
+/// credential, a request the upstream judged wrong, a session its profile cannot read, fails the
+/// same way on every attempt, so the item is given up on at once and the sender is told now.
 fn inbox_retry_can_help(error: &MekaError) -> bool {
-    error.is_profile_unavailable() || matches!(error, MekaError::McpTurnGated { .. })
+    error.is_profile_unavailable()
+        || matches!(
+            error,
+            MekaError::McpTurnGated { .. } | MekaError::Database(_) | MekaError::Io(_)
+        )
 }
 
 /// When the next attempt on failed items runs: the backoff for the attempt count, pulled earlier
@@ -138,25 +143,26 @@ fn chrono_duration(duration: std::time::Duration) -> chrono::Duration {
     chrono::Duration::from_std(duration).unwrap_or(chrono::Duration::MAX)
 }
 
-/// Whether an attempt on `item` at `at` would fall at or past `ceiling`, measured from its
-/// enqueue: the one rule for the expiry at a drain's start and for a deferral that would land too
-/// late.
+/// When retrying `item` ends: its enqueue plus `ceiling`. The one rule for the expiry at a
+/// drain's start, for a deferral that would land too late, and for the `retry_until` the item
+/// shows, so a client reads the deadline the driver keeps. An item never tried is not expired by
+/// it: its first attempt runs whenever its turn comes, and only a failure after it is not retried.
+pub(crate) fn inbox_deadline(
+    item: &crate::store::inbox::InboxItem,
+    ceiling: std::time::Duration,
+) -> chrono::DateTime<chrono::Utc> {
+    item.created_at
+        .checked_add_signed(chrono_duration(ceiling))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+}
+
+/// Whether an attempt on `item` at `at` would fall at or past its deadline.
 fn past_ceiling(
     at: chrono::DateTime<chrono::Utc>,
     item: &crate::store::inbox::InboxItem,
     ceiling: std::time::Duration,
 ) -> bool {
-    at - item.created_at >= chrono_duration(ceiling)
-}
-
-/// A prompt the user did not type, shown where the host shows such things before it runs: as the
-/// text the model is given where the host's transcript shows user turns (ACP), as a stage
-/// direction naming what opened the turn where it does not (the screen).
-pub(crate) enum OutOfBandPrompt<'a> {
-    /// A batch of finished background work.
-    Outcomes(&'a [BackgroundTask]),
-    /// A scheduled job about to fire.
-    Scheduled(&'a Wakeup),
+    at >= inbox_deadline(item, ceiling)
 }
 
 /// What differs between hosts around a scheduled or outcome-driven turn.
@@ -210,10 +216,6 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
         true
     }
 
-    /// Show a prompt the user did not type. ACP pushes it to the editor as a user-message chunk so
-    /// the transcript shows what the turn answered; the others show nothing.
-    fn show_prompt(&self, _entry: &Self::Entry, _prompt: OutOfBandPrompt<'_>) {}
-
     /// The stop signal an out-of-band turn runs under. `serve` derives it from shutdown so a
     /// stopping server ends the turn, and the turn then says it was the server.
     fn cancellation(&self) -> crate::agent::TurnCancellation {
@@ -262,6 +264,12 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
     /// How long an item is retried for, from its enqueue, before it is given up on.
     fn inbox_retry_ceiling(&self) -> std::time::Duration {
         DEFAULT_INBOX_RETRY_CEILING
+    }
+
+    /// The error a failed turn leaves on its items, as the host's API states an error, for
+    /// whoever reads the item later; `None` on a host whose items nobody reads back.
+    fn inbox_error_record(&self, _error: &MekaError) -> Option<String> {
+        None
     }
 
     /// An inbox item was withdrawn because the turn opened on it was canceled. `serve` tells the
@@ -371,6 +379,7 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
         job.id.clone(),
         job.prompt.clone(),
         wakeup.render_prompt(),
+        wakeup.lateness(),
     ) {
         Ok(input) => input
             .retaining(job.prompt_retention())
@@ -399,9 +408,7 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
                 outcomes = riding.len()
             );
         }
-        hooks.show_prompt(&entry, OutOfBandPrompt::Outcomes(&riding));
     }
-    hooks.show_prompt(&entry, OutOfBandPrompt::Scheduled(&wakeup));
     let input = input.riding(riding);
 
     let origin = TurnSource::Schedule {
@@ -578,7 +585,6 @@ where
         }
 
         entry.touch();
-        hooks.show_prompt(&entry, OutOfBandPrompt::Outcomes(&ready));
         let cancellation = hooks.cancellation();
         let turn_id = uuid::Uuid::new_v4();
         let _published = entry
@@ -815,6 +821,7 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
                         .withdraw(
                             item_id,
                             Some("the turn opened on it was canceled".to_string()),
+                            None,
                         )
                         .await
                     {
@@ -861,8 +868,9 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
                      {delay:?}"
                 );
                 let retried_ids: Vec<uuid::Uuid> = retried.iter().map(|item| item.id).collect();
+                let record = hooks.inbox_error_record(&error);
                 let deferred = match inbox
-                    .defer_pending(&retried_ids, not_before, Some(&error.sentence()))
+                    .defer_pending(&retried_ids, not_before, record.as_deref())
                     .await
                 {
                     Ok(deferred) => deferred,
@@ -900,7 +908,15 @@ async fn give_up_inbox_item<H: HostHooks>(
     match hooks
         .store()
         .inbox_store()
-        .withdraw(item_id, Some(reason.clone()))
+        .withdraw(
+            item_id,
+            Some(reason.clone()),
+            // The error that decided it, or the last attempt's when the ceiling did with nothing
+            // newer known: what a reader of the item is shown as why.
+            error
+                .and_then(|error| hooks.inbox_error_record(error))
+                .or_else(|| item.last_error.clone()),
+        )
         .await
     {
         Ok(crate::store::inbox::Withdrawal::Withdrawn) => {
@@ -966,9 +982,64 @@ mod tests {
         assert!(ceiling_reason(1, Duration::ZERO).contains("inbox_retry_ceiling"));
     }
 
+    /// The deadline is the enqueue plus the ceiling, and a ceiling too long to add leaves the
+    /// item never past it rather than failing the arithmetic.
+    #[test]
+    fn an_item_s_deadline_is_its_enqueue_plus_the_ceiling() {
+        let created_at = chrono::Utc::now();
+        let item = crate::store::inbox::InboxItem {
+            id: uuid::Uuid::nil(),
+            session_id: uuid::Uuid::nil(),
+            class: crate::conversation::InboxClass::Steer,
+            source: None,
+            body: "hi".to_string(),
+            created_at,
+            attempts: 0,
+            not_before: None,
+            last_error: None,
+            appended_at: None,
+            delivered_at: None,
+            withdrawn_at: None,
+            failure: None,
+        };
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(
+            inbox_deadline(&item, hour),
+            created_at + chrono::Duration::hours(1)
+        );
+        assert!(past_ceiling(
+            created_at + chrono::Duration::hours(1),
+            &item,
+            hour
+        ));
+        assert!(!past_ceiling(
+            created_at + chrono::Duration::minutes(59),
+            &item,
+            hour
+        ));
+        assert_eq!(
+            inbox_deadline(&item, std::time::Duration::ZERO),
+            created_at,
+            "a zero ceiling expires an item at its enqueue"
+        );
+        assert_eq!(
+            inbox_deadline(&item, std::time::Duration::MAX),
+            chrono::DateTime::<chrono::Utc>::MAX_UTC,
+            "a ceiling too long to add saturates rather than failing"
+        );
+        assert!(
+            !past_ceiling(
+                created_at + chrono::Duration::days(365_000),
+                &item,
+                std::time::Duration::MAX
+            ),
+            "and is not reached in a thousand years"
+        );
+    }
+
     /// Only a failure waiting can change is retried: the upstream's unavailability, a quota
-    /// refusal and a required MCP server not ready; a rejected credential, a bad request, a
-    /// configuration refusal and an overflow fail the item at once.
+    /// refusal, a required MCP server not ready and meka's own store or disk refusing; a rejected
+    /// credential, a bad request, a configuration refusal and an overflow fail the item at once.
     #[test]
     fn only_a_failure_waiting_can_change_is_retried() {
         assert!(inbox_retry_can_help(&MekaError::RetryableProvider {
@@ -986,6 +1057,12 @@ mod tests {
         assert!(inbox_retry_can_help(&MekaError::McpTurnGated {
             servers: vec![("exa".to_string(), "down".to_string())],
         }));
+        assert!(inbox_retry_can_help(&MekaError::Database(
+            "database is locked".to_string()
+        )));
+        assert!(inbox_retry_can_help(&MekaError::Io(std::io::Error::other(
+            "no space left on device"
+        ))));
         assert!(!inbox_retry_can_help(&MekaError::Provider(
             "401".to_string()
         )));

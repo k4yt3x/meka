@@ -1676,7 +1676,7 @@ How long a queued inbox item is retried for after a turn on it failed, from when
 |------|---------|
 | `string` (duration) | `"1h"` |
 
-The ceiling bounds the whole wait: a retry never lands past it, whatever the upstream said about when it would be back, so a deployment states its own patience here. Set `"0s"` to give an item up on its first failure, for a client that owns redelivery itself. A failure no retry would change, a rejected credential or a request the upstream judged wrong, gives the item up at once regardless. See [The inbox](../usage/http-api.md#the-inbox).
+The ceiling bounds the whole wait: a retry never lands past it, whatever the upstream said about when it would be back, so a deployment states its own patience here, and every item shows the deadline it sets as `retry_until`. Set `"0s"` to give an item up on its first failure, for a client that owns redelivery itself. A failure no retry would change, a rejected credential or a request the upstream judged wrong, gives the item up at once regardless; one waiting can change, the upstream unavailable, a required MCP server not ready, meka's own store or disk refusing, is retried within the ceiling. See [The inbox](../usage/http-api.md#the-inbox).
 
 ### `serve.idle_timeout`
 

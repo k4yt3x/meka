@@ -513,14 +513,6 @@ pub(super) async fn run_prompt_turn(
     } else {
         Vec::new()
     };
-    if !outcomes.is_empty() {
-        // Shown to the editor as well as sent, as the scheduled-fire path does: the model answers
-        // about this text, and a transcript without it reads as an answer to a question nobody
-        // asked. Pushed before the prompt, which is the order the model receives them in.
-        entry
-            .frontend
-            .push_out_of_band_prompt(&crate::background::render_outcomes(&outcomes));
-    }
     let input = input.riding(outcomes);
     // Clone the cancellation token so we can probe `is_cancelled()` after the call returns. The
     // spec mandates that any cancel arriving during a turn must surface as `StopReason::Cancelled`,
