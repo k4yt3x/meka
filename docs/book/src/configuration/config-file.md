@@ -171,22 +171,6 @@ gateway serving `/chat/completions` at its root is legitimate and meka cannot te
 missing `/v1`. If an OpenAI-compatible endpoint 404s, check that the base carries the version segment
 its documentation shows.
 
-### `interleaved_thinking`
-
-Whether the endpoint takes the `interleaved-thinking` beta header, which `anthropic-messages`
-sends whenever thinking is on. Unset is `true`, which is what Anthropic's own API needs to think
-between tool calls; an endpoint that refuses the header sets it `false`. The other backends never
-read it, and `meka account add --interleaved-thinking` refuses it for them. The other switch an
-endpoint decides, the cache breakpoint, is a profile field, because its answer varies by model on
-a gateway; see [`cache_control`](#cache_control).
-
-```toml
-[accounts.gateway]
-backend = "anthropic-messages"
-base_url = "https://gateway.example.test"
-interleaved_thinking = false
-```
-
 ### `oauth_token_url`
 
 The OAuth token endpoint meka posts to, for the initial code exchange at `meka account add` /
@@ -208,6 +192,22 @@ both.
 ### `client_id`
 
 OAuth client id override (advanced; `claude-subscription` / `chatgpt-subscription` only). Leave unset to use meka's built-in default client ids.
+
+### `interleaved_thinking`
+
+Whether the endpoint takes the `interleaved-thinking` beta header, which `anthropic-messages`
+sends whenever thinking is on. Unset is `true`, which is what Anthropic's own API needs to think
+between tool calls; an endpoint that refuses the header sets it `false`. The other backends never
+read it, and `meka account add --interleaved-thinking` refuses it for them. The other switch an
+endpoint decides, the cache breakpoint, is a profile field, because its answer varies by model on
+a gateway; see [`cache_control`](#cache_control).
+
+```toml
+[accounts.gateway]
+backend = "anthropic-messages"
+base_url = "https://gateway.example.test"
+interleaved_thinking = false
+```
 
 ### `device_id`
 
@@ -296,6 +296,24 @@ account           = "anthropic"
 max_output_tokens = 16000
 ```
 
+### `max_request_bytes`
+
+Largest request body, in bytes, before the oldest tool-result images are redacted to fit; a body
+that still does not fit is refused, and the turn retries without its newest attachments. Unset, the
+Anthropic backends use **31457280** (30 MiB), which is Anthropic's 32 MiB cap less headroom, and the
+OpenAI backends apply no ceiling until one is stated: their endpoints' caps are the endpoints' own
+facts. An account reaches whatever its `base_url` names, so a profile on an endpoint with a smaller
+cap states it here. Redaction removes tool-result images, oldest first; an image attached to the
+newest message is never removed, and a body that still does not fit is refused so the turn can
+degrade its own attachments instead. `openai-chat-completions` never sends tool-result images (that
+API's tool messages are text), so there the ceiling only refuses.
+
+```toml
+[profiles.local]
+account           = "gateway"
+max_request_bytes = 8388608
+```
+
 ### `effort`
 
 One knob for reasoning effort across every backend: Claude sends it as `output_config.effort` (`claude-subscription` under the `effort-2025-11-24` beta, `anthropic-messages` directly), `openai-chat-completions` as `reasoning_effort` (with `max_completion_tokens` for the output cap), and the two Responses backends as `reasoning.effort` (with `max_output_tokens`).
@@ -323,6 +341,33 @@ Refusal is per session, from the profile that session recorded, on both ACP and 
 account = "ollama"
 model   = "llama-3-8b"
 vision  = false
+```
+
+### `deferred_tools`
+
+How a request carries the tools the agent has not loaded: `native` or `append`. Every backend but
+`openai-chat-completions` reads it. Under `append` a deferred tool is absent from the request until
+`tool_load` adds its schema to the `tools` array; the array heads the cached prefix, so the request
+after a load rewrites the whole cache once. Under `native` every deferred tool is declared from the
+first request with `defer_loading`, the array never changes, and `tool_load` and `tool_search`
+answer with a reference the endpoint expands in place: Anthropic's `tool_reference` block on
+`anthropic-messages` and `claude-subscription`; on `openai-responses` and `chatgpt-subscription`
+the endpoint's own `tool_search` item, which replaces the two discovery tools there and takes a
+`query` to find or a list of `names` to load. Unset is `native` on the two subscription backends
+and on `anthropic-messages` and `openai-responses` without a `base_url`, and `append` elsewhere: a
+gateway that ignores `defer_loading` accepts it silently and shows the model every deferred schema
+from the first request, which costs more than `append` and is invisible. Whether a gateway honors
+it varies by model and by the upstream it routes a request to, so check a profile before setting
+`native` on it: a deferred tool called with the right arguments and no load means the schema was
+shown. See
+[Deferred tools](../tools/overview.md#deferred-tools) for the cost model and for `deferral`, the
+registry setting that decides which tools are deferred at all.
+
+```toml
+[profiles.claude-via-openrouter]
+account        = "openrouter"
+model          = "anthropic/claude-opus-5-5"
+deferred_tools = "native"
 ```
 
 ### `thinking`
@@ -354,24 +399,6 @@ Per profile because it is a parameter of `thinking`, and `thinking` is per profi
 account         = "anthropic"
 thinking        = "budgeted"
 thinking_budget = 20000
-```
-
-### `max_request_bytes`
-
-Largest request body, in bytes, before the oldest tool-result images are redacted to fit; a body
-that still does not fit is refused, and the turn retries without its newest attachments. Unset, the
-Anthropic backends use **31457280** (30 MiB), which is Anthropic's 32 MiB cap less headroom, and the
-OpenAI backends apply no ceiling until one is stated: their endpoints' caps are the endpoints' own
-facts. An account reaches whatever its `base_url` names, so a profile on an endpoint with a smaller
-cap states it here. Redaction removes tool-result images, oldest first; an image attached to the
-newest message is never removed, and a body that still does not fit is refused so the turn can
-degrade its own attachments instead. `openai-chat-completions` never sends tool-result images (that
-API's tool messages are text), so there the ceiling only refuses.
-
-```toml
-[profiles.local]
-account           = "gateway"
-max_request_bytes = 8388608
 ```
 
 ### `cache_control`
@@ -422,33 +449,6 @@ redaction beta as Claude Code does.
 [profiles.work]
 account          = "anthropic"
 thinking_display = "updates"
-```
-
-### `deferred_tools`
-
-How a request carries the tools the agent has not loaded: `native` or `append`. Every backend but
-`openai-chat-completions` reads it. Under `append` a deferred tool is absent from the request until
-`tool_load` adds its schema to the `tools` array; the array heads the cached prefix, so the request
-after a load rewrites the whole cache once. Under `native` every deferred tool is declared from the
-first request with `defer_loading`, the array never changes, and `tool_load` and `tool_search`
-answer with a reference the endpoint expands in place: Anthropic's `tool_reference` block on
-`anthropic-messages` and `claude-subscription`; on `openai-responses` and `chatgpt-subscription`
-the endpoint's own `tool_search` item, which replaces the two discovery tools there and takes a
-`query` to find or a list of `names` to load. Unset is `native` on the two subscription backends
-and on `anthropic-messages` and `openai-responses` without a `base_url`, and `append` elsewhere: a
-gateway that ignores `defer_loading` accepts it silently and shows the model every deferred schema
-from the first request, which costs more than `append` and is invisible. Whether a gateway honors
-it varies by model and by the upstream it routes a request to, so check a profile before setting
-`native` on it: a deferred tool called with the right arguments and no load means the schema was
-shown. See
-[Deferred tools](../tools/overview.md#deferred-tools) for the cost model and for `deferral`, the
-registry setting that decides which tools are deferred at all.
-
-```toml
-[profiles.claude-via-openrouter]
-account        = "openrouter"
-model          = "anthropic/claude-opus-5-5"
-deferred_tools = "native"
 ```
 
 ## `meka account` CLI
@@ -513,21 +513,23 @@ as writing an empty value: an absent key follows whatever the documented default
 which is what an unstated setting has always meant. `model` is the one key with no default to fall
 back to, so `--unset model` and an empty `model` are both refused.
 
-Eleven keys are settable, each named after the [profile field](#profile-fields) it writes:
+Twelve keys are settable, each named after the [profile field](#profile-fields) it writes, in the
+order the fields are documented:
 
 | Key | Value |
 |---|---|
 | `model` | Any non-empty string, forwarded to the provider verbatim; the one key `--unset` refuses |
+| `fallbacks` | Profile names, comma-separated; `--unset` removes the list |
 | `context_window` | A whole number of tokens |
 | `max_output_tokens` | A whole number of tokens |
+| `max_request_bytes` | A whole number of bytes |
 | `effort` | Any string |
 | `vision` | `true` or `false` |
+| `deferred_tools` | `native` or `append` |
 | `thinking` | `adaptive`, `budgeted`, or `off` |
 | `thinking_budget` | A whole number of tokens |
-| `max_request_bytes` | A whole number of bytes |
 | `cache_control` | `true` or `false` |
 | `thinking_display` | `updates`, `summarized` or `redacted` |
-| `deferred_tools` | `native` or `append` |
 
 A token count must be whole and at most 9223372036854775807, the largest integer TOML can represent;
 anything else is refused before the file is opened. A boolean takes `true` or `false` and nothing
@@ -659,6 +661,18 @@ Which MCP servers to connect to, and what their tools are allowed to do. The [MC
 page covers the rest: the `meka mcp` command suite, where a server's secrets live, the OAuth flows,
 the connection lifecycle, and the resource and prompt tools.
 
+### `[mcp]` top-level table
+
+| Field | Purpose |
+|-------|---------|
+| `default_permission` | Fallback permission for MCP tools whose server didn't advertise `readOnlyHint` and doesn't have a `permission` override. Accepts `"none"`, `"read"`, `"workspace"`, or `"unrestricted"`; any other value is refused at startup, naming the line. If unset the hardcoded fallback is `"unrestricted"` (strict). It stays there deliberately: an MCP server runs unsandboxed, so `workspace` cannot confine it. |
+| `deferral` | Default for every server's `deferral`: `deferred` (the default), `eager` or `hidden`. A server's own `deferral` wins, a name in its `eager_load_tools` ships eager under every value, and the MCP resource and prompt tools follow this setting. |
+| `default_required` | Default for every server's `required` flag. When `true`, all enabled servers gate the turn; when `false` (the default) only servers with `required = true` do. An unavailable optional server doesn't stop the turn; its failure is logged once when it happens, and its live state is shown by `/mcp list` on the screen or probed with `meka mcp reconnect <name>`. |
+| `grace` | Per-turn cap on how long to wait for still-`Pending` servers to connect before deciding. A duration string; default `"3s"`. `"0s"` skips the wait, for scripts that want to fail fast. |
+| `connect_timeout` | Per-server timeout for connect + the protocol probe or `initialize` + `list_tools`. A hung stdio spawn or slow HTTPS handshake can't stall the whole fleet past this bound. The `server/discover` probe a stdio server gets waits up to ten seconds, or half of this value when that is less, before the server is taken for legacy; an HTTP server's probe waits up to ten seconds whatever this value is, so a value at or under ten seconds leaves an HTTP server that ignores the probe no time for the fallback. A duration string; default `"30s"`. `"0s"` is refused at startup. |
+| `stdio_concurrency` | How many stdio servers connect at once at startup. Each is a process launch, so raising it trades startup latency for load; lower it on a machine where several heavy servers starting together is the problem. Default `3`; `0` is refused at startup. |
+| `http_concurrency` | How many HTTP servers connect at once at startup. Higher than the stdio limit because a connect is a request rather than a process. Default `20`; `0` is refused at startup. |
+
 ### `[[mcp.servers]]`
 
 An array of MCP server configurations. Each entry defines a server to connect to at startup.
@@ -671,9 +685,9 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `args` | No | Arguments to pass to the command. |
 | `env` | No | Environment variables to set for the spawned process (stdio only). The child does **not** inherit meka's environment; see below. |
 | `url` | HTTP only | URL of the MCP server endpoint. |
-| `auth` | No | OAuth authentication configuration (see below). Mutually exclusive with a stored bearer token. |
 | `headers` | No | Custom HTTP headers to include with every request (HTTP only). |
 | `headers_helper` | No | Path to an executable whose stdout (`Name: Value\n` lines) is merged over `headers` at connect-time (HTTP only). Absolute, or relative to the directory `config.toml` is in; a bare name is not searched on `PATH`. Executed with `MEKA_MCP_SERVER_NAME` / `MEKA_MCP_SERVER_URL` in env; 15 s timeout. |
+| `auth` | No | OAuth authentication configuration (see below). Mutually exclusive with a stored bearer token. |
 | `permission` | No | Server-wide permission override: `none`, `read`, `workspace` or `unrestricted`. Applies to every tool on this server, beating the `readOnlyHint` the server advertises and the `[mcp].default_permission` global fallback. Any other value is refused at startup, naming the line, the way an unknown key is. See *Permission resolution* below. |
 | `allowed_tools` | No | Optional allow-list of raw tool names (the form the server advertises, not the `server__tool` namespaced form). When set and non-empty, only these tools are registered; all others from this server are ignored. |
 | `disabled_tools` | No | Optional block-list of raw tool names. Applied **after** `allowed_tools`; tools listed here are never registered. Both lists can coexist; the net set is `allowed_tools \ disabled_tools`. |
@@ -683,18 +697,6 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `trust_read_only_hint` | No | Whether this server's `readOnlyHint: true` may classify a tool as `read`. Defaults to `true`. Set `false` for a server you have not audited: its hints become advisory for display only, so its tools fall through to the strict `unrestricted` fallback, skipping `[mcp].default_permission` (a global convenience must not re-grant what a per-server audit decision refused). A `readOnlyHint: false` is still honored either way, since it only raises the requirement. See *Permission resolution* below. |
 | `disabled` | No | When `true`, the server is skipped entirely at startup: no process is spawned, no HTTP connect is attempted. Flip it back with `meka mcp enable <name>` or by editing the config. Unset means `false`. |
 | `required` | No | When `true`, a turn is refused while this enabled server is not `Connected` (a `disabled` server is never started, so it never gates). Over the HTTP API that refusal is a 503 `/errors/mcp-unavailable` naming the servers. When `false`, the session runs without it and its tools are simply absent. Unset inherits `[mcp].default_required` (itself `false`), so servers are optional unless they opt in. |
-
-### `[mcp]` top-level table
-
-| Field | Purpose |
-|-------|---------|
-| `default_permission` | Fallback permission for MCP tools whose server didn't advertise `readOnlyHint` and doesn't have a `permission` override. Accepts `"none"`, `"read"`, `"workspace"`, or `"unrestricted"`; any other value is refused at startup, naming the line. If unset the hardcoded fallback is `"unrestricted"` (strict). It stays there deliberately: an MCP server runs unsandboxed, so `workspace` cannot confine it. |
-| `deferral` | Default for every server's `deferral`: `deferred` (the default), `eager` or `hidden`. A server's own `deferral` wins, a name in its `eager_load_tools` ships eager under every value, and the MCP resource and prompt tools follow this setting. |
-| `default_required` | Default for every server's `required` flag. When `true`, all enabled servers gate the turn; when `false` (the default) only servers with `required = true` do. An unavailable optional server doesn't stop the turn; its failure is logged once when it happens, and its live state is shown by `/mcp list` on the screen or probed with `meka mcp reconnect <name>`. |
-| `grace` | Per-turn cap on how long to wait for still-`Pending` servers to connect before deciding. A duration string; default `"3s"`. `"0s"` skips the wait, for scripts that want to fail fast. |
-| `connect_timeout` | Per-server timeout for connect + the protocol probe or `initialize` + `list_tools`. A hung stdio spawn or slow HTTPS handshake can't stall the whole fleet past this bound. The `server/discover` probe a stdio server gets waits up to ten seconds, or half of this value when that is less, before the server is taken for legacy; an HTTP server's probe waits up to ten seconds whatever this value is, so a value at or under ten seconds leaves an HTTP server that ignores the probe no time for the fallback. A duration string; default `"30s"`. `"0s"` is refused at startup. |
-| `stdio_concurrency` | How many stdio servers connect at once at startup. Each is a process launch, so raising it trades startup latency for load; lower it on a machine where several heavy servers starting together is the problem. Default `3`; `0` is refused at startup. |
-| `http_concurrency` | How many HTTP servers connect at once at startup. Higher than the stdio limit because a connect is a request rather than a process. Default `20`; `0` is refused at startup. |
 
 ### Permission resolution
 
@@ -1089,19 +1091,23 @@ Sub-agents spawned via `agent_spawn` inherit the same filter; a disabled built-i
 
 ## `[subagents]`
 
-What a sub-agent may never hold, and the one choice its parent may make for it. Where `[tools]` restricts everyone, this block applies only to sub-agents.
+How deep sub-agents may nest, what one may never hold, and the one choice its parent may make for it. Where `[tools]` restricts everyone, this block applies only to sub-agents.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
+| `max_depth` | int | `3` | How deep sub-agents may nest; `1` lets only the root spawn, `0` withholds `agent_spawn` |
 | `disabled_servers` | list | `[]` | MCP servers a sub-agent cannot see at all |
 | `disabled_tools` | list | `[]` | Individual tool names a sub-agent cannot see |
 | `agent_chosen_profile` | bool | `false` | Let the spawning agent choose the profile a sub-agent runs on |
 
 ```toml
 [subagents]
+max_depth = 2
 disabled_servers = ["mekabridge"]
 disabled_tools = ["mcp__notion__create_page"]
 ```
+
+`max_depth` bounds nesting through [`agent_spawn`](../tools/overview.md#agent_spawn). The root agent spawns at depth 1, its sub-agents at depth 2, and so on; each level below the cap is granted its own `agent_spawn`. `1` lets the root spawn and nothing below it; `0` withholds `agent_spawn` from everyone, and the four lifecycle tools with it. An agent can narrow a subtree with the tool's `max_depth` parameter, never widen it, and a built-in absolute cap bounds real nesting whatever either says.
 
 **`disabled_servers` is the one that matters.** Naming a server removes everything it offers from every sub-agent: its tools, its resources, and its prompts. Reach for it when a server exists to talk to *you* or to act on your behalf. The motivating case is a server that can message the user: without this, a sub-agent three levels down can send a message the user has no way to distinguish from the one they are actually talking to.
 
@@ -1195,9 +1201,9 @@ Controls the wakeups the agent schedules for itself. See the [Scheduling](../usa
 | `poll_interval` | duration | `"10s"` | How often due jobs are checked; `"0s"` is refused at startup |
 | `missed_grace` | duration | `"24h"` | How late a one-shot job may be and still fire after downtime |
 | `gate_timeout` | duration | `"30s"` | Wall-clock budget for a gate probe; `"0s"` is refused at startup |
+| `claim_lease` | duration | `"1h"` | How long a host's claim on a due occurrence is good for |
 | `max_jobs` | int | `50` | Per-session ceiling, refused at `schedule_create`; `0` is refused at startup |
 | `max_consecutive_fires` | int | `5` | Per-session ceiling on turns spent in one sweep |
-| `claim_lease` | duration | `"1h"` | How long a host's claim on a due occurrence is good for |
 
 ```toml
 [schedule]
@@ -1205,9 +1211,9 @@ enabled = true
 poll_interval = "10s"
 missed_grace = "24h"
 gate_timeout = "30s"
+claim_lease = "1h"
 max_jobs = 50
 max_consecutive_fires = 5
-claim_lease = "1h"
 ```
 
 `poll_interval` is the real resolution floor: a job whose interval is shorter than the tick fires once per tick, not once per interval.
@@ -1329,32 +1335,6 @@ When neither is set, meka assumes **1000000**. It does not infer the window from
 context_window = 200000
 ```
 
-### `session.subagent_max_depth`
-
-Maximum recursion depth for sub-agents spawned via [`agent_spawn`](../tools/overview.md#agent_spawn). The root agent spawns at depth 1, its sub-agents at depth 2, and so on; each level below this limit is granted its own `agent_spawn`. `1` reproduces the historical behavior where sub-agents cannot spawn further sub-agents; `0` disables `agent_spawn` entirely. An agent can tune a subtree with the tool's `max_depth` parameter, but a built-in absolute cap always bounds real nesting so recursion can't run away.
-
-Default: `3`
-
-```toml
-[session]
-subagent_max_depth = 3
-```
-
-### `session.send_class`
-
-What Enter does on the interactive screen while a turn is running: `steer` posts the message to the
-session's inbox, where the agent reads it at its next round; `followup` holds it and sends it as the
-next turn once this one ends; `interrupt` cuts the answer being streamed and hands the agent the
-message at once. Alt+S cycles the class for one run. See
-[While a turn runs](../usage/interactive-mode.md#while-a-turn-runs).
-
-Default: `steer`
-
-```toml
-[session]
-send_class = "followup"
-```
-
 ## `[thinking]`
 
 Presentation and budget settings for extended thinking (`anthropic-messages` and `claude-subscription` backends). Whether thinking is on, and which wire encoding it uses, is the per-profile [`thinking`](#thinking) key, not a setting here.
@@ -1419,8 +1399,9 @@ max_redirects = 0
 
 ## `[display]`
 
-Settings for the interactive screen: the two rows it composes, the session id lines, the mouse,
-and `stream`, which also decides how a one-shot run asks the provider.
+Settings for the interactive screen: the two rows it composes, the session id lines, what Enter
+does while a turn runs, the mouse, and `stream`, which also decides how a one-shot run asks the
+provider.
 
 ### `display.status_row`
 
@@ -1506,6 +1487,21 @@ A one-shot run prints no session id whatever these say: `--format json` carries 
 show_session_id_on_create = true
 show_session_id_on_resume = false
 show_session_id_on_exit = false
+```
+
+### `display.send_class`
+
+What Enter does on the interactive screen while a turn is running: `steer` posts the message to the
+session's inbox, where the agent reads it at its next round; `followup` holds it and sends it as the
+next turn once this one ends; `interrupt` cuts the answer being streamed and hands the agent the
+message at once. Alt+S cycles the class for one run. See
+[While a turn runs](../usage/interactive-mode.md#while-a-turn-runs).
+
+Default: `steer`
+
+```toml
+[display]
+send_class = "followup"
 ```
 
 ### `display.mouse`

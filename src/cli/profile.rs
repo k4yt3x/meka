@@ -25,26 +25,26 @@ pub(crate) async fn run(
             fallback,
             context_window,
             max_output_tokens,
+            max_request_bytes,
             effort,
             vision,
+            deferred_tools,
             thinking,
             thinking_budget,
-            max_request_bytes,
             cache_control,
             thinking_display,
-            deferred_tools,
         } => run_add(name, account.as_deref(), model.clone(), ProfileTuning {
             fallbacks: fallback.clone(),
             context_window: *context_window,
             max_output_tokens: *max_output_tokens,
+            max_request_bytes: *max_request_bytes,
             effort: effort.clone(),
             vision: *vision,
+            deferred_tools: *deferred_tools,
             thinking: *thinking,
             thinking_budget: *thinking_budget,
-            max_request_bytes: *max_request_bytes,
             cache_control: *cache_control,
             thinking_display: *thinking_display,
-            deferred_tools: *deferred_tools,
         }),
         ProfileAction::List { format } => run_list(*format),
         ProfileAction::Set {
@@ -77,14 +77,14 @@ struct ProfileTuning {
     fallbacks: Vec<String>,
     context_window: Option<u64>,
     max_output_tokens: Option<u64>,
+    max_request_bytes: Option<u64>,
     effort: Option<String>,
     vision: Option<bool>,
+    deferred_tools: Option<crate::config::DeferredTools>,
     thinking: Option<config::ThinkingMode>,
     thinking_budget: Option<u64>,
-    max_request_bytes: Option<u64>,
     cache_control: Option<bool>,
     thinking_display: Option<crate::config::ThinkingDisplay>,
-    deferred_tools: Option<crate::config::DeferredTools>,
 }
 
 fn run_add(
@@ -366,14 +366,14 @@ pub(super) const SETTABLE_PROFILE_KEYS: &[&str] = &[
     "fallbacks",
     "context_window",
     "max_output_tokens",
+    "max_request_bytes",
     "effort",
     "vision",
+    "deferred_tools",
     "thinking",
     "thinking_budget",
-    "max_request_bytes",
     "cache_control",
     "thinking_display",
-    "deferred_tools",
 ];
 
 /// Parse one `key`/`value` pair into the TOML value the profile should carry.
@@ -793,11 +793,20 @@ fn upsert_profile_document(
             toml_edit::value(toml_integer("max_output_tokens", cap)?),
         );
     }
+    if let Some(bytes) = tuning.max_request_bytes {
+        profile.insert(
+            "max_request_bytes",
+            toml_edit::value(toml_integer("max_request_bytes", bytes)?),
+        );
+    }
     if let Some(effort) = tuning.effort.as_deref() {
         profile.insert("effort", toml_edit::value(effort));
     }
     if let Some(vision) = tuning.vision {
         profile.insert("vision", toml_edit::value(vision));
+    }
+    if let Some(setting) = tuning.deferred_tools {
+        profile.insert("deferred_tools", toml_edit::value(setting.name()));
     }
     if let Some(mode) = tuning.thinking {
         profile.insert("thinking", toml_edit::value(mode.name()));
@@ -808,20 +817,11 @@ fn upsert_profile_document(
             toml_edit::value(toml_integer("thinking_budget", budget)?),
         );
     }
-    if let Some(bytes) = tuning.max_request_bytes {
-        profile.insert(
-            "max_request_bytes",
-            toml_edit::value(toml_integer("max_request_bytes", bytes)?),
-        );
-    }
     if let Some(cache_control) = tuning.cache_control {
         profile.insert("cache_control", toml_edit::value(cache_control));
     }
     if let Some(display) = tuning.thinking_display {
         profile.insert("thinking_display", toml_edit::value(display.name()));
-    }
-    if let Some(setting) = tuning.deferred_tools {
-        profile.insert("deferred_tools", toml_edit::value(setting.name()));
     }
     // Redundant here, since the inserts above already run in order, and deliberately kept: it is
     // the one line that makes "every writer leaves the canonical order" true of this writer too,

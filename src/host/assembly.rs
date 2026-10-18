@@ -907,7 +907,6 @@ impl SharedDeps {
             schedule: self.config.schedule.clone(),
             background: self.config.background.clone(),
             subagents: self.config.subagents.clone(),
-            subagent_max_depth: self.config.subagent_max_depth,
         }
     }
 }

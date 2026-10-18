@@ -86,7 +86,8 @@ pub(crate) struct AccountConfig {
 /// **Field order is canonical and load-bearing**, and every surface that lists these keys repeats
 /// it: [`ProfileSettings`], [`resolve_profile`], `ProfileTuning`, `upsert_profile_document`,
 /// `SETTABLE_PROFILE_KEYS`, the `profile add` flags, and the `config.toml` reference. `account`
-/// leads, then `model`, then every model-tied knob, widest reach first and ending with
+/// leads, then `model`, then `fallbacks` as the one key that names another profile, then every
+/// model-tied knob by how many backends read it: the keys every backend reads first, down to
 /// `thinking_display` as the only `claude-subscription` setting.
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
@@ -109,6 +110,10 @@ pub(crate) struct ProfileConfig {
     /// Override the per-request output (completion) token cap. When unset, each backend keeps its
     /// built-in default. On Claude the value must exceed the thinking budget.
     pub(crate) max_output_tokens: Option<u64>,
+    /// Largest request body, in bytes, before the oldest tool-result images are redacted to fit.
+    /// Anthropic's endpoint caps at 32 MiB and the Anthropic backends default to 30 MiB, but an
+    /// `anthropic-messages` account reaches whatever `base_url` names, whose cap is its own fact.
+    pub(crate) max_request_bytes: Option<u64>,
     /// The reasoning-effort knob for every backend: Claude's `output_config.effort` and OpenAI's
     /// `reasoning.effort`. Passed through verbatim (trimmed and lowercased); when unset the field
     /// is omitted entirely, which is how meka asks for the provider's own default. meka picks no
@@ -117,6 +122,10 @@ pub(crate) struct ProfileConfig {
     /// Whether this profile's model accepts image input. Defaults to `true`; set `false` to stop
     /// the ACP frontend from advertising / accepting images for a text-only model.
     pub(crate) vision: Option<bool>,
+    /// How the wire carries deferred tools, `native` or `append`; see
+    /// [`crate::config::DeferredTools`]. Unset takes the endpoint's answer: `native` on the
+    /// subscription backends and on an API-key backend with no `base_url`, `append` otherwise.
+    pub(crate) deferred_tools: Option<crate::config::DeferredTools>,
     /// Claude-only: how this profile encodes extended thinking, `adaptive`, `budgeted`, or `off`.
     /// Defaults to `adaptive`. The right value depends on the model *and* on what the endpoint
     /// implements, which meka can't infer, so it is stated rather than guessed; a profile that
@@ -131,10 +140,6 @@ pub(crate) struct ProfileConfig {
     /// it did not state, and tell the user to lower a global every other profile is also budgeting
     /// against.
     pub(crate) thinking_budget: Option<u64>,
-    /// Largest request body, in bytes, before the oldest tool-result images are redacted to fit.
-    /// Anthropic's endpoint caps at 32 MiB and the Anthropic backends default to 30 MiB, but an
-    /// `anthropic-messages` account reaches whatever `base_url` names, whose cap is its own fact.
-    pub(crate) max_request_bytes: Option<u64>,
     /// `anthropic-messages` only: whether the request carries the moving `cache_control`
     /// breakpoint. Defaults to `true`, which is what Anthropic's own API needs to cache the prefix
     /// incrementally. What an endpoint does with the breakpoint is the endpoint's fact, which meka
@@ -145,10 +150,6 @@ pub(crate) struct ProfileConfig {
     /// `claude-subscription` only: how the model's thinking is presented, one of Claude Code's
     /// three display modes. Defaults to `updates`, Claude Code's own default.
     pub(crate) thinking_display: Option<crate::config::ThinkingDisplay>,
-    /// How the wire carries deferred tools, `native` or `append`; see
-    /// [`crate::config::DeferredTools`]. Unset takes the endpoint's answer: `native` on the
-    /// subscription backends and on an API-key backend with no `base_url`, `append` otherwise.
-    pub(crate) deferred_tools: Option<crate::config::DeferredTools>,
 }
 /// [`AccountConfig`]'s field order, as the key names a `config.toml` account table carries.
 pub(crate) const ACCOUNT_KEY_ORDER: &[&str] = &[
@@ -170,14 +171,14 @@ pub(crate) const PROFILE_KEY_ORDER: &[&str] = &[
     "fallbacks",
     "context_window",
     "max_output_tokens",
+    "max_request_bytes",
     "effort",
     "vision",
+    "deferred_tools",
     "thinking",
     "thinking_budget",
-    "max_request_bytes",
     "cache_control",
     "thinking_display",
-    "deferred_tools",
 ];
 /// Put one table's keys into `order`.
 ///
@@ -244,21 +245,21 @@ pub(crate) struct ProfileSettings {
     pub(crate) fallbacks: Vec<String>,
     pub(crate) context_window: Option<u64>,
     pub(crate) max_output_tokens: Option<u64>,
+    /// See [`ProfileConfig::max_request_bytes`]; `None` leaves the backend's default.
+    pub(crate) max_request_bytes: Option<usize>,
     pub(crate) effort: Option<String>,
     pub(crate) vision: bool,
+    /// See [`ProfileConfig::deferred_tools`]; resolved to the endpoint's default here.
+    pub(crate) deferred_tools: crate::config::DeferredTools,
     pub(crate) thinking: crate::config::ThinkingMode,
     /// Resolved with the default already applied, unlike [`Self::context_window`]. No caller needs
     /// to tell "unset" from "16000": the budget is only ever sent as a number, whereas an absent
     /// window is what [`crate::provider::profile_context_window`] reports rather than dividing by
     /// a figure meka has no reason to believe.
     pub(crate) thinking_budget: u64,
-    pub(crate) thinking_display: crate::config::ThinkingDisplay,
-    /// See [`ProfileConfig::deferred_tools`]; resolved to the endpoint's default here.
-    pub(crate) deferred_tools: crate::config::DeferredTools,
-    /// See [`ProfileConfig::max_request_bytes`]; `None` leaves the backend's default.
-    pub(crate) max_request_bytes: Option<usize>,
     /// See [`ProfileConfig::cache_control`]; resolved to the default here.
     pub(crate) cache_control: bool,
+    pub(crate) thinking_display: crate::config::ThinkingDisplay,
 }
 /// The selected profile's name, read straight off disk without resolving anything else.
 ///
@@ -359,21 +360,21 @@ pub(crate) fn resolve_profile(
         max_request_bytes: profile
             .max_request_bytes
             .and_then(|bytes| usize::try_from(bytes).ok()),
-        cache_control: profile.cache_control.unwrap_or(true),
         // Pure passthrough for every backend: whatever the profile sets goes to the provider
         // verbatim (the provider trims and lowercases it). Unset means the field is omitted and
         // the provider applies its own default. An invalid value is the user's to own.
         effort: profile.effort.clone(),
         vision: profile.vision.unwrap_or(true),
+        deferred_tools: profile.deferred_tools.unwrap_or(
+            crate::config::DeferredTools::default_for(backend, account.base_url.is_some()),
+        ),
         thinking: profile.thinking.unwrap_or_default(),
         thinking_budget: profile
             .thinking_budget
             .or(default_thinking_budget)
             .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS),
+        cache_control: profile.cache_control.unwrap_or(true),
         thinking_display: profile.thinking_display.unwrap_or_default(),
-        deferred_tools: profile.deferred_tools.unwrap_or(
-            crate::config::DeferredTools::default_for(backend, account.base_url.is_some()),
-        ),
     })
 }
 /// The `claude-subscription` device identifier for one account, seeding and persisting one when
@@ -1018,14 +1019,14 @@ mod tests {
             "fallbacks = [\"backup\"]\n",
             "context_window = 200000\n",
             "max_output_tokens = 64000\n",
+            "max_request_bytes = 8388608\n",
             "effort = \"high\"\n",
             "vision = true\n",
+            "deferred_tools = \"append\"\n",
             "thinking = \"budgeted\"\n",
             "thinking_budget = 32000\n",
-            "max_request_bytes = 8388608\n",
             "cache_control = false\n",
             "thinking_display = \"redacted\"\n",
-            "deferred_tools = \"append\"\n",
         );
 
         let parsed: ConfigFile =

@@ -1499,13 +1499,14 @@ impl ToolRegistry {
             materials,
             cells,
         );
-        // `subagent_max_depth == 0` disables sub-agents entirely (the root gets no `agent_spawn`);
-        // `>= 1` seeds the root's soft recursion budget, and `absolute_depth` starts at 0 for the
-        // root. The predicate folds in the `[tools]` half too, and is named because `meka tool
-        // list` has to reach the same answer with no provider to assemble a session with.
+        // `[subagents].max_depth = 0` disables sub-agents entirely (the root gets no
+        // `agent_spawn`); `>= 1` seeds the root's soft recursion budget, and `absolute_depth`
+        // starts at 0 for the root. The predicate folds in the `[tools]` half too, and is named
+        // because `meka tool list` has to reach the same answer with no provider to assemble a
+        // session with.
         if super::subagent::agent_tools_registered(
             &materials.core.builtin_filter,
-            materials.subagent_max_depth,
+            materials.subagents.max_depth,
         ) {
             let config_scope = ToolScope::new(
                 materials.subagents.disabled_servers.clone(),
@@ -1524,7 +1525,7 @@ impl ToolRegistry {
                     parent_options: options.clone(),
                 },
                 inherited_scope: config_scope,
-                remaining_depth: materials.subagent_max_depth,
+                remaining_depth: materials.subagents.max_depth,
                 absolute_depth: 0,
             })?;
         }

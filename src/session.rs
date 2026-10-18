@@ -175,7 +175,6 @@ pub(crate) struct SessionMaterials {
     pub(crate) schedule: crate::config::ResolvedScheduleConfig,
     pub(crate) background: crate::config::ResolvedBackgroundConfig,
     pub(crate) subagents: crate::config::ResolvedSubagentsConfig,
-    pub(crate) subagent_max_depth: usize,
 }
 
 /// The id of the session the cells belong to, shared by handle between the agent, every tool that
@@ -465,7 +464,6 @@ impl SessionMaterials {
             schedule: crate::config::ResolvedScheduleConfig::default(),
             background: crate::config::ResolvedBackgroundConfig::default(),
             subagents: crate::config::ResolvedSubagentsConfig::default(),
-            subagent_max_depth: 0,
         }
     }
 }

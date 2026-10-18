@@ -437,12 +437,26 @@ pub(crate) enum ProfileAction {
         /// Per-request output token cap; unset leaves the backend's default
         #[arg(long = "max-output-tokens", value_name = "TOKENS")]
         max_output_tokens: Option<u64>,
+        /// Largest request body in bytes before old images are redacted (Anthropic backends
+        /// default to 30 MiB)
+        #[arg(long = "max-request-bytes", value_name = "BYTES")]
+        max_request_bytes: Option<u64>,
         /// Reasoning effort; unset leaves the provider's default
         #[arg(long, value_name = "EFFORT")]
         effort: Option<String>,
         /// Accept image input (default: true)
         #[arg(long, hide_possible_values = true, value_name = "BOOL")]
         vision: Option<bool>,
+        #[arg(
+            long = "deferred-tools",
+            value_name = "MODE",
+            help = listed(
+                "How a request carries deferred tools",
+                crate::config::DeferredTools::ALL.iter().map(|setting| setting.name()),
+                " (default: by endpoint)"
+            )
+        )]
+        deferred_tools: Option<crate::config::DeferredTools>,
         #[arg(
             long,
             value_enum,
@@ -458,10 +472,6 @@ pub(crate) enum ProfileAction {
         /// Token budget when thinking = budgeted (default: `[thinking].budget`, then 16000)
         #[arg(long = "thinking-budget", value_name = "TOKENS")]
         thinking_budget: Option<u64>,
-        /// Largest request body in bytes before old images are redacted (Anthropic backends
-        /// default to 30 MiB)
-        #[arg(long = "max-request-bytes", value_name = "BYTES")]
-        max_request_bytes: Option<u64>,
         /// Send the moving cache breakpoint (anthropic-messages only; default: true)
         #[arg(
             long = "cache-control",
@@ -481,16 +491,6 @@ pub(crate) enum ProfileAction {
             )
         )]
         thinking_display: Option<crate::config::ThinkingDisplay>,
-        #[arg(
-            long = "deferred-tools",
-            value_name = "MODE",
-            help = listed(
-                "How a request carries deferred tools",
-                crate::config::DeferredTools::ALL.iter().map(|setting| setting.name()),
-                " (default: by endpoint)"
-            )
-        )]
-        deferred_tools: Option<crate::config::DeferredTools>,
     },
     /// List configured profiles
     List {

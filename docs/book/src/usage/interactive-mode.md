@@ -78,7 +78,7 @@ runs the empty composer names it: `Steer the agent`, `Queue a followup` or `Inte
 | `interrupt` | Cuts the answer being streamed and hands the agent the message at once |
 
 **Alt+S** cycles the class for this run;
-[`session.send_class`](../configuration/config-file.md#sessionsend_class) sets where it starts. The
+[`display.send_class`](../configuration/config-file.md#displaysend_class) sets where it starts. The
 prompt appears in the transcript with its class and reads `waiting` until the agent has read it.
 A slash command that would have to wait on the turn is refused while one runs; see
 [Slash commands](#slash-commands).
@@ -309,7 +309,7 @@ and the `Thinking` mode. The rest are cumulative counters for the session.
 
 `cache hit` is the share of input tokens served from the prompt cache rather than re-sent at full price, on every backend that reports one (Anthropic's cache tiers, OpenAI's `cached_tokens`). It should climb and stay high: meka keeps everything that changes mid-session out of the cached prefix, so a steady session re-reads the cache instead of rewriting it. The figure is arithmetic as much as it is health: every new token (a tool result, the model's own reply) is written to the cache once and read on each later request, so the session-wide share starts at zero, passes 90% around the fifteenth request (each tool call is a request) and keeps climbing from there; a low figure on a short session is not a miss. Expect it to drop once after a `/compact` (which rewrites the head of the conversation) and to recover on the following turns. A profile with [`cache_control = false`](../configuration/config-file.md#cache_control) on an endpoint that caches only what is marked reads zero here by design.
 
-`Redactions` reports any times an Anthropic backend had to drop the oldest tool-result image blocks because the request body would have exceeded the profile's `max_request_bytes` (30 MiB by default, held under Anthropic's own 32 MiB limit). A non-zero count indicates the cache prefix was invalidated for the redacted messages. See [`display.show_token_usage`](../configuration/config-file.md#displayshow_token_usage) for a per-turn variant of the same data.
+`Redactions` reports any times an Anthropic backend had to drop the oldest tool-result image blocks because the request body would have exceeded the profile's `max_request_bytes` (30 MiB by default, held under Anthropic's own 32 MiB limit). A non-zero count indicates the cache prefix was invalidated for the redacted messages.
 
 ### `/usage`
 

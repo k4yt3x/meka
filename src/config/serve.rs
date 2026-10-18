@@ -22,25 +22,6 @@ pub(crate) struct ServeConfig {
     /// that holds it can use it from anywhere regardless. The allowlist guards only what needs no
     /// token: the health probes, the opt-in OpenAPI document and the body of a 401.
     pub(crate) cors_allowed_origins: Option<Vec<String>>,
-    /// Idle-timeout for session eviction. Sessions with no turn activity for this long are dropped
-    /// from the in-memory map by the GC scanner. Accepts humantime strings like `"24h"`, `"30m"`,
-    /// `"86400s"`. Default `"24h"`.
-    #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub(crate) idle_timeout: Option<std::time::Duration>,
-    /// How often the GC scanner sweeps the session map. Accepts humantime strings like `"5m"`,
-    /// `"300s"`. Default `"5m"`.
-    #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub(crate) gc_scan_interval: Option<std::time::Duration>,
-    /// When true, GC also deletes the SQLite row for idle sessions; default false (keep the row so
-    /// a future request with the same session ID can re-attach, mirroring ACP's `session/load`).
-    pub(crate) delete_on_idle: Option<bool>,
-    /// On SIGTERM / SIGINT, wait at most this long for in-flight turns to finish before forcibly
-    /// aborting. Accepts humantime strings like `"30s"`, `"1m"`. Default `"30s"`.
-    #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub(crate) shutdown_drain_timeout: Option<std::time::Duration>,
-    /// Process-wide cap on concurrent in-flight turns across all sessions. None = unbounded
-    /// (default). Returns 429 with `concurrency-limit` when exceeded.
-    pub(crate) max_concurrent_turns: Option<usize>,
     /// Request body size limit (bytes). Default 10 MiB.
     pub(crate) max_body_bytes: Option<usize>,
     /// Whether a 502 carries the failing provider call's error text, as a `provider_response`
@@ -74,6 +55,9 @@ pub(crate) struct ServeConfig {
     /// deployment is real. Turn it on deliberately, on a deployment where anyone who can reach the
     /// port is entitled to the map.
     pub(crate) docs: Option<bool>,
+    /// Process-wide cap on concurrent in-flight turns across all sessions. None = unbounded
+    /// (default). Returns 429 with `concurrency-limit` when exceeded.
+    pub(crate) max_concurrent_turns: Option<usize>,
     /// How many SSE events per turn to retain so a client reconnecting with `Last-Event-ID` can
     /// replay what it missed. Default 256, matching the live broadcast channel's capacity.
     ///
@@ -93,6 +77,22 @@ pub(crate) struct ServeConfig {
     /// redelivery itself.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub(crate) inbox_retry_ceiling: Option<std::time::Duration>,
+    /// Idle-timeout for session eviction. Sessions with no turn activity for this long are dropped
+    /// from the in-memory map by the GC scanner. Accepts humantime strings like `"24h"`, `"30m"`,
+    /// `"86400s"`. Default `"24h"`.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub(crate) idle_timeout: Option<std::time::Duration>,
+    /// How often the GC scanner sweeps the session map. Accepts humantime strings like `"5m"`,
+    /// `"300s"`. Default `"5m"`.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub(crate) gc_scan_interval: Option<std::time::Duration>,
+    /// When true, GC also deletes the SQLite row for idle sessions; default false (keep the row so
+    /// a future request with the same session ID can re-attach, mirroring ACP's `session/load`).
+    pub(crate) delete_on_idle: Option<bool>,
+    /// On SIGTERM / SIGINT, wait at most this long for in-flight turns to finish before forcibly
+    /// aborting. Accepts humantime strings like `"30s"`, `"1m"`. Default `"30s"`.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub(crate) shutdown_drain_timeout: Option<std::time::Duration>,
     /// Bearer tokens configured for this deployment. An empty list is refused at startup: `meka
     /// serve` exits rather than binding a port nothing can authenticate against.
     pub(crate) tokens: Option<Vec<ServeTokenConfig>>,

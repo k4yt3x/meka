@@ -330,17 +330,17 @@ pub(crate) struct ToolsConfig {
     pub(crate) tool_permissions: Option<HashMap<String, Permission>>,
 }
 
-/// `[subagents]` table: what a sub-agent may never hold, and the one choice its parent may make
-/// for it.
+/// `[subagents]` table: how deep sub-agents may nest, what one may never hold, and the one choice
+/// its parent may make for it.
 ///
-/// Two deny lists and one grant, `agent_chosen_profile`, which passes the same test: with it off,
-/// the `profile` parameter is not in the schema. The distinction that decides what belongs here: a
-/// *capability* is something config can genuinely withhold, because a tool the registry never
-/// registered cannot be reached however the parent phrases the task. *Context* (the memory store,
-/// the instructions file) cannot be withheld the same way, because a parent holding it can copy
-/// it into the sub-agent's prompt; a config key promising otherwise would read as a boundary while
-/// being none. Context is therefore granted per call by `agent_spawn`, defaulting to nothing, and
-/// has no key here.
+/// A depth cap, two deny lists and one grant, `agent_chosen_profile`, which passes the same test:
+/// with it off, the `profile` parameter is not in the schema. The distinction that decides what
+/// belongs here: a *capability* is something config can genuinely withhold, because a tool the
+/// registry never registered cannot be reached however the parent phrases the task. *Context* (the
+/// memory store, the instructions file) cannot be withheld the same way, because a parent holding
+/// it can copy it into the sub-agent's prompt; a config key promising otherwise would read as a
+/// boundary while being none. Context is therefore granted per call by `agent_spawn`, defaulting
+/// to nothing, and has no key here.
 ///
 /// The forgetting failure these lists exist for is real: MCP servers are inherited by default, so a
 /// parent that never considers the question hands a sub-agent every tool it has, including one
@@ -350,6 +350,10 @@ pub(crate) struct ToolsConfig {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SubagentsConfig {
+    /// How deep sub-agents may nest: the root spawns at depth 1 and each level below the cap is
+    /// handed its own `agent_spawn`. `1` lets the root spawn and nothing below it; `0` withholds
+    /// `agent_spawn` from everyone. Unset is [`DEFAULT_SUBAGENT_MAX_DEPTH`].
+    pub(crate) max_depth: Option<usize>,
     /// Whole MCP servers a sub-agent cannot see. The coarse lever and the one that matters: naming
     /// a server removes its tools, its resources, and its prompts.
     pub(crate) disabled_servers: Option<Vec<String>>,
@@ -441,6 +445,8 @@ impl InstructionAccess {
 /// [`SubagentsConfig`] with defaults filled in.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ResolvedSubagentsConfig {
+    /// See [`SubagentsConfig::max_depth`]; seeds the root `AgentSpawnTool`'s depth budget.
+    pub(crate) max_depth: usize,
     pub(crate) disabled_servers: Vec<String>,
     pub(crate) disabled_tools: Vec<String>,
     pub(crate) agent_chosen_profile: bool,
@@ -450,6 +456,7 @@ impl ResolvedSubagentsConfig {
     fn resolve(raw: Option<SubagentsConfig>) -> Self {
         let raw = raw.unwrap_or_default();
         Self {
+            max_depth: raw.max_depth.unwrap_or(DEFAULT_SUBAGENT_MAX_DEPTH),
             disabled_servers: raw.disabled_servers.unwrap_or_default(),
             disabled_tools: raw.disabled_tools.unwrap_or_default(),
             agent_chosen_profile: raw.agent_chosen_profile.unwrap_or(false),
@@ -645,6 +652,10 @@ pub(crate) struct DisplayConfig {
     pub(crate) show_session_id_on_create: Option<bool>,
     pub(crate) show_session_id_on_resume: Option<bool>,
     pub(crate) show_session_id_on_exit: Option<bool>,
+    /// What Enter does on the interactive screen while a turn is running: `steer` (default) is
+    /// read at the turn's next round, `followup` waits for the turn to end, `interrupt` cuts the
+    /// answer being streamed.
+    pub(crate) send_class: Option<SendClass>,
     /// Whether the interactive screen captures the mouse: the wheel scrolls and a click expands a
     /// block, at the cost of the terminal's own click-and-drag selection, which then needs its
     /// modifier key. Default `true`.
@@ -850,14 +861,14 @@ const DEFAULT_SUBAGENT_MAX_DEPTH: usize = 3;
 #[serde(deny_unknown_fields)]
 pub(crate) struct ShellConfig {
     pub(crate) sandbox: Option<bool>,
-    /// Directories every confined command may read beyond the system directories, when
-    /// `[permissions].confine_reads` is on: where this machine keeps system software that the
-    /// platform list does not name.
-    pub(crate) additional_readable_directories: Option<Vec<PathBuf>>,
     /// Linux-only choice between `"landlock"` and `"bubblewrap"`. When omitted, the resolver
     /// auto-picks bubblewrap if available and falls back to landlock with a one-shot warning (see
     /// `src/sandbox.rs` and `Warn 2` in `warn_if_sandbox_issues`).
     pub(crate) sandbox_backend: Option<SandboxBackend>,
+    /// Directories every confined command may read beyond the system directories, when
+    /// `[permissions].confine_reads` is on: where this machine keeps system software that the
+    /// platform list does not name.
+    pub(crate) additional_readable_directories: Option<Vec<PathBuf>>,
 }
 
 /// Linux sandbox backend. Silently ignored on macOS and Windows (sandbox-exec and Low-integrity
@@ -1067,11 +1078,6 @@ pub(crate) struct SessionConfig {
     /// identity.
     pub(crate) compact_checkpoint: Option<bool>,
     pub(crate) context_window: Option<u64>,
-    pub(crate) subagent_max_depth: Option<usize>,
-    /// What Enter does on the interactive screen while a turn is running: `steer` (default) is
-    /// read at the turn's next round, `followup` waits for the turn to end, `interrupt` cuts the
-    /// answer being streamed.
-    pub(crate) send_class: Option<SendClass>,
 }
 
 impl Backend {
@@ -1680,7 +1686,7 @@ pub(crate) struct ResolvedConfig {
     pub(crate) show_session_id_on_exit: bool,
     /// Resolved `[display].mouse`.
     pub(crate) mouse: bool,
-    /// Resolved `[session].send_class`.
+    /// Resolved `[display].send_class`.
     pub(crate) send_class: SendClass,
     /// Resolved `[display].status_row`: what the status row shows, in order.
     pub(crate) status_row: Vec<StatusFact>,
@@ -1726,10 +1732,6 @@ pub(crate) struct ResolvedConfig {
     /// through the *active* profile would become that profile's budget for every profile stating
     /// none.
     pub(crate) default_thinking_budget: Option<u64>,
-    /// Maximum sub-agent recursion depth. `1` lets the root agent spawn but denies its sub-agents
-    /// the same; `0` disables `agent_spawn` entirely. Seeds the root `AgentSpawnTool`'s depth
-    /// budget in `main.rs`.
-    pub(crate) subagent_max_depth: usize,
     /// Whether the selected profile's model accepts image input (the ACP `image` prompt
     /// capability). Resolved from `[profiles.<name>].vision`, defaulting to `true`.
     pub(crate) vision: bool,
@@ -2631,7 +2633,7 @@ impl ResolvedConfig {
             show_session_id_on_resume: file_display.show_session_id_on_resume.unwrap_or(true),
             show_session_id_on_exit: file_display.show_session_id_on_exit.unwrap_or(true),
             mouse: file_display.mouse.unwrap_or(true),
-            send_class: file_session.send_class.unwrap_or_default(),
+            send_class: file_display.send_class.unwrap_or_default(),
             turn_end_summary: file_display
                 .turn_end_summary
                 .unwrap_or_else(|| TurnEndFact::DEFAULT_SUMMARY.to_vec()),
@@ -2667,9 +2669,6 @@ impl ResolvedConfig {
             // Unresolved for the same reason, and by the same rule: every profile that states no
             // budget of its own falls back to this one.
             default_thinking_budget,
-            subagent_max_depth: file_session
-                .subagent_max_depth
-                .unwrap_or(DEFAULT_SUBAGENT_MAX_DEPTH),
             vision: active_settings
                 .as_ref()
                 .is_none_or(|settings| settings.vision),
@@ -4063,6 +4062,7 @@ max_tasks = 3
     fn subagents_config_deserialization() {
         let config: ConfigFile = toml::from_str(
             r#"[subagents]
+max_depth = 5
 disabled_servers = ["mekabridge"]
 disabled_tools = ["mcp__notion__create_page", "file_write"]
 agent_chosen_profile = true
@@ -4070,6 +4070,7 @@ agent_chosen_profile = true
         )
         .expect("config parses");
         let subagents = ResolvedSubagentsConfig::resolve(config.subagents);
+        assert_eq!(subagents.max_depth, 5);
         assert_eq!(subagents.disabled_servers, vec!["mekabridge".to_string()]);
         assert_eq!(subagents.disabled_tools, vec![
             "mcp__notion__create_page".to_string(),
@@ -4085,6 +4086,7 @@ agent_chosen_profile = true
         let config: ConfigFile = toml::from_str("").expect("empty config parses");
         assert!(config.subagents.is_none());
         let subagents = ResolvedSubagentsConfig::resolve(config.subagents);
+        assert_eq!(subagents.max_depth, DEFAULT_SUBAGENT_MAX_DEPTH);
         assert!(subagents.disabled_servers.is_empty());
         assert!(subagents.disabled_tools.is_empty());
         assert!(
@@ -4532,6 +4534,29 @@ command = "ida-mcp"
         let error = toml::from_str::<ConfigFile>("[session]\ncontext_messages = 200\n")
             .expect_err("the retired key must not parse");
         assert!(error.to_string().contains("context_messages"), "{error}");
+    }
+
+    /// The two keys that moved out of `[session]` are refused there by name, with no alias, and
+    /// read in the section that governs each: the depth cap beside the other sub-agent floors, the
+    /// send class beside the other screen settings.
+    #[test]
+    fn the_keys_that_left_session_are_refused_there_and_read_in_their_sections() {
+        for (key, value) in [("subagent_max_depth", "2"), ("send_class", "\"followup\"")] {
+            let error = toml::from_str::<ConfigFile>(&format!("[session]\n{key} = {value}\n"))
+                .expect_err("a moved key must not parse where it was");
+            assert!(error.to_string().contains(key), "{error}");
+        }
+        let config: ConfigFile =
+            toml::from_str("[subagents]\nmax_depth = 2\n\n[display]\nsend_class = \"followup\"\n")
+                .expect("the keys parse in their sections");
+        assert_eq!(
+            ResolvedSubagentsConfig::resolve(config.subagents).max_depth,
+            2
+        );
+        assert_eq!(
+            config.display.and_then(|display| display.send_class),
+            Some(SendClass::Followup)
+        );
     }
 
     /// The percent is the user's and reaches the agent beside the switch; the two keys are checked
@@ -5076,9 +5101,6 @@ context_ceiling_percent = 50
     #[test]
     fn session_defaults_applied() {
         let file_session = SessionConfig::default();
-        let subagent_max_depth = file_session.subagent_max_depth.unwrap_or(3);
-
-        assert_eq!(subagent_max_depth, 3);
         // Retention has no default: unset means keep every session forever.
         assert!(file_session.retention.is_none());
     }
@@ -5134,11 +5156,9 @@ permission = "workspace"
 context_ceiling_percent = 50
 retention = "30d"
 turn_retention = "36h"
-subagent_max_depth = 5
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let file_session = config.session.unwrap_or_default();
-        let subagent_max_depth = file_session.subagent_max_depth.unwrap_or(3);
 
         assert_eq!(file_session.context_ceiling_percent, Some(50));
         assert_eq!(
@@ -5150,7 +5170,6 @@ subagent_max_depth = 5
             file_session.turn_retention,
             Some(std::time::Duration::from_secs(36 * 3_600))
         );
-        assert_eq!(subagent_max_depth, 5);
     }
 
     #[test]

@@ -8805,7 +8805,7 @@ fn a_session_denied_agent_spawn_registers_none_of_the_family() {
 #[test]
 fn a_session_at_depth_zero_registers_none_of_the_family() {
     let harness = ServeTestHarness::spawn_with_prelude(
-        "[session]\nsubagent_max_depth = 0\n",
+        "[subagents]\nmax_depth = 0\n",
         "",
         mock_simple_turn(),
     );

@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.81.0] - 2026-10-18
+
+### Changed
+
+- **Breaking:** `[session].subagent_max_depth` is `[subagents].max_depth`.
+- **Breaking:** `[session].send_class` is `[display].send_class`.
+- A profile's keys are ordered by how many backends read them, on the page and in the file.
+
 ## [0.80.0] - 2026-10-18
 
 ### Changed
@@ -2828,7 +2836,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.80.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.81.0...HEAD
+[0.81.0]: https://github.com/k4yt3x/meka/compare/0.80.0...0.81.0
 [0.80.0]: https://github.com/k4yt3x/meka/compare/0.79.0...0.80.0
 [0.79.0]: https://github.com/k4yt3x/meka/compare/0.78.0...0.79.0
 [0.78.0]: https://github.com/k4yt3x/meka/compare/0.77.0...0.78.0

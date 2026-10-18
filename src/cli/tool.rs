@@ -86,10 +86,12 @@ pub(crate) fn run_tool_subcommand(
                 session_stats: std::sync::Arc::new(crate::stats::SessionStats::default()),
                 schedule: config.schedule.clone(),
                 background: config.background.clone(),
-                subagents: config.subagents.clone(),
                 // At least one, so the `agent_*` family is registered and can be listed; whether a
                 // real session would have it is asked below, against the configured depth.
-                subagent_max_depth: config.subagent_max_depth.max(1),
+                subagents: crate::config::ResolvedSubagentsConfig {
+                    max_depth: config.subagents.max_depth.max(1),
+                    ..config.subagents.clone()
+                },
             };
             let cells = crate::session::SessionCells::new(
                 shared_permission,
@@ -110,7 +112,7 @@ pub(crate) fn run_tool_subcommand(
             // them. A per-name `[tools]` entry is a separate question, applied below alongside
             // every other tool's.
             let agent_family_registered =
-                crate::tools::subagent::agent_tools_registered(&filter, config.subagent_max_depth);
+                crate::tools::subagent::agent_tools_registered(&filter, config.subagents.max_depth);
             // Withheld from every session on `none`, asked the same way.
             let web_fetch_registered = crate::tools::web::web_fetch_registered(config.network);
 

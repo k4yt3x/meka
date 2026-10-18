@@ -14,7 +14,6 @@ pub(crate) struct McpConfig {
     /// What becomes of a tool that no `eager_load_tools` entry names, on every server that states
     /// no `deferral` of its own. Unset is `deferred`.
     pub(crate) deferral: Option<Deferral>,
-    pub(crate) servers: Option<Vec<McpServerConfig>>,
     /// Default for each server's [`McpServerConfig::required`]. When true, every enabled server
     /// gates the turn; when false (the default) only servers that opt in with `required = true`
     /// do. A gated turn is refused outright rather than sent to the model.
@@ -38,6 +37,7 @@ pub(crate) struct McpConfig {
     /// How many HTTP servers the startup connector connects at once. Default 20; `0` is refused
     /// at startup.
     pub(crate) http_concurrency: Option<usize>,
+    pub(crate) servers: Option<Vec<McpServerConfig>>,
 }
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]

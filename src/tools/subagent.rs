@@ -21,7 +21,7 @@ use crate::{
     },
 };
 
-/// Hard ceiling on sub-agent nesting depth, independent of the tunable `session.subagent_max_depth`
+/// Hard ceiling on sub-agent nesting depth, independent of the tunable `[subagents].max_depth`
 /// budget. Guarantees recursion always terminates even if an agent re-grants `max_depth` at every
 /// level: no agent nested deeper than this is given a `agent_spawn` tool, so the tree can never
 /// exceed this height.
@@ -264,7 +264,7 @@ pub(crate) struct AgentSpawnTool {
     /// `agent_spawn` deep.
     pub(crate) inherited_scope: ToolScope,
     /// Soft, agent-tunable recursion budget for sub-agents spawned by this tool. The root tool is
-    /// seeded from `session.subagent_max_depth`; each level hands the child `remaining_depth - 1`
+    /// seeded from `[subagents].max_depth`; each level hands the child `remaining_depth - 1`
     /// unless the caller overrides it via the `max_depth` param. A nested `agent_spawn` is granted
     /// only while the child's budget is `>= 1`.
     pub(crate) remaining_depth: usize,
@@ -1037,11 +1037,8 @@ pub(crate) fn register_subagent_tools(
 /// Takes the filter rather than a [`ToolRegistry`] because the listing builds its reference
 /// registry unfiltered on purpose, to read every tool's hardcoded permission level; asking that
 /// registry would answer "yes" no matter what the user configured.
-pub(crate) fn agent_tools_registered(
-    filter: &BuiltinToolFilter,
-    subagent_max_depth: usize,
-) -> bool {
-    subagent_max_depth >= 1 && filter.admits("agent_spawn")
+pub(crate) fn agent_tools_registered(filter: &BuiltinToolFilter, max_depth: usize) -> bool {
+    max_depth >= 1 && filter.admits("agent_spawn")
 }
 
 /// The family [`agent_tools_registered`] decides about, for a listing that shows it as denied.
@@ -2436,13 +2433,13 @@ fn clamp_enabled_permissions(
 /// `remaining_depth` / `absolute_depth`, honoring an optional `max_depth` override.
 ///
 /// Returns `(child_remaining, child_absolute, allow_nested)`. `remaining_depth` is the budget
-/// seeded from `session.subagent_max_depth`; `max_depth` may lower it but never raise it.
+/// seeded from `[subagents].max_depth`; `max_depth` may lower it but never raise it.
 /// `absolute_depth` is the monotonic hard counter: it always increments and, once it reaches
 /// [`SUBAGENT_ABSOLUTE_MAX_DEPTH`], no further `agent_spawn` is granted. A nested `agent_spawn` is
 /// granted only when both budgets allow it.
 ///
-/// The override is clamped because `[session] subagent_max_depth` is documented as a ceiling
-/// ("`subagent_max_depth = 1` means sub-agents cannot spawn further sub-agents"), and an
+/// The override is clamped because `[subagents].max_depth` is documented as a ceiling
+/// ("`max_depth = 1` means sub-agents cannot spawn further sub-agents"), and an
 /// unclamped override would make it merely a default that one `agent_spawn` passing `max_depth:
 /// 15` re-grants at every level. Recursion is still bounded by [`SUBAGENT_ABSOLUTE_MAX_DEPTH`], so
 /// this is about the config key meaning what it says rather than about termination.
@@ -2838,9 +2835,9 @@ mod tests {
         assert!(!allow);
     }
 
-    /// `max_depth` narrows the child's budget and can never widen it. `[session]
-    /// subagent_max_depth` is documented as a ceiling, so a model asking for more than the operator
-    /// allowed gets the operator's answer.
+    /// `max_depth` narrows the child's budget and can never widen it. `[subagents].max_depth` is
+    /// documented as a ceiling, so a model asking for more than the operator allowed gets the
+    /// operator's answer.
     #[test]
     fn child_spawn_depth_override_only_narrows() {
         // Asking for more than is left yields what is left, not what was asked for.
@@ -2848,10 +2845,10 @@ mod tests {
         assert_eq!(remaining, 2);
         assert!(allow);
 
-        // At the documented `subagent_max_depth = 1`, no override can grant a grandchild.
+        // At the documented `max_depth = 1`, no override can grant a grandchild.
         let (remaining, _absolute, allow) = child_spawn_depth(1, 0, Some(5));
         assert_eq!(remaining, 0);
-        assert!(!allow, "subagent_max_depth = 1 must forbid nesting");
+        assert!(!allow, "max_depth = 1 must forbid nesting");
 
         // Asking for less than is left is honored: the agent may still restrict itself.
         let (remaining, _absolute, _allow) = child_spawn_depth(5, 0, Some(1));

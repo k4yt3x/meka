@@ -1141,7 +1141,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/request-too-large` | 422 | meka refused to send the turn: the conversation is still over the profile's `max_request_bytes` after redacting older tool-result images. meka's own ceiling, so no provider judged it and no `provider_response` rides along; `detail` names the size, the limit and the remedy, `/compact`. **Do not retry unchanged**: `POST /compact` first |
 | `/errors/payload-too-large` | 413 | Body exceeds `max_body_bytes`, meka's limit on the HTTP request itself. Unrelated to `request-too-large`, which is about what meka may send onward |
 | `/errors/concurrency-limit` | 429 | Process-wide turn limit reached (`Retry-After` header included) |
-| `/errors/sse-lag` | 500 | SSE consumer fell behind; stream terminated (see [SSE lag](#sse-lag)) |
+| `/errors/sse-lag` | 500 | SSE consumer fell behind; stream terminated (see [Falling behind](#falling-behind)) |
 | `/errors/stream-detached` | 500 | SSE-only. A re-attached stream ended with no recorded outcome because the turn's task died; read `GET /messages` for what completed |
 | `/errors/provider` | 502 | An upstream call failed for a reason meka could not classify as transient. Usually permanent (a revoked credential, a `base_url` that is not the API), but it is a catch-all, so treat it as "no reason to expect a retry to help" rather than "a retry cannot help" |
 | `/errors/provider-unavailable` | 502 | The upstream failed in a way meka's classifier had already labeled transient. **Worth one backed-off resend.** Carries a `Retry-After` when the upstream gave one, which most of the time it did not |

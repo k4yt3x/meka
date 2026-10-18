@@ -307,7 +307,7 @@ fn tool_list_reports_the_whole_agent_family_as_denied_with_agent_spawn() {
     }
 }
 
-/// `session.subagent_max_depth = 0` is the documented way to turn delegation off, and the listing
+/// `[subagents].max_depth = 0` is the documented way to turn delegation off, and the listing
 /// missed it entirely while the family was described in prose.
 #[test]
 fn tool_list_reports_the_agent_family_as_denied_at_depth_zero() {
@@ -316,7 +316,7 @@ fn tool_list_reports_the_agent_family_as_denied_at_depth_zero() {
     std::fs::create_dir_all(&config_dir).expect("config dir");
     std::fs::write(
         config_dir.join("config.toml"),
-        "[session]\nsubagent_max_depth = 0\n",
+        "[subagents]\nmax_depth = 0\n",
     )
     .expect("write config.toml");
     let output = run_isolated(&install, &["tool", "list"]);

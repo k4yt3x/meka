@@ -10,6 +10,21 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.80 to 0.81
+
+**Two keys move to the section that governs them.** `config.toml` refuses the old key, naming its
+line; move it.
+
+| Surface | 0.80 | 0.81 |
+|---|---|---|
+| `config.toml` | `[session].subagent_max_depth` | `[subagents].max_depth` |
+| `config.toml` | `[session].send_class` | `[display].send_class` |
+
+**A profile's keys are ordered by how many backends read them.** `meka profile add` and
+`meka profile set` write `max_request_bytes` after `max_output_tokens` and `deferred_tools` after
+`vision`, and the next write to a profile puts an existing one in that order. Nothing is renamed
+and no value changes.
+
 ## 0.78 to 0.79
 
 Nothing is renamed and no key is refused; two things change what a running deployment does.
@@ -204,7 +219,7 @@ the bottom, and you can type while the agent works. What that changes for an exi
   them, as every other pair of blocks does.
 
 Two keys are new: [`display.mouse`](../configuration/config-file.md#displaymouse), on by default,
-and [`session.send_class`](../configuration/config-file.md#sessionsend_class), `steer` by default.
+and [`session.send_class`](../configuration/config-file.md#displaysend_class), `steer` by default.
 [Interactive mode](../usage/interactive-mode.md) describes the screen.
 
 ## 0.70 to 0.71
