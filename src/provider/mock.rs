@@ -159,6 +159,18 @@ pub(crate) enum MockEvent {
     Usage {
         input_tokens: u64,
     },
+    /// Holds the reply until `gate` fires, and like [`Self::Sleep`] ends at once on a stop. The
+    /// pacing a test keys on an event of its own rather than on the clock: a test that has to act
+    /// before a round ends releases the gate once it has, where a fixed delay only hopes to be
+    /// long enough on a slow machine. Never scripted, so never written or read.
+    #[serde(skip)]
+    #[allow(
+        dead_code,
+        reason = "constructed by tests alone, which pace a round on an event of their own"
+    )]
+    Hold {
+        gate: tokio_util::sync::CancellationToken,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,6 +448,14 @@ impl Provider for MockProvider {
                 MockEvent::Stall { ms } => {
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 }
+                MockEvent::Hold { gate } => {
+                    tokio::select! {
+                        _ = gate.cancelled() => {}
+                        _ = cancellation.cancelled() => {
+                            return Err(crate::error::MekaError::Interrupted);
+                        }
+                    }
+                }
                 MockEvent::Text { text: chunk } => text.push_str(&chunk),
                 MockEvent::ThinkingDelta { text: chunk } => thinking.push_str(&chunk),
                 // A live indicator's running estimate. Nothing survives a non-streaming turn, which
@@ -625,6 +645,15 @@ impl Provider for MockProvider {
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                     continue;
                 }
+                MockEvent::Hold { gate } => {
+                    tokio::select! {
+                        _ = gate.cancelled() => {}
+                        _ = cancellation.cancelled() => {
+                            return Err(crate::error::MekaError::Interrupted);
+                        }
+                    }
+                    continue;
+                }
                 event => {
                     let stream_event = match event {
                         MockEvent::Notice { message } => {
@@ -660,6 +689,7 @@ impl Provider for MockProvider {
                         )]
                         MockEvent::Sleep { .. }
                         | MockEvent::Stall { .. }
+                        | MockEvent::Hold { .. }
                         | MockEvent::Fail { .. }
                         | MockEvent::ExpectSystemPrompt { .. }
                         | MockEvent::FailStream { .. }

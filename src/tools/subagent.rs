@@ -5144,11 +5144,14 @@ mod tests {
             .await
             .expect("parent session");
         let parent_session = crate::session::SharedSessionId::new(Some(parent_sid));
-        // The worker's first round waits long enough for the steer to be written before its tool
-        // runs; the boundary after that tool is where the steer lands.
+        // The worker's first round holds until the steer is written, so its tool runs after it;
+        // the boundary after that tool is where the steer lands.
+        let steer_written = CancellationToken::new();
         let mock = Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
             vec![
-                crate::provider::mock::MockEvent::Sleep { ms: 800 },
+                crate::provider::mock::MockEvent::Hold {
+                    gate: steer_written.clone(),
+                },
                 crate::provider::mock::MockEvent::ToolUseStart {
                     id: "call-0".to_string(),
                     name: "does_not_exist".to_string(),
@@ -5211,6 +5214,7 @@ mod tests {
             )
             .await
             .expect("steer succeeds");
+        steer_written.cancel();
 
         let text = running.await.expect("the spawn task");
         assert!(text.contains("done"), "{text}");
