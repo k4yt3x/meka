@@ -5002,6 +5002,8 @@ mod tests {
             delivered_at: None,
             withdrawn_at: None,
             failure: None,
+            not_before: None,
+            last_error: None,
         };
         let rendered = render_inbox_item(&item, false);
         assert!(

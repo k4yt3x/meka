@@ -66,6 +66,10 @@ pub(crate) struct InboxItem {
     pub(crate) created_at: DateTime<Utc>,
     /// Turns that opened on this item and failed before the provider accepted anything.
     pub(crate) attempts: u32,
+    /// When its next attempt may run, while it waits after a failure or a held session.
+    pub(crate) not_before: Option<DateTime<Utc>>,
+    /// Why the last turn opened on it failed, while it waits to be tried again.
+    pub(crate) last_error: Option<String>,
     pub(crate) appended_at: Option<DateTime<Utc>>,
     pub(crate) delivered_at: Option<DateTime<Utc>>,
     pub(crate) withdrawn_at: Option<DateTime<Utc>>,
@@ -160,7 +164,7 @@ pub(crate) struct InboxStore {
 }
 
 const COLUMNS: &str = "id, session_id, class, source, body, created_at, attempts, appended_at, \
-                       delivered_at, withdrawn_at, failure";
+                       delivered_at, withdrawn_at, failure, not_before, last_error";
 
 /// A row is offered to a turn while its text is not yet in the log, it has not been taken back,
 /// and any retry wait has passed.
@@ -419,31 +423,45 @@ impl InboxStore {
     }
 
     /// Hold pending items back until `not_before` after a turn on them failed, counting the
-    /// attempt. Rows already in the conversation are left alone: they are not waiting to be
-    /// appended, and their turn did not fail on their account.
+    /// attempt and keeping `last_error`, why it failed, for whoever reads the item while it waits.
+    /// Answers the ids it held back. Rows already in the conversation are left alone and are not
+    /// among them: they are not waiting to be appended, and their turn did not fail on their
+    /// account.
     pub(crate) async fn defer_pending(
         &self,
         ids: &[Uuid],
         not_before: DateTime<Utc>,
-    ) -> Result<()> {
+        last_error: Option<&str>,
+    ) -> Result<Vec<Uuid>> {
         if ids.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
-        let ids: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+        let ids: Vec<Uuid> = ids.to_vec();
         let not_before = not_before.to_rfc3339();
+        let last_error = last_error.map(str::to_string);
         self.connection
-            .call(move |connection| -> rusqlite::Result<()> {
+            .call(move |connection| -> rusqlite::Result<Vec<Uuid>> {
                 let transaction = connection.transaction()?;
+                let mut deferred = Vec::new();
                 {
                     let mut statement = transaction.prepare(
-                        "UPDATE inbox_items SET not_before = ?2, attempts = attempts + 1 \
+                        "UPDATE inbox_items SET not_before = ?2, attempts = attempts + 1, \
+                         last_error = ?3 \
                          WHERE id = ?1 AND appended_at IS NULL AND withdrawn_at IS NULL",
                     )?;
                     for id in &ids {
-                        statement.execute(rusqlite::params![id, not_before])?;
+                        let changed = statement.execute(rusqlite::params![
+                            id.to_string(),
+                            not_before,
+                            last_error
+                        ])?;
+                        if changed > 0 {
+                            deferred.push(*id);
+                        }
                     }
                 }
-                transaction.commit()
+                transaction.commit()?;
+                Ok(deferred)
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to defer inbox items: {error}")))
@@ -560,6 +578,8 @@ impl InboxStore {
                         delivered_at: row.get(8)?,
                         withdrawn_at: row.get(9)?,
                         failure: row.get(10)?,
+                        not_before: row.get(11)?,
+                        last_error: row.get(12)?,
                     })
                 })?;
                 rows.collect()
@@ -619,8 +639,10 @@ pub(super) fn stamp_appended(
     if ids.is_empty() {
         return Ok(());
     }
-    let mut statement = transaction
-        .prepare("UPDATE inbox_items SET appended_at = ?2 WHERE id = ?1 AND appended_at IS NULL")?;
+    let mut statement = transaction.prepare(
+        "UPDATE inbox_items SET appended_at = ?2, not_before = NULL, last_error = NULL \
+             WHERE id = ?1 AND appended_at IS NULL",
+    )?;
     for id in ids {
         statement.execute(rusqlite::params![id, now])?;
     }
@@ -675,6 +697,8 @@ struct InboxRow {
     delivered_at: Option<String>,
     withdrawn_at: Option<String>,
     failure: Option<String>,
+    not_before: Option<String>,
+    last_error: Option<String>,
 }
 
 impl InboxRow {
@@ -697,6 +721,8 @@ impl InboxRow {
             body: self.body,
             created_at: stamp(Some(self.created_at))?.ok_or("missing created_at")?,
             attempts: u32::try_from(self.attempts.max(0)).unwrap_or(u32::MAX),
+            not_before: stamp(self.not_before)?,
+            last_error: self.last_error,
             appended_at: stamp(self.appended_at)?,
             delivered_at: stamp(self.delivered_at)?,
             withdrawn_at: stamp(self.withdrawn_at)?,
@@ -891,6 +917,70 @@ mod tests {
         assert_eq!(named.source, Some("test".to_string()));
     }
 
+    /// A deferred item shows when it runs next and why it waits, and both read back off the row.
+    #[tokio::test]
+    async fn a_deferred_item_shows_when_it_runs_next_and_why_it_waits() {
+        let (store, session_id) = store_with_session().await;
+        let inbox = store.inbox_store();
+        let id = inbox
+            .enqueue(item(session_id, InboxClass::Steer, "later"))
+            .await
+            .expect("enqueue")
+            .id;
+        let fresh = inbox.get(id).await.expect("get").expect("row");
+        assert_eq!(
+            (fresh.not_before, fresh.last_error.as_deref()),
+            (None, None)
+        );
+        let carried = inbox
+            .enqueue(item(session_id, InboxClass::Steer, "already read"))
+            .await
+            .expect("enqueue")
+            .id;
+        inbox
+            .stamp_appended_after_rewrite(&[carried])
+            .await
+            .expect("stamp");
+        let not_before = Utc::now() + chrono::Duration::minutes(5);
+        let deferred = inbox
+            .defer_pending(
+                &[id, carried],
+                not_before,
+                Some("the profile's quota or credit is exhausted"),
+            )
+            .await
+            .expect("defer");
+        assert_eq!(
+            deferred,
+            vec![id],
+            "a row already in the conversation is left alone and not named"
+        );
+        let waiting = inbox.get(id).await.expect("get").expect("row");
+        assert_eq!(waiting.attempts, 1);
+        assert_eq!(
+            waiting.not_before.map(|at| at.timestamp()),
+            Some(not_before.timestamp())
+        );
+        assert_eq!(
+            waiting.last_error.as_deref(),
+            Some("the profile's quota or credit is exhausted")
+        );
+
+        inbox
+            .stamp_appended_after_rewrite(&[id])
+            .await
+            .expect("stamp");
+        let appended = inbox.get(id).await.expect("get").expect("row");
+        assert_eq!(
+            appended.last_error, None,
+            "a turn that carried it clears why the last one failed"
+        );
+        assert_eq!(
+            appended.not_before, None,
+            "and when it would have been tried next"
+        );
+    }
+
     #[tokio::test]
     async fn a_blank_body_is_refused_before_it_reaches_the_store() {
         let session_id = Uuid::new_v4();
@@ -962,7 +1052,7 @@ mod tests {
 
         // A deferred item waits out `not_before`, then is offered again with the attempt counted.
         inbox
-            .defer_pending(&[steer], now + chrono::Duration::minutes(5))
+            .defer_pending(&[steer], now + chrono::Duration::minutes(5), None)
             .await
             .expect("defer");
         let soon = inbox

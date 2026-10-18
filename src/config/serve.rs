@@ -87,6 +87,12 @@ pub(crate) struct ServeConfig {
     /// abandoned work, and makes re-attach useful only for turns that already finished.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub(crate) stream_reattach_grace: Option<std::time::Duration>,
+    /// How long a queued inbox item is retried after a turn on it failed, from when it was
+    /// enqueued, before it is given up on. Accepts humantime strings like `"1h"`, `"10m"`.
+    /// Default `"1h"`. `"0s"` gives an item up on its first failure, for a client that owns
+    /// redelivery itself.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub(crate) inbox_retry_ceiling: Option<std::time::Duration>,
     /// Bearer tokens configured for this deployment. An empty list is refused at startup: `meka
     /// serve` exits rather than binding a port nothing can authenticate against.
     pub(crate) tokens: Option<Vec<ServeTokenConfig>>,

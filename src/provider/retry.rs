@@ -77,20 +77,15 @@ const RETRY_AFTER_CAP: Duration = Duration::from_secs(60);
 pub(crate) const OUTAGE_REPRIEVE: Duration = BACKOFF_CAP;
 
 /// How long a profile that failed a turn over to a fallback is skipped at the start of later
-/// turns when its upstream stated no reset: long enough that an outage is not probed on every
-/// turn, short enough that a recovered upstream is back within one.
+/// turns: long enough that an outage is not probed on every turn, short enough that a recovered
+/// upstream is back within one.
 pub(crate) const FALLBACK_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
-/// Ceiling on a cooldown the upstream stated. A reset hours away would hide a recovery the
-/// upstream makes early, and a probe an hour later costs one retry sequence.
-pub(crate) const FALLBACK_COOLDOWN_CAP: Duration = Duration::from_secs(60 * 60);
-
-/// How long a failed profile's breaker stays open: what the upstream said access resumes in,
-/// within the cap, else the default.
+/// How long a failed profile's breaker stays open: the default, or sooner when the upstream said
+/// access resumes sooner. A stated reset never lengthens the skip: it is an estimate the operator
+/// can overtake by topping an account up, and the probe that notices costs one request.
 pub(crate) fn fallback_cooldown(stated: Option<Duration>) -> Duration {
-    stated.map_or(FALLBACK_COOLDOWN, |stated| {
-        stated.min(FALLBACK_COOLDOWN_CAP)
-    })
+    stated.map_or(FALLBACK_COOLDOWN, |stated| stated.min(FALLBACK_COOLDOWN))
 }
 
 // `Duration::clamp` panics on an inverted range, and the floor and the ceiling in
@@ -169,10 +164,10 @@ mod tests {
         );
     }
 
-    /// The breaker takes the upstream's own reset within the cap, and the default when it stated
-    /// none.
+    /// The breaker takes the upstream's own reset when it is sooner than the default, and never a
+    /// later one: a stated reset shortens the skip or leaves it alone.
     #[test]
-    fn a_fallback_cooldown_is_the_stated_reset_within_the_cap() {
+    fn a_fallback_cooldown_never_outlasts_the_default() {
         assert_eq!(fallback_cooldown(None), FALLBACK_COOLDOWN);
         assert_eq!(
             fallback_cooldown(Some(Duration::from_secs(10))),
@@ -180,7 +175,7 @@ mod tests {
         );
         assert_eq!(
             fallback_cooldown(Some(Duration::from_secs(3 * 60 * 60))),
-            FALLBACK_COOLDOWN_CAP
+            FALLBACK_COOLDOWN
         );
     }
 

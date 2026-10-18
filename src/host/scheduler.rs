@@ -92,10 +92,62 @@ const INBOX_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(10)
 /// Longest wait between two attempts, and the wait for a session that could not be brought up
 /// at all, which no backoff from a first try would fit.
 const INBOX_RETRY_LONGEST_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-/// How long an item is retried for before it is given up on, from when it was enqueued. Long
-/// enough to ride out a provider blip; short enough that an outage is reported to whoever is
-/// waiting rather than left to look like silence.
-const INBOX_RETRY_CEILING: chrono::Duration = chrono::Duration::hours(1);
+/// `[serve].inbox_retry_ceiling` when unset: how long an item is retried for before it is given
+/// up on, from when it was enqueued. Long enough to ride out a provider blip; short enough that an
+/// outage is reported to whoever is waiting rather than left to look like silence.
+pub(crate) const DEFAULT_INBOX_RETRY_CEILING: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60);
+
+/// Whether waiting can change the answer a failed inbox turn got: the upstream could not serve the
+/// profile and may again (an outage, a dropped stream, a quota that resets), or a required MCP
+/// server was not ready and may reconnect. Anything else, a rejected credential, a request the
+/// upstream judged wrong, a session its profile cannot read, fails the same way on every attempt,
+/// so the item is given up on at once and the sender is told now.
+fn inbox_retry_can_help(error: &MekaError) -> bool {
+    error.is_profile_unavailable() || matches!(error, MekaError::McpTurnGated { .. })
+}
+
+/// When the next attempt on failed items runs: the backoff for the attempt count, pulled earlier
+/// to the upstream's own word when it said it would be back sooner, never later. A stated time is
+/// an estimate the operator can overtake by topping an account up, so it only ever shortens a
+/// wait, and the floor keeps a reset already past from spinning the driver.
+fn inbox_retry_delay(attempts: u32, advised: Option<std::time::Duration>) -> std::time::Duration {
+    let backoff = INBOX_RETRY_BASE
+        .saturating_mul(1u32 << attempts.min(16))
+        .min(INBOX_RETRY_LONGEST_WAIT);
+    match advised {
+        Some(advised) => backoff.min(advised.max(INBOX_RETRY_BASE)),
+        None => backoff,
+    }
+}
+
+/// Why an item is given up on when its retries ran out of the ceiling.
+fn ceiling_reason(attempts: u32, ceiling: std::time::Duration) -> String {
+    if ceiling.is_zero() {
+        return "it could not be delivered at once and `[serve] inbox_retry_ceiling` is 0s"
+            .to_string();
+    }
+    format!(
+        "no turn could deliver it in {attempts} attempt(s) within the retry ceiling of {}",
+        crate::text::format_duration_words(ceiling)
+    )
+}
+
+/// A `std` duration as `chrono` measures one, saturating rather than failing on one too long.
+fn chrono_duration(duration: std::time::Duration) -> chrono::Duration {
+    chrono::Duration::from_std(duration).unwrap_or(chrono::Duration::MAX)
+}
+
+/// Whether an attempt on `item` at `at` would fall at or past `ceiling`, measured from its
+/// enqueue: the one rule for the expiry at a drain's start and for a deferral that would land too
+/// late.
+fn past_ceiling(
+    at: chrono::DateTime<chrono::Utc>,
+    item: &crate::store::inbox::InboxItem,
+    ceiling: std::time::Duration,
+) -> bool {
+    at - item.created_at >= chrono_duration(ceiling)
+}
 
 /// A prompt the user did not type, shown where the host shows such things before it runs: as the
 /// text the model is given where the host's transcript shows user turns (ACP), as a stage
@@ -185,13 +237,31 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
     ) {
     }
 
-    /// An inbox item was given up on and withdrawn. `serve` tells the feed and the webhooks.
+    /// An inbox item was given up on and withdrawn, for `reason`, which `error` decided when it
+    /// was a failed turn's. `serve` tells the feed and the webhooks.
     async fn inbox_given_up(
         &self,
         _entry: &Self::Entry,
         _item: &crate::store::inbox::InboxItem,
         _reason: &str,
+        _error: Option<&MekaError>,
     ) {
+    }
+
+    /// A turn on `items` failed with `error` in a way waiting can change, and they wait for the
+    /// next attempt at `not_before`. `serve` tells the feed and the webhooks.
+    async fn inbox_deferred(
+        &self,
+        _entry: &Self::Entry,
+        _items: &[crate::store::inbox::InboxItem],
+        _not_before: chrono::DateTime<chrono::Utc>,
+        _error: &MekaError,
+    ) {
+    }
+
+    /// How long an item is retried for, from its enqueue, before it is given up on.
+    fn inbox_retry_ceiling(&self) -> std::time::Duration {
+        DEFAULT_INBOX_RETRY_CEILING
     }
 
     /// An inbox item was withdrawn because the turn opened on it was canceled. `serve` tells the
@@ -576,9 +646,10 @@ pub(crate) enum InboxDrain {
 /// A busy session is waited for: the running turn reads steers itself at its round boundaries,
 /// and what it leaves pending opens a turn the moment it ends. Turns are chained while items keep
 /// arriving, each opening on everything waiting at that moment. A turn that fails before anything
-/// reached the conversation has withdrawn its prompt and put its items back; they are deferred by
-/// a backoff that doubles per attempt, and given up on past [`INBOX_RETRY_CEILING`], which is
-/// when whoever is waiting is told rather than left with silence. A turn that fails after a tool
+/// reached the conversation has withdrawn its prompt and put its items back; when waiting can
+/// change the answer ([`inbox_retry_can_help`]) they are deferred by [`inbox_retry_delay`] and
+/// given up on past the host's retry ceiling, which is when whoever is waiting is told rather than
+/// left with silence, and otherwise given up on at once. A turn that fails after a tool
 /// ran keeps its prompt, so its items are in the conversation already and the next turn, whoever
 /// starts it, delivers them. A turn canceled from outside withdraws the items it opened on, as a
 /// canceled client turn loses its prompt: a cancel that re-ran the same items would not be one.
@@ -660,29 +731,21 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
         }
         // An item that has failed before and has waited past the ceiling is given up on. A fresh
         // one is never expired: the ceiling bounds retrying, not queueing.
+        let ceiling = hooks.inbox_retry_ceiling();
         let (expired, items): (Vec<_>, Vec<_>) = items
             .into_iter()
-            .partition(|item| item.attempts > 0 && now - item.created_at >= INBOX_RETRY_CEILING);
+            .partition(|item| item.attempts > 0 && past_ceiling(now, item, ceiling));
         for item in expired {
-            let reason = format!(
-                "no turn could deliver it in {} attempt(s) over the last hour",
-                item.attempts
-            );
-            let item_id = item.id;
-            match inbox.withdraw(item_id, Some(reason.clone())).await {
-                Ok(crate::store::inbox::Withdrawal::Withdrawn) => {
-                    tracing::warn!("giving up on inbox item {item_id}: {reason}");
-                    hooks.inbox_given_up(&entry, &item, &reason).await;
-                }
-                Ok(_) => {}
-                Err(error) => tracing::warn!("failed to withdraw inbox item {item_id}: {error}"),
-            }
+            let reason = ceiling_reason(item.attempts, ceiling);
+            give_up_inbox_item(hooks, &entry, &item, reason, None).await;
         }
         if items.is_empty() {
             continue;
         }
         let attempts = items.iter().map(|item| item.attempts).max().unwrap_or(0);
         let item_ids: Vec<uuid::Uuid> = items.iter().map(|item| item.id).collect();
+        // Kept for the failure arms below, which name the items a turn could not carry.
+        let offered = items.clone();
 
         entry.touch();
         // Put off like the arms above, or the sweeper asks again at once: a session whose row
@@ -768,21 +831,84 @@ pub(crate) async fn run_inbox_turns<H: HostHooks>(hooks: &H, session_id: uuid::U
             Err(error) => {
                 // Only what the withdrawal put back is pending; what a tool round kept is in the
                 // conversation and waits for a turn of any kind.
-                let delay = INBOX_RETRY_BASE
-                    .saturating_mul(1u32 << attempts.min(16))
-                    .min(INBOX_RETRY_LONGEST_WAIT);
+                if !inbox_retry_can_help(&error) {
+                    let reason = format!(
+                        "the turn opened on it failed, and waiting would not change that: {}",
+                        error.sentence()
+                    );
+                    tracing::warn!("inbox turn on session {session_id} failed: {error}");
+                    for item in &offered {
+                        give_up_inbox_item(hooks, &entry, item, reason.clone(), Some(&error)).await;
+                    }
+                    return InboxDrain::Done;
+                }
+                let delay = inbox_retry_delay(attempts, error.resumes_after());
+                let not_before = chrono::Utc::now() + chrono_duration(delay);
+                // An item whose next attempt would land past the ceiling is given up now, so the
+                // sender hears at once rather than at the tick that would have found it expired.
+                let (hopeless, retried): (Vec<_>, Vec<_>) = offered
+                    .into_iter()
+                    .partition(|item| past_ceiling(not_before, item, ceiling));
+                for item in &hopeless {
+                    let reason = ceiling_reason(item.attempts + 1, ceiling);
+                    give_up_inbox_item(hooks, &entry, item, reason, Some(&error)).await;
+                }
+                if retried.is_empty() {
+                    return InboxDrain::Done;
+                }
                 tracing::warn!(
                     "inbox turn on session {session_id} failed: {error}; trying again in \
                      {delay:?}"
                 );
-                let not_before = chrono::Utc::now()
-                    + chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::zero());
-                if let Err(error) = inbox.defer_pending(&item_ids, not_before).await {
-                    tracing::warn!("failed to defer inbox items: {error}");
+                let retried_ids: Vec<uuid::Uuid> = retried.iter().map(|item| item.id).collect();
+                let deferred = match inbox
+                    .defer_pending(&retried_ids, not_before, Some(&error.sentence()))
+                    .await
+                {
+                    Ok(deferred) => deferred,
+                    Err(error) => {
+                        tracing::warn!("failed to defer inbox items: {error}");
+                        Vec::new()
+                    }
+                };
+                // Named on the event are the rows the store held back; one a tool round already
+                // carried into the conversation is history and waits for no attempt.
+                let waiting: Vec<_> = retried
+                    .into_iter()
+                    .filter(|item| deferred.contains(&item.id))
+                    .collect();
+                if !waiting.is_empty() {
+                    hooks
+                        .inbox_deferred(&entry, &waiting, not_before, &error)
+                        .await;
                 }
                 return InboxDrain::Done;
             }
         }
+    }
+}
+
+/// Withdraw `item` for `reason` and tell the host, with the error that decided it when one did.
+async fn give_up_inbox_item<H: HostHooks>(
+    hooks: &H,
+    entry: &H::Entry,
+    item: &crate::store::inbox::InboxItem,
+    reason: String,
+    error: Option<&MekaError>,
+) {
+    let item_id = item.id;
+    match hooks
+        .store()
+        .inbox_store()
+        .withdraw(item_id, Some(reason.clone()))
+        .await
+    {
+        Ok(crate::store::inbox::Withdrawal::Withdrawn) => {
+            tracing::warn!("giving up on inbox item {item_id}: {reason}");
+            hooks.inbox_given_up(entry, item, &reason, error).await;
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!("failed to withdraw inbox item {item_id}: {error}"),
     }
 }
 
@@ -812,6 +938,67 @@ pub(crate) async fn a_turn_can_carry_them(agent: &crate::agent::Agent) -> bool {
 }
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The next attempt waits the backoff for the attempt count, or less when the upstream said it
+    /// would be back sooner; a stated time never lengthens the wait, and one already past still
+    /// waits the floor.
+    #[test]
+    fn an_inbox_retry_waits_the_backoff_or_the_upstream_s_sooner_word() {
+        use std::time::Duration;
+        assert_eq!(inbox_retry_delay(0, None), Duration::from_secs(10));
+        assert_eq!(inbox_retry_delay(3, None), Duration::from_secs(80));
+        assert_eq!(inbox_retry_delay(20, None), Duration::from_secs(300));
+        assert_eq!(
+            inbox_retry_delay(5, Some(Duration::from_secs(45))),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            inbox_retry_delay(0, Some(Duration::from_secs(7_200))),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            inbox_retry_delay(2, Some(Duration::ZERO)),
+            Duration::from_secs(10)
+        );
+        assert!(ceiling_reason(3, Duration::from_secs(3_600)).contains("3 attempt(s)"));
+        assert!(ceiling_reason(3, Duration::from_secs(3_600)).contains("1 hour"));
+        assert!(ceiling_reason(1, Duration::ZERO).contains("inbox_retry_ceiling"));
+    }
+
+    /// Only a failure waiting can change is retried: the upstream's unavailability, a quota
+    /// refusal and a required MCP server not ready; a rejected credential, a bad request, a
+    /// configuration refusal and an overflow fail the item at once.
+    #[test]
+    fn only_a_failure_waiting_can_change_is_retried() {
+        assert!(inbox_retry_can_help(&MekaError::RetryableProvider {
+            message: "529".to_string(),
+            retry_after: None,
+            server_error_on_completion: false,
+        }));
+        assert!(inbox_retry_can_help(&MekaError::StreamError(
+            "cut".to_string()
+        )));
+        assert!(inbox_retry_can_help(&MekaError::ProviderExhausted {
+            message: "402".to_string(),
+            resets_after: None,
+        }));
+        assert!(inbox_retry_can_help(&MekaError::McpTurnGated {
+            servers: vec![("exa".to_string(), "down".to_string())],
+        }));
+        assert!(!inbox_retry_can_help(&MekaError::Provider(
+            "401".to_string()
+        )));
+        assert!(!inbox_retry_can_help(&MekaError::InvalidRequest(
+            "bad".to_string()
+        )));
+        assert!(!inbox_retry_can_help(&MekaError::Config(
+            "text-only".to_string()
+        )));
+        assert!(!inbox_retry_can_help(&MekaError::ContextOverflow(
+            "too long".to_string()
+        )));
+    }
 
     /// The outcome poller runs every tick on every resident session, so it reads what there is to
     /// deliver before it takes the conversation lock, and admits the hold the moment it has it:

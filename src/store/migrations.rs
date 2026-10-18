@@ -384,6 +384,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "turns_record_the_profile_that_served_them",
         step: Step::Rust(turns_record_the_profile_that_served_them),
     },
+    // 0.78 shows an inbox item why its last turn failed while it waits to be tried again.
+    Migration {
+        name: "inbox_items_remember_why_their_last_turn_failed",
+        step: Step::Rust(inbox_items_remember_why_their_last_turn_failed),
+    },
 ];
 
 /// The position of the last turn a session opened, beside the eight cumulative counters: `NULL`
@@ -567,6 +572,18 @@ fn turns_record_the_profile_that_served_them(
 ) -> rusqlite::Result<()> {
     if !table_has_column(transaction, "turns", "profile")? {
         transaction.execute_batch("ALTER TABLE turns ADD COLUMN profile TEXT")?;
+    }
+    Ok(())
+}
+
+/// `inbox_items.last_error`, nullable: why the last turn opened on a pending item failed, cleared
+/// with the row's other waiting state. Guarded on the column set for the reason the module docs
+/// give.
+fn inbox_items_remember_why_their_last_turn_failed(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    if !table_has_column(transaction, "inbox_items", "last_error")? {
+        transaction.execute_batch("ALTER TABLE inbox_items ADD COLUMN last_error TEXT")?;
     }
     Ok(())
 }
@@ -786,7 +803,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 3_284_728_608_954_377_463;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 8_554_481_683_041_798_745;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -4548,6 +4565,10 @@ mod tests {
             (
                 "turns_record_the_profile_that_served_them",
                 16857558564953777198_u64,
+            ),
+            (
+                "inbox_items_remember_why_their_last_turn_failed",
+                14439600663556915070_u64,
             ),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,

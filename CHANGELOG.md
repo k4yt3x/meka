@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GET /v1/profiles` carries each profile's `fallbacks`.
 - `/errors/provider-exhausted`: a quota or billing refusal, its reset relayed as `Retry-After`.
 - A turn's record and its terminal event carry `profile` when a fallback profile served the turn.
+- `[serve] inbox_retry_ceiling`: how long a queued inbox item is retried; `"0s"` fails it at once.
+- `inbox.deferred`; `inbox.failed` carries `error`; waiting items show `not_before`, `last_error`.
 
 ### Changed
 
@@ -28,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A 402 or a 429 naming a quota or the subscription window is `provider-exhausted`, not retried.
 - A fallback must match its profile's `vision` and have a window and request cap no smaller.
 - A turn on a `vision = false` profile is refused before sending while the session holds an image.
+- An inbox turn retries only when waiting can help; a stated reset pulls the next attempt earlier.
 - Session archives are `format_version` 14; a 0.77 archive is read as it is.
 
 ## [0.77.0] - 2026-10-16

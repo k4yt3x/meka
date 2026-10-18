@@ -180,6 +180,29 @@ impl HttpHooks {
     pub(super) fn new(state: ServerState) -> Self {
         Self { state }
     }
+
+    /// The error an inbox event carries, in two copies. The feed's is the Problem Detail a
+    /// response would get, under the same relay switch, so the two never disagree about what the
+    /// upstream's text may travel in. The webhook's keeps the type, title, status and detail and
+    /// never `provider_response`: a webhook payload carries no content, for the reason
+    /// `notify_turn_end` gives. Built once, so the upstream's text is logged once.
+    fn event_errors(
+        &self,
+        error: &crate::error::MekaError,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let full = serde_json::to_value(crate::host::http::errors::ProblemDetail::for_error(
+            error,
+            self.state.config.relay_provider_errors,
+        ))
+        .unwrap_or(serde_json::Value::Null);
+        let slim = serde_json::json!({
+            "type": full["type"],
+            "title": full["title"],
+            "status": full["status"],
+            "detail": full["detail"],
+        });
+        (full, slim)
+    }
 }
 
 /// The `status` a `schedule.fired` webhook carries for a turn that ran. A stop is neither of the
@@ -335,19 +358,55 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         entry: &Self::Entry,
         item: &crate::store::inbox::InboxItem,
         reason: &str,
+        error: Option<&crate::error::MekaError>,
     ) {
-        let data = serde_json::json!({
+        let mut data = serde_json::json!({
             "item_id": item.id.to_string(),
             "session_id": entry.id.to_string(),
             "reason": reason,
         });
-        entry.frontend.push_sse(
-            crate::host::http::sse::SseEventType::InboxFailed,
-            data.clone(),
+        let mut delivery = data.clone();
+        if let Some(error) = error {
+            let (full, slim) = self.event_errors(error);
+            data["error"] = full;
+            delivery["error"] = slim;
+        }
+        entry
+            .frontend
+            .push_sse(crate::host::http::sse::SseEventType::InboxFailed, data);
+        self.state.webhooks.send(
+            crate::host::http::webhook::WebhookEvent::InboxFailed,
+            delivery,
         );
-        self.state
-            .webhooks
-            .send(crate::host::http::webhook::WebhookEvent::InboxFailed, data);
+    }
+
+    async fn inbox_deferred(
+        &self,
+        entry: &Self::Entry,
+        items: &[crate::store::inbox::InboxItem],
+        not_before: chrono::DateTime<chrono::Utc>,
+        error: &crate::error::MekaError,
+    ) {
+        let (full, slim) = self.event_errors(error);
+        let mut data = serde_json::json!({
+            "item_ids": items.iter().map(|item| item.id.to_string()).collect::<Vec<_>>(),
+            "session_id": entry.id.to_string(),
+            "not_before": not_before.to_rfc3339(),
+        });
+        let mut delivery = data.clone();
+        data["error"] = full;
+        delivery["error"] = slim;
+        entry
+            .frontend
+            .push_sse(crate::host::http::sse::SseEventType::InboxDeferred, data);
+        self.state.webhooks.send(
+            crate::host::http::webhook::WebhookEvent::InboxDeferred,
+            delivery,
+        );
+    }
+
+    fn inbox_retry_ceiling(&self) -> std::time::Duration {
+        self.state.config.inbox_retry_ceiling
     }
 
     /// The prompt's text as a notice, since this surface has no user-message event and a client

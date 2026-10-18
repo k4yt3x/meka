@@ -9822,6 +9822,193 @@ fn an_inbox_item_on_an_idle_session_starts_a_turn_and_the_feed_reports_its_deliv
     );
 }
 
+/// Enqueue a steer on `session_id` and hand back its item id.
+fn enqueue_inbox_item(harness: &ServeTestHarness, session_id: &str, message: &str) -> String {
+    let accepted = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{session_id}/inbox"),
+        )
+        .json(&serde_json::json!({"message": message, "class": "steer"}))
+        .send()
+        .expect("send");
+    assert_eq!(accepted.status(), 202);
+    let accepted: serde_json::Value = accepted.json().expect("parse");
+    accepted["item_id"].as_str().expect("item id").to_string()
+}
+
+/// A failure no retry would change, a rejected credential here, gives the item up at once: the
+/// feed says so with the error, rather than after an hour of attempts.
+#[test]
+fn an_inbox_turn_that_fails_for_good_gives_the_item_up_at_once() {
+    let script = serde_json::json!([[{ "type": "fail", "message": "401 authentication_error" }]]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = start_streaming_session(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let item_id = enqueue_inbox_item(&harness, &id, "are you there?");
+
+    let body = read_feed_until(feed, |text| text.contains("event: inbox.failed"));
+    let failed = sse_event_data(&body, "inbox.failed").expect("inbox.failed on the feed");
+    assert_eq!(failed["item_id"], item_id, "{body}");
+    assert!(
+        failed["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("waiting would not change that"),
+        "{failed}"
+    );
+    assert_eq!(
+        failed["error"]["type"], "https://meka.run/errors/provider",
+        "{failed}"
+    );
+    assert!(
+        sse_event_data(&body, "inbox.deferred").is_none(),
+        "nothing was deferred: {body}"
+    );
+    let open: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/inbox"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert!(
+        open["items"].as_array().is_some_and(Vec::is_empty),
+        "the item is withdrawn: {open}"
+    );
+}
+
+/// A quota refusal is a failure waiting can change: the item waits for the next attempt at the
+/// backoff, not the hour the upstream stated, the feed says until when and why, and the item
+/// record shows both while it waits.
+#[test]
+fn an_inbox_turn_refused_for_quota_waits_and_says_so() {
+    let script = serde_json::json!([[
+        { "type": "fail_exhausted", "message": "insufficient_quota", "resets_after_secs": 3600 }
+    ]]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = start_streaming_session(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let item_id = enqueue_inbox_item(&harness, &id, "are you there?");
+
+    let body = read_feed_until(feed, |text| text.contains("event: inbox.deferred"));
+    let deferred = sse_event_data(&body, "inbox.deferred").expect("inbox.deferred on the feed");
+    assert_eq!(deferred["item_ids"][0], item_id, "{body}");
+    assert_eq!(
+        deferred["error"]["type"], "https://meka.run/errors/provider-exhausted",
+        "{deferred}"
+    );
+    let not_before =
+        chrono::DateTime::parse_from_rfc3339(deferred["not_before"].as_str().expect("not_before"))
+            .expect("rfc3339");
+    let wait = not_before
+        .signed_duration_since(chrono::Utc::now())
+        .num_seconds();
+    assert!(
+        (5..=20).contains(&wait),
+        "the first retry waits the backoff, not the hour the upstream stated: {wait}s"
+    );
+    assert!(
+        sse_event_data(&body, "inbox.failed").is_none(),
+        "nothing was given up: {body}"
+    );
+    let open: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/inbox"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let item = &open["items"][0];
+    assert_eq!(item["id"], item_id, "{open}");
+    assert_eq!(item["state"], "pending", "{open}");
+    assert!(item["not_before"].is_string(), "{open}");
+    assert!(
+        item["last_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("quota"),
+        "{open}"
+    );
+}
+
+/// With the ceiling at zero the first failure fails the item, reset or not, and the reason says
+/// the ceiling is why.
+#[test]
+fn with_a_zero_retry_ceiling_an_inbox_item_fails_on_its_first_failure() {
+    let script = serde_json::json!([[
+        { "type": "fail_exhausted", "message": "insufficient_quota", "resets_after_secs": 60 }
+    ]]);
+    let harness = ServeTestHarness::spawn("inbox_retry_ceiling = \"0s\"\n", script);
+    let id = start_streaming_session(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let item_id = enqueue_inbox_item(&harness, &id, "are you there?");
+
+    let body = read_feed_until(feed, |text| text.contains("event: inbox.failed"));
+    let failed = sse_event_data(&body, "inbox.failed").expect("inbox.failed on the feed");
+    assert_eq!(failed["item_id"], item_id, "{body}");
+    assert!(
+        failed["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("inbox_retry_ceiling"),
+        "{failed}"
+    );
+    assert_eq!(
+        failed["error"]["type"], "https://meka.run/errors/provider-exhausted",
+        "{failed}"
+    );
+    assert!(
+        sse_event_data(&body, "inbox.deferred").is_none(),
+        "nothing was deferred: {body}"
+    );
+}
+
+/// A webhook payload carries no content: the feed's copy of an inbox event carries the upstream's
+/// text under `provider_response` while the relay is on, and the webhook's copy carries the
+/// error's type, title, status and detail alone.
+#[test]
+fn an_inbox_webhook_carries_the_error_without_the_upstream_s_text() {
+    let (port, rx) = spawn_webhook_listener();
+    let config = format!(
+        "\n[[serve.webhooks]]\nurl = \"http://127.0.0.1:{port}/hook\"\nsecret = \"s\"\nevents = \
+         [\"inbox.deferred\"]\n"
+    );
+    let script = serde_json::json!([[{
+        "type": "fail_exhausted",
+        "message": "insufficient_quota for acct-0f3c",
+        "resets_after_secs": 3600
+    }]]);
+    let harness = ServeTestHarness::spawn(&config, script);
+    let id = start_streaming_session(&harness);
+    let feed = open_feed(&harness, &id, None, Duration::from_secs(30));
+    let item_id = enqueue_inbox_item(&harness, &id, "are you there?");
+
+    let body = read_feed_until(feed, |text| text.contains("event: inbox.deferred"));
+    let deferred = sse_event_data(&body, "inbox.deferred").expect("inbox.deferred on the feed");
+    assert!(
+        deferred["error"]["provider_response"]
+            .as_str()
+            .is_some_and(|text| text.contains("acct-0f3c")),
+        "the feed relays the upstream's text: {deferred}"
+    );
+
+    let delivery = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the deferral is delivered");
+    assert_eq!(delivery.event, "inbox.deferred");
+    let payload: serde_json::Value = serde_json::from_str(&delivery.body).expect("json body");
+    assert_eq!(payload["item_ids"][0], item_id, "{}", delivery.body);
+    assert_eq!(
+        payload["error"]["type"], "https://meka.run/errors/provider-exhausted",
+        "{}",
+        delivery.body
+    );
+    assert!(
+        payload["error"].get("provider_response").is_none() && !delivery.body.contains("acct-0f3c"),
+        "a webhook carries no content: {}",
+        delivery.body
+    );
+}
+
 /// The whole point of a steer: a message that lands while the turn works is read at the next
 /// round boundary, after that round's tool results, inside the same turn.
 #[test]

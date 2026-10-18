@@ -483,7 +483,7 @@ An item is `pending` until its text is in the conversation, `appended` until the
 
 `Idempotency-Key` works here as on `POST /turn`: the same key with another `message` or `class` is refused with `409` `idempotency`. One difference matters to a bridge: the key is recorded on the row rather than in memory, so a retry that lands after a meka restart still finds its earlier item and answers it with `replayed: true`, and the key stays bound to that item for the session's life, withdrawn or delivered. The item is durable before the `202`; a session evicted for idleness is revived to run it, and a process that restarts finds it waiting.
 
-A turn opened on inbox items that fails before anything from the model reached the conversation withdraws its prompt and offers the items again, waiting 10 seconds, then twice that per attempt, up to five minutes between attempts. After an hour from when an item was enqueued it is given up on: withdrawn, with `inbox.failed` on the feed and the webhook, so whoever is waiting is told rather than left with silence. An item a tool round already carried into the conversation is not retried: it is history, and the next turn of any kind delivers it. An item on a session another process holds (a screen open on it, say) is asked about again every ten seconds until the holder lets go, or the holder's own next turn carries it; those waits count toward the hour.
+A turn opened on inbox items that fails before anything from the model reached the conversation withdraws its prompt and offers the items again, when waiting can change the answer: the upstream could not serve the profile (an outage, a dropped stream, a quota or billing refusal), or a required MCP server was not ready. Any other failure, a rejected credential, a request the upstream judged wrong, a profile that cannot read the session's images, gives the item up at once, since every attempt would fail the same way. A retry waits 10 seconds, then twice that per attempt, up to five minutes between attempts, or less when the upstream said it would be back sooner (`Retry-After`, a quota reset); a stated time never makes it wait longer, since an account topped up early is noticed at the next attempt. Each deferral posts `inbox.deferred` on the feed and the webhook with the time of the next attempt and the error, and the item shows `not_before` and `last_error` while it waits. Retrying ends at [`[serve] inbox_retry_ceiling`](../configuration/config-file.md#serveinbox_retry_ceiling), an hour from when the item was enqueued by default: the item is given up on, withdrawn, with `inbox.failed` on the feed and the webhook carrying the reason and the last error, so whoever is waiting is told rather than left with silence; `"0s"` gives an item up on its first failure. An item a tool round already carried into the conversation is not retried: it is history, and the next turn of any kind delivers it. An item on a session another process holds (a screen open on it, say) is asked about again every ten seconds until the holder lets go, or the holder's own next turn carries it; those waits count toward the ceiling.
 
 Only a `pending` item can be withdrawn. `DELETE` on one that is already in the conversation answers `409` `inbox-appended`, since only a turn can answer it now; a delivered or withdrawn one is `404`. A `DELETE` that lands in the instant between a turn reading the item and writing it may still be read by the model. Canceling a turn the inbox opened, with `POST /cancel`, withdraws the items it opened on, the way a canceled client turn loses its prompt, and the feed reports each as `inbox.withdrawn`. The endpoint refuses a sub-agent's session exactly as `POST /turn` does: a worker's inbox is its parent's, written with the `agent_steer` tool. No images in this release.
 
@@ -694,7 +694,8 @@ Every resident session has one event feed. Everything a turn emits goes on it, w
 | Event | Payload | When |
 |-------|---------|------|
 | `inbox.delivered` | `item_ids`, `turn_id`, `session_id` | The provider accepted a request carrying these items, so the model has read them |
-| `inbox.failed` | `item_id`, `session_id`, `reason` | meka gave up on the item after the retry ceiling and withdrew it |
+| `inbox.deferred` | `item_ids`, `session_id`, `not_before`, `error` (Problem Detail shape) | A turn on these items failed in a way waiting can change; the next attempt runs at `not_before` |
+| `inbox.failed` | `item_id`, `session_id`, `reason`, `error` (Problem Detail shape) when a failed turn decided it | meka gave up on the item and withdrew it: its retry ceiling passed, or its turn failed in a way no retry would change |
 | `inbox.withdrawn` | `item_id`, `session_id` | A client withdrew the item with `DELETE`, or the turn it opened was canceled; `turn_id` names the turn in flight at the time, if any |
 
 `inbox.delivered` arrives inside the turn that read the item, before that turn's terminal: for a `steer` read at a round boundary, after the `tool_call.completed` of that round; for an `interrupt` that cut the answer, after the `notice` announcing the cut. See [The inbox](#the-inbox).
@@ -860,7 +861,7 @@ same limit `turn_in_flight` has.
 [[serve.webhooks]]
 url = "https://bridge.example/meka-hook"
 secret = "${MEKA_WEBHOOK_SECRET}"     # or secret_file = "/etc/meka/hook.secret"
-events = ["turn.finished", "turn.failed", "task.finished", "schedule.fired", "inbox.delivered", "inbox.failed"]
+events = ["turn.finished", "turn.failed", "task.finished", "schedule.fired", "inbox.deferred", "inbox.delivered", "inbox.failed"]
 timeout = "10s"                        # per attempt, default 10s; "0s" is refused at startup
 max_retries = 3                        # after the first attempt, default 3, at most 10
 ```
@@ -871,9 +872,9 @@ max_retries = 3                        # after the first attempt, default 3, at 
 
 `task.finished` is not a turn event. It fires when a background task reaches a terminal state, whether or not any turn reports it: a canceled task fires it with no turn at all, and its outcome then rides the next round boundary of a running turn or whichever turn the session takes next. Expect it alongside a `turn.finished` when a client's own `POST /turn` is what carries the outcome, and expect it on its own for a task interrupted by a host that died, which no turn ever ran.
 
-`inbox.delivered` and `inbox.failed` are the [inbox](#the-inbox)'s two outcomes: the model read an item, or meka gave up on it. A turn the server runs on inbox items posts `turn.finished` or `turn.failed` like a client's, since nothing else carries it.
+`inbox.deferred`, `inbox.delivered` and `inbox.failed` are the [inbox](#the-inbox)'s three outcomes: an item waits for another attempt, the model read it, or meka gave up on it. The `error` on a webhook copy of `inbox.deferred` or `inbox.failed` is the Problem Detail's `type`, `title`, `status` and `detail`; `provider_response` rides the feed's copy alone. A turn the server runs on inbox items posts `turn.finished` or `turn.failed` like a client's, since nothing else carries it.
 
-A client that wants to know about everything the agent did should subscribe to all six.
+A client that wants to know about everything the agent did should subscribe to all seven.
 
 ### Payloads
 

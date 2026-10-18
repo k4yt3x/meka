@@ -131,9 +131,9 @@ turn stays there, so a turn never alternates between backends.
 
 The fallback serves one turn. The session keeps naming its own profile, `meka session list` and
 `GET /v1/sessions/{id}` keep saying so, and the next turn starts on it again, unless its breaker is
-open: a profile that failed over is skipped at the start of later turns for a cooldown the upstream
-set (`Retry-After`, a quota reset, up to an hour) or five minutes when it set none, and the turn
-starts on the first fallback whose breaker is closed, or on the session's own when every profile in
+open: a profile that failed over is skipped at the start of later turns for five minutes, or until
+the upstream's stated reset when that is sooner, never longer, and the turn starts on the first
+fallback whose breaker is closed, or on the session's own when every profile in
 the chain is skipped. The breaker decides only where a turn starts. Once a turn is running and its
 profile fails, it moves to the next profile in the chain it has not tried, breaker or not, wrapping
 round to the ones its start skipped, so a turn fails only once every profile in the chain has

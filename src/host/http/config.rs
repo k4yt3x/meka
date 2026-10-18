@@ -266,6 +266,9 @@ pub(crate) struct ResolvedServeConfig {
     /// How long a streaming turn keeps running after its SSE consumer disconnects, waiting for a
     /// reconnect. Zero cancels the turn the moment the stream drops.
     pub(crate) stream_reattach_grace: std::time::Duration,
+    /// How long a queued inbox item is retried for, from its enqueue, before it is given up on.
+    /// Zero gives an item up on its first failure.
+    pub(crate) inbox_retry_ceiling: std::time::Duration,
     pub(crate) tokens: Vec<ResolvedServeToken>,
     pub(crate) webhooks: Vec<ResolvedWebhook>,
 }
@@ -393,6 +396,9 @@ impl ResolvedServeConfig {
             stream_reattach_grace: raw
                 .stream_reattach_grace
                 .unwrap_or(DEFAULT_STREAM_REATTACH_GRACE),
+            inbox_retry_ceiling: raw
+                .inbox_retry_ceiling
+                .unwrap_or(crate::host::scheduler::DEFAULT_INBOX_RETRY_CEILING),
             tokens,
             webhooks,
         })

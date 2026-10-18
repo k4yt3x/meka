@@ -67,6 +67,12 @@ pub(crate) struct InboxItemView {
     /// Why it was given up on, when it was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) failure: Option<String>,
+    /// When its next attempt may run, while it waits after a failed turn or a held session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) not_before: Option<String>,
+    /// Why the last turn opened on it failed, while it waits to be tried again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_error: Option<String>,
 }
 
 impl From<InboxItem> for InboxItemView {
@@ -82,6 +88,8 @@ impl From<InboxItem> for InboxItemView {
             delivered_at: item.delivered_at.map(|at| at.to_rfc3339()),
             withdrawn_at: item.withdrawn_at.map(|at| at.to_rfc3339()),
             failure: item.failure,
+            not_before: item.not_before.map(|at| at.to_rfc3339()),
+            last_error: item.last_error,
         }
     }
 }

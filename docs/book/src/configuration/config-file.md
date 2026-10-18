@@ -243,7 +243,7 @@ Change it with `meka profile set <name> model <value>`.
 
 Profiles to serve a turn from when this one cannot, in order of preference: list the profile you would rather run on first, since every turn starts on the first profile, this one included, whose upstream is not known to be down, and a switch rebuilds the prompt cache at the new profile once. A turn falls back when the profile's upstream is still failing once the retry budget is spent (an outage, a rate limit, a dropped stream), or when it refuses for quota or billing by a signal it documents (a 402, a quota code on a 429, the Claude subscription's exhausted window). It does not fall back on a context overflow, an invalid request, a tool refusal or an authentication failure, which another profile would not fix. The whole profile is swapped, so no setting of this one is ever mixed with another's. Each fallback must be able to carry the sessions of the profile it backs: the same `vision`, and a `context_window` and `max_request_bytes` no smaller, each resolved as a session resolves it. A larger window or cap on a fallback is never drawn on: while a fallback serves, the session keeps gauging against its own profile's window, so when it compacts does not depend on who answered.
 
-The session keeps naming this profile. A fallback serves one turn, the rest of that turn stays on it, and the next turn starts here again, or on the first fallback whose upstream is not known to be down: a profile that failed over is skipped for a cooldown the upstream set (`Retry-After`, a quota reset) or five minutes when it set none, capped at an hour. Once a turn is running, a failure moves it to the next profile in the list it has not tried, so it fails only when every one has refused it. What served a turn is on its record (`profile` on [`GET /v1/sessions/{id}/turns`](../usage/http-api.md#turns) and on `turn.finished`) and in a notice on the feed and the screen. See [Fallback profiles](../usage/sessions.md#fallback-profiles).
+The session keeps naming this profile. A fallback serves one turn, the rest of that turn stays on it, and the next turn starts here again, or on the first fallback whose upstream is not known to be down: a profile that failed over is skipped for five minutes, or until the upstream's stated reset when that is sooner, never longer. Once a turn is running, a failure moves it to the next profile in the list it has not tried, so it fails only when every one has refused it. What served a turn is on its record (`profile` on [`GET /v1/sessions/{id}/turns`](../usage/http-api.md#turns) and on `turn.finished`) and in a notice on the feed and the screen. See [Fallback profiles](../usage/sessions.md#fallback-profiles).
 
 Each entry must name another configured profile, once. `meka profile remove` refuses a profile another's `fallbacks` names, and `meka profile rename` moves the name.
 
@@ -1668,6 +1668,16 @@ How long a held turn keeps running after its request's client disconnects, waiti
 
 Zero subscribers means nobody is listening, and a turn with no audience is spending provider tokens for nothing. That is the right instinct and the wrong deadline: a client whose connection just dropped and one that is never coming back are the same observation until the window expires. Set `"0s"` to stop a turn at the first round boundary after its request drops, which spends less on abandoned work and makes re-attach useful only for turns that already finished. A turn a request opened with `detach: true`, and one the server opened, is never stopped for want of a reader; see [Holding a turn](../usage/http-api.md#holding-a-turn).
 
+### `serve.inbox_retry_ceiling`
+
+How long a queued inbox item is retried for after a turn on it failed, from when it was enqueued, before it is given up on with `inbox.failed`. Accepts duration strings.
+
+| Type | Default |
+|------|---------|
+| `string` (duration) | `"1h"` |
+
+The ceiling bounds the whole wait: a retry never lands past it, whatever the upstream said about when it would be back, so a deployment states its own patience here. Set `"0s"` to give an item up on its first failure, for a client that owns redelivery itself. A failure no retry would change, a rejected credential or a request the upstream judged wrong, gives the item up at once regardless. See [The inbox](../usage/http-api.md#the-inbox).
+
 ### `serve.idle_timeout`
 
 How long a session can sit idle (no turns submitted) before the GC evicts it from memory. Accepts duration strings like `"24h"`, `"30m"`, `"7d"`. `"0s"` turns idle GC off: nothing is ever evicted for being idle.
@@ -1780,7 +1790,7 @@ max_retries = 3
 | `url` | `string` | required | `https://` or `http://`; supports `${ENV_VAR}` |
 | `secret` | `string` | none | HMAC key for `X-Meka-Signature`; supports `${ENV_VAR}` |
 | `secret_file` | `path` | none | Mutually exclusive with `secret`; chmod 0600 |
-| `events` | `array` | required | One or more of `turn.finished`, `turn.failed`, `task.finished`, `schedule.fired`, `inbox.delivered`, `inbox.failed` |
+| `events` | `array` | required | One or more of `turn.finished`, `turn.failed`, `task.finished`, `schedule.fired`, `inbox.deferred`, `inbox.delivered`, `inbox.failed` |
 | `timeout` | `duration` | `"10s"` | Per attempt; `"0s"` is refused at startup |
 | `max_retries` | `integer` | `3` | Retries after the first attempt, capped at 10 |
 

@@ -39,7 +39,9 @@ pub(crate) enum WebhookEvent {
     ScheduleFired,
     /// The model was shown an inbox item: a request carrying its text was accepted.
     InboxDelivered,
-    /// An inbox item was given up on after the retry ceiling, and withdrawn.
+    /// A turn on inbox items failed in a way waiting can change, and they wait for the next.
+    InboxDeferred,
+    /// An inbox item was given up on, and withdrawn.
     InboxFailed,
 }
 
@@ -47,6 +49,7 @@ impl WebhookEvent {
     /// Every event name, for config validation. Kept sorted so the error text listing them is
     /// stable.
     pub(crate) const ALL: &'static [&'static str] = &[
+        "inbox.deferred",
         "inbox.delivered",
         "inbox.failed",
         "schedule.fired",
@@ -62,6 +65,7 @@ impl WebhookEvent {
             Self::TaskFinished => "task.finished",
             Self::ScheduleFired => "schedule.fired",
             Self::InboxDelivered => "inbox.delivered",
+            Self::InboxDeferred => "inbox.deferred",
             Self::InboxFailed => "inbox.failed",
         }
     }
@@ -542,6 +546,9 @@ mod tests {
             WebhookEvent::TurnFailed,
             WebhookEvent::TaskFinished,
             WebhookEvent::ScheduleFired,
+            WebhookEvent::InboxDelivered,
+            WebhookEvent::InboxDeferred,
+            WebhookEvent::InboxFailed,
         ] {
             assert!(
                 WebhookEvent::ALL.contains(&event.as_str()),
