@@ -155,7 +155,7 @@ where
 
 /// The half of the placement that is set on the command before it starts, for a door where
 /// another crate makes the spawn; [`adopt`] is the other half. A door this crate spawns for itself
-/// goes through [`spawn`] or [`spawn_with_pre_exec`], which do both.
+/// goes through [`spawn`] or `spawn_with_pre_exec`, which do both.
 pub(crate) fn prepare<C: Spawnable>(command: &mut C) {
     prepare_standard(command.standard());
 }
@@ -384,9 +384,11 @@ fn announce_once(announced: &AtomicBool, message: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "linux", windows))]
     use super::*;
 
-    /// A quiet child that lives until it is killed, on every platform.
+    /// A quiet child that lives until it is killed, where a test spawns one.
+    #[cfg(any(target_os = "linux", windows))]
     fn sleeping_command() -> tokio::process::Command {
         #[cfg(windows)]
         let mut command = {
