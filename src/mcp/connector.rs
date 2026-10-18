@@ -650,6 +650,8 @@ pub(super) async fn connect_server(entry: &ServerEntry) -> Result<McpRunningServ
                 // there is otherwise the one way a server that ignores a closed stdin outlives
                 // meka.
                 command.kill_on_drop(true);
+                // rmcp makes the spawn, so the door's two halves are called here, around it.
+                crate::process::prepare(&mut command);
 
                 // No bound on an incoming line: rmcp 3.1's `TokioChildProcess` builds its
                 // transport with no seam to configure, and that transport's `receive` reads until
@@ -676,6 +678,9 @@ pub(super) async fn connect_server(entry: &ServerEntry) -> Result<McpRunningServ
                             format!("failed to spawn process: {error}")
                         },
                     })?;
+                if let Some(process_id) = transport.id() {
+                    crate::process::adopt(process_id);
+                }
                 if let Some(stderr) = stderr {
                     forward_child_stderr(server_name.to_string(), stderr);
                 }

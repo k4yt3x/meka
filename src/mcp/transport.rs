@@ -140,7 +140,7 @@ fn run_headers_helper(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| {
+    let mut child = crate::process::spawn(&mut command).map_err(|error| {
         connection_error(format!(
             "failed to spawn `headers_helper` '{script}': {error}"
         ))

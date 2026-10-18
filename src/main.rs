@@ -42,6 +42,7 @@ mod memory;
 mod oauth;
 mod paths;
 mod permission;
+mod process;
 mod prompt;
 mod provider;
 mod relay;

@@ -1022,13 +1022,12 @@ pub(crate) async fn run_shell_probe(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // Dropping the future on timeout must not leave the command running until the next tick
-        // spawns another. Note this reaps the direct child only: a gate whose shell backgrounds
+        // spawns another. On Unix this reaps the direct child only: a gate whose shell backgrounds
         // something of its own can still orphan it, which is a reason to keep gates to simple
-        // checks.
+        // checks. On Windows the job the door places the child in takes the tree with it.
         .kill_on_drop(true);
 
-    let mut child = builder
-        .spawn()
+    let mut child = crate::process::spawn(&mut builder)
         .map_err(|error| format!("failed to start gate: {error}"))?;
 
     // Read up to the parse limit and one byte more, never the whole pipe: `wait_with_output` would

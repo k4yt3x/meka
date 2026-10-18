@@ -2969,7 +2969,7 @@ fn log_item(line: crate::relay::LogLine) -> Item {
 fn spawn_shell_command(
     command: &str,
     working_dir: &Path,
-) -> std::io::Result<tokio::process::Child> {
+) -> std::io::Result<crate::process::Spawned<tokio::process::Child>> {
     #[cfg(windows)]
     let mut shell = {
         let mut shell = tokio::process::Command::new("powershell");
@@ -2991,13 +2991,13 @@ fn spawn_shell_command(
     // A group of its own, so a stop reaches what the command started and not only the shell.
     #[cfg(unix)]
     shell.process_group(0);
-    shell.spawn()
+    crate::process::spawn(&mut shell)
 }
 
 /// Wait for a started command to exit, or for `stop` to fire, which kills it with every process
 /// it started; then what it printed. The second value says whether it was stopped.
 async fn wait_for_shell_command(
-    mut child: tokio::process::Child,
+    mut child: crate::process::Spawned<tokio::process::Child>,
     stop: tokio_util::sync::CancellationToken,
 ) -> (Result<super::frontend::ShellOutput, String>, bool) {
     let mut stdout = tokio::spawn(read_tail(child.stdout.take()));
@@ -3006,6 +3006,10 @@ async fn wait_for_shell_command(
         biased;
         () = stop.cancelled() => {
             signal_shell_group(child.id());
+            #[cfg(windows)]
+            if let Err(error) = child.terminate_tree() {
+                tracing::debug!("failed to terminate the command's job: {error}");
+            }
             if let Err(error) = child.kill().await {
                 tracing::debug!("failed to kill the command: {error}");
             }
@@ -3099,7 +3103,7 @@ async fn drained_within(drain: &mut tokio::task::JoinHandle<(Vec<u8>, u64)>) -> 
 }
 
 /// Kill everything a command started along with it: on Unix the process group it was given,
-/// named by its own pid. Elsewhere the shell alone is killed, by whoever holds the child.
+/// named by its own pid. Elsewhere the job the child runs in is terminated by whoever holds it.
 fn signal_shell_group(pid: Option<u32>) {
     #[cfg(unix)]
     if let Some(pid) = pid {
@@ -3112,7 +3116,9 @@ fn signal_shell_group(pid: Option<u32>) {
         }
     }
     #[cfg(not(unix))]
-    tracing::trace!("no process group to signal for {pid:?}; the child is killed by its holder");
+    tracing::trace!(
+        "no process group to signal for {pid:?}; the child's job is ended by its holder"
+    );
 }
 
 /// The modes the screen takes beyond raw mode and the alternate screen, which ratatui gives back

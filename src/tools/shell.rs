@@ -612,15 +612,15 @@ impl Tool for ExecuteCommandTool {
             _ => None,
         };
 
-        // Unix: place the child in its own session/process group via `setsid` so timeouts and
-        // cancellation can kill the whole tree (including backgrounded grandchildren such as
-        // `(sleep 3600 &)`) via `kill(-pgid, …)`. On Linux the Landlock setup runs in the same
-        // closure, because `pre_exec` overwrites rather than chains, and only for the Landlock
+        // Unix: the child-side steps, run by the door after its own placement. `setsid` puts the
+        // child in its own session/process group so timeouts and cancellation can kill the whole
+        // tree (including backgrounded grandchildren such as `(sleep 3600 &)`) via
+        // `kill(-pgid, …)`. On Linux the Landlock setup runs here too, and only for the Landlock
         // dialect: under Bubblewrap the ruleset is enacted inside the sandbox by `meka confine`,
         // after bwrap's mounts, because a domain that handles any filesystem right refuses
         // `mount(2)`.
         #[cfg(unix)]
-        {
+        let in_child = {
             // Planned here, in the parent, because `pre_exec` runs after `fork` in a
             // single-threaded child where reading the filesystem and allocating are not
             // async-signal-safe.
@@ -642,36 +642,38 @@ impl Tool for ExecuteCommandTool {
             #[cfg(target_os = "linux")]
             let network = confinement.network();
 
-            unsafe {
-                command_builder.pre_exec(move || {
-                    // SAFETY: `setsid(2)` is async-signal-safe and has no preconditions beyond "the
-                    // caller isn't already a process group leader", which is guaranteed for a
-                    // freshly forked child process.
-                    if libc::setsid() == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    // The layer's executable rides into Bubblewrap on its descriptor, which stays
-                    // close-on-exec until here so no other child of meka inherits it. `fcntl(2)`
-                    // is async-signal-safe.
-                    #[cfg(target_os = "linux")]
-                    if let Some(executable) = &inner_executable
-                        && libc::fcntl(
+            move || {
+                // SAFETY: `setsid(2)` is async-signal-safe and has no preconditions beyond "the
+                // caller isn't already a process group leader", which is guaranteed for a
+                // freshly forked child process.
+                if unsafe { libc::setsid() } == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // The layer's executable rides into Bubblewrap on its descriptor, which stays
+                // close-on-exec until here so no other child of meka inherits it. `fcntl(2)`
+                // is async-signal-safe.
+                #[cfg(target_os = "linux")]
+                if let Some(executable) = &inner_executable
+                    && unsafe {
+                        libc::fcntl(
                             std::os::fd::AsRawFd::as_raw_fd(executable),
                             libc::F_SETFD,
                             0,
-                        ) == -1
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    #[cfg(target_os = "linux")]
-                    if let Some(abi) = landlock_abi {
-                        crate::sandbox::apply_landlock(abi, &grants, network)
-                            .map_err(std::io::Error::from_raw_os_error)?;
-                    }
-                    Ok(())
-                });
+                        )
+                    } == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                #[cfg(target_os = "linux")]
+                if let Some(abi) = landlock_abi {
+                    // SAFETY: called between `fork` and `exec` with the grants planned above, which
+                    // is the contract `apply_landlock` states.
+                    unsafe { crate::sandbox::apply_landlock(abi, &grants, network) }
+                        .map_err(std::io::Error::from_raw_os_error)?;
+                }
+                Ok(())
             }
-        }
+        };
 
         // Scrub env before spawn so secrets in the parent process (`ANTHROPIC_API_KEY`, `AWS_*`,
         // `GITHUB_TOKEN`, …) cannot ride along into a confined child. Sandboxes block writes/IPC
@@ -689,18 +691,22 @@ impl Tool for ExecuteCommandTool {
         // Resolve commands against the agent's per-session cwd, not the process cwd. `/cd` mutates
         // the agent's cwd; this is how it actually reaches the child.
         command_builder.current_dir(self.site.cwd.get());
+        command_builder
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
 
-        let mut child = ChildGroup(
-            command_builder
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .map_err(|error| MekaError::ToolExecution {
-                    tool_name: "shell_execute".to_string(),
-                    message: format!("failed to spawn command: {error}"),
-                })?,
-        );
+        // SAFETY: `in_child` makes only async-signal-safe calls over values planned in the parent
+        // and allocates nothing.
+        #[cfg(unix)]
+        let spawned =
+            unsafe { crate::process::spawn_with_pre_exec(&mut command_builder, in_child) };
+        #[cfg(windows)]
+        let spawned = crate::process::spawn(&mut command_builder);
+        let mut child = ChildGroup(spawned.map_err(|error| MekaError::ToolExecution {
+            tool_name: "shell_execute".to_string(),
+            message: format!("failed to spawn command: {error}"),
+        })?);
 
         // Drain stdout/stderr on dedicated tasks that start *before* the wait.
         // `tokio::process::Child::wait()` does not read the pipes; a child writing past the OS pipe
@@ -852,11 +858,6 @@ fn output_cut_note() -> String {
     )
 }
 
-/// Terminate the child and, on Unix, its entire process group. Called on timeout and on
-/// cancellation. On Unix the `setsid()` done in `pre_exec` makes the child's pid its pgid, so
-/// `kill(-pgid, …)` reaches every backgrounded descendant it spawned (`(sleep 3600 &)` survives a
-/// plain `child.kill()` but is caught here). The fallback `child.kill().await` is a no-op on Unix
-/// once the group has been signaled but still the right primitive on Windows.
 /// The refusal for a command admitted at a level that confines it when no backend can: it fails
 /// toward not running, never toward a plain `sh -c`.
 fn unconfinable_command() -> MekaError {
@@ -867,7 +868,8 @@ fn unconfinable_command() -> MekaError {
     }
 }
 
-/// The command's child, killed with its whole process group when the value is dropped.
+/// The command's child, killed with its whole process group when the value is dropped; on
+/// Windows the job the door placed it in ends the tree when the value drops.
 ///
 /// The `select!` arms below kill the group on a stop, a timeout and an exhausted bound, but a
 /// caller that drops the `execute` future never reaches them: a gate's `tokio::time::timeout`
@@ -875,10 +877,10 @@ fn unconfinable_command() -> MekaError {
 /// every evaluation of a `shell_execute` gate would leave its command running. `Drop` is
 /// synchronous, so there is no grace signal here; a child the arms already killed and reaped has
 /// no id and is not signaled.
-struct ChildGroup(tokio::process::Child);
+struct ChildGroup(crate::process::Spawned<tokio::process::Child>);
 
 impl std::ops::Deref for ChildGroup {
-    type Target = tokio::process::Child;
+    type Target = crate::process::Spawned<tokio::process::Child>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -912,7 +914,16 @@ impl Drop for ChildGroup {
     }
 }
 
-async fn kill_child_tree(child: &mut tokio::process::Child) {
+/// Terminate the child and everything it started. Called on timeout and on cancellation. On Unix
+/// the `setsid()` done in `pre_exec` makes the child's pid its pgid, so `kill(-pgid, …)` reaches
+/// every backgrounded descendant it spawned (`(sleep 3600 &)` survives a plain `child.kill()` but
+/// is caught here); on Windows the job the door placed the child in is terminated. The closing
+/// `child.kill().await` is a no-op once the tree is gone and reaps the child either way.
+async fn kill_child_tree(child: &mut crate::process::Spawned<tokio::process::Child>) {
+    #[cfg(windows)]
+    if let Err(error) = child.terminate_tree() {
+        tracing::debug!("failed to terminate the command's job: {error}");
+    }
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
@@ -1249,11 +1260,10 @@ fn assemble_command_output(stdout: &str, stderr: &str, exit_code: i32) -> ToolOu
 ///
 /// # Drain timeouts
 ///
-/// On Windows there is no atomic "kill process tree" primitive available in this code path (a
-/// future refactor could wrap the child in a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
-/// Consequently, a grandchild that inherits the pipe write handles can keep the pipe alive past the
-/// direct child's exit; the drain tasks would then block on `ReadFile` until the grandchild
-/// finally exits. To bound the tool-call wall time the drains are collected under
+/// The job the child runs in ends every process it started, but only when the child is killed or
+/// this call returns. A grandchild that inherited the pipe write handles can therefore keep the
+/// pipe alive past the direct child's own exit, and the drain tasks would block on `ReadFile`
+/// until the job took it. To bound the tool-call wall time the drains are collected under
 /// [`DRAIN_TIMEOUT`] and told to stop at it, keeping what they read.
 #[cfg(windows)]
 async fn run_windows_sandboxed(

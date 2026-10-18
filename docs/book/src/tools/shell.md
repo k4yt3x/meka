@@ -21,8 +21,8 @@ Execute a shell command and return its output.
 - Returns the exit code along with the output if non-zero.
 - Oversized output is losslessly persisted to the scratchpad by the agent layer; the tool never truncates what it returns to the agent.
 - A command may print up to 64 MiB across stdout and stderr. Past that it is stopped, the way a timeout stops it, and the result states the reason and then carries everything it printed up to the stop. Nothing is elided and nothing is written to disk: the whole output is in the result, and in the scratchpad when it is too large for the conversation. The bound exists because a command that writes faster than the turn ends (`cat /dev/zero`, a runaway build log) would otherwise grow one buffer until the process died; a command that hits it wants a narrower rerun (`grep`, `head`, `tail`), not a larger bound.
-- Default timeout is 30 seconds. If the command exceeds the timeout, it is killed (on Unix, via the process group so backgrounded grandchildren are caught too), and the result keeps what it printed before the kill.
-- Supports cancellation: pressing Ctrl+C while a command is running kills the child process.
+- Default timeout is 30 seconds. If the command exceeds the timeout, it is killed with every process it started (on Unix through its process group, on Windows through its Job Object), and the result keeps what it printed before the kill.
+- Supports cancellation: pressing Ctrl+C while a command is running kills the command and everything it started.
 
 ### Shell-specific semantics
 
@@ -32,6 +32,28 @@ Execute a shell command and return its output.
 ### Network
 
 The sandbox leaves the network open by default: the threat model is "no state mutation", and `curl http://x | pdftotext` must keep working. [`[permissions].network = "none"`](../configuration/config-file.md#permissions) cuts a confined command off: Bubblewrap unshares the network namespace, so not even loopback answers; Landlock handles every TCP bind and connect from ABI v4 and grants no port, which leaves UDP open since no Landlock ABI has a right over it; `sandbox-exec` withholds its outbound rule under `(deny default)`, which closes every socket while the system resolver's Mach service stays reachable, so a command can still look names up. Windows cannot cut a command off and warns once at startup. The setting reaches `web_fetch` too, which runs in the meka process where no sandbox reaches and is withheld whole, and it never reaches an MCP server, which is a process outside the sandbox: withhold the server instead. A sub-agent holds its parent's setting unless its spawn narrows it with `network`, and the scope lines of a session that is cut off say `Network: none (shell and web_fetch)`.
+
+### Memory
+
+A command that takes every byte the machine has is the process that loses it, not meka, wherever the platform has a lever, so the session survives and the result says the command died:
+
+- **Linux**: every process meka starts runs at the highest `oom_score_adj`, inherited by the shell, the Bubblewrap or Landlock layer around it and everything they start. Whether the service's cgroup or the whole host runs out of memory, the kernel's OOM killer takes that process, a stdio MCP server included, ahead of meka and of everything else on the host, whatever meka's own score is.
+- **Windows**: every process meka starts runs in a Job Object whose committed memory stops at the machine's physical memory. Past it the command's own allocations fail and it exits; meka's never do. The cap is per command, so two commands can still exhaust the machine together. The job ends with the command: when it returns, times out or is stopped, every process it started is ended, so a server a command left running in the background does not outlive the call. A program started through an app execution alias (the `python` or `winget` shims under `WindowsApps`) runs outside the command's job, so neither the cap nor the kill reaches it; name such an executable by its real path.
+- **macOS**: no lever exists for one process over another. The system takes the largest footprint first, which is the runaway command.
+
+This covers every process meka starts: shell commands, the screen's `!` commands, schedule gates, stdio MCP servers and an HTTP MCP server's `headers_helper`. Two exceptions are the user's own processes: the editor `meka skill edit` and `meka memory edit` open, and the browser the screen opens for a URL a server asks for.
+
+Running `meka serve` under systemd, give the unit a ceiling and tell systemd that a command's death is not meka's:
+
+```ini
+[Service]
+MemoryMax=75%
+MemorySwapMax=0
+OOMPolicy=continue
+OOMScoreAdjust=-900
+```
+
+`MemoryMax=75%` is relative to the machine's physical memory, so the unit moves with its host. `OOMPolicy=continue` keeps the unit running when the kernel kills a command inside it; the default, `stop`, ends meka too. `OOMScoreAdjust=-900` ranks meka below everything else the host runs.
 
 ### Read-only sandbox
 

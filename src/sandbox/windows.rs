@@ -4,7 +4,11 @@
 use std::{
     fs::File,
     mem,
-    os::windows::{ffi::OsStrExt, io::FromRawHandle, process::ExitStatusExt},
+    os::windows::{
+        ffi::OsStrExt,
+        io::{AsRawHandle, FromRawHandle},
+        process::ExitStatusExt,
+    },
     process::ExitStatus,
     ptr,
 };
@@ -34,11 +38,7 @@ use windows_sys::Win32::{
             AllocConsole, GetConsoleWindow, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
             STD_OUTPUT_HANDLE, SetStdHandle,
         },
-        JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
-        },
+        JobObjects::{AssignProcessToJobObject, TerminateJobObject},
         Pipes::CreatePipe,
         Threading::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
@@ -103,8 +103,8 @@ impl Drop for OwnedHandle {
 /// (matching Unix's `setsid()` + `kill(-pgid, …)` semantics). `kill()` terminates the entire
 /// job, not just the direct child.
 pub(crate) struct SandboxedChild {
-    process: OwnedHandle,
-    job: OwnedHandle,
+    process: std::os::windows::io::OwnedHandle,
+    job: std::os::windows::io::OwnedHandle,
     stdout: Option<File>,
     stderr: Option<File>,
 }
@@ -123,12 +123,12 @@ impl SandboxedChild {
     pub(crate) fn wait_blocking(&self) -> std::io::Result<ExitStatus> {
         // SAFETY: `process` is a valid open process HANDLE until Drop.
         unsafe {
-            let rc = WaitForSingleObject(self.process.as_raw(), INFINITE);
+            let rc = WaitForSingleObject(self.process.as_raw_handle(), INFINITE);
             if rc != WAIT_OBJECT_0 {
                 return Err(std::io::Error::last_os_error());
             }
             let mut exit_code: u32 = 0;
-            if GetExitCodeProcess(self.process.as_raw(), &mut exit_code) == 0 {
+            if GetExitCodeProcess(self.process.as_raw_handle(), &mut exit_code) == 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(ExitStatus::from_raw(exit_code))
@@ -142,7 +142,7 @@ impl SandboxedChild {
         // SAFETY: `job` is a valid open Job HANDLE until Drop. Terminating the job cascades to
         // every process assigned to it, including any grandchildren the user command spawned.
         unsafe {
-            if TerminateJobObject(self.job.as_raw(), 1) == 0 {
+            if TerminateJobObject(self.job.as_raw_handle(), 1) == 0 {
                 let error = std::io::Error::last_os_error();
                 // ERROR_ACCESS_DENIED (5) is returned when the job is already gone; treat as
                 // success.
@@ -929,11 +929,13 @@ pub(crate) fn spawn_sandboxed_command(
 
         let mut proc_info: PROCESS_INFORMATION = mem::zeroed();
 
-        // 8. Create a Job Object with `KILL_ON_JOB_CLOSE` BEFORE spawning, so the child can be
-        //    assigned to it while still suspended. When `SandboxedChild` drops, the job handle
-        //    drops too; that automatic close cascades to every assigned process, eliminating
-        //    grandchild leaks on normal exit, kill, or panic.
-        let job = create_kill_on_close_job()?;
+        // 8. Create the job BEFORE spawning, so the child can be assigned to it while still
+        //    suspended. It is the door's job (kill-on-close, capped at the machine's memory): when
+        //    `SandboxedChild` drops, the job handle drops too, and that automatic close cascades to
+        //    every assigned process, eliminating grandchild leaks on normal exit, kill, or panic.
+        //    Unlike the door, this path fails the spawn when the job cannot be made, because the
+        //    job is part of the boundary a confined command runs behind.
+        let job = crate::process::open_job(crate::process::JobEnd::WithHandle)?;
 
         // 9. Spawn SUSPENDED. We assign the child to the job before any of its code runs; otherwise
         //    the child could spawn a grandchild outside the job in the gap between create and
@@ -962,7 +964,7 @@ pub(crate) fn spawn_sandboxed_command(
         spawn_result?;
 
         // 10. Assign the suspended child to the job, then resume.
-        if AssignProcessToJobObject(job.as_raw(), proc_info.hProcess) == 0 {
+        if AssignProcessToJobObject(job.as_raw_handle(), proc_info.hProcess) == 0 {
             let error = std::io::Error::last_os_error();
             // Best-effort kill of the suspended child before bailing, so the orphan doesn't sit
             // around if AssignProcess failed.
@@ -979,7 +981,7 @@ pub(crate) fn spawn_sandboxed_command(
         if ResumeThread(proc_info.hThread) == u32::MAX {
             let error = std::io::Error::last_os_error();
             // Kill via job since assignment already succeeded.
-            TerminateJobObject(job.as_raw(), 1);
+            TerminateJobObject(job.as_raw_handle(), 1);
             CloseHandle(proc_info.hProcess);
             if !proc_info.hThread.is_null() {
                 CloseHandle(proc_info.hThread);
@@ -998,46 +1000,12 @@ pub(crate) fn spawn_sandboxed_command(
         let stderr_handle = stderr_read.into_raw();
 
         Ok(SandboxedChild {
-            process: OwnedHandle(proc_info.hProcess),
+            process: std::os::windows::io::OwnedHandle::from_raw_handle(proc_info.hProcess),
             job,
             stdout: Some(File::from_raw_handle(stdout_handle as _)),
             stderr: Some(File::from_raw_handle(stderr_handle as _)),
         })
     }
-}
-
-/// Create an empty Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` set. Any process later
-/// assigned to the job is killed when the job's last handle closes, the Windows analog to
-/// Unix process groups teardown via `kill(-pgid, SIGKILL)`. Grandchildren inherit job
-/// membership automatically.
-unsafe fn create_kill_on_close_job() -> std::io::Result<OwnedHandle> {
-    // SAFETY: CreateJobObjectW with null name and null SECURITY_ATTRIBUTES returns an unnamed
-    // Job HANDLE the current process owns.
-    let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-    if job.is_null() {
-        return Err(std::io::Error::last_os_error());
-    }
-    let job = OwnedHandle(job);
-
-    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { mem::zeroed() };
-    info.BasicLimitInformation = JOBOBJECT_BASIC_LIMIT_INFORMATION {
-        LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        ..unsafe { mem::zeroed() }
-    };
-
-    if unsafe {
-        SetInformationJobObject(
-            job.as_raw(),
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const core::ffi::c_void,
-            mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    Ok(job)
 }
 
 /// Create an anonymous pipe using the supplied SECURITY_ATTRIBUTES.

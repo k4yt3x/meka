@@ -159,8 +159,8 @@ pub(super) fn smoke_test_bwrap(
     let parent = std::process::id() as libc::pid_t;
     // SAFETY: the closure runs after `fork` in the child and calls only async-signal-safe
     // functions (`prctl`, `getppid`, `_exit`), allocating nothing.
-    unsafe {
-        std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
+    let spawned = unsafe {
+        crate::process::spawn_with_pre_exec(&mut command, move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -168,10 +168,10 @@ pub(super) fn smoke_test_bwrap(
                 libc::_exit(0);
             }
             Ok(())
-        });
-    }
+        })
+    };
 
-    let mut child = match command.spawn() {
+    let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {
             return SmokeResult::OtherFailure {

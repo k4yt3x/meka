@@ -68,8 +68,10 @@ const RANKS: &[(&str, u32)] = &[
     ("permission", 17),
     ("checklist", 17),
     ("image", 17),
-    // Leaves.
+    // Leaves. `process` is the one door for every process meka starts, below `sandbox`, which
+    // takes its job definition from it.
     ("fs", 18),
+    ("process", 18),
     ("error", 19),
     ("sync", 19),
     ("text", 20),
@@ -522,6 +524,122 @@ fn production_code_reads_meka_variables_only_where_the_ledger_says() {
     );
 }
 
+/// Every file that starts a process, with how the door in `src/process.rs` reaches what it
+/// starts. The door is what puts a child behind meka in the line for memory, so a spawn it does
+/// not reach is a command that can take meka down with it.
+const PROCESS_STARTERS: &[(&str, &str)] = &[
+    (
+        "src/tools/shell.rs",
+        "`shell_execute`, through `process::spawn_with_pre_exec` on Unix and `process::spawn` on \
+         Windows",
+    ),
+    (
+        "src/host/tui/screen.rs",
+        "the screen's `!command`, through `process::spawn`; the browser it opens for a URL a \
+         server asks for (`open::that`) is the user's own and stays outside, since a job would \
+         close it with the call",
+    ),
+    (
+        "src/scheduler.rs",
+        "a schedule's shell gate, through `process::spawn`",
+    ),
+    (
+        "src/mcp/transport.rs",
+        "a stdio MCP server, which rmcp spawns between `process::prepare` and `process::adopt` in \
+         the connector, and the `headers_helper`, through `process::spawn`",
+    ),
+    (
+        "src/sandbox/bubblewrap.rs",
+        "the Bubblewrap smoke test, through `process::spawn_with_pre_exec`",
+    ),
+    (
+        "src/sandbox/windows.rs",
+        "a confined Windows command, created suspended and assigned to the job \
+         `process::open_job` makes before it runs",
+    ),
+    (
+        "src/sandbox/landlock.rs",
+        "`meka confine` becomes the command by `exec` inside the sandbox and inherits what the \
+         door set on Bubblewrap",
+    ),
+    (
+        "src/entry.rs",
+        "the user's own editor, opened for the user at a prompt and never under `meka serve`: not \
+         a command run on the model's behalf, and on Windows a job would take an editor that \
+         forks a window down when the file closes",
+    ),
+    (
+        "src/prompt.rs",
+        "`sw_vers` on macOS, where the door has nothing to do",
+    ),
+];
+
+/// Production code starts a process only where [`PROCESS_STARTERS`] says, so a new spawn site is
+/// placed behind the door, or argued out of it, in the ledger rather than slipped in. Matched
+/// where the command is built rather than where it is spawned, so a file that builds one another
+/// crate spawns is listed for it.
+#[test]
+fn production_code_starts_a_process_only_where_the_ledger_says() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    source_files(&root.join("src"), &mut files);
+    files.sort();
+
+    let allowed: BTreeSet<&str> = PROCESS_STARTERS.iter().map(|(file, _)| *file).collect();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut violations = Vec::new();
+
+    for path in &files {
+        let relative = path
+            .strip_prefix(root)
+            .expect("a path under the manifest directory")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source = fs::read_to_string(path).expect("read a source file");
+        let code = strip_test_code(&source)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if starts_a_process(&code) {
+            if allowed.contains(relative.as_str()) {
+                seen.insert(relative);
+            } else {
+                violations.push(format!("{relative} starts a process outside the door"));
+            }
+        }
+    }
+
+    for (file, _) in PROCESS_STARTERS {
+        if !seen.contains(*file) {
+            violations.push(format!(
+                "{file} no longer starts a process; remove it from the ledger"
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "process starts outside the ledger:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// Whether `code` builds a command or creates a process: a `Command::new(` that is not the tail
+/// of a longer name (`AvailableCommand::new(` is ACP's), a `CreateProcess` call, or the `open`
+/// crate's `open::that(`, which starts the platform's opener.
+fn starts_a_process(code: &str) -> bool {
+    if code.contains("CreateProcess") || code.contains("open::that(") {
+        return true;
+    }
+    code.match_indices("Command::new(").any(|(at, _)| {
+        code[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !(before.is_alphanumeric() || before == '_'))
+    })
+}
+
 /// `None` passed to `Store::open` is the user's own `meka.db`, not the absence of a path, so a
 /// test that spells it seeds sessions into the developer's store on every run and migrates it on
 /// the way in. Only `main` opens the store there; a test opens `Store::for_test()`.
@@ -580,4 +698,20 @@ fn code_is_not_an_edge() {
         .map(|s| (*s).to_string())
         .collect();
     assert_eq!(edges, expected);
+}
+
+/// The spawn matcher takes a command however its path is spelled, a raw process creation and
+/// the `open` crate's launcher, and leaves a longer name that merely ends in `Command` alone.
+#[test]
+fn a_longer_name_ending_in_command_is_not_a_process_start() {
+    assert!(starts_a_process(
+        "let mut command = std::process::Command::new(\"sh\");"
+    ));
+    assert!(starts_a_process("let mut command = Command::new(program);"));
+    assert!(starts_a_process("CreateProcessAsUserW(token, ..)"));
+    assert!(starts_a_process("open::that(&question.url)"));
+    assert!(!starts_a_process(
+        "AvailableCommand::new(command.name, command.help)"
+    ));
+    assert!(!starts_a_process("my_command::new()"));
 }

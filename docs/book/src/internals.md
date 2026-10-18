@@ -48,6 +48,7 @@ rank  module          holds
 17    checklist       the checklist: items, states, the open rule
 17    image           format detection and transcoding
 18    fs              private directories, atomic replace, file locks
+18    process         the one door for every process meka starts: behind meka for memory
 19    error           MekaError
 19    sync            locks that outlive a panic
 19    streams         raw stderr
@@ -190,6 +191,7 @@ they guard. When adding a path, call the predicate rather than restating the rul
 | What a delete locks | `Store::lock_tree`: the session and every sub-agent under it, since the cascade takes them | the sweep and `--all` (over roots, through `delete_the_unattached_among`), `session remove <id>`, `agent_delete`, the servers' deletes of a session they have not loaded |
 | What `${VAR}` means in `config.toml` | `config::expand_env_vars`, one grammar (`${VAR}`, `${VAR:-default}`; an unclosed `${`, an empty name or a nested default is reported as malformed and left as written); what a miss or a malformed reference costs is the caller's: `[serve]` refuses, an MCP server is refused when it sits in `args`, `env`, `url` or `headers`, and `mcp add` skips its probe | `[serve]` tokens and URLs, every MCP server field |
 | What a tool call's arguments are, and whether it detaches | `tools::admit_arguments` | dispatch, ahead of every tool |
+| Where a process is started, and what it is handed for memory | `process::spawn` (and `process::prepare` with `process::adopt` where rmcp makes the spawn): the highest `oom_score_adj` on Linux, a job capped at the machine's memory on Windows; `tests/layering.rs` lists every spawn site in its `PROCESS_STARTERS` ledger | the shell tool, the screen's `!command`, schedule gates, stdio MCP servers and an HTTP server's `headers_helper`, the Bubblewrap smoke test, the confined Windows command |
 | Where a `MEKA_*` variable is read | `ResolvedConfig::resolve` in `config.rs`, with `paths.rs` for the two that locate the config file; `tests/layering.rs` keeps every other file out through its `ENVIRONMENT_READERS` ledger | every operational override: the permission level, the standing instructions, the sandbox backend, the render mode, the MCP tool timeout, and the debug-only mock switches |
 | The level a call must clear | `tools::effective_permission`: the `[tools.tool_permissions]` override, else the tool's own | dispatch, the gate, `tool_load`'s listing, the catalog |
 | What level a scheduled job runs at | `scheduler::live_permission`, reading the session row through `admit_recorded` | the fire door, the wake watcher, `meka schedule show` |

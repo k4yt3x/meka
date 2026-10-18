@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.80.0] - 2026-10-18
+
+### Changed
+
+- On Linux, every process meka starts runs at the highest `oom_score_adj`: OOM kills take it first.
+- On Windows, every process meka starts runs in a Job Object capped at the machine's memory.
+- A shell command on Windows ends with every process it started, on return, timeout or stop.
+- The shell tool's page gives the systemd unit lines that keep a runaway command from ending meka.
+
 ## [0.79.0] - 2026-10-18
 
 ### Added
@@ -2819,7 +2828,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.79.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.80.0...HEAD
+[0.80.0]: https://github.com/k4yt3x/meka/compare/0.79.0...0.80.0
 [0.79.0]: https://github.com/k4yt3x/meka/compare/0.78.0...0.79.0
 [0.78.0]: https://github.com/k4yt3x/meka/compare/0.77.0...0.78.0
 [0.77.0]: https://github.com/k4yt3x/meka/compare/0.76.0...0.77.0

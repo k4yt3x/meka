@@ -32,6 +32,8 @@ Two flags are refused rather than ignored: `-c` and `-r`. Both name one run's se
 
 > **TLS**: `meka serve` speaks plain HTTP. For production, front it with a TLS-terminating reverse proxy (nginx, Caddy, Cloudflare Tunnel).
 
+Under systemd, the unit lines in the shell tool's [Memory](../tools/shell.md#memory) section keep a command that takes every byte from taking the server with it.
+
 ## Quick example
 
 ### Blocking turn (simplest)
