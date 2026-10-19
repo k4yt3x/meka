@@ -1140,8 +1140,8 @@ async fn claude_login(
 ) -> anyhow::Result<AuthCredential> {
     let client_id = client_id.unwrap_or(DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID);
     let token_url = oauth_token_url.unwrap_or(DEFAULT_CLAUDE_SUBSCRIPTION_TOKEN_URL);
-    let (code_verifier, code_challenge) = generate_pkce_pair();
-    let state = generate_state();
+    let (code_verifier, code_challenge) = generate_pkce_pair()?;
+    let state = generate_state()?;
     let url = build_authorize_url(client_id, &code_challenge, &state)?;
 
     crate::streams::write_stderr_line("\nTo authorize, open this URL in your browser:");
@@ -1238,8 +1238,8 @@ async fn codex_login(
 ) -> anyhow::Result<AuthCredential> {
     let client_id = client_id.unwrap_or(DEFAULT_CHATGPT_SUBSCRIPTION_CLIENT_ID);
     let token_url = oauth_token_url.unwrap_or(CODEX_TOKEN_URL);
-    let (code_verifier, code_challenge) = generate_pkce_pair();
-    let state = generate_state();
+    let (code_verifier, code_challenge) = generate_pkce_pair()?;
+    let state = generate_state()?;
     let redirect_uri = format!("http://localhost:{CODEX_REDIRECT_PORT}/auth/callback");
     let url = build_codex_authorize_url(client_id, &code_challenge, &state, &redirect_uri)?;
 

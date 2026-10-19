@@ -387,7 +387,7 @@ pub(crate) fn resolve_device_id(
     backend: Backend,
     account_name: &str,
     configured: Option<&str>,
-) -> String {
+) -> crate::error::Result<String> {
     device_id::resolve(Some(backend), Some(account_name), configured)
 }
 /// The profile a name denotes, or [`crate::error::MekaError::ProfileNotConfigured`] naming the
@@ -546,21 +546,21 @@ pub(crate) mod device_id {
         backend: Option<super::Backend>,
         account_name: Option<&str>,
         configured: Option<&str>,
-    ) -> String {
+    ) -> crate::error::Result<String> {
         if backend != Some(super::Backend::ClaudeSubscription) {
-            return String::new();
+            return Ok(String::new());
         }
 
         // The account's `device_id`, already deserialized, wins.
         if let Some(id) = configured
             && !id.is_empty()
         {
-            return id.to_string();
+            return Ok(id.to_string());
         }
 
         let (id, source) = match read_claude_code_user_id(dirs::home_dir()) {
             Some(id) => (id, "~/.claude.json"),
-            None => (generate(), "random"),
+            None => (generate()?, "random"),
         };
         tracing::info!("seeded claude-subscription device_id from {source}");
 
@@ -570,15 +570,14 @@ pub(crate) mod device_id {
         {
             tracing::warn!("failed to persist device_id: {error}");
         }
-        id
+        Ok(id)
     }
 
     /// A fresh device id: 32 random bytes as lowercase hex.
-    pub(super) fn generate() -> String {
-        use rand::RngExt;
+    pub(super) fn generate() -> crate::error::Result<String> {
         let mut bytes = [0u8; 32];
-        rand::rng().fill(&mut bytes);
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        getrandom::fill(&mut bytes).map_err(std::io::Error::from)?;
+        Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
     /// Claude Code's `userID`, read from the `.claude.json` under `home`.
@@ -961,14 +960,16 @@ mod tests {
         // Should not generate / persist anything when the provider doesn't need a device_id. Empty
         // string flows through but is ignored by non-claude-subscription providers.
         assert_eq!(
-            device_id::resolve(Some(Backend::OpenAiChatCompletions), Some("work"), None),
+            device_id::resolve(Some(Backend::OpenAiChatCompletions), Some("work"), None)
+                .expect("resolve"),
             ""
         );
         assert_eq!(
-            device_id::resolve(Some(Backend::AnthropicMessages), Some("work"), None),
+            device_id::resolve(Some(Backend::AnthropicMessages), Some("work"), None)
+                .expect("resolve"),
             ""
         );
-        assert_eq!(device_id::resolve(None, None, None), "");
+        assert_eq!(device_id::resolve(None, None, None).expect("resolve"), "");
         // Even an explicit configured value is suppressed when the provider isn't
         // claude-subscription; the field is provider-scoped.
         assert_eq!(
@@ -976,7 +977,8 @@ mod tests {
                 Some(Backend::OpenAiChatCompletions),
                 Some("work"),
                 Some("explicit")
-            ),
+            )
+            .expect("resolve"),
             ""
         );
     }
@@ -986,7 +988,8 @@ mod tests {
         // A configured value returns before the persist branch, so this never touches the FS.
         let id = "deadbeef".repeat(8);
         assert_eq!(
-            device_id::resolve(Some(Backend::ClaudeSubscription), Some("work"), Some(&id)),
+            device_id::resolve(Some(Backend::ClaudeSubscription), Some("work"), Some(&id))
+                .expect("resolve"),
             id,
             "configured value must be used verbatim for claude-subscription"
         );
@@ -1211,7 +1214,8 @@ mod tests {
         // Closing the loop: the reader feeds the persisted value back through `resolve`, which must
         // return it verbatim rather than regenerate a fresh id on the next run.
         assert_eq!(
-            device_id::resolve(Some(Backend::ClaudeSubscription), Some("work"), persisted),
+            device_id::resolve(Some(Backend::ClaudeSubscription), Some("work"), persisted)
+                .expect("resolve"),
             "abc123",
             "a persisted device_id must be picked up on the next run, not regenerated"
         );
@@ -1296,8 +1300,8 @@ mod tests {
     /// A generated device id has the shape of the one it stands in for, and no two runs share one.
     #[test]
     fn a_generated_device_id_is_64_lowercase_hex_characters_and_never_repeats() {
-        let first = device_id::generate();
-        let second = device_id::generate();
+        let first = device_id::generate().expect("generate");
+        let second = device_id::generate().expect("generate");
         for id in [&first, &second] {
             assert_eq!(id.len(), 64, "{id}");
             assert!(

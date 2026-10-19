@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.82.0] - 2026-10-19
 
 ### Removed
 
@@ -2846,7 +2846,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.81.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.82.0...HEAD
+[0.82.0]: https://github.com/k4yt3x/meka/compare/0.81.0...0.82.0
 [0.81.0]: https://github.com/k4yt3x/meka/compare/0.80.0...0.81.0
 [0.80.0]: https://github.com/k4yt3x/meka/compare/0.79.0...0.80.0
 [0.79.0]: https://github.com/k4yt3x/meka/compare/0.78.0...0.79.0

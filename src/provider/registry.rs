@@ -446,6 +446,10 @@ impl ProviderRegistry {
                 }
             })
             .await;
+            let resolved = match resolved {
+                Ok(resolved) => resolved,
+                Err(join_error) => Err(MekaError::io(join_error.to_string())),
+            };
             match resolved {
                 Ok(device_id) => {
                     crate::sync::lock(&self.device_ids)
@@ -480,7 +484,7 @@ impl ProviderRegistry {
             account,
             self.session_context_window,
             self.default_thinking_budget,
-            self.device_id_for(&configured.account, account),
+            self.device_id_for(&configured.account, account)?,
         )
         .map_err(MekaError::Config)
     }
@@ -490,26 +494,20 @@ impl ProviderRegistry {
         &self,
         name: &str,
         account: &crate::config::AccountConfig,
-    ) -> String {
+    ) -> Result<String> {
         let mut cache = crate::sync::lock(&self.device_ids);
-        cache
-            .entry(name.to_string())
-            .or_insert_with(|| {
-                // A `backend` that does not parse resolves no device id; `settings` refuses the
-                // profile a moment later with the message that names the typo.
-                account
-                    .backend
-                    .parse::<Backend>()
-                    .map(|backend| {
-                        crate::config::resolve_device_id(
-                            backend,
-                            name,
-                            account.device_id.as_deref(),
-                        )
-                    })
-                    .unwrap_or_default()
-            })
-            .clone()
+        if let Some(device_id) = cache.get(name) {
+            return Ok(device_id.clone());
+        }
+        // A `backend` that does not parse resolves no device id; `settings` refuses the profile a
+        // moment later with the message that names the typo.
+        let device_id = match account.backend.parse::<Backend>() {
+            Ok(backend) => {
+                crate::config::resolve_device_id(backend, name, account.device_id.as_deref())?
+            }
+            Err(_) => String::new(),
+        };
+        Ok(cache.entry(name.to_string()).or_insert(device_id).clone())
     }
 
     /// The provider for one profile, built on first ask and reused after, with the settings it was
@@ -645,7 +643,7 @@ impl ProviderRegistry {
             .credential_key(Some(name.to_string()))
             .oauth_token_url(account.oauth_token_url.clone())
             .token_store(needs_token_store.then(|| Arc::clone(&self.token_store)))
-            .device_id(self.device_id_for(name, account))
+            .device_id(self.device_id_for(name, account)?)
             .build()?;
         Ok((provider, backend))
     }

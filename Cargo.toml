@@ -1,6 +1,6 @@
 [package]
 name = "meka"
-version = "0.81.0"
+version = "0.82.0"
 edition = "2024"
 rust-version = "1.95"
 license = "AGPL-3.0-or-later"
@@ -29,8 +29,8 @@ dirs = "7"
 eventsource-stream = "0.2"
 fast_html2md = "0.0"
 futures = "0.3"
+getrandom = { version = "0.4", features = ["std"] }
 glob = "0.3"
-grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 hmac = "0.13.0"
@@ -40,7 +40,6 @@ infer = { version = "0.22", default-features = false }
 open = "5"
 percent-encoding = "2"
 pulldown-cmark = { version = "0.13.4", default-features = false }
-rand = "0.10"
 ratatui = "0.30"
 ratatui-textarea = "0.9"
 ratskin = "0.3"
@@ -84,7 +83,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 winres = "0.1"
 
 [dev-dependencies]
-filetime = "0.2.29"
 http = "1"
 reqwest = { version = "0.13", features = ["blocking", "json"] }
 tempfile = "3"

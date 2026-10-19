@@ -1576,16 +1576,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "filetime"
-version = "0.2.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
-dependencies = [
- "cfg-if",
- "libc",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2712,7 +2702,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "meka"
-version = "0.81.0"
+version = "0.82.0"
 dependencies = [
  "agent-client-protocol",
  "ansi-to-tui",
@@ -2729,10 +2719,9 @@ dependencies = [
  "dirs",
  "eventsource-stream",
  "fast_html2md",
- "filetime",
  "futures",
+ "getrandom 0.4.3",
  "glob",
- "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "hmac",
@@ -2744,7 +2733,6 @@ dependencies = [
  "open",
  "percent-encoding",
  "pulldown-cmark",
- "rand 0.10.3",
  "ratatui",
  "ratatui-textarea",
  "ratskin",

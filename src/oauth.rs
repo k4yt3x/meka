@@ -4,7 +4,6 @@
 use std::{sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::RngExt;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -466,19 +465,19 @@ pub(crate) async fn store_refreshed_credential(
     }
 }
 /// A PKCE verifier and its S256 challenge, for a login's authorization request.
-pub(crate) fn generate_pkce_pair() -> (String, String) {
+pub(crate) fn generate_pkce_pair() -> Result<(String, String)> {
     let mut bytes = [0u8; 32];
-    rand::rng().fill(&mut bytes);
+    getrandom::fill(&mut bytes).map_err(std::io::Error::from)?;
     let code_verifier = URL_SAFE_NO_PAD.encode(bytes);
     let digest = Sha256::digest(code_verifier.as_bytes());
     let code_challenge = URL_SAFE_NO_PAD.encode(digest);
-    (code_verifier, code_challenge)
+    Ok((code_verifier, code_challenge))
 }
 /// A fresh `state` value for a login's authorization request.
-pub(crate) fn generate_state() -> String {
+pub(crate) fn generate_state() -> Result<String> {
     let mut bytes = [0u8; 32];
-    rand::rng().fill(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
+    getrandom::fill(&mut bytes).map_err(std::io::Error::from)?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
 /// What a subscription request authenticates with: the access token and, where the issuer names
@@ -1138,12 +1137,15 @@ mod tests {
     }
     #[test]
     fn generate_pkce_pair_challenge_is_sha256_of_verifier() {
-        let (verifier, challenge) = generate_pkce_pair();
+        let (verifier, challenge) = generate_pkce_pair().expect("pkce pair");
         let expected = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         assert_eq!(challenge, expected);
     }
     #[test]
     fn two_generated_states_differ() {
-        assert_ne!(generate_state(), generate_state());
+        assert_ne!(
+            generate_state().expect("state"),
+            generate_state().expect("state")
+        );
     }
 }

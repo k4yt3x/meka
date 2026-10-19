@@ -1634,11 +1634,11 @@ mod tests {
             .and_then(|meta| meta.modified())
             .expect("mtime");
         std::fs::write(dir.join("SKILL.md"), render(7)).expect("write v2");
-        filetime::set_file_mtime(
-            dir.join("SKILL.md"),
-            filetime::FileTime::from_system_time(before),
-        )
-        .ok();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("SKILL.md"))
+            .and_then(|file| file.set_modified(before))
+            .ok();
 
         // Without invalidation the cache is entitled to serve the stale value; with it, it must
         // not. Only the second half is a guarantee, so only that is asserted.
