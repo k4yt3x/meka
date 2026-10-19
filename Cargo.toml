@@ -10,7 +10,7 @@ repository = "https://github.com/k4yt3x/meka"
 [features]
 default = ["serve"]
 mock-provider = []
-serve = ["dep:axum", "dep:tower-http", "dep:utoipa", "dep:utoipa-swagger-ui"]
+serve = ["dep:axum", "dep:tower-http", "dep:utoipa"]
 
 [dependencies]
 agent-client-protocol = { version = "2.2", features = ["unstable_end_turn_token_usage", "unstable_session_fork"] }
@@ -69,7 +69,6 @@ unicode-segmentation = "1"
 unicode-width = "0.2"
 url = "2"
 utoipa = { version = "6", features = ["axum_extras", "chrono", "uuid"], optional = true }
-utoipa-swagger-ui = { version = "10", features = ["axum", "vendored"], optional = true }
 uuid = { version = "1", features = ["v4", "serde"] }
 yaml_serde = "0.10.7"
 zune-core = "0.5"

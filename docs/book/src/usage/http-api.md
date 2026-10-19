@@ -980,7 +980,7 @@ A request with `stream: false` never sees a `permission_required` event, so it i
 
 ## Authentication
 
-Every request requires `Authorization: Bearer <token>`, except the two health probes and, when `[serve].docs` is enabled, `/v1/openapi.json` and `/v1/docs`. Both of those are off by default, so on a default deployment they answer 404 rather than serving anything unauthenticated. A `401` carries `WWW-Authenticate: Bearer realm="meka"`, as RFC 9110 requires. A browser's CORS preflight is the one other exception, and only where [`cors_allowed_origins`](#browser-clients) is set.
+Every request requires `Authorization: Bearer <token>`, except the two health probes and, when `[serve].docs` is enabled, `/v1/openapi.json`. That one is off by default, so on a default deployment it answers 404 rather than serving anything unauthenticated. A `401` carries `WWW-Authenticate: Bearer realm="meka"`, as RFC 9110 requires. A browser's CORS preflight is the one other exception, and only where [`cors_allowed_origins`](#browser-clients) is set.
 
 ### Scopes
 
@@ -1201,7 +1201,6 @@ These endpoints help clients inspect the server's capabilities at runtime.
 | `GET /v1/skills` | Any read scope | Installed skills |
 | `GET /v1/mcp` | Any read scope | MCP server connection status, with the protocol version a connected one speaks |
 | `GET /v1/openapi.json` | None, and off unless `[serve].docs` is set | OpenAPI 3 spec |
-| `GET /v1/docs` | None, and off unless `[serve].docs` is set | Swagger UI |
 
 ## Session lifecycle
 
@@ -1478,7 +1477,6 @@ Key points:
 | GET | `/v1/instructions` | `sessions:r` | Resolved standing instructions, without the per-session files `[instructions]` names |
 | GET | `/v1/profiles` | read | Configured profiles |
 | GET | `/v1/openapi.json` | None, and off unless `[serve].docs` is set | OpenAPI spec |
-| GET | `/v1/docs` | None, and off unless `[serve].docs` is set | Swagger UI |
 
 `GET /v1/sessions` is paginated by `limit` and `cursor` (see [Sessions](#sessions)), and takes `include_children=true` to list sub-agent sessions alongside root ones, `working_directory=<path>` to filter by working directory, and `parent=<id>` to list one session's direct children. A sub-agent's session record carries `parent_id`, which is what reconnects it to the session that dispatched it.
 
@@ -1516,9 +1514,9 @@ A `connected` server in `GET /v1/mcp` carries `protocol_version`, the MCP revisi
 
 MCP OAuth login and logout are deliberately absent: the flow prints a URL for a person to open in a browser and waits for the callback, which does not belong on a service-to-service surface. Use `meka mcp login` on the host. `/v1/profiles` is read-only for the same reason profile selection has no environment tier: an ambient value must never silently rebind which account a named profile bills.
 
-For full request/response schemas, see `/v1/openapi.json` on a running server, or browse it interactively at `/v1/docs` (Swagger UI).
+For full request/response schemas, see `/v1/openapi.json` on a running server, or browse it in one of the [tools below](#import-into-tools).
 
-Both are **off unless you set [`[serve].docs`](../configuration/config-file.md#servedocs)**, and both are unauthenticated when on, so CI pipelines and code generators can fetch the spec without a token. That combination is what makes them opt-in: they take no token *and* they publish the shape of every endpoint the deployment exposes, which is useful on a workstation and reconnaissance anywhere else.
+It is **off unless you set [`[serve].docs`](../configuration/config-file.md#servedocs)**, and unauthenticated when on, so CI pipelines and code generators can fetch the spec without a token. That combination is what makes it opt-in: it takes no token *and* it publishes the shape of every endpoint the deployment exposes, which is useful on a workstation and reconnaissance anywhere else.
 
 ### Exporting the spec
 

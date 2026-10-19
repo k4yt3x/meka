@@ -46,14 +46,13 @@ pub(crate) struct ServeConfig {
     /// entitled to the account behind it. `/errors/mcp-unavailable` is not covered either way: it
     /// reports server names only, and that reason is meka's own subprocess text.
     pub(crate) relay_provider_errors: Option<bool>,
-    /// Whether to serve the Swagger UI and the OpenAPI document at `/v1/docs` and
-    /// `/v1/openapi.json`. Default `false`.
+    /// Whether to serve the OpenAPI document at `/v1/openapi.json`. Default `false`.
     ///
-    /// Off by default because they are unauthenticated (as are the two health probes, which
-    /// publish nothing) and what they publish is the shape of every endpoint the deployment
-    /// exposes. That is useful while building a client and pure reconnaissance value once the
-    /// deployment is real. Turn it on deliberately, on a deployment where anyone who can reach the
-    /// port is entitled to the map.
+    /// Off by default because it is unauthenticated (as are the two health probes, which publish
+    /// nothing) and what it publishes is the shape of every endpoint the deployment exposes. That
+    /// is useful while building a client and pure reconnaissance value once the deployment is
+    /// real. Turn it on deliberately, on a deployment where anyone who can reach the port is
+    /// entitled to the map.
     pub(crate) docs: Option<bool>,
     /// Process-wide cap on concurrent in-flight turns across all sessions. None = unbounded
     /// (default). Returns 429 with `concurrency-limit` when exceeded.

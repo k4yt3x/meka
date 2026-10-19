@@ -10,6 +10,12 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.81 to 0.82
+
+**The Swagger UI is gone.** `/v1/docs` answers 404 whatever `[serve].docs` says, and the key still
+serves `/v1/openapi.json`. To browse the API, import that URL into one of the
+[tools the HTTP API page lists](../usage/http-api.md#import-into-tools).
+
 ## 0.80 to 0.81
 
 **Two keys move to the section that governs them.** `config.toml` refuses the old key, naming its

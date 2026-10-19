@@ -1315,24 +1315,22 @@ fn patch_session_sets_approvals_and_the_session_reports_it() {
     assert_eq!(after["approvals"], true, "read back off the row: {after}");
 }
 
-/// The docs routes are the only unauthenticated ones that describe the deployment rather than
-/// report on it, so they are opt-in. Anyone who can reach the port could otherwise read the shape
-/// of every endpoint without presenting a token.
+/// The OpenAPI document is the only unauthenticated route that describes the deployment rather
+/// than reports on it, so it is opt-in. Anyone who can reach the port could otherwise read the
+/// shape of every endpoint without presenting a token.
 #[test]
-fn the_docs_routes_are_off_unless_asked_for() {
+fn the_openapi_document_is_off_unless_asked_for() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
-    for path in ["/v1/openapi.json", "/v1/docs/"] {
-        let response = harness
-            .client
-            .get(format!("{}{}", harness.base_url, path))
-            .send()
-            .expect("send");
-        assert_eq!(
-            response.status(),
-            404,
-            "{path} must not be served unless `[serve].docs` is set"
-        );
-    }
+    let response = harness
+        .client
+        .get(format!("{}/v1/openapi.json", harness.base_url))
+        .send()
+        .expect("send");
+    assert_eq!(
+        response.status(),
+        404,
+        "the document must not be served unless `[serve].docs` is set"
+    );
 }
 
 #[test]
@@ -1371,22 +1369,6 @@ fn openapi_json_is_served_without_auth_and_documents_routes() {
     assert!(
         components.contains_key("ProblemDetail"),
         "ProblemDetail schema must be exported",
-    );
-}
-
-#[test]
-fn swagger_ui_is_served_without_auth() {
-    let harness = ServeTestHarness::spawn("docs = true\n", mock_simple_turn());
-    let response = harness
-        .client
-        .get(format!("{}/v1/docs/", harness.base_url))
-        .send()
-        .expect("send");
-    assert_eq!(response.status(), 200);
-    let body = response.text().expect("text");
-    assert!(
-        body.contains("swagger") || body.contains("Swagger"),
-        "Swagger UI HTML must reference swagger somewhere",
     );
 }
 

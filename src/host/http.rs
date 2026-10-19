@@ -308,8 +308,8 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
         .route("/v1/health/live", get(handlers::discovery::live))
         .route("/v1/health/ready", get(handlers::discovery::ready));
 
-    // `/v1/docs` and `/v1/openapi.json` are the only unauthenticated routes that describe the
-    // deployment rather than report on it, so they are opt-in; see `[serve].docs`.
+    // `/v1/openapi.json` is the only unauthenticated route that describes the deployment rather
+    // than reports on it, so it is opt-in; see `[serve].docs`.
     let documentation = if state.config.docs {
         openapi::router()
     } else {

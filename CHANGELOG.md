@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+- **Breaking:** the Swagger UI at `/v1/docs`; `[serve].docs` serves `/v1/openapi.json` alone.
+
+### Security
+
+- RUSTSEC-2026-0367 through 0369: the build no longer pulls in `zip` 8.x.
+
 ## [0.81.0] - 2026-10-18
 
 ### Changed

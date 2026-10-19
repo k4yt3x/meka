@@ -259,7 +259,7 @@ pub(crate) struct ResolvedServeConfig {
     /// Whether a 502 carries the provider's own response as a `provider_response` member. On
     /// unless turned off.
     pub(crate) relay_provider_errors: bool,
-    /// Whether `/v1/docs` and `/v1/openapi.json` are served. Off unless asked for.
+    /// Whether `/v1/openapi.json` is served. Off unless asked for.
     pub(crate) docs: bool,
     /// How many SSE events per turn to retain for `Last-Event-ID` replay.
     pub(crate) stream_replay_events: usize,

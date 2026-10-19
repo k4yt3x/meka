@@ -1620,12 +1620,12 @@ has carried a command line and its filesystem path. This key does not turn that 
 
 ### `serve.docs`
 
-Whether to serve the Swagger UI at `/v1/docs` and the OpenAPI document at `/v1/openapi.json`.
+Whether to serve the OpenAPI document at `/v1/openapi.json`.
 
-Off by default. These are the only routes on the surface that take no bearer token *and* describe
-the deployment rather than report on it: what they publish is the shape of every endpoint you
-expose. That is exactly what you want while building a client against a local `meka serve`, and
-exactly what you do not want reachable from anywhere else. Turn it on deliberately.
+Off by default. It is the only route on the surface that takes no bearer token *and* describes the
+deployment rather than reports on it: what it publishes is the shape of every endpoint you expose.
+That is exactly what you want while building a client against a local `meka serve`, and exactly
+what you do not want reachable from anywhere else. Turn it on deliberately.
 
 ```toml
 [serve]
