@@ -492,9 +492,9 @@ pub(crate) enum FrontendEvent {
         name: String,
         is_error: bool,
         content: Vec<crate::conversation::ToolResultContent>,
-        /// Tool-specific structured side-channel. `file_edit` / `file_write` populate
-        /// [`ToolOutputMetadata::Diff`] so ACP can emit a proper `diff` content block (and Zed can
-        /// render its apply-diff UI). `None` for tools that have nothing extra.
+        /// Tool-specific structured side-channel. The file, memory and skill tools that change an
+        /// entry populate [`ToolOutputMetadata::Diff`] so a frontend can draw the change. `None`
+        /// for tools that have nothing extra.
         metadata: Option<ToolOutputMetadata>,
     },
     /// Output a still-running tool has produced so far, as it arrives. `id` matches the
@@ -569,12 +569,15 @@ pub(crate) enum FrontendEvent {
 /// `content` text is still the source of truth for the model and the screen).
 #[derive(Debug, Clone)]
 pub(crate) enum ToolOutputMetadata {
-    /// Pre/post file content produced by `file_edit` / `file_write`. `old_text == None` means the
-    /// file did not exist before the call (the write created it).
+    /// What a call changed, as the whole text before and after: a file, a skill file, or a memory
+    /// rendered the way `meka memory export` writes it. `path` is the file on disk, absent for a
+    /// memory, which has none. `old_text == None` means the call created the entry;
+    /// `new_text == None` means it deleted it. Never both: a call that changed nothing attaches
+    /// nothing, and a failed call's is dropped at the one door every result leaves through.
     Diff {
-        path: std::path::PathBuf,
+        path: Option<std::path::PathBuf>,
         old_text: Option<String>,
-        new_text: String,
+        new_text: Option<String>,
     },
     /// How a `shell_execute` child ended. The exit code is already spelled out in the tool text
     /// for the model, but a frontend rendering a terminal needs it as a number, and parsing it back

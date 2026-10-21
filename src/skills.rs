@@ -3359,6 +3359,29 @@ mod tests {
         assert_eq!(names, vec!["zzz", "aaa", "bbb"]);
     }
 
+    /// A write hands back the file as it was and as written, and a delete the file it removed,
+    /// so a caller can report the change without a read of its own.
+    #[test]
+    fn a_write_hands_back_the_file_before_and_after_and_a_delete_what_it_removed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("demo").join("SKILL.md");
+        let created =
+            super::write_skill(temp.path(), "demo", "d", 5, None, Some("one")).expect("create");
+        assert!(created.previous.is_none(), "a create has no before");
+        assert_eq!(
+            created.text,
+            std::fs::read_to_string(&file).expect("read back")
+        );
+        let refined =
+            super::write_skill(temp.path(), "demo", "d", 5, None, Some("two")).expect("rewrite");
+        assert_eq!(refined.previous.as_deref(), Some(created.text.as_str()));
+        assert!(refined.text.contains("two"), "{}", refined.text);
+        let removed = super::delete_skill(temp.path(), "demo").expect("delete");
+        assert_eq!(removed.file, file);
+        assert_eq!(removed.text.as_deref(), Some(refined.text.as_str()));
+        assert!(!removed.dir.exists());
+    }
+
     /// A metadata-only rewrite must not strip attribution the agent was never asked about.
     #[test]
     fn write_skill_preserves_untouched_metadata_and_body() {
@@ -3714,6 +3737,29 @@ mod tests {
         let error = super::write_skill(&root, "sneaky", "d", 5, None, Some("PWNED"))
             .expect_err("must refuse a symlinked file");
         assert!(error.contains("symlink"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read"),
+            "ORIGINAL",
+            "the target must be untouched"
+        );
+    }
+
+    /// A linked skill file is removed as a link, so what it points at is neither the removed
+    /// text nor touched.
+    #[cfg(unix)]
+    #[test]
+    fn delete_reports_no_text_for_a_symlinked_skill_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("skills");
+        let victim = temp.path().join("victim.md");
+        std::fs::create_dir_all(root.join("sneaky")).expect("dir");
+        std::fs::write(&victim, "ORIGINAL").expect("victim");
+        std::os::unix::fs::symlink(&victim, root.join("sneaky").join("SKILL.md")).expect("symlink");
+
+        let removed =
+            super::delete_skill(&root, "sneaky").expect("a linked file is still removable");
+        assert!(removed.text.is_none(), "{:?}", removed.text);
+        assert!(!removed.dir.exists());
         assert_eq!(
             std::fs::read_to_string(&victim).expect("read"),
             "ORIGINAL",

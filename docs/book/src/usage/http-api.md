@@ -731,13 +731,15 @@ Reasoning streams in chunks, one event per chunk, the way `assistant_text.delta`
 |-------|---------|------|
 | `tool_call.composing` | `id`, `name` | The model started writing the call's arguments |
 | `tool_call.executing` | `id`, `name`, `input`, `display_summary` | Tool call starts |
-| `tool_call.completed` | `id`, `is_error`, `content` | Tool call finishes |
+| `tool_call.completed` | `id`, `is_error`, `content`, `change` | Tool call finishes |
 | `progress` | `server_name`, `tool_name`, `tool_use_id`, `progress`, `total`, `message` | An MCP tool reported progress while running |
 | `tool_call.output_delta` | `id`, `chunk` | A running `shell_execute` produced output; append `chunk` to what you show for the call |
 
 `progress` relays an MCP server's `notifications/progress` for a call that is still running: `progress` is the server's counter, `total` its target when it gave one, `message` its text, and `tool_use_id` the `tool_call.executing` the update belongs to. The three optional fields are omitted when the server did not send them. Only MCP tools report progress; a built-in's next sign of life is its `tool_call.completed`, except `shell_execute`, whose output streams as `tool_call.output_delta`.
 
 `tool_call.output_delta` is progress rather than history, and the feed treats it so: it carries no `id`, is never replayed after a reconnect, and never displaces the events a `Last-Event-ID` resumption depends on. Command output is coalesced to about one event per 150 ms per call, whatever is left is flushed just ahead of the call's `tool_call.completed`, and that event still carries the whole output. A command run with `background: true` is not streamed: its call returns at once with a task id, and its output arrives with the task's outcome. What a sub-agent under an `agent_spawn` call is doing is not summarized on the parent's feed: it is [the sub-agent's own feed](#a-sub-agents-feed), every call in full.
+
+`change` is present on the completion of a call that changed a file, a memory or a skill (`file_write`, `file_edit`, `memory_write`, `memory_delete`, `skill_write`, `skill_delete`) and absent otherwise, a failed call included. It carries the whole text before and after as `old` and `new`, with `path` for a file or a skill's `SKILL.md`; a memory's text is what `meka memory export` writes. `old` is omitted when the call created the entry and `new` when it deleted it, so a client can draw the diff itself or show what the entry now says. It is live only: the log keeps no result metadata, so `GET /messages` never carries it, and a reconnect that has fallen past the replay ring cannot recover it.
 
 The arguments are written between `tool_call.composing` and `tool_call.executing` on the same `id`, which makes that interval the only thing on the stream that separates the agent *writing a message* from the agent doing anything else. Assistant text is usually narration around a call rather than the reply itself, and by `tool_call.executing` the arguments are already finished. A client drawing a typing indicator for a tool like an MCP `send_message` raises it on the first and drops it on the second. The payload is the id and the name because nothing else has streamed yet: which conversation a message is for is not known until `tool_call.executing`.
 

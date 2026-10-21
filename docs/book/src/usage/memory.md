@@ -132,6 +132,8 @@ meka memory verify --rebuild    # regenerate it from the table
 | `memory_search` | Ranked full-text search over every memory |
 | `memory_delete` | Remove a memory permanently |
 
+A write or a delete draws what changed as a diff on the screen and in an ACP editor, over the text `meka memory export` writes, so a reworded description is one changed line and a rewritten body shows line by line; the HTTP feed carries the same two texts on `tool_call.completed`.
+
 `memory_read` states how old the memory is and notes that it is a point-in-time observation. A memory recorded months ago is not live state, and an old note asserted as current fact is the failure this guards against. It is also the only thing that increments the read count: a search hit is weaker evidence, and an operator reading through the HTTP API is not the agent recalling anything.
 
 `memory_write` also names an existing memory whose description says close to the same thing, when there is one:

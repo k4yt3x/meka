@@ -948,15 +948,17 @@ where
 pub(super) fn tool_kind_for(name: &str) -> ToolKind {
     match name {
         "file_read" | "checklist_read" => ToolKind::Read,
-        "file_edit" | "file_write" => ToolKind::Edit,
+        // A skill is a file in meka's store, so its change opens the editor's diff view on it.
+        "file_edit" | "file_write" | "skill_write" => ToolKind::Edit,
+        "skill_delete" => ToolKind::Delete,
         "file_find" | "file_search" => ToolKind::Search,
         "shell_execute" => ToolKind::Execute,
         "web_fetch" => ToolKind::Fetch,
         // The list tools plan rather than touch anything, so a client never opens its diff view
         // for them.
         "agent_spawn" | "checklist_add" | "checklist_edit" => ToolKind::Think,
-        // skill, memory_*, scratchpad_*, image_render, tool_load, mcp__*, and any
-        // future built-ins.
+        // skill_read, memory_* (no file for a diff view to open), scratchpad_*, image_render,
+        // tool_load, mcp__*, and any future built-ins.
         _ => ToolKind::Other,
     }
 }
@@ -1050,6 +1052,53 @@ pub(super) fn tool_locations(
     })
     .unwrap_or_default()
 }
+/// The block for a change: the protocol's `diff`, which names a file and its text after the
+/// call, when the change has both, so an editor opens its diff view on the file; otherwise the
+/// change as a unified diff in a `diff` code block, the way a command's output rides in a
+/// `console` one. A memory has no file, and a delete leaves no text, so the protocol's shape
+/// would name a file the editor cannot open or show a deleted skill as a file emptied out.
+pub(super) fn change_content_block(
+    path: Option<std::path::PathBuf>,
+    old_text: Option<String>,
+    new_text: Option<String>,
+) -> ToolCallContent {
+    match (path, new_text) {
+        (Some(path), Some(new_text)) => {
+            let mut diff = Diff::new(path, new_text);
+            if let Some(old) = old_text {
+                diff = diff.old_text(old);
+            }
+            ToolCallContent::Diff(diff)
+        }
+        (path, new_text) => {
+            let diff = similar::TextDiff::from_lines(
+                old_text.as_deref().unwrap_or(""),
+                new_text.as_deref().unwrap_or(""),
+            );
+            let mut unified = diff.unified_diff();
+            // The file lines name the file when there is one; a memory's change is hunks alone,
+            // under a title that already names the memory.
+            if let Some(path) = &path {
+                let path = path.display().to_string();
+                unified.header(&path, "/dev/null");
+            }
+            let fence = fence_for(&unified.to_string());
+            text_content_block(format!("{fence}diff\n{unified}{fence}"))
+        }
+    }
+}
+/// A code fence no line of `text` can close: one backtick longer than the longest run opening a
+/// line, and never shorter than the three a plain block uses. A memory or a skill holds fenced
+/// code of its own, and an unchanged line of it sits behind the one space a diff gives context,
+/// which is indentation a fence may carry, so a three-backtick block would end there.
+fn fence_for(text: &str) -> String {
+    let longest = text
+        .lines()
+        .map(|line| line.trim_start().chars().take_while(|c| *c == '`').count())
+        .max()
+        .unwrap_or(0);
+    "`".repeat(longest.max(2) + 1)
+}
 /// Wrap a string as a plain-text [`ToolCallContent`] block.
 pub(super) fn text_content_block(text: impl Into<String>) -> ToolCallContent {
     ToolCallContent::from(ContentBlock::Text(
@@ -1101,12 +1150,12 @@ pub(super) fn command_signal(metadata: &Option<ToolOutputMetadata>) -> Option<St
 pub(super) fn console_content_block(output: &str) -> ToolCallContent {
     text_content_block(format!("```console\n{}\n```", output.trim_end()))
 }
-/// Build the `content` array of a `tool_call_update` from meka's tool output. A populated `Diff`
-/// metadata wins (so clients like Zed get the structured diff for apply-UI). `shell_execute`
-/// output is wrapped in a `console` code block so editors render it monospaced (mirrors
-/// claude-agent-acp's no-terminal fallback). Other tools pass their text and image blocks through
-/// unchanged, so a tool that looked at an image (`file_read` on a PNG, `image_render`, `web_fetch`)
-/// shows the human the same picture the model saw.
+/// Build the `content` array of a `tool_call_update` from meka's tool output. A change the tool
+/// reported wins: the words the tool wrote about it are the model's, and the change is what the
+/// human reads. `shell_execute` output is wrapped in a `console` code block so editors render it
+/// monospaced (mirrors claude-agent-acp's no-terminal fallback). Other tools pass their text and
+/// image blocks through unchanged, so a tool that looked at an image (`file_read` on a PNG,
+/// `image_render`, `web_fetch`) shows the human the same picture the model saw.
 pub(super) fn build_completion_content(
     tool_name: &str,
     content: &[ToolResultContent],
@@ -1118,11 +1167,7 @@ pub(super) fn build_completion_content(
         new_text,
     }) = metadata
     {
-        let mut diff = Diff::new(path, new_text);
-        if let Some(old) = old_text {
-            diff = diff.old_text(old);
-        }
-        return vec![ToolCallContent::Diff(diff)];
+        return vec![change_content_block(path, old_text, new_text)];
     }
 
     if tool_name == "shell_execute" {

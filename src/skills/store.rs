@@ -129,7 +129,7 @@ pub(crate) fn write_skill(
     priority: u8,
     author: Option<&str>,
     body: Option<&str>,
-) -> Result<Skill, String> {
+) -> Result<WrittenSkill, String> {
     validate_skill_name(name)?;
     // An empty description parses back as a missing required field, so without this a write
     // succeeds and produces a skill that can never be loaded again; the length ceiling is the
@@ -285,14 +285,37 @@ pub(crate) fn write_skill(
         );
         format!("failed to write skill '{name}': {error}")
     })?;
-    Ok(written)
+    Ok(WrittenSkill {
+        skill: written,
+        previous: existing,
+        text: rendered,
+    })
+}
+/// What [`write_skill`] wrote: the skill as its file parses back, with the file's text before and
+/// after, which a frontend draws as the change.
+#[derive(Debug, Clone)]
+pub(crate) struct WrittenSkill {
+    pub(crate) skill: Skill,
+    /// The file as it was; `None` when the write created it.
+    pub(crate) previous: Option<String>,
+    /// The file as written.
+    pub(crate) text: String,
+}
+/// What [`delete_skill`] removed: the directory, the skill file inside it, and that file's text as
+/// it was, which a frontend draws as the change. The text is `None` when the file could not be
+/// read, since a skill meka cannot read is still one it must be able to remove.
+#[derive(Debug, Clone)]
+pub(crate) struct DeletedSkill {
+    pub(crate) dir: PathBuf,
+    pub(crate) file: PathBuf,
+    pub(crate) text: Option<String>,
 }
 /// Delete one skill's whole directory, returning the path removed.
 ///
 /// The directory, not just `SKILL.md`: a skill's bundled scripts and data files are part of it, and
 /// leaving them behind would turn a delete into a broken half-skill that discovery keeps warning
 /// about. Matches `meka skill remove`.
-pub(crate) fn delete_skill(root: &Path, name: &str) -> Result<PathBuf, String> {
+pub(crate) fn delete_skill(root: &Path, name: &str) -> Result<DeletedSkill, String> {
     // Lookup rules, not write rules. A name the spec refuses does not load, but it is still named
     // by the startup warning and by the skipped list, so the door that removes it must accept what
     // the user was just told to remove. See `validate_addressable_name`.
@@ -314,6 +337,14 @@ pub(crate) fn delete_skill(root: &Path, name: &str) -> Result<PathBuf, String> {
     if !dir.is_dir() {
         return Err(format!("skill '{name}' not found"));
     }
+    // Read ahead of the removal, under the same lock, so what is reported removed is what was
+    // removed rather than what a sibling writer put there since. A link is removed as a link, so
+    // the file it points at is not what goes away and is not read.
+    let file = skill_file_in(&dir);
+    let text = std::fs::symlink_metadata(&file)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .and_then(|_| std::fs::read_to_string(&file).ok());
     std::fs::remove_dir_all(&dir).map_err(|error| {
         tracing::warn!(
             "failed to remove skill '{name}' at {path}: {error}",
@@ -321,7 +352,7 @@ pub(crate) fn delete_skill(root: &Path, name: &str) -> Result<PathBuf, String> {
         );
         format!("failed to remove skill '{name}': {error}")
     })?;
-    Ok(dir)
+    Ok(DeletedSkill { dir, file, text })
 }
 /// Render a complete `SKILL.md` in the shape the Agent Skills spec defines. Shared by
 /// [`write_skill`] and [`render_template`] so the frontmatter key order has one owner.

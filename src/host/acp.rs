@@ -846,6 +846,9 @@ mod tests {
         assert_eq!(tool_kind_for("file_read"), ToolKind::Read);
         assert_eq!(tool_kind_for("file_edit"), ToolKind::Edit);
         assert_eq!(tool_kind_for("file_write"), ToolKind::Edit);
+        assert_eq!(tool_kind_for("skill_write"), ToolKind::Edit);
+        assert_eq!(tool_kind_for("skill_delete"), ToolKind::Delete);
+        assert_eq!(tool_kind_for("memory_write"), ToolKind::Other);
         assert_eq!(tool_kind_for("file_find"), ToolKind::Search);
         assert_eq!(tool_kind_for("file_search"), ToolKind::Search);
         assert_eq!(tool_kind_for("shell_execute"), ToolKind::Execute);
@@ -1076,9 +1079,9 @@ mod tests {
     #[test]
     fn build_completion_content_prefers_diff_metadata() {
         let metadata = Some(ToolOutputMetadata::Diff {
-            path: PathBuf::from("/tmp/foo.txt"),
+            path: Some(PathBuf::from("/tmp/foo.txt")),
             old_text: Some("old".to_string()),
-            new_text: "new".to_string(),
+            new_text: Some("new".to_string()),
         });
         let content = vec![ToolResultContent::Text {
             text: "ignored".to_string(),
@@ -1086,6 +1089,62 @@ mod tests {
         let blocks = build_completion_content("file_edit", &content, metadata);
         assert_eq!(blocks.len(), 1);
         assert!(matches!(blocks[0], ToolCallContent::Diff(_)));
+    }
+
+    /// A memory has no file and a delete leaves no text, so neither fits the protocol's diff,
+    /// which names a file and its text after the call: they ride as a unified diff in a code
+    /// block, a delete's naming the file it removed.
+    #[test]
+    fn a_change_without_a_file_or_an_after_is_a_unified_diff_block() {
+        let text_of = |blocks: Vec<ToolCallContent>| -> String {
+            assert_eq!(blocks.len(), 1);
+            let ToolCallContent::Content(chunk) = &blocks[0] else {
+                panic!("expected ToolCallContent::Content; got {:?}", blocks[0]);
+            };
+            let ContentBlock::Text(text) = &chunk.content else {
+                panic!("expected ContentBlock::Text; got {:?}", chunk.content);
+            };
+            text.text.clone()
+        };
+        let memory = build_completion_content(
+            "memory_write",
+            &[],
+            Some(ToolOutputMetadata::Diff {
+                path: None,
+                old_text: Some("a\nb\n".to_string()),
+                new_text: Some("a\nB\n".to_string()),
+            }),
+        );
+        assert_eq!(text_of(memory), "```diff\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n```");
+        let deleted = build_completion_content(
+            "skill_delete",
+            &[],
+            Some(ToolOutputMetadata::Diff {
+                path: Some(PathBuf::from("/s/demo/SKILL.md")),
+                old_text: Some("gone\n".to_string()),
+                new_text: None,
+            }),
+        );
+        assert_eq!(
+            text_of(deleted),
+            "```diff\n--- /s/demo/SKILL.md\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n```"
+        );
+        // A fence on an unchanged line, which the diff prints behind a space, would close a
+        // three-backtick block early; the block's fence outgrows it. An added or removed fence
+        // sits behind its marker and cannot close anything.
+        let fenced = build_completion_content(
+            "memory_write",
+            &[],
+            Some(ToolOutputMetadata::Diff {
+                path: None,
+                old_text: Some("```python\nprint(1)\n```\n".to_string()),
+                new_text: Some("```python\nprint(2)\n```\n".to_string()),
+            }),
+        );
+        assert_eq!(
+            text_of(fenced),
+            "````diff\n@@ -1,3 +1,3 @@\n ```python\n-print(1)\n+print(2)\n ```\n````"
+        );
     }
 
     /// The title opens with the tool's name, the one the screen's indicator and approval prompt

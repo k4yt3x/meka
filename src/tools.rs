@@ -922,12 +922,15 @@ pub(crate) fn builtin_code_param(name: &str) -> Option<(&'static str, &'static s
 }
 
 /// The arguments of a built-in that its reported change already shows: the text a write puts in
-/// a file, the strings an edit swaps. A screen drawing the change leaves these out of the
-/// argument block, where they would say the same thing twice.
+/// a file, the strings an edit swaps, the fields of a memory or a skill its rendering carries. A
+/// screen drawing the change leaves these out of the argument block, where they would say the
+/// same thing twice.
 pub(crate) fn builtin_change_params(name: &str) -> &'static [&'static str] {
     match name {
         "file_write" => &["content"],
         "file_edit" => &["old_string", "new_string"],
+        "memory_write" => &["body", "description", "priority", "tags"],
+        "skill_write" => &["body", "description", "priority"],
         _ => &[],
     }
 }
@@ -1262,6 +1265,30 @@ mod tests {
     /// renaming that parameter silently breaks it, which is why the probe is built from each
     /// tool's declared properties rather than from a fixed list.
     ///
+    /// Every argument the omission table names is one the tool declares, so a renamed parameter
+    /// cannot leave the screen drawing an argument beside the diff that already shows it.
+    #[tokio::test]
+    async fn every_omitted_change_param_is_a_declared_parameter() {
+        let registry = registry_with_every_builtin().await;
+        let loaded: Vec<String> = MCP_META_TOOL_NAMES.iter().map(|n| n.to_string()).collect();
+        let mut listed = 0;
+        for definition in registry.definitions_active_with_loaded(&loaded) {
+            let omitted = builtin_change_params(&definition.name);
+            listed += usize::from(!omitted.is_empty());
+            for key in omitted {
+                assert!(
+                    definition.parameters["properties"].get(*key).is_some(),
+                    "{} omits `{key}` from its argument block, which it does not declare",
+                    definition.name
+                );
+            }
+        }
+        assert_eq!(
+            listed, 4,
+            "the two file tools, memory_write and skill_write"
+        );
+    }
+
     /// The sweep is over the whole registry rather than `BUILTIN_TOOL_NAMES` so that each name
     /// arrives with its real schema, and it asserts at the end that it saw every name, because a
     /// family missing from the registry would otherwise go unexamined.

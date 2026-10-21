@@ -223,16 +223,19 @@ impl Tool for MemoryWriteTool {
             None => None,
         };
 
-        // Read before the write, since the write is what creates the row, and whether there is a
-        // body to keep rather than merely a row: the confirmation would otherwise claim to have
-        // kept the body of a memory that had none.
+        // Read before the write, since the write is what creates the row, and kept whole: the
+        // confirmation needs to know whether there was a body to keep rather than merely a row,
+        // or it would claim to have kept the body of a memory that had none, and the change
+        // reported to the frontend needs what the memory said.
+        let existing = self
+            .memories
+            .get(name)
+            .await
+            .map_err(|error| tool_error("memory_write", error))?;
         let kept_existing_body = body.is_none()
-            && self
-                .memories
-                .get(name)
-                .await
-                .map_err(|error| tool_error("memory_write", error))?
-                .and_then(|existing| existing.body)
+            && existing
+                .as_ref()
+                .and_then(|existing| existing.body.as_deref())
                 .is_some_and(|existing| !existing.trim().is_empty());
 
         // Also before the write, so the incoming description is compared against the store as it
@@ -265,6 +268,13 @@ impl Tool for MemoryWriteTool {
 
         let name = &written.name;
         tracing::info!("saved memory '{name}'");
+        // Both sides rendered as the export writes them, so a reworded description or a moved
+        // priority shows as one changed frontmatter line and a rewritten body as the body.
+        let change = crate::frontend::ToolOutputMetadata::Diff {
+            path: None,
+            old_text: existing.as_ref().map(memory::export_memory),
+            new_text: Some(memory::export_memory(&written)),
+        };
         Ok(ToolOutput::text(
             format!(
                 "Saved memory '{}' (priority {}){}.{}",
@@ -292,7 +302,8 @@ impl Tool for MemoryWriteTool {
                 }
             ),
             false,
-        ))
+        )
+        .with_metadata(change))
     }
 }
 
@@ -1010,20 +1021,30 @@ impl Tool for MemoryDeleteTool {
         // One `DELETE`, and the row carries its own read counts away with it. Separate steps
         // against a second table keyed by name let the doors disagree twice: one leaks the counters
         // the others clear, and one refuses a file the others remove.
-        if !self
+        let Some(removed) = self
             .memories
             .delete(name)
             .await
             .map_err(|error| tool_error("memory_delete", error))?
-        {
+        else {
             return Err(tool_error(
                 "memory_delete",
                 format!("no memory named '{name}'"),
             ));
-        }
+        };
 
         tracing::info!("deleted memory '{name}'");
-        Ok(ToolOutput::text(format!("Deleted memory '{name}'."), false))
+        // The frontend's one chance to show what the note said: the row is gone and no history
+        // table holds it.
+        Ok(
+            ToolOutput::text(format!("Deleted memory '{name}'."), false).with_metadata(
+                crate::frontend::ToolOutputMetadata::Diff {
+                    path: None,
+                    old_text: Some(memory::export_memory(&removed)),
+                    new_text: None,
+                },
+            ),
+        )
     }
 }
 
@@ -1037,6 +1058,78 @@ mod tests {
     /// exercise the same path a session does.
     async fn store() -> Arc<MemoryStore> {
         MemoryStore::for_test().await.expect("in-memory store")
+    }
+
+    /// A write reports what the memory said before and after, rendered the way the export
+    /// writes it, so a reworded description shows as one changed frontmatter line over the same
+    /// body; a create has no before, and a delete has no after.
+    #[tokio::test]
+    async fn a_write_and_a_delete_report_the_memory_before_and_after() {
+        let memories = store().await;
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+        };
+        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        let change = |output: &ToolOutput| match output.frontend_metadata.clone() {
+            Some(crate::frontend::ToolOutputMetadata::Diff {
+                path,
+                old_text,
+                new_text,
+            }) => (path, old_text, new_text),
+            other => panic!("a change is reported: {other:?} {}", output.text_content()),
+        };
+
+        let created = write
+            .execute(
+                serde_json::json!({
+                    "name": "alice-timezone",
+                    "description": "Alice is in Lisbon",
+                    "body": "Since 2024."
+                }),
+                context(),
+            )
+            .await
+            .expect("create");
+        let (path, old, new) = change(&created);
+        assert!(
+            path.is_none() && old.is_none(),
+            "a memory has no file and a create no before"
+        );
+        let new = new.expect("the memory as written");
+        assert!(
+            new.contains("description: Alice is in Lisbon")
+                && new.ends_with("---\n\nSince 2024.\n"),
+            "{new}"
+        );
+
+        let reworded = write
+            .execute(
+                serde_json::json!({"name": "alice-timezone", "description": "Alice lives in Lisbon"}),
+                context(),
+            )
+            .await
+            .expect("update");
+        let (_, old, after) = change(&reworded);
+        assert_eq!(
+            old.as_deref(),
+            Some(new.as_str()),
+            "the before is what the create wrote"
+        );
+        let after = after.expect("the memory as rewritten");
+        assert!(
+            after.contains("description: Alice lives in Lisbon")
+                && after.ends_with("---\n\nSince 2024.\n"),
+            "{after}"
+        );
+
+        let delete = MemoryDeleteTool { memories };
+        let deleted = delete
+            .execute(serde_json::json!({"name": "alice-timezone"}), context())
+            .await
+            .expect("delete");
+        let (_, old, new) = change(&deleted);
+        assert_eq!(old.as_deref(), Some(after.as_str()));
+        assert!(new.is_none(), "a delete has no after");
     }
 
     #[tokio::test]

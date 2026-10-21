@@ -1288,20 +1288,26 @@ impl MemoryStore {
             .map_err(|error| MekaError::Database(format!("failed to write memory body: {error}")))
     }
 
-    /// Delete one memory. `false` when there was none by that name.
+    /// Delete one memory, returning the row removed. `None` when there was none by that name.
     ///
-    /// The triggers take its FTS rows and the row itself carries its own read counts away, so
-    /// there is nothing else to clean up and no orphan class to prune; a second table keyed by
-    /// name would leave both.
-    pub(crate) async fn delete(&self, name: &str) -> Result<bool> {
+    /// One statement: the row comes back from the `DELETE` itself, so what a caller reports as
+    /// removed is what the statement removed, with no second read for a sibling writer to slip
+    /// between. The triggers take its FTS rows and the row itself carries its own read counts
+    /// away, so there is nothing else to clean up and no orphan class to prune; a second table
+    /// keyed by name would leave both.
+    pub(crate) async fn delete(&self, name: &str) -> Result<Option<Memory>> {
         let name = name.to_string();
         self.writable()?
             .call(move |connection| -> rusqlite::Result<_> {
-                Ok(connection
-                    .execute("DELETE FROM memories WHERE name = ?1", rusqlite::params![
-                        name
-                    ])?
-                    > 0)
+                connection
+                    .query_row(
+                        "DELETE FROM memories WHERE name = ?1
+                         RETURNING name, description, tags, priority, created_at, updated_at,
+                                   read_count, body",
+                        rusqlite::params![name],
+                        row_to_memory,
+                    )
+                    .optional()
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to delete memory: {error}")))
@@ -1786,8 +1792,21 @@ mod tests {
         );
         store.integrity_check().await.expect("after an update");
 
-        // And the delete reached it too, taking the body's posting list with it.
-        assert!(store.delete("policy").await.expect("delete"));
+        // And the delete reached it too, taking the body's posting list with it, and handing
+        // back the row it took.
+        let removed = store
+            .delete("policy")
+            .await
+            .expect("delete")
+            .expect("the row removed");
+        assert_eq!(removed.name, "policy");
+        assert!(
+            removed
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains("xylophone")),
+            "{removed:?}"
+        );
         let body = Terms::parse(&["xylophone".to_string()]);
         assert!(
             store
@@ -1800,7 +1819,7 @@ mod tests {
         );
         store.integrity_check().await.expect("after a delete");
         assert!(
-            !store.delete("policy").await.expect("delete"),
+            store.delete("policy").await.expect("delete").is_none(),
             "already gone"
         );
     }

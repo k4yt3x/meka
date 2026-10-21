@@ -1598,9 +1598,9 @@ impl Tool for EditFileTool {
             false,
         )
         .with_metadata(crate::frontend::ToolOutputMetadata::Diff {
-            path: canonical.clone(),
+            path: Some(canonical.clone()),
             old_text: Some(content),
-            new_text: new_content,
+            new_text: Some(new_content),
         }))
     }
 }
@@ -1837,9 +1837,9 @@ impl Tool for WriteFileTool {
             false,
         )
         .with_metadata(crate::frontend::ToolOutputMetadata::Diff {
-            path: target,
+            path: Some(target),
             old_text,
-            new_text: content.to_string(),
+            new_text: Some(content.to_string()),
         }))
     }
 }

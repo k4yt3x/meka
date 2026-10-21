@@ -36,13 +36,13 @@ pub(crate) struct Settings {
     pub(crate) turn_end_summary: Vec<TurnEndFact>,
 }
 
-/// What a call changed on disk, as the tool reported it: the file, what it held before (`None`
-/// for a file the call created), and what it holds now. The screen draws the two as a diff.
+/// What a call changed, as the tool reported it: what the entry held before (`None` when the
+/// call created it) and what it holds now (`None` when the call deleted it). A file, a skill
+/// file or a memory alike; the screen draws the two as a diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FileChange {
-    pub(crate) path: String,
+pub(crate) struct TextChange {
     pub(crate) old: Option<String>,
-    pub(crate) new: String,
+    pub(crate) new: Option<String>,
 }
 
 /// Where a tool call is in its life.
@@ -99,7 +99,7 @@ pub(crate) enum Item {
         /// An MCP server's progress line for the running call.
         progress: Option<String>,
         /// The file the call changed, when it reported one; drawn in place of the result's text.
-        change: Option<FileChange>,
+        change: Option<TextChange>,
     },
     Checklist {
         items: Vec<ChecklistItem>,
@@ -1069,16 +1069,13 @@ impl Transcript {
                         *result_images = images;
                         *state = ToolState::Done { is_error };
                         *progress = None;
-                        // A call that failed changed nothing, whatever it reports.
-                        if !is_error
-                            && let Some(crate::frontend::ToolOutputMetadata::Diff {
-                                path,
-                                old_text,
-                                new_text,
-                            }) = metadata
+                        if let Some(crate::frontend::ToolOutputMetadata::Diff {
+                            old_text,
+                            new_text,
+                            ..
+                        }) = metadata
                         {
-                            *change = Some(FileChange {
-                                path: path.display().to_string(),
+                            *change = Some(TextChange {
                                 old: old_text,
                                 new: new_text,
                             });
@@ -1493,16 +1490,16 @@ pub(super) fn keep_tail(text: &mut String, keep: usize) {
 
 /// The change a replayed call stands for, from its input alone, since the log keeps no result
 /// metadata: a tool declared to replace one parameter's text with another's is wholly described
-/// by the two. A write's old content was never recorded, so a write stands for no change here.
-fn change_from_input(name: &str, input: &serde_json::Value) -> Option<FileChange> {
+/// by the two. A write's old content was never recorded, nor a deleted entry's, so those stand
+/// for no change here.
+fn change_from_input(name: &str, input: &serde_json::Value) -> Option<TextChange> {
     let &[old, new] = crate::tools::builtin_change_params(name) else {
         return None;
     };
     let text = |key: &str| input.get(key)?.as_str().map(str::to_string);
-    Some(FileChange {
-        path: text("path")?,
+    Some(TextChange {
         old: Some(text(old)?),
-        new: text(new)?,
+        new: Some(text(new)?),
     })
 }
 
@@ -1610,44 +1607,45 @@ mod tests {
         ));
     }
 
-    /// A file tool's result carries what the file held before and after; the transcript keeps
-    /// the two as the call's change, and keeps nothing when the call failed.
+    /// A tool's result carries what the entry held before and after; the transcript keeps the
+    /// two as the call's change, a deleted entry's with no after.
     #[test]
-    fn a_file_edit_keeps_the_change_it_reported() {
-        let started = || FrontendEvent::ToolCallStarted {
+    fn a_call_keeps_the_change_it_reported() {
+        let started = |name: &str| FrontendEvent::ToolCallStarted {
             id: "call-1".into(),
-            name: "file_edit".into(),
+            name: name.into(),
             input: serde_json::json!({"path": "/tmp/hello.py"}),
             display_summary: None,
         };
-        let completed = |is_error: bool| FrontendEvent::ToolCallCompleted {
+        let completed = |name: &str, new_text: Option<&str>| FrontendEvent::ToolCallCompleted {
             id: "call-1".into(),
-            name: "file_edit".into(),
-            is_error,
+            name: name.into(),
+            is_error: false,
             content: vec![ToolResultContent::Text {
-                text: "Successfully edited".into(),
+                text: "done".into(),
             }],
             metadata: Some(crate::frontend::ToolOutputMetadata::Diff {
-                path: std::path::PathBuf::from("/tmp/hello.py"),
+                path: Some(std::path::PathBuf::from("/tmp/hello.py")),
                 old_text: Some("a\nb\n".into()),
-                new_text: "a\nB\n".into(),
+                new_text: new_text.map(str::to_string),
             }),
         };
         let mut edited = transcript();
-        edited.apply(started());
-        edited.apply(completed(false));
+        edited.apply(started("file_edit"));
+        edited.apply(completed("file_edit", Some("a\nB\n")));
         assert!(matches!(
             items(&edited)[0],
-            Item::ToolCall { change: Some(FileChange { path, old: Some(old), new, .. }), .. }
-                if path == "/tmp/hello.py" && old == "a\nb\n" && new == "a\nB\n"
+            Item::ToolCall { change: Some(TextChange { old: Some(old), new: Some(new) }), .. }
+                if old == "a\nb\n" && new == "a\nB\n"
         ));
-        let mut failed = transcript();
-        failed.apply(started());
-        failed.apply(completed(true));
-        assert!(matches!(items(&failed)[0], Item::ToolCall {
-            change: None,
-            ..
-        }));
+        let mut deleted = transcript();
+        deleted.apply(started("skill_delete"));
+        deleted.apply(completed("skill_delete", None));
+        assert!(matches!(
+            items(&deleted)[0],
+            Item::ToolCall { change: Some(TextChange { old: Some(old), new: None }), .. }
+                if old == "a\nb\n"
+        ));
     }
 
     /// A prompt posted to the inbox stays pending until the loop names its id.
@@ -1795,10 +1793,9 @@ mod tests {
         });
         assert_eq!(
             replay("file_edit", edit.clone(), false),
-            Some(FileChange {
-                path: "/tmp/hello.py".into(),
+            Some(TextChange {
                 old: Some("a\n".into()),
-                new: "b\n".into(),
+                new: Some("b\n".into()),
             })
         );
         assert_eq!(
@@ -1814,6 +1811,15 @@ mod tests {
             ),
             None,
             "a write's old content is not on record"
+        );
+        assert_eq!(
+            replay(
+                "memory_write",
+                serde_json::json!({"name": "note", "body": "all"}),
+                false
+            ),
+            None,
+            "a memory's old text is not on record either"
         );
     }
 

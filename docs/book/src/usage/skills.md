@@ -342,6 +342,8 @@ Notes on how it behaves:
   by default, and your config directory being in version control, is the safety net for that case.
 - `skill_delete` removes the whole skill directory, including any bundled files, matching
   `meka skill remove`.
+- Both tools report the `SKILL.md` before and after: the screen and ACP editors draw it as a
+  diff, and the HTTP feed carries the two texts on `tool_call.completed`.
 
 ## Tips
 

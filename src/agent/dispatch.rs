@@ -625,6 +625,15 @@ impl Agent {
         match tool.execute(input.clone(), context).await {
             Ok(output) => crate::tools::ToolOutput {
                 is_output: !output.is_error || tool.reports_failure_as_output(),
+                // A failed call changed nothing, whatever it reports, and every frontend's
+                // completion event is built from what leaves here. How a command ended is a fact
+                // about the failure itself and stays.
+                frontend_metadata: match output.frontend_metadata {
+                    Some(crate::frontend::ToolOutputMetadata::Diff { .. }) if output.is_error => {
+                        None
+                    }
+                    metadata => metadata,
+                },
                 ..output
             },
             Err(MekaError::Interrupted) => {
@@ -1066,6 +1075,107 @@ mod tests {
             frontend.permission_requests().is_empty(),
             "nobody is asked to approve a call that is refused anyway: {:?}",
             frontend.permission_requests()
+        );
+    }
+
+    /// A failed call changed nothing, whatever it reports: the change a tool attached to a
+    /// failure is dropped at the result door, so no frontend draws it; a success keeps its own,
+    /// and a failed command keeps how it ended, which is a fact about the failure.
+    #[tokio::test]
+    async fn a_failed_call_carries_no_change() {
+        struct Fixture {
+            fails: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for Fixture {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "change_thing".to_string(),
+                    description: "fixture".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                    ..Default::default()
+                }
+            }
+
+            fn required_permission(&self) -> crate::permission::Permission {
+                crate::permission::Permission::Read
+            }
+
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _context: crate::tools::ToolContext,
+            ) -> crate::error::Result<crate::tools::ToolOutput> {
+                Ok(
+                    crate::tools::ToolOutput::text("ran".to_string(), self.fails).with_metadata(
+                        crate::frontend::ToolOutputMetadata::Diff {
+                            path: None,
+                            old_text: Some("before".to_string()),
+                            new_text: Some("after".to_string()),
+                        },
+                    ),
+                )
+            }
+        }
+
+        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        let failed =
+            Agent::run_tool(&Fixture { fails: true }, &serde_json::json!({}), context()).await;
+        assert!(failed.is_error);
+        assert!(
+            failed.frontend_metadata.is_none(),
+            "{:?}",
+            failed.frontend_metadata
+        );
+        let succeeded =
+            Agent::run_tool(&Fixture { fails: false }, &serde_json::json!({}), context()).await;
+        assert!(succeeded.frontend_metadata.is_some());
+
+        struct Exited;
+
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for Exited {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "exit_thing".to_string(),
+                    description: "fixture".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                    ..Default::default()
+                }
+            }
+
+            fn required_permission(&self) -> crate::permission::Permission {
+                crate::permission::Permission::Read
+            }
+
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _context: crate::tools::ToolContext,
+            ) -> crate::error::Result<crate::tools::ToolOutput> {
+                Ok(
+                    crate::tools::ToolOutput::text("exit 7".to_string(), true).with_metadata(
+                        crate::frontend::ToolOutputMetadata::CommandExit {
+                            exit_code: Some(7),
+                            signal: None,
+                        },
+                    ),
+                )
+            }
+        }
+
+        let exited = Agent::run_tool(&Exited, &serde_json::json!({}), context()).await;
+        assert!(
+            matches!(
+                exited.frontend_metadata,
+                Some(crate::frontend::ToolOutputMetadata::CommandExit {
+                    exit_code: Some(7),
+                    ..
+                })
+            ),
+            "{:?}",
+            exited.frontend_metadata
         );
     }
 

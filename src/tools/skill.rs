@@ -423,20 +423,6 @@ impl Tool for SkillWriteTool {
                 }
             },
         };
-        // Read before the write, since the write is what makes the file exist, and whether there is
-        // a body to keep rather than merely a file: the confirmation would otherwise claim to have
-        // kept the body of a skill that had none.
-        let kept_existing_body = match existing {
-            Some(skill) if body.is_none() => tokio::fs::read_to_string(&skill.body_path)
-                .await
-                .ok()
-                .and_then(|text| {
-                    crate::entry::split_frontmatter(&text).map(|(_, body)| body.to_string())
-                })
-                .is_some_and(|body| !body.trim().is_empty()),
-            _ => false,
-        };
-
         // On the blocking pool, for the same reason `memory_write` is: the write goes through
         // `write_file_atomic`, which `fsync`s, and a `fsync` parks the calling thread for as long
         // as the filesystem takes. On a runtime worker that is every other session's turn waiting.
@@ -470,7 +456,21 @@ impl Tool for SkillWriteTool {
         // dispatcher flow writes a skill and hands it to `agent_spawn(skill:)` in the same turn.
         self.skills.invalidate().await;
 
-        let path = written.body_path.display();
+        let skills::WrittenSkill {
+            skill,
+            previous,
+            text,
+        } = written;
+        // From the text the write read under its lock: whether there was a body to keep rather
+        // than merely a file, or the confirmation would claim to have kept the body of a skill
+        // that had none.
+        let kept_existing_body = body.is_none()
+            && previous
+                .as_deref()
+                .and_then(crate::entry::split_frontmatter)
+                .is_some_and(|(_, body)| !body.trim().is_empty());
+
+        let path = skill.body_path.display();
         tracing::info!("saved skill to {path}");
         Ok(ToolOutput::text(
             // The rank the *file* now carries, read back from the bytes rather than echoed from
@@ -481,7 +481,7 @@ impl Tool for SkillWriteTool {
                 "Saved skill '{}' (priority {}){}. From the next turn on you can load it with \
                  skill_read, or hand it to a worker with agent_spawn(skill: \"{}\").",
                 name,
-                written.priority,
+                skill.priority,
                 if kept_existing_body {
                     ", keeping the existing body"
                 } else {
@@ -490,7 +490,12 @@ impl Tool for SkillWriteTool {
                 name
             ),
             false,
-        ))
+        )
+        .with_metadata(crate::frontend::ToolOutputMetadata::Diff {
+            path: Some(skill.body_path),
+            old_text: previous,
+            new_text: Some(text),
+        }))
     }
 }
 
@@ -564,7 +569,7 @@ impl Tool for SkillDeleteTool {
             ));
         }
 
-        let dir =
+        let removed =
             skills::delete_skill(&root, &name).map_err(|message| MekaError::ToolExecution {
                 tool_name: "skill_delete".to_string(),
                 message,
@@ -572,12 +577,22 @@ impl Tool for SkillDeleteTool {
         // See the note in `skill_write`: the index must not keep listing a skill that is gone.
         self.skills.invalidate().await;
 
-        let path = dir.display();
+        let path = removed.dir.display();
         tracing::info!("deleted skill {path}");
-        Ok(ToolOutput::text(
+        let output = ToolOutput::text(
             format!("Deleted skill '{name}' and everything in its directory."),
             false,
-        ))
+        );
+        // The frontend's one chance to show what the skill said: the file is gone. A skill whose
+        // file could not be read is reported removed with no change to draw.
+        Ok(match removed.text {
+            Some(text) => output.with_metadata(crate::frontend::ToolOutputMetadata::Diff {
+                path: Some(removed.file),
+                old_text: Some(text),
+                new_text: None,
+            }),
+            None => output,
+        })
     }
 }
 
@@ -764,6 +779,55 @@ mod tests {
             !message.contains("does not exist") && !message.contains("is required to create it"),
             "a skill whose file is on disk must not be reported as absent: {message}"
         );
+    }
+
+    /// The tools report the skill file before and after, with its path, a delete with no after,
+    /// so every surface draws the change.
+    #[tokio::test]
+    async fn a_write_and_a_delete_report_the_file_before_and_after() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("skills");
+        std::fs::create_dir_all(&root).expect("root");
+        let skills = SkillCache::new(Some(root.clone()), Vec::new());
+        let write = SkillWriteTool {
+            skills: skills.clone(),
+        };
+        let change = |output: &ToolOutput| match output.frontend_metadata.clone() {
+            Some(crate::frontend::ToolOutputMetadata::Diff {
+                path,
+                old_text,
+                new_text,
+            }) => (path, old_text, new_text),
+            other => panic!("a change is reported: {other:?} {}", output.text_content()),
+        };
+        let file = root.join("demo").join("SKILL.md");
+
+        let created = run(
+            &write,
+            serde_json::json!({"name": "demo", "description": "d", "body": "one"}),
+        )
+        .await;
+        assert!(!created.is_error, "{}", created.text_content());
+        let (path, old, new) = change(&created);
+        assert_eq!(path.as_deref(), Some(file.as_path()));
+        assert!(old.is_none(), "a create has no before");
+        let new = new.expect("the file as written");
+        assert_eq!(new, std::fs::read_to_string(&file).expect("read back"));
+
+        let refined = run(&write, serde_json::json!({"name": "demo", "body": "two"})).await;
+        assert!(!refined.is_error, "{}", refined.text_content());
+        let (_, old, after) = change(&refined);
+        assert_eq!(old.as_deref(), Some(new.as_str()));
+        let after = after.expect("the file as rewritten");
+        assert!(after.contains("two"), "{after}");
+
+        let delete = SkillDeleteTool { skills };
+        let deleted = run(&delete, serde_json::json!({"name": "demo"})).await;
+        assert!(!deleted.is_error, "{}", deleted.text_content());
+        let (path, old, new) = change(&deleted);
+        assert_eq!(path.as_deref(), Some(file.as_path()));
+        assert_eq!(old.as_deref(), Some(after.as_str()));
+        assert!(new.is_none(), "a delete has no after");
     }
 
     /// A non-string `body` is refused, not read as "leave it alone": `as_str` would put

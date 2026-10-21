@@ -283,15 +283,29 @@ pub(crate) fn translate(
             id,
             is_error,
             content,
+            metadata,
             ..
-        } => (
-            SseEventType::ToolCallCompleted,
-            serde_json::json!({
+        } => {
+            let mut data = serde_json::json!({
                 "id": id,
                 "is_error": is_error,
                 "content": tool_result_content_view(&content),
-            }),
-        ),
+            });
+            // Omitted, not `null`, for a call that changed nothing, like every optional field.
+            if let Some(crate::frontend::ToolOutputMetadata::Diff {
+                path,
+                old_text,
+                new_text,
+            }) = metadata
+            {
+                data["change"] = serde_json::json!(ChangeView {
+                    path: path.map(|path| path.display().to_string()),
+                    old: old_text,
+                    new: new_text,
+                });
+            }
+            (SseEventType::ToolCallCompleted, data)
+        }
         // The whole open list, as the session record carries it, so a client that shows the
         // list replaces rather than patches; empty once everything is disposed of.
         FrontendEvent::ChecklistUpdated { items } => (
@@ -392,6 +406,19 @@ impl From<ProgressUpdate> for ProgressView {
             message: update.message,
         }
     }
+}
+
+/// A call's change on `tool_call.completed`: the whole text before and after. `path` is absent
+/// for a memory, which has no file; `old` for an entry the call created; `new` for one it deleted;
+/// each omitted rather than `null`.
+#[derive(Debug, Serialize)]
+struct ChangeView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -538,6 +565,51 @@ mod tests {
         assert!(
             data.get("display_summary").is_none(),
             "an absent summary must be omitted, not null: {data}"
+        );
+    }
+
+    /// A call that changed an entry carries the text before and after on its completion, an
+    /// absent side omitted rather than `null`; a call that changed nothing carries no field.
+    #[test]
+    fn translate_tool_call_completed_carries_the_change() {
+        let completed = |metadata| FrontendEvent::ToolCallCompleted {
+            id: "tu_1".into(),
+            name: "memory_write".into(),
+            is_error: false,
+            content: vec![crate::conversation::ToolResultContent::Text {
+                text: "Saved".into(),
+            }],
+            metadata,
+        };
+        let translated = |metadata| {
+            translate(completed(metadata), SessionCapabilities::default()).expect("translates")
+        };
+        let (event_type, data) = translated(Some(crate::frontend::ToolOutputMetadata::Diff {
+            path: None,
+            old_text: None,
+            new_text: Some("---\ndescription: d\n---\n\nbody\n".into()),
+        }));
+        assert_eq!(event_type, SseEventType::ToolCallCompleted);
+        assert_eq!(data["change"]["new"], "---\ndescription: d\n---\n\nbody\n");
+        assert!(
+            data["change"].get("path").is_none() && data["change"].get("old").is_none(),
+            "a memory has no file and a create no before: {data}"
+        );
+        let (_, data) = translated(Some(crate::frontend::ToolOutputMetadata::Diff {
+            path: Some("/s/demo/SKILL.md".into()),
+            old_text: Some("gone\n".into()),
+            new_text: None,
+        }));
+        assert_eq!(data["change"]["path"], "/s/demo/SKILL.md");
+        assert_eq!(data["change"]["old"], "gone\n");
+        assert!(
+            data["change"].get("new").is_none(),
+            "a delete has no after: {data}"
+        );
+        let (_, data) = translated(None);
+        assert!(
+            data.get("change").is_none(),
+            "a call that changed nothing carries no field: {data}"
         );
     }
 

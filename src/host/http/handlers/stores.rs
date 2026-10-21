@@ -532,15 +532,16 @@ pub(crate) async fn delete_memory(
     AxumPath(name): AxumPath<String>,
 ) -> Result<StatusCode, ProblemDetail> {
     crate::memory::validate_memory_lookup(&name).map_err(store_error)?;
-    // 404 from `rows_affected`, not from a pre-check. As separate statements a name can stop
-    // existing between them, and this endpoint then answers 422 `invalid-body` for something
-    // already gone, which a client switching on `type` reads as "fix your request".
-    if !state
+    // 404 from the statement's own answer, not from a pre-check. As separate statements a name
+    // can stop existing between them, and this endpoint then answers 422 `invalid-body` for
+    // something already gone, which a client switching on `type` reads as "fix your request".
+    if state
         .shared
         .memories
         .delete(&name)
         .await
         .map_err(memory_failure)?
+        .is_none()
     {
         return Err(not_found("memory", &name));
     }

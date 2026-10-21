@@ -107,7 +107,11 @@ fn tool_body(item: &Item, expanded: bool, width: usize) -> Vec<Line<'static>> {
         // are the model's.
         Some(_) if change.is_some() && !failed => {
             if let Some(change) = change {
-                let (diff, _) = draw::diff_rows(change.old.as_deref(), &change.new, inner);
+                let (diff, _) = draw::diff_rows(
+                    change.old.as_deref(),
+                    change.new.as_deref().unwrap_or(""),
+                    inner,
+                );
                 rows.extend(diff);
             }
         }
@@ -265,7 +269,14 @@ pub(crate) fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
             let stat = change
                 .as_ref()
                 .filter(|_| *state != ToolState::Done { is_error: true })
-                .map(|change| draw::diff_rows(change.old.as_deref(), &change.new, width).1);
+                .map(|change| {
+                    draw::diff_rows(
+                        change.old.as_deref(),
+                        change.new.as_deref().unwrap_or(""),
+                        width,
+                    )
+                    .1
+                });
             // The arguments are shown in full under the row when the call is expanded; the row
             // then carries no summary, which would say the same thing twice.
             let summary = match state {
@@ -1329,10 +1340,9 @@ mod tests {
             };
         let command = serde_json::json!({ "command": format!("\trun --flag={token} {address}") });
         let edit = serde_json::json!({ "path": format!("{token}.rs"), "old_string": "a", "new_string": "b" });
-        let change = super::super::model::FileChange {
-            path: format!("{token}.rs"),
+        let change = super::super::model::TextChange {
             old: Some(format!("old {token}\n")),
-            new: format!("new {address}\n\tsecond {token}\n"),
+            new: Some(format!("new {address}\n\tsecond {token}\n")),
         };
         let items = vec![
             Item::Prompt {
@@ -1613,10 +1623,9 @@ mod tests {
             result_images: 0,
             activity: String::new(),
             progress: None,
-            change: Some(super::super::model::FileChange {
-                path: "hello.py".into(),
+            change: Some(super::super::model::TextChange {
                 old: Some("import sys\nprint(\"Hello, World!\")\nsys.exit(0)\n".into()),
-                new: "import sys\nprint(\"Hello, world!\")\nsys.exit(0)\n".into(),
+                new: Some("import sys\nprint(\"Hello, world!\")\nsys.exit(0)\n".into()),
             }),
         };
         let collapsed = plain(&entry_lines(&entry(item.clone(), false), 60));
@@ -1642,10 +1651,9 @@ mod tests {
             result_images: 0,
             activity: String::new(),
             progress: None,
-            change: Some(super::super::model::FileChange {
-                path: "big.py".into(),
+            change: Some(super::super::model::TextChange {
                 old: None,
-                new: (1..=60).map(|n| format!("line {n}\n")).collect(),
+                new: Some((1..=60).map(|n| format!("line {n}\n")).collect()),
             }),
         };
         let collapsed = plain(&entry_lines(&entry(rewrite, false), 60));
@@ -1671,6 +1679,59 @@ mod tests {
             expanded.iter().any(|row| row == "  │ path: hello.py")
                 && !expanded.iter().any(|row| row.contains("old_string")),
             "the arguments the diff already shows are left out of the block: {expanded:?}"
+        );
+    }
+
+    /// A delete draws every line it removed, in red with its old number, and a memory's change
+    /// leaves the fields the diff shows out of the argument block, the way a file's does.
+    #[test]
+    fn a_delete_draws_every_line_removed() {
+        let item = Item::ToolCall {
+            id: "1".into(),
+            name: "memory_delete".into(),
+            input: Some(serde_json::json!({"name": "alice-timezone"})),
+            summary: Some("alice-timezone".into()),
+            state: ToolState::Done { is_error: false },
+            output: String::new(),
+            result: Some("Deleted memory 'alice-timezone'.".into()),
+            result_images: 0,
+            activity: String::new(),
+            progress: None,
+            change: Some(super::super::model::TextChange {
+                old: Some("---\ndescription: Alice is in Lisbon\n---\n\nSince 2024.\n".into()),
+                new: None,
+            }),
+        };
+        let collapsed = plain(&entry_lines(&entry(item, false), 60));
+        assert_eq!(collapsed, vec![
+            "• memory_delete alice-timezone  +0 -5",
+            "  └ 1 - ---",
+            "    2 - description: Alice is in Lisbon",
+            "    3 - ---",
+            "    4 -",
+            "    5 - Since 2024.",
+        ]);
+        let write = Item::ToolCall {
+            id: "2".into(),
+            name: "memory_write".into(),
+            input: Some(serde_json::json!({"name": "alice-timezone", "body": "Since 2025."})),
+            summary: Some("alice-timezone".into()),
+            state: ToolState::Done { is_error: false },
+            output: String::new(),
+            result: Some("Saved memory".into()),
+            result_images: 0,
+            activity: String::new(),
+            progress: None,
+            change: Some(super::super::model::TextChange {
+                old: Some("Since 2024.\n".into()),
+                new: Some("Since 2025.\n".into()),
+            }),
+        };
+        let expanded = plain(&entry_lines(&entry(write, true), 60));
+        assert!(
+            expanded.iter().any(|row| row == "  │ name: alice-timezone")
+                && !expanded.iter().any(|row| row.contains("body")),
+            "the fields the diff already shows are left out of the block: {expanded:?}"
         );
     }
 

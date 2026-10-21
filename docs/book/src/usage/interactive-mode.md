@@ -107,11 +107,14 @@ three, each cut at the edge, and a count of the rest, so a listing shows its hea
 and a file its first lines, while what a tool wrote for the model after its payload is counted
 rather than shown. A
 call that failed says `failed:` in red there. A shell command is highlighted as code on the row.
-A call that changed a file (`file_write`, `file_edit`) draws the change as a diff in place of
-the words the tool wrote: the line before, the line taken out in red with its old number, the
-line put in in green with its new number, the line after, and `…` between hunks; its row counts
-the change, `+1 -1`, and the arguments the diff already shows are left out of its expanded
-block. Collapsed, a change gets twenty rows rather than the three of plain output, so a small
+A call that changed a file, a memory or a skill (`file_write`, `file_edit`, `memory_write`,
+`skill_write` and the two deletes) draws the change as a diff in place of the words the tool
+wrote: the line before, the line taken out in red with its old number, the line put in in green
+with its new number, the line after, and `…` between hunks; its row counts the change, `+1 -1`,
+and the arguments the diff already shows are left out of its expanded block. A memory's diff is
+over the text `meka memory export` writes, so a reworded description is one changed line of
+frontmatter, and a delete is every line in red.
+Collapsed, a change gets twenty rows rather than the three of plain output, so a small
 edit shows whole and a rewrite shows its first rows and a count. Either expands to the whole thing: the full reasoning, or every argument of the call
 wrapped in full and all of its output. The row drops its summary once the arguments are under it; they hang
 on a `│` bar from the row down to the `└` of the result, a shell command first, behind `$`,

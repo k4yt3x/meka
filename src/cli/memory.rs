@@ -448,7 +448,7 @@ pub(crate) async fn run_remove(store: &MemoryStore, name: &str) -> Result<()> {
     // The lookup rule, not the write rule. Refusing to *delete* a name this store would not have
     // written is what left a row nothing meka ships could remove.
     memory::validate_memory_lookup(name).map_err(MekaError::Usage)?;
-    if !store.delete(name).await? {
+    if store.delete(name).await?.is_none() {
         return Err(MekaError::Usage(format!("no memory named '{name}'")));
     }
     tracing::info!("removed memory '{name}'");
