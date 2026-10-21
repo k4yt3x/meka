@@ -1008,8 +1008,8 @@ impl ProviderErrorBody {
 }
 
 /// The codes a backend documents as "the account cannot pay for this now": what the Codex client
-/// reads off a 429 (`references/codex/codex-rs/codex-api/src/api_bridge.rs`), which covers the
-/// OpenAI platform's `insufficient_quota` as well. A message's words are never read: an
+/// reads off a 429 (`.local/references/codex/codex-rs/codex-api/src/api_bridge.rs`), which covers
+/// the OpenAI platform's `insufficient_quota` as well. A message's words are never read: an
 /// Anthropic API key over its limit answers a 400 `invalid_request_error` with the reset in prose
 /// alone, and that stays a permanent error.
 fn is_exhaustion_code(word: &str) -> bool {
