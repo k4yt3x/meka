@@ -402,7 +402,7 @@ const MIGRATIONS: &[Migration] = &[
         name: "subagent_specs_name_their_allow_lists",
         step: Step::Rust(subagent_specs_name_their_allow_lists),
     },
-    // 0.82 lets a memory say how it loads, what it depends on, where it came from, when it was
+    // 0.83 lets a memory say how it loads, what it depends on, where it came from, when it was
     // last verified and when it expires. A row written before the columns loads by its priority,
     // since priority 0 was the inline band, and is verified as of its creation, since nothing
     // has verified it since.

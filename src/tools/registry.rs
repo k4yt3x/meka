@@ -391,6 +391,7 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "session_search",
     "shell_execute",
     "skill_delete",
+    "skill_edit",
     "skill_read",
     "skill_search",
     "skill_write",
@@ -1271,6 +1272,9 @@ impl ToolRegistry {
                 self.register_builtin(Arc::new(skill::SkillWriteTool {
                     skills: skills.clone(),
                 }));
+                self.register_builtin(Arc::new(skill::SkillEditTool {
+                    skills: skills.clone(),
+                }));
                 self.register_builtin(Arc::new(skill::SkillDeleteTool { skills }));
             }
         }
@@ -2149,6 +2153,7 @@ mod tests {
         );
         assert!(registry.get("skill_search").is_some());
         assert!(registry.get("skill_write").is_none());
+        assert!(registry.get("skill_edit").is_none());
         assert!(registry.get("skill_delete").is_none());
     }
 

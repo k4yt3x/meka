@@ -1151,7 +1151,7 @@ Controls the skill store. See the [Skills](../usage/skills.md) guide.
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Register `skill_read` / `skill_search` and render the skills index |
-| `agent_managed` | bool | `false` | Additionally register `skill_write` / `skill_delete` |
+| `agent_managed` | bool | `false` | Additionally register `skill_write`, `skill_edit` and `skill_delete` |
 | `additional_directories` | array | `[]` | Directories to scan beyond meka's own store, read-only |
 
 ```toml

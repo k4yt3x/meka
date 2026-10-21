@@ -1067,11 +1067,11 @@ pub(crate) async fn load_skill_body(skill: &Skill) -> Result<String, String> {
         .await
         .map_err(|error| format!("failed to read {}: {}", skill.body_path.display(), error))?;
 
-    let body = split_frontmatter(&content)
-        .map(|(_, body)| body.to_string())
-        .unwrap_or(content);
-
-    Ok(format!("{}\n\n{}", skill_context_header(skill), body))
+    Ok(format!(
+        "{}\n\n{}",
+        skill_context_header(skill),
+        skill_body_of(&content)
+    ))
 }
 
 /// The skill body exactly as stored, frontmatter stripped and nothing added.
@@ -1089,9 +1089,15 @@ pub(crate) async fn load_skill_source(skill: &Skill) -> Result<String, String> {
     let content = tokio::fs::read_to_string(&skill.body_path)
         .await
         .map_err(|error| format!("failed to read {}: {}", skill.body_path.display(), error))?;
-    Ok(split_frontmatter(&content)
-        .map(|(_, body)| body.to_string())
-        .unwrap_or(content))
+    Ok(skill_body_of(&content).to_string())
+}
+
+/// The body of a skill file: what follows the frontmatter, or the whole file when it has none.
+///
+/// One derivation for every reader and for the body a write compares against, so `skill_edit`'s
+/// compare-and-swap matches what `skill_read` and `GET /v1/skills/{name}` handed out.
+fn skill_body_of(content: &str) -> &str {
+    split_frontmatter(content).map_or(content, |(_, body)| body)
 }
 
 /// Build the context header prepended to a skill body by [`load_skill_body`]. Points the agent at
@@ -3890,5 +3896,61 @@ mod tests {
             let error = validate_addressable_name(name).expect_err(name);
             assert!(error.contains("not one directory name"), "{error}");
         }
+    }
+
+    /// A body write compares under the lock: it lands when the body is the one the caller read,
+    /// carries every frontmatter key as it is, and reports a body that moved or a skill that is
+    /// gone rather than writing over either or creating anything.
+    #[test]
+    fn a_body_write_keeps_the_frontmatter_and_refuses_a_stale_or_missing_skill() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = "---\nname: imported\ndescription: d\nlicense: MIT\nmetadata:\n  author: \
+                      Jane\n  meka-priority: \"3\"\n---\nStep one\n";
+        write_skill(temp.path(), "imported", source);
+        let file = temp.path().join("imported/SKILL.md");
+
+        match super::write_skill_body(temp.path(), "imported", "Step one\n", "Step two\n")
+            .expect("write")
+        {
+            BodyWrite::Saved(written) => {
+                assert_eq!(written.previous.as_deref(), Some(source));
+                assert!(
+                    written.text.ends_with("---\n\nStep two\n"),
+                    "{}",
+                    written.text
+                );
+                assert_eq!(written.skill.description, "d");
+                assert_eq!(written.skill.priority, 3);
+                assert_eq!(written.skill.license.as_deref(), Some("MIT"));
+                assert_eq!(written.skill.author().as_deref(), Some("Jane"));
+            }
+            other => panic!("the body the caller read is the one on disk: {other:?}"),
+        }
+        assert!(
+            std::fs::read_to_string(&file)
+                .expect("read")
+                .contains("Step two")
+        );
+
+        assert!(matches!(
+            super::write_skill_body(temp.path(), "imported", "Step one\n", "Step three\n")
+                .expect("refused, not failed"),
+            BodyWrite::ChangedUnderneath
+        ));
+        assert!(
+            std::fs::read_to_string(&file)
+                .expect("read")
+                .contains("Step two"),
+            "a stale write changes nothing"
+        );
+
+        assert!(matches!(
+            super::write_skill_body(temp.path(), "absent", "x\n", "y\n").expect("gone"),
+            BodyWrite::Gone
+        ));
+        assert!(
+            !temp.path().join("absent").exists(),
+            "a miss creates nothing"
+        );
     }
 }

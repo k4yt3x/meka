@@ -160,7 +160,8 @@ impl Drop for RunningGuard {
 pub(crate) struct SessionMaterials {
     pub(crate) core: CoreMaterials,
     pub(crate) skills: Arc<crate::skills::SkillCache>,
-    /// Whether the root agent gets `skill_write` / `skill_delete`. Never a sub-agent.
+    /// Whether the root agent gets `skill_write`, `skill_edit` and `skill_delete`. Never a
+    /// sub-agent.
     pub(crate) skills_agent_managed: bool,
     pub(crate) memories: Arc<crate::store::memory::MemoryStore>,
     pub(crate) store: Store,

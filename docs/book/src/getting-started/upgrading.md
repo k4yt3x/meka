@@ -10,6 +10,17 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.82 to 0.83
+
+Nothing is renamed and no key is refused; one thing changes what a memory does.
+
+**`load` decides how a memory reaches the context; priority is importance alone.** A memory stored
+at priority 0 before 0.83 is migrated to `load: inline`, so what sat in every turn's context stays
+there. A memory written from now on is `index` unless the write says `inline` or `search`, whatever
+its priority: `memory_write`'s `load`, `meka memory add --load`, or `load` on
+`PUT /v1/memory/{name}`. Every existing memory is marked verified as of its creation, since nothing
+has verified it since; `memory_search`'s `unverified` filter and `--unverified` count from there.
+
 ## 0.81 to 0.82
 
 **The Swagger UI is gone.** `/v1/docs` answers 404 whatever `[serve].docs` says, and the key still

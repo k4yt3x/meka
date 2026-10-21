@@ -949,7 +949,7 @@ pub(super) fn tool_kind_for(name: &str) -> ToolKind {
     match name {
         "file_read" | "checklist_read" => ToolKind::Read,
         // A skill is a file in meka's store, so its change opens the editor's diff view on it.
-        "file_edit" | "file_write" | "skill_write" => ToolKind::Edit,
+        "file_edit" | "file_write" | "skill_write" | "skill_edit" => ToolKind::Edit,
         "skill_delete" => ToolKind::Delete,
         "file_find" | "file_search" => ToolKind::Search,
         "shell_execute" => ToolKind::Execute,

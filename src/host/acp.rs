@@ -847,6 +847,7 @@ mod tests {
         assert_eq!(tool_kind_for("file_edit"), ToolKind::Edit);
         assert_eq!(tool_kind_for("file_write"), ToolKind::Edit);
         assert_eq!(tool_kind_for("skill_write"), ToolKind::Edit);
+        assert_eq!(tool_kind_for("skill_edit"), ToolKind::Edit);
         assert_eq!(tool_kind_for("skill_delete"), ToolKind::Delete);
         assert_eq!(tool_kind_for("memory_write"), ToolKind::Other);
         assert_eq!(tool_kind_for("file_find"), ToolKind::Search);

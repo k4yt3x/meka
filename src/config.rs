@@ -96,8 +96,8 @@ pub(crate) struct InstructionsConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SkillsConfig {
     pub(crate) enabled: Option<bool>,
-    /// Whether the agent may author skills, adding `skill_write` and `skill_delete` to its
-    /// registry. Default `false`.
+    /// Whether the agent may author skills, adding `skill_write`, `skill_edit` and `skill_delete`
+    /// to its registry. Default `false`.
     ///
     /// Off by default because for the ordinary terminal session the human authors and curates
     /// skills, and an agent rewriting that store is not something the user asked for. It earns its
@@ -1761,8 +1761,8 @@ pub(crate) struct ResolvedConfig {
     /// Whether the `skill_read` / `skill_search` tools are registered and the `[Skills]` index
     /// rendered. Defaults to `true`; see [`SkillsConfig`].
     pub(crate) skills_enabled: bool,
-    /// Whether `skill_write` / `skill_delete` are additionally registered. Defaults to `false`;
-    /// see [`SkillsConfig::agent_managed`].
+    /// Whether `skill_write`, `skill_edit` and `skill_delete` are additionally registered.
+    /// Defaults to `false`; see [`SkillsConfig::agent_managed`].
     pub(crate) skills_agent_managed: bool,
     /// Read-only skill roots scanned in addition to meka's own; see
     /// [`SkillsConfig::additional_directories`]. Already tilde-expanded, and empty unless

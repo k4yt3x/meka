@@ -33,6 +33,7 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`skill_read`](./overview.md#the-skill_-tools) | Read | Load a named skill's instructions |
 | [`skill_search`](./overview.md#the-skill_-tools) | Read | Regex over the full text of every skill |
 | [`skill_write`](./overview.md#the-skill_-tools) | Read | Create or update a skill |
+| [`skill_edit`](./overview.md#the-skill_-tools) | Read | Replace an exact string in a skill's body |
 | [`skill_delete`](./overview.md#the-skill_-tools) | Read | Delete a skill and its directory |
 | [`memory_write`](../usage/memory.md) | Read | Save a durable note that outlives the session |
 | [`memory_edit`](../usage/memory.md) | Read | Replace an exact string in a memory's body |
@@ -64,7 +65,7 @@ Tools are grouped by the minimum permission level required:
 - `file_read`, `file_find`, `file_search`, `web_fetch`
 - `shell_execute` (sandboxed, filesystem write-protected)
 - `checklist_add`, `checklist_edit`, `checklist_read`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_steer`, `agent_delete`, `image_render`
-- All skill tools, including `skill_write` and `skill_delete` when they are enabled: like memory,
+- All skill tools, including `skill_write`, `skill_edit` and `skill_delete` when they are enabled: like memory,
   skills live in meka's own config directory, not your working tree
 - `conversation_search`, `conversation_read`, `session_list`, `session_search`, `context_check`, `context_compact`
 - Every scratchpad tool except `scratchpad_save_file`, which writes to a path you name and so sits at `workspace` with `file_write`
@@ -278,9 +279,10 @@ Skills are knowledge packages stored in `~/.config/meka/skills/<name>/SKILL.md`.
 - `skill_read({"name": "<skill-name>"})` returns the full body, prefixed with the skill's base directory.
 - `skill_search({"pattern": "<regex>"})` matches each line of every skill, bodies included. This is what reaches skills the capped index did not list, and what answers "which of my skills covers this" when the one-line descriptions do not.
 - `skill_write({"name": ..., "description": ..., "priority": ..., "body": ...})` creates or updates a skill. Omitted fields keep their values; a given `body` replaces the existing one whole.
+- `skill_edit({"name": ..., "old_string": ..., "new_string": ..., "replace_all": ...})` replaces one exact string in the body and leaves the frontmatter alone. An `old_string` that matches more than once is refused unless `replace_all` is true, and an edit computed against a body that has since changed is refused rather than written over it.
 - `skill_delete({"name": ...})` removes the skill's whole directory, bundled files included.
 
-The last two are registered only when [`[skills] agent_managed`](../configuration/config-file.md#skills) is on, and never for a sub-agent. See [Skills](../usage/skills.md) for how to author skills and [Letting the agent manage skills](../usage/skills.md#letting-the-agent-manage-skills) for when to hand authoring to the agent.
+The last three are registered only when [`[skills] agent_managed`](../configuration/config-file.md#skills) is on, and never for a sub-agent. See [Skills](../usage/skills.md) for how to author skills and [Letting the agent manage skills](../usage/skills.md#letting-the-agent-manage-skills) for when to hand authoring to the agent.
 
 ## `image_render`
 

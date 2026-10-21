@@ -164,7 +164,7 @@ The default is empty. `~/.agents/skills` has emerged as a cross-client conventio
 
 **Precedence.** meka's own store is searched first, then each `additional_directories` entry in order. When two directories hold the same skill name, the first wins and the shadowed one is logged.
 
-**Writes never follow.** `skill_write`, `skill_delete`, `meka skill add`, `meka skill remove`, `PUT /v1/skills/{name}` and `DELETE /v1/skills/{name}` all target meka's own store. Asked to write a name that resolves to a skill in a read-only directory, they refuse, because writing would create a second copy that shadows the original instead of changing it; the refusal says to edit or remove it where it lives, and the CLI names the directory. This holds whether or not the file there is valid: a directory whose `SKILL.md` does not parse still claims that name, and shadowing a broken skill is the case worth refusing hardest, since nothing then reports the original at all.
+**Writes never follow.** `skill_write`, `skill_edit`, `skill_delete`, `meka skill add`, `meka skill remove`, `PUT /v1/skills/{name}` and `DELETE /v1/skills/{name}` all target meka's own store. Asked to write a name that resolves to a skill in a read-only directory, they refuse, because writing would create a second copy that shadows the original instead of changing it; the refusal says to edit or remove it where it lives, and the CLI names the directory. This holds whether or not the file there is valid: a directory whose `SKILL.md` does not parse still claims that name, and shadowing a broken skill is the case worth refusing hardest, since nothing then reports the original at all.
 
 There is deliberately no automatic project-level scan. meka reads nothing from the working directory that config does not name, [instructions](./instructions.md#reading-a-projects-agentsmd) included, because a cloned repository that could silently add instructions to the agent's context is exactly the trust it never extends. Name a project's skills directory in `additional_directories` if you want it read.
 
@@ -290,7 +290,8 @@ meka skill add imported --from-file ./SKILL.md
 ## Letting the agent manage skills
 
 By default the agent can only read skills. Setting `[skills] agent_managed = true` additionally
-registers `skill_write` and `skill_delete`, letting it create, refine, and remove skills itself:
+registers `skill_write`, `skill_edit` and `skill_delete`, letting it create, refine, and remove
+skills itself:
 
 ```toml
 [skills]
@@ -314,7 +315,7 @@ agent_spawn(skill: "triage-build-failure")
 
 Notes on how it behaves:
 
-- Both tools run at **read** permission, like `memory_write`. They write to meka's own config
+- All three run at **read** permission, like `memory_write`. They write to meka's own config
   directory rather than to your working tree, and the deployment they exist for typically runs at
   read permission permanently. The config flag is the authorization, not the permission tier.
 - **Sub-agents never get them**, whatever this setting says. A sub-agent that inferred something from
@@ -324,6 +325,9 @@ Notes on how it behaves:
   Note that `meka skill add --force` is a *replace*, not an update: it rewrites `SKILL.md` from the
   template and removes any bundled files alongside it. The new `SKILL.md` is written first, so a
   failure to clear a bundled file leaves the skill intact and says which files it could not remove.
+- `skill_edit` replaces one exact string in the body and nothing else: the frontmatter is kept as
+  it is, an `old_string` that matches more than once is refused unless `replace_all` is set, and
+  an edit computed against a body that has since changed is refused rather than written over it.
 - Skills the agent *creates* are stamped `metadata.author: meka (agent-authored)`, so
   `meka skill list` shows where an entry came from. An existing `author` is kept, so an agent
   refining a skill you wrote does not reassign it to itself. Informational, not a guard.
@@ -337,12 +341,12 @@ Notes on how it behaves:
 - A file that exists at that name but is not a valid skill is **refused, not overwritten**. Such a
   file is invisible everywhere else in meka, so nothing could tell you what was about to be lost.
 - A skill from a read-only [`additional_directories`](#reading-skills-from-other-directories) directory is
-  **refused** by both tools, since writing would shadow it rather than change it.
+  **refused** by all three, since writing would shadow it rather than change it.
 - A hand-written skill in meka's own store is not protected from being rewritten. The flag being off
   by default, and your config directory being in version control, is the safety net for that case.
 - `skill_delete` removes the whole skill directory, including any bundled files, matching
   `meka skill remove`.
-- Both tools report the `SKILL.md` before and after: the screen and ACP editors draw it as a
+- All three report the `SKILL.md` before and after: the screen and ACP editors draw it as a
   diff, and the HTTP feed carries the two texts on `tool_call.completed`.
 
 ## Tips

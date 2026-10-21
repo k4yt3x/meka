@@ -505,7 +505,7 @@ The agent will explain that it cannot write files at `read` and suggest switchin
 | Store | Location | Tools |
 |-------|----------|-------|
 | Memory | the `memories` table in `MEKA_DATA_DIR` | `memory_write`, `memory_edit`, `memory_delete` |
-| Skills | `~/.config/meka/skills/` | `skill_write`, `skill_delete` (only with [`[skills] agent_managed`](../configuration/config-file.md#skills)) |
+| Skills | `~/.config/meka/skills/` | `skill_write`, `skill_edit`, `skill_delete` (only with [`[skills] agent_managed`](../configuration/config-file.md#skills)) |
 | Scratchpad, scheduled jobs, background tasks | the store | various |
 
 Of those, only the skill tools reach the filesystem at all; memory is a table in the store. Note what that makes `skill_write` at `read`: a persistence primitive. A skill it writes is read back into every later session's prompt, so a prompt-injected instruction can outlive the turn that carried it. That is the reason `[skills] agent_managed` is off by default and the tool is never given to a sub-agent. That boundary is enforced in two places: a skill name must be one path component matching the Agent Skills spec's own rule (lowercase letters, digits and hyphens), so it cannot contain `..` or a path separator, and a symlink sitting at that name is refused rather than followed, so an existing link cannot redirect a write out of the skills directory. Memory names are governed by a different and wider rule (`[A-Za-z0-9_-]`), which is safe for a different reason: a memory name is a primary key in a table, never a path. `file_write`, `file_edit` and `scratchpad_save_file` are the only built-ins that touch your tree, and all three require `workspace` or above, and are fenced to the workspace roots at that level.

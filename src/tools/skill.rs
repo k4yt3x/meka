@@ -1,13 +1,14 @@
 //! The `skill_*` tools: the agent's access to the installed skill store ([`crate::skills`]).
 //!
-//! All four gate at [`Permission::Read`], for the reason spelled out on [`crate::tools::memory`]:
+//! All five gate at [`Permission::Read`], for the reason spelled out on [`crate::tools::memory`]:
 //! `workspace` in meka means "may modify the user's tree", and these write to a store meka owns
 //! under its own config directory. `agent_spawn` is a read-tier tool too, so the dispatcher
 //! deployment these exist for runs at read permission permanently; gating them at `workspace` would
 //! withhold them from the only configuration that wants them.
 //!
-//! `skill_write` and `skill_delete` are registered only when `[skills] agent_managed` is on, and
-//! never for a sub-agent. The authorization lives in that flag rather than in the permission tier.
+//! `skill_write`, `skill_edit` and `skill_delete` are registered only when `[skills] agent_managed`
+//! is on, and never for a sub-agent. The authorization lives in that flag rather than in the
+//! permission tier.
 
 use std::sync::Arc;
 
@@ -261,7 +262,8 @@ impl Tool for SkillWriteTool {
             description: "Create or update a skill: a reusable procedure a later session or \
                 sub-agent can follow without being told again. Writing to an existing name \
                 updates it: omitted fields keep their values, and a given `body` replaces the \
-                whole body. Prefer a skill over a memory for a *method* rather than a fact, \
+                whole body (`skill_edit` changes part of one). Prefer a skill over a memory for a \
+                *method* rather than a fact, \
                 especially one to hand to `agent_spawn`."
                 .to_string(),
             parameters: serde_json::json!({
@@ -507,6 +509,210 @@ impl Tool for SkillWriteTool {
 /// branches on it.
 const AGENT_AUTHOR: &str = "meka (agent-authored)";
 
+pub(super) struct SkillEditTool {
+    pub(crate) skills: Arc<SkillCache>,
+}
+
+#[async_trait]
+impl Tool for SkillEditTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "skill_edit".to_string(),
+            description: "Replace an exact string in a skill's body and leave the rest as it is. \
+                Refused when `old_string` matches more than once unless `replace_all` is true. \
+                For a small change; `skill_write` replaces the whole body."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the skill, as listed in the skills index."
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "The exact text to find in the body as stored; the header skill_read prepends is not part of it."
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "The replacement; an empty string deletes `old_string`."
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Change every occurrence. When false and `old_string` matches more than once, the edit is refused as ambiguous. Default: false."
+                    }
+                },
+                "required": ["name", "old_string", "new_string"]
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn required_permission(&self) -> Permission {
+        Permission::Read
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        _context: crate::tools::ToolContext,
+    ) -> Result<ToolOutput> {
+        let root = require_root(&self.skills, "skill_edit")?;
+        let name = require_str(&input, "name", "skill_edit")?;
+        // Write rules, as `skill_write` applies them: an edit rewrites the file, and the name is
+        // joined onto the root.
+        skills::validate_skill_name(&name).map_err(|message| MekaError::ToolExecution {
+            tool_name: "skill_edit".to_string(),
+            message,
+        })?;
+        let old_string = require_str(&input, "old_string", "skill_edit")?;
+        let new_string =
+            super::util::require_str_allowing_empty(&input, "new_string", "skill_edit")?;
+        let replace_all = match input.get("replace_all") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(replace_all)) => *replace_all,
+            Some(value) => {
+                return Err(MekaError::ToolExecution {
+                    tool_name: "skill_edit".to_string(),
+                    message: format!("'replace_all' must be true or false, got {value}"),
+                });
+            }
+        };
+
+        let installed = self.skills.current().await;
+        // Unreadable first, for the reason `skill_write` gives.
+        if let Some(refusal) = reject_unreadable(&name, &installed, &root) {
+            return Ok(refusal);
+        }
+        if let Some(refusal) = skills::refuse_foreign_write(&installed, &name, &root) {
+            return Ok(ToolOutput::text(
+                format!("Error: {}", refusal.where_it_lives()),
+                true,
+            ));
+        }
+        let Some(skill) = installed.find(&name) else {
+            return Err(MekaError::ToolExecution {
+                tool_name: "skill_edit".to_string(),
+                message: format!(
+                    "no skill named '{}'.{}",
+                    name,
+                    crate::tools::did_you_mean_hint(
+                        &name,
+                        installed.skills.iter().map(|skill| skill.name.as_str())
+                    )
+                ),
+            });
+        };
+        // The body as stored rather than as `skill_read` shows it: the base-directory header is
+        // a render-time line, so an anchor matched against it is one the file cannot contain.
+        let body =
+            skills::load_skill_source(skill)
+                .await
+                .map_err(|message| MekaError::ToolExecution {
+                    tool_name: "skill_edit".to_string(),
+                    message,
+                })?;
+        let (edited, count, first_match_byte) =
+            match super::util::replace_anchored(&body, &old_string, &new_string, replace_all) {
+                Ok(applied) => applied,
+                Err(super::util::AnchorMiss::NotFound) => {
+                    // Named when it is the likely cause, as `file_edit` does: a hand-written
+                    // `SKILL.md` can carry CRLF, and nothing in a bare "not found" points at an
+                    // invisible difference.
+                    let crlf_hint = if body.contains("\r\n")
+                        && old_string.contains('\n')
+                        && !old_string.contains("\r\n")
+                    {
+                        " (this skill uses CRLF line endings; old_string uses LF)"
+                    } else {
+                        ""
+                    };
+                    return Ok(ToolOutput::text(
+                        format!(
+                            "Error: '{}' not found in the body of skill '{name}'{crlf_hint}",
+                            super::util::truncate_string(&old_string, 100)
+                        ),
+                        true,
+                    ));
+                }
+                Err(super::util::AnchorMiss::Ambiguous(count)) => {
+                    return Ok(ToolOutput::text(
+                        format!(
+                            "Error: '{}' matches {count} times in skill '{name}'; add surrounding \
+                             context to make old_string unique, or set replace_all=true to change \
+                             every occurrence",
+                            super::util::truncate_string(&old_string, 100)
+                        ),
+                        true,
+                    ));
+                }
+            };
+
+        // On the blocking pool for the reason `skill_write` gives, and compared against the body
+        // read above under the store lock: the read happened outside it, so a write that landed in
+        // between is refused rather than overwritten.
+        let outcome = {
+            let root = root.clone();
+            let name = name.clone();
+            let body = body.clone();
+            let edited = edited.clone();
+            tokio::task::spawn_blocking(move || {
+                skills::write_skill_body(&root, &name, &body, &edited)
+            })
+            .await
+            .map_err(|error| MekaError::ToolExecution {
+                tool_name: "skill_edit".to_string(),
+                message: format!("write task failed: {error}"),
+            })?
+            .map_err(|message| MekaError::ToolExecution {
+                tool_name: "skill_edit".to_string(),
+                message,
+            })?
+        };
+        // See the note in `skill_write`; on a refusal the store moved under the index, which is
+        // one more reason to read it again.
+        self.skills.invalidate().await;
+        let written = match outcome {
+            skills::BodyWrite::Saved(written) => *written,
+            skills::BodyWrite::ChangedUnderneath => {
+                return Ok(ToolOutput::text(
+                    format!(
+                        "Error: skill '{name}' changed while the edit was computed; read it again \
+                         and retry"
+                    ),
+                    true,
+                ));
+            }
+            skills::BodyWrite::Gone => {
+                return Err(MekaError::ToolExecution {
+                    tool_name: "skill_edit".to_string(),
+                    message: format!("skill '{name}' was deleted while the edit was computed"),
+                });
+            }
+        };
+
+        let path = written.skill.body_path.display();
+        tracing::info!("edited skill at {path}");
+        // The stored body opens with the blank line the renderer leaves after the fence; the
+        // snippet numbers the procedure's own lines from 1.
+        let (shown, shown_match_byte) = match edited.strip_prefix('\n') {
+            Some(rest) if first_match_byte > 0 => (rest, first_match_byte - 1),
+            _ => (edited.as_str(), first_match_byte),
+        };
+        let snippet = super::file::build_context_snippet(shown, shown_match_byte, 3);
+        Ok(ToolOutput::text(
+            format!("Edited skill '{name}': {count} occurrence(s).\n\n{snippet}"),
+            false,
+        )
+        .with_metadata(crate::frontend::ToolOutputMetadata::Diff {
+            path: Some(written.skill.body_path),
+            old_text: written.previous,
+            new_text: Some(written.text),
+        }))
+    }
+}
+
 pub(super) struct SkillDeleteTool {
     pub(crate) skills: Arc<SkillCache>,
 }
@@ -517,7 +723,7 @@ impl Tool for SkillDeleteTool {
         ToolDefinition {
             name: "skill_delete".to_string(),
             description: "Delete a skill permanently, including any files bundled with it. To \
-                revise one instead, call skill_write with the same name."
+                revise one instead, call skill_write or skill_edit with the same name."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -1535,5 +1741,260 @@ mod tests {
             .expect("skill");
         assert_eq!(skill.priority, 1, "a refinement must not demote it");
         assert_eq!(skill.description, "refined");
+    }
+
+    /// `skill_edit` swaps one exact string, refuses an ambiguous one, replaces every occurrence
+    /// when asked, deletes with an empty replacement, anchors on the stored body rather than the
+    /// header `skill_read` shows, leaves the frontmatter alone, points at a near-miss name, and
+    /// reports the file before and after.
+    #[tokio::test]
+    async fn skill_edit_changes_the_body_in_place() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("skills");
+        std::fs::create_dir_all(&root).expect("root");
+        let skills = SkillCache::new(Some(root.clone()), Vec::new());
+        let write = SkillWriteTool {
+            skills: skills.clone(),
+        };
+        let edit = SkillEditTool {
+            skills: skills.clone(),
+        };
+        let file = root.join("note").join("SKILL.md");
+        let created = run(
+            &write,
+            serde_json::json!({
+                "name": "note",
+                "description": "a note",
+                "priority": 2,
+                "body": "alpha beta alpha"
+            }),
+        )
+        .await;
+        assert!(!created.is_error, "{}", created.text_content());
+
+        let ambiguous = run(
+            &edit,
+            serde_json::json!({"name": "note", "old_string": "alpha", "new_string": "gamma"}),
+        )
+        .await;
+        assert!(ambiguous.is_error, "{}", ambiguous.text_content());
+        assert!(
+            ambiguous.text_content().contains("matches 2 times"),
+            "{}",
+            ambiguous.text_content()
+        );
+
+        let all = run(
+            &edit,
+            serde_json::json!({
+                "name": "note",
+                "old_string": "alpha",
+                "new_string": "gamma",
+                "replace_all": true
+            }),
+        )
+        .await;
+        assert!(!all.is_error, "{}", all.text_content());
+        assert!(
+            all.text_content()
+                .starts_with("Edited skill 'note': 2 occurrence(s)."),
+            "{}",
+            all.text_content()
+        );
+        assert!(
+            all.text_content().contains("1 | gamma beta gamma"),
+            "the snippet numbers the body's own first line as 1: {}",
+            all.text_content()
+        );
+        match all.frontend_metadata.clone() {
+            Some(crate::frontend::ToolOutputMetadata::Diff {
+                path: Some(path),
+                old_text: Some(old),
+                new_text: Some(new),
+            }) => {
+                assert_eq!(path, file);
+                assert!(old.ends_with("---\n\nalpha beta alpha\n"), "{old}");
+                assert!(new.ends_with("---\n\ngamma beta gamma\n"), "{new}");
+                assert_eq!(new, std::fs::read_to_string(&file).expect("read back"));
+            }
+            other => panic!("an edit reports the file before and after: {other:?}"),
+        }
+        let current = skills.current().await;
+        let skill = current.find("note").expect("still listed");
+        assert_eq!(skill.priority, 2, "an edit leaves the frontmatter alone");
+        assert_eq!(skill.description, "a note");
+
+        let deleted = run(
+            &edit,
+            serde_json::json!({"name": "note", "old_string": "beta ", "new_string": ""}),
+        )
+        .await;
+        assert!(!deleted.is_error, "{}", deleted.text_content());
+        let current = skills.current().await;
+        let body = skills::load_skill_source(current.find("note").expect("listed"))
+            .await
+            .expect("body");
+        // The blank line the renderer puts after the closing fence is part of the stored body.
+        assert_eq!(body, "\ngamma gamma\n");
+
+        // The line `skill_read` puts above the body is not in the file, so an anchor that quotes
+        // it misses rather than matching something the write would then duplicate.
+        let read = SkillReadTool {
+            skills: skills.clone(),
+        };
+        let shown = run(&read, serde_json::json!({"name": "note"}))
+            .await
+            .text_content();
+        let header = shown.lines().next().expect("a header line").to_string();
+        assert!(header.starts_with("Base directory"), "{shown}");
+        let missing = run(
+            &edit,
+            serde_json::json!({"name": "note", "old_string": header, "new_string": "x"}),
+        )
+        .await;
+        assert!(
+            missing.is_error
+                && missing
+                    .text_content()
+                    .contains("not found in the body of skill 'note'"),
+            "{}",
+            missing.text_content()
+        );
+
+        let unknown = edit
+            .execute(
+                serde_json::json!({"name": "nots", "old_string": "a", "new_string": "b"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await;
+        match unknown {
+            Err(MekaError::ToolExecution { message, .. }) => {
+                assert!(message.contains("no skill named 'nots'"), "{message}");
+                assert!(message.contains("note"), "{message}");
+            }
+            other => panic!("an unknown name is an error naming the near miss: {other:?}"),
+        }
+        let not_a_bool = edit
+            .execute(
+                serde_json::json!({
+                    "name": "note",
+                    "old_string": "a",
+                    "new_string": "b",
+                    "replace_all": "yes"
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await;
+        assert!(not_a_bool.is_err(), "a string replace_all is refused");
+        assert_eq!(edit.required_permission(), Permission::Read);
+    }
+
+    /// The edit door applies the write rules: a skill from a read-only root is refused without
+    /// a shadow copy, a broken file is refused with its parse error rather than "not found", and
+    /// a traversing name is refused before anything is joined onto the root.
+    #[tokio::test]
+    async fn skill_edit_refuses_what_skill_write_refuses() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let native = temp.path().join("native");
+        let shared = temp.path().join("shared");
+        write_skill(
+            &shared,
+            "borrowed",
+            "---\ndescription: theirs\n---\nTHEIR PROCEDURE\n",
+        );
+        write_skill(&native, "broken", "no frontmatter at all\nKEEP ME\n");
+        let edit = SkillEditTool {
+            skills: SkillCache::new(Some(native.clone()), vec![shared.clone()]),
+        };
+
+        let foreign = run(
+            &edit,
+            serde_json::json!({"name": "borrowed", "old_string": "THEIR", "new_string": "MY"}),
+        )
+        .await;
+        assert!(foreign.is_error, "{}", foreign.text_content());
+        assert!(
+            foreign.text_content().contains("does not write to"),
+            "{}",
+            foreign.text_content()
+        );
+        assert!(
+            std::fs::read_to_string(shared.join("borrowed/SKILL.md"))
+                .expect("still there")
+                .contains("THEIR PROCEDURE")
+        );
+        assert!(
+            !native.join("borrowed").exists(),
+            "a shadowing copy must not be created in meka's own root"
+        );
+
+        let broken = run(
+            &edit,
+            serde_json::json!({"name": "broken", "old_string": "KEEP", "new_string": "DROP"}),
+        )
+        .await;
+        assert!(broken.is_error, "{}", broken.text_content());
+        assert!(
+            broken.text_content().contains("not a valid skill"),
+            "{}",
+            broken.text_content()
+        );
+        assert!(!broken.text_content().contains("not found"));
+        assert!(
+            std::fs::read_to_string(native.join("broken/SKILL.md"))
+                .expect("read")
+                .contains("KEEP ME")
+        );
+
+        let traversing = edit
+            .execute(
+                serde_json::json!({"name": "../escape", "old_string": "a", "new_string": "b"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await;
+        assert!(
+            traversing.is_err(),
+            "a traversing name must not reach the disk"
+        );
+    }
+
+    /// A hand-written `SKILL.md` with CRLF line endings: an LF anchor across a line break misses,
+    /// and the refusal names the cause, as `file_edit`'s does.
+    #[tokio::test]
+    async fn skill_edit_names_crlf_when_an_lf_anchor_misses() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_skill(
+            temp.path(),
+            "windows",
+            "---\r\ndescription: d\r\n---\r\nline one\r\nline two\r\n",
+        );
+        let edit = SkillEditTool {
+            skills: cache_at(&temp),
+        };
+        let missed = run(
+            &edit,
+            serde_json::json!({
+                "name": "windows",
+                "old_string": "line one\nline two",
+                "new_string": "x"
+            }),
+        )
+        .await;
+        assert!(missed.is_error, "{}", missed.text_content());
+        assert!(
+            missed.text_content().contains("CRLF line endings"),
+            "{}",
+            missed.text_content()
+        );
+        let matched = run(
+            &edit,
+            serde_json::json!({
+                "name": "windows",
+                "old_string": "line one\r\nline two",
+                "new_string": "one line"
+            }),
+        )
+        .await;
+        assert!(!matched.is_error, "{}", matched.text_content());
     }
 }

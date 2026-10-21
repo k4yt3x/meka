@@ -928,7 +928,7 @@ pub(crate) fn builtin_code_param(name: &str) -> Option<(&'static str, &'static s
 pub(crate) fn builtin_change_params(name: &str) -> &'static [&'static str] {
     match name {
         "file_write" => &["content"],
-        "file_edit" | "memory_edit" => &["old_string", "new_string"],
+        "file_edit" | "memory_edit" | "skill_edit" => &["old_string", "new_string"],
         "memory_write" => &[
             "body",
             "description",
@@ -1081,7 +1081,7 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         "scratchpad_rename" => "old",
         "session_search" => "query",
         "shell_execute" => "command",
-        "skill_delete" | "skill_read" | "skill_write" => "name",
+        "skill_delete" | "skill_edit" | "skill_read" | "skill_write" => "name",
         "skill_search" => "pattern",
         "tool_load" => "name",
         "tool_search" => "query",
@@ -1294,8 +1294,8 @@ mod tests {
             }
         }
         assert_eq!(
-            listed, 5,
-            "the two file tools, memory_write, memory_edit and skill_write"
+            listed, 6,
+            "the two file tools, memory_write, memory_edit, skill_write and skill_edit"
         );
     }
 
@@ -1364,7 +1364,7 @@ mod tests {
     /// A registry holding every name in [`BUILTIN_TOOL_NAMES`], for tests that must not silently
     /// skip a family.
     ///
-    /// `build_default` alone is not enough: `skill_write` / `skill_delete` need `agent_managed`,
+    /// `build_default` alone is not enough: the skill authoring tools need `agent_managed`,
     /// the `task_*` and `context_*` families are registered by their own hosts, and the MCP
     /// meta-tools appear only once a server is configured. None of them need to *work* here, only
     /// to answer `definition()`, so the collaborators are the cheapest that construct: an in-memory
@@ -2099,10 +2099,12 @@ mod tests {
             registry.get("skill_write").is_none(),
             "skill_write must not register without [skills] agent_managed"
         );
+        assert!(registry.get("skill_edit").is_none());
         assert!(registry.get("skill_delete").is_none());
 
         let registry = tool_registry_for_test_with(BuiltinToolFilter::default(), true).await;
         assert!(registry.get("skill_write").is_some());
+        assert!(registry.get("skill_edit").is_some());
         assert!(registry.get("skill_delete").is_some());
     }
 

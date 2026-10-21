@@ -1,9 +1,10 @@
 //! Writing skills to disk and removing them: the file layout, the template a new skill starts from,
 //! and the refusal to touch a skill meka did not put there.
 //!
-//! Every refusal here names the skill and logs the path. These functions serve five doors, and two
-//! of them answer someone who is not the operator: `PUT`/`DELETE /v1/skills/{name}` puts the string
-//! in a 409 or 422 body, and `skill_write`/`skill_delete` hand it to the model. An absolute path
+//! Every refusal here names the skill and logs the path. These functions serve seven doors, and
+//! five of them answer someone who is not the operator: `PUT`/`DELETE /v1/skills/{name}` put the
+//! string in a 409 or 422 body, and the three writing `skill_*` tools hand it to the model. An
+//! absolute path
 //! out of the operator's `config.toml` is a fact about someone else's host, so the sentence carries
 //! the name and the `warn!` beside it carries the path.
 //!
@@ -20,9 +21,10 @@ use super::*;
 /// elsewhere would not update that skill: it would put a second one in meka's store that shadows
 /// it.
 ///
-/// One function for all five write doors (`skill_write`, `meka skill add`, `PUT /v1/skills`, and
-/// through [`refuse_foreign_delete`] the two delete doors), because copies of a rule drift: checked
-/// against loaded skills, every site misses a shadowed file that does not parse.
+/// One function for all seven doors (`skill_write`, `skill_edit`, `meka skill add` and
+/// `PUT /v1/skills`, and through [`refuse_foreign_delete`] `skill_delete`, `meka skill remove` and
+/// `DELETE /v1/skills`), because copies of a rule drift: checked against loaded skills, every site
+/// misses a shadowed file that does not parse.
 ///
 /// The path is carried rather than written into the sentence, so each door renders the audience it
 /// has: see [`ForeignSkill`].
@@ -104,10 +106,8 @@ pub(super) fn foreign_location(
 /// Write one skill's `SKILL.md`, creating its directory if needed, and return the skill as written.
 ///
 /// The written skill, not the requested one: a caller reports what it did, and the only honest
-/// source is the bytes that reached disk, which this function already parses for the guard below.
-///
-/// The name is joined onto `root` here, so [`validate_skill_name`] has to run before any of it.
-/// Callers validate too; this is the backstop that makes the join safe regardless.
+/// source is the bytes that reached disk, which [`OpenedSkill::commit`] already parses for its
+/// guard.
 ///
 /// `body: None` preserves whatever the existing file said, as `memory_write` does: a call that
 /// changes only the description or the priority is one the schema invites, and rendering an absent
@@ -119,9 +119,6 @@ pub(super) fn foreign_location(
 /// for, so every frontmatter key survives a rewrite, including `metadata` entries meka has no
 /// meaning for. `author` is only stamped on a skill that does not already claim one, since
 /// overwriting a human's attribution loses information nothing else records.
-///
-/// Refuses outright when the file exists but does not parse. Such a file is in no index and no
-/// listing, so neither the caller nor the model can know what is about to be overwritten.
 pub(crate) fn write_skill(
     root: &Path,
     name: &str,
@@ -130,6 +127,8 @@ pub(crate) fn write_skill(
     author: Option<&str>,
     body: Option<&str>,
 ) -> Result<WrittenSkill, String> {
+    // Ahead of the description check, so a caller that got both wrong hears about the identity
+    // first; `open` validates again as the backstop for the join.
     validate_skill_name(name)?;
     // An empty description parses back as a missing required field, so without this a write
     // succeeds and produces a skill that can never be loaded again; the length ceiling is the
@@ -137,107 +136,24 @@ pub(crate) fn write_skill(
     if let Some(problem) = description_problem(description) {
         return Err(problem);
     }
-
-    // Held across everything below, and across processes: the collision and symlink checks read
-    // the store and the write acts on what they read, so two writers that both checked before
-    // either locked would both pass (`Foo/` beside `foo/`, or a link planted after the check), and
-    // the read-modify-write of `meka skill add` and a turn's `skill_write` would lose one edit.
-    let _store_lock = crate::fs::lock_store(root).map_err(|error| {
-        tracing::warn!(
-            "failed to lock the skill store at {root}: {error}",
-            root = root.display()
-        );
-        format!("failed to lock the skill store: {error}")
-    })?;
-
-    // Read the directory rather than the discovered index: this must see what is on disk right now,
-    // including a skill written since the index was built.
-    if let Ok(entries) = std::fs::read_dir(root) {
-        let names: Vec<String> = entries
-            .flatten()
-            .filter(|entry| entry.path().is_dir())
-            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-            .collect();
-        crate::entry::check_case_collision(name, names.iter().map(String::as_str), "skill")?;
-    }
-
-    let dir = root.join(name);
-    // Whichever spelling is already there, so an edit changes the skill rather than creating a
-    // second file beside it: a skill stored as `skill.md` would otherwise read as absent and be
-    // clobbered.
-    let skill_file = skill_file_in(&dir);
-    // Both levels: a skill is a directory, so either the directory or the file inside it can be
-    // the redirect. See [`crate::fs::reject_symlinked_path`], which warns with the path it refused;
-    // what comes back here says which skill, for the reason the module header gives.
-    crate::fs::reject_symlinked_path(&dir, "skill").map_err(|_| symlinked(name))?;
-    crate::fs::reject_symlinked_path(&skill_file, "skill").map_err(|_| symlinked(name))?;
-
-    // A read error is not "there is no file here": a `SKILL.md` in Latin-1 or at mode 000 would
-    // otherwise be replaced by a stub, because `body: None` then means "there was no body".
-    let existing = match std::fs::read_to_string(&skill_file) {
-        Ok(content) => Some(content),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            tracing::warn!(
-                "refusing to write skill '{name}': failed to read {path}: {error}",
-                path = skill_file.display()
-            );
-            return Err(format!(
-                "skill '{name}' exists but failed to read ({error}); refusing to overwrite \
-                 contents meka cannot see, so repair the file or remove the skill first"
-            ));
-        }
-    };
-    let existing_skill = match existing.as_deref() {
-        Some(content) => match parse_skill_definition(name, root, &dir, &skill_file, content) {
-            Ok(skill) => Some(skill),
-            Err(reason) => {
-                tracing::warn!(
-                    "refusing to write skill '{name}': {path} is not a valid skill: {reason}",
-                    path = skill_file.display()
-                );
-                return Err(format!(
-                    "skill '{name}' exists but is not a valid skill ({reason}); refusing to \
-                     overwrite it"
-                ));
-            }
-        },
-        None => None,
-    };
-    // Refused rather than worked around: the spec says `metadata` is a map, and a file where it is
-    // not leaves meka nowhere spec-legal to put `meka-priority` or `author`. Reading such a skill
-    // still works; only rewriting it is refused.
-    if let Some(existing) = existing_skill.as_ref()
-        && existing
-            .metadata
-            .as_ref()
-            .is_some_and(|value| !value.is_mapping())
-    {
-        tracing::warn!(
-            "refusing to rewrite skill '{name}': {path} has a `metadata` that is not a map",
-            path = skill_file.display()
-        );
-        return Err(format!(
-            "skill '{name}' has a `metadata` that is not a map; make it the map of string to \
-             string the Agent Skills spec describes"
-        ));
-    }
+    let opened = OpenedSkill::open(root, name)?;
 
     let body = match body {
         Some(body) => body.to_string(),
-        None => existing
-            .as_deref()
-            .and_then(|content| split_frontmatter(content).map(|(_, body)| body.to_string()))
+        None => opened
+            .existing
+            .as_ref()
+            .map(|(text, _)| skill_body_of(text).to_string())
             .unwrap_or_default(),
     };
 
     // Start from what the file said and change only what was asked for. Rebuilding from a fixed
     // list of fields loses every frontmatter key meka does not model.
-    let mut merged = match existing_skill {
-        Some(existing) => existing,
+    let mut merged = match &opened.existing {
+        Some((_, existing)) => existing.clone(),
         None => Skill {
             name: name.to_string(),
-            source_dir: dir.clone(),
+            source_dir: opened.dir.clone(),
             description: String::new(),
             license: None,
             compatibility: None,
@@ -246,15 +162,12 @@ pub(crate) fn write_skill(
             metadata: None,
             extra: yaml_serde::Mapping::new(),
             conformance: Conformance::default(),
-            body_path: skill_file.clone(),
+            body_path: opened.skill_file.clone(),
             root: root.to_path_buf(),
         },
     };
     merged.description = description.to_string();
     merged.priority = priority;
-    // The struct is about to be rendered and parsed back, and the parse-back is what every caller
-    // reads. Leaving stale conformance on it would be a `Skill` that contradicts its own file.
-    merged.conformance = Conformance::default();
     // Only when the skill does not already claim one, in either spelling: [`Skill::author`] rather
     // than `metadata` alone, because a hand-written file keeps its claim at the top level, and
     // reading only the nested spelling would let an agent rewriting that skill sign it.
@@ -268,28 +181,197 @@ pub(crate) fn write_skill(
         map.insert(yaml_serde::Value::from(META_AUTHOR), author.into());
     }
 
-    let rendered = render_skill_file(&merged, &body);
+    opened.commit(name, merged, &body)
+}
 
-    // Parse the bytes about to be written, exactly as discovery will: a file the renderer got
-    // wrong would otherwise report success and then be skipped by discovery forever, refused by
-    // this function's own clobber guard, so the agent could not even repair it.
-    let written = parse_skill_definition(name, root, &dir, &skill_file, &rendered)
-        .map_err(|error| format!("refusing to write a skill that would not parse back: {error}"))?;
+/// Replace a skill's body only while it still reads `expected`, leaving the frontmatter as it is.
+///
+/// The compare-and-swap `skill_edit` needs: the edit is computed from a body read outside the
+/// store lock, and a `meka skill add`, a `PUT /v1/skills/{name}` or an editor save that lands in
+/// between would otherwise be overwritten with text computed against what it replaced. The
+/// comparison is made under the lock, against the body [`load_skill_source`] returns now.
+pub(crate) fn write_skill_body(
+    root: &Path,
+    name: &str,
+    expected: &str,
+    body: &str,
+) -> Result<BodyWrite, String> {
+    let opened = OpenedSkill::open(root, name)?;
+    let Some((text, skill)) = &opened.existing else {
+        return Ok(BodyWrite::Gone);
+    };
+    if skill_body_of(text) != expected {
+        return Ok(BodyWrite::ChangedUnderneath);
+    }
+    let skill = skill.clone();
+    Ok(BodyWrite::Saved(Box::new(
+        opened.commit(name, skill, body)?,
+    )))
+}
 
-    // Atomic, like every other store write: `fs::write` truncates in place, so an interrupted write
-    // leaves a half-file that discovery rejects and the guard above then refuses to overwrite.
-    crate::fs::write_file_atomic(&skill_file, &rendered).map_err(|error| {
-        tracing::warn!(
-            "failed to write skill '{name}' to {path}: {error}",
-            path = skill_file.display()
-        );
-        format!("failed to write skill '{name}': {error}")
-    })?;
-    Ok(WrittenSkill {
-        skill: written,
-        previous: existing,
-        text: rendered,
-    })
+/// What [`write_skill_body`] did.
+#[derive(Debug)]
+pub(crate) enum BodyWrite {
+    Saved(Box<WrittenSkill>),
+    /// The body is no longer the one the caller computed against.
+    ChangedUnderneath,
+    /// No skill at that name any more.
+    Gone,
+}
+
+/// A skill opened for writing: the store lock, and what is at the name under it.
+///
+/// Every write door's checks, made once and acted on under one lock. The name is joined onto
+/// `root` here, so [`validate_skill_name`] has to run before any of it; callers validate too, and
+/// this is the backstop that makes the join safe regardless.
+struct OpenedSkill {
+    /// Held across everything below, and across processes: the collision and symlink checks read
+    /// the store and the write acts on what they read, so two writers that both checked before
+    /// either locked would both pass (`Foo/` beside `foo/`, or a link planted after the check),
+    /// and the read-modify-write of `meka skill add` and a turn's `skill_write` would lose one
+    /// edit.
+    _store_lock: crate::fs::StoreLock,
+    root: PathBuf,
+    dir: PathBuf,
+    skill_file: PathBuf,
+    /// The file as it is and the skill it parses to; `None` when there is no file.
+    existing: Option<(String, Skill)>,
+}
+
+impl OpenedSkill {
+    /// Lock the store and read what is at `name`, refusing what no write may touch.
+    ///
+    /// Refuses outright when the file exists but does not parse. Such a file is in no index and no
+    /// listing, so neither the caller nor the model can know what is about to be overwritten.
+    fn open(root: &Path, name: &str) -> Result<Self, String> {
+        validate_skill_name(name)?;
+        let store_lock = crate::fs::lock_store(root).map_err(|error| {
+            tracing::warn!(
+                "failed to lock the skill store at {root}: {error}",
+                root = root.display()
+            );
+            format!("failed to lock the skill store: {error}")
+        })?;
+
+        // Read the directory rather than the discovered index: this must see what is on disk right
+        // now, including a skill written since the index was built.
+        if let Ok(entries) = std::fs::read_dir(root) {
+            let names: Vec<String> = entries
+                .flatten()
+                .filter(|entry| entry.path().is_dir())
+                .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+                .collect();
+            crate::entry::check_case_collision(name, names.iter().map(String::as_str), "skill")?;
+        }
+
+        let dir = root.join(name);
+        // Whichever spelling is already there, so an edit changes the skill rather than creating a
+        // second file beside it: a skill stored as `skill.md` would otherwise read as absent and be
+        // clobbered.
+        let skill_file = skill_file_in(&dir);
+        // Both levels: a skill is a directory, so either the directory or the file inside it can be
+        // the redirect. See [`crate::fs::reject_symlinked_path`], which warns with the path it
+        // refused; what comes back here says which skill, for the reason the module header gives.
+        crate::fs::reject_symlinked_path(&dir, "skill").map_err(|_| symlinked(name))?;
+        crate::fs::reject_symlinked_path(&skill_file, "skill").map_err(|_| symlinked(name))?;
+
+        // A read error is not "there is no file here": a `SKILL.md` in Latin-1 or at mode 000
+        // would otherwise be replaced by a stub, because `body: None` then means "there was no
+        // body".
+        let text = match std::fs::read_to_string(&skill_file) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                tracing::warn!(
+                    "refusing to write skill '{name}': failed to read {path}: {error}",
+                    path = skill_file.display()
+                );
+                return Err(format!(
+                    "skill '{name}' exists but failed to read ({error}); refusing to overwrite \
+                     contents meka cannot see, so repair the file or remove the skill first"
+                ));
+            }
+        };
+        let existing = match text {
+            Some(content) => {
+                match parse_skill_definition(name, root, &dir, &skill_file, &content) {
+                    Ok(skill) => Some((content, skill)),
+                    Err(reason) => {
+                        tracing::warn!(
+                            "refusing to write skill '{name}': {path} is not a valid skill: \
+                             {reason}",
+                            path = skill_file.display()
+                        );
+                        return Err(format!(
+                            "skill '{name}' exists but is not a valid skill ({reason}); refusing \
+                             to overwrite it"
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
+        // Refused rather than worked around: the spec says `metadata` is a map, and a file where it
+        // is not leaves meka nowhere spec-legal to put `meka-priority` or `author`. Reading such a
+        // skill still works; only rewriting it is refused.
+        if let Some((_, existing)) = existing.as_ref()
+            && existing
+                .metadata
+                .as_ref()
+                .is_some_and(|value| !value.is_mapping())
+        {
+            tracing::warn!(
+                "refusing to rewrite skill '{name}': {path} has a `metadata` that is not a map",
+                path = skill_file.display()
+            );
+            return Err(format!(
+                "skill '{name}' has a `metadata` that is not a map; make it the map of string to \
+                 string the Agent Skills spec describes"
+            ));
+        }
+        Ok(Self {
+            _store_lock: store_lock,
+            root: root.to_path_buf(),
+            dir,
+            skill_file,
+            existing,
+        })
+    }
+
+    /// Render `skill` over `body`, prove the result parses back, and write it in place of the
+    /// file read under the lock.
+    fn commit(self, name: &str, mut skill: Skill, body: &str) -> Result<WrittenSkill, String> {
+        // The struct is about to be rendered and parsed back, and the parse-back is what every
+        // caller reads. Leaving stale conformance on it would be a `Skill` that contradicts its
+        // own file.
+        skill.conformance = Conformance::default();
+        let rendered = render_skill_file(&skill, body);
+
+        // Parse the bytes about to be written, exactly as discovery will: a file the renderer got
+        // wrong would otherwise report success and then be skipped by discovery forever, refused
+        // by `open`'s own clobber guard, so the agent could not even repair it.
+        let written =
+            parse_skill_definition(name, &self.root, &self.dir, &self.skill_file, &rendered)
+                .map_err(|error| {
+                    format!("refusing to write a skill that would not parse back: {error}")
+                })?;
+
+        // Atomic, like every other store write: `fs::write` truncates in place, so an interrupted
+        // write leaves a half-file that discovery rejects and the guard above then refuses to
+        // overwrite.
+        crate::fs::write_file_atomic(&self.skill_file, &rendered).map_err(|error| {
+            tracing::warn!(
+                "failed to write skill '{name}' to {path}: {error}",
+                path = self.skill_file.display()
+            );
+            format!("failed to write skill '{name}': {error}")
+        })?;
+        Ok(WrittenSkill {
+            skill: written,
+            previous: self.existing.map(|(text, _)| text),
+            text: rendered,
+        })
+    }
 }
 /// What [`write_skill`] wrote: the skill as its file parses back, with the file's text before and
 /// after, which a frontend draws as the change.
