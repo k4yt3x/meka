@@ -7438,6 +7438,112 @@ fn a_skill_body_round_trips_through_get_and_put() {
     );
 }
 
+/// The memory routes carry every field the tool carries, `GET /v1/memory/{name}` adds the
+/// backlinks, the list takes the three filters with and without `q`, and an empty `expires`
+/// clears the expiry the way the tool's does.
+#[test]
+fn memory_routes_carry_the_new_fields_and_take_the_filters() {
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
+        "memory:r", "memory:w",
+    ]);
+    harness
+        .request(reqwest::Method::PUT, "/v1/memory/hub")
+        .json(&serde_json::json!({"description": "the hub note"}))
+        .send()
+        .expect("create hub");
+    let spoke: serde_json::Value = harness
+        .request(reqwest::Method::PUT, "/v1/memory/spoke")
+        .json(&serde_json::json!({
+            "description": "the spoke note",
+            "load": "search",
+            "references": ["hub", "https://example.com/x"],
+            "source": "ops, in chat",
+            "expires": "2020-01-01",
+            "body": "spoke body",
+        }))
+        .send()
+        .expect("create spoke")
+        .json()
+        .expect("parse");
+    assert_eq!(spoke["load"], "search");
+    assert_eq!(
+        spoke["references"],
+        serde_json::json!(["hub", "https://example.com/x"])
+    );
+    assert_eq!(spoke["source"], "ops, in chat");
+    assert!(spoke["expires_at"].is_string(), "{spoke}");
+    assert_eq!(spoke["verified_at"], spoke["created_at"]);
+    assert!(
+        spoke.get("referenced_by").is_none(),
+        "backlinks ride on the single-memory read alone: {spoke}"
+    );
+
+    let hub: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/memory/hub")
+        .send()
+        .expect("read hub")
+        .json()
+        .expect("parse");
+    assert_eq!(hub["referenced_by"], serde_json::json!(["spoke"]));
+    assert!(hub.get("expires_at").is_none(), "{hub}");
+
+    let names = |query: &str| -> Vec<String> {
+        harness
+            .request(reqwest::Method::GET, &format!("/v1/memory{query}"))
+            .send()
+            .expect("list")
+            .json::<serde_json::Value>()
+            .expect("parse")["memories"]
+            .as_array()
+            .expect("a listing")
+            .iter()
+            .map(|row| row["name"].as_str().expect("name").to_string())
+            .collect()
+    };
+    assert_eq!(names(""), ["spoke", "hub"], "newest first within the band");
+    assert_eq!(names("?referencing=HUB"), ["spoke"]);
+    assert_eq!(names("?referencing=nothing"), Vec::<String>::new());
+    assert_eq!(names("?expired=true"), ["spoke"]);
+    assert_eq!(names("?unverified=1d"), Vec::<String>::new());
+    assert_eq!(names("?q=note&referencing=hub"), ["spoke"]);
+    assert_eq!(names("?q=note&expired=true"), ["spoke"]);
+    assert_eq!(names("?q=note&referencing=nothing"), Vec::<String>::new());
+    let unreadable = harness
+        .request(reqwest::Method::GET, "/v1/memory?unverified=soon")
+        .send()
+        .expect("send");
+    assert_eq!(unreadable.status(), 422, "a window the parser cannot read");
+
+    let cleared: serde_json::Value = harness
+        .request(reqwest::Method::PUT, "/v1/memory/spoke")
+        .json(&serde_json::json!({
+            "description": "the spoke note",
+            "expires": "",
+            "verified": true,
+        }))
+        .send()
+        .expect("update")
+        .json()
+        .expect("parse");
+    assert!(
+        cleared.get("expires_at").is_none(),
+        "an empty expires clears the expiry: {cleared}"
+    );
+    assert_ne!(
+        cleared["verified_at"], cleared["created_at"],
+        "verified: true moves the stamp: {cleared}"
+    );
+    assert_eq!(
+        cleared["load"], "search",
+        "an update keeps what it does not mention"
+    );
+    assert_eq!(
+        cleared["references"],
+        serde_json::json!(["hub", "https://example.com/x"])
+    );
+    assert_eq!(names("?expired=true"), Vec::<String>::new());
+}
+
 /// Omitting `priority` on an update must keep it, the way omitting `body` or `author` already
 /// does. Resetting it would make the obvious edit demote a skill out of the index the model reads.
 #[test]

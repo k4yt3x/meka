@@ -3562,6 +3562,8 @@ mod tests {
                 priority: Some(0),
                 tags: None,
                 body: Some(body.into()),
+                load: Some(crate::memory::Load::Inline),
+                ..crate::store::memory::WriteRequest::default()
             };
             agent
                 .memories

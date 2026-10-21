@@ -288,7 +288,7 @@ impl Default for ResolvedBackgroundConfig {
 /// `[memory]` table: the agent's durable note store ([`crate::memory`]).
 ///
 /// Config-only, with no env var and no CLI flag: whether an agent keeps memories is a property of
-/// the installation, not something to vary per run. Turning it off keeps the four `memory_*` tool
+/// the installation, not something to vary per run. Turning it off keeps the five `memory_*` tool
 /// schemas out of every request, which is the point for someone running lean coding sessions.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -383,7 +383,7 @@ pub(crate) enum MemoryAccess {
     None,
     /// `memory_read` and `memory_search`; no `memory_write` or `memory_delete`.
     Read,
-    /// All four memory tools. The root agent only.
+    /// All five memory tools. The root agent only.
     Write,
 }
 

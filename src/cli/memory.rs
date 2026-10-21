@@ -9,18 +9,19 @@ use crate::{
     memory,
     store::{
         Store,
-        memory::{MemoryStore, WriteRequest},
+        memory::{MemoryFilter, MemoryStore, WriteRequest},
     },
 };
 
 /// Ceiling on the tags column, shown for information; `get` lists them all.
 const TAGS_TRUNCATE: usize = 24;
 
-/// The listing's columns: the name `get`, `show` and `remove` take, three facts, and the
+/// The listing's columns: the name `get`, `show` and `remove` take, four facts, and the
 /// description spending the rest.
-const MEMORY_COLUMNS: [crate::text::Column; 5] = [
+const MEMORY_COLUMNS: [crate::text::Column; 6] = [
     crate::text::Column::content("Name"),
     crate::text::Column::content("Priority"),
+    crate::text::Column::content("Load"),
     crate::text::Column::content("Recorded"),
     crate::text::Column::capped("Tags", TAGS_TRUNCATE),
     crate::text::Column::remainder("Description"),
@@ -35,17 +36,25 @@ pub(crate) struct AddArgs<'a> {
     pub(crate) tags: &'a [String],
     pub(crate) body: Option<&'a str>,
     pub(crate) from_file: Option<&'a Path>,
+    pub(crate) load: Option<memory::Load>,
+    pub(crate) references: &'a [String],
+    pub(crate) source: Option<&'a str>,
+    /// `Some("")` clears the expiry, as the tool's `expires: ""` does.
+    pub(crate) expires: Option<&'a str>,
+    pub(crate) verified: bool,
     pub(crate) force: bool,
 }
 
-/// `meka memory list` under a chosen format and stream: a table of every memory in index order,
-/// or under `--format json` `{"memories": [...]}`, the shape `GET /v1/memory` answers with.
+/// `meka memory list` under a chosen format and stream: a table of the memories the filter
+/// selects, every one of them by default, in index order; or under `--format json`
+/// `{"memories": [...]}`, the shape `GET /v1/memory` answers with.
 pub(crate) async fn list(
     store: &MemoryStore,
+    filter: &MemoryFilter,
     format: crate::cli::OutputFormat,
     stream: crate::render::Stream,
 ) -> Result<()> {
-    let index = store.index().await?;
+    let index = store.list(filter).await?;
     if format == crate::cli::OutputFormat::Json {
         let views: Vec<crate::view::MemoryDetail> = index
             .iter()
@@ -66,6 +75,7 @@ pub(crate) async fn list(
             vec![
                 entry.name.clone(),
                 entry.priority.to_string(),
+                entry.load.to_string(),
                 memory::render_age(entry.created_at, now),
                 entry.tags.join(","),
                 crate::text::prose_cell(&memory::render_description_for_model(&entry.description)),
@@ -85,8 +95,16 @@ pub(crate) async fn run_get(
     format: crate::cli::OutputFormat,
 ) -> Result<()> {
     let entry = require_memory(store, name).await?;
+    let referenced_by: Vec<String> = store
+        .referenced_by(&entry.name)
+        .await?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
     if format == crate::cli::OutputFormat::Json {
-        crate::cli::write_json(&crate::view::MemoryDetail::new(&entry, None))?;
+        let mut detail = crate::view::MemoryDetail::new(&entry, None);
+        detail.referenced_by = Some(referenced_by);
+        crate::cli::write_json(&detail)?;
         return Ok(());
     }
     let now = std::time::SystemTime::now();
@@ -97,13 +115,46 @@ pub(crate) async fn run_get(
             memory::render_description_for_model(&entry.description),
         ),
         ("priority", entry.priority.to_string()),
-        // Two dates, because they answer different questions. "created" is when the note was made
-        // and is stamped once; "updated" is when the row last changed, which a priority nudge
-        // moves without the note saying anything new.
+        ("load", entry.load.to_string()),
+        // Three dates, because they answer different questions. "created" is when the note was
+        // made and is stamped once; "updated" is when the row last changed, which a priority
+        // nudge moves without the note saying anything new; "verified" is when the fact was last
+        // verified, which only an explicit verification moves.
         ("created", memory::render_age(entry.created_at, now)),
         ("updated", memory::render_age(entry.updated_at, now)),
+        ("verified", memory::render_age(entry.verified_at, now)),
         ("read count", entry.read_count.to_string()),
     ];
+    if let Some(expires) = entry.expires_at {
+        fields.push(("expires", memory::render_expiry(expires, now)));
+    }
+    if !entry.source.is_empty() {
+        fields.push((
+            "source",
+            memory::render_description_for_model(&entry.source),
+        ));
+    }
+    if !entry.references.is_empty() {
+        fields.push((
+            "references",
+            entry
+                .references
+                .iter()
+                .map(|reference| memory::render_description_for_model(reference))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    if !referenced_by.is_empty() {
+        fields.push((
+            "referenced by",
+            referenced_by
+                .iter()
+                .map(|name| memory::render_description_for_model(name))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
     if !entry.tags.is_empty() {
         fields.push(("tags", entry.tags.join(", ")));
     }
@@ -193,6 +244,20 @@ pub(crate) async fn run_add(store: &MemoryStore, args: AddArgs<'_>) -> Result<()
     } else {
         Some(memory::normalize_tags(args.tags).map_err(MekaError::Usage)?)
     };
+    let references = if args.references.is_empty() {
+        None
+    } else {
+        Some(memory::normalize_references(args.references).map_err(MekaError::Usage)?)
+    };
+    let source = match args.source {
+        Some(source) => Some(memory::normalize_source(source).map_err(MekaError::Usage)?),
+        None => None,
+    };
+    let expires_at = match args.expires {
+        None => None,
+        Some(raw) if raw.trim().is_empty() => Some(None),
+        Some(raw) => Some(Some(memory::parse_expiry(raw).map_err(MekaError::Usage)?)),
+    };
 
     let written = store
         .write(WriteRequest {
@@ -204,6 +269,11 @@ pub(crate) async fn run_add(store: &MemoryStore, args: AddArgs<'_>) -> Result<()
             tags,
             body,
             priority: args.priority,
+            load: args.load,
+            references,
+            source,
+            expires_at,
+            verified: args.verified,
         })
         .await?;
     tracing::info!(
@@ -288,7 +358,12 @@ pub(crate) async fn run_edit(store: &MemoryStore, name: &str) -> Result<()> {
     //
     // The scratch directory is removed *after* this, not before: `edit_in` waits for the editor to
     // exit, so on a refused save the scratch file is the only copy of what the user typed.
-    match store.write_body(&entry.name, &original, edited).await {
+    // The operator is not the agent verifying a fact, so the editor round trip never moves the
+    // verification stamp.
+    match store
+        .write_body(&entry.name, &original, edited, false)
+        .await
+    {
         Ok(crate::store::memory::BodyWrite::Saved) => {
             discard_scratch(&directory);
             tracing::info!("updated the body of memory '{name}'");
@@ -698,8 +773,26 @@ pub(crate) async fn run_memory_subcommand(
     // memories; it is not a reason to refuse to show, back up or delete what is already stored.
     let store = store.memory_store(true);
     match action {
-        crate::cli::MemoryAction::List { format } => {
-            crate::cli::memory::list(&store, *format, crate::render::Stream::Stdout).await?
+        crate::cli::MemoryAction::List {
+            format,
+            referencing,
+            unverified,
+            expired,
+        } => {
+            let filter = MemoryFilter {
+                referencing: referencing.clone(),
+                unverified_for: match unverified {
+                    Some(window) => {
+                        Some(memory::parse_unverified_window(window).map_err(|message| {
+                            MekaError::Usage(format!("--unverified {message}"))
+                        })?)
+                    }
+                    None => None,
+                },
+                expired: *expired,
+            };
+            crate::cli::memory::list(&store, &filter, *format, crate::render::Stream::Stdout)
+                .await?
         }
         crate::cli::MemoryAction::Get { name, format } => {
             crate::cli::memory::run_get(&store, name, *format).await?
@@ -714,6 +807,11 @@ pub(crate) async fn run_memory_subcommand(
             tags,
             body,
             from_file,
+            load,
+            references,
+            source,
+            expires,
+            verified,
             force,
         } => {
             crate::cli::memory::run_add(&store, crate::cli::memory::AddArgs {
@@ -723,6 +821,11 @@ pub(crate) async fn run_memory_subcommand(
                 tags,
                 body: body.as_deref(),
                 from_file: from_file.as_deref(),
+                load: *load,
+                references,
+                source: source.as_deref(),
+                expires: expires.as_deref(),
+                verified: *verified,
                 force: *force,
             })
             .await?
@@ -760,6 +863,7 @@ mod tests {
                     tags: Some(vec!["infra".to_string()]),
                     body: Some(body.to_string()),
                     priority: Some(*priority),
+                    ..WriteRequest::default()
                 })
                 .await
                 .expect("write");
@@ -780,6 +884,16 @@ mod tests {
             tags: &[],
             body: None,
             from_file: None,
+            load: None,
+
+            references: &[],
+
+            source: None,
+
+            expires: None,
+
+            verified: false,
+
             force: true,
         })
         .await
@@ -806,6 +920,16 @@ mod tests {
             tags: &[],
             body: None,
             from_file: None,
+            load: None,
+
+            references: &[],
+
+            source: None,
+
+            expires: None,
+
+            verified: false,
+
             force: false,
         })
         .await
@@ -833,6 +957,16 @@ mod tests {
             tags: &[],
             body: None,
             from_file: None,
+            load: None,
+
+            references: &[],
+
+            source: None,
+
+            expires: None,
+
+            verified: false,
+
             force: false,
         })
         .await
@@ -866,6 +1000,7 @@ mod tests {
                 tags: None,
                 body: Some(body.to_string()),
                 priority: None,
+                ..WriteRequest::default()
             })
             .await
             .expect("write");
@@ -899,6 +1034,7 @@ mod tests {
                 tags: None,
                 body: Some(handed.replace("keep", "kept")),
                 priority: None,
+                ..WriteRequest::default()
             })
             .await
             .expect("rewrite");
@@ -1009,6 +1145,7 @@ mod tests {
                 tags: None,
                 body: Some("WHAT THE AGENT LEARNED".to_string()),
                 priority: None,
+                ..WriteRequest::default()
             })
             .await
             .expect("the agent writes mid-edit");
@@ -1244,6 +1381,7 @@ mod tests {
                     tags: None,
                     body: Some("body".to_string()),
                     priority: None,
+                    ..WriteRequest::default()
                 })
                 .await
                 .expect("write");
@@ -1325,6 +1463,7 @@ mod tests {
                     tags: None,
                     body: Some("body".to_string()),
                     priority: None,
+                    ..WriteRequest::default()
                 })
                 .await
                 .expect("write");

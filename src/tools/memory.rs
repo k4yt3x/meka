@@ -1,8 +1,8 @@
 //! The `memory_*` tools: the agent's read/write access to its own durable notes
 //! ([`crate::memory`]).
 //!
-//! All four gate at [`Permission::Read`], matching `scratchpad_*` and `checklist_*`: these write to
-//! a store meka owns in its own database, not to the user's tree, and the motivating deployment
+//! All of them gate at [`Permission::Read`], matching `scratchpad_*` and `checklist_*`: these write
+//! to a store meka owns in its own database, not to the user's tree, and the motivating deployment
 //! runs at read permission permanently. Gating them at `workspace` would mean an agent that can
 //! never remember anything, which defeats the feature.
 //!
@@ -46,7 +46,7 @@ impl Tool for MemoryWriteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "memory_write".to_string(),
-            description: "Save preferences, constraints, decisions, or facts that later sessions need. Update an existing name to refine it: omitted fields keep their values, and a given `body` replaces the whole body. Temporary task state and large outputs belong in the scratchpad, which later sessions do not read. Write a description that states the useful fact on its own.".to_string(),
+            description: "Save preferences, constraints, decisions, or facts that later sessions need. Update an existing name to refine it: omitted fields keep their values, and a given `body` replaces the whole body (`memory_edit` changes part of one). Temporary task state and large outputs belong in the scratchpad, which later sessions do not read. Write a description that states the useful fact on its own.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -64,7 +64,7 @@ impl Tool for MemoryWriteTool {
                         "minimum": 0,
                         "maximum": 9,
                         "default": crate::entry::DEFAULT_PRIORITY,
-                        "description": "Lower sorts higher. 0 marks a standing directive whose body is inlined within the context budget; overflow must be read. Other tiers list descriptions within the index budget. Default: 5."
+                        "description": "Importance, 0 (highest) to 9: decides index order and search weight, not what loads. 0-1 standing directives, 2-4 durable facts, 6-9 situational. Default: 5."
                     },
                     "tags": {
                         "type": "array",
@@ -76,9 +76,41 @@ impl Tool for MemoryWriteTool {
                     },
                     "body": {
                         "type": "string",
-                        "description": "Detail loaded by `memory_read`, and inlined within budget at priority 0. \
-                                        Replaces the existing body whole; omit it to leave it \
+                        "description": "Detail loaded by `memory_read`, and in context every turn when `load` is \
+                                        `inline`. Replaces the existing body whole; omit it to leave it \
                                         untouched, or pass an empty string to clear it."
+                    },
+                    "load": {
+                        "type": "string",
+                        "enum": ["inline", "index", "search"],
+                        "description": "How the memory reaches your context: `inline` puts the body in every \
+                                        turn, for a rule you must follow without looking it up; `index` lists \
+                                        the description every turn; `search` leaves it to memory_search alone. \
+                                        Default: index. Omit to keep."
+                    },
+                    "references": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "What this memory depends on: other memory names, paths, URLs or \
+                                        external ids, one line each, at most 20. memory_read shows what \
+                                        references a memory, so a changed fact can be revisited wherever \
+                                        it is cited. Omit to keep; pass [] to clear."
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Where the fact came from, one line. Omit to keep; pass \"\" to clear."
+                    },
+                    "verified": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "true when this write follows a check that the fact is current. The \
+                                        only thing that moves the verification stamp memory_read reports."
+                    },
+                    "expires": {
+                        "type": "string",
+                        "description": "When the memory stops applying: RFC 3339, or YYYY-MM-DD for the whole \
+                                        of that day. Past it the memory leaves the index and is found by \
+                                        memory_search alone. Omit to keep; pass \"\" to clear."
                     }
                 },
                 "required": ["name"]
@@ -195,7 +227,7 @@ impl Tool for MemoryWriteTool {
         // `i64` so a negative clamps to 0 instead of failing the `as_u64` cast outright.
         //
         // `None` means "leave it alone", which the upsert resolves in SQL: reading the absence as
-        // the default would demote a priority-0 standing directive every time the agent reworded
+        // the default would demote an inline standing directive every time the agent reworded
         // it.
         let priority = match input.get("priority") {
             Some(serde_json::Value::Null) | None => None,
@@ -207,6 +239,98 @@ impl Tool for MemoryWriteTool {
                 Some(memory::parse_priority(Some(raw), name))
             }
         };
+        let load = match input.get("load") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(raw)) => Some(
+                raw.trim()
+                    .parse::<memory::Load>()
+                    .map_err(|message| tool_error("memory_write", message))?,
+            ),
+            Some(value) => {
+                return Err(tool_error(
+                    "memory_write",
+                    format!(
+                        "'load' must be one of {}, got {value}",
+                        memory::Load::supported()
+                    ),
+                ));
+            }
+        };
+        // The same omit-to-keep rule and the same refusal of a malformed list as `tags`.
+        let references: Option<Vec<String>> = match input.get("references") {
+            Some(serde_json::Value::Array(values)) => {
+                let mut collected = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(reference) = value.as_str() else {
+                        return Err(tool_error(
+                            "memory_write",
+                            format!("every entry in 'references' must be a string, got {value}"),
+                        ));
+                    };
+                    collected.push(reference.to_string());
+                }
+                Some(
+                    memory::normalize_references(&collected)
+                        .map_err(|message| tool_error("memory_write", message))?,
+                )
+            }
+            Some(serde_json::Value::String(single)) => Some(
+                memory::normalize_references(std::slice::from_ref(single))
+                    .map_err(|message| tool_error("memory_write", message))?,
+            ),
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => {
+                return Err(tool_error(
+                    "memory_write",
+                    format!("'references' must be a list of strings, got {value}"),
+                ));
+            }
+        };
+        let source = match input.get("source") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(text)) => Some(
+                memory::normalize_source(text)
+                    .map_err(|message| tool_error("memory_write", message))?,
+            ),
+            Some(value) => {
+                return Err(tool_error(
+                    "memory_write",
+                    format!("'source' must be a string, got {value}"),
+                ));
+            }
+        };
+        let verified = match input.get("verified") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(verified)) => *verified,
+            Some(value) => {
+                return Err(tool_error(
+                    "memory_write",
+                    format!("'verified' must be true or false, got {value}"),
+                ));
+            }
+        };
+        // Three answers, like the store's field: absent keeps, `""` clears, anything else is a
+        // moment the parser has to accept.
+        let expires_at = match input.get("expires") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(raw)) if raw.trim().is_empty() => Some(None),
+            Some(serde_json::Value::String(raw)) => Some(Some(
+                memory::parse_expiry(raw).map_err(|message| tool_error("memory_write", message))?,
+            )),
+            Some(value) => {
+                return Err(tool_error(
+                    "memory_write",
+                    format!("'expires' must be a timestamp or a date, got {value}"),
+                ));
+            }
+        };
+        // The index lists a description every turn, so one that has grown into a paragraph is
+        // spending the budget of several entries; said once, on the write that set it, and
+        // never refused.
+        let long_description = description
+            .as_deref()
+            .map(|description| description.chars().count())
+            .filter(|length| *length > DESCRIPTION_NOTE_CHARS);
 
         // Held from here until after the write, so a second `memory_write` issued in the same turn
         // queues behind this one rather than racing it. Not for the write's sake (the upsert is
@@ -262,6 +386,11 @@ impl Tool for MemoryWriteTool {
                 tags,
                 body,
                 priority,
+                load,
+                references,
+                source,
+                expires_at,
+                verified,
             })
             .await
             .map_err(|error| tool_error("memory_write", error))?;
@@ -275,35 +404,50 @@ impl Tool for MemoryWriteTool {
             old_text: existing.as_ref().map(memory::export_memory),
             new_text: Some(memory::export_memory(&written)),
         };
-        Ok(ToolOutput::text(
-            format!(
-                "Saved memory '{}' (priority {}){}.{}",
-                written.name,
-                // What landed, not what was asked for: an omitted priority is resolved from the
-                // stored row, so echoing the argument would report a number the store does not
-                // carry.
-                written.priority,
-                // Stated so the two calls are distinguishable from the result alone: a metadata
-                // update and a rewrite otherwise report identically, and the difference is the
-                // whole body of the note.
-                if kept_existing_body {
-                    ", keeping the existing body"
-                } else {
-                    ""
-                },
-                match duplicate {
-                    Some(existing) => format!(
-                        "\n\nNote: '{existing}' already says something very similar. If this is \
-                         the same fact, call memory_write on '{existing}' instead and delete \
-                         '{name}'. Two near-copies both stay in the index for ever and neither \
-                         supersedes the other."
-                    ),
-                    None => String::new(),
-                }
-            ),
-            false,
-        )
-        .with_metadata(change))
+        let now = std::time::SystemTime::now();
+        let mut text = format!(
+            "Saved memory '{}' (priority {}{}){}.",
+            written.name,
+            // What landed, not what was asked for: an omitted priority is resolved from the
+            // stored row, so echoing the argument would report a number the store does not
+            // carry.
+            written.priority,
+            // The load only when it is not the default, the way the export writes it.
+            if written.load == memory::Load::default() {
+                String::new()
+            } else {
+                format!(", {}", written.load)
+            },
+            // Stated so the two calls are distinguishable from the result alone: a metadata
+            // update and a rewrite otherwise report identically, and the difference is the
+            // whole body of the note.
+            if kept_existing_body {
+                ", keeping the existing body"
+            } else {
+                ""
+            },
+        );
+        if let Some(length) = long_description {
+            text.push_str(&format!(
+                "\n\nNote: the description is {length} characters and the index lists it every \
+                 turn; keep the fact there and the detail in the body."
+            ));
+        }
+        if written.is_expired(now) {
+            text.push_str(&format!(
+                "\n\nNote: this memory {}, so it is reachable through memory_search alone; pass \
+                 `expires: \"\"` to clear the expiry.",
+                memory::render_expiry(written.expires_at.unwrap_or(now), now)
+            ));
+        }
+        if let Some(existing) = duplicate {
+            text.push_str(&format!(
+                "\n\nNote: '{existing}' already says something very similar. If this is the \
+                 same fact, call memory_write on '{existing}' instead and delete '{name}'. Two \
+                 near-copies both stay in the index for ever and neither supersedes the other."
+            ));
+        }
+        Ok(ToolOutput::text(text, false).with_metadata(change))
     }
 }
 
@@ -322,7 +466,11 @@ impl MemoryWriteTool {
 
         let hits = self
             .memories
-            .search(incoming.match_expression(), 5)
+            .search(
+                incoming.match_expression(),
+                &crate::store::memory::MemoryFilter::default(),
+                5,
+            )
             .await
             .inspect_err(|error| {
                 tracing::debug!("duplicate check skipped: {error}");
@@ -353,6 +501,192 @@ impl MemoryWriteTool {
     }
 }
 
+pub(super) struct MemoryEditTool {
+    pub(crate) memories: Arc<MemoryStore>,
+}
+
+#[async_trait]
+impl Tool for MemoryEditTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_edit".to_string(),
+            description: "Replace an exact string in a memory's body and leave the rest as it is. Refused when `old_string` matches more than once unless `replace_all` is true. For a small change; `memory_write` replaces the whole body.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the memory, as listed in the memory index."
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "The exact text to find in the body."
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "The replacement; an empty string deletes `old_string`."
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Change every occurrence. When false and `old_string` matches more than once, the edit is refused as ambiguous. Default: false."
+                    },
+                    "verified": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "true when this edit follows a check that the fact is current; moves the verification stamp."
+                    }
+                },
+                "required": ["name", "old_string", "new_string"]
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn required_permission(&self) -> Permission {
+        Permission::Read
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        _context: crate::tools::ToolContext,
+    ) -> Result<ToolOutput> {
+        let name = require_str(&input, "name", "memory_edit")?;
+        let name = name.as_str();
+        let old_string = require_str(&input, "old_string", "memory_edit")?;
+        let new_string =
+            super::util::require_str_allowing_empty(&input, "new_string", "memory_edit")?;
+        let replace_all = match input.get("replace_all") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(replace_all)) => *replace_all,
+            Some(value) => {
+                return Err(tool_error(
+                    "memory_edit",
+                    format!("'replace_all' must be true or false, got {value}"),
+                ));
+            }
+        };
+        let verified = match input.get("verified") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(verified)) => *verified,
+            Some(value) => {
+                return Err(tool_error(
+                    "memory_edit",
+                    format!("'verified' must be true or false, got {value}"),
+                ));
+            }
+        };
+        memory::validate_memory_lookup(name)
+            .map_err(|message| tool_error("memory_edit", message))?;
+
+        let Some(existing) = self
+            .memories
+            .get(name)
+            .await
+            .map_err(|error| tool_error("memory_edit", error))?
+        else {
+            let index = self
+                .memories
+                .index()
+                .await
+                .map_err(|error| tool_error("memory_edit", error))?;
+            return Err(tool_error(
+                "memory_edit",
+                format!(
+                    "no memory named '{}'.{}",
+                    name,
+                    crate::tools::did_you_mean_hint(
+                        name,
+                        index.iter().map(|entry| entry.name.as_str())
+                    )
+                ),
+            ));
+        };
+        let body = existing.body.clone().unwrap_or_default();
+        let (edited, count, first_match_byte) =
+            match super::util::replace_anchored(&body, &old_string, &new_string, replace_all) {
+                Ok(applied) => applied,
+                Err(super::util::AnchorMiss::NotFound) => {
+                    return Ok(ToolOutput::text(
+                        format!(
+                            "Error: '{}' not found in the body of memory '{}'",
+                            super::util::truncate_string(&old_string, 100),
+                            existing.name
+                        ),
+                        true,
+                    ));
+                }
+                Err(super::util::AnchorMiss::Ambiguous(count)) => {
+                    return Ok(ToolOutput::text(
+                        format!(
+                            "Error: '{}' matches {count} times in memory '{}'; add surrounding \
+                             context to make old_string unique, or set replace_all=true to \
+                             change every occurrence",
+                            super::util::truncate_string(&old_string, 100),
+                            existing.name
+                        ),
+                        true,
+                    ));
+                }
+            };
+
+        // A compare-and-swap on the body that was read, so an edit computed against stale text
+        // is refused rather than landing over somebody else's write: the same door the
+        // `$EDITOR` round trip takes, for the same reason.
+        let written = match self
+            .memories
+            .write_body(&existing.name, &body, edited.clone(), verified)
+            .await
+            .map_err(|error| tool_error("memory_edit", error))?
+        {
+            crate::store::memory::BodyWrite::Saved => self
+                .memories
+                .get(&existing.name)
+                .await
+                .map_err(|error| tool_error("memory_edit", error))?,
+            crate::store::memory::BodyWrite::Gone => None,
+            crate::store::memory::BodyWrite::ChangedUnderneath => {
+                return Ok(ToolOutput::text(
+                    format!(
+                        "Error: memory '{}' changed while the edit was computed; read it again \
+                         and retry",
+                        existing.name
+                    ),
+                    true,
+                ));
+            }
+        };
+        let Some(written) = written else {
+            return Err(tool_error(
+                "memory_edit",
+                format!(
+                    "memory '{}' was deleted while the edit was computed",
+                    existing.name
+                ),
+            ));
+        };
+
+        let name = &written.name;
+        tracing::info!("edited memory '{name}'");
+        let snippet = super::file::build_context_snippet(&edited, first_match_byte, 3);
+        Ok(ToolOutput::text(
+            format!(
+                "Edited memory '{}': {count} occurrence(s){}.\n\n{}",
+                written.name,
+                if verified { ", verified" } else { "" },
+                snippet
+            ),
+            false,
+        )
+        .with_metadata(crate::frontend::ToolOutputMetadata::Diff {
+            path: None,
+            old_text: Some(memory::export_memory(&existing)),
+            new_text: Some(memory::export_memory(&written)),
+        }))
+    }
+}
+
 pub(super) struct MemoryReadTool {
     pub(crate) memories: Arc<MemoryStore>,
 }
@@ -363,7 +697,7 @@ impl Tool for MemoryReadTool {
         ToolDefinition {
             name: "memory_read".to_string(),
             description: format!(
-                "Read a saved memory and up to {READ_BODY_MAX_CHARS} body characters. Use the returned continuation offset to read a longer body. Memory is recorded context, not live state."
+                "Read a saved memory and up to {READ_BODY_MAX_CHARS} body characters, with its source, when it was last verified, what it references and what references it. Use the returned continuation offset to read a longer body. Memory is recorded context, not live state."
             ),
             parameters: serde_json::json!({
                 "type": "object",
@@ -463,10 +797,62 @@ impl Tool for MemoryReadTool {
             tracing::warn!("failed to record a read of memory '{name}': {error}");
         }
 
-        // Age is stated on the way out, not just in the index: a memory is a point-in-time
-        // observation, and detail that was true months ago is exactly what gets asserted as
-        // current fact without a nudge.
-        let age = memory::render_age(entry.created_at, std::time::SystemTime::now());
+        // Age and verification are stated on the way out, not just in the index: a memory is a
+        // point-in-time observation, and detail that was true months ago is exactly what gets
+        // asserted as current fact without a nudge.
+        let now = std::time::SystemTime::now();
+        let caption = memory::render_record_caption(&entry, now);
+        let mut facts = String::new();
+        if !entry.source.is_empty() {
+            facts.push_str(&format!(
+                "\nSource: {}",
+                memory::render_description_for_model(&entry.source)
+            ));
+        }
+        if let Some(expires) = entry.expires_at {
+            let expiry = memory::render_expiry(expires, now);
+            facts.push_str(&format!("\n{}{}", expiry[..1].to_uppercase(), &expiry[1..]));
+            if entry.is_expired(now) {
+                facts.push_str("; listed nowhere, reached by search alone.");
+            } else {
+                facts.push('.');
+            }
+        }
+        // Resolved on the way out: a reference that names a memory shows that memory's
+        // description beside it, and one that names nothing is shown as written, which is the
+        // "worth writing later" marker and the typo both.
+        if !entry.references.is_empty() {
+            let mut rendered: Vec<String> = Vec::with_capacity(entry.references.len());
+            for reference in &entry.references {
+                let shown = memory::render_description_for_model(reference);
+                match self
+                    .memories
+                    .get(reference)
+                    .await
+                    .map_err(|error| tool_error("memory_read", error))?
+                {
+                    Some(target) => rendered.push(format!(
+                        "{shown} ({})",
+                        crate::entry::elide_description_for_index(
+                            &memory::render_description_for_model(&target.description)
+                        )
+                    )),
+                    None => rendered.push(shown),
+                }
+            }
+            facts.push_str(&format!("\nReferences: {}", rendered.join(", ")));
+        }
+        let backlinks = self
+            .memories
+            .referenced_by(&entry.name)
+            .await
+            .map_err(|error| tool_error("memory_read", error))?;
+        if !backlinks.is_empty() {
+            facts.push_str(&format!(
+                "\nReferenced by: {}",
+                render_backlinks(&entry.name, &backlinks)
+            ));
+        }
         let end = offset.saturating_add(READ_BODY_MAX_CHARS).min(length);
         let page: String = body.chars().skip(offset).take(end - offset).collect();
         let rendered = if length == 0 {
@@ -482,11 +868,10 @@ impl Tool for MemoryReadTool {
         };
         Ok(ToolOutput::text(
             format!(
-                "# {}\n\n{}\n\nSaved {}. This is what you recorded then, not live state; verify \
-                 before relying on it.\n\n{}",
+                "# {}\n\n{}\n\n{caption} This is what you recorded then, not live state; verify \
+                 before relying on it.{facts}\n\n{}",
                 entry.name,
                 memory::render_description_for_model(&entry.description),
-                age,
                 rendered
             ),
             false,
@@ -518,6 +903,14 @@ const READ_BODY_MAX_CHARS: usize = 16_000;
 
 /// Ceiling on the whole rendered result, inlined bodies included.
 const SEARCH_RESULT_MAX_BYTES: usize = 6_144;
+
+/// Past this many characters a written description earns a note: the index lists it every turn,
+/// and the render cap sits at 500, so one this long is spending the budget of several entries.
+const DESCRIPTION_NOTE_CHARS: usize = 200;
+
+/// How many memories a read or a delete names as referencing the one at hand before pointing at
+/// the filter instead.
+const BACKLINKS_SHOWN_MAX: usize = 20;
 
 /// Fraction of an incoming description's words that must already appear in an existing memory's
 /// description before the write says so.
@@ -646,14 +1039,27 @@ impl Tool for MemorySearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "memory_search".to_string(),
-            description: "Search saved memories, including those omitted from the context index. Supply alternative phrasings together in `queries`; matching is case-insensitive and handles word endings.".to_string(),
+            description: "Search saved memories, including those the context index leaves out. Supply alternative phrasings together in `queries`; matching is case-insensitive and handles word endings. `referencing`, `unverified` and `expired` narrow a search, or list memories on their own when no query is given.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "queries": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "One or more phrasings of what you are looking for. Include synonyms when you do not remember the wording."
+                        "description": "One or more phrasings of what you are looking for. Include synonyms when you do not remember the wording. Optional when a filter is given."
+                    },
+                    "referencing": {
+                        "type": "string",
+                        "description": "Only memories whose references name this: a memory name, path, URL or id, matched whole."
+                    },
+                    "unverified": {
+                        "type": "string",
+                        "description": "Only memories not verified within this long, e.g. '90d' or '6months'."
+                    },
+                    "expired": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Only memories whose expiry has passed."
                     },
                     "limit": {
                         "type": "integer",
@@ -663,7 +1069,7 @@ impl Tool for MemorySearchTool {
                         "description": format!("Maximum memories to return. Default: {DEFAULT_SEARCH_LIMIT}.")
                     }
                 },
-                "required": ["queries"]
+                "required": []
             }),
             ..Default::default()
         }
@@ -693,12 +1099,52 @@ impl Tool for MemorySearchTool {
             ),
             _ => None,
         };
-        let Some(queries) = queries else {
+        let filter = crate::store::memory::MemoryFilter {
+            referencing: match input.get("referencing") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(target)) if target.trim().is_empty() => None,
+                Some(serde_json::Value::String(target)) => Some(target.trim().to_string()),
+                Some(value) => {
+                    return Err(tool_error(
+                        "memory_search",
+                        format!("'referencing' must be a string, got {value}"),
+                    ));
+                }
+            },
+            unverified_for: match input.get("unverified") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(window)) if window.trim().is_empty() => None,
+                Some(serde_json::Value::String(window)) => {
+                    Some(memory::parse_unverified_window(window).map_err(|message| {
+                        tool_error("memory_search", format!("'unverified': {message}"))
+                    })?)
+                }
+                Some(value) => {
+                    return Err(tool_error(
+                        "memory_search",
+                        format!("'unverified' must be a duration like '90d', got {value}"),
+                    ));
+                }
+            },
+            expired: match input.get("expired") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::Bool(expired)) => *expired,
+                Some(value) => {
+                    return Err(tool_error(
+                        "memory_search",
+                        format!("'expired' must be true or false, got {value}"),
+                    ));
+                }
+            },
+        };
+        let queries = queries.unwrap_or_default();
+        if queries.is_empty() && filter.is_empty() {
             return Err(MekaError::ToolExecution {
                 tool_name: "memory_search".to_string(),
-                message: "missing 'queries' parameter".to_string(),
+                message: "give 'queries', or one of 'referencing', 'unverified' and 'expired'"
+                    .to_string(),
             });
-        };
+        }
         // Coerced rather than ignored: `as_u64` alone answers `None` for `"3"`, `3.0` and `-1`
         // alike, and a silent default would give ten results to a call that asked for three. The
         // same handler accepts a bare string where `queries` declares an array.
@@ -718,8 +1164,38 @@ impl Tool for MemorySearchTool {
         };
 
         let store = self.memories.as_ref();
+        let now = std::time::SystemTime::now();
+        // A filter and no words is a listing, in index order: every row matched the filter
+        // equally, so there is no relevance to rank by.
+        if queries.is_empty() {
+            let results = store
+                .filtered(&filter, limit)
+                .await
+                .map_err(|error| tool_error("memory_search", error))?;
+            if results.hits.is_empty() {
+                return Ok(ToolOutput::text(
+                    format!("No memories {}.", describe_filter(&filter)),
+                    false,
+                ));
+            }
+            return Ok(ToolOutput::text(
+                render_hits(
+                    Tier::Exact,
+                    ScannedTerms {
+                        found: &[],
+                        missed: &[],
+                        beside_words: false,
+                    },
+                    &results,
+                    limit,
+                    now,
+                    Some(&filter),
+                ),
+                false,
+            ));
+        }
         let Some(found) = store
-            .find(&queries, limit)
+            .find(&queries, &filter, limit)
             .await
             .map_err(|error| tool_error("memory_search", error))?
         else {
@@ -739,7 +1215,6 @@ impl Tool for MemorySearchTool {
         } = found;
         let tier = Tier::from(tier);
 
-        let now = std::time::SystemTime::now();
         if !results.hits.is_empty() {
             return Ok(ToolOutput::text(
                 render_hits(
@@ -752,24 +1227,31 @@ impl Tool for MemorySearchTool {
                     &results,
                     limit,
                     now,
+                    (!filter.is_empty()).then_some(&filter),
                 ),
                 false,
             ));
         }
 
-        // Only now is the whole index loaded: the tiers above answer from SQL, and this one is
-        // the last resort that has to scan.
-        let index = self
+        // Only now is the whole listing loaded: the tiers above answer from SQL, and this one is
+        // the last resort that has to scan. The listing rather than the index, so a memory the
+        // index leaves out is still found by its spelling, under the same filter.
+        let listing = self
             .memories
-            .index()
+            .list(&filter)
             .await
             .map_err(|error| tool_error("memory_search", error))?;
-        let (fuzzy, candidates) = Self::fuzzy_by_spelling(&index, &words, limit);
+        let (fuzzy, candidates) = Self::fuzzy_by_spelling(&listing, &words, limit);
         if fuzzy.is_empty() {
             return Ok(ToolOutput::text(
                 format!(
-                    "No memories matched {queries:?}. Try broader words, or several phrasings of the \
-                     same idea in one call."
+                    "No memories matched {queries:?}{}. Try broader words, or several phrasings \
+                     of the same idea in one call.",
+                    if filter.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", describe_filter(&filter))
+                    }
                 ),
                 false,
             ));
@@ -801,13 +1283,61 @@ fn quoted_list(terms: &[String]) -> String {
         .join(", ")
 }
 
-/// Render ranked hits: one entry per memory, with its body inlined when short enough.
+/// What a filter selected, for a header or a "nothing" line: "referencing 'x'", "not verified
+/// in 90 days", "expired", joined with "and".
+fn describe_filter(filter: &crate::store::memory::MemoryFilter) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(target) = &filter.referencing {
+        parts.push(format!("referencing '{target}'"));
+    }
+    if let Some(window) = filter.unverified_for {
+        parts.push(format!(
+            "not verified in {}",
+            crate::text::format_duration_words(window)
+        ));
+    }
+    if filter.expired {
+        parts.push("expired".to_string());
+    }
+    parts.join(" and ")
+}
+
+/// The memories that reference one, capped so a hub does not spend a read's whole result on its
+/// backlinks; the filter reaches the rest.
+fn render_backlinks(name: &str, backlinks: &[(String, String)]) -> String {
+    let shown: Vec<String> = backlinks
+        .iter()
+        .take(BACKLINKS_SHOWN_MAX)
+        .map(|(name, description)| {
+            format!(
+                "{} ({})",
+                memory::render_description_for_model(name),
+                crate::entry::elide_description_for_index(&memory::render_description_for_model(
+                    description
+                ))
+            )
+        })
+        .collect();
+    let more = backlinks.len().saturating_sub(BACKLINKS_SHOWN_MAX);
+    if more > 0 {
+        format!(
+            "{}, and {more} more; `memory_search` with `referencing: '{name}'` lists them",
+            shown.join(", ")
+        )
+    } else {
+        shown.join(", ")
+    }
+}
+
+/// Render ranked hits: one entry per memory, with its body inlined when short enough. With a
+/// `filter`, the header names it; with no words behind the result, the order is the index's.
 fn render_hits(
     tier: Tier,
     scanned: ScannedTerms<'_>,
     results: &SearchResults,
     limit: usize,
     now: std::time::SystemTime,
+    filter: Option<&crate::store::memory::MemoryFilter>,
 ) -> String {
     let hits = &results.hits;
     let mut out = String::from(tier.preamble());
@@ -832,18 +1362,32 @@ fn render_hits(
     // The number of *matches*, not the number rendered. Reporting the truncated length as the
     // total reads as "this is everything that matched", which is how a full store becomes a
     // confidently incomplete answer.
+    // A listing's hits carry no score, which is what tells it from a search here: "3 memories
+    // referencing 'x', most important first" against "3 matching memories referencing 'x', most
+    // relevant first".
+    let listing = hits.iter().all(|hit| hit.score == 0.0);
     out.push_str(&format!(
-        "{}{} matching {}, most relevant first:\n\n",
+        "{}{} {}{}{}, {}:\n\n",
         if results.pool_exhausted {
             "at least "
         } else {
             ""
         },
         results.matched,
+        if listing { "" } else { "matching " },
         if results.matched == 1 {
             "memory"
         } else {
             "memories"
+        },
+        match filter {
+            Some(filter) => format!(" {}", describe_filter(filter)),
+            None => String::new(),
+        },
+        if listing {
+            "most important first"
+        } else {
+            "most relevant first"
         }
     ));
     let mut shown = 0;
@@ -851,10 +1395,20 @@ fn render_hits(
     for hit in hits {
         let mut entry = String::new();
         entry.push_str(&format!(
-            "- **{}** (p{}, created {}, read {}x)\n",
+            "- **{}** (p{}, created {}{}{}, read {}x)\n",
             hit.name,
             hit.priority,
             memory::render_age(hit.created, now),
+            // The verification only when there was one, as `memory_read`'s caption says it.
+            if hit.verified != hit.created {
+                format!(", verified {}", memory::render_age(hit.verified, now))
+            } else {
+                String::new()
+            },
+            match hit.expires {
+                Some(expires) => format!(", {}", memory::render_expiry(expires, now)),
+                None => String::new(),
+            },
             hit.read_count
         ));
         // Elided, like every other rendered description: descriptions are unbounded at parse time,
@@ -1018,6 +1572,14 @@ impl Tool for MemoryDeleteTool {
             message,
         })?;
 
+        // Asked before the delete, so the answer is what pointed at the row while it existed;
+        // the references themselves stay where they are, as markers of a fact to revisit.
+        let backlinks = self
+            .memories
+            .referenced_by(name)
+            .await
+            .map_err(|error| tool_error("memory_delete", error))?;
+
         // One `DELETE`, and the row carries its own read counts away with it. Separate steps
         // against a second table keyed by name let the doors disagree twice: one leaks the counters
         // the others clear, and one refuses a file the others remove.
@@ -1034,10 +1596,17 @@ impl Tool for MemoryDeleteTool {
         };
 
         tracing::info!("deleted memory '{name}'");
+        let mut text = format!("Deleted memory '{name}'.");
+        if !backlinks.is_empty() {
+            text.push_str(&format!(
+                " Still referenced by {}; revisit those.",
+                render_backlinks(name, &backlinks)
+            ));
+        }
         // The frontend's one chance to show what the note said: the row is gone and no history
         // table holds it.
         Ok(
-            ToolOutput::text(format!("Deleted memory '{name}'."), false).with_metadata(
+            ToolOutput::text(text, false).with_metadata(
                 crate::frontend::ToolOutputMetadata::Diff {
                     path: None,
                     old_text: Some(memory::export_memory(&removed)),
@@ -1555,6 +2124,7 @@ mod tests {
                 tags: None,
                 body: Some("deployment body".to_string()),
                 priority: Some(5),
+                ..WriteRequest::default()
             })
             .await
             .expect("write");
@@ -2839,6 +3409,591 @@ mod tests {
                 .expect("saved")
                 .read_count,
             reads
+        );
+    }
+
+    /// Every new field round-trips through a write and shows on a read: the load in the saved
+    /// line, the source, the record caption, the expiry, the references resolved to their
+    /// descriptions, and the backlinks on the memory they point at.
+    #[tokio::test]
+    async fn a_write_carries_every_new_field_to_a_read() {
+        let memories = store().await;
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+        };
+        let read = MemoryReadTool {
+            memories: memories.clone(),
+        };
+        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        write
+            .execute(
+                serde_json::json!({"name": "alice-timezone", "description": "Alice is in Lisbon"}),
+                context(),
+            )
+            .await
+            .expect("the referenced memory");
+        let tomorrow = (chrono::Local::now() + chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let saved = write
+            .execute(
+                serde_json::json!({
+                    "name": "alice-meeting",
+                    "description": "Meeting with Alice",
+                    "body": "Meet at 10 Lisbon time.",
+                    "load": "search",
+                    "references": ["alice-timezone", "/srv/calendar"],
+                    "source": "alice, in chat",
+                    "expires": tomorrow,
+                }),
+                context(),
+            )
+            .await
+            .expect("create")
+            .text_content();
+        assert!(
+            saved.starts_with("Saved memory 'alice-meeting' (priority 5, search)."),
+            "{saved}"
+        );
+
+        let opened = read
+            .execute(serde_json::json!({"name": "alice-meeting"}), context())
+            .await
+            .expect("read")
+            .text_content();
+        assert!(opened.contains("Recorded today."), "{opened}");
+        assert!(opened.contains("\nSource: alice, in chat"), "{opened}");
+        assert!(opened.contains("\nExpires tomorrow."), "{opened}");
+        assert!(
+            opened.contains("\nReferences: alice-timezone (Alice is in Lisbon), /srv/calendar"),
+            "{opened}"
+        );
+        assert!(opened.contains("Meet at 10 Lisbon time."), "{opened}");
+
+        let target = read
+            .execute(serde_json::json!({"name": "alice-timezone"}), context())
+            .await
+            .expect("read")
+            .text_content();
+        assert!(
+            target.contains("\nReferenced by: alice-meeting (Meeting with Alice)"),
+            "{target}"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        write
+            .execute(
+                serde_json::json!({"name": "alice-meeting", "verified": true}),
+                context(),
+            )
+            .await
+            .expect("verify");
+        let verified = read
+            .execute(serde_json::json!({"name": "alice-meeting"}), context())
+            .await
+            .expect("read")
+            .text_content();
+        assert!(
+            verified.contains("Recorded today, verified today."),
+            "{verified}"
+        );
+
+        // A write with a date already past says so, and the memory is still there to search.
+        let past = write
+            .execute(
+                serde_json::json!({"name": "alice-meeting", "expires": "2020-01-01"}),
+                context(),
+            )
+            .await
+            .expect("expire")
+            .text_content();
+        assert!(
+            past.contains("Note: this memory expired") && past.contains("`expires: \"\"`"),
+            "{past}"
+        );
+        let cleared = write
+            .execute(
+                serde_json::json!({"name": "alice-meeting", "expires": ""}),
+                context(),
+            )
+            .await
+            .expect("clear")
+            .text_content();
+        assert!(!cleared.contains("expired"), "{cleared}");
+        assert!(
+            memories
+                .get("alice-meeting")
+                .await
+                .expect("get")
+                .expect("row")
+                .expires_at
+                .is_none(),
+            "an empty expires clears the expiry"
+        );
+        for (parameter, value) in [
+            ("load", serde_json::json!("always")),
+            ("references", serde_json::json!([1])),
+            ("expires", serde_json::json!("next week")),
+            ("verified", serde_json::json!("yes")),
+            ("source", serde_json::json!(["a"])),
+        ] {
+            let refused = write
+                .execute(
+                    serde_json::json!({"name": "alice-meeting", parameter: value}),
+                    context(),
+                )
+                .await;
+            assert!(refused.is_err(), "{parameter} must be refused: {refused:?}");
+        }
+    }
+
+    /// A description past the note threshold is saved and noted on the write that set it, and
+    /// a later write that leaves it alone says nothing about it.
+    #[tokio::test]
+    async fn a_long_description_is_noted_not_refused() {
+        let memories = store().await;
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+        };
+        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        let long = "word ".repeat(50).trim().to_string();
+        let saved = write
+            .execute(
+                serde_json::json!({"name": "long", "description": long}),
+                context(),
+            )
+            .await
+            .expect("saved")
+            .text_content();
+        assert!(
+            saved.contains("Note: the description is 249 characters"),
+            "{saved}"
+        );
+        let body_only = write
+            .execute(
+                serde_json::json!({"name": "long", "body": "detail"}),
+                context(),
+            )
+            .await
+            .expect("saved")
+            .text_content();
+        assert!(!body_only.contains("Note: the description"), "{body_only}");
+        // The threshold is exclusive: a description exactly at it passes without a word.
+        for (length, noted) in [
+            (DESCRIPTION_NOTE_CHARS, false),
+            (DESCRIPTION_NOTE_CHARS + 1, true),
+        ] {
+            let saved = write
+                .execute(
+                    serde_json::json!({"name": "long", "description": "d".repeat(length)}),
+                    context(),
+                )
+                .await
+                .expect("saved")
+                .text_content();
+            assert_eq!(
+                saved.contains("Note: the description"),
+                noted,
+                "{length} characters: {saved}"
+            );
+        }
+    }
+
+    /// Every memory tool reaches the model with a name and a description, since a schema without
+    /// one is a tool the model cannot choose.
+    #[tokio::test]
+    async fn every_memory_tool_describes_itself() {
+        let memories = store().await;
+        let definitions = [
+            MemoryWriteTool {
+                memories: memories.clone(),
+            }
+            .definition(),
+            MemoryEditTool {
+                memories: memories.clone(),
+            }
+            .definition(),
+            MemoryReadTool {
+                memories: memories.clone(),
+            }
+            .definition(),
+            MemorySearchTool {
+                memories: memories.clone(),
+            }
+            .definition(),
+            MemoryDeleteTool { memories }.definition(),
+        ];
+        let names: Vec<&str> = definitions
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect();
+        assert_eq!(names, [
+            "memory_write",
+            "memory_edit",
+            "memory_read",
+            "memory_search",
+            "memory_delete"
+        ]);
+        for definition in &definitions {
+            assert!(
+                definition.description.len() > 40,
+                "{} has no description to speak of: {:?}",
+                definition.name,
+                definition.description
+            );
+            assert!(
+                definition.parameters["properties"].is_object(),
+                "{} declares no parameters",
+                definition.name
+            );
+        }
+    }
+
+    /// `memory_edit` swaps one exact string, refuses an ambiguous one, replaces every occurrence
+    /// when asked, deletes with an empty replacement, verifies when told, points at a near-miss
+    /// name, and reports the memory before and after.
+    #[tokio::test]
+    async fn memory_edit_changes_the_body_in_place() {
+        let memories = store().await;
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+        };
+        let edit = MemoryEditTool {
+            memories: memories.clone(),
+        };
+        let read = MemoryReadTool {
+            memories: memories.clone(),
+        };
+        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        write
+            .execute(
+                serde_json::json!({
+                    "name": "note",
+                    "description": "a note",
+                    "body": "alpha beta alpha"
+                }),
+                context(),
+            )
+            .await
+            .expect("create");
+
+        let ambiguous = edit
+            .execute(
+                serde_json::json!({"name": "note", "old_string": "alpha", "new_string": "gamma"}),
+                context(),
+            )
+            .await
+            .expect("refused as output");
+        assert!(ambiguous.is_error, "{}", ambiguous.text_content());
+        assert!(
+            ambiguous.text_content().contains("matches 2 times"),
+            "{}",
+            ambiguous.text_content()
+        );
+
+        let all = edit
+            .execute(
+                serde_json::json!({
+                    "name": "note",
+                    "old_string": "alpha",
+                    "new_string": "gamma",
+                    "replace_all": true
+                }),
+                context(),
+            )
+            .await
+            .expect("edited");
+        assert!(!all.is_error, "{}", all.text_content());
+        assert!(
+            all.text_content()
+                .starts_with("Edited memory 'note': 2 occurrence(s)."),
+            "{}",
+            all.text_content()
+        );
+        match all.frontend_metadata.clone() {
+            Some(crate::frontend::ToolOutputMetadata::Diff {
+                path: None,
+                old_text: Some(old),
+                new_text: Some(new),
+            }) => {
+                assert!(old.ends_with("---\n\nalpha beta alpha\n"), "{old}");
+                assert!(new.ends_with("---\n\ngamma beta gamma\n"), "{new}");
+            }
+            other => panic!("an edit reports the memory before and after: {other:?}"),
+        }
+
+        let deleted = edit
+            .execute(
+                serde_json::json!({"name": "note", "old_string": "beta ", "new_string": ""}),
+                context(),
+            )
+            .await
+            .expect("deleted");
+        assert!(!deleted.is_error, "{}", deleted.text_content());
+        assert_eq!(
+            memories
+                .get("note")
+                .await
+                .expect("get")
+                .expect("row")
+                .body
+                .as_deref(),
+            Some("gamma gamma")
+        );
+
+        let missing = edit
+            .execute(
+                serde_json::json!({"name": "note", "old_string": "zzz", "new_string": "y"}),
+                context(),
+            )
+            .await
+            .expect("refused as output");
+        assert!(
+            missing.is_error && missing.text_content().contains("not found"),
+            "{}",
+            missing.text_content()
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        edit.execute(
+            serde_json::json!({
+                "name": "note",
+                "old_string": "gamma gamma",
+                "new_string": "delta",
+                "verified": true
+            }),
+            context(),
+        )
+        .await
+        .expect("verified");
+        let opened = read
+            .execute(serde_json::json!({"name": "note"}), context())
+            .await
+            .expect("read")
+            .text_content();
+        assert!(opened.contains("verified today"), "{opened}");
+
+        let unknown = edit
+            .execute(
+                serde_json::json!({"name": "nots", "old_string": "a", "new_string": "b"}),
+                context(),
+            )
+            .await;
+        match unknown {
+            Err(MekaError::ToolExecution { message, .. }) => {
+                assert!(message.contains("no memory named 'nots'"), "{message}");
+                assert!(message.contains("note"), "{message}");
+            }
+            other => panic!("an unknown name is an error naming the near miss: {other:?}"),
+        }
+        assert_eq!(edit.required_permission(), Permission::Read);
+    }
+
+    /// A filter alone lists in index order and says so; with words it narrows the search; a
+    /// call with neither is refused with the remedy, and so is a duration the parser cannot read.
+    #[tokio::test]
+    async fn search_filters_list_on_their_own_and_narrow_a_search() {
+        let memories = store().await;
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+        };
+        let search = MemorySearchTool {
+            memories: memories.clone(),
+        };
+        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        for (name, extra) in [
+            (
+                "a",
+                serde_json::json!({"references": ["Hub"], "body": "deploy notes"}),
+            ),
+            (
+                "b",
+                serde_json::json!({"references": ["hub"], "body": "deploy steps"}),
+            ),
+            (
+                "c",
+                serde_json::json!({"expires": "2020-01-01", "body": "deploy freeze"}),
+            ),
+        ] {
+            let mut input =
+                serde_json::json!({"name": name, "description": format!("note {name}")});
+            for (key, value) in extra.as_object().expect("object") {
+                input[key] = value.clone();
+            }
+            write.execute(input, context()).await.expect("write");
+        }
+
+        let referencing = search
+            .execute(serde_json::json!({"referencing": "HUB"}), context())
+            .await
+            .expect("listing")
+            .text_content();
+        assert!(
+            referencing.starts_with("2 memories referencing 'HUB', most important first:"),
+            "{referencing}"
+        );
+        let b = referencing.find("**b**").expect("b listed");
+        let a = referencing.find("**a**").expect("a listed");
+        assert!(b < a, "index order, newest first: {referencing}");
+
+        let expired = search
+            .execute(serde_json::json!({"expired": true}), context())
+            .await
+            .expect("listing")
+            .text_content();
+        assert!(
+            expired.starts_with("1 memory expired, most important first:")
+                && expired.contains("**c**")
+                && expired.contains("expired"),
+            "{expired}"
+        );
+
+        let narrowed = search
+            .execute(
+                serde_json::json!({"queries": ["deploy"], "referencing": "hub"}),
+                context(),
+            )
+            .await
+            .expect("search")
+            .text_content();
+        assert!(
+            narrowed.starts_with("2 matching memories referencing 'hub', most relevant first:")
+                && !narrowed.contains("**c**"),
+            "{narrowed}"
+        );
+
+        let none = search
+            .execute(serde_json::json!({"referencing": "nothing"}), context())
+            .await
+            .expect("listing")
+            .text_content();
+        assert_eq!(none, "No memories referencing 'nothing'.");
+
+        // An empty filter value is no filter, so these are nothing to search by too.
+        for nothing in [
+            serde_json::json!({}),
+            serde_json::json!({"queries": []}),
+            serde_json::json!({"referencing": "", "unverified": " "}),
+        ] {
+            match search.execute(nothing, context()).await {
+                Err(MekaError::ToolExecution { message, .. }) => {
+                    assert!(message.contains("'referencing'"), "{message}");
+                }
+                other => panic!("nothing to search by is refused: {other:?}"),
+            }
+        }
+        let unreadable = search
+            .execute(serde_json::json!({"unverified": "soon"}), context())
+            .await;
+        match unreadable {
+            Err(MekaError::ToolExecution { message, .. }) => {
+                assert!(message.contains("'unverified'"), "{message}");
+            }
+            other => panic!("a duration the parser cannot read is refused: {other:?}"),
+        }
+        let fresh = search
+            .execute(serde_json::json!({"unverified": "1d"}), context())
+            .await
+            .expect("listing")
+            .text_content();
+        assert_eq!(fresh, "No memories not verified in 1 day.");
+    }
+
+    /// A read names at most twenty of the memories referencing it and points the rest at the
+    /// filter, so a hub's backlinks cannot spend the whole result.
+    #[tokio::test]
+    async fn a_read_caps_the_backlinks_it_names() {
+        let memories = store().await;
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+        };
+        let read = MemoryReadTool {
+            memories: memories.clone(),
+        };
+        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        write
+            .execute(
+                serde_json::json!({"name": "hub", "description": "the hub"}),
+                context(),
+            )
+            .await
+            .expect("hub");
+        for index in 0..21 {
+            write
+                .execute(
+                    serde_json::json!({
+                        "name": format!("spoke-{index:02}"),
+                        "description": format!("spoke {index}"),
+                        "references": ["hub"]
+                    }),
+                    context(),
+                )
+                .await
+                .expect("spoke");
+        }
+        let opened = read
+            .execute(serde_json::json!({"name": "hub"}), context())
+            .await
+            .expect("read")
+            .text_content();
+        let line = opened
+            .lines()
+            .find(|line| line.starts_with("Referenced by: "))
+            .expect("backlinks line");
+        assert_eq!(line.matches("spoke-").count(), 20, "{line}");
+        assert!(
+            line.ends_with("and 1 more; `memory_search` with `referencing: 'hub'` lists them"),
+            "{line}"
+        );
+    }
+
+    /// Deleting a referenced memory names what still points at it, and leaves those references
+    /// in place as markers of a fact to revisit.
+    #[tokio::test]
+    async fn delete_names_the_memories_still_referencing_the_deleted_one() {
+        let memories = store().await;
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+        };
+        let delete = MemoryDeleteTool {
+            memories: memories.clone(),
+        };
+        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        write
+            .execute(
+                serde_json::json!({"name": "hub", "description": "the hub"}),
+                context(),
+            )
+            .await
+            .expect("hub");
+        write
+            .execute(
+                serde_json::json!({
+                    "name": "spoke",
+                    "description": "a spoke",
+                    "references": ["hub"]
+                }),
+                context(),
+            )
+            .await
+            .expect("spoke");
+        let deleted = delete
+            .execute(serde_json::json!({"name": "hub"}), context())
+            .await
+            .expect("deleted")
+            .text_content();
+        assert_eq!(
+            deleted,
+            "Deleted memory 'hub'. Still referenced by spoke (a spoke); revisit those."
+        );
+        assert_eq!(
+            memories
+                .get("spoke")
+                .await
+                .expect("get")
+                .expect("row")
+                .references,
+            ["hub"]
         );
     }
 }

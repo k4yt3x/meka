@@ -345,6 +345,16 @@ pub(crate) struct MemoryListQuery {
     /// `q`.
     #[serde(default)]
     pub(crate) limit: Option<u32>,
+    /// Only memories whose references name this: a memory name, path, URL or id, matched whole
+    /// and without regard to case.
+    #[serde(default)]
+    pub(crate) referencing: Option<String>,
+    /// Only memories not verified within this long, e.g. `90d`.
+    #[serde(default)]
+    pub(crate) unverified: Option<String>,
+    /// Only memories whose expiry has passed.
+    #[serde(default)]
+    pub(crate) expired: Option<bool>,
 }
 
 #[utoipa::path(
@@ -366,10 +376,22 @@ pub(crate) async fn list_memories(
     Query(query): Query<MemoryListQuery>,
 ) -> Result<Json<MemoryListResponse>, ProblemDetail> {
     let memories = &state.shared.memories;
+    // The same filter the agent's tool and the CLI take, so the three doors select the same rows.
+    let filter = crate::store::memory::MemoryFilter {
+        referencing: query.referencing.filter(|target| !target.trim().is_empty()),
+        unverified_for: match query.unverified.filter(|window| !window.trim().is_empty()) {
+            Some(window) => Some(
+                crate::memory::parse_unverified_window(&window)
+                    .map_err(|message| store_error(format!("unverified: {message}")))?,
+            ),
+            None => None,
+        },
+        expired: query.expired.unwrap_or(false),
+    };
     let Some(words) = query.q.filter(|words| !words.trim().is_empty()) else {
-        let index = memories.index().await.map_err(memory_failure)?;
+        let listed = memories.list(&filter).await.map_err(memory_failure)?;
         return Ok(Json(MemoryListResponse {
-            memories: index
+            memories: listed
                 .iter()
                 .map(|memory| MemoryDetail::new(memory, None))
                 .collect(),
@@ -379,7 +401,7 @@ pub(crate) async fn list_memories(
     // The same ladder the agent climbs, so an operator and the model find the same memories for
     // the same words. A query with no searchable words finds nothing, as the tool says.
     let found = memories
-        .find(&[words], limit)
+        .find(&[words], &filter, limit)
         .await
         .map_err(memory_failure)?;
     let mut listed = Vec::new();
@@ -426,7 +448,19 @@ pub(crate) async fn get_memory(
         .map_err(memory_failure)?
         .ok_or_else(|| not_found("memory", &name))?;
     let body = memory.body.clone().unwrap_or_default();
-    Ok(Json(MemoryDetail::new(&memory, Some(body))))
+    let mut detail = MemoryDetail::new(&memory, Some(body));
+    detail.referenced_by = Some(
+        state
+            .shared
+            .memories
+            .referenced_by(&memory.name)
+            .await
+            .map_err(memory_failure)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect(),
+    );
+    Ok(Json(detail))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -444,6 +478,25 @@ pub(crate) struct WriteMemoryRequest {
     /// Omit to keep the existing body when updating; send `""` to clear it.
     #[serde(default)]
     pub(crate) body: Option<String>,
+    /// How the memory reaches the agent's context: `inline`, `index` or `search`. Omit to keep;
+    /// defaults to `index` on creation.
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub(crate) load: Option<crate::memory::Load>,
+    /// What the memory depends on: memory names, paths, URLs or ids, one line each, at most 20.
+    /// Omit to keep; send `[]` to clear.
+    #[serde(default)]
+    pub(crate) references: Option<Vec<String>>,
+    /// Where the fact came from, one line. Omit to keep; send `""` to clear.
+    #[serde(default)]
+    pub(crate) source: Option<String>,
+    /// `true` when this write verifies the fact is current, which moves `verified_at`.
+    #[serde(default)]
+    pub(crate) verified: Option<bool>,
+    /// When the memory stops applying: RFC 3339, or `YYYY-MM-DD` for the whole of that day.
+    /// Omit to keep; send `""` to clear.
+    #[serde(default)]
+    pub(crate) expires: Option<String>,
 }
 
 /// `PUT /v1/memory/{name}`: create or update a memory.
@@ -489,6 +542,21 @@ pub(crate) async fn put_memory(
         Some(tags) => Some(crate::memory::normalize_tags(tags).map_err(store_error)?),
         None => None,
     };
+    let references = match &body.references {
+        Some(references) => {
+            Some(crate::memory::normalize_references(references).map_err(store_error)?)
+        }
+        None => None,
+    };
+    let source = match &body.source {
+        Some(source) => Some(crate::memory::normalize_source(source).map_err(store_error)?),
+        None => None,
+    };
+    let expires_at = match body.expires.as_deref() {
+        None => None,
+        Some(raw) if raw.trim().is_empty() => Some(None),
+        Some(raw) => Some(Some(crate::memory::parse_expiry(raw).map_err(store_error)?)),
+    };
 
     // One upsert, one transaction, and no lock. No `flock` and no blocking pool: the write is a
     // single statement rather than a read-modify-write over a file, which is what would make two
@@ -503,6 +571,11 @@ pub(crate) async fn put_memory(
             tags,
             body: body.body.clone(),
             priority: body.priority,
+            load: body.load,
+            references,
+            source,
+            expires_at,
+            verified: body.verified.unwrap_or(false),
         })
         .await
         .map_err(memory_failure)?;

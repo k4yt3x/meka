@@ -35,6 +35,7 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`skill_write`](./overview.md#the-skill_-tools) | Read | Create or update a skill |
 | [`skill_delete`](./overview.md#the-skill_-tools) | Read | Delete a skill and its directory |
 | [`memory_write`](../usage/memory.md) | Read | Save a durable note that outlives the session |
+| [`memory_edit`](../usage/memory.md) | Read | Replace an exact string in a memory's body |
 | [`memory_read`](../usage/memory.md) | Read | Read a saved memory, paging long bodies |
 | [`memory_search`](../usage/memory.md) | Read | Ranked full-text search over every memory |
 | [`memory_delete`](../usage/memory.md) | Read | Delete a saved memory |

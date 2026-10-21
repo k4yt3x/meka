@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Memory and skill writes and deletes show their change as a diff on the screen and in editors.
 - `tool_call.completed` carries `change`: a file, memory or skill's whole text before and after.
+- `memory_edit` replaces an exact string in a memory's body, refusing an ambiguous match.
+- A memory's `references` name what it depends on; reads show backlinks, and lists filter by them.
+- A memory carries a `source`, and `verified: true` on a write records that the fact was checked.
+- Search freshness decays from the verification stamp, so a re-verified note ranks as fresh.
+- A memory past its `expires` date leaves the index and stays searchable; nothing deletes it.
+- `memory_search` takes `referencing`, `unverified` and `expired` filters, and lists by them alone.
+- `meka memory list` and `GET /v1/memory` take the same three filters.
+- A description longer than 200 characters is noted in the write result, never refused.
+
+### Changed
+
+- `load` (`inline`, `index`, `search`) decides how a memory loads; priority is importance alone.
+- A priority-0 memory becomes `inline` on upgrade.
+- The memory index counts the search-only and expired memories it leaves out.
 
 ## [0.82.0] - 2026-10-19
 

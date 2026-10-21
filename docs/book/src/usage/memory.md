@@ -8,10 +8,10 @@ Without it, an agent's only state is its context window. When a long session com
 
 - Memories are rows in the `memories` table of the store (`~/.local/share/meka/meka.db`, or under `MEKA_DATA_DIR`), one row per memory.
 - The store is scoped to the **meka instance**, not to a session or a directory. Everything sharing a `MEKA_DATA_DIR` shares one memory; pointing a deployment at its own data dir gives it its own.
-- The per-turn context includes a bounded memory index, updated when it changes. Priority-0 bodies are inlined within a separate budget; other bodies are read on demand with `memory_read`.
+- The per-turn context includes a bounded memory index, updated when it changes. A memory's `load` decides how it gets there: an `inline` body is rendered in full within its own budget, an `index` memory is listed by its description, and a `search` memory is reached by `memory_search` alone. Other bodies are read on demand with `memory_read`.
 - The index is re-stated in full at the start of a session, after every compaction, and whenever it scrolls out of the context window. This is what makes memory survive compaction.
 - The agent is told to save durable preferences, constraints, decisions, and facts, to keep temporary task state in the scratchpad, and that current instructions and corrections take precedence over stored preferences.
-- Memories are available at every permission level except **none**; all four memory tools ask only for **read**. Writing a memory therefore needs no write authority over your files, and `workspace`'s boundary does not apply to it: the store belongs to meka, not to your working tree.
+- Memories are available at every permission level except **none**; all five memory tools ask only for **read**. Writing a memory therefore needs no write authority over your files, and `workspace`'s boundary does not apply to it: the store belongs to meka, not to your working tree.
 
 > **Memories live in `MEKA_DATA_DIR`**, alongside sessions, rather than in the config directory. A backup of your config directory does not capture them; `meka memory export` is what does.
 
@@ -21,11 +21,16 @@ Without it, an agent's only state is its context window. When a long session com
 |---|---|
 | `name` | Unique identifier, `[A-Za-z0-9_-]`. Case-insensitive: `NOTE` and `note` are one memory. |
 | `description` | One line used in the bounded index. Make it stand on its own. |
-| `priority` | `0`–`9`, default `5`. See [Priority](#priority). |
+| `priority` | `0`–`9`, default `5`: how important the note is, not whether it loads. See [Priority](#priority). |
+| `load` | How the memory reaches the context: `inline`, `index` (default) or `search`. See [Loading](#loading). |
 | `tags` | Lowercase labels (`[a-z0-9-]`, at most 10) for grouping and filtering. |
-| `body` | Detail, loaded on demand by `memory_read`. |
+| `body` | Detail, loaded on demand by `memory_read`, or in context every turn when `load` is `inline`. |
+| `references` | What the memory depends on: memory names, paths, URLs, external ids. See [References and backlinks](#references-and-backlinks). |
+| `source` | One line saying where the fact came from. See [Source and verification](#source-and-verification). |
 | `created` | When the memory was made. Stamped once, at creation. |
 | `updated` | When the row last changed. |
+| `verified` | When the fact was last verified. Stamped at creation and moved only by `verified: true`. |
+| `expires` | When the memory stops applying, if a date was set. See [Expiry](#expiry). |
 | `read count` | How many times `memory_read` has opened it. Feeds search ranking. Only `memory_read` increments it: a search hit is weaker evidence, and reading through the CLI or the HTTP API is the operator rather than the agent. |
 
 ### `created` versus `updated`
@@ -38,13 +43,19 @@ The rule is enforced by the `INSERT ... ON CONFLICT DO UPDATE` statement itself,
 
 ### Omitting a field keeps what is there
 
-`memory_write`'s `body`, `tags` and `priority` are all optional, and omitting any of them **keeps whatever the memory already had**. That makes a metadata-only update (a reworded description, say) a single call that cannot cost the note its contents, its labels or its rank. To clear the first two, pass `""` and `[]` explicitly.
+`memory_write`'s `body`, `tags`, `priority`, `load`, `references`, `source` and `expires` are all optional, and omitting any of them **keeps whatever the memory already had**. That makes a metadata-only update (a reworded description, say) a single call that cannot cost the note its contents, its labels, its rank, its dependencies or its deadline. To clear a string or a list, pass `""` or `[]` explicitly.
 
 `PUT /v1/memory/{name}` and `meka memory add <name> --force` follow the same rule.
 
+## Editing a memory
+
+`memory_edit` changes part of a body the way `file_edit` changes part of a file: it finds `old_string` exactly once and replaces it with `new_string`, refuses a match that is ambiguous unless `replace_all` is true, and deletes the text when `new_string` is empty. It exists because `memory_write` replaces the whole body, and a long-lived note rewritten whole on every small change drifts: wording moves, lists reorder, and a line is lost with nothing said. An edit touches the text it was told to and nothing else, and the result shows the lines around the change. Pass `verified: true` on an edit that follows a check, and it verifies the memory as a write would.
+
+A rewrite computed against a body that changed meanwhile is refused rather than landing over it, the same compare-and-swap `meka memory edit` uses when `$EDITOR` comes back.
+
 ## Priority
 
-**Lower means more important** (the same direction as `nice`, the opposite of CSS `z-index`). Priority decides two things: where a memory sits in the index, and which memories survive when the index hits its size budget.
+**Lower means more important** (the same direction as `nice`, the opposite of CSS `z-index`). Priority decides three things: where a memory sits in the index, which memories survive when the index hits its size budget, and how heavily search weighs it. It does not decide whether a memory's body is in context; that is [`load`](#loading), and a rule can be in front of the agent every turn without being its most important note.
 
 | Range | Use for |
 |---|---|
@@ -57,9 +68,19 @@ Within one priority band, the most recently *recorded* memory sorts first, so a 
 
 Because the agent picks a priority at write time and everything feels important then, priorities tend to drift downward over a long-lived instance. The Priority column of `meka memory list` shows that happening so you can rebalance. Search ranking compensates for the same drift from the other side: see [Search](#search).
 
-**Priority 0 is the inline tier.** A priority-0 memory has its *body* rendered into the per-turn context within the limits below, not just its description, because for a standing directive the body is the directive and leaving it behind a tool call means the agent has to look the rule up before it can follow it. The band is budgeted separately from the index (4 KiB in total, 1,024 characters per memory) so a long directive cannot crowd out the index and the index cannot crowd out the directives. Priority 1 is still "standing" for ranking purposes, but is listed by description like everything else.
+## Loading
 
-Priority 0 is not a promise of unlimited space. A memory the 4 KiB band cannot fit falls through to the index below, and on a large store the index has its own ceiling to ration, so past a few dozen standing memories some of them fit nowhere. The section says so explicitly when it happens, naming how many are listed by description and how many were left out entirely, because a standing rule the agent never sees is one it is being held to and cannot read. If you see that line, either raise those notes' importance relative to the rest of the store or trim the tier: a hundred always-apply rules is not an always-apply tier.
+`load` says how a memory reaches the context, independently of how important it is:
+
+| Value | What the per-turn context carries |
+|---|---|
+| `inline` | The whole body, within the band's budget. For a standing directive the body is the directive, and leaving it behind a tool call means the agent has to look the rule up before it can follow it. |
+| `index` | The description, as one line of the index. The default. |
+| `search` | Nothing. The memory is reached by `memory_search` alone: a runbook, a reference note, anything worth keeping that is not worth a line every turn. |
+
+The inline band is budgeted separately from the index (4 KiB in total, 1,024 characters per memory) so a long directive cannot crowd out the index and the index cannot crowd out the directives. It is not a promise of unlimited space. A memory the band cannot fit falls through to the index below, and on a large store the index has its own ceiling to ration, so past a few dozen inline memories some of them fit nowhere. The section says so explicitly when it happens, naming how many are listed by description and how many were left out entirely, because a rule the agent never sees is one it is being held to and cannot read. If you see that line, trim the tier: a hundred always-apply rules is not an always-apply tier.
+
+The index ends with a count of the memories it lists nowhere, the search-only ones and the [expired](#expiry) ones, so the agent knows there is more than it can see. On upgrade from a release before `load`, every priority-0 memory becomes `inline` and everything else `index`, which is what the priority used to mean.
 
 ## The index budget
 
@@ -89,7 +110,7 @@ age are repeated on each page.
 
 - **relevance**: BM25, weighting a hit on the name above the description, and the description above the body.
 - **importance**: the declared priority, blended with how often you have actually read the memory. A memory opened forty times is important whatever it was labeled two years ago, which is the counterweight to priority drift.
-- **freshness**: a gentle decay on `created`, **disabled entirely for priority 0–1**. A two-year-old standing rule is exactly as binding as a new one; a two-year-old situational note probably is not.
+- **freshness**: a gentle decay on `verified`, which is `created` until the agent verifies the fact, **disabled entirely for priority 0–1**. A two-year-old standing rule is exactly as binding as a new one; a two-year-old situational note probably is not, unless somebody checked it last week.
 
 **Fuzzy matching** works in four senses, and the result says which one answered so a guess is not mistaken for a recalled fact:
 
@@ -110,7 +131,41 @@ What the matching does not do: an Arabic word is matched as written, article pre
 
 The last row is the important one: `queries` is a **list**, and supplying synonyms costs nothing. `["terse", "brevity", "verbosity"]` in one call finds a memory that used any of them, which is the answer to "the agent has to guess the words it used months ago": it does not have to guess right, only to guess several times.
 
-Results carry enough to act on without a follow-up read: name, priority, age, read count, description, and the body itself when it is short.
+Results carry enough to act on without a follow-up read: name, priority, age, read count, description, and the body itself when it is short, with "verified" when the fact was verified after it was recorded and "expired" when it has expired.
+
+### Filters
+
+`memory_search` takes three filters beside `queries`, and so do `meka memory list` and `GET /v1/memory`, so a hygiene pass reads the same rows whoever runs it:
+
+| Filter | Selects |
+|---|---|
+| `referencing` | Memories whose references name this memory, path, URL or id, matched whole and without regard to case. |
+| `unverified` | Memories not verified within this long: `90d`, `6months`. |
+| `expired` | Memories whose expiry has passed. |
+
+With `queries` a filter narrows the search. Without them it is a listing, in index order, most important first, and the result says which: "3 memories referencing 'deploy-host', most important first". A scheduled job can run one (`memory_search` with `unverified: "90d"`, then `memory_read` and `memory_write` with `verified: true` on what still holds) and keep the store honest without anyone remembering to.
+
+## References and backlinks
+
+A memory's `references` say what it depends on: other memories by name, a path, a URL, an external id, one line each and at most twenty. They are structured so the question "what else cites this?" has an exact answer:
+
+- `memory_read` shows what a memory references, with the description of each reference that names a memory, and what references it ("Referenced by: ..."), so a changed fact can be revisited everywhere it is cited.
+- `memory_search` with `referencing`, `meka memory list --referencing` and `GET /v1/memory?referencing=` list the memories pointing at a target.
+- `memory_delete` names the memories that still reference the deleted one and leaves those references in place, as markers of a fact to revisit.
+
+A reference that names no memory is allowed: it is a pointer to something worth writing later, and the read shows it bare where a resolved one carries a description.
+
+## Source and verification
+
+`source` is one line saying where a fact came from: who said it and when, the log it was read from, the page it was taken from. It is shown on `memory_read` and `meka memory get` and takes no part in ranking.
+
+`verified` is when the fact was last verified to hold. It answers a question neither other timestamp can: `created` is when the note was first written, and `updated` moves on any change to the row, a retag included, so neither says whether anyone has checked the note since. The stamp is set at creation and moved only by an explicit `verified: true` on `memory_write` or `memory_edit`, never as a side effect of an edit, because a stamp that moved on every write would answer the same question `updated` does. A write that states newly learned information should pass `verified: true` with it.
+
+What the stamp buys: `memory_read` captions a memory "Recorded 47 days ago, verified yesterday" or "Recorded 47 days ago, not verified since"; search freshness decays from it, so a re-verified old note ranks as fresh without a rewrite; and the `unverified` filter lists what has not been checked within a period.
+
+## Expiry
+
+`expires` is when a memory stops applying: an RFC 3339 timestamp, or a `YYYY-MM-DD` date meaning the whole of that day in local time, so a note that holds "until the freeze ends on the 25th" expires when the 26th begins. Past it the memory leaves the index and the inline band, stays searchable, and is marked as expired wherever it is read or found; nothing deletes it. The index counts its expired memories, and the context changes announce one expiring between turns, since an inline rule that expires has stopped applying without its text changing. Omitting `expires` on a write keeps the expiry, a rewrite of an expired memory keeps it expired and says so, and `""` clears it.
 
 ### The search index
 
@@ -128,13 +183,16 @@ meka memory verify --rebuild    # regenerate it from the table
 | Tool | Purpose |
 |---|---|
 | `memory_write` | Save a memory, or update one by writing to the same name |
+| `memory_edit` | Replace an exact string in a memory's body |
 | `memory_read` | Read a memory body, continuing with `offset` when needed |
-| `memory_search` | Ranked full-text search over every memory |
+| `memory_search` | Ranked full-text search over every memory, or a filtered listing |
 | `memory_delete` | Remove a memory permanently |
 
-A write or a delete draws what changed as a diff on the screen and in an ACP editor, over the text `meka memory export` writes, so a reworded description is one changed line and a rewritten body shows line by line; the HTTP feed carries the same two texts on `tool_call.completed`.
+A write, an edit or a delete draws what changed as a diff on the screen and in an ACP editor, over the text `meka memory export` writes, so a reworded description or a moved expiry is one changed line of frontmatter and a rewritten body shows line by line; the HTTP feed carries the same two texts on `tool_call.completed`.
 
-`memory_read` states how old the memory is and notes that it is a point-in-time observation. A memory recorded months ago is not live state, and an old note asserted as current fact is the failure this guards against. It is also the only thing that increments the read count: a search hit is weaker evidence, and an operator reading through the HTTP API is not the agent recalling anything.
+`memory_read` states when the memory was recorded and when it was last verified, and notes that it is a point-in-time observation. A memory recorded months ago is not live state, and an old note asserted as current fact is the failure this guards against. It is also the only thing that increments the read count: a search hit is weaker evidence, and an operator reading through the HTTP API is not the agent recalling anything.
+
+A write whose description runs past 200 characters gets a note in the result and nothing else: the index lists the description every turn, so one that has grown into a paragraph is spending the budget of several entries, and the fact belongs there with the detail in the body.
 
 `memory_write` also names an existing memory whose description says close to the same thing, when there is one:
 
@@ -159,12 +217,18 @@ What belongs in memory: who someone is and how they prefer to work, guidance you
 
 ```bash
 meka memory list                                    # index order
-meka memory get k4yt3x-prefers-terse-replies        # every stored field
+meka memory list --referencing deploy-host          # what cites a memory, path, URL or id
+meka memory list --unverified 90d                   # not verified in 90 days
+meka memory list --expired                          # past their expiry
+meka memory get k4yt3x-prefers-terse-replies        # every stored field, backlinks included
 meka memory show k4yt3x-prefers-terse-replies       # the body
 meka memory list --format json                      # {"memories": [...]}; get and show print one object
 meka memory add tz --description "K4YT3X is in UTC+8" --priority 2 --tag people
 meka memory add tz --force --description "K4YT3X is in UTC+9"   # keeps body, tags, priority
-meka memory add runbook --description "Where the deploy runbook lives" --body "wiki/ops/deploy"
+meka memory add tz --force --description "K4YT3X is in UTC+9" --verified   # the fact was checked
+meka memory add rule --description "Answer in kind" --load inline --body "Match the user's language."
+meka memory add runbook --description "Where the deploy runbook lives" --body "wiki/ops/deploy" --load search
+meka memory add freeze --description "No deploys this week" --expires 2026-10-25 --source "ops, in chat"
 meka memory add notes --description "Meeting notes" --from-file notes.md   # the body, from a file
 meka memory edit stale-note                         # $VISUAL, then $EDITOR, on the body
 meka memory remove stale-note
@@ -178,20 +242,25 @@ meka memory export --dir ~/backup/memory            # one Markdown file per memo
 | `--description <DESCRIPTION>` | Required. The one line shown in every session's memory index. |
 | `--priority <PRIORITY>` | `0` is most important, `9` least; defaults to `5`. |
 | `--tag <TAG>` | Label for grouping and filtering; repeatable. |
-| `--body <BODY>` | Detail read on demand, or inlined within budget at priority 0. |
+| `--body <BODY>` | Detail read on demand, or in context every turn with `--load inline`. |
 | `--from-file <PATH>` | Read the body from this file instead of `--body`. |
+| `--load <LOAD>` | `inline`, `index` (the default) or `search`. |
+| `--reference <REFERENCE>` | A memory name, path, URL or id the memory depends on; repeatable. |
+| `--source <SOURCE>` | Where the fact came from. |
+| `--expires <WHEN>` | RFC 3339, or `YYYY-MM-DD` for the whole of that day; an empty value clears it. |
+| `--verified` | Record that the fact was just verified current. |
 | `--force` | Update an existing memory instead of refusing; whatever is not mentioned is kept. |
 
 On the screen, `/memory` is a picker of what is saved, by name and description, and Enter (or
 `/memory <name>`) shows one memory in full.
 
-`--format json` prints each memory with the fields [`GET /v1/memory`](http-api.md) uses (`name`, `description`, `priority`, `tags`, `created_at`, `updated_at` as RFC 3339) plus `read_count`; `show` adds `body` as stored, and `list` and `get` leave it out.
+`--format json` prints each memory with the fields [`GET /v1/memory`](http-api.md) uses (`name`, `description`, `priority`, `load`, `tags`, `references`, `source`, `created_at`, `updated_at`, `verified_at` and `expires_at` as RFC 3339) plus `read_count`; `get` adds `referenced_by`, `show` adds `body` as stored, and `list` leaves both out.
 
 `meka memory edit` opens the **body** only. Metadata goes through `meka memory add <name> --force --description ...`, which keeps whatever it does not mention.
 
 ## Export, backup, and git
 
-`meka memory export` writes one `<name>.md` per memory: YAML frontmatter carrying `description`, `priority`, `created`, `tags` and `read_count`, followed by the body. That is the `grep`, git and backup answer now that memories live in the store rather than in files.
+`meka memory export` writes one `<name>.md` per memory: YAML frontmatter carrying `description`, `priority` and `load` when they are not the defaults, `created`, `verified` when it differs from `created`, `expires`, `source`, `read_count`, `references` and `tags` when they are set, followed by the body. That is the `grep`, git and backup answer now that memories live in the store rather than in files.
 
 `read_count` is there because it is the one value a file cannot otherwise reconstruct. Descriptions, bodies and dates are all in the note; how often the agent has actually opened it is not, and a restored backup with every counter at zero would silently lose each memory's accumulated ranking weight.
 
@@ -222,6 +291,6 @@ Memory is on by default. To turn it off:
 enabled = false
 ```
 
-Disabling it keeps the four `memory_*` tool schemas out of every request and renders no memory section, which is worth doing if you run lean sessions that will never use it. Memories already stored are left alone, and both the `meka memory` subcommands and the `/v1/memory` endpoints still reach them: whether an *agent* keeps memories is a different question from whether you can inspect or back up what is already there.
+Disabling it keeps the five `memory_*` tool schemas out of every request and renders no memory section, which is worth doing if you run lean sessions that will never use it. Memories already stored are left alone, and both the `meka memory` subcommands and the `/v1/memory` endpoints still reach them: whether an *agent* keeps memories is a different question from whether you can inspect or back up what is already there.
 
 There is deliberately no environment variable and no CLI flag: whether an agent keeps memories is a property of the installation, not something to vary per run.

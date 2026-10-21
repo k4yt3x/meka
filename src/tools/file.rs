@@ -1507,58 +1507,50 @@ impl Tool for EditFileTool {
             return Ok(ToolOutput::text(stale, true));
         }
 
-        if !content.contains(&old_string) {
-            // Name the line endings when they are the likely cause. A windowed `file_read` shows
-            // the model LF text, so an `old_string` spanning a line break will not match a CRLF
-            // file, and nothing in a bare "not found" points at an invisible difference.
-            let crlf_hint = if content.contains("\r\n")
-                && old_string.contains('\n')
-                && !old_string.contains("\r\n")
-            {
-                " (this file uses CRLF line endings; old_string uses LF)"
-            } else {
-                ""
-            };
-            return Ok(ToolOutput::text(
-                format!(
-                    "Error: '{}' not found in '{}'{}",
-                    truncate_string(&old_string, 100),
-                    path,
-                    crlf_hint
-                ),
-                true,
-            ));
-        }
-
-        // Reject an ambiguous single-occurrence edit: silently editing the first of several
-        // matches is almost never intended. Surface the count so the caller can add surrounding
-        // context to disambiguate, or set `replace_all` to change every occurrence on purpose.
-        let match_count = content.matches(&old_string).count();
-        if !replace_all && match_count > 1 {
-            return Ok(ToolOutput::text(
-                format!(
-                    "Error: '{}' matches {} times in '{}'; add surrounding context to make \
-                     old_string unique, or set replace_all=true to change every occurrence",
-                    truncate_string(&old_string, 100),
-                    match_count,
-                    path
-                ),
-                true,
-            ));
-        }
-
-        // Record the byte offset of the first match in the *original* content; since `replacen` /
-        // `replace` only mutate at-or-after this point, the byte offset is stable in the new
-        // content and locates the first edit site for the response snippet.
-        let first_match_byte = content.find(&old_string).unwrap_or(0);
-
-        let (new_content, count) = if replace_all {
-            (
-                content.replace(&old_string, &effective_new_string),
-                match_count,
-            )
-        } else {
-            (content.replacen(&old_string, &effective_new_string, 1), 1)
+        let (new_content, count, first_match_byte) = match super::util::replace_anchored(
+            &content,
+            &old_string,
+            &effective_new_string,
+            replace_all,
+        ) {
+            Ok(applied) => applied,
+            Err(super::util::AnchorMiss::NotFound) => {
+                // Name the line endings when they are the likely cause. A windowed `file_read`
+                // shows the model LF text, so an `old_string` spanning a line break will not
+                // match a CRLF file, and nothing in a bare "not found" points at an invisible
+                // difference.
+                let crlf_hint = if content.contains("\r\n")
+                    && old_string.contains('\n')
+                    && !old_string.contains("\r\n")
+                {
+                    " (this file uses CRLF line endings; old_string uses LF)"
+                } else {
+                    ""
+                };
+                return Ok(ToolOutput::text(
+                    format!(
+                        "Error: '{}' not found in '{}'{}",
+                        truncate_string(&old_string, 100),
+                        path,
+                        crlf_hint
+                    ),
+                    true,
+                ));
+            }
+            // Silently editing the first of several matches is almost never intended. The count
+            // lets the caller add surrounding context, or ask for every occurrence on purpose.
+            Err(super::util::AnchorMiss::Ambiguous(match_count)) => {
+                return Ok(ToolOutput::text(
+                    format!(
+                        "Error: '{}' matches {} times in '{}'; add surrounding context to make \
+                         old_string unique, or set replace_all=true to change every occurrence",
+                        truncate_string(&old_string, 100),
+                        match_count,
+                        path
+                    ),
+                    true,
+                ));
+            }
         };
 
         // Write back through whichever filesystem produced `content`. Re-deciding here instead of
@@ -1608,7 +1600,11 @@ impl Tool for EditFileTool {
 /// Render a ±`lines_around` snippet around the line containing `change_byte_offset` in `content`.
 /// Each line is prefixed with a right-aligned 1-based line number and a `|` separator, and
 /// truncated to 200 chars to keep the response compact.
-fn build_context_snippet(content: &str, change_byte_offset: usize, lines_around: usize) -> String {
+pub(super) fn build_context_snippet(
+    content: &str,
+    change_byte_offset: usize,
+    lines_around: usize,
+) -> String {
     let safe_offset = change_byte_offset.min(content.len());
     let line_index = content[..safe_offset]
         .bytes()

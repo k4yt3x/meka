@@ -3313,21 +3313,167 @@ fn memory_list_get_and_show_print_json_and_only_show_carries_the_body() {
         row["created_at"].is_string() && row["updated_at"].is_string(),
         "{row}"
     );
+    assert_eq!(row["load"], "index");
+    assert_eq!(row["references"], serde_json::json!([]));
+    assert_eq!(row["source"], "");
+    assert_eq!(
+        row["verified_at"], row["created_at"],
+        "a new memory is verified as of its creation"
+    );
     assert!(
-        row.get("body").is_none(),
-        "the listing leaves the body out: {row}"
+        row.get("body").is_none() && row.get("expires_at").is_none(),
+        "the listing leaves the body out and carries no expiry it does not have: {row}"
+    );
+    assert!(
+        row.get("referenced_by").is_none(),
+        "backlinks ride only on the single-memory surfaces: {row}"
     );
 
     let got = json_stdout(run_isolated(&install, &[
         "memory", "get", "tz", "--format", "json",
     ]));
-    assert_eq!(got, *row, "get prints the listing's object");
+    let mut expected = row.clone();
+    expected["referenced_by"] = serde_json::json!([]);
+    assert_eq!(
+        got, expected,
+        "get prints the listing's object plus its backlinks"
+    );
 
     let shown = json_stdout(run_isolated(&install, &[
         "memory", "show", "tz", "--format", "json",
     ]));
     assert_eq!(shown["name"], "tz");
     assert_eq!(shown["body"], "detail line");
+}
+
+/// `memory add` takes every field the tool takes, `get` prints each one it holds and the
+/// backlinks, `list` filters by them, and an empty `--expires` clears the expiry the way the
+/// tool's `""` does.
+#[test]
+fn memory_add_takes_every_field_and_get_and_list_show_them() {
+    let install = Install::new();
+    for args in [
+        vec!["memory", "add", "hub", "--description", "The hub"],
+        vec![
+            "memory",
+            "add",
+            "spoke",
+            "--description",
+            "A spoke",
+            "--load",
+            "search",
+            "--reference",
+            "hub",
+            "--reference",
+            "https://example.com/x",
+            "--source",
+            "ops, in chat",
+            "--expires",
+            "2020-01-01",
+            "--body",
+            "spoke body",
+        ],
+    ] {
+        let added = run_isolated(&install, &args);
+        assert!(
+            added.status.success(),
+            "memory add: {}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+    }
+
+    // The fields are printed as an aligned table, so the comparison collapses the padding.
+    let flat = |output: std::process::Output| -> String {
+        String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let plain = flat(run_isolated(&install, &["memory", "get", "spoke"]));
+    for line in [
+        "load: search",
+        "expires: expired ",
+        "source: ops, in chat",
+        "references: hub, https://example.com/x",
+    ] {
+        assert!(plain.contains(line), "missing `{line}` in:\n{plain}");
+    }
+    assert!(!plain.contains("referenced by:"), "{plain}");
+    let hub = flat(run_isolated(&install, &["memory", "get", "hub"]));
+    assert!(hub.contains("referenced by: spoke"), "{hub}");
+    assert!(
+        !hub.contains("source:") && !hub.contains("expires:") && !hub.contains("references:"),
+        "fields a memory does not hold are not printed:\n{hub}"
+    );
+
+    let names = |args: &[&str]| -> Vec<String> {
+        json_stdout(run_isolated(&install, args))["memories"]
+            .as_array()
+            .expect("a listing")
+            .iter()
+            .map(|row| row["name"].as_str().expect("a name").to_string())
+            .collect()
+    };
+    assert_eq!(
+        names(&["memory", "list", "--referencing", "HUB", "--format", "json"]),
+        ["spoke"]
+    );
+    assert_eq!(
+        names(&["memory", "list", "--expired", "--format", "json"]),
+        ["spoke"]
+    );
+    assert!(
+        names(&["memory", "list", "--unverified", "1d", "--format", "json"]).is_empty(),
+        "both were written today"
+    );
+    let bad = run_isolated(&install, &["memory", "list", "--unverified", "soon"]);
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("--unverified"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    let cleared = run_isolated(&install, &[
+        "memory",
+        "add",
+        "spoke",
+        "--force",
+        "--description",
+        "A spoke",
+        "--expires",
+        "",
+        "--verified",
+    ]);
+    assert!(
+        cleared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    let detail = json_stdout(run_isolated(&install, &[
+        "memory", "get", "spoke", "--format", "json",
+    ]));
+    assert!(
+        detail.get("expires_at").is_none(),
+        "an empty --expires clears the expiry: {detail}"
+    );
+    assert_ne!(
+        detail["verified_at"], detail["created_at"],
+        "--verified moves the stamp: {detail}"
+    );
+    assert_eq!(
+        detail["load"], "search",
+        "--force keeps what it does not mention"
+    );
+    assert_eq!(
+        detail["references"],
+        serde_json::json!(["hub", "https://example.com/x"])
+    );
+    assert_eq!(detail["source"], "ops, in chat");
+    assert_eq!(
+        names(&["memory", "list", "--expired", "--format", "json"]),
+        Vec::<String>::new()
+    );
 }
 
 /// `skill list`, `get` and `show` under `--format json`: the palette's fields plus where each skill

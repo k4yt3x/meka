@@ -69,11 +69,13 @@ pub(crate) fn split_frontmatter<'a>(content: &'a str) -> Option<(&'a str, &'a st
 /// quoting; skills use a real serializer, because hand-rolled quoting loses content on a newline
 /// in a `license` and on a metadata *key* containing one.
 ///
-/// Its remaining caller is `crate::memory::render_memory`, the export renderer, which passes three
-/// kinds of value and is safe for three separate reasons: a `description` that has been through
-/// [`normalize_description`], a `created` that is RFC 3339 rendered from a `SystemTime`, and
-/// `tags` whose elements have all passed `crate::memory::validate_tag` and so cannot contain a
-/// newline. (`priority` is a `u8` and never reaches here.)
+/// Its remaining caller is `crate::memory::render_memory`, the export renderer, which passes four
+/// kinds of value and is safe for four separate reasons: a `description` or a `source` that has
+/// been through [`normalize_description`], a `created`, `verified` or `expires` that is RFC 3339
+/// rendered from a `SystemTime`, `tags` whose elements have all passed
+/// `crate::memory::validate_tag`, and `references` whose elements have all passed
+/// `crate::memory::validate_reference`, which refuses a control character and so a newline.
+/// (`priority` is a `u8`, `load` a fixed name, and neither reaches here.)
 ///
 /// That list is the safety argument, so a *fifth* kind of value invalidates it. Anything free-form
 /// (anything that could arrive holding a newline) needs the serializer, not this.

@@ -7565,6 +7565,8 @@ mod tests {
                 priority: Some(0),
                 tags: None,
                 body: Some("Keep the fixture unchanged.".into()),
+                load: Some(crate::memory::Load::Inline),
+                ..crate::store::memory::WriteRequest::default()
             })
             .await
             .expect("memory");

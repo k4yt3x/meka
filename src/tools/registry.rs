@@ -371,6 +371,7 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "mcp_resource_unsubscribe",
     "mcp_resource_updates_list",
     "memory_delete",
+    "memory_edit",
     "memory_read",
     "memory_search",
     "memory_write",
@@ -1281,6 +1282,9 @@ impl ToolRegistry {
             // keep a full-access agent's order stable.
             if memory_access == crate::config::MemoryAccess::Write {
                 self.register_builtin(Arc::new(memory::MemoryWriteTool {
+                    memories: memories.clone(),
+                }));
+                self.register_builtin(Arc::new(memory::MemoryEditTool {
                     memories: memories.clone(),
                 }));
             }
@@ -2196,6 +2200,7 @@ mod tests {
         assert!(registry.get("skill_read").is_none());
         for name in [
             "memory_write",
+            "memory_edit",
             "memory_read",
             "memory_search",
             "memory_delete",
@@ -3126,10 +3131,11 @@ mod tests {
         .expect("subagent registry should build")
     }
 
-    const MEMORY_TOOLS: [&str; 4] = [
+    const MEMORY_TOOLS: [&str; 5] = [
         "memory_read",
         "memory_search",
         "memory_write",
+        "memory_edit",
         "memory_delete",
     ];
 

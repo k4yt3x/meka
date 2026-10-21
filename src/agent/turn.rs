@@ -6122,6 +6122,7 @@ mod tests {
                 tags: None,
                 body: None,
                 priority: Some(3),
+                ..crate::store::memory::WriteRequest::default()
             })
             .await
             .expect("write");
@@ -6700,6 +6701,7 @@ mod tests {
                 tags: None,
                 body: None,
                 priority: Some(3),
+                ..crate::store::memory::WriteRequest::default()
             })
             .await
             .expect("write");

@@ -928,8 +928,18 @@ pub(crate) fn builtin_code_param(name: &str) -> Option<(&'static str, &'static s
 pub(crate) fn builtin_change_params(name: &str) -> &'static [&'static str] {
     match name {
         "file_write" => &["content"],
-        "file_edit" => &["old_string", "new_string"],
-        "memory_write" => &["body", "description", "priority", "tags"],
+        "file_edit" | "memory_edit" => &["old_string", "new_string"],
+        "memory_write" => &[
+            "body",
+            "description",
+            "expires",
+            "load",
+            "priority",
+            "references",
+            "source",
+            "tags",
+            "verified",
+        ],
         "skill_write" => &["body", "description", "priority"],
         _ => &[],
     }
@@ -1057,7 +1067,7 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         "mcp_prompt_get" => "name",
         "mcp_prompt_list" | "mcp_resource_list" => "server",
         "mcp_resource_read" | "mcp_resource_subscribe" | "mcp_resource_unsubscribe" => "uri",
-        "memory_delete" | "memory_read" | "memory_write" => "name",
+        "memory_delete" | "memory_edit" | "memory_read" | "memory_write" => "name",
         "memory_search" => "queries",
         "schedule_cancel" => "id",
         "schedule_create" => "prompt",
@@ -1284,8 +1294,8 @@ mod tests {
             }
         }
         assert_eq!(
-            listed, 4,
-            "the two file tools, memory_write and skill_write"
+            listed, 5,
+            "the two file tools, memory_write, memory_edit and skill_write"
         );
     }
 

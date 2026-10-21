@@ -100,7 +100,15 @@ struct MemoryIndexEntry {
     created: std::time::SystemTime,
     /// Labels, for the histogram that stands in for the entries the budget could not list.
     tags: Vec<String>,
-    /// The body, for a priority-0 memory only, so [`render_memory_section`] can put a standing
+    /// How the memory reaches the context: which band renders it, or neither.
+    load: crate::memory::Load,
+    /// When the memory expires, rendered on its line so the model sees the deadline coming.
+    expires: Option<std::time::SystemTime>,
+    /// Whether the expiry had passed when the snapshot was taken. Settled here rather than at
+    /// render time, deliberately unlike `created`: an expiry passing is a change the model has
+    /// to be told about, since a rule it was shown as in force has stopped being so.
+    expired: bool,
+    /// The body, for an inline memory only, so [`render_memory_section`] can put a standing
     /// directive's *text* in context rather than a pointer to it.
     ///
     /// In the snapshot rather than read at render time because it has to take part in the diff:
@@ -310,6 +318,7 @@ impl WorldSnapshot {
         } else {
             &[]
         };
+        let now = std::time::SystemTime::now();
         // The two discovery tools leave with the section they serve, as they leave the request
         // (`ToolRegistry::active_tools`): named under `[Available tools]` with nothing to find,
         // they would be an instruction the model cannot use.
@@ -363,12 +372,17 @@ impl WorldSnapshot {
                     priority: memory.priority,
                     created: memory.created_at,
                     tags: memory.tags.clone(),
-                    // Only the standing band carries one, which is what `MemoryStore::index`
+                    load: memory.load,
+                    expires: memory.expires_at,
+                    expired: memory.is_expired(now),
+                    // Only the inline band carries one, which is what `MemoryStore::index`
                     // loads. An empty body is the same as none for rendering purposes.
                     inline_body: memory
                         .body
                         .as_ref()
-                        .filter(|body| !body.trim().is_empty())
+                        .filter(|body| {
+                            memory.load == crate::memory::Load::Inline && !body.trim().is_empty()
+                        })
                         .map(|body| crate::memory::render_for_model(body)),
                 })
                 .collect(),
@@ -1624,6 +1638,11 @@ mod tests {
             name: name.to_string(),
             description: description.to_string(),
             priority,
+            load: crate::memory::Load::Index,
+            references: Vec::new(),
+            source: String::new(),
+            verified_at: age,
+            expires_at: None,
             tags: Vec::new(),
             created_at: age,
             updated_at: age,
@@ -1632,9 +1651,10 @@ mod tests {
         }
     }
 
-    /// A priority-0 memory with its body, which is the tier the index renders in full.
+    /// An inline memory with its body, which is the tier the index renders in full.
     fn standing_memory(name: &str, description: &str, body: &str) -> Memory {
         let mut memory = sample_memory(name, 0, description, 1);
+        memory.load = crate::memory::Load::Inline;
         memory.body = Some(body.to_string());
         memory
     }
@@ -1778,7 +1798,7 @@ mod tests {
         let rendered = world_state_for_memories(&memories);
 
         assert!(
-            rendered.contains("further priority-0 memories"),
+            rendered.contains("further inline memories"),
             "the remainder must be stated: {}",
             &rendered[..rendered.len().min(400)]
         );
@@ -3925,6 +3945,41 @@ mod tests {
                     &[],
                 ),
             ),
+            ("memory tool, the same memory search-only", {
+                let mut memory = sample_memory("note", 3, "a fact", 1);
+                memory.load = crate::memory::Load::Search;
+                WorldSnapshot::new(
+                    &[tool(MEMORY_INDEX_TOOL, "loads a memory", false)],
+                    &no_skills(),
+                    std::slice::from_ref(&memory),
+                    &[],
+                    &[],
+                )
+            }),
+            ("memory tool, the same memory with an expiry ahead", {
+                let mut memory = sample_memory("note", 3, "a fact", 1);
+                memory.expires_at =
+                    Some(std::time::SystemTime::now() + std::time::Duration::from_secs(3 * 86_400));
+                WorldSnapshot::new(
+                    &[tool(MEMORY_INDEX_TOOL, "loads a memory", false)],
+                    &no_skills(),
+                    std::slice::from_ref(&memory),
+                    &[],
+                    &[],
+                )
+            }),
+            ("memory tool, the same memory expired", {
+                let mut memory = sample_memory("note", 3, "a fact", 1);
+                memory.expires_at =
+                    Some(std::time::SystemTime::now() - std::time::Duration::from_secs(86_400));
+                WorldSnapshot::new(
+                    &[tool(MEMORY_INDEX_TOOL, "loads a memory", false)],
+                    &no_skills(),
+                    std::slice::from_ref(&memory),
+                    &[],
+                    &[],
+                )
+            }),
         ];
 
         for (from_label, from) in &snapshots {
@@ -3943,6 +3998,104 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The band follows `load`, not the number: a priority-5 inline memory renders its body, a
+    /// priority-0 memory that is merely listed renders a line, and a search-only one renders
+    /// nowhere but in the footer's count.
+    #[test]
+    fn the_band_and_the_index_follow_load() {
+        let mut inlined = sample_memory("inlined", 5, "a rule", 1);
+        inlined.load = crate::memory::Load::Inline;
+        inlined.body = Some("Be terse.".to_string());
+        let mut listed = sample_memory("listed-rule", 0, "a listed rule", 1);
+        listed.body = Some("not rendered".to_string());
+        let mut hidden = sample_memory("hidden", 2, "a reference note", 1);
+        hidden.load = crate::memory::Load::Search;
+        let rendered = world_state_for_memories(&[listed, inlined, hidden]);
+        let section = memory_section_of(&rendered);
+        assert!(section.contains("  Be terse."), "{section}");
+        assert!(section.contains("- **listed-rule** (p0, "), "{section}");
+        assert!(!section.contains("not rendered"), "{section}");
+        assert!(!section.contains("**hidden**"), "{section}");
+        assert!(
+            section.contains("1 search-only memory is not listed; `memory_search` reaches it."),
+            "{section}"
+        );
+    }
+
+    /// An expired memory leaves both bands, the footer counts it, and the line of one still in
+    /// force says when it expires.
+    #[test]
+    fn an_expired_memory_is_unlisted_and_counted_and_a_live_one_shows_its_deadline() {
+        let now = std::time::SystemTime::now();
+        let day = std::time::Duration::from_secs(86_400);
+        let mut expired_rule = standing_memory("freeze", "deploy freeze", "No deploys.");
+        expired_rule.expires_at = Some(now - day);
+        let mut ahead = sample_memory("window", 4, "the migration window", 1);
+        // An hour past three days, so the render's slightly later `now` still floors to three.
+        ahead.expires_at = Some(now + 3 * day + std::time::Duration::from_secs(3_600));
+        let mut gone_too = sample_memory("old-note", 6, "an expired note", 1);
+        gone_too.expires_at = Some(now - 2 * day);
+        let mut dated_rule = standing_memory("thaw", "the thaw", "Deploy freely.");
+        dated_rule.expires_at = Some(now + 3 * day + std::time::Duration::from_secs(3_600));
+        let rendered = world_state_for_memories(&[expired_rule, ahead, gone_too, dated_rule]);
+        let section = memory_section_of(&rendered);
+        assert!(
+            section
+                .contains("- **thaw** (yesterday, expires in 3 days): the thaw\n  Deploy freely."),
+            "the band shows the deadline the index line shows: {section}"
+        );
+        assert!(!section.contains("No deploys."), "{section}");
+        assert!(!section.contains("**freeze**"), "{section}");
+        assert!(
+            section
+                .contains("- **window** (p4, yesterday, expires in 3 days): the migration window"),
+            "{section}"
+        );
+        assert!(
+            section.contains("2 expired memories are not listed; `memory_search` reaches them."),
+            "{section}"
+        );
+    }
+
+    /// An expiry passing between two turns is announced as such, and a memory moved out of the
+    /// index is announced as search-only: both leave the model's picture, and neither is a
+    /// deletion.
+    #[test]
+    fn the_diff_announces_an_expiry_passing_and_a_move_to_search_only() {
+        let catalog = catalog_with(MEMORY_INDEX_TOOL);
+        let now = std::time::SystemTime::now();
+        let snapshot =
+            |memories: &[Memory]| WorldSnapshot::new(&catalog, &no_skills(), memories, &[], &[]);
+        let mut rule = standing_memory("freeze", "deploy freeze", "No deploys.");
+        rule.expires_at = Some(now + std::time::Duration::from_secs(3_600));
+        let mut note = sample_memory("note", 3, "a fact", 1);
+        let before = snapshot(&[rule.clone(), note.clone()]);
+
+        // The expiry itself does not move; the clock does, which is what `expired` settles
+        // at snapshot time. Flipped by hand rather than by waiting an hour.
+        note.load = crate::memory::Load::Search;
+        let mut after = snapshot(&[rule, note]);
+        let rule = after
+            .memories
+            .iter_mut()
+            .find(|entry| entry.name == "freeze")
+            .expect("the rule is in the snapshot");
+        assert!(!rule.expired, "the premise: not yet expired");
+        rule.expired = true;
+
+        let diff = render_world_state(&after, Some(&before));
+        assert!(
+            diff.contains("- Memories expired, no longer in force: `freeze`"),
+            "{diff}"
+        );
+        assert!(diff.contains("note (p3: a fact) (search-only)"), "{diff}");
+        assert!(!diff.contains("Memories deleted"), "{diff}");
+        assert!(
+            !diff.contains("freeze (p0"),
+            "an expiry passing is announced once, as an expiry, not also as an update: {diff}"
+        );
     }
 
     /// The one exemption from the loop above.

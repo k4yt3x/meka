@@ -504,7 +504,7 @@ The agent will explain that it cannot write files at `read` and suggest switchin
 
 | Store | Location | Tools |
 |-------|----------|-------|
-| Memory | the `memories` table in `MEKA_DATA_DIR` | `memory_write`, `memory_delete` |
+| Memory | the `memories` table in `MEKA_DATA_DIR` | `memory_write`, `memory_edit`, `memory_delete` |
 | Skills | `~/.config/meka/skills/` | `skill_write`, `skill_delete` (only with [`[skills] agent_managed`](../configuration/config-file.md#skills)) |
 | Scratchpad, scheduled jobs, background tasks | the store | various |
 

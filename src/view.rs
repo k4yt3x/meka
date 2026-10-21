@@ -411,12 +411,28 @@ pub(crate) struct MemoryDetail {
     /// 0..=9, lower first. Unlike a skill's, a memory's priority is shown to the model, because it
     /// says how heavily to weigh a note the model is already reasoning from.
     pub(crate) priority: u8,
+    /// How the memory reaches the agent's context: `inline`, `index` or `search`.
+    #[cfg_attr(feature = "serve", schema(value_type = String))]
+    pub(crate) load: crate::memory::Load,
     /// RFC 3339, when the row was last written, which a metadata-only edit moves; see
     /// `created_at` for when the note was made.
     pub(crate) updated_at: String,
     /// RFC 3339, when the memory was created. Stamped once, at creation: the one the model is
     /// shown as an age, and the one ties are broken by.
     pub(crate) created_at: String,
+    /// RFC 3339, when the fact was last verified: the creation, until an explicit verification
+    /// moves it. Search freshness decays from here.
+    pub(crate) verified_at: String,
+    /// RFC 3339, when the memory stops applying, present when an expiry was set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) expires_at: Option<String>,
+    /// Where the fact came from; empty when not recorded.
+    pub(crate) source: String,
+    /// What the memory depends on: memory names, paths, URLs, external ids.
+    pub(crate) references: Vec<String>,
+    /// The memories whose references name this one, present on the single-memory surfaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) referenced_by: Option<Vec<String>>,
     /// Lowercase labels for grouping and filtering.
     pub(crate) tags: Vec<String>,
     /// How many times the agent has recalled this memory through `memory_read`. Feeds search
@@ -437,8 +453,16 @@ impl MemoryDetail {
             name: memory.name.clone(),
             description: memory.description.clone(),
             priority: memory.priority,
+            load: memory.load,
             updated_at: chrono::DateTime::<chrono::Utc>::from(memory.updated_at).to_rfc3339(),
             created_at: chrono::DateTime::<chrono::Utc>::from(memory.created_at).to_rfc3339(),
+            verified_at: chrono::DateTime::<chrono::Utc>::from(memory.verified_at).to_rfc3339(),
+            expires_at: memory
+                .expires_at
+                .map(|expires| chrono::DateTime::<chrono::Utc>::from(expires).to_rfc3339()),
+            source: memory.source.clone(),
+            references: memory.references.clone(),
+            referenced_by: None,
             tags: memory.tags.clone(),
             read_count: memory.read_count,
             body,

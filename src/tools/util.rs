@@ -106,6 +106,41 @@ pub(super) fn require_str(
         })
 }
 
+/// Why an exact-anchor edit did not apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AnchorMiss {
+    /// The anchor appears nowhere in the text.
+    NotFound,
+    /// The anchor appears this many times and the caller did not ask for every occurrence.
+    Ambiguous(usize),
+}
+
+/// Replace `old` with `new` in `text`: its one occurrence, or every occurrence when
+/// `replace_all`. Returns the edited text, how many replacements were made, and the byte offset
+/// of the first in the original, which `replacen` and `replace` leave stable in the result.
+///
+/// `file_edit` and `memory_edit` both apply an edit this way, so "an ambiguous anchor is refused
+/// unless every occurrence was asked for" is one rule rather than one per tool.
+pub(super) fn replace_anchored(
+    text: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> std::result::Result<(String, usize, usize), AnchorMiss> {
+    let Some(first) = text.find(old) else {
+        return Err(AnchorMiss::NotFound);
+    };
+    let count = text.matches(old).count();
+    if !replace_all && count > 1 {
+        return Err(AnchorMiss::Ambiguous(count));
+    }
+    if replace_all {
+        Ok((text.replace(old, new), count, first))
+    } else {
+        Ok((text.replacen(old, new, 1), 1, first))
+    }
+}
+
 /// [`require_str`] for the one field whose empty value is meaningful: a file's whole content.
 pub(super) fn require_str_allowing_empty(
     input: &serde_json::Value,

@@ -402,6 +402,14 @@ const MIGRATIONS: &[Migration] = &[
         name: "subagent_specs_name_their_allow_lists",
         step: Step::Rust(subagent_specs_name_their_allow_lists),
     },
+    // 0.82 lets a memory say how it loads, what it depends on, where it came from, when it was
+    // last verified and when it expires. A row written before the columns loads by its priority,
+    // since priority 0 was the inline band, and is verified as of its creation, since nothing
+    // has verified it since.
+    Migration {
+        name: "memories_carry_load_references_source_verification_and_expiry",
+        step: Step::Rust(memories_carry_load_references_source_verification_and_expiry),
+    },
 ];
 
 /// The position of the last turn a session opened, beside the eight cumulative counters: `NULL`
@@ -828,7 +836,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 8_554_481_683_041_798_745;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 3_543_547_029_945_738_551;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -2807,6 +2815,41 @@ fn subagent_specs_name_their_allow_lists(
     Ok(())
 }
 
+/// Five columns on `memories`, each guarded on the column set for the reason the module docs
+/// give. The two conversions run only while their column is being added: on a replay the column
+/// is there, and a memory the user has since moved from `inline` to `index`, or verified, must
+/// not snap back.
+fn memories_carry_load_references_source_verification_and_expiry(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    if !table_has_column(transaction, "memories", "load")? {
+        transaction.execute_batch(
+            "ALTER TABLE memories ADD COLUMN load TEXT NOT NULL DEFAULT 'index';
+             UPDATE memories SET load = 'inline' WHERE priority = 0;",
+        )?;
+    }
+    // `reference_list`, not `references`: SQLite refuses the latter unquoted as a column name.
+    if !table_has_column(transaction, "memories", "reference_list")? {
+        transaction.execute_batch(
+            "ALTER TABLE memories ADD COLUMN reference_list TEXT NOT NULL DEFAULT '[]'",
+        )?;
+    }
+    if !table_has_column(transaction, "memories", "source")? {
+        transaction
+            .execute_batch("ALTER TABLE memories ADD COLUMN source TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !table_has_column(transaction, "memories", "verified_at")? {
+        transaction.execute_batch(
+            "ALTER TABLE memories ADD COLUMN verified_at TEXT NOT NULL DEFAULT '';
+             UPDATE memories SET verified_at = created_at;",
+        )?;
+    }
+    if !table_has_column(transaction, "memories", "expires_at")? {
+        transaction.execute_batch("ALTER TABLE memories ADD COLUMN expires_at TEXT")?;
+    }
+    Ok(())
+}
+
 /// Give a spec the two allow-list keys 0.76 records, `null` each, where it lacks them, reporting
 /// whether it did.
 fn allow_lists_0_76(spec: &mut serde_json::Value) -> bool {
@@ -4681,6 +4724,10 @@ mod tests {
             (
                 "subagent_specs_name_their_allow_lists",
                 7456634420440402148_u64,
+            ),
+            (
+                "memories_carry_load_references_source_verification_and_expiry",
+                11700233977647167775_u64,
             ),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
@@ -8521,5 +8568,101 @@ mod tests {
         let turn = &export.sessions[0].turns[0];
         assert_eq!(turn.status.as_deref(), Some("succeeded"));
         assert_eq!(turn.profile, None);
+    }
+
+    /// A row written before the memory columns loads by its priority, since priority 0 was the
+    /// inline band, and is verified as of its creation; the other three columns take their
+    /// empty defaults. A replay leaves a row the user has since moved alone, so the conversion is
+    /// tied to the column being added rather than to the step running.
+    #[test]
+    fn memories_written_before_load_take_it_from_their_priority() {
+        let mut connection = rusqlite::Connection::open_in_memory().expect("open");
+        let to_head = plan(&connection).expect("plan");
+        apply(&mut connection, to_head, &Context::default()).expect("apply");
+        // The shape the step converts from: the five columns gone and the version one short.
+        connection
+            .execute_batch(
+                "ALTER TABLE memories DROP COLUMN load;
+                 ALTER TABLE memories DROP COLUMN reference_list;
+                 ALTER TABLE memories DROP COLUMN source;
+                 ALTER TABLE memories DROP COLUMN verified_at;
+                 ALTER TABLE memories DROP COLUMN expires_at;",
+            )
+            .expect("the shape before the step");
+        connection
+            .execute_batch(&format!("PRAGMA user_version = {};", MIGRATIONS.len() - 1))
+            .expect("one step short of head");
+        connection
+            .execute_batch(
+                "INSERT INTO memories (name, description, priority, created_at, updated_at)
+                 VALUES ('rule', 'always', 0, '2024-01-01T00:00:00+00:00',
+                         '2024-06-01T00:00:00+00:00'),
+                        ('note', 'sometimes', 5, '2024-02-01T00:00:00+00:00',
+                         '2024-06-01T00:00:00+00:00');",
+            )
+            .expect("two rows an older meka wrote");
+
+        let pending = plan(&connection).expect("plan");
+        assert_eq!(pending.from as usize, MIGRATIONS.len() - 1);
+        apply(&mut connection, pending, &Context::default()).expect("the step runs");
+
+        let row = |connection: &rusqlite::Connection,
+                   name: &str|
+         -> (String, String, String, String, Option<String>) {
+            connection
+                .query_row(
+                    "SELECT load, reference_list, source, verified_at, expires_at
+                     FROM memories WHERE name = ?1",
+                    [name],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .expect("the row")
+        };
+        assert_eq!(
+            row(&connection, "rule"),
+            (
+                "inline".to_string(),
+                "[]".to_string(),
+                String::new(),
+                "2024-01-01T00:00:00+00:00".to_string(),
+                None
+            )
+        );
+        assert_eq!(
+            row(&connection, "note"),
+            (
+                "index".to_string(),
+                "[]".to_string(),
+                String::new(),
+                "2024-02-01T00:00:00+00:00".to_string(),
+                None
+            )
+        );
+
+        // The user moves the rule out of the band and verifies the note; a replay changes neither.
+        connection
+            .execute_batch(
+                "UPDATE memories SET load = 'index' WHERE name = 'rule';
+                 UPDATE memories SET verified_at = '2025-01-01T00:00:00+00:00' WHERE name = 'note';",
+            )
+            .expect("moved by hand");
+        let before = (row(&connection, "rule"), row(&connection, "note"));
+        let transaction = connection.transaction().expect("transaction");
+        memories_carry_load_references_source_verification_and_expiry(&transaction)
+            .expect("a replay");
+        transaction.commit().expect("commit");
+        assert_eq!(
+            (row(&connection, "rule"), row(&connection, "note")),
+            before,
+            "a replay is a no-op"
+        );
     }
 }

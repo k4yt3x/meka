@@ -650,6 +650,18 @@ pub(crate) enum MemoryAction {
         /// Output format: plain or json
         #[arg(long, default_value = "plain")]
         format: OutputFormat,
+
+        /// Only memories referencing this name, path, URL or id
+        #[arg(long, value_name = "REFERENCE")]
+        referencing: Option<String>,
+
+        /// Only memories not verified within this long, e.g. 90d
+        #[arg(long, value_name = "DURATION")]
+        unverified: Option<String>,
+
+        /// Only memories whose expiry has passed
+        #[arg(long)]
+        expired: bool,
     },
     /// Print one memory's stored fields
     Get {
@@ -684,13 +696,33 @@ pub(crate) enum MemoryAction {
         #[arg(long = "tag", value_name = "TAG")]
         tags: Vec<String>,
 
-        /// Detail loaded only on `memory_read`
+        /// Detail read on `memory_read`, or in context every turn with `--load inline`
         #[arg(long)]
         body: Option<String>,
 
         /// Read the body from this file, not `--body`
         #[arg(long = "from-file", value_name = "PATH")]
         from_file: Option<std::path::PathBuf>,
+
+        /// How it reaches the context: inline, index or search (default: index)
+        #[arg(long, value_name = "LOAD")]
+        load: Option<crate::memory::Load>,
+
+        /// What it depends on: a memory name, path, URL or id (repeatable)
+        #[arg(long = "reference", value_name = "REFERENCE")]
+        references: Vec<String>,
+
+        /// Where the fact came from
+        #[arg(long)]
+        source: Option<String>,
+
+        /// When it stops applying: RFC 3339 or YYYY-MM-DD; an empty value clears it
+        #[arg(long, value_name = "WHEN")]
+        expires: Option<String>,
+
+        /// Record that the fact was just verified current
+        #[arg(long)]
+        verified: bool,
 
         /// Update an existing memory instead of refusing
         #[arg(long)]

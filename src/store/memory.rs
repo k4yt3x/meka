@@ -451,7 +451,12 @@ impl MemoryStore {
     /// the tokenizer does not split into words at all. A term of a script written without spaces
     /// takes the scan every time rather than as a last resort, so a query mixing scripts is
     /// answered for both halves. `None` when `queries` hold no searchable words.
-    pub(crate) async fn find(&self, queries: &[String], limit: usize) -> Result<Option<Found>> {
+    pub(crate) async fn find(
+        &self,
+        queries: &[String],
+        filter: &MemoryFilter,
+        limit: usize,
+    ) -> Result<Option<Found>> {
         let terms = Terms::parse(queries);
         if terms.is_empty() {
             return Ok(None);
@@ -468,18 +473,20 @@ impl MemoryStore {
         let mut tier = SearchTier::Exact;
         let mut results = SearchResults::default();
         if !indexable.is_empty() {
-            results = self.search(indexable.match_expression(), window).await?;
+            results = self
+                .search(indexable.match_expression(), filter, window)
+                .await?;
             if results.hits.is_empty() {
                 tier = SearchTier::Prefix;
                 results = self
-                    .search(indexable.prefix_match_expression(), window)
+                    .search(indexable.prefix_match_expression(), filter, window)
                     .await?;
             }
             // Still the prefix tier, in the other direction: longest prefix first, stopping at
             // the first that answers, so the most specific query that can find anything does.
             if results.hits.is_empty() {
                 for expression in indexable.trimmed_prefix_match_expressions() {
-                    results = self.search(expression, window).await?;
+                    results = self.search(expression, filter, window).await?;
                     if !results.hits.is_empty() {
                         break;
                     }
@@ -495,14 +502,14 @@ impl MemoryStore {
             // the tokenizer joined into one token, an identifier or a path as much as a sentence
             // of Chinese.
             tier = SearchTier::Substring;
-            results = self.substring_search(terms.words(), limit).await?;
+            results = self.substring_search(terms.words(), filter, limit).await?;
         } else {
             // One scan per term, so the result can say which terms it answered for. With no
             // indexable half this is the whole answer rather than a fallback, so the tier stays
             // the one whose preamble does not say the words matched nothing.
             for term in &unspaced {
                 let found = self
-                    .substring_search(std::slice::from_ref(term), window)
+                    .substring_search(std::slice::from_ref(term), filter, window)
                     .await?;
                 if found.hits.is_empty() {
                     missed.push(term.clone());
@@ -666,6 +673,10 @@ pub(crate) struct Hit {
     pub(crate) priority: u8,
     pub(crate) created: SystemTime,
     pub(crate) read_count: u32,
+    /// When the fact was last verified, which is what freshness decays from.
+    pub(crate) verified: SystemTime,
+    /// When the memory expires, if an expiry was set.
+    pub(crate) expires: Option<SystemTime>,
     /// The composed [`Ranking::score`]. Higher is better, unlike the raw `bm25` it derives from.
     pub(crate) score: f64,
     /// How many parts of the query found this memory: one from the tier that answered, one more
@@ -685,6 +696,74 @@ pub(crate) struct SearchResults {
     pub(crate) hits: Vec<Hit>,
     pub(crate) matched: usize,
     pub(crate) pool_exhausted: bool,
+}
+
+/// What a listing or a search is narrowed to, the same three questions at every door:
+/// `memory_search`'s filters, `meka memory list`'s flags and `GET /v1/memory`'s query parameters.
+///
+/// One definition so the doors cannot disagree about what "referencing" or "unverified" selects,
+/// and so a search with words and a listing without them read the same rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MemoryFilter {
+    /// Memories whose references name this, matched whole and without regard to case.
+    pub(crate) referencing: Option<String>,
+    /// Memories not verified within this long of now.
+    pub(crate) unverified_for: Option<Duration>,
+    /// Memories whose expiry has passed.
+    pub(crate) expired: bool,
+}
+
+impl MemoryFilter {
+    /// Whether the filter selects everything.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.referencing.is_none() && self.unverified_for.is_none() && !self.expired
+    }
+
+    /// The `AND ...` tail of a `WHERE` clause and the parameters it binds, numbered from
+    /// `first`; `table` is the alias prefix the statement uses for `memories`, `"m."` or `""`.
+    /// Empty for an empty filter.
+    ///
+    /// Stamps are compared as the RFC 3339 text the columns hold, which orders correctly because
+    /// every stamp meka writes is UTC with the same field widths; the parameters are strings so
+    /// the closure that binds them stays `Send`.
+    fn clause(&self, table: &str, first: usize, now: SystemTime) -> (String, Vec<String>) {
+        let mut clause = String::new();
+        let mut parameters: Vec<String> = Vec::new();
+        if let Some(target) = &self.referencing {
+            clause.push_str(" AND ");
+            clause.push_str(&Self::referencing_sql(table, first + parameters.len()));
+            parameters.push(target.clone());
+        }
+        if let Some(window) = self.unverified_for {
+            clause.push_str(&format!(
+                " AND {table}verified_at < ?{}",
+                first + parameters.len()
+            ));
+            parameters.push(crate::memory::render_stamp(
+                now.checked_sub(window).unwrap_or(SystemTime::UNIX_EPOCH),
+            ));
+        }
+        if self.expired {
+            clause.push_str(&format!(
+                " AND {table}expires_at IS NOT NULL AND {table}expires_at <= ?{}",
+                first + parameters.len()
+            ));
+            parameters.push(crate::memory::render_stamp(now));
+        }
+        (clause, parameters)
+    }
+
+    /// The condition selecting rows whose reference list names parameter `position`.
+    ///
+    /// `json_each` over the row's own column, so the match is against each reference whole;
+    /// `NOCASE` because memory names are matched without regard to case everywhere else and a
+    /// listing that shows one row too many is harmless where one too few is not.
+    fn referencing_sql(table: &str, position: usize) -> String {
+        format!(
+            "EXISTS (SELECT 1 FROM json_each({table}reference_list) \
+             WHERE json_each.value = ?{position} COLLATE NOCASE)"
+        )
+    }
 }
 
 impl SearchResults {
@@ -729,6 +808,8 @@ pub(crate) struct Ranking;
 
 impl Ranking {
     /// `relevance x priority x usage x freshness`, all of them positive and increasing-is-better.
+    /// `age` is how long since the fact was last verified, so a re-verified old note ranks as
+    /// fresh and a note nobody has checked decays from the day it was written.
     ///
     /// `bm25` is negated on the way in. FTS5 returns a *negative* number whose magnitude grows with
     /// relevance, so multiplying it by a positive weight ranks the least relevant result first, and
@@ -773,10 +854,12 @@ impl Ranking {
 }
 
 /// What [`MemoryStore::write`] is being asked to store. `None` means "leave whatever is there".
-#[derive(Debug, Clone)]
+///
+/// `Default` exists for a test that sets a few fields; every production door names them all.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct WriteRequest {
     pub(crate) name: String,
-    /// `None` means "keep what is stored", exactly as it does for the three fields below.
+    /// `None` means "keep what is stored", exactly as it does for the optional fields below.
     ///
     /// Required only when the write creates the memory, which [`MemoryStore::write`] checks inside
     /// its own transaction. As a plain `String`, a caller refining a stored note would have to
@@ -787,6 +870,15 @@ pub(crate) struct WriteRequest {
     pub(crate) tags: Option<Vec<String>>,
     pub(crate) body: Option<String>,
     pub(crate) priority: Option<u8>,
+    pub(crate) load: Option<crate::memory::Load>,
+    pub(crate) references: Option<Vec<String>>,
+    pub(crate) source: Option<String>,
+    /// Outer `None` keeps the stored expiry; `Some(None)` clears it.
+    pub(crate) expires_at: Option<Option<SystemTime>>,
+    /// Whether this write verifies the fact holds, which is the one thing that moves
+    /// `verified_at` on an existing row. A creating write stamps it regardless, since a new note
+    /// is as verified as it will ever be.
+    pub(crate) verified: bool,
 }
 
 /// What [`MemoryStore::write_body`] found when it went to save.
@@ -821,6 +913,9 @@ pub(crate) enum BodyWrite {
 /// [`crate::memory::render_for_model`].
 fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
     let tags: String = row.get(2)?;
+    let load: String = row.get(8)?;
+    let references: String = row.get(9)?;
+    let expires_at: Option<String> = row.get(12)?;
     Ok(Memory {
         name: row.get(0)?,
         description: row.get(1)?,
@@ -834,7 +929,55 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         updated_at: stamp_or_epoch(&row.get::<_, String>(5)?),
         read_count: clamp_read_count(row.get(6)?),
         body: row.get(7)?,
+        load: load.parse().unwrap_or_default(),
+        references: keepable_references(&references),
+        source: row.get(10)?,
+        verified_at: stamp_or_epoch(&row.get::<_, String>(11)?),
+        expires_at: expires_at.as_deref().and_then(crate::memory::parse_stamp),
     })
+}
+
+/// Every column of a `memories` row, in the order [`row_to_memory`] reads them.
+///
+/// One constant so a statement cannot select the columns in another order: every one of them is
+/// a string or a number that would survive being put in the wrong slot.
+const MEMORY_COLUMNS: &str = "name, description, tags, priority, created_at, updated_at, \
+                              read_count, body, load, reference_list, source, verified_at, \
+                              expires_at";
+
+/// The references a stored row holds, or none when the column is not the JSON array of one-line
+/// strings every write door stores.
+///
+/// All-or-nothing per element, by the write door's own rule, for the reason [`keepable_tag`]
+/// gives: a reference that fails [`crate::memory::validate_reference`] is dropped whole rather
+/// than trimmed into a different, plausible pointer.
+fn keepable_references(stored: &str) -> Vec<String> {
+    let Ok(serde_json::Value::Array(values)) = serde_json::from_str::<serde_json::Value>(stored)
+    else {
+        return Vec::new();
+    };
+    values
+        .into_iter()
+        .filter_map(|value| match value {
+            serde_json::Value::String(reference)
+                if crate::memory::validate_reference(&reference).is_ok() =>
+            {
+                Some(reference)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The JSON array a write stores a reference list as.
+fn references_column(references: &[String]) -> String {
+    serde_json::Value::Array(
+        references
+            .iter()
+            .map(|reference| serde_json::Value::String(reference.clone()))
+            .collect(),
+    )
+    .to_string()
 }
 
 /// Reduce a stored tag to the characters a tag is allowed to hold.
@@ -1029,28 +1172,149 @@ impl MemoryStore {
     /// Every memory, ordered as the `[Memory]` index renders them: priority ascending, then most
     /// recently created, then by name so the result is total and stable.
     ///
-    /// Bodies are loaded only for the standing band ([`crate::memory::INLINE_BODY_PRIORITY_MAX`]),
-    /// which is the only tier that renders one in full. Carrying every body would put the whole
+    /// Bodies are loaded only for the inline band ([`crate::memory::Load::Inline`]), which is
+    /// the only tier that renders one in full. Carrying every body would put the whole
     /// store in resident memory for the sake of a handful of entries, and the rest are reachable
     /// through [`Self::get`] and [`Self::search`].
     pub(crate) async fn index(&self) -> Result<Vec<Memory>> {
         let Some(connection) = self.connection.as_deref() else {
             return Ok(Vec::new());
         };
-        let inline_max = i64::from(crate::memory::INLINE_BODY_PRIORITY_MAX);
+        let inline = crate::memory::Load::Inline.name();
         connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(
                     "SELECT name, description, tags, priority, created_at, updated_at, read_count,
-                            CASE WHEN priority <= ?1 THEN body ELSE NULL END
+                            CASE WHEN load = ?1 THEN body ELSE NULL END,
+                            load, reference_list, source, verified_at, expires_at
                      FROM memories
                      ORDER BY priority ASC, created_at DESC, name ASC",
                 )?;
-                let rows = statement.query_map(rusqlite::params![inline_max], row_to_memory)?;
+                let rows = statement.query_map(rusqlite::params![inline], row_to_memory)?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to read memories: {error}")))
+    }
+
+    /// The memories a filter selects, in index order and without their bodies, for a listing.
+    ///
+    /// Beside [`Self::index`] rather than folded into it: the index is every memory with the
+    /// inline bodies, read once per turn, and a listing is what an operator or a hygiene pass
+    /// asked for, which is usually a few rows out of the store.
+    pub(crate) async fn list(&self, filter: &MemoryFilter) -> Result<Vec<Memory>> {
+        let Some(connection) = self.connection.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let (clause, parameters) = filter.clause("", 1, SystemTime::now());
+        connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(&format!(
+                    "SELECT name, description, tags, priority, created_at, updated_at, read_count,
+                            NULL, load, reference_list, source, verified_at, expires_at
+                     FROM memories
+                     WHERE 1 {clause}
+                     ORDER BY priority ASC, created_at DESC, name ASC"
+                ))?;
+                let rows =
+                    statement.query_map(rusqlite::params_from_iter(parameters), row_to_memory)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to list memories: {error}")))
+    }
+
+    /// The memories whose references name `target`, in index order: name and description, which
+    /// is what a reader needs to name them and what a sweep needs to decide which to revisit.
+    pub(crate) async fn referenced_by(&self, target: &str) -> Result<Vec<(String, String)>> {
+        let Some(connection) = self.connection.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let target = target.to_string();
+        connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(&format!(
+                    "SELECT name, description FROM memories
+                     WHERE {}
+                     ORDER BY priority ASC, created_at DESC, name ASC",
+                    MemoryFilter::referencing_sql("", 1)
+                ))?;
+                let rows = statement.query_map(rusqlite::params![target], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to read memory references: {error}"))
+            })
+    }
+
+    /// The memories a filter alone selects, bodies included, as search results in index order:
+    /// what `memory_search` answers when it was given a filter and no words.
+    ///
+    /// Not re-ranked. Every row matched the filter equally, so the importance order the index
+    /// uses is the one a reader expects, and a hygiene pass reads the list top to bottom.
+    pub(crate) async fn filtered(
+        &self,
+        filter: &MemoryFilter,
+        limit: usize,
+    ) -> Result<SearchResults> {
+        let Some(connection) = self.connection.as_deref() else {
+            return Ok(SearchResults::default());
+        };
+        let (clause, parameters) = filter.clause("", 1, SystemTime::now());
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let matched: i64 = connection.query_row(
+                    &format!("SELECT count(*) FROM memories WHERE 1 {clause}"),
+                    rusqlite::params_from_iter(parameters.iter()),
+                    |row| row.get(0),
+                )?;
+                let mut statement = connection.prepare(&format!(
+                    "SELECT name, description, body, priority, created_at, read_count,
+                            verified_at, expires_at
+                     FROM memories
+                     WHERE 1 {clause}
+                     ORDER BY priority ASC, created_at DESC, name ASC
+                     LIMIT ?{}",
+                    parameters.len() + 1
+                ))?;
+                let bound: Vec<&dyn rusqlite::ToSql> = parameters
+                    .iter()
+                    .map(|parameter| parameter as &dyn rusqlite::ToSql)
+                    .chain(std::iter::once(&limit as &dyn rusqlite::ToSql))
+                    .collect();
+                let rows = statement.query_map(bound.as_slice(), |row| {
+                    let body: String = row.get(2)?;
+                    Ok(Hit {
+                        name: row.get(0)?,
+                        description: row.get(1)?,
+                        // The opening, since nothing was matched: what a listing's excerpt is.
+                        snippet: body.chars().take(SUBSTRING_SNIPPET_CHARS).collect(),
+                        body,
+                        priority: clamp_priority(row.get(3)?),
+                        created: stamp_or_epoch(&row.get::<_, String>(4)?),
+                        read_count: clamp_read_count(row.get(5)?),
+                        verified: stamp_or_epoch(&row.get::<_, String>(6)?),
+                        expires: row
+                            .get::<_, Option<String>>(7)?
+                            .as_deref()
+                            .and_then(crate::memory::parse_stamp),
+                        score: 0.0,
+                        found_by: 1,
+                    })
+                })?;
+                let hits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(SearchResults {
+                    hits,
+                    matched: usize::try_from(matched).unwrap_or(usize::MAX),
+                    pool_exhausted: false,
+                })
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to list memories: {error}")))
     }
 
     /// Insert a row straight at the column, past every write door.
@@ -1071,14 +1335,37 @@ impl MemoryStore {
         connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "INSERT INTO memories (name, description, created_at, updated_at) \
-                     VALUES (?1, ?2, '2024-01-01T00:00:00+00:00', '2024-01-01T00:00:00+00:00')",
+                    "INSERT INTO memories (name, description, created_at, updated_at, verified_at) \
+                     VALUES (?1, ?2, '2024-01-01T00:00:00+00:00', '2024-01-01T00:00:00+00:00', \
+                             '2024-01-01T00:00:00+00:00')",
                     rusqlite::params![name, description],
                 )?;
                 Ok(())
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to plant a row: {error}")))
+    }
+
+    /// Overwrite a row's reference list straight at the column, past every write door, so the
+    /// read guard for a list no door would store is reachable from the suite.
+    #[cfg(test)]
+    pub(crate) async fn plant_references_for_test(&self, name: &str, raw: &str) -> Result<()> {
+        let Some(connection) = self.connection.as_deref() else {
+            return Err(MekaError::Database(
+                "memory store has no database".to_string(),
+            ));
+        };
+        let (name, raw) = (name.to_string(), raw.to_string());
+        connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE memories SET reference_list = ?2 WHERE name = ?1",
+                    rusqlite::params![name, raw],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to plant references: {error}")))
     }
 
     /// Rename a row straight at the column.
@@ -1120,9 +1407,7 @@ impl MemoryStore {
             .call(move |connection| -> rusqlite::Result<_> {
                 connection
                     .query_row(
-                        "SELECT name, description, tags, priority, created_at, updated_at,
-                                read_count, body
-                         FROM memories WHERE name = ?1",
+                        &format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE name = ?1"),
                         rusqlite::params![name],
                         row_to_memory,
                     )
@@ -1185,16 +1470,29 @@ impl MemoryStore {
                     // the constraint instead of reaching the `COALESCE` below. The `''` is never
                     // stored, because the only path that inserts rather than updates is one the
                     // existence check above already required a description for.
+                    //
+                    // `verified_at` takes the row's own stamp on insert and moves on update only
+                    // when the request says it verifies the fact; `expires_at` takes the request's
+                    // value on insert and on update only when one was given, since `NULL` is both
+                    // "clear it" and "not mentioned" and the flag tells them apart.
                     "INSERT INTO memories
-                         (name, description, tags, body, priority, created_at, updated_at)
+                         (name, description, tags, body, priority, created_at, updated_at,
+                          load, reference_list, source, verified_at, expires_at)
                      VALUES (?1, COALESCE(?2, ''), COALESCE(?3, ''), COALESCE(?4, ''),
-                             COALESCE(?5, ?7), ?6, ?6)
+                             COALESCE(?5, ?7), ?6, ?6,
+                             COALESCE(?8, ?9), COALESCE(?10, '[]'), COALESCE(?11, ''), ?6, ?12)
                      ON CONFLICT(name) DO UPDATE SET
-                         description = COALESCE(?2, memories.description),
-                         tags        = COALESCE(?3, memories.tags),
-                         body        = COALESCE(?4, memories.body),
-                         priority    = COALESCE(?5, memories.priority),
-                         updated_at  = excluded.updated_at",
+                         description    = COALESCE(?2, memories.description),
+                         tags           = COALESCE(?3, memories.tags),
+                         body           = COALESCE(?4, memories.body),
+                         priority       = COALESCE(?5, memories.priority),
+                         updated_at     = excluded.updated_at,
+                         load           = COALESCE(?8, memories.load),
+                         reference_list = COALESCE(?10, memories.reference_list),
+                         source         = COALESCE(?11, memories.source),
+                         verified_at    = CASE WHEN ?14 THEN excluded.updated_at
+                                               ELSE memories.verified_at END,
+                         expires_at     = CASE WHEN ?13 THEN ?12 ELSE memories.expires_at END",
                     rusqlite::params![
                         request.name,
                         request.description,
@@ -1203,12 +1501,20 @@ impl MemoryStore {
                         request.priority.map(i64::from),
                         now,
                         i64::from(DEFAULT_PRIORITY),
+                        request.load.map(|load| load.name()),
+                        crate::memory::Load::default().name(),
+                        request.references.as_deref().map(references_column),
+                        request.source,
+                        request
+                            .expires_at
+                            .flatten()
+                            .map(crate::memory::render_stamp),
+                        request.expires_at.is_some(),
+                        request.verified,
                     ],
                 )?;
                 let written = transaction.query_row(
-                    "SELECT name, description, tags, priority, created_at, updated_at, read_count,
-                            body
-                     FROM memories WHERE name = ?1",
+                    &format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE name = ?1"),
                     rusqlite::params![request.name],
                     row_to_memory,
                 )?;
@@ -1256,6 +1562,7 @@ impl MemoryStore {
         name: &str,
         expected: &str,
         body: String,
+        verified: bool,
     ) -> Result<BodyWrite> {
         let name = name.to_string();
         let expected = expected.to_string();
@@ -1263,9 +1570,10 @@ impl MemoryStore {
         self.writable()?
             .call(move |connection| -> rusqlite::Result<_> {
                 let updated = connection.execute(
-                    "UPDATE memories SET body = ?2, updated_at = ?3
+                    "UPDATE memories SET body = ?2, updated_at = ?3,
+                         verified_at = CASE WHEN ?5 THEN ?3 ELSE verified_at END
                      WHERE name = ?1 AND body = ?4",
-                    rusqlite::params![name, body, now, expected],
+                    rusqlite::params![name, body, now, expected, verified],
                 )?;
                 if updated > 0 {
                     return Ok(BodyWrite::Saved);
@@ -1301,9 +1609,7 @@ impl MemoryStore {
             .call(move |connection| -> rusqlite::Result<_> {
                 connection
                     .query_row(
-                        "DELETE FROM memories WHERE name = ?1
-                         RETURNING name, description, tags, priority, created_at, updated_at,
-                                   read_count, body",
+                        &format!("DELETE FROM memories WHERE name = ?1 RETURNING {MEMORY_COLUMNS}"),
                         rusqlite::params![name],
                         row_to_memory,
                     )
@@ -1320,6 +1626,7 @@ impl MemoryStore {
     pub(crate) async fn search(
         &self,
         match_expression: String,
+        filter: &MemoryFilter,
         limit: usize,
     ) -> Result<SearchResults> {
         let Some(connection) = self.connection.as_deref() else {
@@ -1329,46 +1636,59 @@ impl MemoryStore {
             return Ok(SearchResults::default());
         }
         let now = SystemTime::now();
+        let (clause, filter_parameters) = filter.clause("m.", 8, now);
+        let pool = i64::try_from(CANDIDATE_POOL).unwrap_or(i64::MAX);
         let mut hits = connection
             .call(move |connection| -> rusqlite::Result<_> {
-                let mut statement = connection.prepare(
+                let mut statement = connection.prepare(&format!(
                     // `snippet()` and `bm25()` read the *index*; every stored column comes from
                     // `memories` through the rowid the index is anchored to. One join, rather than
                     // metadata columns duplicated into a mirror.
                     "SELECT m.name, m.description, m.body, m.priority, m.created_at,
-                            m.read_count,
+                            m.read_count, m.verified_at, m.expires_at,
                             snippet(memories_fts, ?2, '', '', '…', 24),
                             bm25(memories_fts, ?3, ?4, ?5, ?6)
                      FROM memories_fts f
                      JOIN memories m ON m.id = f.rowid
-                     WHERE memories_fts MATCH ?1
+                     WHERE memories_fts MATCH ?1 {clause}
                      ORDER BY bm25(memories_fts, ?3, ?4, ?5, ?6)
-                     LIMIT ?7",
-                )?;
-                let rows = statement.query_map(
-                    rusqlite::params![
-                        match_expression,
-                        COLUMN_BODY,
-                        WEIGHT_NAME,
-                        WEIGHT_DESCRIPTION,
-                        WEIGHT_TAGS,
-                        WEIGHT_BODY,
-                        CANDIDATE_POOL as i64,
-                    ],
-                    |row| {
-                        Ok(Hit {
-                            name: row.get(0)?,
-                            description: row.get(1)?,
-                            body: row.get(2)?,
-                            priority: clamp_priority(row.get(3)?),
-                            created: stamp_or_epoch(&row.get::<_, String>(4)?),
-                            read_count: clamp_read_count(row.get(5)?),
-                            snippet: row.get(6)?,
-                            score: row.get::<_, f64>(7)?,
-                            found_by: 1,
-                        })
-                    },
-                )?;
+                     LIMIT ?7"
+                ))?;
+                let fixed: [&dyn rusqlite::ToSql; 7] = [
+                    &match_expression,
+                    &COLUMN_BODY,
+                    &WEIGHT_NAME,
+                    &WEIGHT_DESCRIPTION,
+                    &WEIGHT_TAGS,
+                    &WEIGHT_BODY,
+                    &pool,
+                ];
+                let bound: Vec<&dyn rusqlite::ToSql> = fixed
+                    .into_iter()
+                    .chain(
+                        filter_parameters
+                            .iter()
+                            .map(|parameter| parameter as &dyn rusqlite::ToSql),
+                    )
+                    .collect();
+                let rows = statement.query_map(bound.as_slice(), |row| {
+                    Ok(Hit {
+                        name: row.get(0)?,
+                        description: row.get(1)?,
+                        body: row.get(2)?,
+                        priority: clamp_priority(row.get(3)?),
+                        created: stamp_or_epoch(&row.get::<_, String>(4)?),
+                        read_count: clamp_read_count(row.get(5)?),
+                        verified: stamp_or_epoch(&row.get::<_, String>(6)?),
+                        expires: row
+                            .get::<_, Option<String>>(7)?
+                            .as_deref()
+                            .and_then(crate::memory::parse_stamp),
+                        snippet: row.get(8)?,
+                        score: row.get::<_, f64>(9)?,
+                        found_by: 1,
+                    })
+                })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })
             .await
@@ -1377,7 +1697,7 @@ impl MemoryStore {
             })?;
 
         for hit in hits.iter_mut() {
-            let age = now.duration_since(hit.created).unwrap_or(Duration::ZERO);
+            let age = now.duration_since(hit.verified).unwrap_or(Duration::ZERO);
             hit.score = Ranking::score(hit.score, hit.priority, hit.read_count, age);
         }
         // `total_cmp` rather than `partial_cmp`: a NaN from a degenerate bm25 would make the
@@ -1412,6 +1732,7 @@ impl MemoryStore {
     pub(crate) async fn substring_search(
         &self,
         terms: &[String],
+        filter: &MemoryFilter,
         limit: usize,
     ) -> Result<SearchResults> {
         let Some(connection) = self.connection.as_deref() else {
@@ -1447,6 +1768,7 @@ impl MemoryStore {
             .collect::<Vec<_>>()
             .join(" OR ");
         let pool = i64::try_from(CANDIDATE_POOL).unwrap_or(i64::MAX);
+        let (filter_clause, filter_parameters) = filter.clause("", patterns.len() + 1, now);
         // The raw terms, not the `LIKE` patterns: the excerpt has to find in the body what SQLite
         // matched, and the patterns carry `%` wrappers and backslash escapes it never sees.
         let excerpt_terms: Vec<String> = terms.to_vec();
@@ -1460,15 +1782,17 @@ impl MemoryStore {
                     // importance weights *are* the ranking; applied after an arbitrary window, a
                     // store of filler notes hides the priority-0 standing directive that is the
                     // only real answer behind old p9 rows labeled "most relevant first".
-                    "SELECT name, description, body, priority, created_at, read_count
+                    "SELECT name, description, body, priority, created_at, read_count,
+                            verified_at, expires_at
                      FROM memories
-                     WHERE {clause}
+                     WHERE ({clause}) {filter_clause}
                      ORDER BY priority ASC, created_at DESC, name ASC
                      LIMIT ?{}",
-                    patterns.len() + 1
+                    patterns.len() + filter_parameters.len() + 1
                 ))?;
                 let parameters: Vec<&dyn rusqlite::ToSql> = patterns
                     .iter()
+                    .chain(filter_parameters.iter())
                     .map(|pattern| pattern as &dyn rusqlite::ToSql)
                     .chain(std::iter::once(&pool as &dyn rusqlite::ToSql))
                     .collect();
@@ -1494,6 +1818,11 @@ impl MemoryStore {
                         priority: clamp_priority(row.get(3)?),
                         created: stamp_or_epoch(&row.get::<_, String>(4)?),
                         read_count: clamp_read_count(row.get(5)?),
+                        verified: stamp_or_epoch(&row.get::<_, String>(6)?),
+                        expires: row
+                            .get::<_, Option<String>>(7)?
+                            .as_deref()
+                            .and_then(crate::memory::parse_stamp),
                         // No bm25 here: every row matched literally, so there is no relevance to
                         // grade and the importance weights decide the order on their own. Written
                         // in bm25's own sign convention (negative, more-negative-is-better), so
@@ -1510,7 +1839,7 @@ impl MemoryStore {
             })?;
 
         for hit in hits.iter_mut() {
-            let age = now.duration_since(hit.created).unwrap_or(Duration::ZERO);
+            let age = now.duration_since(hit.verified).unwrap_or(Duration::ZERO);
             hit.score = Ranking::score(hit.score, hit.priority, hit.read_count, age);
         }
         hits.sort_by(|left, right| right.score.total_cmp(&left.score));
@@ -1627,12 +1956,9 @@ impl MemoryStore {
         };
         connection
             .call(|connection| -> rusqlite::Result<_> {
-                let mut statement = connection.prepare(
-                    "SELECT name, description, tags, priority, created_at, updated_at, read_count,
-                            body
-                     FROM memories
-                     ORDER BY name ASC",
-                )?;
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {MEMORY_COLUMNS} FROM memories ORDER BY name ASC"
+                ))?;
                 let rows = statement.query_map([], row_to_memory)?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })
@@ -1685,6 +2011,9 @@ mod tests {
     use super::*;
 
     /// A write that states every field, for fixtures that only care about the text.
+    /// A whole memory. Priority 0 is written as inline, the way the migration maps a row written
+    /// before `load` existed, so the tests here can keep speaking of "the standing band" by its
+    /// priority.
     fn full(name: &str, priority: u8, description: &str, body: &str) -> WriteRequest {
         WriteRequest {
             name: name.to_string(),
@@ -1692,6 +2021,12 @@ mod tests {
             tags: Some(Vec::new()),
             body: Some(body.to_string()),
             priority: Some(priority),
+            load: Some(if priority == 0 {
+                crate::memory::Load::Inline
+            } else {
+                crate::memory::Load::Index
+            }),
+            ..WriteRequest::default()
         }
     }
 
@@ -1728,6 +2063,7 @@ mod tests {
                 tags: Some(vec!["style".to_string()]),
                 body: Some("Always answer in kind. xylophone".to_string()),
                 priority: Some(0),
+                ..WriteRequest::default()
             })
             .await
             .expect("create");
@@ -1742,6 +2078,7 @@ mod tests {
                 tags: None,
                 body: None,
                 priority: None,
+                ..WriteRequest::default()
             })
             .await
             .expect("metadata-only update");
@@ -1774,7 +2111,7 @@ mod tests {
         assert_eq!(
             names(
                 &store
-                    .search(stale.match_expression(), 5)
+                    .search(stale.match_expression(), &MemoryFilter::default(), 5)
                     .await
                     .expect("search")
             ),
@@ -1784,7 +2121,7 @@ mod tests {
         assert_eq!(
             names(
                 &store
-                    .search(fresh.match_expression(), 5)
+                    .search(fresh.match_expression(), &MemoryFilter::default(), 5)
                     .await
                     .expect("search")
             ),
@@ -1810,7 +2147,7 @@ mod tests {
         let body = Terms::parse(&["xylophone".to_string()]);
         assert!(
             store
-                .search(body.match_expression(), 5)
+                .search(body.match_expression(), &MemoryFilter::default(), 5)
                 .await
                 .expect("search")
                 .hits
@@ -1916,7 +2253,7 @@ mod tests {
         let stale = Terms::parse(&["marimba".to_string()]);
         assert!(
             store
-                .search(stale.match_expression(), 5)
+                .search(stale.match_expression(), &MemoryFilter::default(), 5)
                 .await
                 .expect("search")
                 .hits
@@ -1931,7 +2268,7 @@ mod tests {
         assert_eq!(
             names(
                 &store
-                    .search(stale.match_expression(), 5)
+                    .search(stale.match_expression(), &MemoryFilter::default(), 5)
                     .await
                     .expect("search")
             ),
@@ -1966,7 +2303,7 @@ mod tests {
         let stale = Terms::parse(&["marimba".to_string()]);
         assert!(
             store
-                .search(stale.match_expression(), 5)
+                .search(stale.match_expression(), &MemoryFilter::default(), 5)
                 .await
                 .expect("search")
                 .hits
@@ -1986,7 +2323,7 @@ mod tests {
         assert_eq!(
             names(
                 &store
-                    .search(stale.match_expression(), 5)
+                    .search(stale.match_expression(), &MemoryFilter::default(), 5)
                     .await
                     .expect("search")
             ),
@@ -2016,7 +2353,7 @@ mod tests {
         let terms = Terms::parse(&["xylophone".to_string()]);
         assert!(
             store
-                .search(terms.match_expression(), 5)
+                .search(terms.match_expression(), &MemoryFilter::default(), 5)
                 .await
                 .expect("search")
                 .hits
@@ -2031,7 +2368,7 @@ mod tests {
         assert_eq!(
             names(
                 &store
-                    .search(terms.match_expression(), 5)
+                    .search(terms.match_expression(), &MemoryFilter::default(), 5)
                     .await
                     .expect("search")
             ),
@@ -2059,12 +2396,17 @@ mod tests {
                 tags: Some(vec!["infra".to_string()]),
                 body: None,
                 priority: Some(5),
+                ..WriteRequest::default()
             })
             .await
             .expect("write");
 
         let by_tag = store
-            .search(Terms::parse(&["infra".to_string()]).match_expression(), 5)
+            .search(
+                Terms::parse(&["infra".to_string()]).match_expression(),
+                &MemoryFilter::default(),
+                5,
+            )
             .await
             .expect("search");
         assert_eq!(
@@ -2082,12 +2424,17 @@ mod tests {
                 tags: Some(vec!["deploy".to_string()]),
                 body: None,
                 priority: None,
+                ..WriteRequest::default()
             })
             .await
             .expect("retag");
 
         let after = store
-            .search(Terms::parse(&["deploy".to_string()]).match_expression(), 5)
+            .search(
+                Terms::parse(&["deploy".to_string()]).match_expression(),
+                &MemoryFilter::default(),
+                5,
+            )
             .await
             .expect("search");
         assert_eq!(
@@ -2096,7 +2443,11 @@ mod tests {
             "the new tag has to be findable"
         );
         let stale = store
-            .search(Terms::parse(&["infra".to_string()]).match_expression(), 5)
+            .search(
+                Terms::parse(&["infra".to_string()]).match_expression(),
+                &MemoryFilter::default(),
+                5,
+            )
             .await
             .expect("search");
         assert!(
@@ -2130,6 +2481,7 @@ mod tests {
                 tags: None,
                 body: None,
                 priority: Some(5),
+                ..WriteRequest::default()
             })
             .await
             .expect("write");
@@ -2140,7 +2492,11 @@ mod tests {
                 .await
                 .expect("rename straight at the column");
             let hits = store
-                .search(Terms::parse(&[to.to_lowercase()]).match_expression(), 5)
+                .search(
+                    Terms::parse(&[to.to_lowercase()]).match_expression(),
+                    &MemoryFilter::default(),
+                    5,
+                )
                 .await
                 .expect("search");
             assert_eq!(
@@ -2248,7 +2604,7 @@ mod tests {
         assert_eq!(
             names(
                 &store
-                    .search(terms.match_expression(), 5)
+                    .search(terms.match_expression(), &MemoryFilter::default(), 5)
                     .await
                     .expect("search")
             ),
@@ -2282,6 +2638,8 @@ mod tests {
             priority: 5,
             created: SystemTime::UNIX_EPOCH,
             read_count: 0,
+            verified: SystemTime::UNIX_EPOCH,
+            expires: None,
             score,
             found_by: 1,
         };
@@ -2343,7 +2701,7 @@ mod tests {
         let terms = Terms::parse(&["\u{5357}\u{5c71}\u{533a}".to_string()]);
         assert!(
             store
-                .search(terms.match_expression(), 5)
+                .search(terms.match_expression(), &MemoryFilter::default(), 5)
                 .await
                 .expect("search")
                 .hits
@@ -2351,7 +2709,7 @@ mod tests {
             "the premise: no full-text tier can reach inside the run"
         );
         let results = store
-            .substring_search(terms.words(), 5)
+            .substring_search(terms.words(), &MemoryFilter::default(), 5)
             .await
             .expect("scan");
         assert_eq!(
@@ -2392,7 +2750,7 @@ mod tests {
         assert_eq!(
             names(
                 &store
-                    .search(terms.match_expression(), 5)
+                    .search(terms.match_expression(), &MemoryFilter::default(), 5)
                     .await
                     .expect("search")
             ),
@@ -2407,7 +2765,8 @@ mod tests {
                 .write_body(
                     "note",
                     before.body.as_deref().unwrap_or_default(),
-                    "kazoo".to_string()
+                    "kazoo".to_string(),
+                    false,
                 )
                 .await
                 .expect("body"),
@@ -2416,7 +2775,7 @@ mod tests {
         store.integrity_check().await.expect("after an edit");
         assert!(
             store
-                .search(terms.match_expression(), 5)
+                .search(terms.match_expression(), &MemoryFilter::default(), 5)
                 .await
                 .expect("search")
                 .hits
@@ -2427,7 +2786,7 @@ mod tests {
         assert_eq!(
             names(
                 &store
-                    .search(terms.match_expression(), 5)
+                    .search(terms.match_expression(), &MemoryFilter::default(), 5)
                     .await
                     .expect("search")
             ),
@@ -2451,6 +2810,7 @@ mod tests {
                 tags: None,
                 body: None,
                 priority: Some(0),
+                ..WriteRequest::default()
             })
             .await
             .expect("concurrent write");
@@ -2462,7 +2822,8 @@ mod tests {
                 .write_body(
                     &read_before.name,
                     read_before.body.as_deref().unwrap_or_default(),
-                    "line A\nline B".to_string()
+                    "line A\nline B".to_string(),
+                    false,
                 )
                 .await
                 .expect("body"),
@@ -2482,7 +2843,7 @@ mod tests {
         assert_eq!(after.priority, 0, "nor a priority");
         assert_eq!(
             store
-                .write_body("gone", "", String::new())
+                .write_body("gone", "", String::new(), false)
                 .await
                 .expect("absent"),
             BodyWrite::Gone,
@@ -2510,6 +2871,7 @@ mod tests {
                 tags: None,
                 body: Some("WHAT THE AGENT LEARNED".to_string()),
                 priority: None,
+                ..WriteRequest::default()
             })
             .await
             .expect("the agent writes mid-edit");
@@ -2519,7 +2881,8 @@ mod tests {
                 .write_body(
                     &read_before.name,
                     read_before.body.as_deref().unwrap_or_default(),
-                    "ORIGINAL, edited by the human".to_string()
+                    "ORIGINAL, edited by the human".to_string(),
+                    false,
                 )
                 .await
                 .expect("write_body"),
@@ -2558,7 +2921,7 @@ mod tests {
         .await;
         let terms = Terms::parse(&["kubernetes".to_string()]);
         let results = store
-            .search(terms.match_expression(), 5)
+            .search(terms.match_expression(), &MemoryFilter::default(), 5)
             .await
             .expect("search");
         assert_eq!(
@@ -2579,6 +2942,7 @@ mod tests {
                 tags: Some(Vec::new()),
                 body: Some(String::new()),
                 priority: None,
+                ..WriteRequest::default()
             })
             .await
             .expect("clear");
@@ -2641,6 +3005,8 @@ mod tests {
                 tags: None,
                 body: Some(body.to_string()),
                 priority: Some(0),
+                load: Some(crate::memory::Load::Inline),
+                ..WriteRequest::default()
             })
             .await
             .expect("write");
@@ -2814,7 +3180,7 @@ mod tests {
         // is the whole reason this is an FTS index rather than a scan.
         let terms = Terms::parse(&["preference".to_string()]);
         let results = store
-            .search(terms.match_expression(), 10)
+            .search(terms.match_expression(), &MemoryFilter::default(), 10)
             .await
             .expect("search");
         assert_eq!(names(&results), ["alice-timezone"], "{results:?}");
@@ -2823,7 +3189,7 @@ mod tests {
         // A term only in a body still lands, weighted below one in a description.
         let terms = Terms::parse(&["hostname".to_string()]);
         let results = store
-            .search(terms.match_expression(), 10)
+            .search(terms.match_expression(), &MemoryFilter::default(), 10)
             .await
             .expect("search");
         assert_eq!(names(&results), ["deploy-host"]);
@@ -2847,7 +3213,7 @@ mod tests {
         ] {
             let terms = Terms::parse(&[query.to_string()]);
             let hits = store
-                .search(terms.match_expression(), 10)
+                .search(terms.match_expression(), &MemoryFilter::default(), 10)
                 .await
                 .unwrap_or_else(|error| panic!("{query:?} must not error: {error}"))
                 .hits;
@@ -2879,11 +3245,11 @@ mod tests {
         );
         // Both tiers answer rather than erroring, which is the whole claim.
         store
-            .search(terms.match_expression(), 5)
+            .search(terms.match_expression(), &MemoryFilter::default(), 5)
             .await
             .expect("a long query must not fail the full-text tier");
         store
-            .substring_search(terms.words(), 5)
+            .substring_search(terms.words(), &MemoryFilter::default(), 5)
             .await
             .expect("nor the literal scan");
     }
@@ -2948,7 +3314,7 @@ mod tests {
         let store = store_with(&[("office", 5, "办公室位置", &body)]).await;
 
         let hits = store
-            .substring_search(&["深圳".to_string()], 5)
+            .substring_search(&["深圳".to_string()], &MemoryFilter::default(), 5)
             .await
             .expect("scan")
             .hits;
@@ -2967,7 +3333,7 @@ mod tests {
         let ascii = format!("{}NEEDLE-HERE", "padding. ".repeat(120));
         let store = store_with(&[("notes", 5, "d", &ascii)]).await;
         let hits = store
-            .substring_search(&["needle-here".to_string()], 5)
+            .substring_search(&["needle-here".to_string()], &MemoryFilter::default(), 5)
             .await
             .expect("scan")
             .hits;
@@ -2983,7 +3349,7 @@ mod tests {
         // opening is the honest answer rather than an empty string.
         let store = store_with(&[("policy", 5, "the retention window", "body text")]).await;
         let hits = store
-            .substring_search(&["retention".to_string()], 5)
+            .substring_search(&["retention".to_string()], &MemoryFilter::default(), 5)
             .await
             .expect("scan")
             .hits;
@@ -3000,7 +3366,7 @@ mod tests {
         let terms = Terms::parse(&["深圳".to_string()]);
         assert!(
             store
-                .search(terms.match_expression(), 5)
+                .search(terms.match_expression(), &MemoryFilter::default(), 5)
                 .await
                 .expect("search")
                 .hits
@@ -3010,7 +3376,7 @@ mod tests {
         assert_eq!(
             names(
                 &store
-                    .substring_search(terms.words(), 5)
+                    .substring_search(terms.words(), &MemoryFilter::default(), 5)
                     .await
                     .expect("scan")
             ),
@@ -3020,7 +3386,7 @@ mod tests {
         // A term holding a `LIKE` wildcard means itself, not everything.
         assert!(
             store
-                .substring_search(&["%".to_string()], 5)
+                .substring_search(&["%".to_string()], &MemoryFilter::default(), 5)
                 .await
                 .expect("scan")
                 .hits
@@ -3045,7 +3411,7 @@ mod tests {
         }
         let terms = Terms::parse(&["deployment".to_string()]);
         let results = store
-            .search(terms.match_expression(), 10)
+            .search(terms.match_expression(), &MemoryFilter::default(), 10)
             .await
             .expect("search");
         assert_eq!(names(&results), ["read-often", "never-read"], "{results:?}");
@@ -3079,7 +3445,7 @@ mod tests {
 
         let terms = Terms::parse(&["deployment".to_string()]);
         let results = store
-            .search(terms.match_expression(), 10)
+            .search(terms.match_expression(), &MemoryFilter::default(), 10)
             .await
             .expect("search");
         assert_eq!(results.hits[0].name, "standing", "{results:?}");
@@ -3087,7 +3453,7 @@ mod tests {
         // And `limit` cuts after the re-rank, so asking for one gets the important one rather than
         // whichever BM25 happened to list first.
         let results = store
-            .search(terms.match_expression(), 1)
+            .search(terms.match_expression(), &MemoryFilter::default(), 1)
             .await
             .expect("search");
         assert_eq!(names(&results), ["standing"]);
@@ -3105,7 +3471,7 @@ mod tests {
         assert!(store.get("anything").await.expect("get").is_none());
         assert!(
             store
-                .search("\"anything\"".to_string(), 5)
+                .search("\"anything\"".to_string(), &MemoryFilter::default(), 5)
                 .await
                 .expect("search")
                 .hits
@@ -3175,7 +3541,7 @@ mod tests {
         let started = std::time::Instant::now();
         let terms = Terms::parse(&["xylophone".to_string()]);
         let results = store
-            .search(terms.match_expression(), 10)
+            .search(terms.match_expression(), &MemoryFilter::default(), 10)
             .await
             .expect("search");
         let search_elapsed = started.elapsed();
@@ -3233,6 +3599,360 @@ mod tests {
                 "memories_after_update"
             ],
             "only this build's triggers remain"
+        );
+    }
+
+    /// Every new field keeps its stored value when a write omits it, so a reword cannot cost a
+    /// note its load, its dependencies, its source or its expiry; the explicit empties clear.
+    #[tokio::test]
+    async fn omitting_a_new_field_keeps_it_and_the_explicit_empty_clears_it() {
+        let store = MemoryStore::for_test().await.expect("store");
+        let expires = SystemTime::now() + Duration::from_secs(30 * 86_400);
+        let written = store
+            .write(WriteRequest {
+                name: "note".to_string(),
+                description: Some("a fact".to_string()),
+                load: Some(crate::memory::Load::Search),
+                references: Some(vec!["alice-timezone".to_string(), "/srv/x".to_string()]),
+                source: Some("alice, in chat".to_string()),
+                expires_at: Some(Some(expires)),
+                ..WriteRequest::default()
+            })
+            .await
+            .expect("create");
+        assert_eq!(written.load, crate::memory::Load::Search);
+        assert_eq!(written.references, ["alice-timezone", "/srv/x"]);
+        assert_eq!(written.source, "alice, in chat");
+        assert_eq!(
+            written.expires_at.map(crate::memory::render_stamp),
+            Some(crate::memory::render_stamp(expires))
+        );
+        assert_eq!(written.verified_at, written.created_at);
+
+        let reworded = store
+            .write(WriteRequest {
+                name: "note".to_string(),
+                description: Some("the fact, reworded".to_string()),
+                ..WriteRequest::default()
+            })
+            .await
+            .expect("reword");
+        assert_eq!(reworded.load, crate::memory::Load::Search);
+        assert_eq!(reworded.references, ["alice-timezone", "/srv/x"]);
+        assert_eq!(reworded.source, "alice, in chat");
+        assert_eq!(reworded.expires_at, written.expires_at);
+
+        let cleared = store
+            .write(WriteRequest {
+                name: "note".to_string(),
+                load: Some(crate::memory::Load::Index),
+                references: Some(Vec::new()),
+                source: Some(String::new()),
+                expires_at: Some(None),
+                ..WriteRequest::default()
+            })
+            .await
+            .expect("clear");
+        assert_eq!(cleared.load, crate::memory::Load::Index);
+        assert!(cleared.references.is_empty());
+        assert!(cleared.source.is_empty());
+        assert!(cleared.expires_at.is_none());
+    }
+
+    /// `verified_at` is the row's own stamp when the row is created and moves on `verified` and
+    /// on nothing else: a body rewrite, a reword and a retag all leave it where it was.
+    #[tokio::test]
+    async fn only_a_verification_moves_the_verification_stamp() {
+        let store = MemoryStore::for_test().await.expect("store");
+        let created = store
+            .write(full("note", 5, "a fact", "the detail"))
+            .await
+            .expect("create");
+        assert_eq!(created.verified_at, created.created_at);
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let rewritten = store
+            .write(WriteRequest {
+                name: "note".to_string(),
+                description: Some("a fact, reworded".to_string()),
+                body: Some("new detail".to_string()),
+                tags: Some(vec!["infra".to_string()]),
+                priority: Some(2),
+                ..WriteRequest::default()
+            })
+            .await
+            .expect("rewrite");
+        assert_eq!(
+            rewritten.verified_at, created.verified_at,
+            "a rewrite is not a verification"
+        );
+        assert!(rewritten.updated_at > created.updated_at);
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let verified = store
+            .write(WriteRequest {
+                name: "note".to_string(),
+                verified: true,
+                ..WriteRequest::default()
+            })
+            .await
+            .expect("verify");
+        assert!(verified.verified_at > created.verified_at);
+        assert_eq!(verified.verified_at, verified.updated_at);
+        assert_eq!(verified.body.as_deref(), Some("new detail"));
+        assert_eq!(verified.created_at, created.created_at);
+    }
+
+    /// The filter's three questions select the same rows at the listing, the filter-only
+    /// results, the backlink query and both search tiers.
+    #[tokio::test]
+    async fn a_filter_selects_by_reference_verification_and_expiry() {
+        let store = MemoryStore::for_test().await.expect("store");
+        let past = SystemTime::now() - Duration::from_secs(86_400);
+        for (name, references, expires, body) in [
+            (
+                "a",
+                vec!["Alice-Timezone".to_string(), "/srv/x".to_string()],
+                None,
+                "deploy from 深圳",
+            ),
+            (
+                "b",
+                vec!["alice-timezone".to_string()],
+                None,
+                "deploy from home",
+            ),
+            ("c", Vec::new(), Some(Some(past)), "deploy from 深圳 too"),
+        ] {
+            store
+                .write(WriteRequest {
+                    name: name.to_string(),
+                    description: Some(format!("note {name}")),
+                    body: Some(body.to_string()),
+                    references: Some(references),
+                    expires_at: expires,
+                    ..WriteRequest::default()
+                })
+                .await
+                .expect("write");
+        }
+        // A row verified long ago, which no write door can produce today.
+        store
+            .plant_row_for_test("old", "note old")
+            .await
+            .expect("planted");
+
+        let listed = |memories: Vec<Memory>| -> Vec<String> {
+            memories.into_iter().map(|memory| memory.name).collect()
+        };
+        let referencing = |target: &str| MemoryFilter {
+            referencing: Some(target.to_string()),
+            ..MemoryFilter::default()
+        };
+        // Index order: newest first within the band.
+        assert_eq!(
+            listed(
+                store
+                    .list(&referencing("ALICE-timezone"))
+                    .await
+                    .expect("list")
+            ),
+            ["b", "a"]
+        );
+        assert_eq!(
+            listed(store.list(&referencing("/srv/x")).await.expect("list")),
+            ["a"]
+        );
+        assert_eq!(
+            store
+                .referenced_by("alice-timezone")
+                .await
+                .expect("backlinks"),
+            [
+                ("b".to_string(), "note b".to_string()),
+                ("a".to_string(), "note a".to_string())
+            ]
+        );
+        let expired = MemoryFilter {
+            expired: true,
+            ..MemoryFilter::default()
+        };
+        assert_eq!(listed(store.list(&expired).await.expect("list")), ["c"]);
+        let stale = MemoryFilter {
+            unverified_for: Some(Duration::from_secs(30 * 86_400)),
+            ..MemoryFilter::default()
+        };
+        assert_eq!(listed(store.list(&stale).await.expect("list")), ["old"]);
+        assert_eq!(
+            listed(store.list(&MemoryFilter::default()).await.expect("list")),
+            ["c", "b", "a", "old"]
+        );
+
+        let only_expired = store.filtered(&expired, 10).await.expect("filtered");
+        assert_eq!(names(&only_expired), ["c"]);
+        assert_eq!(only_expired.matched, 1);
+        assert_eq!(only_expired.hits[0].body, "deploy from 深圳 too");
+
+        let words = Terms::parse(&["deploy".to_string()]);
+        let by_words = store
+            .search(words.match_expression(), &referencing("alice-timezone"), 10)
+            .await
+            .expect("search");
+        let mut by_words = names(&by_words);
+        by_words.sort_unstable();
+        assert_eq!(by_words, ["a", "b"]);
+        let by_scan = store
+            .substring_search(&["深圳".to_string()], &expired, 10)
+            .await
+            .expect("scan");
+        assert_eq!(names(&by_scan), ["c"]);
+        let found = store
+            .find(&["deploy".to_string()], &expired, 10)
+            .await
+            .expect("find")
+            .expect("words");
+        assert_eq!(names(&found.results), ["c"]);
+
+        // Two and three filters at once, at every door that binds them after its own
+        // parameters: the clause numbers each placeholder from where the statement left off.
+        let referencing_and_expired = MemoryFilter {
+            referencing: Some("alice-timezone".to_string()),
+            expired: true,
+            ..MemoryFilter::default()
+        };
+        assert!(
+            listed(store.list(&referencing_and_expired).await.expect("list")).is_empty(),
+            "a and b reference the target but have not expired"
+        );
+        let all_three = MemoryFilter {
+            referencing: Some("alice-timezone".to_string()),
+            unverified_for: Some(Duration::from_secs(1)),
+            expired: false,
+        };
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert_eq!(listed(store.list(&all_three).await.expect("list")), [
+            "b", "a"
+        ]);
+        let by_words = store
+            .search(words.match_expression(), &all_three, 10)
+            .await
+            .expect("search");
+        let mut by_words = names(&by_words);
+        by_words.sort_unstable();
+        assert_eq!(by_words, ["a", "b"]);
+        let by_scan = store
+            .substring_search(&["deploy".to_string()], &all_three, 10)
+            .await
+            .expect("scan");
+        let mut by_scan = names(&by_scan);
+        by_scan.sort_unstable();
+        assert_eq!(by_scan, ["a", "b"]);
+        let by_scan_expired = store
+            .substring_search(&["深圳".to_string()], &referencing_and_expired, 10)
+            .await
+            .expect("scan");
+        assert!(names(&by_scan_expired).is_empty());
+    }
+
+    /// The index carries a body for an inline memory whatever its priority, and none for a
+    /// priority-0 memory that is merely listed: the band follows `load`, not the number.
+    #[tokio::test]
+    async fn the_index_inlines_by_load_not_priority() {
+        let store = MemoryStore::for_test().await.expect("store");
+        for (name, priority, load) in [
+            ("listed-rule", 0, crate::memory::Load::Index),
+            ("inlined-note", 5, crate::memory::Load::Inline),
+            ("searched", 0, crate::memory::Load::Search),
+        ] {
+            store
+                .write(WriteRequest {
+                    name: name.to_string(),
+                    description: Some(name.to_string()),
+                    body: Some(format!("body of {name}")),
+                    priority: Some(priority),
+                    load: Some(load),
+                    ..WriteRequest::default()
+                })
+                .await
+                .expect("write");
+        }
+        let index = store.index().await.expect("index");
+        let body_of = |name: &str| {
+            index
+                .iter()
+                .find(|memory| memory.name == name)
+                .expect("listed")
+                .body
+                .clone()
+        };
+        assert_eq!(body_of("listed-rule"), None);
+        assert_eq!(
+            body_of("inlined-note").as_deref(),
+            Some("body of inlined-note")
+        );
+        assert_eq!(body_of("searched"), None);
+    }
+
+    /// A stored reference is kept as written or dropped whole, never trimmed into a different
+    /// pointer, and a column that is not a JSON array of strings reads as no references at all.
+    #[tokio::test]
+    async fn a_planted_reference_list_is_read_by_the_write_door_s_rule() {
+        let store = MemoryStore::for_test().await.expect("store");
+        store
+            .write(full("note", 5, "a note", "body"))
+            .await
+            .expect("write");
+        store
+            .plant_references_for_test(
+                "note",
+                "[\"kept\", \"two\\nlines\", 7, \"\", \"also-kept\"]",
+            )
+            .await
+            .expect("planted");
+        let read = store.get("note").await.expect("get").expect("row");
+        assert_eq!(read.references, ["kept", "also-kept"]);
+        store
+            .plant_references_for_test("note", "{\"not\": \"a list\"}")
+            .await
+            .expect("planted");
+        let read = store.get("note").await.expect("get").expect("row");
+        assert!(read.references.is_empty(), "{:?}", read.references);
+    }
+
+    /// Freshness decays from the verification, not the creation, so verifying an old note lifts
+    /// it in the ranking without a rewrite.
+    #[tokio::test]
+    async fn verifying_a_memory_makes_it_fresh_for_ranking() {
+        let store = MemoryStore::for_test().await.expect("store");
+        store
+            .plant_row_for_test("old", "the deploy host moved")
+            .await
+            .expect("planted");
+        let terms = Terms::parse(&["deploy host".to_string()]);
+        let score = |results: SearchResults| results.hits[0].score;
+        let before = score(
+            store
+                .search(terms.match_expression(), &MemoryFilter::default(), 5)
+                .await
+                .expect("search"),
+        );
+        store
+            .write(WriteRequest {
+                name: "old".to_string(),
+                verified: true,
+                ..WriteRequest::default()
+            })
+            .await
+            .expect("verify");
+        let after = score(
+            store
+                .search(terms.match_expression(), &MemoryFilter::default(), 5)
+                .await
+                .expect("search"),
+        );
+        assert!(
+            after > before,
+            "a verified note ranks fresher: {before} before, {after} after"
         );
     }
 }
