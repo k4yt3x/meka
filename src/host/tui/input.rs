@@ -772,7 +772,7 @@ impl Composer {
             return;
         }
         walk.index -= 1;
-        let text = walk.entries[walk.index].clone();
+        let text = walk.entries.get(walk.index).cloned().unwrap_or_default();
         self.set_text(&text);
     }
 
@@ -788,7 +788,7 @@ impl Composer {
         let text = if walk.index == walk.entries.len() {
             std::mem::take(&mut walk.draft)
         } else {
-            walk.entries[walk.index].clone()
+            walk.entries.get(walk.index).cloned().unwrap_or_default()
         };
         let finished = walk.index == walk.entries.len();
         self.set_text(&text);

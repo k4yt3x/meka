@@ -1058,7 +1058,7 @@ pub(crate) async fn run_shell_probe(
                     break;
                 }
                 let room = GATE_OUTPUT_LIMIT.saturating_sub(kept.len());
-                kept.extend_from_slice(&chunk[..read.min(room)]);
+                kept.extend(chunk.iter().take(read.min(room)));
             }
         }
         Ok::<_, std::io::Error>(kept)

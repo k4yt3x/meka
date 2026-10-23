@@ -368,7 +368,7 @@ impl Transcript {
     /// positions move when a reload keeps only part of it.
     pub(crate) fn push(&mut self, item: Item) -> u64 {
         let index = self.push_entry(item);
-        let id = self.tail[index].id;
+        let id = self.tail.get(index).map_or(0, |entry| entry.id);
         self.flush_turn_end();
         id
     }
@@ -658,11 +658,15 @@ impl Transcript {
     /// Mark the prompt items the loop has read.
     pub(crate) fn mark_delivered(&mut self, ids: &[Uuid]) {
         for index in 0..self.tail.len() {
-            if let Item::Prompt {
-                inbox_id: Some(id),
-                delivered,
+            if let Some(Entry {
+                item:
+                    Item::Prompt {
+                        inbox_id: Some(id),
+                        delivered,
+                        ..
+                    },
                 ..
-            } = &mut self.tail[index].item
+            }) = self.tail.get_mut(index)
                 && ids.contains(id)
                 && !*delivered
             {
@@ -1372,13 +1376,17 @@ impl Transcript {
                         });
                         match index {
                             Some(index) if index < out.len() => {
-                                if let Item::ToolCall {
-                                    state,
-                                    result,
-                                    result_images,
-                                    change,
+                                if let Some(Entry {
+                                    item:
+                                        Item::ToolCall {
+                                            state,
+                                            result,
+                                            result_images,
+                                            change,
+                                            ..
+                                        },
                                     ..
-                                } = &mut out[index].item
+                                }) = out.get_mut(index)
                                 {
                                     *result = Some(text);
                                     *result_images = images;

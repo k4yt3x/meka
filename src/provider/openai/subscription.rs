@@ -163,8 +163,13 @@ impl ChatGptSubscriptionProvider {
         // on it, so one conversation's requests reach the machine holding its cached prefix.
         // Measured without it, the cache answered one request in four of a conversation whose
         // prefix never changed.
-        if let Some(session_id) = attribution.session_id {
-            body["prompt_cache_key"] = serde_json::Value::String(session_id.to_string());
+        if let Some(session_id) = attribution.session_id
+            && let Some(fields) = body.as_object_mut()
+        {
+            fields.insert(
+                "prompt_cache_key".into(),
+                serde_json::Value::String(session_id.to_string()),
+            );
         }
         body
     }

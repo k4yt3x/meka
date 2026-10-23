@@ -455,15 +455,15 @@ pub(super) fn convert_messages_to_claude_content(
                                 .collect();
                             // `is_error` is the API's optional flag with false as its default, and
                             // Claude Code writes it only on a failure; a success carries no key.
-                            let mut block = serde_json::json!({
-                                "type": "tool_result",
-                                "tool_use_id": tool_use_id,
-                                "content": content,
-                            });
+                            let mut block = serde_json::Map::from_iter([
+                                ("type".into(), serde_json::json!("tool_result")),
+                                ("tool_use_id".into(), serde_json::json!(tool_use_id)),
+                                ("content".into(), serde_json::json!(content)),
+                            ]);
                             if *is_error {
-                                block["is_error"] = serde_json::Value::Bool(true);
+                                block.insert("is_error".into(), serde_json::Value::Bool(true));
                             }
-                            block
+                            serde_json::Value::Object(block)
                         }
                         // Only a block Claude signed goes back to Claude: the API makes
                         // `signature` required and rejects the whole request without one. A block

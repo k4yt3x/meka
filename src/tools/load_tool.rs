@@ -545,7 +545,7 @@ fn render_search(
     let shown = matches.len().min(TOOL_SEARCH_MAX_RESULTS);
     let mut out = format!("Tools matching '{query}':\n");
     let mut matched_deferred = Vec::new();
-    for found in &matches[..shown] {
+    for found in matches.iter().take(shown) {
         let name = &found.definition.name;
         if deferred.contains(name) {
             matched_deferred.push(name.clone());

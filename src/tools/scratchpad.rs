@@ -319,18 +319,9 @@ impl Tool for ScratchpadWriteTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let name = input["name"]
-            .as_str()
-            .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "scratchpad_write".to_string(),
-                message: "missing 'name' parameter".to_string(),
-            })?;
-        let content = input["content"]
-            .as_str()
-            .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "scratchpad_write".to_string(),
-                message: "missing 'content' parameter".to_string(),
-            })?;
+        let name = &super::util::require_str_allowing_empty(&input, "name", "scratchpad_write")?;
+        let content =
+            &super::util::require_str_allowing_empty(&input, "content", "scratchpad_write")?;
 
         if is_inherited(&self.inherited_names, name) {
             return inherited_write_error(name);
@@ -422,12 +413,7 @@ impl Tool for ScratchpadReadTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let name = input["name"]
-            .as_str()
-            .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "scratchpad_read".to_string(),
-                message: "missing 'name' parameter".to_string(),
-            })?;
+        let name = &super::util::require_str_allowing_empty(&input, "name", "scratchpad_read")?;
         // Parsed ahead of the load and of the regex path, as `file_read` parses it ahead of its
         // I/O, so a malformed range is refused the same way whichever tool and mode it came with.
         let range = line_range(&input, "scratchpad_read")?.unwrap_or(LineRange::WHOLE);
@@ -616,12 +602,7 @@ impl Tool for ScratchpadEditTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let name = input["name"]
-            .as_str()
-            .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "scratchpad_edit".to_string(),
-                message: "missing 'name' parameter".to_string(),
-            })?;
+        let name = &super::util::require_str_allowing_empty(&input, "name", "scratchpad_edit")?;
 
         if is_inherited(&self.inherited_names, name) {
             return inherited_write_error(name);
@@ -670,7 +651,10 @@ impl Tool for ScratchpadEditTool {
                 tool_name: "scratchpad_edit".to_string(),
                 message: "missing 'new_string' parameter".to_string(),
             })?;
-        let replace_all = input["replace_all"].as_bool().unwrap_or(false);
+        let replace_all = input
+            .get("replace_all")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         let existing = self
             .store
@@ -854,12 +838,8 @@ impl Tool for ScratchpadMergeTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let target = input["target"]
-            .as_str()
-            .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "scratchpad_merge".to_string(),
-                message: "missing 'target' parameter".to_string(),
-            })?;
+        let target =
+            &super::util::require_str_allowing_empty(&input, "target", "scratchpad_merge")?;
 
         if is_inherited(&self.inherited_names, target) {
             return inherited_write_error(target);
@@ -1033,12 +1013,7 @@ impl Tool for ScratchpadDeleteTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let name = input["name"]
-            .as_str()
-            .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "scratchpad_delete".to_string(),
-                message: "missing 'name' parameter".to_string(),
-            })?;
+        let name = &super::util::require_str_allowing_empty(&input, "name", "scratchpad_delete")?;
 
         if is_inherited(&self.inherited_names, name) {
             return inherited_write_error(name);
@@ -1106,18 +1081,8 @@ impl Tool for ScratchpadRenameTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let old = input["old"]
-            .as_str()
-            .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "scratchpad_rename".to_string(),
-                message: "missing 'old' parameter".to_string(),
-            })?;
-        let new = input["new"]
-            .as_str()
-            .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "scratchpad_rename".to_string(),
-                message: "missing 'new' parameter".to_string(),
-            })?;
+        let old = &super::util::require_str_allowing_empty(&input, "old", "scratchpad_rename")?;
+        let new = &super::util::require_str_allowing_empty(&input, "new", "scratchpad_rename")?;
 
         // Block both ends. Renaming away from an inherited source would be a no-op against the
         // parent's row but implies the sub-agent owns the name; renaming to an inherited target
@@ -1212,19 +1177,9 @@ impl Tool for ScratchpadLoadFileTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let path = input["path"]
-            .as_str()
-            .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "scratchpad_load_file".to_string(),
-                message: "missing 'path' parameter".to_string(),
-            })?
-            .to_string();
-        let name = input["name"]
-            .as_str()
-            .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "scratchpad_load_file".to_string(),
-                message: "missing 'name' parameter".to_string(),
-            })?;
+        let path = super::util::require_str_allowing_empty(&input, "path", "scratchpad_load_file")?;
+        let name =
+            &super::util::require_str_allowing_empty(&input, "name", "scratchpad_load_file")?;
 
         if is_inherited(&self.inherited_names, name) {
             return inherited_write_error(name);
@@ -1347,19 +1302,9 @@ impl Tool for ScratchpadSaveFileTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let name = input["name"]
-            .as_str()
-            .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "scratchpad_save_file".to_string(),
-                message: "missing 'name' parameter".to_string(),
-            })?;
-        let path = input["path"]
-            .as_str()
-            .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "scratchpad_save_file".to_string(),
-                message: "missing 'path' parameter".to_string(),
-            })?
-            .to_string();
+        let name =
+            &super::util::require_str_allowing_empty(&input, "name", "scratchpad_save_file")?;
+        let path = super::util::require_str_allowing_empty(&input, "path", "scratchpad_save_file")?;
 
         let session_id = resolve_session_id(&self.site.session_id, "scratchpad_save_file")?;
 

@@ -596,8 +596,9 @@ impl Viewport {
             self.scroll = bottom;
         } else if let Some((id, offset)) = self.anchor
             && let Some(position) = ids.iter().position(|&held| held == id)
+            && let Some(&(start, _)) = self.layout.get(position)
         {
-            let start = self.layout[position].0 as isize;
+            let start = start as isize;
             self.scroll = ((start + offset).max(0) as usize).min(bottom);
         } else {
             self.scroll = self.scroll.min(bottom);
@@ -647,9 +648,9 @@ impl Viewport {
             }
             let picked = self.cursor == Some(index);
             let hovered = lit == Some(index);
-            let lines = self
-                .cache
-                .get(&ids[index])
+            let lines = ids
+                .get(index)
+                .and_then(|id| self.cache.get(id))
                 .map(|cached| cached.lines.as_slice())
                 .unwrap_or_default();
             for (offset, line) in lines.iter().enumerate() {
@@ -943,7 +944,10 @@ pub(crate) fn working_line(
     let glyph = if activity.is_waiting() {
         draw::ACT_GLYPH
     } else {
-        SPINNER[frame % SPINNER.len()]
+        SPINNER
+            .get(frame % SPINNER.len())
+            .copied()
+            .unwrap_or_default()
     };
     let mut spans = vec![Span::styled(
         format!("{glyph:<TEXT_EDGE$}"),

@@ -922,7 +922,7 @@ async fn accept_http_callback(
                 }
                 Ok(Err(error)) => return Err(format!("failed to read request: {error}")),
                 Ok(Ok(0)) => break buffer.windows(CRLF_CRLF.len()).any(|w| w == CRLF_CRLF),
-                Ok(Ok(n)) => buffer.extend_from_slice(&temp[..n]),
+                Ok(Ok(n)) => buffer.extend(temp.iter().take(n)),
             }
         };
 

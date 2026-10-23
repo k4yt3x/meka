@@ -551,7 +551,7 @@ fn forward_child_stderr(server_name: String, stderr: tokio::process::ChildStderr
                     break;
                 }
             };
-            for &byte in &buffer[..read] {
+            for &byte in buffer.iter().take(read) {
                 if byte == b'\n' {
                     emit(&server_name, &line, overlong);
                     line.clear();

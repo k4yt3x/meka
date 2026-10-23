@@ -3090,6 +3090,10 @@ fn report_in_context_0_76(context: &str) -> Option<(String, String)> {
 /// block meka wrote on another's behalf becomes its own kind, and a context block carrying a
 /// report has the report moved out behind it. A block already typed matches nothing, so a replay
 /// changes nothing.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "a shipped step's text is frozen by the ledger digest; its indexes are bounded in place"
+)]
 fn type_user_blocks_0_76(
     blocks: &mut Vec<serde_json::Value>,
     resolve: &mut IdResolver<'_>,
@@ -4057,6 +4061,10 @@ fn tool_calls_take_their_class_first_names(
 /// and the scheduler withholds a job whose gate names no tool; left alone, every such job would
 /// stop firing on the first launch after the rename. The spec is one JSON value with the probe
 /// under `tool`, as `GateProbe` serializes it; only the name is touched.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "a shipped step's text is frozen by the ledger digest; its indexes are bounded in place"
+)]
 fn gate_tools_take_their_class_first_names(
     transaction: &rusqlite::Transaction<'_>,
 ) -> rusqlite::Result<()> {

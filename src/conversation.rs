@@ -713,7 +713,10 @@ pub(crate) fn materialize_annotated<Stamp: Clone>(
         let index = match placed.source {
             Source::Append(index) | Source::Boundary(index) | Source::Repair(index) => index,
         };
-        stamps.push(events[index].0.clone());
+        let Some((stamp, _)) = events.get(index) else {
+            continue;
+        };
+        stamps.push(stamp.clone());
         markers.push(placed.marker);
         messages.push(placed.message);
     }
@@ -903,8 +906,8 @@ fn orphan_event_indices(events: &[Event]) -> Vec<usize> {
         .collect();
 
     let mut orphan = Vec::new();
-    for window_index in 0..pairs.len() {
-        let (Some(event_index), message) = pairs[window_index] else {
+    for (window_index, pair) in pairs.iter().enumerate() {
+        let &(Some(event_index), message) = pair else {
             continue;
         };
         if message.role != Role::Assistant {

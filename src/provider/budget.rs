@@ -71,7 +71,7 @@ pub(super) fn redact_oldest_images(
     let last = total - 1;
     let mut stats = RedactionStats::default();
 
-    'outer: for (index, message) in redacted[..last].iter_mut().enumerate() {
+    'outer: for (index, message) in redacted.iter_mut().take(last).enumerate() {
         let from_end = total - index;
         for (block_index, block) in message.content.iter_mut().enumerate() {
             match block {

@@ -1859,7 +1859,7 @@ where
         // Fast path: any byte that is not the start of a `${…}` opener is copied verbatim by
         // reading the next UTF-8 scalar and pushing the whole codepoint. Byte-level `as char` would
         // mangle multi-byte sequences (e.g. `café` → `cafÃ©`).
-        if bytes[i] != b'$' || i + 1 >= bytes.len() || bytes[i + 1] != b'{' {
+        if bytes.get(i) != Some(&b'$') || bytes.get(i + 1) != Some(&b'{') {
             // `i` is always on a char boundary: it advances by `ch.len_utf8()` or to the byte
             // after an ASCII `}`.
             let rest = &input[i..];
@@ -1874,7 +1874,7 @@ where
         }
         // Find matching `}`.
         let start = i + 2;
-        let Some(end_offset) = bytes[start..].iter().position(|&b| b == b'}') else {
+        let Some(end_offset) = bytes.iter().skip(start).position(|&b| b == b'}') else {
             // Unterminated `${`: emit verbatim and stop scanning.
             expansion.malformed.push(input[i..].to_string());
             expansion.text.push_str(&input[i..]);

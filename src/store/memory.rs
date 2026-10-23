@@ -169,7 +169,9 @@ fn find_ignoring_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
     }
     (0..=hay.len() - need.len()).find(|&start| {
         haystack.is_char_boundary(start)
-            && hay[start..start + need.len()].eq_ignore_ascii_case(need)
+            && hay
+                .get(start..start + need.len())
+                .is_some_and(|window| window.eq_ignore_ascii_case(need))
     })
 }
 

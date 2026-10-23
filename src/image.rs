@@ -380,7 +380,9 @@ pub(crate) fn classify_base64_prefix(data: &str) -> ImageHandling {
         .filter(|byte| !byte.is_ascii_whitespace())
         .take(SNIFF_PREFIX_CHARS)
         .collect();
-    let aligned = &prefix[..prefix.len() - prefix.len() % 4];
+    let aligned = prefix
+        .get(..prefix.len() - prefix.len() % 4)
+        .unwrap_or_default();
     match base64::engine::general_purpose::STANDARD.decode(aligned) {
         Ok(bytes) => classify_bytes(&bytes),
         Err(_) => ImageHandling::Unsupported,

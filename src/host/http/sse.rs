@@ -271,13 +271,23 @@ pub(crate) fn translate(
             input,
             display_summary,
         } => {
-            let mut data = serde_json::json!({ "id": id, "name": name, "input": input });
+            let mut data = serde_json::Map::from_iter([
+                ("id".into(), serde_json::json!(id)),
+                ("name".into(), serde_json::json!(name)),
+                ("input".into(), serde_json::json!(input)),
+            ]);
             // Omitted, not `null`, when the tool has no label: the rule every optional field on
             // this API follows, and `json!` would write the `None` out.
             if let Some(display_summary) = display_summary {
-                data["display_summary"] = serde_json::Value::String(display_summary);
+                data.insert(
+                    "display_summary".into(),
+                    serde_json::Value::String(display_summary),
+                );
             }
-            (SseEventType::ToolCallExecuting, data)
+            (
+                SseEventType::ToolCallExecuting,
+                serde_json::Value::Object(data),
+            )
         }
         FrontendEvent::ToolCallCompleted {
             id,
@@ -286,11 +296,14 @@ pub(crate) fn translate(
             metadata,
             ..
         } => {
-            let mut data = serde_json::json!({
-                "id": id,
-                "is_error": is_error,
-                "content": tool_result_content_view(&content),
-            });
+            let mut data = serde_json::Map::from_iter([
+                ("id".into(), serde_json::json!(id)),
+                ("is_error".into(), serde_json::json!(is_error)),
+                (
+                    "content".into(),
+                    serde_json::json!(tool_result_content_view(&content)),
+                ),
+            ]);
             // Omitted, not `null`, for a call that changed nothing, like every optional field.
             if let Some(crate::frontend::ToolOutputMetadata::Diff {
                 path,
@@ -298,13 +311,19 @@ pub(crate) fn translate(
                 new_text,
             }) = metadata
             {
-                data["change"] = serde_json::json!(ChangeView {
-                    path: path.map(|path| path.display().to_string()),
-                    old: old_text,
-                    new: new_text,
-                });
+                data.insert(
+                    "change".into(),
+                    serde_json::json!(ChangeView {
+                        path: path.map(|path| path.display().to_string()),
+                        old: old_text,
+                        new: new_text,
+                    }),
+                );
             }
-            (SseEventType::ToolCallCompleted, data)
+            (
+                SseEventType::ToolCallCompleted,
+                serde_json::Value::Object(data),
+            )
         }
         // The whole open list, as the session record carries it, so a client that shows the
         // list replaces rather than patches; empty once everything is disposed of.

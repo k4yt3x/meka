@@ -177,7 +177,7 @@ pub(super) fn write_fence_refusal(
     level: Permission,
     input: &serde_json::Value,
 ) -> Option<ToolOutput> {
-    let path = input["path"].as_str()?;
+    let path = input.get("path").and_then(serde_json::Value::as_str)?;
     let file_path = resolve_for_fence(cwd, path);
     let spelled = crate::workspace::resolve_against_cwd(cwd, path);
     let refusal = scope
@@ -441,11 +441,12 @@ async fn read_file_window(
                 break;
             }
             let mut consumed = 0;
-            while consumed < buffer.len() {
-                let rest = &buffer[consumed..];
+            while let Some(rest) = buffer.get(consumed..)
+                && !rest.is_empty()
+            {
                 match rest.iter().position(|&byte| byte == b'\n') {
                     Some(at) => {
-                        scan.push(&rest[..at]);
+                        scan.push(rest.get(..at).unwrap_or_default());
                         scan.end_line(true);
                         consumed += at + 1;
                     }
@@ -1009,13 +1010,7 @@ impl Tool for ReadFileTool {
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let cancellation = context.cancellation.clone();
-        let path = input["path"]
-            .as_str()
-            .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "file_read".to_string(),
-                message: "missing 'path' parameter".to_string(),
-            })?
-            .to_string();
+        let path = super::util::require_str_allowing_empty(&input, "path", "file_read")?;
 
         let canonical = super::util::admit_read("file_read", &self.site, &path).await?;
 
@@ -1336,7 +1331,7 @@ impl Tool for EditFileTool {
         level: Permission,
         input: &serde_json::Value,
     ) -> Option<ToolOutput> {
-        let path = input["path"].as_str()?;
+        let path = input.get("path").and_then(serde_json::Value::as_str)?;
         let resolved = crate::workspace::resolve_against_cwd(&self.site.cwd, path);
         let refusal = self
             .scope
@@ -1357,8 +1352,14 @@ impl Tool for EditFileTool {
     ) -> Result<ToolOutput> {
         let path = require_str(&input, "path", "file_edit")?;
         let old_string = require_str(&input, "old_string", "file_edit")?;
-        let replace_all = input["replace_all"].as_bool().unwrap_or(false);
-        let force = input["force"].as_bool().unwrap_or(false);
+        let replace_all = input
+            .get("replace_all")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let force = input
+            .get("force")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         let new_string_opt = input.get("new_string").and_then(|v| v.as_str());
         let insert_before_opt = input.get("insert_before").and_then(|v| v.as_str());
@@ -1700,7 +1701,10 @@ impl Tool for WriteFileTool {
     ) -> Result<ToolOutput> {
         let path = require_str(&input, "path", "file_write")?;
         let content = super::util::require_str_allowing_empty(&input, "content", "file_write")?;
-        let force = input["force"].as_bool().unwrap_or(false);
+        let force = input
+            .get("force")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         let (target, _write_guard) =
             resolve_write_target("file_write", &self.site.cwd, &self.scope, &path).await?;

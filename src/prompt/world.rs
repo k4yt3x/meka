@@ -426,7 +426,7 @@ pub(super) fn render_memory_section(memories: &[MemoryIndexEntry], tools: Memory
             "\n{} more {} not shown here{}{}\n",
             hidden,
             if hidden == 1 { "memory" } else { "memories" },
-            render_tag_histogram(&listable[shown..]),
+            render_tag_histogram(listable.get(shown..).unwrap_or_default()),
             if tools.search {
                 format!(
                     "; use `memory_search` to find {}.",
@@ -947,8 +947,9 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
             bytes += entry.len();
             shown += 1;
         }
-        let rendered = changed_memories[..shown]
+        let rendered = changed_memories
             .iter()
+            .take(shown)
             .map(|(_, line)| line.as_str())
             .collect::<Vec<_>>()
             .join("; ");
@@ -961,8 +962,9 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
             "- Memories saved or updated: {}{}",
             rendered,
             if shown < changed_memories.len() {
-                let cut: Vec<&String> = changed_memories[shown..]
+                let cut: Vec<&String> = changed_memories
                     .iter()
+                    .skip(shown)
                     .map(|(name, _)| name)
                     .collect();
                 format!(
@@ -1069,7 +1071,7 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
         let hidden = gate_changes.len() - shown;
         let mut line = format!(
             "- Scheduled job status: {}",
-            gate_changes[..shown].join("; ")
+            gate_changes.get(..shown).unwrap_or_default().join("; ")
         );
         if hidden > 0 {
             line.push_str(&format!("; and {hidden} more"));
@@ -1201,7 +1203,7 @@ pub(super) const MEMORY_NAMES_MAX: usize = 40;
 /// a list that silently stops reads as the whole list.
 pub(super) fn name_some_of(names: &[&String]) -> String {
     let shown = names.len().min(MEMORY_NAMES_MAX);
-    let named = join_names(names[..shown].iter().copied());
+    let named = join_names(names.iter().take(shown).copied());
     match names.len() - shown {
         0 => named,
         hidden => format!("{named}, and {hidden} more"),

@@ -1397,7 +1397,7 @@ async fn accept_codex_callback(
             }
             match tokio::time::timeout(read_remaining, stream.read(&mut temp)).await {
                 Ok(Ok(0)) => break buffer.windows(4).any(|window| window == b"\r\n\r\n"),
-                Ok(Ok(n)) => buffer.extend_from_slice(&temp[..n]),
+                Ok(Ok(n)) => buffer.extend(temp.iter().take(n)),
                 Ok(Err(error)) => {
                     anyhow::bail!("failed to read the OAuth callback request: {error}")
                 }

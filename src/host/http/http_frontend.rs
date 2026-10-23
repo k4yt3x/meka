@@ -1099,37 +1099,49 @@ pub(crate) fn subagent_terminal(
     ending: &crate::store::turns::TurnEnding,
 ) -> (SseEventType, serde_json::Value) {
     use crate::store::turns::TurnStatus;
-    let mut data = serde_json::json!({
-        "turn_id": turn_id.to_string(),
-        "session_id": session_id.to_string(),
-    });
+    let mut data = serde_json::Map::from_iter([
+        ("turn_id".into(), serde_json::json!(turn_id.to_string())),
+        (
+            "session_id".into(),
+            serde_json::json!(session_id.to_string()),
+        ),
+    ]);
     if let Some(profile) = &ending.profile {
-        data["profile"] = serde_json::Value::from(profile.as_str());
+        data.insert("profile".into(), serde_json::Value::from(profile.as_str()));
     }
     match ending.status {
         TurnStatus::Succeeded => {
-            data["stop_reason"] = serde_json::Value::from(ending.stop_reason.clone());
-            data["usage"] = serde_json::to_value(ending.usage).unwrap_or(serde_json::Value::Null);
-            (SseEventType::TurnFinished, data)
+            data.insert(
+                "stop_reason".into(),
+                serde_json::Value::from(ending.stop_reason.clone()),
+            );
+            data.insert(
+                "usage".into(),
+                serde_json::to_value(ending.usage).unwrap_or(serde_json::Value::Null),
+            );
+            (SseEventType::TurnFinished, serde_json::Value::Object(data))
         }
         TurnStatus::Failed => {
             if let Some(error) = &ending.error {
-                data["error"] = serde_json::json!({
-                    "type": error.kind.type_uri(),
-                    "title": error.kind.title(),
-                    "status": super::errors::status_of(error.kind).as_u16(),
-                    "detail": error.detail,
-                });
+                data.insert(
+                    "error".into(),
+                    serde_json::json!({
+                        "type": error.kind.type_uri(),
+                        "title": error.kind.title(),
+                        "status": super::errors::status_of(error.kind).as_u16(),
+                        "detail": error.detail,
+                    }),
+                );
             }
-            (SseEventType::TurnFailed, data)
+            (SseEventType::TurnFailed, serde_json::Value::Object(data))
         }
         TurnStatus::Canceled => {
             // A worker stops when its parent's turn stops, whoever stopped that; the row says so.
             let reason = ending
                 .reason
                 .unwrap_or(crate::store::turns::CancelReason::Parent);
-            data["reason"] = serde_json::Value::from(reason.name());
-            (SseEventType::TurnCanceled, data)
+            data.insert("reason".into(), serde_json::Value::from(reason.name()));
+            (SseEventType::TurnCanceled, serde_json::Value::Object(data))
         }
     }
 }

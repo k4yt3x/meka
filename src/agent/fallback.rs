@@ -115,9 +115,10 @@ impl Agent {
             .unwrap_or(0);
         let untried: Vec<String> = {
             let tried = crate::sync::lock(&self.profiles_tried);
-            chain[failed_at + 1..]
+            chain
                 .iter()
-                .chain(&chain[..failed_at])
+                .skip(failed_at + 1)
+                .chain(chain.iter().take(failed_at))
                 .filter(|profile| !tried.contains(profile))
                 .cloned()
                 .collect()

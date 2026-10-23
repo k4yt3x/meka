@@ -76,32 +76,35 @@ pub(super) fn build_request_body_for(
         }
     }
 
-    let mut body = serde_json::json!({
-        "model": model,
-        "input": input,
-        "tool_choice": "auto",
-        "store": false,
-        "stream": stream,
-    });
+    let mut body = serde_json::Map::from_iter([
+        ("model".into(), serde_json::json!(model)),
+        ("input".into(), serde_json::json!(input)),
+        ("tool_choice".into(), serde_json::json!("auto")),
+        ("store".into(), serde_json::json!(false)),
+        ("stream".into(), serde_json::json!(stream)),
+    ]);
 
     if !system_prompt.is_empty() {
-        body["instructions"] = serde_json::Value::String(system_prompt.to_string());
+        body.insert(
+            "instructions".into(),
+            serde_json::Value::String(system_prompt.to_string()),
+        );
     }
 
     let declared = encode_tools(tools, deferred_tools, delivery, !searched.is_empty());
     if !declared.is_empty() {
-        body["tools"] = serde_json::Value::Array(declared);
+        body.insert("tools".into(), serde_json::Value::Array(declared));
     }
 
     if let Some(effort) = reasoning_effort {
-        body["reasoning"] = serde_json::json!({"effort": effort});
+        body.insert("reasoning".into(), serde_json::json!({"effort": effort}));
     }
 
     if let Some(max_output) = max_output_tokens {
-        body["max_output_tokens"] = serde_json::json!(max_output);
+        body.insert("max_output_tokens".into(), serde_json::json!(max_output));
     }
 
-    body
+    serde_json::Value::Object(body)
 }
 
 /// Fold a [`StreamEvent`] stream into the tuple [`crate::provider::Provider::complete`] returns.
@@ -174,11 +177,17 @@ pub(super) fn drop_replayed_reasoning(body: &mut serde_json::Value) {
 /// OpenAI parameter, and only `chatgpt-subscription` knows it is talking to OpenAI.
 ///
 /// Takes the body [`build_request_body_for`] returns, where `reasoning` is either an object or
-/// absent;
-/// indexing promotes an absent key through a null to an object, which is how the no-effort case
-/// gets its `reasoning` block.
+/// absent; an absent one is created here, which is how the no-effort case gets its `reasoning`
+/// block.
 pub(super) fn request_reasoning_summary(body: &mut serde_json::Value) {
-    body["reasoning"]["summary"] = serde_json::json!("auto");
+    if let Some(fields) = body.as_object_mut()
+        && let Some(reasoning) = fields
+            .entry("reasoning")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+    {
+        reasoning.insert("summary".into(), serde_json::json!("auto"));
+    }
 }
 
 /// Build the `output` field of a `function_call_output` item from a slice of `ToolResultContent`.
@@ -255,17 +264,17 @@ fn searched_call_ids(
 /// One function entry of the `tools` array; `deferred` marks it `defer_loading`, which withholds
 /// the schema until a `tool_search_output` carries it.
 fn function_declaration(tool: &ToolDefinition, deferred: bool) -> serde_json::Value {
-    let mut declaration = serde_json::json!({
-        "type": "function",
-        "name": tool.name,
-        "description": tool.description,
-        "strict": false,
-        "parameters": tool.parameters,
-    });
+    let mut declaration = serde_json::Map::from_iter([
+        ("type".into(), serde_json::json!("function")),
+        ("name".into(), serde_json::json!(tool.name)),
+        ("description".into(), serde_json::json!(tool.description)),
+        ("strict".into(), serde_json::json!(false)),
+        ("parameters".into(), serde_json::json!(tool.parameters)),
+    ]);
     if deferred {
-        declaration["defer_loading"] = serde_json::Value::Bool(true);
+        declaration.insert("defer_loading".into(), serde_json::Value::Bool(true));
     }
-    declaration
+    serde_json::Value::Object(declaration)
 }
 
 /// The endpoint's own search item, declared with client execution so meka answers it. One door
@@ -480,15 +489,18 @@ fn reasoning_input_item(
     } else {
         serde_json::json!([{ "type": "summary_text", "text": summary }])
     };
-    let mut item = serde_json::json!({
-        "type": "reasoning",
-        "summary": summary,
-        "encrypted_content": encrypted_content,
-    });
+    let mut item = serde_json::Map::from_iter([
+        ("type".into(), serde_json::json!("reasoning")),
+        ("summary".into(), serde_json::json!(summary)),
+        (
+            "encrypted_content".into(),
+            serde_json::json!(encrypted_content),
+        ),
+    ]);
     if let Some(id) = id {
-        item["id"] = serde_json::Value::String(id.to_string());
+        item.insert("id".into(), serde_json::Value::String(id.to_string()));
     }
-    item
+    serde_json::Value::Object(item)
 }
 
 fn encode_tools(

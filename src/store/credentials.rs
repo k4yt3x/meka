@@ -151,7 +151,10 @@ impl TokenStore {
             // The digest's leading four bytes: injective on `u32`, so two accounts never share a
             // file, and short enough that the name stays readable. Rendered by `{:x}`, which drops
             // leading zeros, so this is up to eight hex digits rather than always eight.
-            u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
+            digest
+                .iter()
+                .take(4)
+                .fold(0u32, |word, &byte| (word << 8) | u32::from(byte))
         ));
         try_lock_file(&path)
     }

@@ -87,11 +87,15 @@ impl Tool for SearchContentsTool {
         // `cwd` silently misses whole folders the user can see in their editor. Carried as
         // `PathBuf` end to end: a round trip through `to_string_lossy` would replace every
         // non-UTF-8 byte with U+FFFD and report the user's own cwd as missing.
-        let search_paths: Vec<std::path::PathBuf> = match input["path"].as_str() {
-            Some(raw) => vec![crate::workspace::resolve_against_cwd(&self.site.cwd, raw)],
-            None => crate::workspace::search_roots(&self.site.cwd, &self.site.roots),
-        };
-        let file_glob = input["glob"].as_str().map(|s| s.to_string());
+        let search_paths: Vec<std::path::PathBuf> =
+            match input.get("path").and_then(serde_json::Value::as_str) {
+                Some(raw) => vec![crate::workspace::resolve_against_cwd(&self.site.cwd, raw)],
+                None => crate::workspace::search_roots(&self.site.cwd, &self.site.roots),
+            };
+        let file_glob = input
+            .get("glob")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string());
         // Cap precedence, as `file_find` has it: an explicit `limit` wins, clamped to the inline
         // cap the way `memory_search` clamps its own; with none, `scratchpad` lifts the cap so the
         // agent can collect an unbounded result set.

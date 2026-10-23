@@ -251,7 +251,7 @@ pub(super) const MAX_BACKUP_SUFFIX: u32 = 1000;
 /// Rejects what `Display` cannot produce (nothing at all, a leading zero) and what a `u32` cannot
 /// hold, so an absurdly long run of digits is a non-match rather than a wrap or a panic.
 pub(super) fn parse_number(digits: &[u8]) -> Option<u32> {
-    if digits.is_empty() || (digits.len() > 1 && digits[0] == b'0') {
+    if digits.is_empty() || (digits.len() > 1 && digits.first() == Some(&b'0')) {
         return None;
     }
     std::str::from_utf8(digits).ok()?.parse().ok()

@@ -397,7 +397,7 @@ pub(crate) fn plan_import(
     let mut slots: Vec<Option<ExportedSession>> = export.sessions.into_iter().map(Some).collect();
     let mut records = Vec::with_capacity(order.len());
     for index in order {
-        let session = slots[index].take().ok_or_else(|| {
+        let session = slots.get_mut(index).and_then(Option::take).ok_or_else(|| {
             crate::error::MekaError::Usage(
                 "duplicate session index while ordering import".to_string(),
             )
@@ -551,19 +551,28 @@ pub(crate) fn parents_first_order(
     for (index, (_, parent)) in nodes.iter().enumerate() {
         if let Some(parent) = parent
             && let Some(&parent_index) = index_of.get(parent.as_str())
+            && let Some(siblings) = children.get_mut(parent_index)
+            && let Some(count) = indegree.get_mut(index)
         {
-            children[parent_index].push(index);
-            indegree[index] += 1;
+            siblings.push(index);
+            *count += 1;
         }
     }
-    let mut queue: VecDeque<usize> = (0..nodes.len()).filter(|&i| indegree[i] == 0).collect();
+    let mut queue: VecDeque<usize> = indegree
+        .iter()
+        .enumerate()
+        .filter(|&(_, &count)| count == 0)
+        .map(|(index, _)| index)
+        .collect();
     let mut order = Vec::with_capacity(nodes.len());
     while let Some(node) = queue.pop_front() {
         order.push(node);
-        for &child in &children[node] {
-            indegree[child] -= 1;
-            if indegree[child] == 0 {
-                queue.push_back(child);
+        for &child in children.get(node).into_iter().flatten() {
+            if let Some(count) = indegree.get_mut(child) {
+                *count -= 1;
+                if *count == 0 {
+                    queue.push_back(child);
+                }
             }
         }
     }

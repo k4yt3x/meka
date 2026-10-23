@@ -996,7 +996,7 @@ impl Agent {
                 // disk. Only successful writes count.
                 if name == "memory_write"
                     && !output.is_error
-                    && let Some(memory) = input["name"].as_str()
+                    && let Some(memory) = input.get("name").and_then(serde_json::Value::as_str)
                 {
                     memories_written.push(memory.to_string());
                 }

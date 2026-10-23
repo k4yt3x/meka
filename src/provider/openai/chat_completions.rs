@@ -227,18 +227,18 @@ impl OpenAiChatCompletionsProvider {
                         .collect();
 
                     let mut assistant_message = if tool_calls.is_empty() {
-                        serde_json::json!({
-                            "role": "assistant",
-                            "content": message.text_content(),
-                        })
+                        serde_json::Map::from_iter([
+                            ("role".into(), serde_json::json!("assistant")),
+                            ("content".into(), serde_json::json!(message.text_content())),
+                        ])
                     } else {
                         let text = message.text_content();
-                        let mut with_calls = serde_json::json!({
-                            "role": "assistant",
-                            "tool_calls": tool_calls,
-                        });
+                        let mut with_calls = serde_json::Map::from_iter([
+                            ("role".into(), serde_json::json!("assistant")),
+                            ("tool_calls".into(), serde_json::json!(tool_calls)),
+                        ]);
                         if !text.is_empty() {
-                            with_calls["content"] = serde_json::json!(text);
+                            with_calls.insert("content".into(), serde_json::json!(text));
                         }
                         with_calls
                     };
@@ -259,36 +259,43 @@ impl OpenAiChatCompletionsProvider {
                         .collect::<Vec<_>>()
                         .join("\n\n");
                     if !reasoning.is_empty() {
-                        assistant_message["reasoning_content"] = serde_json::json!(reasoning);
+                        assistant_message
+                            .insert("reasoning_content".into(), serde_json::json!(reasoning));
                     }
-                    openai_messages.push(assistant_message);
+                    openai_messages.push(serde_json::Value::Object(assistant_message));
                 }
             }
         }
 
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "messages": openai_messages,
-            "stream": stream,
-        });
+        let mut body = serde_json::Map::from_iter([
+            ("model".into(), serde_json::json!(self.model)),
+            ("messages".into(), serde_json::json!(openai_messages)),
+            ("stream".into(), serde_json::json!(stream)),
+        ]);
 
         // OpenAI omits `usage` from streamed responses unless explicitly asked; without this the
         // final usage-only chunk never arrives and token accounting (the `/status` context gauge,
         // auto-compact) silently reads zero for streaming turns.
         if stream {
-            body["stream_options"] = serde_json::json!({ "include_usage": true });
+            body.insert(
+                "stream_options".into(),
+                serde_json::json!({ "include_usage": true }),
+            );
         }
 
         let reasoning_effort = self.wire_effort();
         if let Some(effort) = &reasoning_effort {
-            body["reasoning_effort"] = serde_json::json!(effort);
+            body.insert("reasoning_effort".into(), serde_json::json!(effort));
         }
         // Only the profile's own cap: the endpoint's default is the endpoint's fact, and this
         // backend reaches whatever `base_url` names. A floor sent whenever `effort` is set would be
         // rejected by every model with a smaller output cap, and each rejection would cost a
         // degraded retry that fails the same way.
         if let Some(max_output) = self.max_output_tokens {
-            body["max_completion_tokens"] = serde_json::json!(max_output);
+            body.insert(
+                "max_completion_tokens".into(),
+                serde_json::json!(max_output),
+            );
         }
 
         if !tools.is_empty() {
@@ -305,10 +312,10 @@ impl OpenAiChatCompletionsProvider {
                     })
                 })
                 .collect();
-            body["tools"] = serde_json::json!(openai_tools);
+            body.insert("tools".into(), serde_json::json!(openai_tools));
         }
 
-        body
+        serde_json::Value::Object(body)
     }
 
     /// The assistant message, stop reason and usage out of a non-streaming response.

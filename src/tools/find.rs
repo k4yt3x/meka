@@ -86,7 +86,7 @@ impl Tool for FindFilesTool {
         // the search runs in the right place regardless of where the process was launched. With no
         // `path`, sweep every workspace root: in a multi-root ACP workspace, searching only `cwd`
         // silently misses whole folders the user can see in their editor.
-        let base_paths = match input["path"].as_str() {
+        let base_paths = match input.get("path").and_then(serde_json::Value::as_str) {
             Some(raw) => vec![crate::workspace::resolve_against_cwd(&self.site.cwd, raw)],
             None => crate::workspace::glob_roots(&self.site.cwd, &self.site.roots),
         };

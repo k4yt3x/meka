@@ -404,12 +404,12 @@ fn fold_line(line: &Line<'static>, width: usize, at_spaces: bool) -> Vec<Line<'s
         let mut end = start;
         let mut columns = 0;
         let mut last_space = None;
-        while end < characters.len() {
-            let advance = crate::text::char_width(characters[end].0);
+        while let Some((character, _)) = characters.get(end) {
+            let advance = crate::text::char_width(*character);
             if columns + advance > width && end > start {
                 break;
             }
-            if at_spaces && characters[end].0 == ' ' {
+            if at_spaces && *character == ' ' {
                 last_space = Some(end);
             }
             columns += advance;
@@ -422,7 +422,9 @@ fn fold_line(line: &Line<'static>, width: usize, at_spaces: bool) -> Vec<Line<'s
         } else {
             (end, end)
         };
-        rows.push(join_characters(&characters[start..row_end]));
+        rows.push(join_characters(
+            characters.get(start..row_end).unwrap_or_default(),
+        ));
         start = next;
     }
     rows
@@ -529,7 +531,7 @@ pub(crate) fn preview_rows(rows: Vec<Line<'static>>, most: usize) -> Vec<Line<'s
         return rows;
     }
     let omitted = rows.len() - block;
-    let mut out: Vec<Line<'static>> = rows[..block].to_vec();
+    let mut out: Vec<Line<'static>> = rows.iter().take(block).cloned().collect();
     out.push(Line::from(Span::styled(
         format!("… +{omitted} line{}", if omitted == 1 { "" } else { "s" }),
         gray(),
@@ -651,7 +653,7 @@ fn front_columns(characters: &[(char, Style)], columns: usize) -> &[(char, Style
         used += width;
         end = index + 1;
     }
-    &characters[..end]
+    characters.get(..end).unwrap_or_default()
 }
 
 /// Spans cut to `budget` columns at their end, `…` in the last column when something went, every

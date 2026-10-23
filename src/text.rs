@@ -526,8 +526,8 @@ pub(crate) fn format_columns(headers: &[&str], rows: &[Vec<String>]) -> String {
 
     let mut widths: Vec<usize> = headers.iter().map(|header| display_width(header)).collect();
     for row in rows {
-        for (index, cell) in row.iter().take(widths.len()).enumerate() {
-            widths[index] = widths[index].max(display_width(cell));
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(display_width(cell));
         }
     }
 
@@ -649,10 +649,11 @@ pub(crate) fn format_table(columns: &[Column], rows: &[Vec<String>]) -> String {
                 .collect()
         })
         .collect();
-    let widest = |index: usize| {
+    let widest = |index: usize, header: &str| {
         rows.iter()
-            .map(|row| display_width(&row[index]))
-            .chain(std::iter::once(display_width(columns[index].header)))
+            .filter_map(|row| row.get(index))
+            .map(|cell| display_width(cell))
+            .chain(std::iter::once(display_width(header)))
             .max()
             .unwrap_or(0)
     };
@@ -660,9 +661,9 @@ pub(crate) fn format_table(columns: &[Column], rows: &[Vec<String>]) -> String {
         .iter()
         .enumerate()
         .map(|(index, column)| match column.width {
-            Width::Content => widest(index),
+            Width::Content => widest(index, column.header),
             Width::Capped(max_columns) => {
-                widest(index).min(max_columns.max(display_width(column.header)))
+                widest(index, column.header).min(max_columns.max(display_width(column.header)))
             }
             Width::Remainder => 0,
         })
@@ -675,9 +676,10 @@ pub(crate) fn format_table(columns: &[Column], rows: &[Vec<String>]) -> String {
     // Shared equally should a table declare more than one, so a row still fits; one is the design.
     if let Some(share) = TABLE_WIDTH.saturating_sub(spent).checked_div(remainders) {
         let available = share.max(REMAINDER_MINIMUM);
-        for (index, column) in columns.iter().enumerate() {
+        for (index, (width, column)) in widths.iter_mut().zip(columns).enumerate() {
             if column.width == Width::Remainder {
-                widths[index] = widest(index).min(available.max(display_width(column.header)));
+                *width =
+                    widest(index, column.header).min(available.max(display_width(column.header)));
             }
         }
     }

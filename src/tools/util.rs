@@ -96,8 +96,9 @@ pub(super) fn require_str(
     // Blank is missing. Every caller names a thing (a path, a pattern, a command, a name), and an
     // empty one is never that thing: `file_edit` with an empty `old_string` and `replace_all`
     // spliced the replacement between every character of the file and reported success.
-    input[field]
-        .as_str()
+    input
+        .get(field)
+        .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(|s| s.to_string())
         .ok_or_else(|| MekaError::ToolExecution {
@@ -147,8 +148,9 @@ pub(super) fn require_str_allowing_empty(
     field: &str,
     tool_name: &str,
 ) -> Result<String> {
-    input[field]
-        .as_str()
+    input
+        .get(field)
+        .and_then(serde_json::Value::as_str)
         .map(|s| s.to_string())
         .ok_or_else(|| MekaError::ToolExecution {
             tool_name: tool_name.to_string(),

@@ -406,8 +406,9 @@ impl Tool for ExecuteCommandTool {
     ) -> Result<ToolOutput> {
         let cancellation = context.cancellation.clone();
         let command = require_str(&input, "command", "shell_execute")?;
-        let timeout = input["timeout_ms"]
-            .as_u64()
+        let timeout = input
+            .get("timeout_ms")
+            .and_then(serde_json::Value::as_u64)
             .map(std::time::Duration::from_millis)
             .unwrap_or(DEFAULT_TIMEOUT);
         let permission = self.site.permission.get();
@@ -1077,21 +1078,22 @@ where
         match read {
             Ok(0) => break,
             Ok(read) => {
-                let chunk = &buffer[..read];
-                content.extend_from_slice(chunk);
+                content.extend(buffer.iter().take(read));
 
                 if let Some(relay) = &relay {
                     // Relay only the prefix that is complete UTF-8; whatever trails an incomplete
                     // sequence stays behind for the next read to finish.
-                    let pending = &content[relayed..];
+                    let pending = content.get(relayed..).unwrap_or_default();
                     let valid = match std::str::from_utf8(pending) {
                         Ok(text) => text.len(),
                         Err(error) => error.valid_up_to(),
                     };
-                    if valid > 0 {
+                    if valid > 0
+                        && let Some(prefix) = pending.get(..valid)
+                    {
                         // `valid` is the length of a verified-UTF-8 prefix, so the lossy decode
                         // never actually substitutes anything; it is just the panic-free spelling.
-                        let text = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                        let text = String::from_utf8_lossy(prefix).into_owned();
                         relayed += valid;
                         relay.send(text).await;
                     }

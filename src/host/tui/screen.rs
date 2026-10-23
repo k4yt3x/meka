@@ -3058,7 +3058,7 @@ async fn read_tail(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> (Vec<u8>,
         match pipe.read(&mut chunk).await {
             Ok(0) => break,
             Ok(read) => {
-                kept.extend_from_slice(&chunk[..read]);
+                kept.extend(chunk.iter().take(read));
                 // Trimmed once the kept part has doubled, so a long output is moved a few
                 // times rather than once per read.
                 if kept.len() > 2 * SHELL_OUTPUT_KEEP_BYTES {

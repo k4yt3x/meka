@@ -329,12 +329,15 @@ impl Tool for ContextCompactTool {
     ) -> Result<ToolOutput> {
         let request = CompactRequest {
             origin: CompactOrigin::Requested,
-            instructions: input["instructions"]
-                .as_str()
+            instructions: input
+                .get("instructions")
+                .and_then(serde_json::Value::as_str)
                 .map(str::trim)
                 .filter(|instructions| !instructions.is_empty())
                 .map(str::to_string),
-            keep_recent: input["keep_recent"].as_bool(),
+            keep_recent: input
+                .get("keep_recent")
+                .and_then(serde_json::Value::as_bool),
             request_in_flight: None,
         };
         let mut pending = crate::sync::lock(&self.pending);
@@ -407,7 +410,11 @@ impl Tool for ContextReplaceTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let summary = input["summary"].as_str().unwrap_or_default().trim();
+        let summary = input
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim();
         if summary.is_empty() {
             // A tool error rather than a hard failure: the loop gets another iteration to try
             // again, and if it never does, the fallback ladder catches it.
@@ -421,7 +428,9 @@ impl Tool for ContextReplaceTool {
         let mut slot = crate::sync::lock(&self.slot);
         *slot = Some(Submission {
             summary: summary.to_string(),
-            keep_recent: input["keep_recent"].as_bool(),
+            keep_recent: input
+                .get("keep_recent")
+                .and_then(serde_json::Value::as_bool),
         });
         drop(slot);
         Ok(ToolOutput::text("Checkpoint accepted.".to_string(), false))

@@ -1030,7 +1030,11 @@ fn set_default_profile(name: &str) -> anyhow::Result<()> {
     // `require_profile` is the one definition of a name that is a profile.
     let config_file = config::load_config_file_or_err()?;
     config::require_profile(name, &config_file.profiles)?;
-    document["default_profile"] = toml_edit::value(name);
+    // `entry().or_insert()` is what an index assignment does: a present key keeps its decor,
+    // where `insert` would reset it.
+    *document
+        .entry("default_profile")
+        .or_insert(toml_edit::Item::None) = toml_edit::value(name);
     crate::fs::write_file_atomic(&path, &document.to_string())?;
     Ok(())
 }

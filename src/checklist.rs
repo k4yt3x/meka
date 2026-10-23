@@ -384,10 +384,11 @@ impl ChecklistState {
     /// one call move an item off a task that has reported, and it is a rule about the call alone,
     /// so the replay reads the same list from the same calls.
     pub(crate) fn plan(&self, edit: ItemEdit) -> Result<PlannedEdit, String> {
-        let index = self
+        let (index, item) = self
             .items
             .iter()
-            .position(|item| item.id == edit.id)
+            .enumerate()
+            .find(|(_, item)| item.id == edit.id)
             .ok_or_else(|| {
                 format!(
                     "no open item has id {}; call checklist_read for the ids",
@@ -395,7 +396,6 @@ impl ChecklistState {
                 )
             })?;
         let text = edit.text.as_deref().map(clean_text).transpose()?;
-        let item = &self.items[index];
         let current = item.status;
         let word = edit.status.unwrap_or(match current {
             ChecklistStatus::Pending => StatusWord::Pending,
@@ -475,15 +475,18 @@ impl ChecklistState {
                 reason,
                 task,
             } => {
-                let item = &mut self.items[planned.index];
-                item.status = status;
-                item.reason = reason;
-                item.task = task;
+                if let Some(item) = self.items.get_mut(planned.index) {
+                    item.status = status;
+                    item.reason = reason;
+                    item.task = task;
+                }
                 EditOutcome::Kept(status)
             }
         };
-        if let Some(text) = planned.text {
-            self.items[planned.index].text = text;
+        if let Some(text) = planned.text
+            && let Some(item) = self.items.get_mut(planned.index)
+        {
+            item.text = text;
         }
         outcome
     }

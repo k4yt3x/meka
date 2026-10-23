@@ -200,26 +200,20 @@ fn xxh64_avalanche(mut h: u64) -> u64 {
     h
 }
 
+// Every caller of the two lane readers has checked that the lane lies within the buffer, so
+// the zero is never read.
 fn read_u32_le(buffer: &[u8], offset: usize) -> u64 {
-    u32::from_le_bytes([
-        buffer[offset],
-        buffer[offset + 1],
-        buffer[offset + 2],
-        buffer[offset + 3],
-    ]) as u64
+    buffer
+        .get(offset..offset + 4)
+        .and_then(|lane| <[u8; 4]>::try_from(lane).ok())
+        .map_or(0, |lane| u64::from(u32::from_le_bytes(lane)))
 }
 
 fn read_u64_le(buffer: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes([
-        buffer[offset],
-        buffer[offset + 1],
-        buffer[offset + 2],
-        buffer[offset + 3],
-        buffer[offset + 4],
-        buffer[offset + 5],
-        buffer[offset + 6],
-        buffer[offset + 7],
-    ])
+    buffer
+        .get(offset..offset + 8)
+        .and_then(|lane| <[u8; 8]>::try_from(lane).ok())
+        .map_or(0, u64::from_le_bytes)
 }
 
 fn xxh64(input: &[u8], seed: u64) -> u64 {
@@ -279,9 +273,8 @@ fn xxh64(input: &[u8], seed: u64) -> u64 {
             .wrapping_add(XXH64_PRIME3);
     }
 
-    while p < len {
-        h64 ^= (input[p] as u64).wrapping_mul(XXH64_PRIME5);
-        p += 1;
+    for &byte in input.iter().skip(p) {
+        h64 ^= u64::from(byte).wrapping_mul(XXH64_PRIME5);
         h64 = h64.rotate_left(11).wrapping_mul(XXH64_PRIME1);
     }
 
@@ -295,7 +288,7 @@ fn filtered_preimage(body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len());
     let mut i = 0;
 
-    while i < body.len() {
+    while let Some(&byte) = body.get(i) {
         if let Some((next, replacement, trim_prev_comma)) = filter_edit(body, i) {
             if trim_prev_comma && out.last() == Some(&b',') {
                 out.pop();
@@ -303,7 +296,7 @@ fn filtered_preimage(body: &[u8]) -> Vec<u8> {
             out.extend_from_slice(replacement);
             i = next;
         } else {
-            out.push(body[i]);
+            out.push(byte);
             i += 1;
         }
     }
@@ -321,24 +314,25 @@ fn filter_edit(body: &[u8], i: usize) -> Option<(usize, &'static [u8], bool)> {
     const FALLBACKS: &[u8] = b"\"fallbacks\":[";
     const FALLBACK_TOKEN: &[u8] = b"\"fallback_credit_token\":\"";
 
-    if body[i..].starts_with(MODEL) {
+    let rest = body.get(i..)?;
+    if rest.starts_with(MODEL) {
         let end = json_string_end(body, i + MODEL.len())?;
         return Some((end + 1, MODEL_EMPTY, false));
     }
 
-    if body[i..].starts_with(MAX_TOKENS) {
+    if rest.starts_with(MAX_TOKENS) {
         let start = i + MAX_TOKENS.len();
         let end = digits_end(body, start);
         return (end > start).then(|| skip_field(body, i, end));
     }
 
-    if body[i..].starts_with(FALLBACKS) {
+    if rest.starts_with(FALLBACKS) {
         let array_start = i + FALLBACKS.len() - 1;
         let end = json_array_end(body, array_start)?;
         return Some(skip_field(body, i, end + 1));
     }
 
-    if body[i..].starts_with(FALLBACK_TOKEN) {
+    if rest.starts_with(FALLBACK_TOKEN) {
         let end = json_string_end(body, i + FALLBACK_TOKEN.len())?;
         return Some(skip_field(body, i, end + 1));
     }
@@ -352,14 +346,14 @@ fn skip_field(body: &[u8], start: usize, end: usize) -> (usize, &'static [u8], b
     if body.get(end) == Some(&b',') {
         (end + 1, b"", false)
     } else {
-        (end, b"", start > 0 && body[start - 1] == b',')
+        (end, b"", start > 0 && body.get(start - 1) == Some(&b','))
     }
 }
 
 /// Index of the closing quote of a JSON string whose contents start at `i` (handles `\\` escapes).
 fn json_string_end(body: &[u8], mut i: usize) -> Option<usize> {
-    while i < body.len() {
-        match body[i] {
+    while let Some(&byte) = body.get(i) {
+        match byte {
             b'\\' => i += 2,
             b'"' => return Some(i),
             _ => i += 1,
@@ -372,8 +366,8 @@ fn json_string_end(body: &[u8], mut i: usize) -> Option<usize> {
 fn json_array_end(body: &[u8], mut i: usize) -> Option<usize> {
     let mut depth = 0usize;
 
-    while i < body.len() {
-        match body[i] {
+    while let Some(&byte) = body.get(i) {
+        match byte {
             b'"' => i = json_string_end(body, i + 1)? + 1,
             b'[' => {
                 depth += 1;
@@ -419,8 +413,8 @@ fn top_level_system_value(body: &[u8]) -> Option<usize> {
     i += 1;
 
     let mut depth = 0usize;
-    while i < body.len() {
-        match body[i] {
+    while let Some(&byte) = body.get(i) {
+        match byte {
             b'"' => {
                 let end = json_string_end(body, i + 1)?;
                 if depth == 0 {
@@ -428,7 +422,9 @@ fn top_level_system_value(body: &[u8]) -> Option<usize> {
                     while body.get(after).is_some_and(u8::is_ascii_whitespace) {
                         after += 1;
                     }
-                    if body.get(after) == Some(&b':') && &body[i + 1..end] == b"system" {
+                    if body.get(after) == Some(&b':')
+                        && body.get(i + 1..end) == Some(b"system".as_slice())
+                    {
                         return Some(after + 1);
                     }
                 }

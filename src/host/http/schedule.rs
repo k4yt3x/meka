@@ -196,10 +196,10 @@ impl HttpHooks {
         ))
         .unwrap_or(serde_json::Value::Null);
         let slim = serde_json::json!({
-            "type": full["type"],
-            "title": full["title"],
-            "status": full["status"],
-            "detail": full["detail"],
+            "type": full.get("type"),
+            "title": full.get("title"),
+            "status": full.get("status"),
+            "detail": full.get("detail"),
         });
         (full, slim)
     }
@@ -360,23 +360,24 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         reason: &str,
         error: Option<&crate::error::MekaError>,
     ) {
-        let mut data = serde_json::json!({
-            "item_id": item.id.to_string(),
-            "session_id": entry.id.to_string(),
-            "reason": reason,
-        });
+        let mut data = serde_json::Map::from_iter([
+            ("item_id".into(), serde_json::json!(item.id.to_string())),
+            ("session_id".into(), serde_json::json!(entry.id.to_string())),
+            ("reason".into(), serde_json::json!(reason)),
+        ]);
         let mut delivery = data.clone();
         if let Some(error) = error {
             let (full, slim) = self.event_errors(error);
-            data["error"] = full;
-            delivery["error"] = slim;
+            data.insert("error".into(), full);
+            delivery.insert("error".into(), slim);
         }
-        entry
-            .frontend
-            .push_sse(crate::host::http::sse::SseEventType::InboxFailed, data);
+        entry.frontend.push_sse(
+            crate::host::http::sse::SseEventType::InboxFailed,
+            serde_json::Value::Object(data),
+        );
         self.state.webhooks.send(
             crate::host::http::webhook::WebhookEvent::InboxFailed,
-            delivery,
+            serde_json::Value::Object(delivery),
         );
     }
 
@@ -388,20 +389,32 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
         error: &crate::error::MekaError,
     ) {
         let (full, slim) = self.event_errors(error);
-        let mut data = serde_json::json!({
-            "item_ids": items.iter().map(|item| item.id.to_string()).collect::<Vec<_>>(),
-            "session_id": entry.id.to_string(),
-            "not_before": not_before.to_rfc3339(),
-        });
+        let mut data = serde_json::Map::from_iter([
+            (
+                "item_ids".into(),
+                serde_json::json!(
+                    items
+                        .iter()
+                        .map(|item| item.id.to_string())
+                        .collect::<Vec<_>>()
+                ),
+            ),
+            ("session_id".into(), serde_json::json!(entry.id.to_string())),
+            (
+                "not_before".into(),
+                serde_json::json!(not_before.to_rfc3339()),
+            ),
+        ]);
         let mut delivery = data.clone();
-        data["error"] = full;
-        delivery["error"] = slim;
-        entry
-            .frontend
-            .push_sse(crate::host::http::sse::SseEventType::InboxDeferred, data);
+        data.insert("error".into(), full);
+        delivery.insert("error".into(), slim);
+        entry.frontend.push_sse(
+            crate::host::http::sse::SseEventType::InboxDeferred,
+            serde_json::Value::Object(data),
+        );
         self.state.webhooks.send(
             crate::host::http::webhook::WebhookEvent::InboxDeferred,
-            delivery,
+            serde_json::Value::Object(delivery),
         );
     }
 

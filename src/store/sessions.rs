@@ -2651,11 +2651,11 @@ impl Store {
         }
 
         let matches = self.find_sessions_by_prefix(value).await?;
-        match matches.len() {
-            0 => Err(crate::error::MekaError::Usage(format!(
+        match matches.as_slice() {
+            [] => Err(crate::error::MekaError::Usage(format!(
                 "no session matches prefix '{value}'"
             ))),
-            1 => Ok(matches[0]),
+            [one] => Ok(*one),
             _ => {
                 let listing: Vec<String> = matches.iter().map(Uuid::to_string).collect();
                 // "at least" once the scan's own bound is reached, because the count would

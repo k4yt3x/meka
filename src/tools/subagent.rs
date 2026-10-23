@@ -414,11 +414,19 @@ pub(crate) fn agent_spawn_definition(profile_choices: &[String]) -> ToolDefiniti
             " Pass `profile` to run the sub-agent on another configured profile; it keeps that \
              profile on every follow-up.",
         );
-        parameters["properties"]["profile"] = serde_json::json!({
-            "type": "string",
-            "enum": profile_choices,
-            "description": "The profile the sub-agent runs on. Defaults to your own."
-        });
+        if let Some(properties) = parameters
+            .get_mut("properties")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            properties.insert(
+                "profile".into(),
+                serde_json::json!({
+                    "type": "string",
+                    "enum": profile_choices,
+                    "description": "The profile the sub-agent runs on. Defaults to your own."
+                }),
+            );
+        }
     }
     ToolDefinition {
         name: "agent_spawn".to_string(),
@@ -447,13 +455,15 @@ impl Tool for AgentSpawnTool {
         // Both `prompt` and `skill` are optional, but at least one must be present. This mirrors
         // the CLI's `--oneshot` guard in `src/main.rs`. An empty/whitespace `prompt` counts
         // as absent.
-        let prompt = input["prompt"]
-            .as_str()
+        let prompt = input
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|text| !text.is_empty())
             .map(str::to_string);
-        let skill_name = input["skill"]
-            .as_str()
+        let skill_name = input
+            .get("skill")
+            .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|text| !text.is_empty())
             .map(str::to_string);
@@ -1312,7 +1322,10 @@ impl Tool for AgentSteerTool {
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let message = super::util::require_str(&input, "message", "agent_steer")?;
-        let interrupt = input["interrupt"].as_bool().unwrap_or(false);
+        let interrupt = input
+            .get("interrupt")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let (_parent_sid, row) =
             require_child_session(&self.tool_builder_params, "agent_steer", &input).await?;
         let class = if interrupt {

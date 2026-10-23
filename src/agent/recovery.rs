@@ -251,12 +251,12 @@ impl TurnRecovery {
             // before this turn's message is appended and is *not* reset by a proactive compaction,
             // which can leave it pointing past the end of a conversation that has just collapsed to
             // a summary. Compaction also sets `last_accepted_len` to `LAST_ACCEPTED_UNKNOWN`, so
-            // this is the arm a post-compaction rejection takes, and the slice below would panic
-            // rather than fail the turn.
+            // this is the arm a post-compaction rejection takes, and without the clamp the suspect
+            // range would start past the end.
             LAST_ACCEPTED_UNKNOWN => self.suspect_floor.min(messages.len()),
             accepted => accepted.min(messages.len()),
         };
-        let suspect = &messages.as_slice()[suspect_start..];
+        let suspect = messages.as_slice().get(suspect_start..).unwrap_or_default();
         let Some((tier_index, tier, degraded)) = DEGRADE_TIERS
             .iter()
             .enumerate()

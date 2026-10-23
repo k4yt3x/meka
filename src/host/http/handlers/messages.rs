@@ -284,11 +284,13 @@ pub(crate) async fn list_messages(
     // across the *full* materialized view (not just the page) so paging doesn't shift the
     // correlator.
     let turn_indexes = derive_turn_indexes(&materialized);
-    let messages = materialized[offset..end]
+    let messages = materialized
         .iter()
-        .zip(stamps[offset..end].iter())
-        .zip(turn_indexes[offset..end].iter())
-        .zip(markers[offset..end].iter())
+        .skip(offset)
+        .take(end - offset)
+        .zip(stamps.iter().skip(offset))
+        .zip(turn_indexes.iter().skip(offset))
+        .zip(markers.iter().skip(offset))
         .map(|(((message, stamp), turn_label), marker)| MessageView {
             role: match message.role {
                 Role::User => "user".to_string(),

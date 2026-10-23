@@ -1270,17 +1270,29 @@ pub(crate) fn terminal_event_parts(
             let problem =
                 crate::host::http::errors::ProblemDetail::for_error(error, relay_provider_errors)
                     .instance(instance);
-            let mut data = serde_json::json!({
-                "turn_id": turn_id.to_string(),
-                "session_id": session_id.to_string(),
-                "error": serde_json::to_value(problem).unwrap_or(serde_json::Value::Null),
-            });
+            let mut data = serde_json::Map::from_iter([
+                ("turn_id".into(), serde_json::json!(turn_id.to_string())),
+                (
+                    "session_id".into(),
+                    serde_json::json!(session_id.to_string()),
+                ),
+                (
+                    "error".into(),
+                    serde_json::to_value(problem).unwrap_or(serde_json::Value::Null),
+                ),
+            ]);
             // Omitted, not `null`, when there is nothing to say: the rule every optional field on
             // this API follows.
             if let Some(withdrawn) = message_withdrawn {
-                data["message_withdrawn"] = serde_json::Value::Bool(withdrawn);
+                data.insert(
+                    "message_withdrawn".into(),
+                    serde_json::Value::Bool(withdrawn),
+                );
             }
-            (crate::host::http::sse::SseEventType::TurnFailed, data)
+            (
+                crate::host::http::sse::SseEventType::TurnFailed,
+                serde_json::Value::Object(data),
+            )
         }
         Err(panic) => {
             tracing::error!("streaming turn task panicked: {panic:?}");
@@ -1300,16 +1312,18 @@ pub(crate) fn terminal_event_parts(
             )
         }
     };
-    // On every terminal, because a repair, a redaction or a withdrawal rewrites the view inside
-    // the turn and has no event of its own: the terminal is where a client decides what to
-    // re-read. Omitted, like every optional field, when the store could not say.
-    if let Some(revision) = revision {
-        data["revision"] = serde_json::Value::from(revision);
-    }
-    // The fallback that served the turn, when one did: the row's fact, carried so a client need
-    // not fetch the record to learn what the turn cost and whom it billed.
-    if let Some(profile) = served_by {
-        data["profile"] = serde_json::Value::from(profile);
+    if let Some(fields) = data.as_object_mut() {
+        // On every terminal, because a repair, a redaction or a withdrawal rewrites the view
+        // inside the turn and has no event of its own: the terminal is where a client decides
+        // what to re-read. Omitted, like every optional field, when the store could not say.
+        if let Some(revision) = revision {
+            fields.insert("revision".into(), serde_json::Value::from(revision));
+        }
+        // The fallback that served the turn, when one did: the row's fact, carried so a client
+        // need not fetch the record to learn what the turn cost and whom it billed.
+        if let Some(profile) = served_by {
+            fields.insert("profile".into(), serde_json::Value::from(profile));
+        }
     }
     (event_type, data)
 }
@@ -1428,15 +1442,24 @@ fn canceled_parts(
     turn_id: Uuid,
     session_id: Uuid,
 ) -> (crate::host::http::sse::SseEventType, serde_json::Value) {
-    let mut data = serde_json::json!({
-        "turn_id": turn_id.to_string(),
-        "session_id": session_id.to_string(),
-        "reason": reason,
-    });
+    let mut data = serde_json::Map::from_iter([
+        ("turn_id".into(), serde_json::json!(turn_id.to_string())),
+        (
+            "session_id".into(),
+            serde_json::json!(session_id.to_string()),
+        ),
+        ("reason".into(), serde_json::json!(reason)),
+    ]);
     if let Some(withdrawn) = message_withdrawn {
-        data["message_withdrawn"] = serde_json::Value::Bool(withdrawn);
+        data.insert(
+            "message_withdrawn".into(),
+            serde_json::Value::Bool(withdrawn),
+        );
     }
-    (crate::host::http::sse::SseEventType::TurnCanceled, data)
+    (
+        crate::host::http::sse::SseEventType::TurnCanceled,
+        serde_json::Value::Object(data),
+    )
 }
 
 /// Wire `stop_reason` string for a finished turn. Shared by the blocking (`assemble_response`)

@@ -451,7 +451,10 @@ impl Tool for FetchUrlTool {
 
         let html = String::from_utf8_lossy(&body_bytes).into_owned();
 
-        let raw = input["raw"].as_bool().unwrap_or(false);
+        let raw = input
+            .get("raw")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         // Parsing and converting up to ten megabytes of HTML is pure CPU, and on the runtime it
         // blocks every other task on that worker.
         let body = if raw {
@@ -474,8 +477,9 @@ impl Tool for FetchUrlTool {
         let limit = if redirects_to_scratchpad(&input) {
             0
         } else {
-            input["limit"]
-                .as_u64()
+            input
+                .get("limit")
+                .and_then(serde_json::Value::as_u64)
                 .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
                 .unwrap_or(DEFAULT_LIMIT_CHARS)
         };
