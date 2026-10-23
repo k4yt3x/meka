@@ -71,6 +71,7 @@ pub(super) fn render_world_state_full(current: &WorldSnapshot) -> String {
     if !current.memories.is_empty() {
         sections.push(render_memory_section(
             &current.memories,
+            current.inline_overflow.as_ref(),
             current.memory_tools,
         ));
     }
@@ -303,22 +304,6 @@ pub(super) const MEMORY_INDEX_MAX_BYTES: usize = 8_192;
 /// to hundreds of lines.
 pub(super) const MEMORY_INDEX_MAX_ENTRIES: usize = 200;
 
-/// Byte ceiling on the inline bodies rendered in full, separate from
-/// [`MEMORY_INDEX_MAX_BYTES`].
-///
-/// Separate so a long standing directive cannot eat the index, and the index cannot eat the
-/// directives. They answer different questions ("what do I always have to do" against "what else
-/// do I know"), and one budget would let whichever renders first starve the other.
-pub(super) const MEMORY_INLINE_MAX_BYTES: usize = 4_096;
-
-/// Per-entry ceiling on an inlined body, in *characters*, so one runaway memory cannot consume the
-/// whole allowance and leave the rest of the band as bare descriptions.
-///
-/// Characters rather than bytes because it bounds what the model reads, and because the total
-/// above is already a byte bound: whatever this lets through, [`MEMORY_INLINE_MAX_BYTES`] still
-/// stops the block growing without limit.
-pub(super) const MEMORY_INLINE_ENTRY_MAX_CHARS: usize = 1_024;
-
 /// How many distinct tags the histogram names before it stops. Enough to steer a search; this is a
 /// signpost, not a census.
 pub(super) const MEMORY_TAG_HISTOGRAM_MAX: usize = 6;
@@ -332,7 +317,11 @@ pub(super) const MEMORY_TAG_HISTOGRAM_MAX: usize = 6;
 /// The trailing "N more" line is not optional. Silently truncating an index reads to the model as
 /// "this is everything I know", which turns a full store into a confidently incomplete answer;
 /// stating the remainder is what makes `memory_search` the obvious next move.
-pub(super) fn render_memory_section(memories: &[MemoryIndexEntry], tools: MemoryTools) -> String {
+pub(super) fn render_memory_section(
+    memories: &[MemoryIndexEntry],
+    overflow: Option<&InlineOverflow>,
+    tools: MemoryTools,
+) -> String {
     let now = std::time::SystemTime::now();
     // `memory_read` is unconditional because the section itself is gated on it. The rest is not:
     // naming a disabled tool is an instruction the model cannot follow, which is exactly what the
@@ -349,7 +338,7 @@ pub(super) fn render_memory_section(memories: &[MemoryIndexEntry], tools: Memory
         );
     }
     out.push_str("\n\n");
-    let (standing, inlined) = render_standing_memories(memories, now);
+    let (standing, inlined) = render_standing_memories(memories, overflow, tools, now);
 
     // Whatever the standing band rendered in full is not repeated as a description line below.
     // Listing it twice wastes the budget and reads as a duplicate, which a model treats as
@@ -364,19 +353,13 @@ pub(super) fn render_memory_section(memories: &[MemoryIndexEntry], tools: Memory
         })
         .collect();
 
-    // Built into its own buffer so the standing band's overflow notice can be written *between* the
-    // band and the index, after both budgets have been spent. The notice cannot be computed any
-    // earlier: it is a claim about what the index below contains, and the index does not know until
-    // it has laid itself out.
-    //
-    // Measured against the index's own bytes, not `out.len()`. Charging the standing band to this
-    // budget is what [`MEMORY_INLINE_MAX_BYTES`] says it does not do (four ordinary directives
-    // would cost the index 40% of its entries), and the separation is only real if the two are
+    // Measured against the index's own bytes, not `out.len()`. The standing band has a budget of
+    // its own (`[memory] inline_max_bytes`), and charging it here as well would let four ordinary
+    // directives cost the index 40% of its entries; the separation is only real if the two are
     // counted separately.
     let mut index = String::new();
     let mut index_bytes = 0;
     let mut shown = 0;
-    let mut standing_listed = 0;
     for entry in listable.iter().take(MEMORY_INDEX_MAX_ENTRIES) {
         let line = format!(
             "- **{}** (p{}, {}{}): {}\n",
@@ -397,18 +380,10 @@ pub(super) fn render_memory_section(memories: &[MemoryIndexEntry], tools: Memory
         index_bytes += line.len();
         index.push_str(&line);
         shown += 1;
-        if entry.inline_body.is_some() {
-            standing_listed += 1;
-        }
     }
 
     if !standing.is_empty() {
-        let overflow = listable
-            .iter()
-            .filter(|entry| entry.inline_body.is_some())
-            .count();
         out.push_str(&standing);
-        out.push_str(&render_standing_overflow(overflow, standing_listed, tools));
         out.push('\n');
     }
     out.push_str(&index);
@@ -479,15 +454,22 @@ fn render_unlisted(search_only: usize, expired: usize, tools: MemoryTools) -> St
     )
 }
 
-/// The inline band, rendered with its bodies in full, or an empty string when there is none.
+/// The inline band, rendered with its bodies whole, or an empty string when there is none.
 ///
 /// For a standing directive the body *is* the directive, and a one-line description with the text
 /// behind a `memory_read` is a rule the model has to choose to look up before it can follow it.
 /// An expired one is left out: its rule has stopped applying, and the footer says so.
-pub(super) fn render_standing_memories(
-    memories: &[MemoryIndexEntry],
+///
+/// A body is shown whole or not at all. The memories `overflow` demoted are listed here by
+/// description, under a sentence that says why, rather than left to the index below: an index line
+/// does not say which load a memory has, so "listed below" would name nothing the model could
+/// find, and a body cut partway would read as the whole rule.
+pub(super) fn render_standing_memories<'a>(
+    memories: &'a [MemoryIndexEntry],
+    overflow: Option<&InlineOverflow>,
+    tools: MemoryTools,
     now: std::time::SystemTime,
-) -> (String, std::collections::HashSet<&str>) {
+) -> (String, std::collections::HashSet<&'a str>) {
     let mut inlined: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let standing: Vec<&MemoryIndexEntry> = memories
         .iter()
@@ -496,97 +478,130 @@ pub(super) fn render_standing_memories(
     if standing.is_empty() {
         return (String::new(), inlined);
     }
+    let demoted: &[String] = overflow.map_or(&[], |overflow| overflow.demoted.as_slice());
 
     // The header states the contract, because without it the band is ambiguous: a model shown a
     // body cannot tell "this is the whole note" from "this is a preview", and hedges that the full
     // stored body "may contain more", which is the kind of provisionality a standing rule must not
-    // acquire. `clip_chars` already marks a real truncation with an ellipsis; saying so is what
-    // turns that mark into a signal the reader can act on.
+    // acquire.
     let mut out = String::from(
-        "Standing preferences and constraints, subject to current instructions. Bodies are complete unless marked \u{2026}; read a truncated entry with `memory_read` before relying on it.\n\n",
+        "Standing preferences and constraints, subject to current instructions. Bodies are \
+         complete.\n\n",
     );
+    let mut by_description: Vec<&MemoryIndexEntry> = Vec::new();
     for entry in &standing {
         let Some(body) = &entry.inline_body else {
             continue;
         };
-        // Elided like every other index line. Descriptions are deliberately not bounded at parse
-        // time (see `crate::entry::elide_description_for_index`), so an unbounded one here (and
-        // the first block is emitted whatever its size) lets a single memory blow the band's
-        // whole allowance on its description alone.
-        let mut block = format!(
-            "- **{}** ({}{}): {}\n",
-            entry.name,
-            crate::memory::render_age(entry.created, now),
-            match entry.expires {
-                Some(expires) => format!(", {}", crate::memory::render_expiry(expires, now)),
-                None => String::new(),
-            },
-            crate::entry::elide_description_for_index(&entry.description)
-        );
+        inlined.insert(entry.name.as_str());
+        if demoted.contains(&entry.name) {
+            by_description.push(entry);
+            continue;
+        }
+        let mut block = standing_line(entry, now);
         // Deliberately *not* `elide`, which collapses whitespace: it exists for one-line index
         // entries, and a standing directive is very often a short list of rules. Flattening
         // "Answer in kind.\nNever apologize." into one run-on line is a legibility loss in exactly
-        // the case this band was built for, and it happens even when the body is well inside the
-        // budget.
-        for line in clip_chars(body, MEMORY_INLINE_ENTRY_MAX_CHARS).lines() {
+        // the case this band was built for.
+        for line in body.lines() {
             block.push_str(&format!("  {line}\n"));
         }
-        if !inlined.is_empty() && out.len() + block.len() > MEMORY_INLINE_MAX_BYTES {
-            break;
-        }
         out.push_str(&block);
-        inlined.insert(entry.name.as_str());
     }
-
-    // What became of the overflow is stated by [`render_standing_overflow`], which the caller
-    // appends once the index below has laid itself out. This block deliberately does not say,
-    // because from here the answer is a guess.
+    if let Some(overflow) = overflow
+        && !by_description.is_empty()
+    {
+        out.push_str(&format!(
+            "\n{}, so these are shown by description only{}:\n",
+            inline_overflow_lead(overflow),
+            inline_overflow_remedy(tools)
+        ));
+        // Bounded like the index, by the same two ceilings: this list is a listing by
+        // description, and a store written past the doors can hold thousands of inline rows.
+        let mut listed = 0;
+        let mut bytes = 0;
+        for entry in by_description.iter().take(MEMORY_INDEX_MAX_ENTRIES) {
+            let line = standing_line(entry, now);
+            if listed > 0 && bytes + line.len() > MEMORY_INDEX_MAX_BYTES {
+                break;
+            }
+            bytes += line.len();
+            listed += 1;
+            out.push_str(&line);
+        }
+        // The same tail as the index's own footer, for the same reason: a bare count says
+        // something is missing without saying what, and the names are listed nowhere else.
+        let unlisted = by_description.len().saturating_sub(listed);
+        if unlisted > 0 {
+            out.push_str(&format!(
+                "and {unlisted} more inline {} not listed here{}{}\n",
+                if unlisted == 1 { "memory" } else { "memories" },
+                render_tag_histogram(by_description.get(listed..).unwrap_or_default()),
+                if tools.search {
+                    format!(
+                        "; use `memory_search` to find {}.",
+                        if unlisted == 1 { "it" } else { "them" }
+                    )
+                } else {
+                    ".".to_string()
+                }
+            ));
+        }
+    }
     (out, inlined)
 }
 
-/// What became of the inline memories the band could not fit.
+/// One inline memory's bullet: name, age, deadline and description, the body's heading.
 ///
-/// Separate from [`render_standing_memories`] because only the caller knows the answer. The band
-/// does not state its own overflow as "N further inline memories are listed by description
-/// below", tempting as that is on the reasoning that a standing memory the inline budget dropped
-/// still falls through to the index like everything else. That holds for a small store and fails
-/// for a large one: the index rations [`MEMORY_INDEX_MAX_BYTES`] across the whole store, so the
-/// overflow competes with it, and past a few dozen standing memories some of them lose and reach
-/// the model nowhere at all.
-///
-/// The count being wrong is the smaller half. Inline is the tier whose contract is "these always
-/// apply", so one that appears in no part of the context is a rule the model is being held to
-/// and cannot read, and a confident sentence saying otherwise removes the one clue that it should
-/// go looking.
-pub(super) fn render_standing_overflow(
-    overflow: usize,
-    listed: usize,
-    tools: MemoryTools,
-) -> String {
-    if overflow == 0 {
-        return String::new();
-    }
-    if listed >= overflow {
-        return format!(
-            "\n{overflow} further inline {} listed by description below rather than in full; \
-             read {} with `memory_read`.\n",
-            if overflow == 1 {
-                "memory is"
-            } else {
-                "memories are"
-            },
-            if overflow == 1 { "it" } else { "them" }
-        );
-    }
+/// The description is elided like every other index line. Descriptions are deliberately not
+/// bounded at parse time (see `crate::entry::elide_description_for_index`), so an unbounded one
+/// here would let a single memory spend the band on its description alone.
+fn standing_line(entry: &MemoryIndexEntry, now: std::time::SystemTime) -> String {
     format!(
-        "\n{overflow} further inline memories are not shown in full: {listed} listed by \
-         description below, {} left out entirely because this index is full. Their standing guidance still matters{}\n",
-        overflow - listed,
-        if tools.search {
-            "; reach the ones left out with `memory_search`."
-        } else {
-            ", and nothing in this context names the ones left out."
-        }
+        "- **{}** ({}{}): {}\n",
+        entry.name,
+        crate::memory::render_age(entry.created, now),
+        match entry.expires {
+            Some(expires) => format!(", {}", crate::memory::render_expiry(expires, now)),
+            None => String::new(),
+        },
+        crate::entry::elide_description_for_index(&entry.description)
+    )
+}
+
+/// "Inline memories total 41.0 KiB against the 32.0 KiB budget": the fact the band and the diff
+/// both open with.
+fn inline_overflow_lead(overflow: &InlineOverflow) -> String {
+    format!(
+        "Inline memories total {} against the {} budget",
+        crate::text::format_size(overflow.total_bytes),
+        crate::text::format_size(overflow.max_bytes)
+    )
+}
+
+/// What to do about the memories shown by description only: read one before acting on it, since
+/// a rule the model is held to and has not read is the failure the band exists to prevent, and
+/// the cleanup, only when the model has the tool to carry it out; without `memory_write` the
+/// cleanup is the operator's, and naming a tool the model lacks is an instruction it cannot follow.
+/// `memory_read` needs no such guard, because the section itself is gated on it.
+fn inline_overflow_remedy(tools: MemoryTools) -> &'static str {
+    if tools.write {
+        "; read one with `memory_read` before relying on it, and shorten them or set `load: index` \
+         on those that are not standing rules"
+    } else {
+        "; read one with `memory_read` before relying on it"
+    }
+}
+
+/// The diff's one-line form of the overflow, naming the demoted memories.
+fn render_inline_overflow_line(overflow: &InlineOverflow, tools: MemoryTools) -> String {
+    let demoted: Vec<&String> = overflow.demoted.iter().collect();
+    format!(
+        "- {}, so {} {} shown by description only{}.",
+        inline_overflow_lead(overflow),
+        name_some_of(&demoted),
+        if demoted.len() == 1 { "is" } else { "are" },
+        inline_overflow_remedy(tools)
     )
 }
 
@@ -834,8 +849,20 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
         .iter()
         .map(|entry| (entry.name.as_str(), entry))
         .collect();
-    // Name alongside line, so an entry the budget cuts can still be named rather than counted.
-    let changed_memories: Vec<(String, String)> = current
+    // What the band shows by description only, now and at the last render. A body is restated
+    // only for a memory the band shows whole: the demoted ones are shown by description there,
+    // and the diff must not tell the model more than the next full render will.
+    let demoted_now: &[String] = current
+        .inline_overflow
+        .as_ref()
+        .map_or(&[], |overflow| overflow.demoted.as_slice());
+    let demoted_before: &[String] = previous
+        .inline_overflow
+        .as_ref()
+        .map_or(&[], |overflow| overflow.demoted.as_slice());
+    // Name alongside line, so an entry the budget cuts can still be named rather than counted,
+    // and the bytes the budget charges the entry for: its line without the body.
+    let changed_memories: Vec<(String, String, usize)> = current
         .memories
         .iter()
         .filter(|entry| {
@@ -878,37 +905,8 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
         // a tags-only edit emits a line byte-identical to the index entry already in context,
         // which is a change announcement carrying no change.
         .map(|entry| {
-            // Elided like every other rendered description: descriptions are deliberately
-            // unbounded at the write door, and the diff is the only channel after the first turn,
-            // so one long description here would outweigh the 8 KB budget the rest of the section
-            // is engineered around.
-            let mut line = format!(
-                "{} (p{}: {})",
-                entry.name,
-                entry.priority,
-                crate::entry::elide_description_for_index(&entry.description)
-            );
-            if !entry.tags.is_empty() {
-                line.push_str(&format!(" [{}]", entry.tags.join(", ")));
-            }
-            // Where the entry now stands: out of the index, past its date, or dated. A memory
-            // written as expired is announced as such on the one line it gets.
-            if entry.load == crate::memory::Load::Search {
-                line.push_str(" (search-only)");
-            }
-            if let Some(expires) = entry.expires {
-                line.push_str(&format!(
-                    " ({})",
-                    crate::memory::render_expiry(expires, std::time::SystemTime::now())
-                ));
-            }
-            if let Some(body) = &entry.inline_body {
-                line.push_str(&format!(
-                    "\n  {}",
-                    clip_chars(body, MEMORY_INLINE_ENTRY_MAX_CHARS).replace('\n', "\n  ")
-                ));
-            }
-            (entry.name.clone(), line)
+            let (line, counted) = memory_change_line(entry, !demoted_now.contains(&entry.name));
+            (entry.name.clone(), line, counted)
         })
         .collect();
     let removed_memories: Vec<&String> = previous
@@ -934,46 +932,43 @@ pub(super) fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldS
         .map(|entry| &entry.name)
         .collect();
     if !changed_memories.is_empty() {
-        // Budgeted like every other memory render. The entry count is unbounded (a compaction
-        // checkpoint writes several standing memories at once) and each may carry a whole
-        // inline body, so without a ceiling this one line can outweigh the 8 KB the index
-        // itself is held to.
-        let mut shown = 0;
-        let mut bytes = 0;
-        for (_, entry) in &changed_memories {
-            if shown > 0 && bytes + entry.len() > MEMORY_INLINE_MAX_BYTES {
-                break;
-            }
-            bytes += entry.len();
-            shown += 1;
-        }
-        let rendered = changed_memories
-            .iter()
-            .take(shown)
-            .map(|(_, line)| line.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
-        // The cut ones are named, not counted and waved at the index: that is the last full render
-        // and therefore predates the very writes being announced, so eight inline directives
-        // written in one turn would render three and tell the model the other five were somewhere
-        // they were not. Names are what a `memory_read` needs, and they are short; it is the
-        // bodies that spent the budget.
         lines.push(format!(
-            "- Memories saved or updated: {}{}",
-            rendered,
-            if shown < changed_memories.len() {
-                let cut: Vec<&String> = changed_memories
+            "- Memories saved or updated: {}",
+            budgeted_memory_entries(&changed_memories)
+        ));
+    }
+    // The band's layout moves without any memory changing: an operator door can push a rule out
+    // of the budget, and a cleanup can bring one back. Announced in both directions, because the
+    // snapshot advances either way.
+    if current.inline_overflow != previous.inline_overflow {
+        lines.push(match &current.inline_overflow {
+            Some(overflow) => render_inline_overflow_line(overflow, current.memory_tools),
+            None => "- Every inline memory fits the budget again.".to_string(),
+        });
+    }
+    // A body coming back into the band is restated whole: the model has only ever seen its
+    // description, and the next full render is a compaction away. One the line above restated
+    // already is not repeated.
+    let recovered: Vec<(String, String, usize)> = current
+        .memories
+        .iter()
+        .filter(|entry| {
+            entry.inline_bytes() > 0
+                && demoted_before.contains(&entry.name)
+                && !demoted_now.contains(&entry.name)
+                && !changed_memories
                     .iter()
-                    .skip(shown)
-                    .map(|(name, _)| name)
-                    .collect();
-                format!(
-                    "; and {}, not restated here; `memory_read` them",
-                    name_some_of(&cut)
-                )
-            } else {
-                String::new()
-            }
+                    .any(|(name, ..)| *name == entry.name)
+        })
+        .map(|entry| {
+            let (line, counted) = memory_change_line(entry, true);
+            (entry.name.clone(), line, counted)
+        })
+        .collect();
+    if !recovered.is_empty() {
+        lines.push(format!(
+            "- Inline memories shown in full again: {}",
+            budgeted_memory_entries(&recovered)
         ));
     }
     if !expired_memories.is_empty() {
@@ -1182,6 +1177,89 @@ pub(super) fn join_names<'a>(names: impl Iterator<Item = &'a String>) -> String 
         .map(|name| format!("`{name}`"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// One memory's entry in a diff line: name, priority and description, then its tags and standing,
+/// and its whole body indented beneath when `with_body` and the band renders it. Also the bytes
+/// the diff's budget charges the entry for, which is the line without the body.
+///
+/// The line carries what *changed*, not just that something did. A full `[Memory]` render only
+/// happens when there is no previous snapshot, so for the rest of a session this delta is the only
+/// channel: naming a rewritten inline memory without restating its body leaves the superseded
+/// directive as the only rule text in the window, and the model goes on following it. Tags are
+/// stated for the weaker version of the same reason: otherwise a tags-only edit emits a line
+/// byte-identical to the index entry already in context, which is a change announcement carrying
+/// no change.
+fn memory_change_line(entry: &MemoryIndexEntry, with_body: bool) -> (String, usize) {
+    // Elided like every other rendered description: descriptions are deliberately unbounded at
+    // the write door, and the diff is the only channel after the first turn, so one long
+    // description here would outweigh the budget the rest of the section is engineered around.
+    let mut line = format!(
+        "{} (p{}: {})",
+        entry.name,
+        entry.priority,
+        crate::entry::elide_description_for_index(&entry.description)
+    );
+    if !entry.tags.is_empty() {
+        line.push_str(&format!(" [{}]", entry.tags.join(", ")));
+    }
+    // Where the entry now stands: out of the index, past its date, or dated. A memory written as
+    // expired is announced as such on the one line it gets.
+    if entry.load == crate::memory::Load::Search {
+        line.push_str(" (search-only)");
+    }
+    if let Some(expires) = entry.expires {
+        line.push_str(&format!(
+            " ({})",
+            crate::memory::render_expiry(expires, std::time::SystemTime::now())
+        ));
+    }
+    let counted = line.len();
+    if with_body && let Some(body) = &entry.inline_body {
+        line.push_str(&format!("\n  {}", body.replace('\n', "\n  ")));
+    }
+    (line, counted)
+}
+
+/// `(name, line, counted)` entries joined for one diff line: as many as the budget takes, then the
+/// names of the rest.
+///
+/// Budgeted on the entry lines alone, against the index's own ceiling. The entry count is
+/// unbounded (a restore loop through `PUT /v1/memory` moves thousands of rows between two turns),
+/// so without a ceiling one line can outweigh the index it updates. The bodies ride on top
+/// uncounted: the store admits no more of them than the inline budget, the band shows the rest by
+/// description, and a body left out here is a rule the model goes on reading in its superseded
+/// form.
+///
+/// The cut ones are named, not counted and waved at the index: that is the last full render and
+/// therefore predates the very writes being announced, so a hundred memories written between two
+/// turns would render some and tell the model the others were somewhere they were not. Names are
+/// what a `memory_read` needs, and they are short.
+fn budgeted_memory_entries(entries: &[(String, String, usize)]) -> String {
+    let mut shown = 0;
+    let mut bytes = 0;
+    for (.., counted) in entries {
+        if shown > 0 && bytes + counted > MEMORY_INDEX_MAX_BYTES {
+            break;
+        }
+        bytes += counted;
+        shown += 1;
+    }
+    let rendered = entries
+        .iter()
+        .take(shown)
+        .map(|(_, line, _)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if shown < entries.len() {
+        let cut: Vec<&String> = entries.iter().skip(shown).map(|(name, ..)| name).collect();
+        format!(
+            "{rendered}; and {}, not restated here; `memory_read` them",
+            name_some_of(&cut)
+        )
+    } else {
+        rendered
+    }
 }
 
 /// How many memory names the world-state diff spells out before it starts counting instead.

@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Inline memory bodies share a 32 KiB budget, `[memory] inline_max_bytes`; it was 4 KiB and fixed.
+- A memory write that would take the inline bodies past the budget is refused, at every door alike.
+- An inline body is shown whole or listed by description; the memory section says which and why.
+
 ## [0.83.0] - 2026-10-21
 
 ### Added

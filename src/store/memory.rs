@@ -1052,9 +1052,78 @@ pub(crate) struct MemoryStore {
     /// never renders, but which the CLI and the HTTP API still read and write, because those are
     /// the operator rather than the agent.
     enabled: bool,
+    /// `[memory] inline_max_bytes`: what the bodies of the in-force inline memories may total.
+    ///
+    /// Enforced inside [`Self::write`] and [`Self::write_body`], the two statements every door's
+    /// write goes through, so no door can leave the tier larger than the band renders whole.
+    inline_max_bytes: usize,
     /// Serializes `memory_write`'s near-duplicate check against the write that follows it. See
     /// [`Self::lock_duplicate_check`].
     duplicate_check: tokio::sync::Mutex<()>,
+}
+
+/// What a guarded write statement decided, inside its transaction.
+///
+/// A refusal is returned rather than raised so the closure's `rusqlite` errors keep their type;
+/// the transaction is dropped uncommitted on that path, which is what makes "refused" mean
+/// "nothing landed".
+enum Guarded<T> {
+    Committed(T),
+    Refused(String),
+}
+
+/// The bytes the in-force inline bodies total, as the band measures them: the UTF-8 bytes of the
+/// stored body of every `inline` row whose expiry has not passed. Stamps compare as text for the
+/// reason [`MemoryFilter::clause`] gives.
+fn inline_bytes_in_force(connection: &rusqlite::Connection, now: &str) -> rusqlite::Result<usize> {
+    let total: i64 = connection.query_row(
+        "SELECT COALESCE(SUM(LENGTH(CAST(body AS BLOB))), 0) FROM memories
+         WHERE load = ?1 AND (expires_at IS NULL OR expires_at > ?2)",
+        rusqlite::params![crate::memory::Load::Inline.name(), now],
+        |row| row.get(0),
+    )?;
+    Ok(usize::try_from(total).unwrap_or(0))
+}
+
+/// Whether the write this transaction holds may commit, or the refusal it gets.
+///
+/// Refused only when the tier ends over the budget *and* larger than it was: a write that trims an
+/// overfull tier, or leaves its size alone, always lands, or a store the budget was lowered under
+/// could never be brought back within it one memory at a time.
+fn inline_budget_refusal(
+    connection: &rusqlite::Connection,
+    now: &str,
+    before: usize,
+    max_bytes: usize,
+) -> rusqlite::Result<Option<String>> {
+    let after = inline_bytes_in_force(connection, now)?;
+    if after <= max_bytes || after <= before {
+        return Ok(None);
+    }
+    let mut statement = connection.prepare(
+        "SELECT name, LENGTH(CAST(body AS BLOB)) FROM memories
+         WHERE load = ?1 AND (expires_at IS NULL OR expires_at > ?2)
+         ORDER BY LENGTH(CAST(body AS BLOB)) DESC, name ASC
+         LIMIT ?3",
+    )?;
+    let largest = statement
+        .query_map(
+            rusqlite::params![
+                crate::memory::Load::Inline.name(),
+                now,
+                i64::try_from(crate::memory::INLINE_REFUSAL_NAMES).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    usize::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some(crate::memory::render_inline_budget_refusal(
+        after, max_bytes, &largest,
+    )))
 }
 
 impl MemoryStore {
@@ -1063,10 +1132,15 @@ impl MemoryStore {
     /// whether the operator can reach what is already stored: `meka memory list` and
     /// `GET /v1/memory` both work on a disabled installation, and a backup you cannot take because
     /// you turned the feature off is a trap rather than a safeguard.
-    pub(crate) fn new(connection: Arc<Connection>, enabled: bool) -> Arc<Self> {
+    pub(crate) fn new(
+        connection: Arc<Connection>,
+        enabled: bool,
+        inline_max_bytes: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             connection: Some(connection),
             enabled,
+            inline_max_bytes,
             duplicate_check: tokio::sync::Mutex::new(()),
         })
     }
@@ -1077,6 +1151,7 @@ impl MemoryStore {
         Arc::new(Self {
             connection: None,
             enabled: true,
+            inline_max_bytes: crate::config::MEMORY_INLINE_MAX_BYTES_DEFAULT,
             duplicate_check: tokio::sync::Mutex::new(()),
         })
     }
@@ -1088,6 +1163,7 @@ impl MemoryStore {
         Arc::new(Self {
             connection: None,
             enabled: false,
+            inline_max_bytes: crate::config::MEMORY_INLINE_MAX_BYTES_DEFAULT,
             duplicate_check: tokio::sync::Mutex::new(()),
         })
     }
@@ -1097,10 +1173,27 @@ impl MemoryStore {
         self.enabled
     }
 
+    /// What the in-force inline bodies may total; see [`Self::inline_max_bytes`].
+    pub(crate) fn inline_max_bytes(&self) -> usize {
+        self.inline_max_bytes
+    }
+
+    /// The same database under a different inline budget, which is what a store looks like after
+    /// `[memory] inline_max_bytes` is lowered beneath what it already holds.
+    #[cfg(test)]
+    pub(crate) fn with_inline_max_bytes_for_test(&self, inline_max_bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            connection: self.connection.clone(),
+            enabled: self.enabled,
+            inline_max_bytes,
+            duplicate_check: tokio::sync::Mutex::new(()),
+        })
+    }
+
     /// Serialize a `memory_write`'s near-duplicate check against the write that follows it.
     ///
-    /// Deliberately *not* a write lock. [`Self::write`] is one statement in one transaction, and
-    /// SQLite serializes writers across processes, so nothing about correctness needs this. What
+    /// Deliberately *not* a write lock. [`Self::write`] is one immediate transaction, and SQLite
+    /// serializes writers across processes, so nothing about correctness needs this. What
     /// needs it is the advisory check, which is a read followed by a report: a model emits several
     /// tool calls in one message and meka runs them concurrently, so without this two
     /// `memory_write`s in one turn both query the store before either lands, each sees no
@@ -1152,6 +1245,7 @@ impl MemoryStore {
         Ok(Arc::new(Self {
             connection: Some(Arc::new(connection)),
             enabled: true,
+            inline_max_bytes: crate::config::MEMORY_INLINE_MAX_BYTES_DEFAULT,
             duplicate_check: tokio::sync::Mutex::new(()),
         }))
     }
@@ -1428,11 +1522,17 @@ impl MemoryStore {
     /// is absent from the `DO UPDATE` clause entirely, which is what makes "stamped once at
     /// create" a property of the SQL instead of something every caller has to remember.
     ///
+    /// A write that would leave the in-force inline bodies over `[memory] inline_max_bytes`, and
+    /// larger than they were, is refused inside the same transaction with
+    /// [`MekaError::InvalidRequest`], so nothing of it lands; see [`inline_budget_refusal`].
+    ///
     /// Three of this subsystem's defects were omit-to-keep bugs. None of them is expressible here.
     pub(crate) async fn write(&self, request: WriteRequest) -> Result<Memory> {
         let now = crate::memory::render_stamp(SystemTime::now());
         let name = request.name.clone();
-        self.writable()?
+        let inline_max_bytes = self.inline_max_bytes;
+        let written = self
+            .writable()?
             .call(move |connection| -> rusqlite::Result<_> {
                 // IMMEDIATE, not the `transaction()` default of DEFERRED. A deferred
                 // transaction takes a read snapshot first and upgrades on the write; under WAL,
@@ -1465,6 +1565,10 @@ impl MemoryStore {
                         return Err(rusqlite::Error::QueryReturnedNoRows);
                     }
                 }
+                // Measured ahead of the upsert and judged after it, inside the one transaction, so
+                // the verdict is about this write alone and a refusal rolls the upsert back with
+                // the transaction.
+                let inline_bytes_before = inline_bytes_in_force(&transaction, &now)?;
                 transaction.execute(
                     // `COALESCE(?2, '')` in the VALUES clause, not a bare `?2`: SQLite checks
                     // `NOT NULL` while attempting the insert, before it notices the uniqueness
@@ -1515,13 +1619,21 @@ impl MemoryStore {
                         request.verified,
                     ],
                 )?;
+                if let Some(refusal) = inline_budget_refusal(
+                    &transaction,
+                    &now,
+                    inline_bytes_before,
+                    inline_max_bytes,
+                )? {
+                    return Ok(Guarded::Refused(refusal));
+                }
                 let written = transaction.query_row(
                     &format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE name = ?1"),
                     rusqlite::params![request.name],
                     row_to_memory,
                 )?;
                 transaction.commit()?;
-                Ok(written)
+                Ok(Guarded::Committed(written))
             })
             .await
             .map_err(|error| match error {
@@ -1534,7 +1646,11 @@ impl MemoryStore {
                     ))
                 }
                 error => MekaError::Database(format!("failed to write memory: {error}")),
-            })
+            })?;
+        match written {
+            Guarded::Committed(written) => Ok(written),
+            Guarded::Refused(refusal) => Err(MekaError::InvalidRequest(refusal)),
+        }
     }
 
     /// Replace one memory's body and nothing else, provided it still holds `expected`.
@@ -1569,33 +1685,55 @@ impl MemoryStore {
         let name = name.to_string();
         let expected = expected.to_string();
         let now = crate::memory::render_stamp(SystemTime::now());
-        self.writable()?
+        let inline_max_bytes = self.inline_max_bytes;
+        let outcome = self
+            .writable()?
             .call(move |connection| -> rusqlite::Result<_> {
-                let updated = connection.execute(
+                // Immediate for the reason `write` gives, and a transaction at all so the budget
+                // can be judged after the update and the update taken back with it.
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let inline_bytes_before = inline_bytes_in_force(&transaction, &now)?;
+                let updated = transaction.execute(
                     "UPDATE memories SET body = ?2, updated_at = ?3,
                          verified_at = CASE WHEN ?5 THEN ?3 ELSE verified_at END
                      WHERE name = ?1 AND body = ?4",
                     rusqlite::params![name, body, now, expected, verified],
                 )?;
                 if updated > 0 {
-                    return Ok(BodyWrite::Saved);
+                    if let Some(refusal) = inline_budget_refusal(
+                        &transaction,
+                        &now,
+                        inline_bytes_before,
+                        inline_max_bytes,
+                    )? {
+                        return Ok(Guarded::Refused(refusal));
+                    }
+                    transaction.commit()?;
+                    return Ok(Guarded::Committed(BodyWrite::Saved));
                 }
                 // Zero rows is two different answers, and the caller has to tell them apart: one
                 // says the note is gone, the other says the text moved. Asked after the failed
                 // write rather than before it, so it describes why *this* attempt matched nothing.
-                let still_there: bool = connection.query_row(
+                let still_there: bool = transaction.query_row(
                     "SELECT EXISTS(SELECT 1 FROM memories WHERE name = ?1)",
                     rusqlite::params![name],
                     |row| row.get(0),
                 )?;
-                Ok(if still_there {
+                Ok(Guarded::Committed(if still_there {
                     BodyWrite::ChangedUnderneath
                 } else {
                     BodyWrite::Gone
-                })
+                }))
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to write memory body: {error}")))
+            .map_err(|error| {
+                MekaError::Database(format!("failed to write memory body: {error}"))
+            })?;
+        match outcome {
+            Guarded::Committed(outcome) => Ok(outcome),
+            Guarded::Refused(refusal) => Err(MekaError::InvalidRequest(refusal)),
+        }
     }
 
     /// Delete one memory, returning the row removed. `None` when there was none by that name.
@@ -2530,7 +2668,11 @@ mod tests {
             })
             .await
             .expect("schema");
-        let store = MemoryStore::new(Arc::new(connection), true);
+        let store = MemoryStore::new(
+            Arc::new(connection),
+            true,
+            crate::config::MEMORY_INLINE_MAX_BYTES_DEFAULT,
+        );
 
         let writer = tokio::spawn({
             let store = Arc::clone(&store);
@@ -3956,5 +4098,206 @@ mod tests {
             after > before,
             "a verified note ranks fresher: {before} before, {after} after"
         );
+    }
+
+    /// An inline write, for the budget tests: the body, the load, and nothing else of note.
+    fn inline(name: &str, body: &str) -> WriteRequest {
+        WriteRequest {
+            name: name.to_string(),
+            description: Some(format!("About {name}")),
+            body: Some(body.to_string()),
+            load: Some(crate::memory::Load::Inline),
+            ..WriteRequest::default()
+        }
+    }
+
+    /// A write that would leave the in-force inline bodies over the budget is refused inside its
+    /// own transaction, so nothing of it lands: not the row, not a changed body, not a moved
+    /// `updated_at`. The refusal names the budget and the largest inline memories as they would
+    /// have stood, the one being written among them.
+    #[tokio::test]
+    async fn an_inline_write_past_the_budget_is_refused_and_nothing_lands() {
+        let store = MemoryStore::for_test()
+            .await
+            .expect("store")
+            .with_inline_max_bytes_for_test(100);
+        store
+            .write(inline("tone", &"t".repeat(60)))
+            .await
+            .expect("60 of 100");
+        let refused = store
+            .write(inline("deploy", &"d".repeat(50)))
+            .await
+            .expect_err("110 of 100");
+        let message = refused.to_string();
+        assert!(
+            message.contains("inline memories would total 110 B against the 100 B inline budget"),
+            "{message}"
+        );
+        assert!(
+            message.contains("shorten 'tone' (60 B) or 'deploy' (50 B)"),
+            "{message}"
+        );
+        assert!(message.contains("`load: index`"), "{message}");
+        assert!(
+            store.get("deploy").await.expect("get").is_none(),
+            "the refused row must not exist"
+        );
+
+        // Growing an existing body past the budget is refused the same way, and the row stays as
+        // it was, stamps included.
+        let before = store.get("tone").await.expect("get").expect("tone");
+        let refused = store
+            .write(inline("tone", &"t".repeat(101)))
+            .await
+            .expect_err("101 of 100");
+        assert!(refused.to_string().contains("'tone' (101 B)"), "{refused}");
+        let after = store.get("tone").await.expect("get").expect("tone");
+        assert_eq!(after, before, "a refused write leaves the row as it was");
+
+        // Exactly the budget is admitted.
+        store
+            .write(inline("deploy", &"d".repeat(40)))
+            .await
+            .expect("100 of 100");
+    }
+
+    /// Only a write that grows an overfull tier is refused. Shrinking it, leaving its size alone
+    /// or moving a memory out of the band always lands, or a store the budget was lowered under
+    /// could never be brought back within it one memory at a time.
+    #[tokio::test]
+    async fn an_overfull_inline_tier_can_be_trimmed_but_not_grown() {
+        let roomy = MemoryStore::for_test().await.expect("store");
+        for name in ["a", "b", "c"] {
+            roomy
+                .write(inline(name, &"x".repeat(300)))
+                .await
+                .expect("write under the default budget");
+        }
+        // The budget lowered beneath what the store holds.
+        let store = roomy.with_inline_max_bytes_for_test(100);
+
+        store
+            .write(inline("a", &"x".repeat(250)))
+            .await
+            .expect("shrinking lands though the tier is still over");
+        store
+            .write(WriteRequest {
+                name: "b".to_string(),
+                description: Some("reworded".to_string()),
+                ..WriteRequest::default()
+            })
+            .await
+            .expect("a write that leaves the tier where it is lands");
+        store
+            .write(WriteRequest {
+                name: "c".to_string(),
+                load: Some(crate::memory::Load::Index),
+                ..WriteRequest::default()
+            })
+            .await
+            .expect("moving a memory out of the band lands");
+
+        store
+            .write(inline("d", "x"))
+            .await
+            .expect_err("a new inline memory grows the tier");
+        store
+            .write(inline("a", &"x".repeat(251)))
+            .await
+            .expect_err("a body growing by one byte grows the tier");
+        store
+            .write(WriteRequest {
+                name: "c".to_string(),
+                load: Some(crate::memory::Load::Inline),
+                ..WriteRequest::default()
+            })
+            .await
+            .expect_err("moving a body back into the band grows the tier");
+
+        // The body door follows the same rule.
+        let shrunk = "x".repeat(240);
+        store
+            .write_body("a", &"x".repeat(250), shrunk.clone(), false)
+            .await
+            .expect("shrinking through the body door lands");
+        let refused = store
+            .write_body("a", &shrunk, "x".repeat(241), false)
+            .await
+            .expect_err("growing through the body door is refused");
+        assert!(
+            refused.to_string().contains("inline memories would total"),
+            "{refused}"
+        );
+        assert_eq!(
+            store
+                .get("a")
+                .await
+                .expect("get")
+                .expect("a")
+                .body
+                .as_deref(),
+            Some(shrunk.as_str()),
+            "a refused body write leaves the body as it was"
+        );
+    }
+
+    /// The budget counts the bodies the band renders: an inline memory past its expiry, an
+    /// `index` memory however long and an empty body spend nothing, and a cleared expiry brings a
+    /// body back into the count.
+    #[tokio::test]
+    async fn the_inline_budget_counts_in_force_inline_bodies_only() {
+        let store = MemoryStore::for_test()
+            .await
+            .expect("store")
+            .with_inline_max_bytes_for_test(100);
+        let past = Some(Some(SystemTime::now() - Duration::from_secs(60)));
+        store
+            .write(WriteRequest {
+                expires_at: past,
+                ..inline("old", &"o".repeat(90))
+            })
+            .await
+            .expect("an expired inline body spends nothing");
+        store
+            .write(WriteRequest {
+                load: Some(crate::memory::Load::Index),
+                ..inline("handbook", &"h".repeat(5_000))
+            })
+            .await
+            .expect("an index body spends nothing");
+        store
+            .write(inline("tone", &"t".repeat(90)))
+            .await
+            .expect("90 of 100");
+
+        // Clearing the expiry would put `old` back in force: 180 of 100.
+        let refused = store
+            .write(WriteRequest {
+                name: "old".to_string(),
+                expires_at: Some(None),
+                ..WriteRequest::default()
+            })
+            .await
+            .expect_err("a cleared expiry brings the body back into the count");
+        assert!(refused.to_string().contains("'old' (90 B)"), "{refused}");
+
+        // Expiring `tone` instead frees its bytes, and `old` can come back.
+        store
+            .write(WriteRequest {
+                name: "tone".to_string(),
+                expires_at: past,
+                ..WriteRequest::default()
+            })
+            .await
+            .expect("expiring shrinks the tier");
+        store
+            .write(WriteRequest {
+                name: "old".to_string(),
+                expires_at: Some(None),
+                ..WriteRequest::default()
+            })
+            .await
+            .expect("90 of 100 again");
     }
 }

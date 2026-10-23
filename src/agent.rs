@@ -616,6 +616,12 @@ impl Agent {
         self.store.clone()
     }
 
+    /// The memory store this agent writes through, for the screen's `/memory` commands, so they
+    /// read the store under the same inline budget the agent's writes are held to.
+    pub(crate) fn memories(&self) -> &Arc<MemoryStore> {
+        &self.memories
+    }
+
     /// Shared handle to the auto-refreshing skill cache. The screen's `/skill <name>` dispatch
     /// reads from this so the agent's system prompt and the user-invocable list never diverge.
     pub(crate) fn skills(&self) -> &Arc<SkillCache> {

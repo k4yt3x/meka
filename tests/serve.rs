@@ -7438,6 +7438,51 @@ fn a_skill_body_round_trips_through_get_and_put() {
     );
 }
 
+/// `PUT /v1/memory/{name}` is held to `[memory] inline_max_bytes` like every other door: an
+/// inline body the budget cannot take is a 422 carrying the store's sentence, and nothing lands.
+#[test]
+fn put_memory_refuses_an_inline_body_past_the_configured_budget() {
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "[memory]\ninline_max_bytes = 64\n",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["memory:r", "memory:w"],
+    );
+    let admitted = harness
+        .request(reqwest::Method::PUT, "/v1/memory/tone")
+        .json(&serde_json::json!({
+            "description": "How to answer",
+            "load": "inline",
+            "body": "t".repeat(60),
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(admitted.status(), 200, "60 of 64");
+    let refused = harness
+        .request(reqwest::Method::PUT, "/v1/memory/deploy")
+        .json(&serde_json::json!({
+            "description": "Deploy rules",
+            "load": "inline",
+            "body": "dddddddddd",
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(refused.status(), 422, "70 of 64");
+    let body: serde_json::Value = refused.json().expect("problem detail");
+    let detail = body["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains("inline memories would total 70 B against the 64 B inline budget")
+            && detail.contains("'tone' (60 B)"),
+        "{detail}"
+    );
+    let missing = harness
+        .request(reqwest::Method::GET, "/v1/memory/deploy")
+        .send()
+        .expect("send");
+    assert_eq!(missing.status(), 404, "nothing of the refused write lands");
+}
+
 /// The memory routes carry every field the tool carries, `GET /v1/memory/{name}` adds the
 /// backlinks, the list takes the three filters with and without `q`, and an empty `expires`
 /// clears the expiry the way the tool's does.

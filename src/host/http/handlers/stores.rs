@@ -511,7 +511,7 @@ pub(crate) struct WriteMemoryRequest {
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid name, empty description, or an unwritable path", body = ProblemDetail),
+        (status = 422, description = "Invalid name, empty description, or an inline body the budget cannot take", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["memory:w"]))
@@ -558,10 +558,10 @@ pub(crate) async fn put_memory(
         Some(raw) => Some(Some(crate::memory::parse_expiry(raw).map_err(store_error)?)),
     };
 
-    // One upsert, one transaction, and no lock. No `flock` and no blocking pool: the write is a
-    // single statement rather than a read-modify-write over a file, which is what would make two
-    // overlapping PUTs to one name last-writer-wins over a stale read. Omit-to-keep now lives in
-    // the SQL, so there is no read to go stale and SQLite serializes the writers.
+    // One upsert in one immediate transaction, and no lock. No `flock` and no blocking pool: the
+    // write is not a read-modify-write over a file, which is what would make two overlapping PUTs
+    // to one name last-writer-wins over a stale read. Omit-to-keep lives in the SQL, the budget
+    // verdict is read inside the same transaction, and SQLite serializes the writers.
     let written = state
         .shared
         .memories
@@ -578,7 +578,12 @@ pub(crate) async fn put_memory(
             verified: body.verified.unwrap_or(false),
         })
         .await
-        .map_err(memory_failure)?;
+        .map_err(|error| match error {
+            // The store's own refusal, which names the budget and what to shorten: the client's
+            // to act on, not a fault to hide behind the generic sentence.
+            crate::error::MekaError::InvalidRequest(refusal) => store_error(refusal),
+            error => memory_failure(error),
+        })?;
     tracing::info!("wrote memory '{name}' via HTTP");
     Ok(Json(MemoryDetail::new(&written, None)))
 }

@@ -83,10 +83,13 @@ impl Tool for MemoryWriteTool {
                     "load": {
                         "type": "string",
                         "enum": ["inline", "index", "search"],
-                        "description": "How the memory reaches your context: `inline` puts the body in every \
-                                        turn, for a rule you must follow without looking it up; `index` lists \
-                                        the description every turn; `search` leaves it to memory_search alone. \
-                                        Default: index. Omit to keep."
+                        "description": format!(
+                            "How the memory reaches your context: `inline` puts the body in every \
+                             turn, for a rule you must follow without looking it up, within the {} \
+                             all inline bodies share; `index` lists the description every turn; \
+                             `search` leaves it to memory_search alone. Default: index. Omit to keep.",
+                            crate::text::format_size(self.memories.inline_max_bytes())
+                        )
                     },
                     "references": {
                         "type": "array",
@@ -3994,6 +3997,105 @@ mod tests {
                 .expect("row")
                 .references,
             ["hub"]
+        );
+    }
+
+    /// The budget is stated on the schema and enforced at both agent doors: a `memory_write` or
+    /// a `memory_edit` that would leave the inline tier over it is refused with the store's own
+    /// sentence, which names what to shorten, and nothing lands.
+    #[tokio::test]
+    async fn an_inline_write_or_edit_past_the_budget_is_refused_with_the_remedy() {
+        let memories = store().await.with_inline_max_bytes_for_test(100);
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+        };
+        let context = || crate::tools::ToolContext::detached(CancellationToken::new());
+        let schema = write.definition().parameters;
+        let load = schema["properties"]["load"]["description"]
+            .as_str()
+            .expect("load description");
+        assert!(
+            load.contains("within the 100 B all inline bodies share"),
+            "{load}"
+        );
+
+        write
+            .execute(
+                serde_json::json!({
+                    "name": "tone",
+                    "description": "How to answer",
+                    "body": "t".repeat(60),
+                    "load": "inline"
+                }),
+                context(),
+            )
+            .await
+            .expect("60 of 100");
+        let refused = write
+            .execute(
+                serde_json::json!({
+                    "name": "deploy",
+                    "description": "Deploy rules",
+                    "body": "d".repeat(50),
+                    "load": "inline"
+                }),
+                context(),
+            )
+            .await
+            .expect_err("110 of 100");
+        let message = refused.to_string();
+        assert!(
+            message.contains("inline memories would total 110 B against the 100 B inline budget")
+                && message.contains("shorten 'tone' (60 B) or 'deploy' (50 B)"),
+            "{message}"
+        );
+        assert!(
+            memories.get("deploy").await.expect("get").is_none(),
+            "nothing lands"
+        );
+
+        // The same body as an `index` memory is fine, and growing the inline one through an
+        // edit is refused the same way.
+        write
+            .execute(
+                serde_json::json!({
+                    "name": "deploy",
+                    "description": "Deploy rules",
+                    "body": "d".repeat(50)
+                }),
+                context(),
+            )
+            .await
+            .expect("an index body spends nothing");
+        let edit = MemoryEditTool {
+            memories: memories.clone(),
+        };
+        let refused = edit
+            .execute(
+                serde_json::json!({
+                    "name": "tone",
+                    "old_string": "t".repeat(60),
+                    "new_string": "t".repeat(101)
+                }),
+                context(),
+            )
+            .await
+            .expect_err("101 of 100");
+        assert!(
+            refused
+                .to_string()
+                .contains("inline memories would total 101 B"),
+            "{refused}"
+        );
+        assert_eq!(
+            memories
+                .get("tone")
+                .await
+                .expect("get")
+                .expect("tone")
+                .body
+                .as_deref(),
+            Some("t".repeat(60).as_str())
         );
     }
 }

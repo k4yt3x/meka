@@ -443,8 +443,16 @@ impl Store {
     /// Handle on the memory store. See [`crate::store::memory`] for why it shares this database
     /// rather than owning one: meka has one database, and a second would be a new thing to back
     /// up, lock and explain for the sake of two tables.
-    pub(crate) fn memory_store(&self, enabled: bool) -> Arc<crate::store::memory::MemoryStore> {
-        crate::store::memory::MemoryStore::new(Arc::clone(&self.connection), enabled)
+    pub(crate) fn memory_store(
+        &self,
+        enabled: bool,
+        inline_max_bytes: usize,
+    ) -> Arc<crate::store::memory::MemoryStore> {
+        crate::store::memory::MemoryStore::new(
+            Arc::clone(&self.connection),
+            enabled,
+            inline_max_bytes,
+        )
     }
 
     /// The background-tasks table, on this store's connection.

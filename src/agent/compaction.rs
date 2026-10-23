@@ -3555,7 +3555,8 @@ mod tests {
                     calls: Arc::new(std::sync::Mutex::new(Vec::new())),
                 }))
                 .expect("memory tool");
-            agent.memories = store.memory_store(true);
+            agent.memories =
+                store.memory_store(true, crate::config::MEMORY_INLINE_MAX_BYTES_DEFAULT);
             let note = |body: &str| crate::store::memory::WriteRequest {
                 name: "standing-note".into(),
                 description: Some("Current constraints".into()),

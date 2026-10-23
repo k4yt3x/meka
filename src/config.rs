@@ -294,6 +294,31 @@ impl Default for ResolvedBackgroundConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct MemoryConfig {
     pub(crate) enabled: Option<bool>,
+    /// Ceiling on the bytes the bodies of the in-force inline memories may total. A write that
+    /// would take the tier past it is refused at every door, so what the ceiling admits is what
+    /// the model is shown whole. See [`MEMORY_INLINE_MAX_BYTES_DEFAULT`].
+    pub(crate) inline_max_bytes: Option<usize>,
+}
+
+/// `[memory] inline_max_bytes` when the file does not set it.
+///
+/// Sized for a standing rule set rather than a handbook. The inline band is rendered into the
+/// opening message once per session and again after each compaction, so it is prefix the cache
+/// holds rather than a per-turn cost, and 32 KiB is about 8k tokens.
+pub(crate) const MEMORY_INLINE_MAX_BYTES_DEFAULT: usize = 32 * crate::text::KIB;
+
+impl MemoryConfig {
+    /// `[memory] inline_max_bytes` from a file's table, or its default when the table or the key
+    /// is absent.
+    ///
+    /// Answered from the table rather than only through [`ResolvedConfig`] because the CLI
+    /// subcommands open the store without resolving one, and `meka memory add` writes through the
+    /// same door the hosts do.
+    pub(crate) fn inline_max_bytes(memory: Option<&Self>) -> usize {
+        memory
+            .and_then(|memory| memory.inline_max_bytes)
+            .unwrap_or(MEMORY_INLINE_MAX_BYTES_DEFAULT)
+    }
 }
 
 /// `[permissions]` table: choose which levels are reachable at runtime and which level the
@@ -1774,6 +1799,8 @@ pub(crate) struct ResolvedConfig {
     /// Whether the `memory_*` tools are registered and the `[Memory]` index rendered. Defaults to
     /// `true`; see [`MemoryConfig`].
     pub(crate) memory_enabled: bool,
+    /// `[memory] inline_max_bytes` with its default filled; see [`MemoryConfig`].
+    pub(crate) memory_inline_max_bytes: usize,
     /// `[schedule]` with defaults filled. Resolved here rather than at the call site because both
     /// the screen and `meka serve` start a scheduler and would otherwise each re-derive it.
     pub(crate) schedule: ResolvedScheduleConfig,
@@ -2463,6 +2490,7 @@ impl ResolvedConfig {
                  registered at all; set enabled = true to let the agent author skills"
             );
         }
+        let memory_inline_max_bytes = MemoryConfig::inline_max_bytes(config_file.memory.as_ref());
         let memory_enabled = config_file
             .memory
             .unwrap_or_default()
@@ -2685,6 +2713,7 @@ impl ResolvedConfig {
             skills_agent_managed,
             skills_additional_directories,
             memory_enabled,
+            memory_inline_max_bytes,
             schedule,
             background,
             subagents,
@@ -2752,6 +2781,14 @@ impl ResolvedConfig {
         validate_fallback_chains(&self.accounts, &self.profiles, self.session_context_window)
             .map_err(crate::error::MekaError::Config)?;
         warn_about_inert_profile_keys(&self.accounts, &self.profiles);
+        // Zero would refuse every inline memory at every door while the model is still offered
+        // `load: inline`; the switch for a session without memories is `enabled`.
+        if self.memory_inline_max_bytes == 0 {
+            return Err(crate::error::MekaError::Config(format!(
+                "`[memory].inline_max_bytes = 0` would refuse every inline memory; remove the key \
+                 for the default of {MEMORY_INLINE_MAX_BYTES_DEFAULT}"
+            )));
+        }
         // `retention = "0s"` means "delete anything not updated in the last zero seconds", i.e.
         // every session, on every startup. Nobody means that, and the cost of guessing wrong is
         // unrecoverable, so refuse rather than run it once and find out.
@@ -3673,6 +3710,39 @@ model = "m"
         }
     }
 
+    /// The inline budget comes from the file with a default, and zero is refused at startup: it
+    /// would refuse every inline write while the model is still offered the load.
+    #[test]
+    fn the_inline_budget_comes_from_the_file_and_zero_is_refused() {
+        let provider = r#"
+default_profile = "p"
+
+[accounts.p]
+backend = "openai-chat-completions"
+
+[profiles.p]
+account = "p"
+model = "m"
+"#;
+        let resolved = resolve_with_config(provider);
+        assert_eq!(
+            resolved.memory_inline_max_bytes,
+            MEMORY_INLINE_MAX_BYTES_DEFAULT
+        );
+        let resolved =
+            resolve_with_config(&format!("{provider}\n[memory]\ninline_max_bytes = 4096\n"));
+        assert_eq!(resolved.memory_inline_max_bytes, 4096);
+        resolved.validate().expect("a positive budget is fine");
+
+        let resolved =
+            resolve_with_config(&format!("{provider}\n[memory]\ninline_max_bytes = 0\n"));
+        let error = resolved.validate().expect_err("zero must be refused");
+        assert!(
+            error.to_string().contains("[memory].inline_max_bytes"),
+            "{error}"
+        );
+    }
+
     /// A zero connect timeout fails every server before it connects; unlike `grace`, where zero
     /// means "do not wait", there is no reading of it anyone wants.
     #[test]
@@ -3985,15 +4055,20 @@ url = "http://127.0.0.1:9100/mcp"
             r#"
 [memory]
 enabled = false
+inline_max_bytes = 4096
 
 [skills]
 enabled = true
 "#,
         )
         .expect("failed to parse toml");
+        let memory = config.memory.as_ref().expect("memory table present");
+        assert_eq!(memory.enabled, Some(false));
+        assert_eq!(memory.inline_max_bytes, Some(4096));
+        assert_eq!(MemoryConfig::inline_max_bytes(config.memory.as_ref()), 4096);
         assert_eq!(
-            config.memory.expect("memory table present").enabled,
-            Some(false)
+            MemoryConfig::inline_max_bytes(None),
+            MEMORY_INLINE_MAX_BYTES_DEFAULT
         );
         assert_eq!(
             config.skills.expect("skills table present").enabled,

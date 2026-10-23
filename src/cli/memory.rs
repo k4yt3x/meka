@@ -768,10 +768,13 @@ async fn require_memory(store: &MemoryStore, name: &str) -> Result<memory::Memor
 pub(crate) async fn run_memory_subcommand(
     store: &Store,
     action: &crate::cli::MemoryAction,
+    inline_max_bytes: usize,
 ) -> anyhow::Result<()> {
     // Deliberately not gated on `[memory] enabled`. That switch decides whether an *agent* keeps
     // memories; it is not a reason to refuse to show, back up or delete what is already stored.
-    let store = store.memory_store(true);
+    // The inline budget does apply: it is a bound on what the band shows whole, and an operator's
+    // `add` past it would put the store in the state the agent's own writes are refused for.
+    let store = store.memory_store(true, inline_max_bytes);
     match action {
         crate::cli::MemoryAction::List {
             format,
@@ -1184,6 +1187,71 @@ mod tests {
                 .as_deref(),
             Some("WHAT THE AGENT LEARNED"),
             "and the write it would have discarded is still there"
+        );
+        if let Some(directory) = kept.parent() {
+            std::fs::remove_dir_all(directory).expect("clean up the kept scratch");
+        }
+    }
+
+    /// The editor door is held to the inline budget like every other, and a save it refuses for
+    /// that reason keeps the user's text the way a save refused for a moved body does.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_edit_past_the_inline_budget_is_refused_and_keeps_what_the_user_typed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _guard = crate::entry::EDITOR_ENV_LOCK.lock().await;
+        let store = MemoryStore::for_test()
+            .await
+            .expect("store")
+            .with_inline_max_bytes_for_test(16);
+        store
+            .write(WriteRequest {
+                name: "rule".to_string(),
+                description: Some("d".to_string()),
+                body: Some("ORIGINAL".to_string()),
+                load: Some(memory::Load::Inline),
+                ..WriteRequest::default()
+            })
+            .await
+            .expect("8 of 16");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let editor = temp.path().join("editor.sh");
+        std::fs::write(
+            &editor,
+            "#!/bin/sh\nprintf ' plus a long addition' >> \"$1\"\n",
+        )
+        .expect("write the editor");
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let _editor_env = EditorEnv::pointing_at(&editor);
+
+        let error = run_edit(&store, "rule")
+            .await
+            .expect_err("29 of 16 must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("inline memories would total 29 B against the 16 B inline budget"),
+            "{message}"
+        );
+        let kept = message
+            .rsplit("it is in ")
+            .next()
+            .map(std::path::PathBuf::from)
+            .expect("the message must name the file");
+        assert_eq!(
+            std::fs::read_to_string(&kept).expect("read it back"),
+            "ORIGINAL plus a long addition"
+        );
+        assert_eq!(
+            store
+                .get("rule")
+                .await
+                .expect("get")
+                .expect("row")
+                .body
+                .as_deref(),
+            Some("ORIGINAL"),
+            "nothing of the refused save lands"
         );
         if let Some(directory) = kept.parent() {
             std::fs::remove_dir_all(directory).expect("clean up the kept scratch");

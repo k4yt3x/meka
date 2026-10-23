@@ -7568,7 +7568,8 @@ mod tests {
         params.parent_options.streaming = true;
         params.parent_options.auto_compact = true;
         params.parent_options.compact_checkpoint = true;
-        params.materials.memories = store.memory_store(true);
+        params.materials.memories =
+            store.memory_store(true, crate::config::MEMORY_INLINE_MAX_BYTES_DEFAULT);
         params
             .materials
             .memories

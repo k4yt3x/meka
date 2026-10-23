@@ -8,7 +8,7 @@ Without it, an agent's only state is its context window. When a long session com
 
 - Memories are rows in the `memories` table of the store (`~/.local/share/meka/meka.db`, or under `MEKA_DATA_DIR`), one row per memory.
 - The store is scoped to the **meka instance**, not to a session or a directory. Everything sharing a `MEKA_DATA_DIR` shares one memory; pointing a deployment at its own data dir gives it its own.
-- The per-turn context includes a bounded memory index, updated when it changes. A memory's `load` decides how it gets there: an `inline` body is rendered in full within its own budget, an `index` memory is listed by its description, and a `search` memory is reached by `memory_search` alone. Other bodies are read on demand with `memory_read`.
+- The per-turn context includes a bounded memory index, updated when it changes. A memory's `load` decides how it gets there: an `inline` body is rendered whole, within a budget every inline body shares, an `index` memory is listed by its description, and a `search` memory is reached by `memory_search` alone. Other bodies are read on demand with `memory_read`.
 - The index is re-stated in full at the start of a session, after every compaction, and whenever it scrolls out of the context window. This is what makes memory survive compaction.
 - The agent is told to save durable preferences, constraints, decisions, and facts, to keep temporary task state in the scratchpad, and that current instructions and corrections take precedence over stored preferences.
 - Memories are available at every permission level except **none**; all five memory tools ask only for **read**. Writing a memory therefore needs no write authority over your files, and `workspace`'s boundary does not apply to it: the store belongs to meka, not to your working tree.
@@ -74,13 +74,25 @@ Because the agent picks a priority at write time and everything feels important 
 
 | Value | What the per-turn context carries |
 |---|---|
-| `inline` | The whole body, within the band's budget. For a standing directive the body is the directive, and leaving it behind a tool call means the agent has to look the rule up before it can follow it. |
+| `inline` | The whole body, every turn. For a standing directive the body is the directive, and leaving it behind a tool call means the agent has to look the rule up before it can follow it. Inline bodies share one budget; see [The inline budget](#the-inline-budget). |
 | `index` | The description, as one line of the index. The default. |
 | `search` | Nothing. The memory is reached by `memory_search` alone: a runbook, a reference note, anything worth keeping that is not worth a line every turn. |
 
-The inline band is budgeted separately from the index (4 KiB in total, 1,024 characters per memory) so a long directive cannot crowd out the index and the index cannot crowd out the directives. It is not a promise of unlimited space. A memory the band cannot fit falls through to the index below, and on a large store the index has its own ceiling to ration, so past a few dozen inline memories some of them fit nowhere. The section says so explicitly when it happens, naming how many are listed by description and how many were left out entirely, because a rule the agent never sees is one it is being held to and cannot read. If you see that line, trim the tier: a hundred always-apply rules is not an always-apply tier.
-
 The index ends with a count of the memories it lists nowhere, the search-only ones and the [expired](#expiry) ones, so the agent knows there is more than it can see. On upgrade from a release before `load`, every priority-0 memory becomes `inline` and everything else `index`, which is what the priority used to mean.
+
+## The inline budget
+
+Inline bodies share one budget, [`[memory] inline_max_bytes`](../configuration/config-file.md#memory), 32 KiB unless set. It is counted in bytes of body text over the inline memories that are in force: an expired inline memory, an `index` memory however long its body, and an empty body spend nothing. The band is rendered into the opening message once per session and again after each compaction, so what the budget admits costs prefix tokens the cache holds, not tokens on every turn.
+
+A write that would take the tier past the budget is refused at every door alike: `memory_write`, `memory_edit`, `meka memory add`, `meka memory edit` and `PUT /v1/memory/{name}`. The refusal states the total the tier would have reached, names the largest inline memories as they would stand, and gives the remedy: shorten one, or set `load: index` on one that is not a standing rule. Nothing of a refused write lands. A write that shrinks the tier, or leaves its size alone, always goes through, so a store over the budget can be brought back within it one memory at a time.
+
+```
+inline memories would total 33.4 KiB against the 32.0 KiB inline budget (`[memory]
+inline_max_bytes`); shorten 'handbook' (20.1 KiB), 'deploy' (6.2 KiB) or 'tone' (1.1 KiB), or
+set `load: index` on one that is not a standing rule
+```
+
+The budget is what the agent reads whole, and the doors keep a store within it. A store can still be over it: the key lowered beneath what the store already holds, the upgrade that made every priority-0 memory `inline`, or a row written past meka's doors. The band then shows the bodies that fit, in index order, and lists the rest by description under a sentence stating the total against the budget and asking the agent to read one before relying on it and to shorten them or change their load; that list is held to the index's own ceilings and counts what it cannot list, with the same tag histogram and `memory_search` pointer the index footer carries. No body is ever cut partway: a rule is shown whole or named as not shown. Mid-session the context changes carry the same: a memory pushed out of the band is named, and one that fits again after a cleanup is restated whole, since the agent has only ever seen its description.
 
 ## The index budget
 

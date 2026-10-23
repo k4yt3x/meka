@@ -891,6 +891,7 @@ impl Agent {
         };
         let mut current =
             prompt::WorldSnapshot::new(&catalog, &skills, &memories, &mcp_instructions, &scheduled)
+                .with_inline_max_bytes(self.memories.inline_max_bytes())
                 .with_gate_authority(
                     self.store.scheduler_memory(),
                     &scheduled,
@@ -6086,7 +6087,7 @@ mod tests {
         let store = Store::open(Some(&temp.path().join("meka.db")), &Default::default())
             .await
             .expect("open");
-        let memories = store.memory_store(true);
+        let memories = store.memory_store(true, crate::config::MEMORY_INLINE_MAX_BYTES_DEFAULT);
         let registry = crate::tools::ToolRegistry::new();
         registry
             .register(Arc::new(MemoryReadFixture))
@@ -6693,7 +6694,7 @@ mod tests {
         let store = Store::open(Some(&temp.path().join("meka.db")), &Default::default())
             .await
             .expect("open");
-        let memories = store.memory_store(true);
+        let memories = store.memory_store(true, crate::config::MEMORY_INLINE_MAX_BYTES_DEFAULT);
         memories
             .write(crate::store::memory::WriteRequest {
                 name: "deploy-policy".to_string(),

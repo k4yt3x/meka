@@ -241,7 +241,7 @@ pub(crate) async fn build_shared_deps(
     };
     // Always connected, `enabled` carrying the config switch: it gates the agent's tools, not the
     // operator's access to a store that already exists.
-    let memories = store.memory_store(config.memory_enabled);
+    let memories = store.memory_store(config.memory_enabled, config.memory_inline_max_bytes);
     let builtin_filter = crate::config::BuiltinToolFilter::from_config(
         config.builtin_allowed_tools.clone(),
         config.builtin_disabled_tools.clone(),

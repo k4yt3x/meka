@@ -3346,6 +3346,75 @@ fn memory_list_get_and_show_print_json_and_only_show_carries_the_body() {
     assert_eq!(shown["body"], "detail line");
 }
 
+/// `memory add` is held to `[memory] inline_max_bytes` like the agent's own writes: an inline
+/// body the budget cannot take is refused with the store's sentence, and nothing of it lands.
+#[test]
+fn memory_add_refuses_an_inline_body_past_the_configured_budget() {
+    let install = Install::new();
+    let config_dir = install.config_dir();
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[memory]\ninline_max_bytes = 64\n",
+    )
+    .expect("write config.toml");
+    let sixty = "t".repeat(60);
+    let added = run_isolated(&install, &[
+        "memory",
+        "add",
+        "tone",
+        "--description",
+        "How to answer",
+        "--load",
+        "inline",
+        "--body",
+        &sixty,
+    ]);
+    assert!(
+        added.status.success(),
+        "60 of 64: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let refused = run_isolated(&install, &[
+        "memory",
+        "add",
+        "deploy",
+        "--description",
+        "Deploy rules",
+        "--load",
+        "inline",
+        "--body",
+        "dddddddddd",
+    ]);
+    assert!(!refused.status.success(), "70 of 64 must be refused");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("inline memories would total 70 B against the 64 B inline budget")
+            && stderr.contains("'tone' (60 B)"),
+        "{stderr}"
+    );
+    let shown = run_isolated(&install, &["memory", "show", "deploy"]);
+    assert!(
+        !shown.status.success(),
+        "nothing of the refused write lands"
+    );
+    // The same body as an index memory is fine: the budget counts inline bodies alone.
+    let indexed = run_isolated(&install, &[
+        "memory",
+        "add",
+        "deploy",
+        "--description",
+        "Deploy rules",
+        "--body",
+        "dddddddddd",
+    ]);
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+}
+
 /// `memory add` takes every field the tool takes, `get` prints each one it holds and the
 /// backlinks, `list` filters by them, and an empty `--expires` clears the expiry the way the
 /// tool's `""` does.

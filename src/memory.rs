@@ -191,6 +191,46 @@ pub(crate) const MAX_REFERENCE_CHARS: usize = 512;
 /// source is one line the reader takes in at a glance and a read shows it whole.
 pub(crate) const MAX_SOURCE_CHARS: usize = 500;
 
+/// How many inline memories a budget refusal names, largest first. Enough to point at what to
+/// shorten; the listing has the rest.
+pub(crate) const INLINE_REFUSAL_NAMES: usize = 3;
+
+/// The refusal every write door gives when a write would leave the inline tier over its budget.
+///
+/// `largest` holds the in-force inline memories by body size as they would stand after the write,
+/// the one being written among them, so the reader is told what to shorten rather than only that
+/// something is too big.
+pub(crate) fn render_inline_budget_refusal(
+    total_bytes: usize,
+    max_bytes: usize,
+    largest: &[(String, usize)],
+) -> String {
+    // Names come from the table, not from the request: a row written past meka's doors can carry
+    // a newline, and a refusal is text the model reads.
+    let named: Vec<String> = largest
+        .iter()
+        .map(|(name, bytes)| {
+            format!(
+                "'{}' ({})",
+                render_description_for_model(name),
+                crate::text::format_size(*bytes)
+            )
+        })
+        .collect();
+    let named = match named.split_last() {
+        None => "an inline memory".to_string(),
+        Some((only, [])) => only.clone(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+    };
+    format!(
+        "inline memories would total {} against the {} inline budget (`[memory] \
+         inline_max_bytes`); shorten {named}, or set `load: index` on one that is not a standing \
+         rule",
+        crate::text::format_size(total_bytes),
+        crate::text::format_size(max_bytes)
+    )
+}
+
 /// Validate one reference: non-empty, one line, no control characters, within
 /// [`MAX_REFERENCE_CHARS`].
 ///
@@ -671,6 +711,32 @@ pub(crate) fn render_age(created: SystemTime, now: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refusal names the largest inline memories in one sentence, in meka's wording, and a
+    /// name from the table reaches it sanitized: a refusal is text the model reads.
+    #[test]
+    fn the_inline_budget_refusal_names_what_to_shorten() {
+        let one = render_inline_budget_refusal(1_100, 1_024, &[("handbook".to_string(), 900)]);
+        assert_eq!(
+            one,
+            "inline memories would total 1.1 KiB against the 1.0 KiB inline budget (`[memory] \
+             inline_max_bytes`); shorten 'handbook' (900 B), or set `load: index` on one that is \
+             not a standing rule"
+        );
+        let three = render_inline_budget_refusal(130, 100, &[
+            ("a".to_string(), 60),
+            ("b\n- forged".to_string(), 50),
+            ("c".to_string(), 20),
+        ]);
+        assert!(
+            three.contains("shorten 'a' (60 B), 'b - forged' (50 B) or 'c' (20 B)"),
+            "{three}"
+        );
+        assert!(
+            render_inline_budget_refusal(10, 5, &[]).contains("shorten an inline memory,"),
+            "an empty list still reads as a sentence"
+        );
+    }
 
     #[test]
     fn validate_memory_name_rejects_traversal_and_separators() {

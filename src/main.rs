@@ -223,16 +223,23 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
             // the raw document through `toml_edit` and are how a user *repairs* such a file;
             // refusing every subcommand would close the only door out. The migration refuses
             // instead, and only when it actually has rows to stamp.
-            let (installation, default_permission, context) =
+            let (installation, default_permission, context, memory_inline_max_bytes) =
                 match config::default_profile_on_disk(None) {
                     Ok(adopted) => {
-                        // The file is read again for its profile table, which the default reader
-                        // does not hand back.
-                        let configured = config::load_config_file_or_err()?.profiles;
+                        // The file is read again for its profile table and its memory table,
+                        // which the default reader does not hand back.
+                        let file = config::load_config_file_or_err()?;
+                        let memory_inline_max_bytes =
+                            config::MemoryConfig::inline_max_bytes(file.memory.as_ref());
                         let permission = config::default_permission_on_disk()?;
                         let context = store::migrations::Context::adopting(adopted.as_deref())
                             .starting_at(&permission.to_string());
-                        (Some((adopted, configured)), Some(permission), context)
+                        (
+                            Some((adopted, file.profiles)),
+                            Some(permission),
+                            context,
+                            memory_inline_max_bytes,
+                        )
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -243,6 +250,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                             None,
                             None,
                             store::migrations::Context::on_unreadable_config(),
+                            config::MEMORY_INLINE_MAX_BYTES_DEFAULT,
                         )
                     }
                 };
@@ -285,7 +293,8 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                     cli::skills::run_skill_subcommand(action, cli_ref).await
                 }
                 cli::Command::Memory { action } => {
-                    cli::memory::run_memory_subcommand(&store, action).await
+                    cli::memory::run_memory_subcommand(&store, action, memory_inline_max_bytes)
+                        .await
                 }
                 cli::Command::Instructions { action } => {
                     cli::instructions::run_instructions_subcommand(action)

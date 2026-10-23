@@ -1954,7 +1954,7 @@ impl Screen {
                 }
             }
             SlashCommand::MemoryList => {
-                let store = self.launch.store.memory_store(true);
+                let store = Arc::clone(self.launch.agent.memories());
                 match store.index().await {
                     Ok(index) if index.is_empty() => self.reply("No memories."),
                     Ok(index) => {
@@ -1974,7 +1974,7 @@ impl Screen {
                 }
             }
             SlashCommand::MemoryShow { name } => {
-                let store = self.launch.store.memory_store(true);
+                let store = Arc::clone(self.launch.agent.memories());
                 let (outcome, printed) = capture(crate::cli::memory::run_show(&store, &name)).await;
                 self.listing_panel(printed, outcome);
             }

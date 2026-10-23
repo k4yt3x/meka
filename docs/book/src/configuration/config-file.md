@@ -1181,6 +1181,7 @@ Controls the agent's durable note store. See the [Memory](../usage/memory.md) gu
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Register the `memory_*` tools and render the memory index |
+| `inline_max_bytes` | integer | `32768` | Bytes the bodies of the in-force inline memories may total; a write past it is refused |
 
 ```toml
 [memory]
@@ -1188,6 +1189,8 @@ enabled = false
 ```
 
 Setting `enabled = false` keeps the five `memory_*` tool schemas out of every request and renders no memory section, which is worth doing for lean sessions that will never use it. Memories already stored are left untouched, and `meka memory` still reaches them.
+
+`inline_max_bytes` bounds what the agent carries whole in its context. The inline band is rendered into the opening message once per session and again after each compaction, so a larger budget costs prefix tokens the cache holds rather than tokens on every turn. A write that would take the inline tier past it is refused at every door, the operator's included, and a store already past it (the key lowered, or rows written past meka's doors) shows the bodies that fit and lists the rest by description until they are trimmed; see [The inline budget](../usage/memory.md#the-inline-budget). Zero is refused at startup.
 
 There is deliberately no environment variable and no CLI flag here: whether an agent keeps memories is a property of the installation, not something to vary per run.
 
