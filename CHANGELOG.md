@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The ACP `[meka]` chunk for a compaction uses the screen's words; see the upgrade guide.
 - Session archives are `format_version` 16; an older archive is brought forward on import.
 - A compaction from before 0.84 replays as an automatic one at the ceiling; see the upgrade guide.
+- Copying from the transcript no longer warns when no clipboard manager takes the text.
+
+### Fixed
+
+- A warning a library logs is shown on the screen without its `log.*` location fields.
 
 ### Security
 

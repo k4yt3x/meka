@@ -146,12 +146,17 @@ impl Drop for ScreenLogs {
 /// decides which of them the transcript draws.
 pub(crate) struct ScreenLayer {
     shown: tracing_subscriber::EnvFilter,
+    /// Where the lines go: the process's relay, or a private one under test.
+    relay: Relay,
 }
 
 impl ScreenLayer {
     /// A layer whose lines are drawn on the transcript when `shown` passes them.
     pub(crate) fn new(shown: tracing_subscriber::EnvFilter) -> Self {
-        Self { shown }
+        Self {
+            shown,
+            relay: RELAY.clone(),
+        }
     }
 }
 
@@ -164,17 +169,22 @@ where
         event: &tracing::Event<'_>,
         context: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        if !RELAY.is_screen_attached() {
+        if !self.relay.is_screen_attached() {
             return;
         }
-        let shown =
-            tracing_subscriber::layer::Filter::enabled(&self.shown, event.metadata(), &context);
+        // A record the `log` crate bridged arrives under metadata whose target is `log`, carrying
+        // its own target and location as `log.*` fields. The formatting layer names the record's
+        // target and hides those fields, and the screen's row reads as its line would.
+        use tracing_log::NormalizeEvent as _;
+        let normalized = event.normalized_metadata();
+        let metadata = normalized.as_ref().unwrap_or(event.metadata());
+        let shown = tracing_subscriber::layer::Filter::enabled(&self.shown, metadata, &context);
         let mut fields = Fields::default();
         event.record(&mut fields);
-        RELAY.offer(LogLine {
+        self.relay.offer(LogLine {
             at: chrono::Utc::now(),
-            level: *event.metadata().level(),
-            target: event.metadata().target().to_string(),
+            level: *metadata.level(),
+            target: metadata.target().to_string(),
             message: fields.into_message(),
             shown,
         });
@@ -200,23 +210,28 @@ impl Fields {
         }
         out
     }
+
+    fn record(&mut self, field: &tracing::field::Field, value: String) {
+        // The `log.*` fields are a bridged record's target and location: the target names the
+        // line already, and the location is the library's own business.
+        if field.name().starts_with("log.") {
+            return;
+        }
+        if field.name() == "message" {
+            self.message = value;
+        } else {
+            self.rest.push(format!("{}={value}", field.name()));
+        }
+    }
 }
 
 impl tracing::field::Visit for Fields {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.message = format!("{value:?}");
-        } else {
-            self.rest.push(format!("{}={value:?}", field.name()));
-        }
+        self.record(field, format!("{value:?}"));
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
-            self.message = value.to_string();
-        } else {
-            self.rest.push(format!("{}={value}", field.name()));
-        }
+        self.record(field, value.to_string());
     }
 }
 
@@ -292,6 +307,42 @@ mod tests {
         fields.record_str(&field("message"), "stream error");
         fields.record_debug(&field("attempt"), &2);
         assert_eq!(fields.into_message(), "stream error attempt=2");
+    }
+
+    /// A record the `log` crate bridged is the row the formatting layer's line would be: named by
+    /// the record's own target, read against the user's filter under that target, and without
+    /// the `log.*` fields that carry it.
+    #[test]
+    fn a_bridged_log_record_reads_as_its_line_would() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let relay = Relay::new();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+        relay.install(sender);
+        relay.set_screen_attached(true);
+        let layer = ScreenLayer {
+            shown: tracing_subscriber::EnvFilter::new("warn,arboard=error"),
+            relay: relay.clone(),
+        };
+        let _scoped = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        tracing_log::format_trace(
+            &tracing_log::log::Record::builder()
+                .level(tracing_log::log::Level::Warn)
+                .target("arboard::platform::linux::x11")
+                .module_path(Some("arboard::platform::linux::x11"))
+                .file(Some("x11.rs"))
+                .line(Some(791))
+                .args(format_args!("Could not hand the clipboard contents over."))
+                .build(),
+        )
+        .expect("the record reaches the thread's subscriber");
+        let line = receiver.try_recv().expect("the record is a line");
+        assert_eq!(line.level, tracing::Level::WARN);
+        assert_eq!(line.target, "arboard::platform::linux::x11");
+        assert_eq!(line.message, "Could not hand the clipboard contents over.");
+        assert!(
+            !line.shown,
+            "`arboard=error` is read against the record's target, not against `log`"
+        );
     }
 
     fn field(name: &'static str) -> tracing::field::Field {

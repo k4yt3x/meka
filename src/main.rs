@@ -410,8 +410,8 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
 
 /// Build the `tracing` filter for meka.
 ///
-/// `RUST_LOG` is honored verbatim. Otherwise the `-v` level is the floor, with two rmcp log sites
-/// that fire on every retry quieted:
+/// `RUST_LOG` is honored verbatim. Otherwise the `-v` level is the floor, with three library log
+/// sites that fire in ordinary use quieted:
 ///
 /// 1. An MCP server behind a CDN closes idle HTTP streams after about 100 s, which trips
 ///    `rmcp::transport::common::client_side_sse`'s `warn!` before rmcp reconnects on its own via
@@ -421,8 +421,12 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
 ///    unreachable server is retried for the life of the process, so that lands on the prompt every
 ///    few minutes saying nothing `record_connect_failure` has not already said once. Silenced
 ///    outright, because the noise is at the error level itself.
+/// 3. `arboard` warns when no clipboard manager has taken the text 100 ms after its handle is
+///    dropped: every copy on an X11 display that runs without one, or answers late the way a
+///    display forwarded over SSH does, while the OSC 52 sequence written beside it carries the text
+///    wherever the terminal allows. An `=error` floor keeps the clipboard thread's own failures.
 ///
-/// Verified against rmcp 2.1.
+/// Verified against rmcp 2.1 and arboard 3.6.
 fn build_log_filter(rust_log: Option<&str>, log_level: &str) -> tracing_subscriber::EnvFilter {
     use tracing_subscriber::EnvFilter;
     if let Some(value) = rust_log
@@ -444,9 +448,15 @@ fn build_log_filter(rust_log: Option<&str>, log_level: &str) -> tracing_subscrib
     let worker = "rmcp::transport::worker=off"
         .parse()
         .expect("valid tracing directive");
+    #[allow(
+        clippy::expect_used,
+        reason = "a compile-time literal in a known-good shape"
+    )]
+    let clipboard = "arboard=error".parse().expect("valid tracing directive");
     EnvFilter::new(log_level)
         .add_directive(sse)
         .add_directive(worker)
+        .add_directive(clipboard)
 }
 
 /// What the screen keeps for `/log`: everything the user asked to see, and at least `info` from
@@ -562,6 +572,22 @@ mod tests {
         let overridden = build_log_filter(Some("rmcp=debug"), "warn").to_string();
         assert!(
             !overridden.contains("rmcp::transport::worker=off"),
+            "RUST_LOG must replace the defaults wholesale: {overridden}"
+        );
+    }
+
+    /// The clipboard hand-off warning fires on every copy where no clipboard manager answers and
+    /// says nothing about the copy the terminal's own clipboard took; `RUST_LOG` still reaches it.
+    #[test]
+    fn log_filter_quiets_the_clipboard_hand_off() {
+        let filter = build_log_filter(None, "warn").to_string();
+        assert!(
+            filter.contains("arboard=error"),
+            "the hand-off warning must be floored: {filter}"
+        );
+        let overridden = build_log_filter(Some("arboard=debug"), "warn").to_string();
+        assert!(
+            !overridden.contains("arboard=error"),
             "RUST_LOG must replace the defaults wholesale: {overridden}"
         );
     }
