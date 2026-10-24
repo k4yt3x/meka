@@ -222,6 +222,7 @@ pub(crate) struct Completer {
     /// change the set mid-session.
     pub(crate) skill_names: Arc<std::sync::RwLock<Vec<String>>>,
     pub(crate) profile_names: Vec<String>,
+    pub(crate) project_names: Vec<String>,
     pub(crate) cwd: crate::workspace::SharedCwd,
 }
 
@@ -278,6 +279,30 @@ impl Completer {
             ),
             "profile" if argument_index == 1 => {
                 terminal_suggestions(self.profile_names.iter().cloned(), prefix, token_start, pos)
+            }
+            "project" if argument_index == 1 => terminal_suggestions(
+                ["open", "close"].iter().map(|verb| verb.to_string()),
+                prefix,
+                token_start,
+                pos,
+            ),
+            "project" if argument_index == 2 => {
+                let verb = before_cursor
+                    .get(..token_start)
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("");
+                if verb == "open" {
+                    terminal_suggestions(
+                        self.project_names.iter().cloned(),
+                        prefix,
+                        token_start,
+                        pos,
+                    )
+                } else {
+                    Vec::new()
+                }
             }
             "skill" if argument_index == 1 => {
                 let names = crate::sync::read(&self.skill_names).clone();
@@ -1304,6 +1329,7 @@ mod tests {
             mcp_server_names: vec!["exa".into(), "notion".into()],
             skill_names: Arc::new(std::sync::RwLock::new(vec!["review".into()])),
             profile_names: vec!["work".into(), "play".into()],
+            project_names: vec!["webdev".into()],
             cwd: crate::workspace::SharedCwd::new(std::env::temp_dir()),
         }
     }

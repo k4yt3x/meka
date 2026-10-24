@@ -57,9 +57,13 @@ pub(crate) async fn run_interactive(
         approvals: start_approvals,
         repin,
         permission_to_record,
+        project,
+        project_repin,
         cwd: recorded_cwd,
         announce,
     } = resolve_session_resume(&store, &config).await?;
+    // The opening skill within the session's project, which is known only now.
+    crate::host::refuse_a_hidden_opening_skill(&config, project.as_deref())?;
     // After the resume, whose lock is what spares the session this run was asked for.
     let windows = RetentionWindows::from_config(&config);
     sweep_expired(windows, &store).await?;
@@ -121,6 +125,7 @@ pub(crate) async fn run_interactive(
             version: env!("CARGO_PKG_VERSION").to_string(),
             profile,
             model,
+            project: project.clone(),
             directory: input::shorten_path_with_tilde(&cwd.get()),
         });
     }
@@ -213,7 +218,9 @@ pub(crate) async fn run_interactive(
 
     // Before the agent, because the agent resolves the row: a repin that has not landed yet would
     // build this run on the profile the session is leaving.
-    if let Err(error) = commit_resume_repin(&store, &providers, session_id, repin).await {
+    if let Err(error) =
+        commit_resume_repin(&store, &providers, session_id, repin, project_repin).await
+    {
         screen_logs.release();
         crate::render::render_error(&error);
         return Err(AlreadyReported.into());
@@ -232,6 +239,7 @@ pub(crate) async fn run_interactive(
         context_tokens: Arc::clone(&context_tokens),
         context_overhead: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         context_window: Arc::clone(&context_window_gauge),
+        project,
     })
     .await
     {
@@ -344,11 +352,17 @@ pub(crate) async fn run_interactive(
                 .iter()
                 .map(|profile| profile.name.clone())
                 .collect(),
+            project_names: config
+                .project_summaries
+                .iter()
+                .map(|project| project.name.clone())
+                .collect(),
             cwd: cwd.clone(),
         },
         skill_roots: config.skill_roots(),
         current_profile: Arc::clone(&current_profile),
         configured_profiles: config.profile_summaries.clone(),
+        configured_projects: config.project_summaries.clone(),
         schedule: config.schedule.clone(),
         store: store.clone(),
         agent: Arc::clone(&agent),
@@ -358,6 +372,7 @@ pub(crate) async fn run_interactive(
         mouse: config.mouse,
         busy: initial_turn_pending,
         pick_session: config.request.session_resume == Some(crate::config::SessionResume::Pick),
+        pick_project: config.request.requested_project.clone(),
     }));
     // Ends the host loop when the screen stops on its own, a panic included: the loop otherwise
     // waits for an exit only the screen sends, and the signal listener's sender keeps the

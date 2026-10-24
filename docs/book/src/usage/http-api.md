@@ -138,12 +138,13 @@ that working directory, compared in the canonical spelling every session records
 tree view asks for per expanded node, and what an audit asks to learn what a session dispatched.
 `parent` names sub-agents by definition, so `include_children` is moot beside it; a session with
 none, or an id no session has, is an empty page. `profile=<name>` keeps the sessions on one
-profile, `pinned=true` or `pinned=false` the pinned or the unpinned ones, and
+profile, `project=<name>` those on one [project](projects.md) (`project=` those on none),
+`pinned=true` or `pinned=false` the pinned or the unpinned ones, and
 `updated_since=<RFC 3339>` the ones whose `updated_at` is after that instant: a turn or a change
 to what the session runs as, never a title or a pin. The filters compose.
 
 When creating a session, specify the working directory and optionally a permission level, the
-approvals switch, a profile, and capabilities:
+approvals switch, a profile, a project, and capabilities:
 
 ```json
 {
@@ -151,6 +152,7 @@ approvals switch, a profile, and capabilities:
   "permission": "workspace",
   "approvals": false,
   "profile": "work",
+  "project": "webdev",
   "capabilities": {
     "supports_reasoning_stream": false,
     "supports_permission_prompts": true
@@ -173,6 +175,7 @@ Create, get, list, fork and `PATCH` all answer with the same session record:
   "permission": "workspace",
   "approvals": false,
   "profile": "work",
+  "project": "webdev",
   "title": "list the files in src/",
   "last_turn": {
     "id": "7f3b...", "source": "client", "started_at": "2026-05-26T13:46:40Z",
@@ -195,7 +198,7 @@ and on a deferred item its `reason` and the `task` it waits on when it waits on 
 session this server holds; the feed's `checklist.updated` carries the same list on every change.
 
 `created_at` is when the row was made; `updated_at` moves on a turn and on any change to what the
-session runs as (`permission`, `approvals`, `working_directory`, `profile`), a `PATCH` included, but not on a
+session runs as (`permission`, `approvals`, `working_directory`, `profile`, `project`), a `PATCH` included, but not on a
 title or a pin; `title` is the title a client set, else the first user message's words, whitespace
 collapsed and cut to 200 characters. A pinned session also carries `pinned_at`.
 
@@ -233,14 +236,22 @@ Omitted, it is the server's own default profile. The session keeps
 it for the rest of its life and every session response echoes it back as `profile`, so a client can
 confirm which account a session bills.
 
+`project` names a [project](projects.md) in the server's `config.toml`, which decides the memory
+tier the session's writes land in and the tiers it sees; `GET /v1/projects` lists them, and a name
+that is not configured is a `422` whose `detail` reads `no project named 'x' (configured: a, b)`.
+Omitted or empty, the session is on no project, and every session response echoes `project` back,
+`""` for none. `PATCH /v1/sessions/{id}` with `{"project": "movie"}` moves a session onto a project
+and `{"project": ""}` takes it off one; the row is rewritten, and the next turn's context restates
+the memories the session now sees. Like `profile`, it is a `409` when a turn is in flight.
+
 To move a live session onto another profile, `PATCH /v1/sessions/{id}` with `{"profile": "other"}`.
 That rewrites the session's row, so it holds for a resume from any surface rather than for this
 request. Switching mid-conversation is allowed and is your call: a thinking block is tagged with the
 backend that produced it and is not replayed to a different one, so from the next turn the model no
 longer sees the reasoning recorded under the old profile. Like `working_directory`, it is a `409` when a turn is
-already in flight; cancel first. A `PATCH` naming either field holds the session while it writes,
-the way compact does, so a turn arriving meanwhile answers `409` rather than starting under it, and
-so does a second such `PATCH`. `permission` and `approvals` are the two fields that apply during
+already in flight; cancel first. A `PATCH` naming any of `working_directory`, `profile` and
+`project` holds the session while it writes, the way compact does, so a turn arriving meanwhile
+answers `409` rather than starting under it, and so does a second such `PATCH`. `permission` and `approvals` are the two fields that apply during
 a turn; see [Permission levels over HTTP](#permission-levels-over-http).
 
 A `PATCH` naming a profile moves the session to that profile, and the profile is the whole story:
@@ -441,7 +452,7 @@ The turn request body accepts six fields:
 | `images` | array | `[]` | Image attachments; see [Image attachments](#image-attachments) |
 | `stream` | bool | `false` | How the response is encoded: `false` → JSON; `true` → SSE stream |
 | `detach` | bool | `false` | Whether this request holds the turn; see [Holding a turn](#holding-a-turn) |
-| `options.skill` | string \| null | `null` | When set, activates the named [skill](./skills.md) for this turn (equivalent to `/skill <name>` on the screen). With an empty `message` the skill body runs alone, as `--skill` does; a turn with no text, no image and no skill is a `422` |
+| `options.skill` | string \| null | `null` | When set, activates the named [skill](./skills.md) for this turn (equivalent to `/skill <name>` on the screen). With an empty `message` the skill body runs alone, as `--skill` does; a turn with no text, no image and no skill is a `422`, as is a skill the session's [project](./projects.md) hides |
 | `options.unanswered_message` | string | `keep` | What becomes of `message` if the turn ends, failed or canceled, before anything from the model reached the conversation. `keep` leaves it in place, as the screen does with a typed prompt. `withdraw` takes it back, for a client that resends a failed turn; see [Resending a failed turn](#resending-a-failed-turn) |
 
 ### Holding a turn
@@ -1001,7 +1012,7 @@ Each token carries a set of scopes that control what it can access:
 | `mcp:r` | Read MCP server status and advertised tools |
 | `mcp:w` | Reconnect an MCP server |
 
-Discovery endpoints (`/v1/info`, `/v1/skills`, `/v1/mcp`, `/v1/profiles`) accept any token with at least one read scope. Two deliberately do not: `GET /v1/skills/{name}` needs `skills:r` and `GET /v1/instructions` needs `sessions:r`, because both return instruction *text* rather than a listing.
+Discovery endpoints (`/v1/info`, `/v1/skills`, `/v1/mcp`, `/v1/profiles`, `/v1/projects`) accept any token with at least one read scope. Two deliberately do not: `GET /v1/skills/{name}` needs `skills:r` and `GET /v1/instructions` needs `sessions:r`, because both return instruction *text* rather than a listing.
 
 Scopes are flat: `memory:r` does not imply `memory:w`, and neither implies the other. Operations *on a conversation* stay under `sessions:*`, because the thing being read or changed is one session. The process-wide stores carry their own scopes so a bridge token that runs turns cannot also empty the memory store or plant an unattended scheduled job.
 
@@ -1198,6 +1209,7 @@ These endpoints help clients inspect the server's capabilities at runtime.
 |----------|------|-------------|
 | `GET /v1/health/live` | None | Liveness probe: 200 if the process is up |
 | `GET /v1/health/ready` | None | Readiness probe: 200 if the store is healthy, at least one profile is configured, and no `required` MCP server has failed. A failed *optional* server doesn't affect readiness, since it can't stop a turn either. Returns `status`, `session_db`, `profile_configured`, and `mcp_servers_healthy` (boolean, no server names). **`profile_configured` means a profile exists in `config.toml`, not that it has a usable credential**: a profile's credential is checked when a session first needs it, so a server can be ready and still answer 422 to `POST /v1/sessions`. |
+| `GET /v1/projects` | Any read scope | Projects, as `{"projects": [...]}`: every `[projects.<name>]` the server's `config.toml` defines and every name a row still carries, each with `name`, `memories` (in its tier), `sessions` (root sessions on it), `configured`, `false` for a name only the store carries, and whichever of `allowed_servers`, `disabled_servers`, `allowed_skills` and `disabled_skills` its table sets. Read-only; projects come from `config.toml` |
 | `GET /v1/profiles` | Any read scope | Configured profiles, as `{"profiles": [...]}`. Each carries `name`, `account`, `backend` (omitted when the profile names an account that is not configured), `model` (omitted when the profile names none), `fallbacks`, the profiles a turn moves to when this one cannot serve it (omitted when it names none), `vision`, whether a session on it accepts [image attachments](#image-attachments), and `active: true` on the one a session gets when it names none. Read-only; profiles come from `config.toml` |
 | `GET /v1/info` | Any read scope | Server version and permission surface, and `scopes`, the ones the calling token holds, so a client can show only the controls it may use. Carries no profile, model or capability of one: `GET /v1/profiles` reports those per profile and marks the default with `active` |
 | `GET /v1/skills` | Any read scope | Installed skills |
@@ -1470,27 +1482,28 @@ Key points:
 | GET | `/v1/skills/{name}` | `skills:r` | One skill, with its body |
 | PUT | `/v1/skills/{name}` | `skills:w` | Create or update a skill |
 | DELETE | `/v1/skills/{name}` | `skills:w` | Delete a skill |
-| GET | `/v1/memory` | `memory:r` | Memory index, or with `?q=<words>` the memories a search finds, best first; `referencing`, `unverified` and `expired` narrow either |
-| GET | `/v1/memory/{name}` | `memory:r` | One memory, with its body |
-| PUT | `/v1/memory/{name}` | `memory:w` | Create or update a memory |
-| DELETE | `/v1/memory/{name}` | `memory:w` | Delete a memory |
+| GET | `/v1/memory` | `memory:r` | Memory index, or with `?q=<words>` the memories a search finds, best first; `referencing`, `unverified`, `expired` and `project` narrow either |
+| GET | `/v1/memory/{name}` | `memory:r` | One memory, with its body; `?project=<name>` when the name is in several projects |
+| PUT | `/v1/memory/{name}` | `memory:w` | Create or update a memory, in the tier `project` names |
+| DELETE | `/v1/memory/{name}` | `memory:w` | Delete a memory; `?project=<name>` when the name is in several projects |
 | GET | `/v1/mcp/{name}/tools` | `mcp:r` | Tools one MCP server advertises, each with its resolved permission, which step of the resolution chain decided it, whether config lets the agent see it, and whether a `readOnlyHint` the server sent was declined by `trust_read_only_hint = false` |
 | POST | `/v1/mcp/{name}/reconnect` | `mcp:w` | Reconnect an MCP server |
 | GET | `/v1/instructions` | `sessions:r` | Resolved standing instructions, without the per-session files `[instructions]` names |
 | GET | `/v1/profiles` | read | Configured profiles |
+| GET | `/v1/projects` | read | Configured projects, with their memory and session counts |
 | GET | `/v1/openapi.json` | None, and off unless `[serve].docs` is set | OpenAPI spec |
 
 `GET /v1/sessions` is paginated by `limit` and `cursor` (see [Sessions](#sessions)), and takes `include_children=true` to list sub-agent sessions alongside root ones, `working_directory=<path>` to filter by working directory, and `parent=<id>` to list one session's direct children. A sub-agent's session record carries `parent_id`, which is what reconnects it to the session that dispatched it.
 
-A memory record carries `updated_at` (when the row last changed), `created_at` (when the memory was made, stamped once at creation) and `verified_at` (when the fact was last verified: the creation, until a write with `verified: true` moves it), plus its `load` (`inline`, `index` or `search`), its `references`, its `source`, its `expires_at` when an expiry was set, its `tags` and its `read_count`, how many times the agent has recalled it through `memory_read`. The timestamps are deliberately separate: a description edit moves `updated_at` without the note saying anything new, it is `created_at` that the model is shown as an age, and it is `verified_at` that search freshness decays from. `GET /v1/memory/{name}` adds `referenced_by`, the names of the memories whose references name this one.
+A memory record carries `project`, the [tier](memory.md#tiers) it is in (`""` for the global tier), `updated_at` (when the row last changed), `created_at` (when the memory was made, stamped once at creation) and `verified_at` (when the fact was last verified: the creation, until a write with `verified: true` moves it), plus its `load` (`inline`, `index` or `search`), its `references`, its `source`, its `expires_at` when an expiry was set, its `tags` and its `read_count`, how many times the agent has recalled it through `memory_read`. The timestamps are deliberately separate: a description edit moves `updated_at` without the note saying anything new, it is `created_at` that the model is shown as an age, and it is `verified_at` that search freshness decays from. `GET /v1/memory/{name}` adds `referenced_by`, the names of the memories whose references name this one.
 
-`PUT /v1/memory/{name}` accepts `tags`, `references`, `source`, `load` and `expires` with the same omit-to-keep rule as `body`: omit to leave what the memory has alone, send `[]` or `""` to clear a list or a string. `expires` is RFC 3339 or `YYYY-MM-DD` for the whole of that day. `verified: true` records that the write follows a check that the fact is current, and is the only thing that moves `verified_at` on an existing memory. A write that would take the inline bodies past [`[memory] inline_max_bytes`](../configuration/config-file.md#memory) answers **422** with the store's own sentence, naming the total, the largest inline memories and the remedy, and nothing of it lands; see [The inline budget](memory.md#the-inline-budget).
+`PUT /v1/memory/{name}` accepts `tags`, `references`, `source`, `load` and `expires` with the same omit-to-keep rule as `body`: omit to leave what the memory has alone, send `[]` or `""` to clear a list or a string. `project` is the tier to file the memory in, a configured project or `""` for the global tier; omitted, an existing memory keeps its tier and a new one is global, and naming the other tier for an existing memory moves it. A name a global memory and a project memory would share, a project the file does not define, and a name that is in several projects when none is named are each a **422** carrying the store's sentence. `expires` is RFC 3339 or `YYYY-MM-DD` for the whole of that day. `verified: true` records that the write follows a check that the fact is current, and is the only thing that moves `verified_at` on an existing memory. A write that would take the inline bodies past [`[memory] inline_max_bytes`](../configuration/config-file.md#memory) answers **422** with the store's own sentence, naming the total, the largest inline memories and the remedy, and nothing of it lands; see [The inline budget](memory.md#the-inline-budget).
 
-`GET /v1/memory` takes three filters beside `q`, the same three `memory_search` and `meka memory list` take: `referencing=<target>` for the memories whose references name a memory, path, URL or id (matched whole, without regard to case), `unverified=<duration>` for the memories not verified within that long (`90d`), and `expired=true` for those past their expiry. Without `q` the filters list in index order; with it they narrow the search.
+`GET /v1/memory` takes three filters beside `q`, the same three `memory_search` and `meka memory list` take: `referencing=<target>` for the memories whose references name a memory, path, URL or id (matched whole, without regard to case), `unverified=<duration>` for the memories not verified within that long (`90d`), and `expired=true` for those past their expiry. `project=<name>` keeps one tier (`project=` the global tier); without it every tier is read. Without `q` the filters list in index order; with it they narrow the search.
 
 `GET /v1/memory?q=<words>` answers with the memories the agent's own `memory_search` would find for those words, best first and at most `limit` of them (default 10, clamped to 1..25), each carrying the `snippet` it was found on; the same ladder of exact, prefix and substring matching, so an operator and the model find the same memories for the same words. Without `q` it is the whole index.
 
-`GET /v1/memory/{name}` answers **404** for a name that is not stored, with no 422 case: a memory is a row, so there is no file to be present but unparseable. Reading through this endpoint deliberately does *not* increment the memory's read count: an operator is not the agent recalling anything, and the count feeds search ranking.
+`GET /v1/memory/{name}` answers **404** for a name that is not stored, and **422** for a name that is in several projects when `?project=` names none; `DELETE` answers the same and removes nothing on a 422. Reading through this endpoint deliberately does *not* increment the memory's read count: an operator is not the agent recalling anything, and the count feeds search ranking.
 
 Descriptions and bodies are returned **exactly as stored**, not as they are rendered into a model's context: this endpoint is a backup and inspection door, like `meka memory export`, and stripping characters out of a note on the way through would make a restore lossy. JSON escaping keeps that safe in transit, but a client that decodes and prints the text to a terminal should neutralize it, as meka does at its own render boundaries.
 

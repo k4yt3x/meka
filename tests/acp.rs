@@ -7607,3 +7607,172 @@ fn acp_session_fork_refuses_a_source_another_process_holds() {
         "a released source forks: {forked}"
     );
 }
+
+/// The project picker is offered only where `config.toml` defines a project; picking one moves the
+/// session's row, the empty entry takes it off, and an unknown name is refused without moving it.
+#[test]
+fn acp_offers_the_project_picker_only_with_projects_and_a_pick_moves_the_row() {
+    const WITHOUT: &str = r#"
+default_profile = "mock"
+
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
+model = "claude-sonnet-4-5"
+
+[permissions]
+default = "read"
+enabled = ["read", "unrestricted"]
+"#;
+    let mut harness = AcpTestHarness::spawn(WITHOUT, None);
+    let cwd = harness.config_dir();
+    let created = harness.request(
+        "session/new",
+        serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
+    );
+    let ids: Vec<String> = created["result"]["configOptions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no configOptions: {created}"))
+        .iter()
+        .map(|option| option["id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(!ids.iter().any(|id| id == "project"), "{ids:?}");
+    drop(harness);
+
+    let with = format!("{WITHOUT}\n[projects.webdev]\n[projects.movie]\n");
+    let mut harness = AcpTestHarness::spawn(&with, None);
+    let cwd = harness.config_dir();
+    let created = harness.request(
+        "session/new",
+        serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
+    );
+    let session_id = created["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+    let project_option = |response: &serde_json::Value| -> serde_json::Value {
+        response["result"]["configOptions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no configOptions: {response}"))
+            .iter()
+            .find(|option| option["id"] == "project")
+            .unwrap_or_else(|| panic!("no project option: {response}"))
+            .clone()
+    };
+    let option = project_option(&created);
+    assert_eq!(
+        option["currentValue"], "",
+        "a new session is on no project: {option}"
+    );
+    let offered: Vec<String> = option["options"]
+        .as_array()
+        .expect("select options")
+        .iter()
+        .map(|option| option["value"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(offered, vec![
+        String::new(),
+        "movie".to_string(),
+        "webdev".to_string()
+    ]);
+
+    let switched = harness.request(
+        "session/set_config_option",
+        serde_json::json!({ "sessionId": session_id, "configId": "project", "value": "webdev" }),
+    );
+    assert_eq!(
+        project_option(&switched)["currentValue"],
+        "webdev",
+        "{switched}"
+    );
+    let refused = harness.request(
+        "session/set_config_option",
+        serde_json::json!({ "sessionId": session_id, "configId": "project", "value": "ghost" }),
+    );
+    assert!(refused["error"].is_object(), "{refused}");
+    assert!(
+        refused["error"]
+            .to_string()
+            .contains("no project named 'ghost'"),
+        "{refused}"
+    );
+    let cleared = harness.request(
+        "session/set_config_option",
+        serde_json::json!({ "sessionId": session_id, "configId": "project", "value": "" }),
+    );
+    assert_eq!(project_option(&cleared)["currentValue"], "", "{cleared}");
+}
+
+/// A project move through the picker re-sends the slash commands with the skills the project
+/// hides left out, so a client's command list follows the session's view.
+#[test]
+fn a_project_move_over_acp_re_sends_the_commands_the_project_shows() {
+    let config_toml = r#"
+default_profile = "mock"
+
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
+model = "claude-sonnet-4-5"
+
+[projects.movie]
+disabled_skills = ["release"]
+
+[permissions]
+default = "read"
+enabled = ["read", "unrestricted"]
+"#;
+    let mut harness = AcpTestHarness::builder()
+        .config(config_toml)
+        .pre_spawn(|config_dir| {
+            let skill_dir = config_dir.join("skills").join("release");
+            std::fs::create_dir_all(&skill_dir).expect("mkdir skill");
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\ndescription: how to cut a release\n---\nTag it.\n",
+            )
+            .expect("write SKILL.md");
+            serde_json::json!([])
+        })
+        .build();
+    let cwd = harness.config_dir();
+    let created = harness.request(
+        "session/new",
+        serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
+    );
+    let session_id = created["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+    // Whatever the open pushed is drained, so the list read below is the one the move sends.
+    harness.drain_unsolicited_updates(&session_id);
+
+    let id = harness.send_request(
+        "session/set_config_option",
+        serde_json::json!({ "sessionId": session_id, "configId": "project", "value": "movie" }),
+    );
+    let (mut updates, response) = harness.collect_updates(&session_id, id);
+    assert!(response["error"].is_null(), "{response}");
+    updates.extend(harness.drain_unsolicited_updates(&session_id));
+    let names: Vec<String> = updates
+        .iter()
+        .rev()
+        .find_map(|update| {
+            let update = &update["params"]["update"];
+            (update["sessionUpdate"] == "available_commands_update")
+                .then(|| update["availableCommands"].as_array().cloned())
+                .flatten()
+        })
+        .unwrap_or_else(|| panic!("no available_commands_update after the move: {updates:?}"))
+        .iter()
+        .map(|command| command["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        !names.is_empty() && !names.iter().any(|name| name == "release"),
+        "{names:?}"
+    );
+}

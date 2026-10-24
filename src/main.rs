@@ -235,7 +235,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                         let context = store::migrations::Context::adopting(adopted.as_deref())
                             .starting_at(&permission.to_string());
                         (
-                            Some((adopted, file.profiles)),
+                            Some((adopted, file.profiles, file.projects)),
                             Some(permission),
                             context,
                             memory_inline_max_bytes,
@@ -262,15 +262,21 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                 cli::Command::Profile { action } => {
                     crate::cli::profile::run(action, &store).await
                 }
+                cli::Command::Project { action } => {
+                    crate::cli::project::run(action, &store, memory_inline_max_bytes).await
+                }
                 cli::Command::Session { action } => {
-                    let (default, configured) = match &installation {
-                        Some((default, configured)) => (default.as_deref(), Some(configured)),
-                        None => (None, None),
+                    let (default, configured, projects) = match &installation {
+                        Some((default, configured, projects)) => {
+                            (default.as_deref(), Some(configured), Some(projects))
+                        }
+                        None => (None, None, None),
                     };
-                    let profiles = crate::store::export::ImportProfiles {
+                    let profiles = crate::store::export::ImportInstallation {
                         selected: cli_ref.profile.as_deref(),
                         default,
                         configured,
+                        projects,
                     };
                     crate::cli::session::run_session_subcommand(
                         &store,
@@ -324,8 +330,8 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         ));
     }
 
-    // Refused rather than ignored. Both name *this run's session*, and a long-lived host has no
-    // such thing: it creates a session per `session/new` or `POST /v1/sessions`. Accepting them
+    // Refused rather than ignored. All three name *this run's session*, and a long-lived host has
+    // no such thing: it creates a session per `session/new` or `POST /v1/sessions`. Accepting them
     // silently was worse than it sounds, because `-c` / `-r` set `session_resume`, which switches
     // off the default-profile check a host with no default needs most.
     //
@@ -336,21 +342,40 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         let offending = [
             (cli.continue_last, "--continue"),
             (cli.resume.is_some(), "--resume"),
+            (cli.project.is_some(), "--project"),
         ]
         .into_iter()
         .filter_map(|(given, flag)| given.then_some(flag))
         .collect::<Vec<_>>();
         if !offending.is_empty() {
-            // The remedy differs by host: ACP resumes through `session/load`, and an HTTP client
-            // names the session in the path.
-            let remedy = if acp_mode {
-                "resume one with `session/load`"
-            } else {
-                "address one by id under `/v1/sessions/{id}`"
-            };
+            // One remedy per flag given, and each differs by host: ACP resumes through
+            // `session/load` and picks a project through a config option, where an HTTP client
+            // names the session in the path and the project on the create.
+            let remedies = [
+                (
+                    cli.continue_last || cli.resume.is_some(),
+                    if acp_mode {
+                        "resume one with `session/load`"
+                    } else {
+                        "address one by id under `/v1/sessions/{id}`"
+                    },
+                ),
+                (
+                    cli.project.is_some(),
+                    if acp_mode {
+                        "pick its project with the `project` config option"
+                    } else {
+                        "give `project` on `POST /v1/sessions`"
+                    },
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(given, remedy)| given.then_some(remedy))
+            .collect::<Vec<_>>();
             anyhow::bail!(
-                "`meka {host}` does not take {}; {remedy}",
+                "`meka {host}` does not take {}; {}",
                 offending.join(", "),
+                remedies.join(", and "),
             );
         }
     }

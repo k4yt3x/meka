@@ -42,20 +42,36 @@ meka profile rename work daily
 
 See the [`meka profile` CLI reference](./config-file.md#meka-profile-cli) for the full flag list.
 
+### `project`
+
+Manage projects: the work contexts a session opens, each a `[projects.<name>]` table and a memory
+tier of its own. See [Projects](../usage/projects.md).
+
+```bash
+meka project add webdev [--allowed-server <NAME>]... [--disabled-server <NAME>]... [--allowed-skill <NAME>]... [--disabled-skill <NAME>]...
+meka project list [--format <FORMAT>]   # name, memories, sessions, servers, skills, configured
+meka project set webdev allowed_servers fs,exa    # or disabled_servers, allowed_skills, disabled_skills
+meka project set webdev allowed_servers --unset   # back to every configured server
+meka project remove webdev              # refused while anything is on it
+meka project rename webdev web          # moves its sessions and memories with it
+```
+
 ### `session`
 
-Manage stored sessions: list them, show one in full, export one as Markdown or JSON, import a JSON
-export, fork or rewind one, or delete them.
+Manage stored sessions: list or search them, show one in full, export one as Markdown or JSON,
+import a JSON export, fork, rewind, title or pin one, or delete them.
 
 Every `<SESSION_ID>` is a full id or any unique prefix of one, which is what the listings print.
 
 ```bash
-meka session list [-n <LIMIT>] [--include-children] [--format <FORMAT>]   # default limit: 20; sub-agent sessions hidden unless asked
-meka session show <SESSION_ID> [--format <FORMAT>]    # full id, working directory, permission, title
+meka session list [-n <LIMIT>] [--include-children] [--project <NAME>] [--format <FORMAT>]   # default limit: 20; sub-agent sessions hidden unless asked
+meka session show <SESSION_ID> [--format <FORMAT>]    # full id, profile, project, directory, permission, title
 meka session export <SESSION_ID> [-o <OUTPUT>] [--format <FORMAT>]   # markdown (default) or json; -o - prints to stdout
 meka session import <INPUT>                           # a JSON export; - reads stdin
 meka session fork <SESSION_ID>                        # prints the copy's id
 meka session rewind <SESSION_ID> [-n <TURNS>]         # default 1
+meka session set <SESSION_ID> title|pinned <VALUE>      # a title, or true/false
+meka session search <QUERY> [-n <LIMIT>] [--include-children] [--format <FORMAT>]
 meka session remove <SESSION_IDS>...
 meka session remove --older-than-days <DAYS>
 meka session remove --all
@@ -94,7 +110,7 @@ See [MCP](../usage/mcp.md#meka-mcp-cli) for the `add` flags and what each comman
 
 ### `tool`
 
-Inspect the built-in tool filters. `meka tool list` prints every built-in with its `Permission`,
+Inspect built-in tools. `meka tool list` prints every built-in with its `Permission`,
 the `Source` of that requirement (`builtin`, or `override` from `[tools]`), its `Status`
 (`enabled`, `deferred`, or `disabled`), and the start of its description. The levels are the ones
 a session on this machine would enforce: `shell_execute` is `read` where the shell sandbox is on
@@ -123,20 +139,23 @@ See [Skills](../usage/skills.md#meka-skill-cli) for the `add` flags.
 
 ### `memory`
 
-Manage the agent's saved memories.
+Manage the memories the agent keeps.
 
 ```bash
-meka memory list [--format <FORMAT>]
-meka memory get <NAME> [--format <FORMAT>]    # every stored field
-meka memory show <NAME> [--format <FORMAT>]   # the body
-meka memory add <NAME> --description <DESCRIPTION> [flags]
-meka memory edit <NAME>      # the body, in $VISUAL, then $EDITOR
-meka memory remove <NAME>
+meka memory list [--project <NAME>] [--format <FORMAT>]
+meka memory get <NAME> [--project <NAME>] [--format <FORMAT>]    # every stored field
+meka memory show <NAME> [--project <NAME>] [--format <FORMAT>]   # the body
+meka memory add <NAME> --description <DESCRIPTION> [--project <NAME>] [flags]
+meka memory edit <NAME> [--project <NAME>]      # the body, in $VISUAL, then $EDITOR
+meka memory remove <NAME> [--project <NAME>]
 meka memory verify [--rebuild]
-meka memory export [--dir <PATH>]   # default: ./meka-memory-export
+meka memory export [--directory <DIR>] [--project <NAME>]   # default: ./meka-memory-export
 ```
 
-See [Memory](../usage/memory.md#cli) for the `add` flags.
+`--project` names the [tier](../usage/memory.md#tiers) a command works in: a project's, or the
+global tier for an empty value. Without it a listing covers every tier, and a name that is in
+several projects is refused until one is named. See [Memory](../usage/memory.md#cli) for the `add`
+flags.
 
 ### `instructions`
 
@@ -166,8 +185,8 @@ See [Scheduling](../usage/scheduling.md) for details.
 
 ### `acp`
 
-Run meka as an [ACP](../usage/acp.md) agent over stdio. Takes no flags of its own; `-c` and `-r`
-are refused, and `--profile` selects the profile a new session starts on.
+Run meka as an [ACP](../usage/acp.md) agent over stdio. Takes no flags of its own; `-c`, `-r` and
+`--project` are refused, and `--profile` selects the profile a new session starts on.
 
 ```bash
 meka acp
@@ -176,7 +195,8 @@ meka acp
 ### `serve`
 
 Run meka as a long-lived [HTTP service](../usage/http-api.md). `--bind <ADDR>` overrides
-`[serve].bind`. Like `acp`, it refuses `-c` and `-r`: the host creates a session per request.
+`[serve].bind`. Like `acp`, it refuses `-c`, `-r` and `--project`: the host creates a session per
+request.
 
 ```bash
 meka serve
@@ -197,6 +217,17 @@ git diff | meka --oneshot -p -                                      # the prompt
 
 When omitted, meka opens the screen with no initial input. There is no bare positional prompt, so a mistyped subcommand is an error rather than a session opened with the typo as its first turn.
 
+### `--skill <NAME>`
+
+Invoke a [skill](../usage/skills.md) as the first turn. Mirrors the slash command [`/skill <name> [extra...]`](../usage/skills.md#invoking-a-skill-from-the-cli). `-p`, if given, is prepended to the rendered skill body as additional context. Pair with [`--oneshot`](#--oneshot) to exit after the turn instead of opening the screen.
+
+```bash
+meka --skill download-videos -p "https://example.com/video"             # first turn, then the screen
+meka --skill download-videos --oneshot -p "https://example.com/video"   # first turn, then exit
+```
+
+Errors out with a clean message if the skill name is unknown.
+
 ### `-c`, `--continue`
 
 Continue the most recent session. Takes no value.
@@ -206,7 +237,8 @@ meka -c                        # pick up where you left off
 meka -c -p "and now add tests" # …with an opening prompt
 ```
 
-Starting fresh when there is no session yet is not an error; meka just begins a new one.
+Starting fresh when there is no session yet is not an error; meka just begins a new one. With
+`--project <name>`, the most recent session on that project, or a new one on it.
 
 ### `-r`, `--resume [SESSION]`
 
@@ -223,7 +255,8 @@ meka -r 550e -p "and now add tests"              # …with an opening prompt
 
 The value can be left off because nothing on the root command is positional: the prompt is `-p`,
 so `meka -r -p "fix it"` reads as a pick with an opening prompt. A scripted run has no screen to
-pick on, so `--oneshot -r` needs the session named.
+pick on, so `--oneshot -r` needs the session named. With `--project <name>`, a bare `-r` picks among
+that project's sessions, and `-r <id>` moves the named session onto the project.
 
 Errors if the session does not exist, the prefix matches multiple sessions (with the matching ids listed for disambiguation), or the session is locked by another meka instance.
 
@@ -232,6 +265,47 @@ Errors if the session does not exist, the prefix matches multiple sessions (with
 ```bash
 meka --oneshot -r 550e -p "summarize what we decided"
 ```
+
+### `--profile <NAME>`
+
+Select which configured profile a session runs on. Takes the name of a profile from
+`[profiles.<name>]`, overriding `default_profile` in the config file. The choice outlives the run:
+on a new session it is what gets recorded, and on a resume it rewrites the row.
+
+```bash
+meka --profile work
+```
+
+The value is a profile name (e.g. `work`, `personal`), not an account or a backend. List configured profiles with `meka profile list`. There is no short form: `-p` is the prompt.
+
+A new session records the profile it runs on, so `meka -c` later comes back on it rather than on
+`default_profile`. Passing `--profile` alongside `-c` / `-r` **repins** the session: the row is
+rewritten and it keeps that profile from then on. See
+[what a resume restores](../usage/sessions.md#what-a-resume-restores).
+
+> **There is no `--model`, `--base-url`, `--thinking` or `--thinking-budget`.** A profile is an
+> indivisible bundle of an account, a model and every model-tied setting, and a session records
+> which one it runs on rather than a rewritten copy. To change a setting, edit the profile with
+> [`meka profile set`](./config-file.md#meka-profile-cli); to run something different, make a second
+> profile and select it with `--profile`.
+
+### `--project <NAME>`
+
+Open the session on a project, one of the `[projects.<name>]` tables in `config.toml`; see
+[Projects](../usage/projects.md). A new session records it, the way it records its profile, and
+sees the project's memories beside the global ones.
+
+```bash
+meka --project webdev
+meka -c --project webdev          # the latest session on webdev, or a new one there
+meka -r --project webdev          # the picker over webdev's sessions
+meka -r 550e --project webdev     # moves session 550e onto webdev
+```
+
+Beside `-c` and a bare `-r`, the flag **filters** the session meka selects; beside `-r <SESSION>`
+it **moves** the session you named, rewriting its row. A name the file does not define is refused
+before anything is touched. There is no value for "no project": a session with nothing named is
+on none, and `/project close` takes a session off one.
 
 ### `--permission <LEVEL>`
 
@@ -249,6 +323,14 @@ Recorded on the session, so a resume comes back at the level the session was las
 the default. Passing `--permission` alongside `-c` / `-r` repins it, the way `--profile` does. A
 level that is no longer in `[permissions].enabled` is not granted on resume: the session drops to
 the configured default with a warning.
+
+### `--instructions <STRING>`
+
+Standing [instructions](../usage/instructions.md) for this run, replacing the `instructions.md` file and both `MEKA_INSTRUCTIONS*` environment variables. Takes the text itself, not a path; use `"$(cat file.md)"` to read one.
+
+```bash
+meka --instructions "Be terse. No code fences in answers."
+```
 
 ### `--additional-workspace-directory <DIR>`
 
@@ -315,28 +397,16 @@ prints. Ignored on macOS and Windows.
 meka --sandbox-backend landlock
 ```
 
-### `--profile <NAME>`
+### `--eager-load-tool <SERVER:TOOL>`
 
-Select which configured profile a session runs on. Takes the name of a profile from
-`[profiles.<name>]`, overriding `default_profile` in the config file. The choice outlives the run:
-on a new session it is what gets recorded, and on a resume it rewrites the row.
+Eager-load a specific MCP tool for this session, bypassing the `tool_load` round-trip. The tool's schema ships in the cacheable tools-array prefix from turn 1 instead of being deferred. Mirrors the per-server [`eager_load_tools`](./config-file.md#mcpservers) config field: repeatable, raw tool names (the server-advertised form, not `mcp__<server>__<tool>`).
+
+Particularly useful for scripted runs that know up front which tools they'll need. The flag *appends to* whatever `eager_load_tools` lists in `config.toml` for that server; it doesn't replace existing entries. Unknown server names log a warning and are skipped.
 
 ```bash
-meka --profile work
+meka --eager-load-tool notion:search --eager-load-tool github:create_issue \
+     --oneshot -p "search Notion for the deploy runbook and open a GitHub issue"
 ```
-
-The value is a profile name (e.g. `work`, `personal`), not an account or a backend. List configured profiles with `meka profile list`. There is no short form: `-p` is the prompt.
-
-A new session records the profile it runs on, so `meka -c` later comes back on it rather than on
-`default_profile`. Passing `--profile` alongside `-c` / `-r` **repins** the session: the row is
-rewritten and it keeps that profile from then on. See
-[what a resume restores](../usage/sessions.md#what-a-resume-restores).
-
-> **There is no `--model`, `--base-url`, `--thinking` or `--thinking-budget`.** A profile is an
-> indivisible bundle of an account, a model and every model-tied setting, and a session records
-> which one it runs on rather than a rewritten copy. To change a setting, edit the profile with
-> [`meka profile set`](./config-file.md#meka-profile-cli); to run something different, make a second
-> profile and select it with `--profile`.
 
 ### `--no-stream`
 
@@ -344,34 +414,6 @@ Disable streaming for this run. The agent waits for the complete response before
 
 ```bash
 meka --no-stream
-```
-
-### `--instructions <STRING>`
-
-Standing [instructions](../usage/instructions.md) for this run, replacing the `instructions.md` file and both `MEKA_INSTRUCTIONS*` environment variables. Takes the text itself, not a path; use `"$(cat file.md)"` to read one.
-
-```bash
-meka --instructions "Be terse. No code fences in answers."
-```
-
-### `--skill <NAME>`
-
-Invoke a [skill](../usage/skills.md) as the first turn. Mirrors the slash command [`/skill <name> [extra...]`](../usage/skills.md#invoking-a-skill-from-the-cli). `-p`, if given, is prepended to the rendered skill body as additional context. Pair with [`--oneshot`](#--oneshot) to exit after the turn instead of opening the screen.
-
-```bash
-meka --skill download-videos -p "https://example.com/video"             # first turn, then the screen
-meka --skill download-videos --oneshot -p "https://example.com/video"   # first turn, then exit
-```
-
-Errors out with a clean message if the skill name is unknown.
-
-### `--oneshot`
-
-Exit after the first turn finishes. Requires either `-p` or `--skill <NAME>`; without one of those, meka has nothing to do. Useful for scripts and CI invocations.
-
-```bash
-meka --oneshot -p "summarize the last commit"
-meka --oneshot --skill deploy -p "to staging"
 ```
 
 ### `--format <FORMAT>`
@@ -382,11 +424,11 @@ What a `--oneshot` run writes to stdout: `plain` (the default) streams the answe
 meka --oneshot -p "what changed?" --format json | jq -r .text
 ```
 
-Every listing and `show` command takes the same `--format plain|json`: `session list|show`,
-`account list|usage|whoami|stats`, `profile list`, `mcp list|get|tools`, `schedule list|show`,
-`memory list|get|show`, `tool list`, `history list` and `skill list|get|show`. Under `json`, a
-`show` prints one object and a listing prints `{"<nouns>": [...]}` (`sessions`, `accounts`,
-`profiles`, `servers`, `jobs`, `memories`, `tools`, `history`, `skills`), with the field names the
+Every listing and `show` command takes the same `--format plain|json`: `session list|show|search`,
+`account list|usage|whoami|stats`, `profile list`, `project list`, `mcp list|get|tools`,
+`schedule list|show`, `memory list|get|show`, `tool list`, `history list` and `skill list|get|show`.
+Under `json`, a `show` prints one object and a listing prints `{"<nouns>": [...]}` (`sessions`,
+`accounts`, `profiles`, `projects`, `servers`, `jobs`, `memories`, `tools`, `history`, `skills`), with the field names the
 [HTTP API](../usage/http-api.md) uses for the same object where it has one. An empty listing is the envelope around an empty array
 and nothing on stderr; in `plain`, it is a `No <nouns>.` note on stderr and nothing on stdout.
 Warnings and hints stay on stderr under either format, so `meka … --format json 2>/dev/null | jq`
@@ -397,15 +439,13 @@ meka session list --format json | jq -r '.sessions[].id'
 meka mcp get notion --format json | jq .url
 ```
 
-### `--eager-load-tool <SERVER:TOOL>`
+### `--oneshot`
 
-Eager-load a specific MCP tool for this session, bypassing the `tool_load` round-trip. The tool's schema ships in the cacheable tools-array prefix from turn 1 instead of being deferred. Mirrors the per-server [`eager_load_tools`](./config-file.md#mcpservers) config field: repeatable, raw tool names (the server-advertised form, not `mcp__<server>__<tool>`).
-
-Particularly useful for scripted runs that know up front which tools they'll need. The flag *appends to* whatever `eager_load_tools` lists in `config.toml` for that server; it doesn't replace existing entries. Unknown server names log a warning and are skipped.
+Exit after the first turn finishes. Requires either `-p` or `--skill <NAME>`; without one of those, meka has nothing to do. Useful for scripts and CI invocations.
 
 ```bash
-meka --eager-load-tool notion:search --eager-load-tool github:create_issue \
-     --oneshot -p "search Notion for the deploy runbook and open a GitHub issue"
+meka --oneshot -p "summarize the last commit"
+meka --oneshot --skill deploy -p "to staging"
 ```
 
 ### `-v`, `--verbose`

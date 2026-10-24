@@ -28,6 +28,7 @@
 - [Instructions](./usage/instructions.md)
 - [Skills](./usage/skills.md)
 - [Memory](./usage/memory.md)
+- [Projects](./usage/projects.md)
 - [Scheduling](./usage/scheduling.md)
 - [Background tasks](./usage/background.md)
 - [Account info](./usage/account.md)

@@ -29,6 +29,9 @@ pub(super) struct SkillReadTool {
     /// Shared skill cache with the agent. Dispatch reads through `current().await` so the tool
     /// sees any auto-reloads that happened during the turn.
     pub(crate) skills: Arc<SkillCache>,
+    /// The session's view of the installed skills, read per call so a project move mid-session
+    /// changes what the next call sees.
+    pub(crate) lens: crate::session::ProjectLens,
 }
 
 #[async_trait]
@@ -65,7 +68,7 @@ impl Tool for SkillReadTool {
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let name = require_str(&input, "name", "skill_read")?;
-        let skills = self.skills.current().await;
+        let skills = self.skills.current_for(&self.lens.access()).await;
 
         let skill = match skills.find(&name) {
             Some(skill) => skill,
@@ -169,6 +172,9 @@ fn reject_unreadable(
 
 pub(super) struct SkillSearchTool {
     pub(crate) skills: Arc<SkillCache>,
+    /// The session's view of the installed skills, read per call so a project move mid-session
+    /// changes what the next call sees.
+    pub(crate) lens: crate::session::ProjectLens,
 }
 
 #[async_trait]
@@ -205,7 +211,7 @@ impl Tool for SkillSearchTool {
     ) -> Result<ToolOutput> {
         let pattern = require_str(&input, "pattern", "skill_search")?;
         let regex = compile_user_regex(&pattern, "skill_search")?;
-        let skills = self.skills.current().await;
+        let skills = self.skills.current_for(&self.lens.access()).await;
 
         let mut matches = Vec::new();
         let mut truncated = false;
@@ -252,6 +258,9 @@ impl Tool for SkillSearchTool {
 
 pub(super) struct SkillWriteTool {
     pub(crate) skills: Arc<SkillCache>,
+    /// The session's view of the installed skills: a name the view hides is not one this session
+    /// may overwrite, whatever it may create.
+    pub(crate) lens: crate::session::ProjectLens,
 }
 
 #[async_trait]
@@ -369,6 +378,14 @@ impl Tool for SkillWriteTool {
         };
 
         let installed = self.skills.current().await;
+        if installed.find(&name).is_some() && !self.lens.access().sees_skill(&name) {
+            return Err(MekaError::ToolExecution {
+                tool_name: "skill_write".to_string(),
+                message: format!(
+                    "'{name}' is a skill this session's project hides; choose another name"
+                ),
+            });
+        }
         // Omitted means "leave it alone", as `PUT /v1/skills` has it: reading the absence as the
         // default would demote a prioritized skill every time the agent refined its text, and
         // priority decides which entries the index cap drops.
@@ -511,6 +528,9 @@ const AGENT_AUTHOR: &str = "meka (agent-authored)";
 
 pub(super) struct SkillEditTool {
     pub(crate) skills: Arc<SkillCache>,
+    /// The session's view of the installed skills, read per call so a project move mid-session
+    /// changes what the next call sees.
+    pub(crate) lens: crate::session::ProjectLens,
 }
 
 #[async_trait]
@@ -580,7 +600,7 @@ impl Tool for SkillEditTool {
             }
         };
 
-        let installed = self.skills.current().await;
+        let installed = self.skills.current_for(&self.lens.access()).await;
         // Unreadable first, for the reason `skill_write` gives.
         if let Some(refusal) = reject_unreadable(&name, &installed, &root) {
             return Ok(refusal);
@@ -715,6 +735,9 @@ impl Tool for SkillEditTool {
 
 pub(super) struct SkillDeleteTool {
     pub(crate) skills: Arc<SkillCache>,
+    /// The session's view of the installed skills, read per call so a project move mid-session
+    /// changes what the next call sees.
+    pub(crate) lens: crate::session::ProjectLens,
 }
 
 #[async_trait]
@@ -757,7 +780,7 @@ impl Tool for SkillDeleteTool {
             message,
         })?;
 
-        let installed = self.skills.current().await;
+        let installed = self.skills.current_for(&self.lens.access()).await;
         // Unreadable first, for the reason `skill_write` gives.
         if let Some(refusal) = reject_unreadable(&name, &installed, &root) {
             return Ok(refusal);
@@ -820,6 +843,7 @@ mod tests {
     async fn skill_tool_unknown_skill() {
         let tool = SkillReadTool {
             skills: SkillCache::for_root(None),
+            lens: Default::default(),
         };
         let result = tool
             .execute(
@@ -838,6 +862,7 @@ mod tests {
     async fn skill_tool_missing_name() {
         let tool = SkillReadTool {
             skills: SkillCache::for_root(None),
+            lens: Default::default(),
         };
         let result = tool
             .execute(
@@ -858,6 +883,7 @@ mod tests {
         );
         let tool = SkillReadTool {
             skills: SkillCache::for_root(Some(temp.path().to_path_buf())),
+            lens: Default::default(),
         };
         let result = tool
             .execute(
@@ -951,6 +977,7 @@ mod tests {
         let skills_cache = SkillCache::new(Some(root.clone()), Vec::new());
         let write = SkillWriteTool {
             skills: skills_cache.clone(),
+            lens: Default::default(),
         };
 
         let refined = run(
@@ -997,6 +1024,7 @@ mod tests {
         let skills = SkillCache::new(Some(root.clone()), Vec::new());
         let write = SkillWriteTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
         let change = |output: &ToolOutput| match output.frontend_metadata.clone() {
             Some(crate::frontend::ToolOutputMetadata::Diff {
@@ -1027,7 +1055,10 @@ mod tests {
         let after = after.expect("the file as rewritten");
         assert!(after.contains("two"), "{after}");
 
-        let delete = SkillDeleteTool { skills };
+        let delete = SkillDeleteTool {
+            skills,
+            lens: Default::default(),
+        };
         let deleted = run(&delete, serde_json::json!({"name": "demo"})).await;
         assert!(!deleted.is_error, "{}", deleted.text_content());
         let (path, old, new) = change(&deleted);
@@ -1046,6 +1077,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("root");
         let write = SkillWriteTool {
             skills: SkillCache::new(Some(root), Vec::new()),
+            lens: Default::default(),
         };
 
         let result = write
@@ -1080,6 +1112,7 @@ mod tests {
         let skills = SkillCache::new(Some(root.clone()), Vec::new());
         let write = SkillWriteTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
 
         // Longer than the index elides to, which is the case that made the loss invisible.
@@ -1140,6 +1173,7 @@ mod tests {
 
         let write = SkillWriteTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
         let result = run(
             &write,
@@ -1155,6 +1189,7 @@ mod tests {
 
         let delete = SkillDeleteTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
         let result = run(&delete, serde_json::json!({"name": "borrowed"})).await;
         assert!(result.is_error);
@@ -1202,6 +1237,7 @@ mod tests {
 
         let write = SkillWriteTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
         let result = run(
             &write,
@@ -1273,6 +1309,7 @@ mod tests {
 
         let write = SkillWriteTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
         let result = run(
             &write,
@@ -1296,6 +1333,7 @@ mod tests {
         skills.invalidate().await;
         let delete = SkillDeleteTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
         let result = run(&delete, serde_json::json!({"name": "deploy"})).await;
         assert!(!result.is_error, "{}", result.text_content());
@@ -1315,6 +1353,7 @@ mod tests {
 
         let read = SkillReadTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
         let result = run(&read, serde_json::json!({"name": "broken"})).await;
         assert!(result.is_error);
@@ -1350,6 +1389,7 @@ mod tests {
         let skills = cache_at(&temp);
         let write = SkillWriteTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
 
         let error = write
@@ -1389,6 +1429,7 @@ mod tests {
         let skills = cache_at(&temp);
         let write = SkillWriteTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
 
         let result = run(
@@ -1416,7 +1457,10 @@ mod tests {
         assert_eq!(skill.priority, 2);
         assert_eq!(skill.author().as_deref(), Some(AGENT_AUTHOR));
 
-        let read = SkillReadTool { skills };
+        let read = SkillReadTool {
+            skills,
+            lens: Default::default(),
+        };
         let body = run(&read, serde_json::json!({"name": "triage"}))
             .await
             .text_content();
@@ -1432,6 +1476,7 @@ mod tests {
         let skills = cache_at(&temp);
         let write = SkillWriteTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
 
         run(
@@ -1452,6 +1497,7 @@ mod tests {
 
         let read = SkillReadTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
         let body = run(&read, serde_json::json!({"name": "keep"}))
             .await
@@ -1474,6 +1520,7 @@ mod tests {
         let skills = cache_at(&temp);
         let write = SkillWriteTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
 
         run(
@@ -1487,7 +1534,10 @@ mod tests {
         )
         .await;
 
-        let read = SkillReadTool { skills };
+        let read = SkillReadTool {
+            skills,
+            lens: Default::default(),
+        };
         let body = run(&read, serde_json::json!({"name": "clear"}))
             .await
             .text_content();
@@ -1504,6 +1554,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let write = SkillWriteTool {
             skills: cache_at(&temp),
+            lens: Default::default(),
         };
         let result = write
             .execute(
@@ -1530,6 +1581,7 @@ mod tests {
 
         let delete = SkillDeleteTool {
             skills: cache_at(&temp),
+            lens: Default::default(),
         };
         let result = run(&delete, serde_json::json!({"name": "bundled"})).await;
         assert!(!result.is_error, "{}", result.text_content());
@@ -1541,6 +1593,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let delete = SkillDeleteTool {
             skills: cache_at(&temp),
+            lens: Default::default(),
         };
         let result = run(&delete, serde_json::json!({"name": "absent"})).await;
         assert!(result.is_error);
@@ -1557,6 +1610,7 @@ mod tests {
 
         let delete = SkillDeleteTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
         let result = run(&delete, serde_json::json!({"name": "broken"})).await;
         assert!(result.is_error);
@@ -1564,7 +1618,10 @@ mod tests {
         assert!(text.contains("not a valid skill"), "{text}");
         assert!(!text.contains("not found"), "{text}");
 
-        let write = SkillWriteTool { skills };
+        let write = SkillWriteTool {
+            skills,
+            lens: Default::default(),
+        };
         let result = run(
             &write,
             serde_json::json!({"name": "broken", "description": "d", "body": "new"}),
@@ -1598,6 +1655,7 @@ mod tests {
 
         let search = SkillSearchTool {
             skills: cache_at(&temp),
+            lens: Default::default(),
         };
         let text = run(&search, serde_json::json!({"pattern": "kubectl"}))
             .await
@@ -1620,6 +1678,7 @@ mod tests {
         let skills = cache_at(&temp);
         let write = SkillWriteTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
 
         for (name, given, expected) in [("low", -5, 0u8), ("high", 99, 9)] {
@@ -1663,6 +1722,7 @@ mod tests {
 
         let search = SkillSearchTool {
             skills: cache_at(&temp),
+            lens: Default::default(),
         };
         let text = run(&search, serde_json::json!({"pattern": "needle"}))
             .await
@@ -1679,6 +1739,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let search = SkillSearchTool {
             skills: cache_at(&temp),
+            lens: Default::default(),
         };
         let result = search
             .execute(
@@ -1695,6 +1756,7 @@ mod tests {
     async fn write_without_a_root_fails_with_a_reason() {
         let write = SkillWriteTool {
             skills: SkillCache::for_root(None),
+            lens: Default::default(),
         };
         let error = write
             .execute(
@@ -1715,6 +1777,7 @@ mod tests {
         let skills = cache_at(&temp);
         let write = SkillWriteTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
 
         run(
@@ -1755,9 +1818,11 @@ mod tests {
         let skills = SkillCache::new(Some(root.clone()), Vec::new());
         let write = SkillWriteTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
         let edit = SkillEditTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
         let file = root.join("note").join("SKILL.md");
         let created = run(
@@ -1841,6 +1906,7 @@ mod tests {
         // it misses rather than matching something the write would then duplicate.
         let read = SkillReadTool {
             skills: skills.clone(),
+            lens: Default::default(),
         };
         let shown = run(&read, serde_json::json!({"name": "note"}))
             .await
@@ -1905,6 +1971,7 @@ mod tests {
         write_skill(&native, "broken", "no frontmatter at all\nKEEP ME\n");
         let edit = SkillEditTool {
             skills: SkillCache::new(Some(native.clone()), vec![shared.clone()]),
+            lens: Default::default(),
         };
 
         let foreign = run(
@@ -1970,6 +2037,7 @@ mod tests {
         );
         let edit = SkillEditTool {
             skills: cache_at(&temp),
+            lens: Default::default(),
         };
         let missed = run(
             &edit,
@@ -1996,5 +2064,102 @@ mod tests {
         )
         .await;
         assert!(!matched.is_error, "{}", matched.text_content());
+    }
+
+    /// A skill the session's project hides is unknown to `skill_read`, `skill_search`,
+    /// `skill_edit` and `skill_delete`, and visible again once the session moves off the project.
+    #[tokio::test]
+    async fn a_skill_the_project_hides_is_unknown_to_the_scoped_tools() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("skills");
+        std::fs::create_dir_all(&root).expect("root");
+        let skills = SkillCache::new(Some(root), Vec::new());
+        let write = SkillWriteTool {
+            skills: skills.clone(),
+            lens: Default::default(),
+        };
+        let created = run(
+            &write,
+            serde_json::json!({"name": "release", "description": "How to cut a release", "body": "Tag it."}),
+        )
+        .await;
+        assert!(!created.is_error, "{}", created.text_content());
+        let project = crate::session::SharedProject::new(Some("quiet".to_string()));
+        let lens = crate::session::ProjectLens::new(
+            project.clone(),
+            Arc::new(
+                toml::from_str("[quiet]\ndisabled_skills = [\"release\"]\n").expect("projects"),
+            ),
+        );
+
+        let read = SkillReadTool {
+            skills: skills.clone(),
+            lens: lens.clone(),
+        };
+        let hidden = run(&read, serde_json::json!({"name": "release"})).await;
+        assert!(hidden.is_error, "{}", hidden.text_content());
+        assert!(
+            !hidden.text_content().contains("Tag it."),
+            "{}",
+            hidden.text_content()
+        );
+        let search = SkillSearchTool {
+            skills: skills.clone(),
+            lens: lens.clone(),
+        };
+        let searched = run(&search, serde_json::json!({"pattern": "Tag"})).await;
+        assert!(
+            !searched.text_content().contains("release"),
+            "{}",
+            searched.text_content()
+        );
+        let edit = SkillEditTool {
+            skills: skills.clone(),
+            lens: lens.clone(),
+        };
+        let edited = edit
+            .execute(
+                serde_json::json!({"name": "release", "old_string": "Tag it.", "new_string": "Tag it twice."}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await;
+        assert!(
+            edited.as_ref().map_or(true, |output| output.is_error),
+            "{edited:?}"
+        );
+        let delete = SkillDeleteTool {
+            skills: skills.clone(),
+            lens: lens.clone(),
+        };
+        let deleted = run(&delete, serde_json::json!({"name": "release"})).await;
+        assert!(deleted.is_error, "{}", deleted.text_content());
+        assert!(
+            skills.current().await.find("release").is_some(),
+            "nothing was deleted"
+        );
+        let scoped_write = SkillWriteTool {
+            skills: skills.clone(),
+            lens: lens.clone(),
+        };
+        let overwritten = scoped_write
+            .execute(
+                serde_json::json!({"name": "release", "description": "Replaced", "body": "Twice."}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await;
+        assert!(
+            matches!(&overwritten, Err(error) if error.to_string().contains("hides")),
+            "{overwritten:?}"
+        );
+        let kept = skills.current().await;
+        let body = crate::skills::load_skill_body(kept.find("release").expect("still there"))
+            .await
+            .expect("readable");
+        assert!(body.contains("Tag it."), "nothing was overwritten: {body}");
+
+        project.set(None);
+        let shown = run(&read, serde_json::json!({"name": "release"})).await;
+        assert!(!shown.is_error, "{}", shown.text_content());
+        assert!(shown.text_content().contains("Tag it."));
     }
 }

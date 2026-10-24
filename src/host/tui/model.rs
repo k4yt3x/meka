@@ -129,6 +129,8 @@ pub(crate) enum Item {
         version: String,
         profile: String,
         model: Option<String>,
+        /// The project the session opened on, when it opened on one.
+        project: Option<String>,
         directory: String,
     },
 }
@@ -2061,6 +2063,7 @@ mod tests {
             version: "0.1.0".into(),
             profile: "work".into(),
             model: None,
+            project: None,
             directory: "~".into(),
         };
         let mut transcript = transcript();

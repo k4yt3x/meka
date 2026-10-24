@@ -76,6 +76,8 @@ pub(crate) struct SessionMetaRow {
     /// What the session runs on, so an export carries it and an import can restore it rather than
     /// landing every imported session on the empty profile no configuration can name.
     pub(crate) profile: String,
+    /// The project the session is on; empty for none. Carried for the same reason the profile is.
+    pub(crate) project: String,
     /// The title a user set, or `None` for a session labeled by its first words.
     pub(crate) title: Option<String>,
     /// When the session was pinned, or `None` for one that is not.
@@ -119,6 +121,9 @@ pub(crate) struct ImportSessionRecord {
     /// profile keeps it, and one written before the field existed adopts the importing
     /// installation's default, which is the only thing that can be known about it here.
     pub(crate) profile: String,
+    /// The project the archive recorded, checked by the planner against the configured projects
+    /// as the profile is, so no row names one this installation lacks.
+    pub(crate) project: String,
     /// The title the archive carried, already through [`normalize_title`].
     pub(crate) title: Option<String>,
     /// When the archived session was pinned, restored as it was written.
@@ -226,6 +231,9 @@ pub(crate) struct SessionSummary {
     /// The name of the profile this session runs on, and nothing else: a profile is an
     /// indivisible bundle, so the name is the whole binding.
     pub(crate) profile: String,
+    /// The project the session is on, which decides the memory tier its writes land in and the
+    /// tiers it sees; empty for a session on none.
+    pub(crate) project: String,
     /// Per-session capability flags, as a serialized
     /// [`crate::host::http::http_frontend::SessionCapabilities`]. Deliberately not enumerated
     /// here: the flag set has grown twice, and each restatement went stale silently. NULL for
@@ -300,6 +308,8 @@ pub(crate) struct SessionFilter {
     pub(crate) parent: Option<Uuid>,
     /// Only sessions on this profile.
     pub(crate) profile: Option<String>,
+    /// Only sessions on this project; empty names the sessions on none.
+    pub(crate) project: Option<String>,
     /// Only pinned sessions, or only unpinned ones.
     pub(crate) pinned: Option<bool>,
     /// Only sessions changed after this instant, by the `updated_at` the row records.
@@ -319,6 +329,8 @@ pub(crate) struct SessionPatch {
     pub(crate) approvals: Option<bool>,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) profile: Option<String>,
+    /// The project to move the session onto; empty moves it off its project.
+    pub(crate) project: Option<String>,
     /// The complete resulting list of roots beyond `cwd`, so `Some(vec![])` clears the column.
     /// Per the ACP spec a non-empty `additionalDirectories` "is the complete resulting
     /// additional-root list", while omitted or empty means none are activated.
@@ -343,6 +355,7 @@ impl SessionPatch {
         self.permission.is_some()
             || self.approvals.is_some()
             || self.cwd.is_some()
+            || self.project.is_some()
             || self.profile.is_some()
             || self.roots.is_some()
     }
@@ -365,6 +378,13 @@ impl std::fmt::Display for SessionPatch {
         }
         if let Some(profile) = &self.profile {
             parts.push(format!("profile '{profile}'"));
+        }
+        if let Some(project) = &self.project {
+            parts.push(if project.is_empty() {
+                "no project".to_string()
+            } else {
+                format!("project '{project}'")
+            });
         }
         if let Some(roots) = &self.roots {
             parts.push(format!("{} additional root(s)", roots.len()));
@@ -949,6 +969,28 @@ impl Store {
             None,
             None,
             profile,
+            String::new(),
+        )
+        .await
+        .map(|created| created.id)
+    }
+
+    /// [`Self::create_session`] for a session on a project.
+    #[cfg(test)]
+    pub(crate) async fn create_session_in_project_for_test(
+        &self,
+        cwd: Option<std::path::PathBuf>,
+        profile: impl Into<String>,
+        project: impl Into<String>,
+    ) -> Result<Uuid> {
+        self.create_session_with_metadata(
+            cwd,
+            crate::permission::Permission::Read.to_string(),
+            false,
+            None,
+            None,
+            profile,
+            project.into(),
         )
         .await
         .map(|created| created.id)
@@ -963,6 +1005,10 @@ impl Store {
     /// [`Self::create_session`] remain as the unlocked doors, reached from tests and from callers
     /// that genuinely want a row nobody is holding.
     #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per column the doors decide, as `insert_session_row` takes them"
+    )]
     pub(crate) async fn create_session_with_metadata(
         &self,
         cwd: Option<std::path::PathBuf>,
@@ -971,6 +1017,7 @@ impl Store {
         capabilities_json: Option<String>,
         token_id: Option<String>,
         profile: impl Into<String>,
+        project: String,
     ) -> Result<CreatedSession> {
         self.insert_session_row(
             Uuid::new_v4(),
@@ -980,6 +1027,7 @@ impl Store {
             capabilities_json,
             token_id,
             profile.into(),
+            project,
         )
         .await
     }
@@ -1005,6 +1053,10 @@ impl Store {
     /// refuses can report the reason it actually hit. Callers differ on what it is worth: a host
     /// that must be alone refuses, and the agent's own path warns and runs the turn regardless
     /// rather than breaking installations that work today.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per column the doors decide, as `insert_session_row` takes them"
+    )]
     pub(crate) async fn create_session_locked(
         &self,
         cwd: Option<std::path::PathBuf>,
@@ -1013,6 +1065,9 @@ impl Store {
         capabilities_json: Option<String>,
         token_id: Option<String>,
         profile: impl Into<String>,
+        // The project the session opens on, empty for none: what the host or the run selected,
+        // recorded with the row so every later process reads the same answer.
+        project: String,
     ) -> Result<(CreatedSession, std::result::Result<FileLock, MekaError>)> {
         let session_id = Uuid::new_v4();
         let lock = self.claim_a_fresh_id(session_id);
@@ -1028,6 +1083,7 @@ impl Store {
                 capabilities_json,
                 token_id,
                 profile.into(),
+                project,
             )
             .await?;
         Ok((created, lock))
@@ -1174,6 +1230,102 @@ impl Store {
             })
     }
 
+    /// The project a session's row records, empty for none; `None` means the session is gone.
+    /// A name `config.toml` no longer defines is refused where the session next runs, with the
+    /// remedy, as a profile that left the file is.
+    pub(crate) async fn recorded_project(&self, session_id: Uuid) -> Result<Option<String>> {
+        let id = session_id.to_string();
+        self.connection
+            .call(move |connection| {
+                connection
+                    .query_row("SELECT project FROM sessions WHERE id = ?1", [&id], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .optional()
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to read the session's project: {error}"))
+            })
+    }
+
+    /// How many root sessions are on one project, for the refusal `meka project remove` gives
+    /// while any are; root sessions only, for the reason [`Self::count_sessions_on_profile`]
+    /// gives.
+    pub(crate) async fn count_sessions_on_project(&self, project: &str) -> Result<u64> {
+        let project = project.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM sessions
+                         WHERE project = ?1 AND NOT {}",
+                        spawned_session_sql("")
+                    ),
+                    rusqlite::params![project],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await
+            .map(|count| count.max(0) as u64)
+            .map_err(|error| {
+                MekaError::Database(format!("failed to count sessions on a project: {error}"))
+            })
+    }
+
+    /// Every project some root session names, sorted, for the listing that shows a project the
+    /// file no longer defines beside the ones it does. Root sessions, as
+    /// [`Self::count_sessions_on_project`] counts them: a sub-agent's row keeps the project its
+    /// parent was on when it was spawned, and a name only such rows carry would be listed with a
+    /// count of none.
+    pub(crate) async fn session_project_names(&self) -> Result<Vec<String>> {
+        self.connection
+            .call(|connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(&format!(
+                    "SELECT DISTINCT project FROM sessions
+                     WHERE project != '' AND NOT {}
+                     ORDER BY project ASC",
+                    spawned_session_sql("")
+                ))?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to read the sessions' projects: {error}"))
+            })
+    }
+
+    /// Move every session and every memory on `project` to `new_project`, and answer how many
+    /// of each moved.
+    ///
+    /// One transaction over both tables, so a crash cannot leave the sessions on one name and
+    /// their memories on another, which no door could then bring back together.
+    pub(crate) async fn rename_project(
+        &self,
+        project: &str,
+        new_project: &str,
+    ) -> Result<(u64, u64)> {
+        let project = project.to_string();
+        let new_project = new_project.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let transaction = connection.transaction()?;
+                let sessions = transaction.execute(
+                    "UPDATE sessions SET project = ?2 WHERE project = ?1",
+                    rusqlite::params![project, new_project],
+                )?;
+                let memories = transaction.execute(
+                    "UPDATE memories SET project = ?2 WHERE project = ?1",
+                    rusqlite::params![project, new_project],
+                )?;
+                transaction.commit()?;
+                Ok((sessions as u64, memories as u64))
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to rename a project: {error}")))
+    }
+
     /// Take the lock on an id that is about to become a row.
     ///
     /// The ordering rule in one place, because four doors mint a session and each has to keep it.
@@ -1199,7 +1351,7 @@ impl Store {
     /// are written in one place.
     ///
     /// One parameter per column the doors decide, in column order; a struct here would carry the
-    /// same seven names one step upstream and add nothing but a second place to keep them in order.
+    /// same eight names one step upstream and add nothing but a second place to keep them in order.
     /// The level is a `String` and not an `Option`: every door writes one, so the scheduler can
     /// read the row alone, and the type is what keeps the next door from forgetting.
     #[allow(
@@ -1215,6 +1367,7 @@ impl Store {
         capabilities_json: Option<String>,
         token_id: Option<String>,
         profile: String,
+        project: String,
     ) -> Result<CreatedSession> {
         let created_at = chrono::Utc::now().to_rfc3339();
         let cwd_string = cwd.map(|path| path.display().to_string());
@@ -1224,8 +1377,8 @@ impl Store {
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
                     "INSERT INTO sessions (id, created_at, updated_at, working_directory, permission, approvals, \
-                     capabilities_json, token_id, profile)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     capabilities_json, token_id, profile, project)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     rusqlite::params![
                         session_id.to_string(),
                         created_at_for_db,
@@ -1236,6 +1389,7 @@ impl Store {
                         capabilities_json,
                         token_id,
                         profile,
+                        project,
                     ],
                 )?;
                 Ok(())
@@ -1249,6 +1403,29 @@ impl Store {
         })
     }
 
+    /// [`Self::create_child_session`] for a sub-agent of a session on no project.
+    #[cfg(test)]
+    pub(crate) async fn create_child_session_for_test(
+        &self,
+        parent: Uuid,
+        cwd: Option<std::path::PathBuf>,
+        additional_roots: Vec<PathBuf>,
+        subagent_spec_json: Option<String>,
+        permission: String,
+        profile: String,
+    ) -> Result<(Uuid, std::result::Result<FileLock, MekaError>)> {
+        self.create_child_session(
+            parent,
+            cwd,
+            additional_roots,
+            subagent_spec_json,
+            permission,
+            profile,
+            String::new(),
+        )
+        .await
+    }
+
     /// Create a session whose `parent_session_id` references an existing session, used by
     /// `agent_spawn` so sub-agent conversations persist as children of the parent for auditing.
     /// Cascades on parent delete (see [`Self::delete_session`]). The optional `cwd` is the parent's
@@ -1260,6 +1437,10 @@ impl Store {
     /// time. It is written with the row rather than updated afterwards, as the roots are: a spawn
     /// that fails between the two would otherwise leave a child that can be followed up on with
     /// no recorded terms.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per column the doors decide, as `insert_session_row` takes them"
+    )]
     pub(crate) async fn create_child_session(
         &self,
         parent: Uuid,
@@ -1278,6 +1459,9 @@ impl Store {
         // that did the work. Passed in for the same reason the window is: everything about a
         // sub-agent's binding comes off one cell.
         profile: String,
+        // The parent agent's live project, for the same reason: the row records what the worker's
+        // view is seeded from.
+        project: String,
     ) -> Result<(Uuid, std::result::Result<FileLock, MekaError>)> {
         let session_id = Uuid::new_v4();
         // Locked before the row, like every other door that mints one, and the exposure here is
@@ -1308,8 +1492,8 @@ impl Store {
                     "INSERT INTO sessions
                          (id, created_at, updated_at, parent_session_id, working_directory,
                           additional_workspace_directories_json, subagent_spec_json, permission, approvals,
-                          profile)
-                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, approvals, ?9
+                          profile, project)
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, approvals, ?9, ?10
                      FROM sessions WHERE id = ?4",
                     rusqlite::params![
                         session_id.to_string(),
@@ -1321,6 +1505,7 @@ impl Store {
                         subagent_spec_json,
                         permission,
                         profile,
+                        project,
                     ],
                 )?;
                 Ok(rows > 0)
@@ -1546,7 +1731,7 @@ impl Store {
                          id, created_at, updated_at, parent_session_id, subagent_spec_json,
                          working_directory, permission, approvals,
                          capabilities_json, token_id, additional_workspace_directories_json, profile,
-                         turns,
+                         project, turns,
                          input_tokens, output_tokens,
                          cache_creation_input_tokens, cache_read_input_tokens,
                          redactions, redacted_images, redacted_bytes,
@@ -1557,7 +1742,7 @@ impl Store {
                             COALESCE(?3, working_directory), permission, approvals,
                             capabilities_json, ?4,
                             CASE WHEN ?5 THEN ?6 ELSE additional_workspace_directories_json END, profile,
-                            turns,
+                            project, turns,
                             input_tokens, output_tokens,
                             cache_creation_input_tokens, cache_read_input_tokens,
                             redactions, redacted_images, redacted_bytes,
@@ -1829,6 +2014,7 @@ impl Store {
             additional_roots_json: Option<String>,
             subagent_spec_json: Option<String>,
             profile: String,
+            project: String,
             title: Option<String>,
             pinned_at: Option<String>,
             stats: crate::stats::SessionStatsSnapshot,
@@ -1875,6 +2061,7 @@ impl Store {
                 additional_roots_json: encode_additional_roots(&record.additional_roots)?,
                 subagent_spec_json: record.subagent_spec_json,
                 profile: record.profile,
+                project: record.project,
                 title: record.title,
                 pinned_at: record.pinned_at,
                 stats: record.stats,
@@ -1932,8 +2119,8 @@ impl Store {
                              turns, input_tokens, output_tokens,
                              cache_creation_input_tokens, cache_read_input_tokens,
                              redactions, redacted_images, redacted_bytes,
-                             title, pinned_at, prompt_index, turn_index
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                             title, pinned_at, prompt_index, turn_index, project
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                         rusqlite::params![
                             session.id,
                             session.created_at,
@@ -1958,6 +2145,7 @@ impl Store {
                             session.pinned_at,
                             session.stats.turn_position.map(|position| position.prompt_index as i64),
                             session.stats.turn_position.map(|position| position.turn_index as i64),
+                            session.project,
                         ],
                     )?;
                     for turn in &session.turns {
@@ -2140,7 +2328,8 @@ impl Store {
                      )
                      SELECT s.id, s.parent_session_id, s.created_at, s.updated_at,
                             s.working_directory, s.permission, s.capabilities_json, s.additional_workspace_directories_json,
-                            s.subagent_spec_json, s.profile, s.approvals, s.title, s.pinned_at
+                            s.subagent_spec_json, s.profile, s.approvals, s.title, s.pinned_at,
+                            s.project
                      FROM sessions s JOIN tree ON s.id = tree.id
                      ORDER BY tree.depth ASC, s.created_at ASC, s.id ASC",
                 )?;
@@ -2173,6 +2362,7 @@ impl Store {
                         approvals: row.get(10)?,
                         title: row.get(11)?,
                         pinned_at: row.get(12)?,
+                        project: row.get(13)?,
                     })
                 })?;
                 let mut out = Vec::new();
@@ -2607,17 +2797,21 @@ impl Store {
     /// same question the refusal does. An imported sub-agent has no parent link and is refused all
     /// the same, so keying on the link alone would let `-c` select one and then decline it:
     /// exactly the dead-end above, and permanent, because nothing newer can outrank it.
-    pub(crate) async fn last_session_id(&self) -> Result<Option<Uuid>> {
+    ///
+    /// With a project, the most recent root session on it: `-c --project <name>` continues the
+    /// user's latest work there rather than wherever they were last.
+    pub(crate) async fn last_session_id(&self, project: Option<&str>) -> Result<Option<Uuid>> {
+        let project = project.map(str::to_string);
         self.connection
-            .call(|connection| -> rusqlite::Result<_> {
+            .call(move |connection| -> rusqlite::Result<_> {
                 let result: std::result::Result<String, _> = connection.query_row(
                     &format!(
                         "SELECT id FROM sessions
-                         WHERE NOT {}
+                         WHERE NOT {} AND (?1 IS NULL OR project = ?1)
                          ORDER BY updated_at DESC LIMIT 1",
                         spawned_session_sql("")
                     ),
-                    [],
+                    rusqlite::params![project],
                     |row| row.get(0),
                 );
 
@@ -2797,6 +2991,7 @@ impl Store {
         let cwd_filter_string = filter.cwd.as_ref().map(|path| path.display().to_string());
         let parent_string = filter.parent.map(|parent| parent.to_string());
         let profile_filter = filter.profile.clone();
+        let project_filter = filter.project.clone();
         let pinned_filter = filter.pinned;
         // Compared as text: every writer renders `updated_at` with `to_rfc3339`, whose fixed
         // width and `+00:00` offset sort as the instants do, so this holds only while no writer
@@ -2823,6 +3018,9 @@ impl Store {
                 }
                 if profile_filter.is_some() {
                     clauses.push("s.profile = :profile");
+                }
+                if project_filter.is_some() {
+                    clauses.push("s.project = :project");
                 }
                 match pinned_filter {
                     Some(true) => clauses.push("s.pinned_at IS NOT NULL"),
@@ -2854,7 +3052,7 @@ impl Store {
                     (super::turns::TURN_COLUMNS, super::turns::LATEST_TURN_JOIN);
                 let query = format!(
                     "SELECT s.id, s.created_at, s.updated_at, s.working_directory, s.permission, s.capabilities_json, s.additional_workspace_directories_json, s.token_id, s.parent_session_id, s.profile, s.approvals,
-                            s.title, s.pinned_at,
+                            s.title, s.pinned_at, s.project,
                             COALESCE(
                               (SELECT content FROM messages
                                WHERE {title_row}
@@ -2895,6 +3093,9 @@ impl Store {
                 if let Some(ref profile) = profile_filter {
                     params.push((":profile", profile));
                 }
+                if let Some(ref project) = project_filter {
+                    params.push((":project", project));
+                }
                 if let Some(ref since) = updated_since {
                     params.push((":updated_since", since));
                 }
@@ -2918,15 +3119,16 @@ impl Store {
                     let approvals: bool = row.get(10)?;
                     let set_title: Option<String> = row.get(11)?;
                     let pinned_at: Option<String> = row.get(12)?;
-                    let title_kind: String = row.get(14)?;
+                    let project: String = row.get(13)?;
+                    let title_kind: String = row.get(15)?;
                     let title = effective_title(
                         set_title,
                         &id_str,
                         &title_kind,
-                        row.get(13)?,
+                        row.get(14)?,
                         title_chars,
                     );
-                    let last_turn = turn_from_row(row, 15)?;
+                    let last_turn = turn_from_row(row, 16)?;
                     Ok((
                         id_str,
                         created_at,
@@ -2938,6 +3140,7 @@ impl Store {
                         token_id,
                         parent_id,
                         profile,
+                        project,
                         approvals,
                         title,
                         pinned_at,
@@ -2958,6 +3161,7 @@ impl Store {
                         token_id,
                         parent_id,
                         profile,
+                        project,
                         approvals,
                         title,
                         pinned_at,
@@ -2978,6 +3182,7 @@ impl Store {
                         ),
                         approvals,
                         profile,
+                        project,
                         capabilities_json,
                         additional_roots: decode_additional_roots(additional_roots_json.as_deref()),
                         token_id,
@@ -3012,7 +3217,7 @@ impl Store {
                     (super::turns::TURN_COLUMNS, super::turns::LATEST_TURN_JOIN);
                 let mut statement = connection.prepare(&format!(
                     "SELECT s.id, s.created_at, s.updated_at, s.working_directory, s.permission, s.capabilities_json, s.additional_workspace_directories_json, s.token_id, s.parent_session_id, s.profile, s.approvals,
-                            s.title, s.pinned_at,
+                            s.title, s.pinned_at, s.project,
                             COALESCE(
                               (SELECT content FROM messages
                                WHERE {title_row}
@@ -3044,15 +3249,16 @@ impl Store {
                     let approvals: bool = row.get(10)?;
                     let set_title: Option<String> = row.get(11)?;
                     let pinned_at: Option<String> = row.get(12)?;
-                    let title_kind: String = row.get(14)?;
+                    let project: String = row.get(13)?;
+                    let title_kind: String = row.get(15)?;
                     let title = effective_title(
                         set_title,
                         &id_str,
                         &title_kind,
-                        row.get(13)?,
+                        row.get(14)?,
                         crate::conversation::TITLE_CHARS,
                     );
-                    let last_turn = turn_from_row(row, 15)?;
+                    let last_turn = turn_from_row(row, 16)?;
                     Ok((
                         id_str,
                         created_at,
@@ -3064,6 +3270,7 @@ impl Store {
                         token_id,
                         parent_id,
                         profile,
+                        project,
                         approvals,
                         title,
                         pinned_at,
@@ -3083,6 +3290,7 @@ impl Store {
                             token_id,
                             parent_id,
                             profile,
+                            project,
                             approvals,
                             title,
                             pinned_at,
@@ -3103,6 +3311,7 @@ impl Store {
                             ),
                             approvals,
                             profile,
+                            project,
                             additional_roots: decode_additional_roots(
                                 additional_roots_json.as_deref(),
                             ),
@@ -3622,6 +3831,7 @@ impl Store {
             approvals,
             cwd,
             profile,
+            project,
             roots,
             title,
             pinned,
@@ -3661,6 +3871,10 @@ impl Store {
                 if let Some(profile) = &profile {
                     assignments.push("profile = :profile");
                     params.push((":profile", profile));
+                }
+                if let Some(project) = &project {
+                    assignments.push("project = :project");
+                    params.push((":project", project));
                 }
                 if let Some(roots) = &roots {
                     assignments.push("additional_workspace_directories_json = :roots");
@@ -4421,7 +4635,7 @@ mod tests {
         let parent = plain_session(&store, "parent").await;
         let other = plain_session(&store, "other").await;
         let (child, _lock) = store
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -4432,7 +4646,7 @@ mod tests {
             .await
             .expect("spawn");
         let (grandchild, _lock) = store
-            .create_child_session(
+            .create_child_session_for_test(
                 child,
                 None,
                 Vec::new(),
@@ -4931,6 +5145,7 @@ mod tests {
                     additional_roots: Vec::new(),
                     subagent_spec_json: None,
                     profile: "test-profile".to_string(),
+                    project: String::new(),
                     title: Some("From the archive".to_string()),
                     pinned_at: Some("2026-02-02T00:00:00+00:00".to_string()),
                     stats: Default::default(),
@@ -5029,7 +5244,7 @@ mod tests {
             .await
             .expect("parent");
         let (child, _lock) = store
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -5222,7 +5437,7 @@ mod tests {
         // must be used. Nothing here needs the child's lock: `fork_session_into` and
         // `load_session_tree` take none.
         let _child = store
-            .create_child_session(
+            .create_child_session_for_test(
                 source,
                 None,
                 Vec::new(),
@@ -5512,7 +5727,7 @@ mod tests {
             .await
             .expect("a root session");
         let (sub_agent, _lock) = store
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -5525,7 +5740,7 @@ mod tests {
         assert_ne!(parent, sub_agent);
 
         assert_eq!(
-            store.last_session_id().await.expect("read"),
+            store.last_session_id(None).await.expect("read"),
             Some(parent),
             "a sub-agent is not resumable, so offering it to `-c` is offering a dead end"
         );
@@ -5541,7 +5756,7 @@ mod tests {
             .await
             .expect("root");
         let (pinned, _lock) = store
-            .create_child_session(
+            .create_child_session_for_test(
                 root,
                 None,
                 Vec::new(),
@@ -5552,7 +5767,7 @@ mod tests {
             .await
             .expect("pinned");
         let (unpinned, _lock) = store
-            .create_child_session(
+            .create_child_session_for_test(
                 root,
                 None,
                 Vec::new(),
@@ -5568,7 +5783,7 @@ mod tests {
             .expect("other");
         // What an import copies verbatim from an archive somebody edited: not JSON at all.
         let (malformed, _lock) = store
-            .create_child_session(
+            .create_child_session_for_test(
                 root,
                 None,
                 Vec::new(),
@@ -5677,7 +5892,7 @@ mod tests {
         );
 
         assert_eq!(
-            store.last_session_id().await.expect("read"),
+            store.last_session_id(None).await.expect("read"),
             Some(drivable),
             "`-c` has to skip the orphan and reach the session it can actually drive"
         );
@@ -5712,7 +5927,7 @@ mod tests {
             .await
             .expect("a root session");
         let (sub_agent, lock) = store
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -5846,6 +6061,9 @@ mod tests {
             // Copied by a fork: the copy continues numbering its turns where the source stood.
             "prompt_index",
             "turn_index",
+            // Copied by a fork: the copy continues the conversation in the same project, seeing
+            // the memories the source saw.
+            "project",
         ]);
     }
 
@@ -5870,6 +6088,7 @@ mod tests {
                     additional_roots: Vec::new(),
                     subagent_spec_json: None,
                     profile: "work".to_string(),
+                    project: String::new(),
                     title: None,
                     pinned_at: None,
                     stats: crate::stats::SessionStatsSnapshot::default(),
@@ -5905,6 +6124,7 @@ mod tests {
                 approvals: Some(true),
                 cwd: Some(PathBuf::from("/work/new")),
                 profile: Some("beta".to_string()),
+                project: None,
                 roots: None,
                 title: None,
                 pinned: None,
@@ -6028,7 +6248,7 @@ mod tests {
             // never consulted. It said "on the parent's profile" while doing the opposite, so
             // deleting the filter outright left the suite green.
             let (_id, lock) = store
-                .create_child_session(
+                .create_child_session_for_test(
                     parent,
                     None,
                     Vec::new(),
@@ -6080,7 +6300,7 @@ mod tests {
     async fn spawning_from_a_session_that_is_gone_is_refused() {
         let store = Store::for_test().await;
         let Err(error) = store
-            .create_child_session(
+            .create_child_session_for_test(
                 Uuid::new_v4(),
                 None,
                 Vec::new(),
@@ -6811,14 +7031,14 @@ mod tests {
     #[tokio::test]
     async fn the_last_session_id_is_none_until_a_session_exists() {
         let store = Store::for_test().await;
-        assert!(store.last_session_id().await.expect("failed").is_none());
+        assert!(store.last_session_id(None).await.expect("failed").is_none());
 
         let session_id = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("failed to create session");
         let last = store
-            .last_session_id()
+            .last_session_id(None)
             .await
             .expect("failed to get last session");
         assert_eq!(last, Some(session_id));
@@ -6959,7 +7179,7 @@ mod tests {
             .await
             .expect("parent");
         let child = store
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -6971,7 +7191,7 @@ mod tests {
             .expect("child")
             .0;
         let grandchild = store
-            .create_child_session(
+            .create_child_session_for_test(
                 child,
                 None,
                 Vec::new(),
@@ -7089,6 +7309,7 @@ mod tests {
                 None,
                 None,
                 "test-profile".to_string(),
+                String::new(),
             )
             .await;
 
@@ -7330,6 +7551,7 @@ mod tests {
             additional_roots: Vec::new(),
             subagent_spec_json: parent.map(|_| "{\"tools\":[]}".to_string()),
             profile: "work".to_string(),
+            project: String::new(),
             title: None,
             pinned_at: None,
             stats: crate::stats::SessionStatsSnapshot::default(),
@@ -7388,6 +7610,7 @@ mod tests {
                     ))],
                     subagent_spec_json: None,
                     profile: "work".to_string(),
+                    project: String::new(),
                     title: None,
                     pinned_at: None,
                     stats: crate::stats::SessionStatsSnapshot::default(),
@@ -7483,6 +7706,7 @@ mod tests {
                 None,
                 None,
                 "test-profile".to_string(),
+                String::new(),
             )
             .await
             .expect("create")
@@ -7630,7 +7854,7 @@ mod tests {
             .await
             .expect("create parent");
         let child = store
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -8248,6 +8472,7 @@ mod tests {
             additional_roots: Vec::new(),
             subagent_spec_json: None,
             profile: "test-profile".to_string(),
+            project: String::new(),
             title: None,
             pinned_at: None,
             stats: Default::default(),
@@ -8432,6 +8657,7 @@ mod tests {
                 Some(r#"{"supports_reasoning_stream":true}"#.to_string()),
                 Some("token_fp_1234".to_string()),
                 "test-profile".to_string(),
+                String::new(),
             )
             .await
             .expect("create with metadata");
@@ -8483,7 +8709,7 @@ mod tests {
             .await
             .expect("create parent");
         let child = store
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -8516,7 +8742,7 @@ mod tests {
             .await
             .expect("create parent");
         let _child = store
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -8693,7 +8919,7 @@ mod tests {
             .await
             .expect("create parent");
         let child = store
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -9410,5 +9636,190 @@ mod tests {
             holds(crashed_in_view).await,
             "a turn nobody closed is dated by its start"
         );
+    }
+
+    /// Every door that mints a row records the project it was given, every reader hands it
+    /// back, and the operator's doors filter, count and move by it.
+    #[tokio::test]
+    async fn sessions_record_their_project_and_the_doors_filter_count_and_move_by_it() {
+        let store = Store::for_test().await;
+        let plain = store
+            .create_session(None, "profile")
+            .await
+            .expect("a session on no project");
+        let on_web = store
+            .create_session_in_project_for_test(None, "profile", "webdev")
+            .await
+            .expect("a session on webdev");
+        let (child, _lock) = store
+            .create_child_session(
+                on_web,
+                None,
+                Vec::new(),
+                None,
+                "read".to_string(),
+                "profile".to_string(),
+                "webdev".to_string(),
+            )
+            .await
+            .expect("a sub-agent of it");
+        let info = |id: Uuid| {
+            let store = store.clone();
+            async move {
+                store
+                    .session_info(id)
+                    .await
+                    .expect("info")
+                    .expect("row")
+                    .project
+            }
+        };
+        assert_eq!(info(plain).await, "");
+        assert_eq!(info(on_web).await, "webdev");
+        assert_eq!(info(child).await, "webdev");
+        assert_eq!(
+            store.recorded_project(on_web).await.expect("recorded"),
+            Some("webdev".to_string())
+        );
+        assert_eq!(
+            store
+                .recorded_project(Uuid::new_v4())
+                .await
+                .expect("recorded"),
+            None
+        );
+
+        // `-c --project` continues the latest root session on the project, never the sub-agent
+        // that touched its row last and never a session elsewhere.
+        assert_eq!(
+            store.last_session_id(Some("webdev")).await.expect("last"),
+            Some(on_web)
+        );
+        assert_eq!(
+            store.last_session_id(Some("movie")).await.expect("last"),
+            None
+        );
+        assert_eq!(
+            store.last_session_id(Some("")).await.expect("last"),
+            Some(plain)
+        );
+        let listed = |project: Option<&str>| {
+            let store = store.clone();
+            let project = project.map(str::to_string);
+            async move {
+                store
+                    .list_sessions(10, None, &SessionFilter {
+                        project,
+                        ..SessionFilter::default()
+                    })
+                    .await
+                    .expect("list")
+                    .0
+                    .into_iter()
+                    .map(|summary| summary.id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(listed(Some("webdev")).await, [on_web]);
+        assert_eq!(listed(Some("")).await, [plain]);
+        assert_eq!(listed(None).await.len(), 2);
+        assert_eq!(
+            store
+                .count_sessions_on_project("webdev")
+                .await
+                .expect("count"),
+            1,
+            "root sessions only, as the profile count is"
+        );
+
+        // A fork continues the conversation in the same project.
+        let forked = store
+            .fork_session_for_test(on_web, ForkOverrides::default())
+            .await
+            .expect("fork")
+            .expect("source exists");
+        assert_eq!(info(forked.id).await, "webdev");
+
+        // A patch moves a session onto a project or off one, and moves `updated_at` with it,
+        // since what the session runs as has changed.
+        let before = store.session_info(plain).await.expect("info").expect("row");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        store
+            .update_session(plain, SessionPatch {
+                project: Some("webdev".to_string()),
+                ..SessionPatch::default()
+            })
+            .await
+            .expect("move onto");
+        let after = store.session_info(plain).await.expect("info").expect("row");
+        assert_eq!(after.project, "webdev");
+        assert!(
+            after.updated_at > before.updated_at,
+            "a move touches the row"
+        );
+        store
+            .update_session(plain, SessionPatch {
+                project: Some(String::new()),
+                ..SessionPatch::default()
+            })
+            .await
+            .expect("move off");
+        assert_eq!(info(plain).await, "");
+
+        // A rename moves every row on the project, sessions and memories in one transaction.
+        let memories = store.memory_store(true, crate::config::MEMORY_INLINE_MAX_BYTES_DEFAULT);
+        memories
+            .write(crate::store::memory::WriteRequest {
+                name: "note".to_string(),
+                description: Some("d".to_string()),
+                view: crate::store::memory::MemoryView::Session("webdev".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("a webdev memory");
+        assert_eq!(
+            store.rename_project("webdev", "web").await.expect("rename"),
+            (3, 1),
+            "the root, its sub-agent and the fork, plus the one memory"
+        );
+        assert_eq!(info(on_web).await, "web");
+        assert_eq!(info(child).await, "web");
+        assert_eq!(memories.project_names().await.expect("names"), ["web"]);
+        assert_eq!(
+            store
+                .count_sessions_on_project("webdev")
+                .await
+                .expect("count"),
+            0
+        );
+
+        // A project only a sub-agent's row carries is neither counted nor listed: the listing's
+        // names follow its counts.
+        let (_orphan, _orphan_lock) = store
+            .create_child_session(
+                plain,
+                None,
+                Vec::new(),
+                None,
+                "read".to_string(),
+                "profile".to_string(),
+                "orphan".to_string(),
+            )
+            .await
+            .expect("a sub-agent on a project its parent is not on");
+        assert_eq!(
+            store
+                .count_sessions_on_project("orphan")
+                .await
+                .expect("count"),
+            0
+        );
+        assert_eq!(store.session_project_names().await.expect("names"), ["web"]);
+        let patch = |project: &str| SessionPatch {
+            project: Some(project.to_string()),
+            ..SessionPatch::default()
+        };
+        assert_eq!(patch("web").to_string(), "project 'web'");
+        assert_eq!(patch("").to_string(), "no project");
     }
 }

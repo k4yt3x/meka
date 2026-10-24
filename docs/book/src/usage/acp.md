@@ -20,7 +20,7 @@ A few flags are worth knowing:
 | `-vv` | `debug` (per-request JSON-RPC diagnostics). |
 | `RUST_LOG=meka=trace` | Trace level. |
 
-Two flags are refused rather than ignored: `-c` and `-r`. Both name one run's session, and this host creates one per `session/new`, each naming its own profile. A new session starts on the host's default; move it with `session/set_config_option`, and `session/load` restores whichever profile a session already recorded. `--profile` is accepted, since it selects which configured profile a session gets when it names none, which is a property of the connection rather than of one session.
+Three flags are refused rather than ignored: `-c`, `-r` and `--project`. Each names one run's session, and this host creates one per `session/new`, each naming its own profile and project. A new session starts on the host's default profile and on no project; move either with `session/set_config_option`, and `session/load` restores whichever a session already recorded. `--profile` is accepted, since it selects which configured profile a session gets when it names none, which is a property of the connection rather than of one session.
 
 On startup, after the client's `initialize` arrives, meka logs `ACP client connected: <name> <version>` so you can confirm the client identity under `-v`.
 
@@ -104,7 +104,7 @@ What an `InternalError`'s `data` carries follows the same policy the HTTP API ap
 - **`session/close { sessionId }`**: cancels any in-flight prompt, waits for that turn to finish (the cancel does not cut short a `file_read` or an `fs/*` request already in progress), releases the on-disk session lock, and removes the entry from the map.
 - **`session/cancel { sessionId }`**: interrupts the active `session/prompt`. The response carries `stopReason: "cancelled"`. A cancel sent straight after a prompt still stops that prompt, even if it arrives before the turn has started: meka latches the signal and applies it as the turn begins. The latch is scoped to a prompt that is already on its way, so a cancel with nothing to stop is discarded rather than saved. Interrupting a turn, canceling twice, or canceling while idle all leave the next prompt you send to run normally.
 - **`session/set_mode { sessionId, modeId }`**: flips the agent's `Permission` cell. A level outside `[permissions].enabled` is refused with `InvalidParams`. On success, meka emits `session/update: current_mode_update`. The flip is atomic and applies to the *next* tool call within an in-flight turn; no need to wait for the turn to finish.
-- **`session/set_config_option { sessionId, configId, value }`**: sets one of the three entries in `configOptions`. Returns the full list with its new values. See [Session config options](#session-config-options).
+- **`session/set_config_option { sessionId, configId, value }`**: sets one of the entries in `configOptions`. Returns the full list with its new values. See [Session config options](#session-config-options).
 
 `session/new`, `session/load`, `session/resume` and `session/fork` all answer with `modes` and `configOptions`, and each is followed by an `available_commands_update` (see [Slash commands](#slash-commands)). `--additional-workspace-directory` on the `meka acp` command line adds to every session's workspace, beside whatever the client sent as `additionalDirectories`; those are the session's additional workspace directories at every level, writable at `workspace` and read-only at `read` as the working directory is, since `session/set_mode` moves the level while the session runs. `--additional-readable-directory` adds what every session reads beyond its workspace.
 
@@ -191,12 +191,14 @@ A prompt left unanswered for 30 minutes is denied, and the turn carries on; the 
 ## Session config options
 
 Every session-creation response also carries `configOptions`, a list of options a client can
-render and change with `session/set_config_option`. meka advertises three, in this order:
+render and change with `session/set_config_option`. meka advertises three, four where
+`config.toml` defines a [project](./projects.md), in this order:
 
 | `configId` | Kind | Category | Values | Meaning |
 |------------|------|----------|--------|---------|
 | `permission` | select | `mode` | The ids in `[permissions].enabled` | The same picker as `modes`, so it sits beside the one below |
 | `profile` | select | `model` | The profile names in your `config.toml` | The profile this session runs on |
+| `project` | select | none | `""` (shown as "No project"), then the project names in your `config.toml` | The project this session is on, whose memories it sees beside the global ones; offered only when a project is defined |
 | `approvals` | boolean | `mode` | `true` / `false` | Whether a call above the level is put to you for approval rather than refused; see [Permissions](./permissions.md#approvals) |
 
 `approvals` takes the protocol's boolean value, `"type": "boolean", "value": true` beside `configId`
@@ -224,9 +226,13 @@ your call: a thinking block is tagged with the backend that produced it and is n
 different one, so from the next turn the model no longer sees the reasoning recorded under the old
 profile.
 
-While a turn is in flight the switch is refused with `InvalidParams` (`cannot switch profile while a
-turn is in flight; cancel it first`), the answer a second `session/prompt` gets, and nothing is
-written. Reasoning effort is deliberately not offered: which tiers a
+Changing `project` rewrites the row the same way, and the next turn's context restates the
+memories the session now sees; a new session is on no project, and a name `config.toml` does not
+define is refused without moving the row.
+
+While a turn is in flight either switch is refused with `InvalidParams` (`cannot switch profile while a
+turn is in flight; cancel it first`, or `project`), the answer a second `session/prompt` gets, and
+nothing is written. Reasoning effort is deliberately not offered: which tiers a
 model accepts is a fact about the provider's system, and a fixed dropdown would be meka asserting
 it. It stays on the profile.
 

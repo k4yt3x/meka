@@ -213,8 +213,8 @@ transcript. What the screen holds the answer to works at any time, a turn runnin
 listings and pickers (`/skill`, `/memory`, `/schedule`, `/task`, `/session`, `/help`, `/log`), the
 settings (`/permission`, `/approvals`, `/cd`), `/task cancel` and `/schedule cancel`, and `/exit`.
 A command that needs the agent's turn to be over (`/compact`, `/rewind`, `/fork`, `/export`,
-`/title`, `/status`, `/usage`, every `/mcp` verb and prompt, `/skill <name>` and
-`/profile <name>`) is refused while a turn runs, in a panel naming it: stop the turn with Esc
+`/title`, `/status`, `/usage`, every `/mcp` verb and prompt, `/skill <name>`,
+`/profile <name>`, `/project open <name>` and `/project close`) is refused while a turn runs, in a panel naming it: stop the turn with Esc
 first, or wait for it to end. What a command *does* (set a level, change directory,
 cancel a job) is one dimmed `•` row on the transcript. What a command has to *say back* instead, a
 refusal, a failure or an empty list, is a panel as well, closed with Esc, and leaves no row.
@@ -222,7 +222,7 @@ refusal, a failure or an empty list, is a panel as well, closed with Esc, and le
 the transcript: a warning is a row as it happens, and the debug lines around it are there to read
 without restarting.
 
-A bare `/permission`, `/approvals`, `/profile` or `/resume` is a **picker**: the choices in a panel with the
+A bare `/permission`, `/approvals`, `/profile`, `/project` or `/resume` is a **picker**: the choices in a panel with the
 cursor on the current one, Up and Down (or **j** and **k**) to move it, PgUp and PgDn to move it by
 a page, Ctrl+Home and Ctrl+End to the ends, **Enter** to apply, **Esc** to leave it as it was. In `/resume`'s list, **/** starts typing a filter that keeps only the rows
 matching the text; **Esc** stops typing and keeps the filter, and a second **Esc** closes the list. With an argument each sets the value directly. A bare `/skill`, `/memory`, `/task` or
@@ -240,6 +240,7 @@ with their state, and **Enter** offers reconnect, login and logout for the picke
 | `/permission [level]` | Pick or set the permission level |
 | `/approvals [on\|off]` | Pick or set whether calls above the level are submitted for approval |
 | `/profile [name]` | Pick or set the profile this session runs on |
+| `/project [open <name>\|close]` | Pick, open or close the [project](./projects.md) this session is on |
 | `/resume [session]` | Pick a session to switch to, or switch to one by id or unique prefix |
 | `/compact [instructions]` | Summarize and compact the session, optionally saying what to keep |
 | `/rewind [N]` | Drop the last N turns from the conversation (default 1) |
@@ -273,7 +274,8 @@ Typing `/` opens the list of commands above the composer, each with its descript
 narrows as you type. **Up** and **Down** move the pick, **Enter** runs the picked command, **Tab**
 fills it in so you can go on to an argument, and **Esc** closes the list until you type again. An
 argument's list opens the same way: permission levels for `/permission`, `on`/`off` for
-`/approvals`, configured profile names for `/profile`, installed skill names for `/skill`, the
+`/approvals`, configured profile names for `/profile`, `open` and `close` then configured project
+names for `/project`, installed skill names for `/skill`, the
 subcommands and configured servers for `/mcp`, and directory paths for `/cd` (Tab after a completed
 directory drills into its subdirectories).
 

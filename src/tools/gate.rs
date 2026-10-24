@@ -100,6 +100,76 @@ impl GateToolset {
 /// refused gate; failing open would run one on authority meka never established.
 pub(super) static EMPTY_GATE_REGISTRY: std::sync::LazyLock<ToolRegistry> =
     std::sync::LazyLock::new(ToolRegistry::new);
+/// [`GateToolset`] as one session sees it: a tool the session's project hides resolves to nothing
+/// and is not called, so a gate names only what the session could call itself. Installed on the
+/// session's registry, and built for a row's project by the HTTP job door; the process-wide set
+/// stays what the fire door resolves through.
+pub(crate) struct ScopedGateTools {
+    inner: Arc<dyn crate::schedule::GateTools>,
+    scope: super::registry::LiveScope,
+}
+
+impl ScopedGateTools {
+    pub(crate) fn new(
+        inner: Arc<dyn crate::schedule::GateTools>,
+        scope: super::registry::LiveScope,
+    ) -> Self {
+        Self { inner, scope }
+    }
+
+    /// The set narrowed by a project's view read once, for a door that has a row and no live
+    /// session.
+    pub(crate) fn for_view(
+        inner: Arc<dyn crate::schedule::GateTools>,
+        access: &crate::config::ProjectAccess,
+    ) -> Self {
+        Self::new(
+            inner,
+            super::registry::LiveScope::from(super::registry::project_tool_scope(access)),
+        )
+    }
+}
+
+impl std::fmt::Debug for ScopedGateTools {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScopedGateTools")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl crate::schedule::GateTools for ScopedGateTools {
+    fn resolve(&self, name: &str) -> Option<crate::permission::Permission> {
+        self.scope
+            .current()
+            .admits_tool(name)
+            .then(|| self.inner.resolve(name))
+            .flatten()
+    }
+
+    fn is_still_connecting(&self, name: &str) -> bool {
+        self.scope.current().admits_tool(name) && self.inner.is_still_connecting(name)
+    }
+
+    async fn call(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        timeout: std::time::Duration,
+        cwd: Option<&std::path::Path>,
+        session_id: Option<uuid::Uuid>,
+    ) -> std::result::Result<crate::schedule::ProbeOutcome, String> {
+        if !self.scope.current().admits_tool(name) {
+            return Err(format!("no gate tool named '{name}'"));
+        }
+        self.inner
+            .call(name, arguments, timeout, cwd, session_id)
+            .await
+    }
+}
+
 #[async_trait]
 impl crate::schedule::GateTools for GateToolset {
     fn resolve(&self, name: &str) -> Option<crate::permission::Permission> {
@@ -224,6 +294,7 @@ mod tests {
                 sandbox_enabled: false,
                 sandbox_capability: crate::sandbox::SandboxCapability::Unavailable,
                 builtin_filter: BuiltinToolFilter::from_config(None, Vec::new(), overrides),
+                projects: Default::default(),
                 ..crate::session::CoreMaterials::for_test()
             },
             resolution: std::sync::OnceLock::new(),
@@ -288,6 +359,7 @@ mod tests {
                 sandbox_enabled: false,
                 sandbox_capability: crate::sandbox::SandboxCapability::Unavailable,
                 builtin_filter: BuiltinToolFilter::from_config(None, Vec::new(), HashMap::new()),
+                projects: Default::default(),
                 ..crate::session::CoreMaterials::for_test()
             },
             resolution: std::sync::OnceLock::new(),
@@ -340,6 +412,7 @@ mod tests {
                 sandbox_enabled: false,
                 sandbox_capability: crate::sandbox::SandboxCapability::Unavailable,
                 builtin_filter: BuiltinToolFilter::from_config(None, Vec::new(), HashMap::new()),
+                projects: Default::default(),
                 ..crate::session::CoreMaterials::for_test()
             },
             resolution: std::sync::OnceLock::new(),
@@ -416,5 +489,68 @@ mod tests {
             "so the gate door refuses it at every level, rather than running a command with no \
              boundary on a timer"
         );
+    }
+
+    /// A gate names only what the session could call: a tool the session's project hides resolves
+    /// to nothing through the session's set, and the move that shows the server shows it.
+    #[tokio::test]
+    async fn a_session_s_gate_tools_hide_what_its_project_hides() {
+        use crate::schedule::GateTools as _;
+
+        #[derive(Debug)]
+        struct Everything;
+        #[async_trait]
+        impl crate::schedule::GateTools for Everything {
+            fn resolve(&self, _name: &str) -> Option<crate::permission::Permission> {
+                Some(crate::permission::Permission::Read)
+            }
+
+            async fn call(
+                &self,
+                name: &str,
+                _arguments: &serde_json::Value,
+                _timeout: std::time::Duration,
+                _cwd: Option<&std::path::Path>,
+                _session_id: Option<uuid::Uuid>,
+            ) -> std::result::Result<crate::schedule::ProbeOutcome, String> {
+                Err(format!("called {name}"))
+            }
+        }
+        let projects: std::collections::BTreeMap<String, crate::config::ProjectConfig> =
+            toml::from_str("[quiet]\ndisabled_servers = [\"hidden\"]\n").expect("projects");
+        let project = crate::session::SharedProject::new(Some("quiet".to_string()));
+        let registry = ToolRegistry::new();
+        registry.publish_project(crate::session::ProjectLens::new(
+            project.clone(),
+            Arc::new(projects.clone()),
+        ));
+        let scoped = ScopedGateTools::new(Arc::new(Everything), registry.live_scope());
+        assert!(scoped.resolve("mcp__hidden__probe").is_none());
+        assert_eq!(
+            scoped.resolve("mcp__open__probe"),
+            Some(crate::permission::Permission::Read)
+        );
+        assert!(
+            scoped
+                .call(
+                    "mcp__hidden__probe",
+                    &serde_json::Value::Null,
+                    std::time::Duration::from_secs(1),
+                    None,
+                    None
+                )
+                .await
+                .is_err_and(|error| error.contains("no gate tool named"))
+        );
+        project.set(None);
+        assert_eq!(
+            scoped.resolve("mcp__hidden__probe"),
+            Some(crate::permission::Permission::Read)
+        );
+        let view = ScopedGateTools::for_view(
+            Arc::new(Everything),
+            &crate::config::ProjectAccess::of(&projects, Some("quiet")),
+        );
+        assert!(view.resolve("mcp__hidden__probe").is_none());
     }
 }

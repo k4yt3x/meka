@@ -1378,7 +1378,7 @@ mod tests {
         let (store, root) = store_with_session().await;
         let inbox = store.inbox_store();
         let (child, _lock) = store
-            .create_child_session(
+            .create_child_session_for_test(
                 root,
                 None,
                 Vec::new(),

@@ -3268,6 +3268,7 @@ mod tests {
                         reason: "test fixture".to_string(),
                     },
                     builtin_filter: crate::config::BuiltinToolFilter::default(),
+                    projects: Default::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
                     running_subagents: Default::default(),
                 },
@@ -3280,6 +3281,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: shared_session_id,
+                project: Default::default(),
                 checklist,
                 background_tasks: crate::background::BackgroundTasks::default(),
                 ..crate::session::SessionCells::for_test(
@@ -3432,6 +3434,7 @@ mod tests {
                         reason: "test fixture".to_string(),
                     },
                     builtin_filter: crate::config::BuiltinToolFilter::default(),
+                    projects: Default::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
                     running_subagents: Default::default(),
                 },
@@ -3444,6 +3447,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: shared_session_id,
+                project: Default::default(),
                 checklist,
                 background_tasks: crate::background::BackgroundTasks::default(),
                 ..crate::session::SessionCells::for_test(
@@ -3601,6 +3605,7 @@ mod tests {
                         reason: "test fixture".to_string(),
                     },
                     builtin_filter: crate::config::BuiltinToolFilter::default(),
+                    projects: Default::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
                     running_subagents: Default::default(),
                 },
@@ -3613,6 +3618,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: crate::session::SharedSessionId::default(),
+                project: Default::default(),
                 checklist: crate::checklist::SharedChecklist::default(),
                 background_tasks: crate::background::BackgroundTasks::default(),
                 ..crate::session::SessionCells::for_test(
@@ -3735,6 +3741,7 @@ mod tests {
                         reason: "test fixture".to_string(),
                     },
                     builtin_filter: crate::config::BuiltinToolFilter::default(),
+                    projects: Default::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
                     running_subagents: Default::default(),
                 },
@@ -3747,6 +3754,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: shared_session_id,
+                project: Default::default(),
                 checklist,
                 background_tasks: crate::background::BackgroundTasks::default(),
                 ..crate::session::SessionCells::for_test(
@@ -3861,6 +3869,7 @@ mod tests {
                         reason: "test fixture".to_string(),
                     },
                     builtin_filter: crate::config::BuiltinToolFilter::default(),
+                    projects: Default::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
                     running_subagents: Default::default(),
                 },
@@ -3873,6 +3882,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: shared_session_id,
+                project: Default::default(),
                 checklist,
                 background_tasks: crate::background::BackgroundTasks::default(),
                 ..crate::session::SessionCells::for_test(

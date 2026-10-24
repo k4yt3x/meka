@@ -257,7 +257,26 @@ pub(crate) async fn submit_turn(
         };
 
     let message = if let Some(skill_name) = body.options.skill.as_deref() {
-        let snapshot = state.shared.skills.current().await;
+        // Within the session's project, read off the row because the turn below applies the row
+        // to the agent anyway: a skill the project hides reaches the session through no door.
+        let project = state
+            .shared
+            .store
+            .recorded_project(session_id)
+            .await
+            .map_err(|error| {
+                ProblemDetail::internal_sanitized("failed to read session project", error)
+            })?;
+        // A project the file no longer defines is the refusal to give, not a skill it hides.
+        if let Some(name) = project.as_deref().filter(|name| !name.is_empty()) {
+            crate::config::require_project(name, &state.shared.config.projects).map_err(
+                |error| ProblemDetail::for_error(&error, state.config.relay_provider_errors),
+            )?;
+        }
+        let access =
+            crate::config::ProjectAccess::of(&state.shared.config.projects, project.as_deref());
+        let every = state.shared.skills.current().await;
+        let snapshot = state.shared.skills.current_for(&access).await;
         let skill = snapshot.find(skill_name).ok_or_else(|| {
             // `unavailable`, not a flat "unknown skill": a `SKILL.md` that will not parse is in no
             // index, and telling the caller their skill does not exist sends them looking for a
@@ -265,7 +284,7 @@ pub(crate) async fn submit_turn(
             ProblemDetail::new(
                 ErrorKind::InvalidBody,
                 StatusCode::UNPROCESSABLE_ENTITY,
-                snapshot.unavailable(skill_name),
+                every.unavailable_to(skill_name, &access),
             )
         })?;
         // Sanitized: the reason names the file, and the skills directory is the operator's to
@@ -361,11 +380,11 @@ pub(crate) async fn submit_turn(
     // Under the lock and before the first round, the way ACP's prompt door does it: the turn runs
     // on the profile the row names, or not at all.
     if let Err(error) =
-        crate::host::apply_recorded_profile(&state.shared, &entry.agent, session_id).await
+        crate::host::apply_recorded_bindings(&state.shared, &entry.agent, session_id).await
     {
         return Err(crate::host::http::reattach::agent_build_problem(
             session_id,
-            "cannot run this turn on the profile this session is recorded against",
+            "cannot run this turn on the profile or project this session is recorded against",
             error,
         ));
     }

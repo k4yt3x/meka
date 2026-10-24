@@ -9,7 +9,7 @@ use crate::{
     memory,
     store::{
         Store,
-        memory::{MemoryFilter, MemoryStore, WriteRequest},
+        memory::{MemoryFilter, MemoryStore, MemoryView, WriteRequest},
     },
 };
 
@@ -18,8 +18,9 @@ const TAGS_TRUNCATE: usize = 24;
 
 /// The listing's columns: the name `get`, `show` and `remove` take, four facts, and the
 /// description spending the rest.
-const MEMORY_COLUMNS: [crate::text::Column; 6] = [
+const MEMORY_COLUMNS: [crate::text::Column; 7] = [
     crate::text::Column::content("Name"),
+    crate::text::Column::capped("Project", crate::text::NAME_WIDTH),
     crate::text::Column::content("Priority"),
     crate::text::Column::content("Load"),
     crate::text::Column::content("Recorded"),
@@ -43,6 +44,9 @@ pub(crate) struct AddArgs<'a> {
     pub(crate) expires: Option<&'a str>,
     pub(crate) verified: bool,
     pub(crate) force: bool,
+    /// `--project`: the tier to file the memory in, `Some("")` for the global tier; `None` keeps
+    /// an existing memory's tier and files a new one as global.
+    pub(crate) project: Option<&'a str>,
 }
 
 /// `meka memory list` under a chosen format and stream: a table of the memories the filter
@@ -74,6 +78,11 @@ pub(crate) async fn list(
         .map(|entry| {
             vec![
                 entry.name.clone(),
+                if entry.project.is_empty() {
+                    "-".to_string()
+                } else {
+                    entry.project.clone()
+                },
                 entry.priority.to_string(),
                 entry.load.to_string(),
                 memory::render_age(entry.created_at, now),
@@ -92,11 +101,12 @@ pub(crate) async fn list(
 pub(crate) async fn run_get(
     store: &MemoryStore,
     name: &str,
+    project: Option<&str>,
     format: crate::cli::OutputFormat,
 ) -> Result<()> {
-    let entry = require_memory(store, name).await?;
+    let entry = require_memory(store, name, &MemoryView::for_operator(project)).await?;
     let referenced_by: Vec<String> = store
-        .referenced_by(&entry.name)
+        .referenced_by(&entry.name, &MemoryView::citing(&entry.project))
         .await?
         .into_iter()
         .map(|(name, _)| name)
@@ -110,6 +120,14 @@ pub(crate) async fn run_get(
     let now = std::time::SystemTime::now();
     let mut fields = vec![
         ("name", entry.name.clone()),
+        (
+            "project",
+            if entry.project.is_empty() {
+                "-".to_string()
+            } else {
+                entry.project.clone()
+            },
+        ),
         (
             "description",
             memory::render_description_for_model(&entry.description),
@@ -171,10 +189,11 @@ pub(crate) async fn run_get(
 /// Sanitized, because this is a display path and a note may hold an escape sequence the terminal
 /// would act on. `meka memory export` is the door that hands back exactly what is stored, and
 /// `meka memory edit` is the one that round-trips it.
-pub(crate) async fn run_show(store: &MemoryStore, name: &str) -> Result<()> {
+pub(crate) async fn run_show(store: &MemoryStore, name: &str, view: &MemoryView) -> Result<()> {
     show(
         store,
         name,
+        view,
         crate::cli::OutputFormat::Plain,
         crate::render::Stream::Stderr,
     )
@@ -187,10 +206,11 @@ pub(crate) async fn run_show(store: &MemoryStore, name: &str) -> Result<()> {
 pub(crate) async fn show(
     store: &MemoryStore,
     name: &str,
+    view: &MemoryView,
     format: crate::cli::OutputFormat,
     stream: crate::render::Stream,
 ) -> Result<()> {
-    let entry = require_memory(store, name).await?;
+    let entry = require_memory(store, name, view).await?;
     if format == crate::cli::OutputFormat::Json {
         let body = entry.body.clone().unwrap_or_default();
         crate::cli::write_json(&crate::view::MemoryDetail::new(&entry, Some(body)))?;
@@ -210,11 +230,37 @@ pub(crate) async fn run_add(store: &MemoryStore, args: AddArgs<'_>) -> Result<()
     if !memory::description_says_something(args.description) {
         return Err(MekaError::Usage("description cannot be empty".to_string()));
     }
-    if store.get(args.name).await?.is_some() && !args.force {
-        return Err(MekaError::Usage(format!(
-            "memory '{}' already exists; pass `--force` to overwrite",
-            args.name
-        )));
+    // The rows this write would update or move: every row of the name when none or the global
+    // tier is named, since an unnamed tier keeps the stored one and the global tier takes a
+    // project's copy with it; the project's own and the global row when a project is named, which
+    // are the two a write into it can land on.
+    let touched = match args.project {
+        None | Some("") => MemoryView::All,
+        Some(project) => MemoryView::Session(project.to_string()),
+    };
+    if let Some(existing) = store.get(args.name, &touched).await?
+        && !args.force
+    {
+        let tier = |project: &str| {
+            if project.is_empty() {
+                "the global tier".to_string()
+            } else {
+                format!("project '{project}'")
+            }
+        };
+        return Err(MekaError::Usage(match args.project {
+            // Naming the other tier moves the memory, which "overwrite" would misdescribe.
+            Some(target) if target != existing.project => format!(
+                "memory '{}' exists in {}; pass `--force` to move it into {}",
+                args.name,
+                tier(&existing.project),
+                tier(target)
+            ),
+            _ => format!(
+                "memory '{}' already exists; pass `--force` to overwrite",
+                args.name
+            ),
+        }));
     }
 
     let body = match (args.body, args.from_file) {
@@ -262,6 +308,8 @@ pub(crate) async fn run_add(store: &MemoryStore, args: AddArgs<'_>) -> Result<()
     let written = store
         .write(WriteRequest {
             name: args.name.to_string(),
+            view: MemoryView::All,
+            project: args.project.map(str::to_string),
             // As `memory_write` and `PUT /v1/memory` do. A description is a one-line label at every
             // door, and `meka memory export` writes it normalized, so storing it raw here made the
             // CLI the one door whose descriptions changed on the way through a backup.
@@ -289,13 +337,14 @@ pub(crate) async fn run_add(store: &MemoryStore, args: AddArgs<'_>) -> Result<()
 /// The body only. Metadata already has a door, `meka memory add <name> --force --description
 /// ...`, which keeps what it does not mention, and putting the frontmatter in front of an editor
 /// would mean parsing YAML back out of it, which this store never does.
-pub(crate) async fn run_edit(store: &MemoryStore, name: &str) -> Result<()> {
+pub(crate) async fn run_edit(store: &MemoryStore, name: &str, project: Option<&str>) -> Result<()> {
     // Validated before the name becomes a path, as every other door does. `run_export`'s comment
     // records that rows carrying names meka would not accept exist in the wild, and this function
     // joins the name onto a temp directory: `meka memory edit ../pwned` wrote the note's body to
     // `/tmp/pwned.md`, outside the directory the cleanup below removes, where it then stayed.
     memory::validate_memory_name(name).map_err(MekaError::Usage)?;
-    let entry = require_memory(store, name).await?;
+    let view = MemoryView::for_operator(project);
+    let entry = require_memory(store, name, &view).await?;
 
     // `create_dir` rather than `create_dir_all`, on a name nothing else can be using: this fails
     // rather than reusing a directory somebody else owns, which in `/tmp` is the difference
@@ -361,7 +410,7 @@ pub(crate) async fn run_edit(store: &MemoryStore, name: &str) -> Result<()> {
     // The operator is not the agent verifying a fact, so the editor round trip never moves the
     // verification stamp.
     match store
-        .write_body(&entry.name, &original, edited, false)
+        .write_body(&entry.name, &view, &original, edited, false)
         .await
     {
         Ok(crate::store::memory::BodyWrite::Saved) => {
@@ -519,11 +568,19 @@ fn edit_in(scratch: &Path, original: &str) -> Result<String> {
 }
 
 /// `meka memory remove <name>`: delete the memory.
-pub(crate) async fn run_remove(store: &MemoryStore, name: &str) -> Result<()> {
+pub(crate) async fn run_remove(
+    store: &MemoryStore,
+    name: &str,
+    project: Option<&str>,
+) -> Result<()> {
     // The lookup rule, not the write rule. Refusing to *delete* a name this store would not have
     // written is what left a row nothing meka ships could remove.
     memory::validate_memory_lookup(name).map_err(MekaError::Usage)?;
-    if store.delete(name).await?.is_none() {
+    if store
+        .delete(name, &MemoryView::for_operator(project))
+        .await?
+        .is_none()
+    {
         return Err(MekaError::Usage(format!("no memory named '{name}'")));
     }
     tracing::info!("removed memory '{name}'");
@@ -538,8 +595,12 @@ pub(crate) async fn run_remove(store: &MemoryStore, name: &str) -> Result<()> {
 /// Refuses to write into a directory that already holds files, rather than merging into it. An
 /// export is a snapshot, and silently leaving a stale `<name>.md` behind from a memory since
 /// deleted would make it one that never quite matches the store.
-pub(crate) async fn run_export(store: &MemoryStore, directory: &Path) -> Result<()> {
-    let memories = store.export_all().await?;
+pub(crate) async fn run_export(
+    store: &MemoryStore,
+    directory: &Path,
+    project: Option<&str>,
+) -> Result<()> {
+    let memories = store.export_all(&MemoryView::for_operator(project)).await?;
     if memories.is_empty() {
         crate::streams::write_stderr_line("No memories to export.");
         return Ok(());
@@ -573,6 +634,14 @@ pub(crate) async fn run_export(store: &MemoryStore, directory: &Path) -> Result<
         .iter()
         .filter_map(|memory| {
             if let Err(reason) = memory::validate_memory_name(&memory.name) {
+                return Some(format!("{} ({})", memory.name, reason));
+            }
+            // The project is the directory the file goes under, so it is held to the same rule:
+            // every door that files a row under a project checks the name, but the column is a
+            // column.
+            if !memory.project.is_empty()
+                && let Err(reason) = crate::entry::validate_entry_name(&memory.project, "project")
+            {
                 return Some(format!("{} ({})", memory.name, reason));
             }
             // A description of nothing but control characters survives the write door (they are
@@ -614,14 +683,44 @@ pub(crate) async fn run_export(store: &MemoryStore, directory: &Path) -> Result<
     // It also tightens an *existing* target directory to 0700, which the memory guide documents:
     // the directory has to be empty for the export to start, so nothing else of the user's lives
     // there.
+    // A project's memories go under a directory of its name, so two projects holding one name
+    // write two files; the frontmatter carries the project regardless, and is what a reader
+    // trusts. Created as privately as the root, on the first memory that needs it.
     let mut written: Vec<PathBuf> = Vec::with_capacity(memories.len());
+    let mut project_directories: Vec<PathBuf> = Vec::new();
     for memory in &memories {
-        let path = memory::memory_file_in(directory, &memory.name);
+        let parent = if memory.project.is_empty() {
+            directory.to_path_buf()
+        } else {
+            directory.join(&memory.project)
+        };
+        if parent != directory && !project_directories.contains(&parent) {
+            if let Err(error) = create_private_export_dir(&parent) {
+                let remaining = remove_partial_export(
+                    &written,
+                    &project_directories,
+                    directory,
+                    created_directory,
+                );
+                return Err(MekaError::io(format!(
+                    "failed to create {}: {error}; nothing was exported{}",
+                    parent.display(),
+                    if remaining > 0 {
+                        ", and some files already written remain"
+                    } else {
+                        ""
+                    }
+                )));
+            }
+            project_directories.push(parent.clone());
+        }
+        let path = memory::memory_file_in(&parent, &memory.name);
         if let Err(error) = crate::fs::write_file_atomic(&path, &memory::export_memory(memory)) {
             // A truncated export is worse than none: it is a valid store that restores a fraction
             // of the memories and reports success, and the retry answers "is not empty" rather
             // than naming the cause.
-            let remaining = remove_partial_export(&written, directory, created_directory);
+            let remaining =
+                remove_partial_export(&written, &project_directories, directory, created_directory);
             return Err(MekaError::io(format!(
                 "failed to write {}: {}; nothing was exported{}",
                 path.display(),
@@ -699,7 +798,12 @@ fn create_private_export_dir(directory: &Path) -> Result<()> {
 ///
 /// Reported rather than assumed: telling the user "nothing was exported" while a partial snapshot
 /// is still sitting there is the same class of lie the export refuses to commit in the first place.
-fn remove_partial_export(written: &[PathBuf], directory: &Path, created_directory: bool) -> usize {
+fn remove_partial_export(
+    written: &[PathBuf],
+    project_directories: &[PathBuf],
+    directory: &Path,
+    created_directory: bool,
+) -> usize {
     let mut remaining = 0;
     for path in written {
         if let Err(error) = std::fs::remove_file(path) {
@@ -709,7 +813,16 @@ fn remove_partial_export(written: &[PathBuf], directory: &Path, created_director
     }
     // Only a directory this run created, and only once it is empty again: a directory the user
     // pointed at and pre-created is theirs, and `remove_dir` refusing a non-empty one is the guard
-    // that keeps this from taking anything it did not put there.
+    // that keeps this from taking anything it did not put there. The project directories first,
+    // since the root is empty only once they are gone.
+    for project_directory in project_directories {
+        if let Err(error) = std::fs::remove_dir(project_directory) {
+            tracing::warn!(
+                "failed to remove {directory}: {error}",
+                directory = project_directory.display()
+            );
+        }
+    }
     if created_directory
         && remaining == 0
         && let Err(error) = std::fs::remove_dir(directory)
@@ -758,9 +871,13 @@ pub(crate) fn default_export_dir() -> PathBuf {
     PathBuf::from("meka-memory-export")
 }
 
-async fn require_memory(store: &MemoryStore, name: &str) -> Result<memory::Memory> {
+async fn require_memory(
+    store: &MemoryStore,
+    name: &str,
+    view: &MemoryView,
+) -> Result<memory::Memory> {
     store
-        .get(name)
+        .get(name, view)
         .await?
         .ok_or_else(|| MekaError::Usage(format!("no memory named '{name}'")))
 }
@@ -781,8 +898,10 @@ pub(crate) async fn run_memory_subcommand(
             referencing,
             unverified,
             expired,
+            project,
         } => {
             let filter = MemoryFilter {
+                view: MemoryView::for_operator(project.as_deref()),
                 referencing: referencing.clone(),
                 unverified_for: match unverified {
                     Some(window) => {
@@ -797,14 +916,28 @@ pub(crate) async fn run_memory_subcommand(
             crate::cli::memory::list(&store, &filter, *format, crate::render::Stream::Stdout)
                 .await?
         }
-        crate::cli::MemoryAction::Get { name, format } => {
-            crate::cli::memory::run_get(&store, name, *format).await?
-        }
-        crate::cli::MemoryAction::Show { name, format } => {
-            crate::cli::memory::show(&store, name, *format, crate::render::Stream::Stdout).await?
+        crate::cli::MemoryAction::Get {
+            name,
+            format,
+            project,
+        } => crate::cli::memory::run_get(&store, name, project.as_deref(), *format).await?,
+        crate::cli::MemoryAction::Show {
+            name,
+            format,
+            project,
+        } => {
+            crate::cli::memory::show(
+                &store,
+                name,
+                &MemoryView::for_operator(project.as_deref()),
+                *format,
+                crate::render::Stream::Stdout,
+            )
+            .await?
         }
         crate::cli::MemoryAction::Add {
             name,
+            project,
             description,
             priority,
             tags,
@@ -817,6 +950,12 @@ pub(crate) async fn run_memory_subcommand(
             verified,
             force,
         } => {
+            // A project the file does not define is refused here, as every door that puts a
+            // row on a project refuses it: the global tier is the one spelled empty.
+            if let Some(project) = project.as_deref().filter(|project| !project.is_empty()) {
+                let config_file = crate::config::load_config_file_or_err()?;
+                crate::config::require_project(project, &config_file.projects)?;
+            }
             crate::cli::memory::run_add(&store, crate::cli::memory::AddArgs {
                 name,
                 description,
@@ -830,23 +969,24 @@ pub(crate) async fn run_memory_subcommand(
                 expires: expires.as_deref(),
                 verified: *verified,
                 force: *force,
+                project: project.as_deref(),
             })
             .await?
         }
-        crate::cli::MemoryAction::Edit { name } => {
-            crate::cli::memory::run_edit(&store, name).await?
+        crate::cli::MemoryAction::Edit { name, project } => {
+            crate::cli::memory::run_edit(&store, name, project.as_deref()).await?
         }
-        crate::cli::MemoryAction::Remove { name } => {
-            crate::cli::memory::run_remove(&store, name).await?
+        crate::cli::MemoryAction::Remove { name, project } => {
+            crate::cli::memory::run_remove(&store, name, project.as_deref()).await?
         }
         crate::cli::MemoryAction::Verify { rebuild } => {
             crate::cli::memory::run_verify(&store, *rebuild).await?
         }
-        crate::cli::MemoryAction::Export { directory } => {
+        crate::cli::MemoryAction::Export { directory, project } => {
             let directory = directory
                 .clone()
                 .unwrap_or_else(crate::cli::memory::default_export_dir);
-            crate::cli::memory::run_export(&store, &directory).await?
+            crate::cli::memory::run_export(&store, &directory, project.as_deref()).await?
         }
     }
     Ok(())
@@ -898,11 +1038,17 @@ mod tests {
             verified: false,
 
             force: true,
+
+            project: None,
         })
         .await
         .expect("force add");
 
-        let entry = store.get("note").await.expect("get").expect("present");
+        let entry = store
+            .get("note", &MemoryView::All)
+            .await
+            .expect("get")
+            .expect("present");
         assert_eq!(entry.description, "reworded");
         assert_eq!(entry.body.as_deref(), Some("contents worth keeping"));
         assert_eq!(entry.tags, ["infra"], "an unmentioned tag list is kept");
@@ -934,12 +1080,14 @@ mod tests {
             verified: false,
 
             force: false,
+
+            project: None,
         })
         .await
         .expect("add");
         assert_eq!(
             store
-                .get("note")
+                .get("note", &MemoryView::All)
                 .await
                 .expect("get")
                 .expect("present")
@@ -971,13 +1119,15 @@ mod tests {
             verified: false,
 
             force: false,
+
+            project: None,
         })
         .await
         .expect_err("must refuse");
         assert!(error.to_string().contains("--force"), "{error}");
         assert_eq!(
             store
-                .get("note")
+                .get("note", &MemoryView::All)
                 .await
                 .expect("get")
                 .map(|entry| entry.description),
@@ -1009,7 +1159,7 @@ mod tests {
             .expect("write");
 
         // What `run_edit` hands to the editor is `entry.body` from this same read.
-        let handed = require_memory(&store, "note")
+        let handed = require_memory(&store, "note", &MemoryView::All)
             .await
             .expect("get")
             .body
@@ -1042,7 +1192,7 @@ mod tests {
             .await
             .expect("rewrite");
         let after = store
-            .get("note")
+            .get("note", &MemoryView::All)
             .await
             .expect("get")
             .expect("present")
@@ -1137,7 +1287,7 @@ mod tests {
 
         let edit = tokio::spawn({
             let store = store.clone();
-            async move { run_edit(&store, "race").await }
+            async move { run_edit(&store, "race", None).await }
         });
         // The agent, while the editor is open.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1179,7 +1329,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .get("race")
+                .get("race", &MemoryView::All)
                 .await
                 .expect("get")
                 .expect("row")
@@ -1225,7 +1375,7 @@ mod tests {
         std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let _editor_env = EditorEnv::pointing_at(&editor);
 
-        let error = run_edit(&store, "rule")
+        let error = run_edit(&store, "rule", None)
             .await
             .expect_err("29 of 16 must be refused");
         let message = error.to_string();
@@ -1244,7 +1394,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .get("rule")
+                .get("rule", &MemoryView::All)
                 .await
                 .expect("get")
                 .expect("row")
@@ -1273,10 +1423,12 @@ mod tests {
         let before = scratch_directory_count();
         let _editor_env = EditorEnv::pointing_at(&editor);
 
-        run_edit(&store, "note").await.expect("the edit saves");
+        run_edit(&store, "note", None)
+            .await
+            .expect("the edit saves");
         assert_eq!(
             store
-                .get("note")
+                .get("note", &MemoryView::All)
                 .await
                 .expect("get")
                 .expect("row")
@@ -1324,7 +1476,7 @@ mod tests {
         // Exits non-zero without touching the file, as `:cq` or a refused editor does.
         let _editor_env = EditorEnv::pointing_at(Path::new("/bin/false"));
 
-        let error = run_edit(&store, "private")
+        let error = run_edit(&store, "private", None)
             .await
             .expect_err("a failed editor is a failed edit");
         let message = error.to_string();
@@ -1361,7 +1513,7 @@ mod tests {
         std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let _editor_env = EditorEnv::pointing_at(&editor);
 
-        let message = run_edit(&store, "note")
+        let message = run_edit(&store, "note", None)
             .await
             .expect_err("reading the body back must fail")
             .to_string();
@@ -1407,7 +1559,7 @@ mod tests {
         std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let _editor_env = EditorEnv::pointing_at(&editor);
 
-        run_edit(&store, "note")
+        run_edit(&store, "note", None)
             .await
             .expect("the body is unchanged, which is not an error");
 
@@ -1456,7 +1608,7 @@ mod tests {
         }
         let temp = tempfile::tempdir().expect("tempdir");
         let directory = temp.path().join("export");
-        let error = run_export(&store, &directory)
+        let error = run_export(&store, &directory, None)
             .await
             .expect_err("must refuse");
         let message = error.to_string();
@@ -1478,6 +1630,40 @@ mod tests {
         );
     }
 
+    /// A project a filesystem cannot take as a directory stops the export as such a name does:
+    /// the column is written only through doors that check it, and the export is where it
+    /// becomes a path.
+    #[tokio::test]
+    async fn an_unexportable_project_stops_the_export_before_it_writes_anything() {
+        let store = MemoryStore::for_test().await.expect("store");
+        for project in ["fine", "../escape"] {
+            store
+                .write(WriteRequest {
+                    name: "note".to_string(),
+                    description: Some("a note".to_string()),
+                    view: MemoryView::All,
+                    project: Some(project.to_string()),
+                    ..WriteRequest::default()
+                })
+                .await
+                .expect("write");
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let directory = temp.path().join("export");
+        let error = run_export(&store, &directory, None)
+            .await
+            .expect_err("must refuse");
+        let message = error.to_string();
+        assert!(
+            message.contains("escape") && message.contains("nothing exported"),
+            "{message}"
+        );
+        assert!(
+            !temp.path().join("escape").exists() && std::fs::read_dir(&directory).is_err(),
+            "nothing may be written"
+        );
+    }
+
     /// An export is readable only by its owner, as the store it came from is.
     ///
     /// `std::fs::write` and `create_dir_all` take the umask, which at the default 022 published
@@ -1493,7 +1679,7 @@ mod tests {
         let store = store_with(&[("alpha", 2, "first note", "private")]).await;
         let temp = tempfile::tempdir().expect("tempdir");
         let directory = temp.path().join("export");
-        run_export(&store, &directory).await.expect("export");
+        run_export(&store, &directory, None).await.expect("export");
 
         let directory_mode = std::fs::metadata(&directory)
             .expect("stat the directory")
@@ -1538,7 +1724,7 @@ mod tests {
         }
         let temp = tempfile::tempdir().expect("tempdir");
         let directory = temp.path().join("export");
-        let error = run_export(&store, &directory)
+        let error = run_export(&store, &directory, None)
             .await
             .expect_err("must refuse");
         let message = error.to_string();
@@ -1586,7 +1772,9 @@ mod tests {
         }
 
         let directory = parent.join("export");
-        let error = run_export(&store, &directory).await.expect_err("must fail");
+        let error = run_export(&store, &directory, None)
+            .await
+            .expect_err("must fail");
         assert!(error.to_string().contains("failed to create"), "{error}");
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).expect("restore");
         assert!(
@@ -1612,21 +1800,28 @@ mod tests {
 
         // `created_directory` false: the user pointed at a directory that already existed, so it is
         // theirs to keep even once it is empty again.
-        let remaining = remove_partial_export(std::slice::from_ref(&ours), &directory, false);
+        let remaining = remove_partial_export(std::slice::from_ref(&ours), &[], &directory, false);
         assert_eq!(remaining, 0, "everything it wrote must come back out");
         assert!(!ours.exists(), "the export's own file is gone");
         assert!(theirs.exists(), "and a file it never wrote is untouched");
         assert!(directory.exists(), "as is a directory it did not create");
 
-        // And one it did create is taken away with its contents.
+        // And one it did create is taken away with its contents, the project directories it made
+        // under it included, since the root cannot go while they stand.
         let owned = temp.path().join("owned");
-        std::fs::create_dir(&owned).expect("create");
+        let project = owned.join("webdev");
+        std::fs::create_dir_all(&project).expect("create");
         let file = owned.join("beta.md");
+        let filed = project.join("beta.md");
         std::fs::write(&file, "x").expect("write");
-        assert_eq!(remove_partial_export(&[file], &owned, true), 0);
+        std::fs::write(&filed, "y").expect("write");
+        assert_eq!(
+            remove_partial_export(&[file, filed], std::slice::from_ref(&project), &owned, true),
+            0
+        );
         assert!(
             !owned.exists(),
-            "a directory this run created is removed with it"
+            "a directory this run created is removed with its project directories"
         );
     }
 
@@ -1641,7 +1836,7 @@ mod tests {
         .await;
         let temp = tempfile::tempdir().expect("tempdir");
         let directory = temp.path().join("export");
-        run_export(&store, &directory).await.expect("export");
+        run_export(&store, &directory, None).await.expect("export");
 
         let alpha = std::fs::read_to_string(directory.join("alpha.md")).expect("alpha");
         let (frontmatter, body) =
@@ -1656,7 +1851,7 @@ mod tests {
 
         // A second export into the same directory is refused: a snapshot that merges would keep a
         // stale file for a memory since deleted, and never quite match the store.
-        let error = run_export(&store, &directory)
+        let error = run_export(&store, &directory, None)
             .await
             .expect_err("must refuse a non-empty directory");
         assert!(error.to_string().contains("not empty"), "{error}");

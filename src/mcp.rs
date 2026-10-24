@@ -4433,7 +4433,7 @@ mod tests {
 
         let subscribe = crate::tools::mcp_resources::SubscribeMcpResourceTool {
             manager: Arc::clone(&stub.manager),
-            tool_scope: Arc::clone(&scope),
+            scope: crate::tools::LiveScope::from((*scope).clone()),
         };
         let output = subscribe
             .execute(
@@ -4451,7 +4451,7 @@ mod tests {
 
         let unsubscribe = crate::tools::mcp_resources::UnsubscribeMcpResourceTool {
             manager: Arc::clone(&stub.manager),
-            tool_scope: scope,
+            scope: crate::tools::LiveScope::from((*scope).clone()),
         };
         let output = unsubscribe
             .execute(arguments, ToolContext::detached(CancellationToken::new()))

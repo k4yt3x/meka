@@ -144,10 +144,11 @@ pub(crate) async fn compact(
         .map_err(|_| turn_in_flight_conflict(id, "compact the conversation"))?;
     // Under the lock and before the checkpoint's first round, as on every turn door: the
     // checkpoint and the summarizer bill the profile the row names, or do not run.
-    if let Err(error) = crate::host::apply_recorded_profile(&state.shared, &entry.agent, id).await {
+    if let Err(error) = crate::host::apply_recorded_bindings(&state.shared, &entry.agent, id).await
+    {
         return Err(crate::host::http::reattach::agent_build_problem(
             id,
-            "cannot compact on the profile this session is recorded against",
+            "cannot compact on the profile or project this session is recorded against",
             error,
         ));
     }
@@ -1049,10 +1050,11 @@ pub(crate) async fn import(
         root_new_id,
     } = crate::store::export::plan_import(
         export,
-        crate::store::export::ImportProfiles {
+        crate::store::export::ImportInstallation {
             selected: None,
             default: state.shared.default_profile.as_deref(),
             configured: Some(&state.shared.config.profiles),
+            projects: Some(&state.shared.config.projects),
         },
         Some(state.shared.config.permission),
     )

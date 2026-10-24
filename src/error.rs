@@ -156,6 +156,10 @@ pub(crate) enum MekaError {
     #[error("{}", crate::text::unknown_name("profile", name, known))]
     ProfileNotConfigured { name: String, known: Vec<String> },
 
+    /// A project name `config.toml` does not have, with the names it does.
+    #[error("{}", crate::text::unknown_name("project", name, known))]
+    ProjectNotConfigured { name: String, known: Vec<String> },
+
     #[error("agent interrupted by user")]
     Interrupted,
 
@@ -520,7 +524,8 @@ impl MekaError {
             | Self::Usage(_)
             | Self::EmptyPrompt
             | Self::DisabledLevel { .. }
-            | Self::ProfileNotConfigured { .. } => ErrorKind::InvalidBody,
+            | Self::ProfileNotConfigured { .. }
+            | Self::ProjectNotConfigured { .. } => ErrorKind::InvalidBody,
             // Same status as the three above, different `type`, because the remedies do not
             // overlap: meka's own ceiling, refused before anything was sent, and a permanent
             // property of the id itself.
@@ -580,6 +585,7 @@ impl MekaError {
             Self::EmptyPrompt
             | Self::DisabledLevel { .. }
             | Self::ProfileNotConfigured { .. }
+            | Self::ProjectNotConfigured { .. }
             | Self::SessionNotFound(_)
             | Self::TurnInFlight { .. } => self.to_string(),
             Self::Provider(_) | Self::InvalidRequest(_) => {

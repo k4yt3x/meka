@@ -269,11 +269,26 @@ pub(crate) async fn create(
 
             // Authority is re-checked at fire time as well; this is the early, specific refusal so
             // a client learns at `POST` rather than from a job that silently never fires.
-            if let Err(refusal) = crate::schedule::gate_probe_is_authorized(
-                &probe,
-                permission,
-                state.shared.gate_tools.as_deref(),
-            ) {
+            // Narrowed by the project the session's row names, as the session's own
+            // `schedule_create` is.
+            let project = state
+                .shared
+                .store
+                .recorded_project(id)
+                .await
+                .map_err(|error| {
+                    ProblemDetail::internal_sanitized("failed to read session project", error)
+                })?;
+            let access =
+                crate::config::ProjectAccess::of(&state.shared.config.projects, project.as_deref());
+            let scoped: Option<std::sync::Arc<dyn crate::schedule::GateTools>> =
+                state.shared.gate_tools.clone().map(|inner| {
+                    std::sync::Arc::new(crate::tools::ScopedGateTools::for_view(inner, &access))
+                        as std::sync::Arc<dyn crate::schedule::GateTools>
+                });
+            if let Err(refusal) =
+                crate::schedule::gate_probe_is_authorized(&probe, permission, scoped.as_deref())
+            {
                 // Routed by what would actually fix it, because that is what clients switch on.
                 //
                 // Never `AuthScope`: the token is fine and a better one will never help. Reporting

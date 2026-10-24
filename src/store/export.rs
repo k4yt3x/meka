@@ -87,12 +87,14 @@ pub(crate) struct ExportedBlob {
     /// The bytes, base64-encoded: the archive is JSON.
     pub(crate) data: String,
 }
-/// The profile facts [`plan_import`] settles every imported session against.
+/// What this installation configures, which [`plan_import`] settles every imported session against.
 ///
-/// A session runs on the profile its row names, and an import is a door that writes such a row, so
-/// it answers to the same rule as every other: the name is one this installation configures, or
-/// the import is refused. `--profile` is the explicit act that moves a session onto another.
-pub(crate) struct ImportProfiles<'a> {
+/// A session runs on the profile its row names and files its memories under the project it names,
+/// and an import is a door that writes such a row, so it answers to the same rule as every other:
+/// each name is one this installation configures, or the import is refused. `--profile` is the
+/// explicit act that moves a session onto another profile; a project the archive names is added
+/// first.
+pub(crate) struct ImportInstallation<'a> {
     /// `--profile <name>`, when it was passed: every imported session takes it, whatever the
     /// archive recorded.
     pub(crate) selected: Option<&'a str>,
@@ -105,6 +107,10 @@ pub(crate) struct ImportProfiles<'a> {
     /// and the HTTP server always holds a parsed one.
     pub(crate) configured:
         Option<&'a std::collections::BTreeMap<String, crate::config::ProfileConfig>>,
+    /// The projects this installation configures, which a project the archive records has to be
+    /// among; `None` where there is no installation to check against, as for the profiles.
+    pub(crate) projects:
+        Option<&'a std::collections::BTreeMap<String, crate::config::ProjectConfig>>,
 }
 /// What [`plan_import`] settled: the sessions to write, the image bytes they reference, and the
 /// id the archive's root was given.
@@ -137,6 +143,10 @@ pub(crate) struct ExportedSession {
     /// settles against the importing installation's default rather than storing a profile no
     /// configuration can name.
     pub(crate) profile: String,
+    /// The project the session was on; absent for none, which is also what an archive written
+    /// before projects reads as.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) project: String,
     /// The title a user set; absent when none was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) title: Option<String>,
@@ -247,6 +257,7 @@ pub(crate) async fn build_session_export(
             additional_workspace_directories: meta.additional_roots,
             subagent_spec_json: meta.subagent_spec_json,
             profile: meta.profile,
+            project: meta.project,
             title: meta.title,
             pinned_at: meta.pinned_at,
             stats,
@@ -297,7 +308,7 @@ pub(crate) fn plan_import(
     export: SessionExport,
     // How each session's profile is settled, here rather than at the reader because an import is
     // where a session enters *this* installation.
-    profiles: ImportProfiles<'_>,
+    installation: ImportInstallation<'_>,
     // What an archive session that records no level adopts, settled here for the same reason as
     // the profile: a row with no level runs nothing under the scheduler, and this installation's
     // default is what such a session would start at. `None` refuses the archive rather than
@@ -358,7 +369,7 @@ pub(crate) fn plan_import(
     let order = parents_first_order(&nodes)?;
 
     // Checked once, ahead of any session being planned: a flag naming nothing moves nothing.
-    if let (Some(name), Some(configured)) = (profiles.selected, profiles.configured) {
+    if let (Some(name), Some(configured)) = (installation.selected, installation.configured) {
         crate::config::require_profile(name, configured).map_err(|refusal| {
             crate::error::MekaError::Usage(format!(
                 "{refusal}; pass a configured name to `--profile`"
@@ -470,15 +481,15 @@ pub(crate) fn plan_import(
             }
         };
         let profile = match (
-            profiles.selected,
+            installation.selected,
             session.profile.is_empty(),
-            profiles.default,
+            installation.default,
         ) {
             (Some(name), ..) => name.to_string(),
             // Refused rather than written: a row naming a profile this installation lacks is a
             // session every resume refuses by name, and a state no other door can produce.
             (None, false, _) => {
-                if let Some(configured) = profiles.configured {
+                if let Some(configured) = installation.configured {
                     crate::config::require_profile(&session.profile, configured).map_err(
                         |refusal| {
                             crate::error::MekaError::Usage(format!(
@@ -501,6 +512,18 @@ pub(crate) fn plan_import(
                 ));
             }
         };
+        // Refused rather than written, as a profile is: a row naming a project this installation
+        // lacks is a session every resume refuses by name.
+        if !session.project.is_empty()
+            && let Some(projects) = installation.projects
+        {
+            crate::config::require_project(&session.project, projects).map_err(|refusal| {
+                crate::error::MekaError::Usage(format!(
+                    "{refusal}; the archive names it, so add it with `meka project add {}` first",
+                    session.project
+                ))
+            })?;
+        }
         records.push(crate::store::ImportSessionRecord {
             new_id,
             new_parent_id,
@@ -512,6 +535,7 @@ pub(crate) fn plan_import(
             additional_roots: session.additional_workspace_directories,
             subagent_spec_json: session.subagent_spec_json,
             profile,
+            project: session.project,
             // Through the same acceptor every door that sets one uses, so an archive cannot
             // plant a title no `PATCH` could.
             title: match session.title.as_deref() {
@@ -692,10 +716,11 @@ mod tests {
         let profiles = configured(&["other"]);
         let message = refusal(plan_import(
             archive_on("work"),
-            ImportProfiles {
+            ImportInstallation {
                 selected: None,
                 default: Some("other"),
                 configured: Some(&profiles),
+                projects: None,
             },
             None,
         ));
@@ -703,6 +728,48 @@ mod tests {
             message.contains("'work'") && message.contains("--profile <name> session import"),
             "{message}"
         );
+    }
+
+    /// A project this installation does not define is refused ahead of any row, as a profile is;
+    /// the archive names it, so the remedy is to define it.
+    #[test]
+    fn an_archive_naming_a_project_this_installation_lacks_is_refused() {
+        let profiles = configured(&["work"]);
+        let none = std::collections::BTreeMap::new();
+        let mut archive = archive_on("work");
+        archive.sessions[0].project = "movie".to_string();
+        let message = refusal(plan_import(
+            archive,
+            ImportInstallation {
+                selected: None,
+                default: Some("work"),
+                configured: Some(&profiles),
+                projects: Some(&none),
+            },
+            Some(crate::permission::Permission::Read),
+        ));
+        assert!(
+            message.contains("no project named 'movie'")
+                && message.contains("`meka project add movie`"),
+            "{message}"
+        );
+        let defined: std::collections::BTreeMap<String, crate::config::ProjectConfig> =
+            [("movie".to_string(), crate::config::ProjectConfig::default())]
+                .into_iter()
+                .collect();
+        let mut archive = archive_on("work");
+        archive.sessions[0].project = "movie".to_string();
+        plan_import(
+            archive,
+            ImportInstallation {
+                selected: None,
+                default: Some("work"),
+                configured: Some(&profiles),
+                projects: Some(&defined),
+            },
+            Some(crate::permission::Permission::Read),
+        )
+        .expect("a configured project is planned");
     }
 
     /// A stamp that is not RFC 3339 is refused ahead of any row: meka's own are, every listing
@@ -714,10 +781,11 @@ mod tests {
         archive.sessions[0].created_at = "yesterday".to_string();
         let message = refusal(plan_import(
             archive,
-            ImportProfiles {
+            ImportInstallation {
                 selected: None,
                 default: Some("work"),
                 configured: Some(&profiles),
+                projects: None,
             },
             Some(crate::permission::Permission::Read),
         ));
@@ -740,10 +808,11 @@ mod tests {
             archive.sessions[0].pinned_at = Some("2026-02-02T00:00:00+00:00".to_string());
             plan_import(
                 archive,
-                ImportProfiles {
+                ImportInstallation {
                     selected: None,
                     default: Some("work"),
                     configured: Some(&profiles),
+                    projects: None,
                 },
                 Some(crate::permission::Permission::Read),
             )
@@ -763,10 +832,11 @@ mod tests {
         let profiles = configured(&["other"]);
         let plan = plan_import(
             archive_on("work"),
-            ImportProfiles {
+            ImportInstallation {
                 selected: Some("other"),
                 default: None,
                 configured: Some(&profiles),
+                projects: None,
             },
             None,
         )
@@ -778,10 +848,11 @@ mod tests {
 
         let message = refusal(plan_import(
             archive_on("work"),
-            ImportProfiles {
+            ImportInstallation {
                 selected: Some("ghost"),
                 default: None,
                 configured: Some(&profiles),
+                projects: None,
             },
             None,
         ));
@@ -795,10 +866,11 @@ mod tests {
         let profiles = configured(&["other"]);
         let plan = plan_import(
             archive_on(""),
-            ImportProfiles {
+            ImportInstallation {
                 selected: None,
                 default: Some("other"),
                 configured: Some(&profiles),
+                projects: None,
             },
             None,
         )
@@ -807,10 +879,11 @@ mod tests {
 
         let message = refusal(plan_import(
             archive_on(""),
-            ImportProfiles {
+            ImportInstallation {
                 selected: None,
                 default: None,
                 configured: Some(&profiles),
+                projects: None,
             },
             None,
         ));

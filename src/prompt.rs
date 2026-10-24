@@ -92,6 +92,9 @@ const MCP_RESOURCE_TOOLS: &[&str] = &[
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MemoryIndexEntry {
     name: String,
+    /// The project whose tier the memory is in; empty for the global tier. In the snapshot so
+    /// the section can group by it and the diff can say which tier a change was in.
+    project: String,
     description: String,
     priority: u8,
     /// [`crate::memory::Memory::created_at`]: when the note was created, not when the row was
@@ -260,6 +263,10 @@ pub(crate) struct WorldSnapshot {
     /// Whether the model can act on the `[Skills]` index beyond loading one entry. See
     /// [`SkillTools`].
     skill_tools: SkillTools,
+    /// The project the session is on, which the memory section names and groups by. In the
+    /// snapshot so a move between projects is a change the diff sees and restates the section
+    /// for.
+    project: Option<String>,
 }
 
 /// Which of the memory family's non-index tools the model actually has.
@@ -355,6 +362,12 @@ impl WorldSnapshot {
         self
     }
 
+    /// Say which project the session is on; see [`Self::project`].
+    pub(crate) fn with_project(mut self, project: Option<String>) -> Self {
+        self.project = project;
+        self
+    }
+
     /// Build the picture the model will be shown.
     ///
     /// Each store's index is dropped when the tool that opens it is not registered. That happens
@@ -409,6 +422,7 @@ impl WorldSnapshot {
                 // foreign writer put in the table, which is the same threat model
                 // `keepable_tag` and `clamp_priority` exist for.
                 name: crate::memory::render_description_for_model(&memory.name),
+                project: memory.project.clone(),
                 // Sanitized here, at the boundary, because the store hands back stored bytes:
                 // this text is read by the model on every turn and must not be able to open a
                 // forged section or reach the terminal rendering it. Doing it in the snapshot
@@ -475,6 +489,7 @@ impl WorldSnapshot {
             skill_tools: SkillTools {
                 search: catalog_has(catalog, SKILL_SEARCH_TOOL),
             },
+            project: None,
             scheduled: scheduled
                 .iter()
                 .map(|job| ScheduledIndexEntry {
@@ -1714,6 +1729,7 @@ mod tests {
         let age = std::time::SystemTime::now() - std::time::Duration::from_secs(age_days * 86_400);
         Memory {
             name: name.to_string(),
+            project: String::new(),
             description: description.to_string(),
             priority,
             load: crate::memory::Load::Index,
@@ -4050,7 +4066,10 @@ mod tests {
                 "{refused}"
             );
 
-            let memories = store.index().await.expect("index");
+            let memories = store
+                .index(&crate::store::memory::MemoryView::All)
+                .await
+                .expect("index");
             let snapshot = |max_bytes: usize| {
                 WorldSnapshot::new(
                     &catalog_with(MEMORY_INDEX_TOOL),
@@ -4297,6 +4316,28 @@ mod tests {
                     &[],
                 )
             }),
+            ("memory tool, the same memory moved to a project", {
+                let mut memory = sample_memory("note", 3, "a fact", 1);
+                memory.project = "webdev".to_string();
+                WorldSnapshot::new(
+                    &[tool(MEMORY_INDEX_TOOL, "loads a memory", false)],
+                    &no_skills(),
+                    std::slice::from_ref(&memory),
+                    &[],
+                    &[],
+                )
+            }),
+            (
+                "memory tool, one memory, the session on a project",
+                WorldSnapshot::new(
+                    &[tool(MEMORY_INDEX_TOOL, "loads a memory", false)],
+                    &no_skills(),
+                    &[sample_memory("note", 3, "a fact", 1)],
+                    &[],
+                    &[],
+                )
+                .with_project(Some("webdev".to_string())),
+            ),
             (
                 "memory tool, a standing directive",
                 WorldSnapshot::new(
@@ -5588,5 +5629,285 @@ mod tests {
                 .ends_with("Network: none (web_fetch)\n")
         );
         assert!(lines(Permission::Read, crate::config::Network::None).contains("Network: none"));
+    }
+
+    fn memory_in(project: &str, memory: Memory) -> Memory {
+        Memory {
+            project: project.to_string(),
+            ..memory
+        }
+    }
+
+    fn snapshot_of(memories: &[Memory], project: Option<&str>) -> WorldSnapshot {
+        WorldSnapshot::new(
+            &catalog_of(&[MEMORY_INDEX_TOOL, MEMORY_WRITE_TOOL, MEMORY_SEARCH_TOOL]),
+            &no_skills(),
+            memories,
+            &[],
+            &[],
+        )
+        .with_project(project.map(str::to_string))
+    }
+
+    /// A session on a project reads its memories grouped by tier, the global tier first, under a
+    /// header that names the project; a session on none reads the one flat index it always has.
+    #[test]
+    fn a_project_session_reads_its_memories_grouped_by_tier() {
+        let memories = [
+            standing_memory("house-rule", "Global rule", "Answer briefly."),
+            memory_in(
+                "webdev",
+                standing_memory("web-rule", "Project rule", "Use pnpm."),
+            ),
+            sample_memory("global-note", 5, "A global fact", 2),
+            memory_in("webdev", sample_memory("web-note", 5, "A project fact", 2)),
+        ];
+        let grouped = render_world_state(&snapshot_of(&memories, Some("webdev")), None);
+        assert!(
+            grouped.contains(
+                "[Memory]\nDurable notes for project 'webdev' and global notes, most important \
+                 first;"
+            ),
+            "{grouped}"
+        );
+        let global_heading = grouped.find("\nGlobal\n").expect("a Global group");
+        let project_heading = grouped
+            .find("\nProject 'webdev'\n")
+            .expect("a project group");
+        assert!(global_heading < project_heading, "{grouped}");
+        let position = |needle: &str| grouped.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(global_heading < position("- **house-rule**"), "{grouped}");
+        assert!(
+            position("- **house-rule**") < position("- **global-note**"),
+            "{grouped}"
+        );
+        assert!(position("- **global-note**") < project_heading, "{grouped}");
+        assert!(project_heading < position("- **web-rule**"), "{grouped}");
+        assert!(
+            position("- **web-rule**") < position("- **web-note**"),
+            "{grouped}"
+        );
+        assert_eq!(
+            grouped
+                .matches("Standing preferences and constraints")
+                .count(),
+            1,
+            "the band's contract is stated once: {grouped}"
+        );
+        // The layout the model reads: the contract's blank line leads into the first group, one
+        // blank line separates the groups, and within a group one separates the bodies from the
+        // index lines.
+        assert!(
+            grouped.contains("Bodies are complete.\n\nGlobal\n- **house-rule**"),
+            "{grouped}"
+        );
+        assert!(
+            grouped.contains("  Answer briefly.\n\n- **global-note**"),
+            "{grouped}"
+        );
+        assert!(
+            grouped.contains("\n\nProject 'webdev'\n- **web-rule**")
+                && !grouped.contains("\n\n\nProject 'webdev'"),
+            "{grouped}"
+        );
+
+        let flat = render_world_state(&snapshot_of(&memories, None), None);
+        assert!(
+            flat.contains(
+                "[Memory]\nDurable notes available to this session, most important first;"
+            ),
+            "{flat}"
+        );
+        assert!(
+            !flat.contains("\nGlobal\n") && !flat.contains("Project 'webdev'"),
+            "{flat}"
+        );
+    }
+
+    /// A move between projects restates the memory section under a line naming the project, in
+    /// place of the memory-by-memory delta, and a move off a project says so the same way.
+    #[test]
+    fn a_project_move_restates_the_memory_section_under_the_project_line() {
+        let memories = [
+            sample_memory("global-note", 5, "A global fact", 2),
+            memory_in("webdev", sample_memory("web-note", 5, "A project fact", 2)),
+        ];
+        let off = snapshot_of(&memories[..1], None);
+        let on = snapshot_of(&memories, Some("webdev"));
+        let moved_on = render_world_state(&on, Some(&off));
+        assert!(
+            moved_on.contains("- Project is now 'webdev'."),
+            "{moved_on}"
+        );
+        assert!(
+            moved_on.contains("[Memory]\nDurable notes for project 'webdev'"),
+            "{moved_on}"
+        );
+        assert!(
+            moved_on.contains("\nProject 'webdev'\n- **web-note**"),
+            "{moved_on}"
+        );
+        assert!(
+            !moved_on.contains("Memories saved") && !moved_on.contains("Memories deleted"),
+            "the view is restated, not diffed: {moved_on}"
+        );
+        let moved_off = render_world_state(&off, Some(&on));
+        assert!(moved_off.contains("- No project."), "{moved_off}");
+        assert!(
+            moved_off.contains("[Memory]\nDurable notes available to this session"),
+            "{moved_off}"
+        );
+        assert!(!moved_off.contains("Memories deleted"), "{moved_off}");
+
+        // A move into a view with nothing in it says so, since the old names stand until then.
+        let emptied = render_world_state(&snapshot_of(&[], None), Some(&on));
+        assert!(
+            emptied.contains("- No project.") && emptied.contains("- No memories are in view."),
+            "{emptied}"
+        );
+        assert!(
+            !emptied.contains("Memories deleted"),
+            "the view is said outright, not diffed: {emptied}"
+        );
+        let still_empty = render_world_state(
+            &snapshot_of(&[], Some("webdev")),
+            Some(&snapshot_of(&[], None)),
+        );
+        assert!(
+            !still_empty.contains("No memories are in view"),
+            "{still_empty}"
+        );
+    }
+
+    /// In a project session the delta says which changes were to global memories, since a note
+    /// the model saved into the wrong tier is one every other project now reads; a session on no
+    /// project has one tier and marks nothing.
+    #[test]
+    fn a_project_session_s_delta_marks_the_global_memories() {
+        let before = [sample_memory("kept", 5, "Stays", 3)];
+        let after = [
+            sample_memory("kept", 5, "Stays", 3),
+            sample_memory("shared", 5, "A global fact", 1),
+            memory_in("webdev", sample_memory("web-note", 5, "A project fact", 1)),
+        ];
+        let on_project = render_world_state(
+            &snapshot_of(&after, Some("webdev")),
+            Some(&snapshot_of(&before, Some("webdev"))),
+        );
+        assert!(
+            on_project.contains("shared (p5: A global fact) (global)"),
+            "{on_project}"
+        );
+        assert!(
+            on_project.contains("web-note (p5: A project fact);")
+                || on_project.ends_with("web-note (p5: A project fact)\n"),
+            "{on_project}"
+        );
+        assert!(!on_project.contains("web-note (p5: A project fact) (global)"));
+        let deleted = render_world_state(
+            &snapshot_of(&before, Some("webdev")),
+            Some(&snapshot_of(&after, Some("webdev"))),
+        );
+        assert!(
+            deleted.contains("Memories deleted: `shared` (global), `web-note`")
+                || deleted.contains("Memories deleted: `web-note`, `shared` (global)"),
+            "{deleted}"
+        );
+        assert!(
+            !deleted.contains("`web-note` (global)"),
+            "a project memory is not marked: {deleted}"
+        );
+        let no_project = render_world_state(
+            &snapshot_of(&after, None),
+            Some(&snapshot_of(&before, None)),
+        );
+        assert!(!no_project.contains("(global)"), "{no_project}");
+    }
+
+    /// The inline band is laid out over the whole view, in index order across both tiers, and
+    /// the memories it demoted are listed once, after the groups.
+    #[test]
+    fn the_inline_band_of_a_project_session_is_budgeted_over_the_whole_view() {
+        let body = "r".repeat(100);
+        let memories = [
+            standing_memory("first", "Oldest global rule", &body),
+            memory_in("webdev", standing_memory("second", "Project rule", &body)),
+            standing_memory("third", "Newest global rule", &body),
+        ];
+        // Index order is priority, then newest first: all three are priority 0 and share an
+        // age, so the order the store handed them in holds, and the third does not fit 250.
+        let rendered = render_world_state(
+            &snapshot_of(&memories, Some("webdev")).with_inline_max_bytes(250),
+            None,
+        );
+        assert_eq!(
+            rendered.matches("shown by description only").count(),
+            1,
+            "{rendered}"
+        );
+        let demoted = rendered
+            .find("shown by description only")
+            .expect("the demoted list");
+        assert!(
+            rendered
+                .find("\nProject 'webdev'\n")
+                .expect("project group")
+                < demoted,
+            "the list follows both groups: {rendered}"
+        );
+        assert!(rendered[demoted..].contains("- **third**"), "{rendered}");
+        assert!(
+            rendered[..demoted].contains("- **first**")
+                && rendered[..demoted].contains("- **second**"),
+            "{rendered}"
+        );
+    }
+
+    /// The demoted list is cut by the index's byte ceiling, and the tail counts what it left out:
+    /// a store written past the doors can hold thousands of inline rows.
+    #[test]
+    fn the_demoted_list_stops_at_the_index_byte_ceiling_and_counts_the_rest() {
+        let memories: Vec<Memory> = (0..150)
+            .map(|index| {
+                standing_memory(
+                    &format!("demoted-{index:03}"),
+                    &"d".repeat(70),
+                    &"b".repeat(40),
+                )
+            })
+            .collect();
+        // The first body fits the budget alone; the other 149 are listed by description, which
+        // runs past the ceiling long before the entry cap.
+        let rendered = render_world_state(
+            &snapshot_of(&memories, None).with_inline_max_bytes(50),
+            None,
+        );
+        // The demoted list alone: the index lines that follow it name the same memories.
+        let start = rendered
+            .find("shown by description only")
+            .expect("the demoted list");
+        let list = &rendered[start..];
+        let tail = list
+            .find(" more inline memories not listed here")
+            .expect("the tail that counts the rest");
+        let listed = list[..tail].matches("- **demoted-").count();
+        assert!(
+            (10..149).contains(&listed),
+            "the list is cut by bytes, neither at once nor never: {listed}"
+        );
+        assert!(
+            list[..tail].ends_with(&format!("and {}", 149 - listed)),
+            "{rendered}"
+        );
+
+        // A list that fits has no tail.
+        let few = render_world_state(
+            &snapshot_of(&memories[..6], None).with_inline_max_bytes(50),
+            None,
+        );
+        assert!(
+            few.contains("shown by description only") && !few.contains("more inline memor"),
+            "{few}"
+        );
     }
 }

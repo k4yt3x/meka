@@ -55,6 +55,8 @@ pub(crate) struct SessionView {
     pub(crate) approvals: bool,
     /// The profile this session runs on.
     pub(crate) profile: String,
+    /// The project the session is on; empty for none.
+    pub(crate) project: String,
     /// The title a user set, else the first user message's words, whitespace collapsed and cut to
     /// 80 characters. Empty until either has happened.
     pub(crate) title: String,
@@ -86,6 +88,7 @@ impl From<&SessionSummary> for SessionView {
             permission: session.permission,
             approvals: session.approvals,
             profile: session.profile.clone(),
+            project: session.project.clone(),
             title: session.title.clone(),
             parent_id: session.parent_id,
             pinned_at: session.pinned_at.clone(),
@@ -114,6 +117,33 @@ impl From<&SessionMatch> for SessionMatchView {
             excerpt: found.excerpt.clone(),
         }
     }
+}
+
+/// A project as `meka project list` prints it and `GET /v1/projects` answers with: its name and
+/// how many memories and sessions are on it.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+pub(crate) struct ProjectView {
+    pub(crate) name: String,
+    /// Memories in the project's tier.
+    pub(crate) memories: u64,
+    /// Root sessions on the project.
+    pub(crate) sessions: u64,
+    /// Whether `config.toml` defines the project. A name only the store carries is one that was
+    /// removed from the file, or renamed by hand, while rows still named it.
+    pub(crate) configured: bool,
+    /// The MCP servers its sessions see, named in full; absent for every configured server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) allowed_servers: Option<Vec<String>>,
+    /// The MCP servers its sessions do not see; absent for none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) disabled_servers: Option<Vec<String>>,
+    /// The skills its sessions see, named in full; absent for every installed skill.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) allowed_skills: Option<Vec<String>>,
+    /// The skills its sessions do not see; absent for none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) disabled_skills: Option<Vec<String>>,
 }
 
 /// A profile as `meka profile list` prints it and `GET /v1/profiles` answers with: its account, the
@@ -407,6 +437,8 @@ impl ScheduledJobView {
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub(crate) struct MemoryDetail {
     pub(crate) name: String,
+    /// The project whose tier the memory is in; empty for the global tier.
+    pub(crate) project: String,
     pub(crate) description: String,
     /// 0..=9, lower first. Unlike a skill's, a memory's priority is shown to the model, because it
     /// says how heavily to weigh a note the model is already reasoning from.
@@ -451,6 +483,7 @@ impl MemoryDetail {
     pub(crate) fn new(memory: &Memory, body: Option<String>) -> Self {
         Self {
             name: memory.name.clone(),
+            project: memory.project.clone(),
             description: memory.description.clone(),
             priority: memory.priority,
             load: memory.load,
@@ -675,6 +708,7 @@ mod tests {
             permission: Some(Permission::Read),
             approvals: true,
             profile: "work".to_string(),
+            project: String::new(),
             capabilities_json: None,
             additional_roots: Vec::new(),
             token_id: None,
@@ -705,6 +739,7 @@ mod tests {
             "permission",
             "approvals",
             "profile",
+            "project",
             "title",
             "parent_id"
         ]);

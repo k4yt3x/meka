@@ -18,6 +18,9 @@ pub(crate) struct CoreMaterials {
     pub(crate) backend_probe: crate::sandbox::BackendProbe,
     /// The `[tools]` filter; sub-agents inherit it.
     pub(crate) builtin_filter: crate::config::BuiltinToolFilter,
+    /// Every configured project, for the view a session's project gives it of the servers and
+    /// skills; see [`ProjectLens`].
+    pub(crate) projects: Arc<std::collections::BTreeMap<String, crate::config::ProjectConfig>>,
     /// The per-path write locks every registry built from these materials takes.
     pub(crate) write_locks: crate::workspace::WriteLocks,
     /// Shared by every session this process builds, so a host can tell which sub-agents are in a
@@ -38,6 +41,7 @@ impl CoreMaterials {
             sandbox_backend: sandbox.backend,
             backend_probe: sandbox.probe.clone(),
             builtin_filter,
+            projects: Arc::new(config.projects.clone()),
             write_locks: crate::workspace::WriteLocks::default(),
             running_subagents: RunningSubagents::default(),
         }
@@ -55,6 +59,7 @@ impl CoreMaterials {
                 reason: "test fixture".to_string(),
             },
             builtin_filter: crate::config::BuiltinToolFilter::default(),
+            projects: Arc::new(std::collections::BTreeMap::new()),
             write_locks: crate::workspace::WriteLocks::default(),
             running_subagents: RunningSubagents::default(),
         }
@@ -202,6 +207,50 @@ impl SharedSessionId {
     }
 }
 
+/// The project a session is on, shared by handle between the agent, the memory tools and the
+/// host, so a move through any surface reaches every reader. `None` for a session on no project.
+///
+/// A `std` lock rather than a `tokio` one, for the reason [`SharedSessionId`] gives.
+#[derive(Clone, Default)]
+pub(crate) struct SharedProject(Arc<std::sync::RwLock<Option<String>>>);
+
+impl SharedProject {
+    pub(crate) fn new(project: Option<String>) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(project)))
+    }
+
+    pub(crate) fn get(&self) -> Option<String> {
+        crate::sync::read(&self.0).clone()
+    }
+
+    pub(crate) fn set(&self, project: Option<String>) {
+        *crate::sync::write(&self.0) = project;
+    }
+}
+
+/// What the project a session is on lets it see of the installed servers and skills, read live
+/// from the project cell against the configured projects, so a move mid-session changes what the
+/// next read sees. The default lens is a session on no project, which sees everything.
+#[derive(Clone, Default)]
+pub(crate) struct ProjectLens {
+    project: SharedProject,
+    projects: Arc<std::collections::BTreeMap<String, crate::config::ProjectConfig>>,
+}
+
+impl ProjectLens {
+    pub(crate) fn new(
+        project: SharedProject,
+        projects: Arc<std::collections::BTreeMap<String, crate::config::ProjectConfig>>,
+    ) -> Self {
+        Self { project, projects }
+    }
+
+    /// The view as it stands now.
+    pub(crate) fn access(&self) -> crate::config::ProjectAccess {
+        crate::config::ProjectAccess::of(&self.projects, self.project.get().as_deref())
+    }
+}
+
 /// The live state of one session: the cells that change as it runs, read by every tool and by the
 /// agent through the same handles, so a change made through any one of them reaches all of them.
 #[derive(Clone)]
@@ -222,6 +271,10 @@ pub(crate) struct SessionCells {
     /// sub-agent.
     pub(crate) network: crate::config::Network,
     pub(crate) session_id: SharedSessionId,
+    /// The project the session is on, which decides the memory tier its writes land in and the
+    /// tiers it sees. A sub-agent's is read off its parent's at spawn and again at every
+    /// follow-up, as its profile is, and its row is rewritten to what it ran under after each.
+    pub(crate) project: SharedProject,
     pub(crate) checklist: crate::checklist::SharedChecklist,
     /// What the session runs on, published so a switch reaches everything holding this.
     pub(crate) profile: crate::provider::PublishedProfile,
@@ -248,6 +301,14 @@ pub(crate) struct SessionCells {
 }
 
 impl SessionCells {
+    /// The lens on this session's project over the configured projects.
+    pub(crate) fn project_lens(
+        &self,
+        projects: &Arc<std::collections::BTreeMap<String, crate::config::ProjectConfig>>,
+    ) -> ProjectLens {
+        ProjectLens::new(self.project.clone(), Arc::clone(projects))
+    }
+
     /// The cells of a session that has not run yet: no session id, an empty checklist, fresh
     /// gauges, nothing in the background.
     pub(crate) fn new(
@@ -265,6 +326,7 @@ impl SessionCells {
             read_boundary: crate::workspace::ReadBoundary::unconfined(),
             network: crate::config::Network::Host,
             session_id: SharedSessionId::default(),
+            project: SharedProject::default(),
             checklist: crate::checklist::SharedChecklist::default(),
             profile,
             context_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -726,18 +788,19 @@ mod tests {
         conversation::{self, format_session_as_markdown},
         host::{ForkHandoff, fork_and_lock},
         store::export::{
-            ImportProfiles, SESSION_EXPORT_FORMAT_VERSION, SessionExport, build_session_export,
+            ImportInstallation, SESSION_EXPORT_FORMAT_VERSION, SessionExport, build_session_export,
             parents_first_order, plan_import,
         },
     };
 
     /// The planner with no installation behind it: nothing selected, nothing to check against,
     /// and whatever default the test states.
-    fn planner_profiles(default: Option<&str>) -> ImportProfiles<'_> {
-        ImportProfiles {
+    fn planner_profiles(default: Option<&str>) -> ImportInstallation<'_> {
+        ImportInstallation {
             selected: None,
             default,
             configured: None,
+            projects: None,
         }
     }
 
@@ -756,6 +819,95 @@ mod tests {
             ("b".to_string(), Some("a".to_string())),
         ];
         assert!(parents_first_order(&nodes).is_err());
+    }
+
+    /// An archive carries the project each session was on, an import writes it back as written,
+    /// and an archive from before projects, which has no such key, imports onto none.
+    #[tokio::test]
+    async fn an_archive_carries_each_session_s_project_and_an_older_one_reads_as_none() {
+        let manager = Store::for_test().await;
+        let root = manager
+            .create_session_in_project_for_test(None, "test-profile", "webdev")
+            .await
+            .expect("root");
+        manager
+            .save_event(
+                root,
+                &crate::conversation::Event::Append(user_msg("hello")),
+                None,
+            )
+            .await
+            .expect("save");
+        let export = build_session_export(&manager, root).await.expect("export");
+        assert_eq!(export.sessions[0].project, "webdev");
+        let text = serde_json::to_string(&export).expect("json");
+        assert!(text.contains("\"project\":\"webdev\""));
+
+        let crate::store::export::ImportPlan {
+            records,
+            blobs,
+            root_new_id,
+        } = plan_import(
+            serde_json::from_str(&text).expect("parse"),
+            planner_profiles(Some("test-profile")),
+            Some(crate::permission::Permission::Read),
+        )
+        .expect("plan");
+        manager
+            .import_sessions(records, blobs)
+            .await
+            .expect("import");
+        assert_eq!(
+            manager
+                .session_info(root_new_id)
+                .await
+                .expect("info")
+                .expect("row")
+                .project,
+            "webdev"
+        );
+
+        // The key is absent for a session on no project, so the archive of one is byte for byte
+        // what an older build wrote, and such an archive reads back as none.
+        let mut older: serde_json::Value = serde_json::from_str(&text).expect("json");
+        older["sessions"][0]
+            .as_object_mut()
+            .expect("object")
+            .remove("project");
+        let crate::store::export::ImportPlan {
+            records,
+            blobs,
+            root_new_id,
+        } = plan_import(
+            serde_json::from_value(older).expect("parse"),
+            planner_profiles(Some("test-profile")),
+            Some(crate::permission::Permission::Read),
+        )
+        .expect("plan");
+        manager
+            .import_sessions(records, blobs)
+            .await
+            .expect("import");
+        assert_eq!(
+            manager
+                .session_info(root_new_id)
+                .await
+                .expect("info")
+                .expect("row")
+                .project,
+            ""
+        );
+        let none = manager
+            .create_session(None, "test-profile")
+            .await
+            .expect("a session on no project");
+        let export = build_session_export(&manager, none).await.expect("export");
+        assert!(
+            !serde_json::to_string(&export)
+                .expect("json")
+                .contains("\"project\""),
+            "no key for a session on no project"
+        );
     }
 
     #[test]
@@ -896,7 +1048,7 @@ mod tests {
         // An archive that drops these imports a sub-agent nobody can resume.
         let child_spec = r#"{"permission":"read","enabled_permissions":["read"],"denied_servers":["mekabridge"],"denied_tools":[],"memory":"none","inherited_scratchpad":[],"remaining_depth":0,"absolute_depth":1}"#;
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 root,
                 None,
                 Vec::new(),
@@ -1391,6 +1543,7 @@ mod tests {
             additional_roots: Vec::new(),
             subagent_spec_json: None,
             profile: "test-profile".to_string(),
+            project: String::new(),
             title: None,
             pinned_at: None,
             stats: crate::stats::SessionStatsSnapshot::default(),

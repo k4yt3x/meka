@@ -162,6 +162,42 @@ pub(crate) async fn apply_recorded_profile(
     tracing::info!("moved session {session_id} onto profile '{profile}'");
     Ok(())
 }
+/// Move a session's agent onto the project its row currently names, before a turn runs on it,
+/// for the reason [`apply_recorded_profile`] gives: the row is the carrier, and a turn that ran
+/// under another project would file its memories in a tier the record does not name. A project
+/// the file no longer defines is refused by name, as a profile is.
+pub(crate) async fn apply_recorded_project(
+    shared: &SharedDeps,
+    agent: &crate::agent::Agent,
+    session_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    let Some(recorded) = shared.store.recorded_project(session_id).await? else {
+        return Ok(());
+    };
+    let recorded = (!recorded.is_empty()).then_some(recorded);
+    if recorded == agent.project() {
+        return Ok(());
+    }
+    if let Some(name) = &recorded {
+        crate::config::require_project(name, &shared.config.projects)?;
+    }
+    agent.set_project(recorded.clone());
+    match recorded {
+        Some(project) => tracing::info!("moved session {session_id} onto project '{project}'"),
+        None => tracing::info!("moved session {session_id} off its project"),
+    }
+    Ok(())
+}
+/// Both of a row's bindings, applied ahead of a turn: the one call every turn door makes, so no
+/// door applies the profile and forgets the project.
+pub(crate) async fn apply_recorded_bindings(
+    shared: &SharedDeps,
+    agent: &crate::agent::Agent,
+    session_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    apply_recorded_profile(shared, agent, session_id).await?;
+    apply_recorded_project(shared, agent, session_id).await
+}
 
 /// Build the process-wide [`SharedDeps`] for `meka acp`. Sets up the provider, MCP wiring, skill
 /// cache, sandbox capability probe, and the shared `agent_options` template. Each ACP session later
@@ -356,6 +392,10 @@ pub(crate) struct SessionSpec {
     pub(crate) context_tokens: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) context_overhead: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) context_window: Arc<std::sync::atomic::AtomicU64>,
+    /// The project the session is on: what a session that does not exist yet opens on and records
+    /// at creation. Beside a `session_id` the row is read instead, since the row is the carrier,
+    /// so a value here is at most the row's own repeated.
+    pub(crate) project: Option<String>,
 }
 /// A session's lifetime counters: the row's, when it has one, so a resumed session continues its
 /// `/status` totals wherever it is resumed; fresh otherwise, and fresh when the row cannot be read,
@@ -393,6 +433,7 @@ pub(crate) async fn build_session_agent(
         context_tokens,
         context_overhead,
         context_window,
+        project,
     } = spec;
     refuse_a_spawned_session(&shared.store, session_id).await?;
     let resolved = crate::provider::resolved_profile(
@@ -400,6 +441,29 @@ pub(crate) async fn build_session_agent(
         crate::provider::profile_for_config(&shared.store, &shared.config, session_id).await?,
     )
     .await?;
+    // The row's project where there is a row, refused by name when the file no longer defines
+    // it, as the profile is: a session cannot be opened on a tier that does not exist.
+    let project = match session_id {
+        Some(id) => shared
+            .store
+            .recorded_project(id)
+            .await?
+            .filter(|project| !project.is_empty()),
+        None => project,
+    };
+    if let Some(name) = &project {
+        crate::config::require_project(name, &shared.config.projects)?;
+        // Said once, as the session opens, rather than at every turn: a skill the file names and
+        // the store lacks restricts nothing, and skills come and go without a config edit, so the
+        // file is not refused over it.
+        let access = crate::config::ProjectAccess::of(&shared.config.projects, Some(name));
+        let installed = shared.skills.current().await;
+        for skill in access.skill_names() {
+            if installed.find(skill).is_none() && installed.skip_reason(skill).is_none() {
+                tracing::warn!("project '{name}' names skill '{skill}', which is not installed");
+            }
+        }
+    }
     let agent_options = session_agent_options(shared, &cwd.get());
     let mut cells = SessionCells::new(
         shared_permission,
@@ -414,6 +478,7 @@ pub(crate) async fn build_session_agent(
     );
     cells.context_tokens = context_tokens;
     cells.context_overhead = context_overhead;
+    cells.project = crate::session::SharedProject::new(project);
     // The process's read boundary, before the tools that judge by it are registered.
     cells.read_boundary = shared.read_boundary.clone();
     cells.read_only_roots = read_only_roots;
@@ -522,6 +587,14 @@ pub(crate) async fn resolve_profile_switch(
     crate::config::require_profile(name, &shared.config.profiles)?;
     Ok(crate::provider::resolved_profile(&shared.providers, name.to_string()).await?)
 }
+/// The project a live session is asked to move onto, refused by name when the configuration has
+/// no such project. The mid-session moves ask this: `/project open`, a resident `PATCH
+/// /v1/sessions/{id}` and ACP's `session/set_config_option`; moving off a project needs no
+/// resolution.
+pub(crate) fn resolve_project_switch(shared: &SharedDeps, name: &str) -> anyhow::Result<String> {
+    crate::config::require_project(name, &shared.config.projects)?;
+    Ok(name.to_string())
+}
 /// Record a change a host has already applied to a live session on its row, and decide what a
 /// failed write costs.
 ///
@@ -531,10 +604,11 @@ pub(crate) async fn resolve_profile_switch(
 /// row: the failure is warned about, loudly, because another process may still read the old value
 /// (a scheduled gate is re-checked against the row, and the next resume opens from it), and the
 /// caller continues. The profile is different: the row is the billing record, and a session running
-/// on a profile its row does not name bills an account no reader can see. The title and the pin
-/// are different for the opposite reason: they live on the row and nowhere else, so a write that
-/// failed is the whole command failing. A patch carrying any of the three returns the failure, so
-/// the door refuses.
+/// on a profile its row does not name bills an account no reader can see. The project is different
+/// for a like reason: the row says which tier the session's memories are filed in, and every
+/// other process reads it there. The title and the pin are different for the opposite reason: they
+/// live on the row and nowhere else, so a write that failed is the whole command failing. A patch
+/// carrying any of the four returns the failure, so the door refuses.
 ///
 /// Every door handles the result the same way, surfacing whatever comes back; which patches can
 /// fail is this function's to know, not theirs.
@@ -543,7 +617,10 @@ pub(crate) async fn record_session_change(
     session_id: uuid::Uuid,
     patch: crate::store::SessionPatch,
 ) -> crate::error::Result<()> {
-    let must_land = patch.profile.is_some() || patch.title.is_some() || patch.pinned.is_some();
+    let must_land = patch.profile.is_some()
+        || patch.project.is_some()
+        || patch.title.is_some()
+        || patch.pinned.is_some();
     let described = patch.to_string();
     match store.update_session(session_id, patch).await {
         Ok(()) => Ok(()),
@@ -571,6 +648,28 @@ pub(crate) async fn record_profile_switch(
         ..Default::default()
     })
     .await?;
+    Ok(())
+}
+/// Record a project move on the session's row, `None` for off its project, skipping a write of
+/// what the row already says for the reason [`record_profile_switch`] gives.
+pub(crate) async fn record_project_switch(
+    store: &Store,
+    session_id: uuid::Uuid,
+    project: Option<&str>,
+) -> anyhow::Result<()> {
+    let recorded = store.recorded_project(session_id).await?;
+    if recorded.as_deref() == Some(project.unwrap_or_default()) {
+        return Ok(());
+    }
+    record_session_change(store, session_id, crate::store::SessionPatch {
+        project: Some(project.unwrap_or_default().to_string()),
+        ..Default::default()
+    })
+    .await?;
+    match project {
+        Some(project) => tracing::info!("recorded project '{project}' on session {session_id}"),
+        None => tracing::info!("recorded no project on session {session_id}"),
+    }
     Ok(())
 }
 /// [`crate::host::claim_undelivered_outcomes`] for the screen, which reaches these paths before
@@ -617,6 +716,14 @@ pub(crate) struct ResumedSession {
     /// uncommitted and for the same reason: written here, a run that then failed to start left
     /// the row at a level it never ran at, for every other reader of it.
     pub(crate) permission_to_record: Option<crate::permission::Permission>,
+    /// The project the session of this run is on: `--project` for a fresh session, checked
+    /// against the file; a resumed row's own, moved by `--project` where `-r <id>` named it.
+    /// What the banner shows and the opening skill is checked against; the build reads a row's
+    /// project off the row.
+    pub(crate) project: Option<String>,
+    /// The project `--project` asked a named session to move onto, still uncommitted like the
+    /// profile's repin and written beside it.
+    pub(crate) project_repin: Option<String>,
     /// The directory the session recorded, which is where it reopens.
     ///
     /// Carried out rather than applied here because the caller owns the
@@ -640,6 +747,15 @@ pub(crate) async fn resolve_session_resume(
     store: &Store,
     config: &ResolvedConfig,
 ) -> anyhow::Result<ResumedSession> {
+    // Checked first, whatever the run resumes: a name the file lacks is refused before a lock is
+    // taken or a row touched.
+    let requested_project = config.request.requested_project.as_deref();
+    if let Some(name) = requested_project {
+        if name.is_empty() {
+            anyhow::bail!("`--project` needs a project name; leave it out for a session on none");
+        }
+        crate::config::require_project(name, &config.projects)?;
+    }
     let fresh = || ResumedSession {
         permission_to_record: None,
         session_id: None,
@@ -650,6 +766,9 @@ pub(crate) async fn resolve_session_resume(
         // A run that resumed nothing has no row to repin: the flags become this session's profile
         // when `resolve_session_profile` builds it, and are recorded when the row is created.
         repin: None,
+        // The project likewise: the session opens on it and the row records it at creation.
+        project: requested_project.map(str::to_string),
+        project_repin: None,
         // Nor a directory to reopen: a fresh session starts where the shell is, and records that.
         cwd: None,
         announce: None,
@@ -657,8 +776,11 @@ pub(crate) async fn resolve_session_resume(
     let resolved = match &config.request.session_resume {
         None => return Ok(fresh()),
         // `--continue` on a store with no sessions yet is not an error: there is simply nothing to
-        // pick up, so the run starts fresh.
-        Some(crate::config::SessionResume::Last) => store.last_session_id().await?,
+        // pick up, so the run starts fresh. With `--project`, the latest session on that project,
+        // or a fresh one on it.
+        Some(crate::config::SessionResume::Last) => {
+            store.last_session_id(requested_project).await?
+        }
         Some(crate::config::SessionResume::Id(value)) => {
             Some(store.resolve_session_id(value).await?)
         }
@@ -690,6 +812,13 @@ pub(crate) async fn resolve_session_resume(
     } else {
         None
     };
+    // `--project` moves a session the user named, and filters a selection meka made: with `-r
+    // <id>` the row is repinned, with `-c` the project chose the session above and the row
+    // already says so.
+    let project_repin = match &config.request.session_resume {
+        Some(crate::config::SessionResume::Id(_)) => requested_project.map(str::to_string),
+        _ => None,
+    };
 
     // The level the session recorded, unless this run asked for a different one. Every surface
     // resolves permission this way, through one admitter: ACP, the HTTP API, the scheduler's fire
@@ -713,6 +842,9 @@ pub(crate) async fn resolve_session_resume(
         .filter(|requested| recorded.permission != Some(*requested));
 
     let messages = hydrate_conversation(store, id).await?;
+    let project = project_repin
+        .clone()
+        .or_else(|| (!recorded.project.is_empty()).then(|| recorded.project.clone()));
     Ok(ResumedSession {
         session_id: Some(id),
         messages,
@@ -721,6 +853,8 @@ pub(crate) async fn resolve_session_resume(
         approvals: recorded.approvals,
         repin,
         permission_to_record,
+        project,
+        project_repin,
         // Read off the row already loaded above, not fetched again.
         cwd: recorded.cwd,
         announce: config.show_session_id_on_resume.then_some(id),
@@ -801,9 +935,13 @@ pub(crate) async fn commit_resume_repin(
     providers: &crate::provider::ProviderRegistry,
     session_id: Option<uuid::Uuid>,
     repin: Option<String>,
+    project_repin: Option<String>,
 ) -> anyhow::Result<()> {
     if let (Some(session_id), Some(profile)) = (session_id, repin) {
         apply_session_repin(store, providers, session_id, profile).await?;
+    }
+    if let (Some(session_id), Some(project)) = (session_id, project_repin) {
+        record_project_switch(store, session_id, Some(&project)).await?;
     }
     Ok(())
 }
@@ -931,7 +1069,7 @@ mod tests {
             .await
             .expect("a root session");
         let (sub_agent, _lock) = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -1000,6 +1138,7 @@ mod tests {
                     additional_roots: Vec::new(),
                     subagent_spec_json: Some("{\"tools\":[]}".to_string()),
                     profile: "profile".to_string(),
+                    project: String::new(),
                     title: None,
                     pinned_at: None,
                     stats: Default::default(),

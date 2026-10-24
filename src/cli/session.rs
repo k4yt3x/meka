@@ -10,14 +10,15 @@
 use crate::{cli, conversation, store::Store, text::Precision, view::SessionView};
 
 /// The listing's columns: an id prefix every session command accepts, the timestamp, the profile
-/// for information, and the first message's words spending the rest.
+/// and the project for information, and the first message's words spending the rest.
 ///
 /// A full UUID would cost 36 of the 120 to repeat what eight characters usually say, and
 /// [`show_session`] has the whole one.
-const SESSION_COLUMNS: [crate::text::Column; 4] = [
+const SESSION_COLUMNS: [crate::text::Column; 5] = [
     crate::text::Column::content("ID"),
     crate::text::Column::content("Updated"),
     crate::text::Column::capped("Profile", crate::text::NAME_WIDTH),
+    crate::text::Column::capped("Project", crate::text::NAME_WIDTH),
     crate::text::Column::remainder("Title"),
 ];
 
@@ -100,7 +101,7 @@ pub(crate) async fn run_session_subcommand(
     // `meka --profile work session import` moves the archive per run, while the migration context
     // the caller also builds ignores it, because that stamps rows once and irreversibly. Unused by
     // every other action here.
-    profiles: crate::store::export::ImportProfiles<'_>,
+    profiles: crate::store::export::ImportInstallation<'_>,
     // The level such an archive's sessions adopt when they record none, for the same reason.
     default_permission: Option<crate::permission::Permission>,
 ) -> anyhow::Result<()> {
@@ -108,8 +109,9 @@ pub(crate) async fn run_session_subcommand(
         cli::SessionAction::List {
             limit,
             include_children,
+            project,
             format,
-        } => list_sessions(store, *limit, *include_children, *format).await,
+        } => list_sessions(store, *limit, *include_children, project.clone(), *format).await,
         cli::SessionAction::Export {
             session_id,
             output,
@@ -351,6 +353,14 @@ async fn show_session(
             "profile",
             crate::text::sanitize_to_line(&session.profile, usize::MAX),
         ),
+        (
+            "project",
+            if session.project.is_empty() {
+                "-".to_string()
+            } else {
+                crate::text::sanitize_to_line(&session.project, usize::MAX)
+            },
+        ),
         ("working directory", match &session.cwd {
             Some(cwd) => crate::text::sanitize_to_line(&cwd.to_string_lossy(), usize::MAX),
             None => "-".to_string(),
@@ -424,11 +434,13 @@ pub(crate) async fn list_sessions(
     store: &Store,
     limit: u32,
     include_children: bool,
+    project: Option<String>,
     format: cli::OutputFormat,
 ) -> anyhow::Result<()> {
     let (sessions, _next_cursor) = store
         .list_sessions(limit, None, &crate::store::SessionFilter {
             include_children,
+            project,
             ..Default::default()
         })
         .await?;
@@ -480,6 +492,11 @@ fn session_rows(
                 id.get(..id_width).unwrap_or(id).to_string(),
                 format_stored_timestamp(&session.updated_at, Precision::Minutes),
                 session.profile.clone(),
+                if session.project.is_empty() {
+                    "-".to_string()
+                } else {
+                    session.project.clone()
+                },
                 // A pin is marked on the label, since the pinned rows sit at the top and the mark
                 // is what says why. The words are a title someone set, or a first message's, which
                 // a model composed or an API caller sent through `POST /v1/sessions`.
@@ -566,7 +583,7 @@ fn write_export(path: &std::path::Path, body: &str) -> std::io::Result<()> {
 pub(crate) async fn import_session(
     store: &Store,
     input: &str,
-    profiles: crate::store::export::ImportProfiles<'_>,
+    profiles: crate::store::export::ImportInstallation<'_>,
     default_permission: Option<crate::permission::Permission>,
 ) -> anyhow::Result<()> {
     // A `config.toml` that did not parse leaves nothing to check an archive's profile name
@@ -888,8 +905,8 @@ mod tests {
             .await
             .expect("list");
         let rows = session_rows(&sessions, &ids_of(&sessions));
-        assert_eq!(rows[0][3], "* kept words");
-        assert_eq!(rows[1][3], "plain words about herons");
+        assert_eq!(rows[0][4], "* kept words");
+        assert_eq!(rows[1][4], "plain words about herons");
 
         let found = store
             .search_sessions("herons", 10, crate::store::SessionReach::Store {
@@ -956,7 +973,7 @@ mod tests {
         let short = table(&["stub"]).await;
         let long = table(&["openrouter-anthropic-messages", "claude-max"]).await;
         assert!(
-            long.contains("openrouter-anthropic-messages  word"),
+            long.contains("openrouter-anthropic-messages  -"),
             "a real profile name is shown in full, not cut to a fixed ceiling: {long}"
         );
         assert!(
@@ -1012,10 +1029,11 @@ mod tests {
         .expect("write archive");
         let store = Store::for_test().await;
         // What `main.rs` hands this door when the file could not be read: nothing to check against.
-        let profiles = crate::store::export::ImportProfiles {
+        let profiles = crate::store::export::ImportInstallation {
             selected: None,
             default: None,
             configured: None,
+            projects: None,
         };
 
         // SAFETY: `MEKA_CONFIG_DIR` is process-global; `CONFIG_DIR_ENV_LOCK` serializes every test

@@ -410,6 +410,13 @@ const MIGRATIONS: &[Migration] = &[
         name: "memories_carry_load_references_source_verification_and_expiry",
         step: Step::Rust(memories_carry_load_references_source_verification_and_expiry),
     },
+    // 0.84 lets a session open a project and files a memory into the global tier or the
+    // project's; a row written before the column has no project, as a session with no profile
+    // has none.
+    Migration {
+        name: "sessions_and_memories_record_their_project",
+        step: Step::Rust(sessions_and_memories_record_their_project),
+    },
 ];
 
 /// The position of the last turn a session opened, beside the eight cumulative counters: `NULL`
@@ -836,7 +843,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 3_543_547_029_945_738_551;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 6_640_939_281_267_135_889;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -2850,6 +2857,62 @@ fn memories_carry_load_references_source_verification_and_expiry(
     Ok(())
 }
 
+/// `sessions` and `memories` record a project, and a memory's name is unique within its tier
+/// rather than across the store.
+///
+/// A session with no project and a memory in the global tier record the empty string, as
+/// `sessions.profile` records no profile. The name constraint moves from `name` to `(project,
+/// name)`, which SQLite cannot alter in place, so `memories` is rebuilt under its own name. Every
+/// row is copied with its `id`, so the external-content FTS table keeps addressing the right
+/// rowids, and the index is rebuilt anyway so the step leaves it whole on its own. The drop takes
+/// the index's triggers with it; they come back on the open that follows, from
+/// `crate::store::memory::reconcile_index`, which owns them and nothing else creates. Each half
+/// is guarded on `project` being absent, so a replay over a store that lost its `user_version`
+/// finds nothing to do. No frozen step reads an object the rebuild removes: each names `memories`
+/// itself, which keeps its name, so `classify_by_shape`'s floor stays where it is.
+fn sessions_and_memories_record_their_project(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    if !table_has_column(transaction, "sessions", "project")? {
+        transaction
+            .execute_batch("ALTER TABLE sessions ADD COLUMN project TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !table_has_column(transaction, "memories", "project")? {
+        transaction.execute_batch(
+            "CREATE TABLE memories_new (
+                id             INTEGER PRIMARY KEY,
+                name           TEXT NOT NULL COLLATE NOCASE,
+                project        TEXT NOT NULL DEFAULT '',
+                description    TEXT NOT NULL,
+                tags           TEXT NOT NULL DEFAULT '',
+                body           TEXT NOT NULL DEFAULT '',
+                priority       INTEGER NOT NULL DEFAULT 5,
+                created_at     TEXT NOT NULL,
+                updated_at     TEXT NOT NULL,
+                read_count     INTEGER NOT NULL DEFAULT 0,
+                load           TEXT NOT NULL DEFAULT 'index',
+                reference_list TEXT NOT NULL DEFAULT '[]',
+                source         TEXT NOT NULL DEFAULT '',
+                verified_at    TEXT NOT NULL DEFAULT '',
+                expires_at     TEXT,
+                UNIQUE (project, name)
+             );
+             INSERT INTO memories_new (id, name, description, tags, body, priority, created_at,
+                                       updated_at, read_count, load, reference_list, source,
+                                       verified_at, expires_at)
+             SELECT id, name, description, tags, body, priority, created_at, updated_at,
+                    read_count, load, reference_list, source, verified_at, expires_at
+             FROM memories;
+             DROP TABLE memories;
+             ALTER TABLE memories_new RENAME TO memories;
+             CREATE INDEX IF NOT EXISTS idx_memories_priority_created_at
+                 ON memories(priority, created_at DESC);
+             INSERT INTO memories_fts(memories_fts) VALUES('rebuild');",
+        )?;
+    }
+    Ok(())
+}
+
 /// Give a spec the two allow-list keys 0.76 records, `null` each, where it lacks them, reporting
 /// whether it did.
 fn allow_lists_0_76(spec: &mut serde_json::Value) -> bool {
@@ -4736,6 +4799,10 @@ mod tests {
             (
                 "memories_carry_load_references_source_verification_and_expiry",
                 11700233977647167775_u64,
+            ),
+            (
+                "sessions_and_memories_record_their_project",
+                3180749961311918637_u64,
             ),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
@@ -6742,45 +6809,18 @@ mod tests {
     /// the other one now names this one and bills here when resumed.
     #[test]
     fn the_step_reports_the_profile_it_adopted_and_only_then() {
-        #[derive(Clone)]
-        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Capture {
-            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-                crate::sync::lock(&self.0).extend_from_slice(buffer);
-                Ok(buffer.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-            type Writer = Self;
-
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
         // INFO rather than WARN, because the adoption notice is a lifecycle signpost and the
         // empty-profile complaint above it is a warning; capturing both keeps one test honest
         // about which level each uses.
         let migrate = |plant: bool, default: Option<&str>| -> String {
-            let capture = Capture(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
-            let buffer = std::sync::Arc::clone(&capture.0);
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(capture)
-                .with_max_level(tracing::Level::INFO)
-                .finish();
-            tracing::subscriber::with_default(subscriber, || {
-                let mut connection = store_as_0_42_left_it();
-                if plant {
-                    plant_session(&connection, "carried");
-                }
-                let plan = plan(&connection).expect("classified");
-                apply(&mut connection, plan, &Context::adopting(default)).expect("migrated");
-            });
-            String::from_utf8_lossy(&crate::sync::lock(&buffer)).into_owned()
+            let captured = crate::streams::capture::capture_logs(tracing::Level::INFO);
+            let mut connection = store_as_0_42_left_it();
+            if plant {
+                plant_session(&connection, "carried");
+            }
+            let plan = plan(&connection).expect("classified");
+            apply(&mut connection, plan, &Context::adopting(default)).expect("migrated");
+            captured.logged()
         };
 
         let text = migrate(true, Some("work"));
@@ -8597,9 +8637,17 @@ mod tests {
                  ALTER TABLE memories DROP COLUMN expires_at;",
             )
             .expect("the shape before the step");
+        // Stamped at the step itself rather than one short of head, so the steps after it run
+        // over the shape it leaves, as they do on a real upgrade from that release.
+        let step = MIGRATIONS
+            .iter()
+            .position(|migration| {
+                migration.name == "memories_carry_load_references_source_verification_and_expiry"
+            })
+            .expect("the step is in the ledger");
         connection
-            .execute_batch(&format!("PRAGMA user_version = {};", MIGRATIONS.len() - 1))
-            .expect("one step short of head");
+            .execute_batch(&format!("PRAGMA user_version = {step};"))
+            .expect("stamped at the step");
         connection
             .execute_batch(
                 "INSERT INTO memories (name, description, priority, created_at, updated_at)
@@ -8611,7 +8659,7 @@ mod tests {
             .expect("two rows an older meka wrote");
 
         let pending = plan(&connection).expect("plan");
-        assert_eq!(pending.from as usize, MIGRATIONS.len() - 1);
+        assert_eq!(pending.from as usize, step);
         apply(&mut connection, pending, &Context::default()).expect("the step runs");
 
         let row = |connection: &rusqlite::Connection,
@@ -8671,6 +8719,246 @@ mod tests {
             (row(&connection, "rule"), row(&connection, "note")),
             before,
             "a replay is a no-op"
+        );
+    }
+
+    /// The shape the project step converts from: a store at head with `sessions.project` gone and
+    /// `memories` under its old constraint, stamped one step short.
+    fn store_before_projects() -> rusqlite::Connection {
+        let mut connection = rusqlite::Connection::open_in_memory().expect("open");
+        let to_head = plan(&connection).expect("plan");
+        apply(&mut connection, to_head, &Context::default()).expect("apply");
+        connection
+            .execute_batch(
+                "ALTER TABLE sessions DROP COLUMN project;
+                 CREATE TABLE memories_old (
+                     id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                     description TEXT NOT NULL,
+                     tags TEXT NOT NULL DEFAULT '',
+                     body TEXT NOT NULL DEFAULT '',
+                     priority INTEGER NOT NULL DEFAULT 5,
+                     created_at TEXT NOT NULL,
+                     updated_at TEXT NOT NULL,
+                     read_count INTEGER NOT NULL DEFAULT 0,
+                     load TEXT NOT NULL DEFAULT 'index',
+                     reference_list TEXT NOT NULL DEFAULT '[]',
+                     source TEXT NOT NULL DEFAULT '',
+                     verified_at TEXT NOT NULL DEFAULT '',
+                     expires_at TEXT
+                 );
+                 DROP TABLE memories;
+                 ALTER TABLE memories_old RENAME TO memories;",
+            )
+            .expect("the shape before the step");
+        connection
+            .execute_batch(&format!("PRAGMA user_version = {};", MIGRATIONS.len() - 1))
+            .expect("one step short of head");
+        connection
+    }
+
+    /// Every memory row as the test reads it back, by id, so a rebuild that dropped a column's
+    /// value or renumbered a row shows up in one comparison.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MemoryRow {
+        id: i64,
+        name: String,
+        project: String,
+        description: String,
+        tags: String,
+        body: String,
+        priority: i64,
+        created_at: String,
+        updated_at: String,
+        read_count: i64,
+        load: String,
+        reference_list: String,
+        source: String,
+        verified_at: String,
+        expires_at: Option<String>,
+    }
+
+    fn memory_rows(connection: &rusqlite::Connection) -> Vec<MemoryRow> {
+        let mut statement = connection
+            .prepare(
+                "SELECT id, name, project, description, tags, body, priority, created_at,
+                        updated_at, read_count, load, reference_list, source, verified_at,
+                        expires_at
+                 FROM memories ORDER BY id",
+            )
+            .expect("prepare");
+        let rows = statement
+            .query_map([], |row| {
+                Ok(MemoryRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    project: row.get(2)?,
+                    description: row.get(3)?,
+                    tags: row.get(4)?,
+                    body: row.get(5)?,
+                    priority: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                    read_count: row.get(9)?,
+                    load: row.get(10)?,
+                    reference_list: row.get(11)?,
+                    source: row.get(12)?,
+                    verified_at: row.get(13)?,
+                    expires_at: row.get(14)?,
+                })
+            })
+            .expect("query");
+        rows.collect::<rusqlite::Result<_>>().expect("rows")
+    }
+
+    /// The rebuild carries every column of every row across with its id, a row written before the
+    /// step is global, and the constraint it exists to move lets two projects hold one name while
+    /// one project still cannot. A replay over the rebuilt store changes nothing.
+    #[test]
+    fn memories_written_before_projects_are_global_and_keep_every_column() {
+        let mut connection = store_before_projects();
+        connection
+            .execute_batch(
+                "INSERT INTO memories (id, name, description, tags, body, priority, created_at,
+                                       updated_at, read_count, load, reference_list, source,
+                                       verified_at, expires_at)
+                 VALUES (7, 'rule', 'always', 'a b', 'the body', 0, '2024-01-01T00:00:00+00:00',
+                         '2024-06-01T00:00:00+00:00', 3, 'inline', '[\"note\"]', 'user',
+                         '2024-07-01T00:00:00+00:00', '2030-01-01T00:00:00+00:00'),
+                        (9, 'note', 'sometimes', '', '', 5, '2024-02-01T00:00:00+00:00',
+                         '2024-06-01T00:00:00+00:00', 0, 'index', '[]', '',
+                         '2024-02-01T00:00:00+00:00', NULL);
+                 INSERT INTO sessions (id, created_at, updated_at, working_directory)
+                 VALUES ('s1', '2024-01-01T00:00:00+00:00', '2024-01-01T00:00:00+00:00', '/w');",
+            )
+            .expect("rows an older meka wrote");
+
+        let pending = plan(&connection).expect("plan");
+        assert_eq!(pending.from as usize, MIGRATIONS.len() - 1);
+        apply(&mut connection, pending, &Context::default()).expect("the step runs");
+
+        let rows = memory_rows(&connection);
+        assert_eq!(rows, vec![
+            MemoryRow {
+                id: 7,
+                name: "rule".to_string(),
+                project: String::new(),
+                description: "always".to_string(),
+                tags: "a b".to_string(),
+                body: "the body".to_string(),
+                priority: 0,
+                created_at: "2024-01-01T00:00:00+00:00".to_string(),
+                updated_at: "2024-06-01T00:00:00+00:00".to_string(),
+                read_count: 3,
+                load: "inline".to_string(),
+                reference_list: "[\"note\"]".to_string(),
+                source: "user".to_string(),
+                verified_at: "2024-07-01T00:00:00+00:00".to_string(),
+                expires_at: Some("2030-01-01T00:00:00+00:00".to_string()),
+            },
+            MemoryRow {
+                id: 9,
+                name: "note".to_string(),
+                project: String::new(),
+                description: "sometimes".to_string(),
+                tags: String::new(),
+                body: String::new(),
+                priority: 5,
+                created_at: "2024-02-01T00:00:00+00:00".to_string(),
+                updated_at: "2024-06-01T00:00:00+00:00".to_string(),
+                read_count: 0,
+                load: "index".to_string(),
+                reference_list: "[]".to_string(),
+                source: String::new(),
+                verified_at: "2024-02-01T00:00:00+00:00".to_string(),
+                expires_at: None,
+            },
+        ]);
+        let session_project: String = connection
+            .query_row("SELECT project FROM sessions WHERE id = 's1'", [], |row| {
+                row.get(0)
+            })
+            .expect("the session row");
+        assert_eq!(session_project, "");
+
+        // The constraint moved: one name in two projects is fine, twice in one project is not,
+        // and case still does not distinguish names within a tier.
+        connection
+            .execute_batch(
+                "INSERT INTO memories (name, project, description, created_at, updated_at)
+                 VALUES ('rule', 'webdev', 'd', '2024-01-01T00:00:00+00:00', '2024-01-01T00:00:00+00:00'),
+                        ('rule', 'movie', 'd', '2024-01-01T00:00:00+00:00', '2024-01-01T00:00:00+00:00');",
+            )
+            .expect("one name per project");
+        let duplicate = connection.execute_batch(
+            "INSERT INTO memories (name, project, description, created_at, updated_at)
+             VALUES ('RULE', 'webdev', 'd', '2024-01-01T00:00:00+00:00', '2024-01-01T00:00:00+00:00')",
+        );
+        assert!(duplicate.is_err(), "a name is unique within its project");
+
+        // The index came back with the rows: the FTS table addresses the rebuilt table and finds
+        // the planted body, and the write after the open is indexed through the triggers
+        // `reconcile_index` restores.
+        crate::store::memory::reconcile_index(&connection).expect("reconcile");
+        let hits: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'body'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("search");
+        assert_eq!(hits, 1, "the rebuilt index finds the planted body");
+        connection
+            .execute_batch(
+                "INSERT INTO memories (name, project, description, body, created_at, updated_at)
+                 VALUES ('later', '', 'd', 'zebra crossing', '2024-01-01T00:00:00+00:00',
+                         '2024-01-01T00:00:00+00:00')",
+            )
+            .expect("a write after the open");
+        let hits: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'zebra'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("search");
+        assert_eq!(hits, 1, "the triggers index a write after the rebuild");
+
+        let before = memory_rows(&connection);
+        let transaction = connection.transaction().expect("transaction");
+        sessions_and_memories_record_their_project(&transaction).expect("a replay");
+        transaction.commit().expect("commit");
+        assert_eq!(memory_rows(&connection), before, "a replay is a no-op");
+    }
+
+    /// A `.dump` round trip loses `user_version`, so a store already in the project shape is
+    /// classified and every step after the floor replays over it; the rows and the constraint
+    /// come through untouched.
+    #[test]
+    fn a_project_shaped_store_that_lost_its_version_replays_to_head_unchanged() {
+        let mut connection = rusqlite::Connection::open_in_memory().expect("open");
+        let to_head = plan(&connection).expect("plan");
+        apply(&mut connection, to_head, &Context::default()).expect("apply");
+        connection
+            .execute_batch(
+                "INSERT INTO memories (name, project, description, created_at, updated_at)
+                 VALUES ('rule', 'webdev', 'd', '2024-01-01T00:00:00+00:00', '2024-01-01T00:00:00+00:00'),
+                        ('rule', '', 'd', '2024-01-01T00:00:00+00:00', '2024-01-01T00:00:00+00:00');
+                 PRAGMA user_version = 0;",
+            )
+            .expect("a dumped and restored store");
+        let before = memory_rows(&connection);
+        let pending = plan(&connection).expect("an unversioned store classifies");
+        assert!(pending.classified);
+        apply(&mut connection, pending, &Context::default()).expect("the replay runs");
+        assert_eq!(memory_rows(&connection), before);
+        assert!(
+            !plan(&connection).expect("plan").has_work(),
+            "the replayed store is stamped at head"
+        );
+        assert_eq!(
+            schema_fingerprint(&connection).expect("fingerprint"),
+            HEAD_SCHEMA_FINGERPRINT
         );
     }
 }

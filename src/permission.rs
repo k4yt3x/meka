@@ -608,55 +608,16 @@ mod tests {
         );
     }
 
+    fn capture_logs() -> crate::streams::capture::CapturedLogs {
+        crate::streams::capture::capture_logs(tracing::Level::INFO)
+    }
+
     /// Absent and unreadable are different answers, and the second one says so.
     ///
     /// The warn arm is reached by any row holding a value this build does not resolve: without the
     /// warning the level silently becomes the configured default and the only later clue is a
     /// message naming a level the row was never created at. Collapsing the two into a bare `None`
     /// is a one-character edit that nothing caught.
-    /// Everything `tracing` emits while the returned guard lives, for a test about a warning.
-    struct CapturedLogs {
-        bytes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-        _guard: tracing::subscriber::DefaultGuard,
-    }
-    impl CapturedLogs {
-        fn logged(&self) -> String {
-            String::from_utf8_lossy(&crate::sync::lock(&self.bytes)).to_string()
-        }
-    }
-    fn capture_logs() -> CapturedLogs {
-        #[derive(Clone)]
-        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Capture {
-            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-                crate::sync::lock(&self.0).extend_from_slice(buffer);
-                Ok(buffer.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-            type Writer = Self;
-
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(Capture(std::sync::Arc::clone(&bytes)))
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        CapturedLogs {
-            bytes,
-            _guard: guard,
-        }
-    }
-
     #[test]
     fn an_unreadable_recorded_permission_warns_where_an_absent_one_is_silent() {
         let captured = capture_logs();

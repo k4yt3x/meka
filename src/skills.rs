@@ -184,6 +184,26 @@ impl SkillIndex {
         self.skills.iter().find(|skill| skill.name == name)
     }
 
+    /// This index as a session on a project sees it: the skills its view admits, in the same
+    /// order, and the skipped directories among them, since a skill the project hides is one the
+    /// session should hear nothing about, broken or not.
+    pub(crate) fn seen_by(&self, access: &crate::config::ProjectAccess) -> Self {
+        Self {
+            skills: self
+                .skills
+                .iter()
+                .filter(|skill| access.sees_skill(&skill.name))
+                .cloned()
+                .collect(),
+            skipped: self
+                .skipped
+                .iter()
+                .filter(|skipped| access.sees_skill(&skipped.name))
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// Why the directory a skill of this name would live in was rejected, if it was.
     ///
     /// Every lookup about to report a name as absent asks this first. "No such skill" and "it is
@@ -214,6 +234,22 @@ impl SkillIndex {
             // The `unknown_name` head without its configured list: a targeted resolve holds only
             // the skill it was asked for, so listing what this index knows would say "none".
             None => format!("no skill named '{name}'"),
+        }
+    }
+
+    /// [`Self::unavailable`] for a name asked through a project's view, of the whole index: the
+    /// project is named as hiding the skill when the index holds it and the view does not, since
+    /// that is the one remedy; otherwise what the narrowed index says.
+    pub(crate) fn unavailable_to(
+        &self,
+        name: &str,
+        access: &crate::config::ProjectAccess,
+    ) -> String {
+        match access.project() {
+            Some(project) if self.find(name).is_some() && !access.sees_skill(name) => {
+                format!("project '{project}' hides skill '{name}'")
+            }
+            _ => self.seen_by(access).unavailable(name),
         }
     }
 
@@ -832,6 +868,19 @@ impl SkillCache {
         state.skills = Arc::new(discovered);
         state.snapshot = now;
         state.skills.clone()
+    }
+
+    /// [`Self::current`] as a session on a project sees it; the whole index, unfiltered and
+    /// uncopied, for a view that narrows nothing.
+    pub(crate) async fn current_for(
+        &self,
+        access: &crate::config::ProjectAccess,
+    ) -> Arc<SkillIndex> {
+        let index = self.current().await;
+        if access.sees_every_skill() {
+            return index;
+        }
+        Arc::new(index.seen_by(access))
     }
 }
 
@@ -3952,5 +4001,67 @@ mod tests {
             !temp.path().join("absent").exists(),
             "a miss creates nothing"
         );
+    }
+
+    /// A project's view keeps the skills it admits, in order, and drops the skipped directories
+    /// it hides with them; a view that narrows nothing is the index itself.
+    #[test]
+    fn a_project_s_view_of_the_index_keeps_what_it_admits() {
+        let skill = |name: &str| Skill {
+            name: name.to_string(),
+            source_dir: std::path::PathBuf::from("/skills").join(name),
+            description: format!("{name} description"),
+            license: None,
+            compatibility: None,
+            allowed_tools: None,
+            metadata: None,
+            extra: yaml_serde::Mapping::new(),
+            conformance: Conformance::default(),
+            root: std::path::PathBuf::from("/skills"),
+            priority: crate::entry::DEFAULT_PRIORITY,
+            body_path: std::path::PathBuf::from("/skills")
+                .join(name)
+                .join("SKILL.md"),
+        };
+        let index = SkillIndex {
+            skills: vec![skill("deploy"), skill("release"), skill("triage")],
+            skipped: vec![SkippedSkill {
+                name: "release-old".to_string(),
+                reason: "bad frontmatter".to_string(),
+                root: std::path::PathBuf::from("/skills"),
+            }],
+        };
+        let projects: std::collections::BTreeMap<String, crate::config::ProjectConfig> =
+            toml::from_str(
+                "[ops]\nallowed_skills = [\"triage\", \"deploy\"]\n[quiet]\ndisabled_skills = \
+                 [\"release\", \"release-old\"]\n",
+            )
+            .expect("projects");
+        let ops = index.seen_by(&crate::config::ProjectAccess::of(&projects, Some("ops")));
+        assert_eq!(
+            ops.skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            ["deploy", "triage"],
+            "the index's order holds"
+        );
+        assert!(
+            ops.skipped.is_empty(),
+            "a skipped directory outside the view is not reported"
+        );
+        let quiet = index.seen_by(&crate::config::ProjectAccess::of(&projects, Some("quiet")));
+        assert_eq!(
+            quiet
+                .skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            ["deploy", "triage"]
+        );
+        assert!(quiet.skipped.is_empty());
+        let all = index.seen_by(&crate::config::ProjectAccess::of(&projects, None));
+        assert_eq!(all.skills.len(), 3);
+        assert_eq!(all.skipped.len(), 1);
     }
 }

@@ -7,13 +7,23 @@ Without it, an agent's only state is its context window. When a long session com
 ## How memory works
 
 - Memories are rows in the `memories` table of the store (`~/.local/share/meka/meka.db`, or under `MEKA_DATA_DIR`), one row per memory.
-- The store is scoped to the **meka instance**, not to a session or a directory. Everything sharing a `MEKA_DATA_DIR` shares one memory; pointing a deployment at its own data dir gives it its own.
+- The store is scoped to the **meka instance**, not to a session or a directory. Everything sharing a `MEKA_DATA_DIR` shares one memory; pointing a deployment at its own data dir gives it its own. Within it, a memory is global or a [project](./projects.md)'s; see [Tiers](#tiers).
 - The per-turn context includes a bounded memory index, updated when it changes. A memory's `load` decides how it gets there: an `inline` body is rendered whole, within a budget every inline body shares, an `index` memory is listed by its description, and a `search` memory is reached by `memory_search` alone. Other bodies are read on demand with `memory_read`.
 - The index is re-stated in full at the start of a session, after every compaction, and whenever it scrolls out of the context window. This is what makes memory survive compaction.
 - The agent is told to save durable preferences, constraints, decisions, and facts, to keep temporary task state in the scratchpad, and that current instructions and corrections take precedence over stored preferences.
 - Memories are available at every permission level except **none**; all five memory tools ask only for **read**. Writing a memory therefore needs no write authority over your files, and `workspace`'s boundary does not apply to it: the store belongs to meka, not to your working tree.
 
 > **Memories live in `MEKA_DATA_DIR`**, alongside sessions, rather than in the config directory. A backup of your config directory does not capture them; `meka memory export` is what does.
+
+## Tiers
+
+A memory is in one of two tiers: **global**, which every session sees, or a **project's**, which the sessions on that [project](./projects.md) see beside the global ones. A session on no project sees the global tier alone. Which tier a session is on is its project, set with `--project`, `/project`, or the session's `project` field over HTTP and ACP; nothing in the store decides it.
+
+- `memory_write` files a memory in the session's project unless `tier: "global"` says otherwise. In a session on no project every write is global, and `tier: "project"` is refused. Writing to a memory that exists keeps its tier unless `tier` names the other one, which moves it: that is how the agent re-files a note it saved in the wrong tier, and the result line says `global` when a project session's write lands in the global tier.
+- A name is unique within a tier, and a global name is never also a project's, so a session never sees two memories of one name; two projects may hold the same name. A write that would make a global memory and a project memory share a name is refused with `choose another name`, at every door.
+- The [inline budget](#the-inline-budget) is measured as a session's band sees it: a project write counts the global inline bodies and the project's, and a global write counts the global bodies and the fullest project's, since a global memory is in every project's band.
+- The `[Memory]` section a session on a project reads is grouped, the global tier first and the project's after it, under one index budget. A move between projects restates the whole section under a line naming the project, and in a project session a change to a global memory is marked `(global)` in the per-turn delta, as a global hit is in `memory_search`'s results. `memory_search` takes `tier` to search one tier.
+- The operator's doors see every tier: `meka memory list` shows a `Project` column, `--project <name>` and `?project=<name>` pick one tier (an empty value, the global tier), and a name that is in several projects is refused by `get`, `show`, `edit`, `remove` and the single-memory HTTP routes until one is named. `meka project rename` moves a project's memories with it; `meka project remove` refuses while any remain.
 
 ## Fields
 
@@ -194,10 +204,10 @@ meka memory verify --rebuild    # regenerate it from the table
 
 | Tool | Purpose |
 |---|---|
-| `memory_write` | Save a memory, or update one by writing to the same name |
+| `memory_write` | Save a memory, or update one by writing to the same name; `tier` picks the [tier](#tiers) |
 | `memory_edit` | Replace an exact string in a memory's body |
 | `memory_read` | Read a memory body, continuing with `offset` when needed |
-| `memory_search` | Ranked full-text search over every memory, or a filtered listing |
+| `memory_search` | Ranked full-text search over the memories the session sees, or a filtered listing; `tier` narrows it to one tier |
 | `memory_delete` | Remove a memory permanently |
 
 A write, an edit or a delete draws what changed as a diff on the screen and in an ACP editor, over the text `meka memory export` writes, so a reworded description or a moved expiry is one changed line of frontmatter and a rewritten body shows line by line; the HTTP feed carries the same two texts on `tool_call.completed`.
@@ -232,6 +242,7 @@ meka memory list                                    # index order
 meka memory list --referencing deploy-host          # what cites a memory, path, URL or id
 meka memory list --unverified 90d                   # not verified in 90 days
 meka memory list --expired                          # past their expiry
+meka memory list --project webdev                   # one project's tier; --project "" the global tier
 meka memory get k4yt3x-prefers-terse-replies        # every stored field, backlinks included
 meka memory show k4yt3x-prefers-terse-replies       # the body
 meka memory list --format json                      # {"memories": [...]}; get and show print one object
@@ -242,9 +253,11 @@ meka memory add rule --description "Answer in kind" --load inline --body "Match 
 meka memory add runbook --description "Where the deploy runbook lives" --body "wiki/ops/deploy" --load search
 meka memory add freeze --description "No deploys this week" --expires 2026-10-25 --source "ops, in chat"
 meka memory add notes --description "Meeting notes" --from-file notes.md   # the body, from a file
+meka memory add stack --description "Uses pnpm" --project webdev   # filed in a project's tier
+meka memory get notes --project movie                # the one in movie, when the name is in several
 meka memory edit stale-note                         # $VISUAL, then $EDITOR, on the body
 meka memory remove stale-note
-meka memory export --dir ~/backup/memory            # one Markdown file per memory
+meka memory export --directory ~/backup/memory      # one Markdown file per memory
 ```
 
 `meka memory add` takes:
@@ -262,22 +275,23 @@ meka memory export --dir ~/backup/memory            # one Markdown file per memo
 | `--expires <WHEN>` | RFC 3339, or `YYYY-MM-DD` for the whole of that day; an empty value clears it. |
 | `--verified` | Record that the fact was just verified current. |
 | `--force` | Update an existing memory instead of refusing; whatever is not mentioned is kept. |
+| `--project <NAME>` | The [tier](#tiers) to file it in, a configured project or `""` for the global tier; omitted, an existing memory keeps its tier and a new one is global. Naming the other tier for an existing memory moves it. |
 
 On the screen, `/memory` is a picker of what is saved, by name and description, and Enter (or
 `/memory <name>`) shows one memory in full.
 
-`--format json` prints each memory with the fields [`GET /v1/memory`](http-api.md) uses (`name`, `description`, `priority`, `load`, `tags`, `references`, `source`, `created_at`, `updated_at`, `verified_at` and `expires_at` as RFC 3339) plus `read_count`; `get` adds `referenced_by`, `show` adds `body` as stored, and `list` leaves both out.
+`--format json` prints each memory with the fields [`GET /v1/memory`](http-api.md) uses (`name`, `project`, `description`, `priority`, `load`, `tags`, `references`, `source`, `created_at`, `updated_at`, `verified_at` and `expires_at` as RFC 3339) plus `read_count`; `get` adds `referenced_by`, `show` adds `body` as stored, and `list` leaves both out.
 
 `meka memory edit` opens the **body** only. Metadata goes through `meka memory add <name> --force --description ...`, which keeps whatever it does not mention.
 
 ## Export, backup, and git
 
-`meka memory export` writes one `<name>.md` per memory: YAML frontmatter carrying `description`, `priority` and `load` when they are not the defaults, `created`, `verified` when it differs from `created`, `expires`, `source`, `read_count`, `references` and `tags` when they are set, followed by the body. That is the `grep`, git and backup answer now that memories live in the store rather than in files.
+`meka memory export` writes one `<name>.md` per memory: YAML frontmatter carrying `description`, `project` for a project memory, `priority` and `load` when they are not the defaults, `created`, `verified` when it differs from `created`, `expires`, `source`, `read_count`, `references` and `tags` when they are set, followed by the body. A project's memories go under a directory of the project's name, so two projects holding one name write two files; the global tier is at the root. `--project <name>` exports one tier. That is the `grep`, git and backup answer now that memories live in the store rather than in files.
 
 `read_count` is there because it is the one value a file cannot otherwise reconstruct. Descriptions, bodies and dates are all in the note; how often the agent has actually opened it is not, and a restored backup with every counter at zero would silently lose each memory's accumulated ranking weight.
 
 ```bash
-meka memory export --dir ~/notes/memory        # must be new or empty
+meka memory export --directory ~/notes/memory  # must be new or empty
 ```
 
 The directory must be new or empty. An export is a snapshot, and merging into an existing one would leave a stale file behind for every memory deleted since, so it would never quite match the store. An export that fails partway removes what it had written rather than leaving a truncated snapshot, which would otherwise restore as a plausible fraction of your store.

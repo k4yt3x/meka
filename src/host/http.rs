@@ -293,6 +293,7 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
         .route("/v1/memory/{name}", delete(handlers::stores::delete_memory))
         .route("/v1/instructions", get(handlers::stores::instructions))
         .route("/v1/profiles", get(handlers::stores::profiles))
+        .route("/v1/projects", get(handlers::stores::projects))
         .route("/v1/mcp", get(handlers::info::mcp))
         .route("/v1/mcp/{name}/tools", get(handlers::info::mcp_tools))
         .route(

@@ -13,6 +13,8 @@ pub(crate) struct ModelStatus<'a> {
     pub(crate) model: Option<&'a str>,
     /// Active profile name (e.g. `claude-max`).
     pub(crate) profile: Option<&'a str>,
+    /// The project the session is on, when it is on one.
+    pub(crate) project: Option<&'a str>,
     /// The account the profile bills.
     pub(crate) account: Option<&'a str>,
     /// The backend the profile's account names.
@@ -43,6 +45,9 @@ pub(crate) fn format_session_status(
     // The cumulative counters follow, and answer a different question.
     if let Some(profile) = model.profile {
         fields.push(("Profile", profile.to_string()));
+    }
+    if let Some(project) = model.project {
+        fields.push(("Project", project.to_string()));
     }
     // The backend rides with the account rather than the profile because it is the account's
     // fact: two profiles on one account state it the same.
@@ -352,6 +357,7 @@ mod tests {
         let model = ModelStatus {
             model: Some("some-local-model"),
             profile: Some("local"),
+            project: None,
             account: Some("acme"),
             backend: Some(crate::config::Backend::AnthropicMessages),
             effort: None,
@@ -387,6 +393,7 @@ mod tests {
             &ModelStatus {
                 model: Some("some-model"),
                 profile: Some("p"),
+                project: None,
                 account: Some("a"),
                 backend: Some(crate::config::Backend::AnthropicMessages),
                 effort: Some("high"),
@@ -458,6 +465,7 @@ mod tests {
                 &ModelStatus {
                     model: Some("some-model"),
                     profile: Some("p"),
+                    project: None,
                     account: None,
                     backend: Some(backend),
                     effort,

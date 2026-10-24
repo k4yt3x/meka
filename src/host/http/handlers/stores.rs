@@ -355,6 +355,27 @@ pub(crate) struct MemoryListQuery {
     /// Only memories whose expiry has passed.
     #[serde(default)]
     pub(crate) expired: Option<bool>,
+    /// Only one tier: a project's memories, or the global tier for an empty value. Absent, every
+    /// tier.
+    #[serde(default)]
+    pub(crate) project: Option<String>,
+}
+
+/// `?project=` on the single-memory routes: the tier the name is in, for a name that is in
+/// several projects; the global tier for an empty value.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub(crate) struct MemoryLookupQuery {
+    #[serde(default)]
+    pub(crate) project: Option<String>,
+}
+
+/// A store refusal a client can act on is a 422 carrying the store's sentence: a name in several
+/// projects with none named, an inline body past the budget, a name a tier already holds.
+fn memory_refusal(error: crate::error::MekaError) -> ProblemDetail {
+    match error {
+        crate::error::MekaError::InvalidRequest(refusal) => store_error(refusal),
+        error => memory_failure(error),
+    }
 }
 
 #[utoipa::path(
@@ -378,6 +399,7 @@ pub(crate) async fn list_memories(
     let memories = &state.shared.memories;
     // The same filter the agent's tool and the CLI take, so the three doors select the same rows.
     let filter = crate::store::memory::MemoryFilter {
+        view: crate::store::memory::MemoryView::for_operator(query.project.as_deref()),
         referencing: query.referencing.filter(|target| !target.trim().is_empty()),
         unverified_for: match query.unverified.filter(|window| !window.trim().is_empty()) {
             Some(window) => Some(
@@ -409,7 +431,13 @@ pub(crate) async fn list_memories(
         // The hit carries the words it was found on; the entry is the memory as the index lists
         // it, read fresh so its tags and counts are the row's. A memory deleted between the two
         // reads is left out rather than invented.
-        if let Some(memory) = memories.get(&hit.name).await.map_err(memory_failure)? {
+        // The hit's own tier, so a name two projects hold reads the row the search found.
+        let view = crate::store::memory::MemoryView::for_operator(Some(&hit.project));
+        if let Some(memory) = memories
+            .get(&hit.name, &view)
+            .await
+            .map_err(memory_failure)?
+        {
             let mut detail = MemoryDetail::new(&memory, None);
             detail.snippet = Some(hit.snippet);
             listed.push(detail);
@@ -423,12 +451,13 @@ pub(crate) async fn list_memories(
     get,
     path = "/v1/memory/{name}",
     tag = "memory",
-    params(("name" = String, Path, description = "Memory name")),
+    params(("name" = String, Path, description = "Memory name"), MemoryLookupQuery),
     responses(
         (status = 200, description = "Memory with its body", body = MemoryDetail),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such memory", body = ProblemDetail),
+        (status = 422, description = "The name is in several projects and `project` named none", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["memory:r"]))
@@ -437,15 +466,19 @@ pub(crate) async fn get_memory(
     State(state): State<ServerState>,
     _scoped: scope::Scoped<scope::MemoryRead>,
     AxumPath(name): AxumPath<String>,
+    Query(query): Query<MemoryLookupQuery>,
 ) -> Result<Json<MemoryDetail>, ProblemDetail> {
     // Deliberately not `record_read`: an operator reading through the HTTP API is not the agent
     // recalling anything, and moving the ranking the agent gets would be a lie about its own use.
     let memory = state
         .shared
         .memories
-        .get(&name)
+        .get(
+            &name,
+            &crate::store::memory::MemoryView::for_operator(query.project.as_deref()),
+        )
         .await
-        .map_err(memory_failure)?
+        .map_err(memory_refusal)?
         .ok_or_else(|| not_found("memory", &name))?;
     let body = memory.body.clone().unwrap_or_default();
     let mut detail = MemoryDetail::new(&memory, Some(body));
@@ -453,7 +486,10 @@ pub(crate) async fn get_memory(
         state
             .shared
             .memories
-            .referenced_by(&memory.name)
+            .referenced_by(
+                &memory.name,
+                &crate::store::memory::MemoryView::citing(&memory.project),
+            )
             .await
             .map_err(memory_failure)?
             .into_iter()
@@ -497,6 +533,12 @@ pub(crate) struct WriteMemoryRequest {
     /// Omit to keep; send `""` to clear.
     #[serde(default)]
     pub(crate) expires: Option<String>,
+    /// The project to file the memory in, which must be one `config.toml` defines; `""` is the
+    /// global tier. Omit to keep an existing memory's tier, or to file a new one as global. Naming
+    /// the other tier for an existing memory moves it; a name a global memory and a project memory
+    /// would share is refused.
+    #[serde(default)]
+    pub(crate) project: Option<String>,
 }
 
 /// `PUT /v1/memory/{name}`: create or update a memory.
@@ -511,7 +553,7 @@ pub(crate) struct WriteMemoryRequest {
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid name, empty description, or an inline body the budget cannot take", body = ProblemDetail),
+        (status = 422, description = "Invalid name, empty description, an unknown project, a name another tier holds, or an inline body the budget cannot take", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["memory:w"]))
@@ -557,6 +599,17 @@ pub(crate) async fn put_memory(
         Some(raw) if raw.trim().is_empty() => Some(None),
         Some(raw) => Some(Some(crate::memory::parse_expiry(raw).map_err(store_error)?)),
     };
+    // A project the file does not define is refused before the write, as every door that files a
+    // row under a project refuses it.
+    if let Some(project) = body
+        .project
+        .as_deref()
+        .filter(|project| !project.is_empty())
+    {
+        crate::config::require_project(project, &state.shared.config.projects).map_err(
+            |error| ProblemDetail::for_error(&error, state.config.relay_provider_errors),
+        )?;
+    }
 
     // One upsert in one immediate transaction, and no lock. No `flock` and no blocking pool: the
     // write is not a read-modify-write over a file, which is what would make two overlapping PUTs
@@ -567,6 +620,8 @@ pub(crate) async fn put_memory(
         .memories
         .write(crate::store::memory::WriteRequest {
             name: name.clone(),
+            view: crate::store::memory::MemoryView::All,
+            project: body.project.clone(),
             description: Some(crate::entry::normalize_description(&body.description)),
             tags,
             body: body.body.clone(),
@@ -593,13 +648,13 @@ pub(crate) async fn put_memory(
     delete,
     path = "/v1/memory/{name}",
     tag = "memory",
-    params(("name" = String, Path, description = "Memory name")),
+    params(("name" = String, Path, description = "Memory name"), MemoryLookupQuery),
     responses(
         (status = 204, description = "Memory removed"),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such memory", body = ProblemDetail),
-        (status = 422, description = "Invalid name, or a symlinked path", body = ProblemDetail),
+        (status = 422, description = "Invalid name, or a name in several projects with none named", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["memory:w"]))
@@ -608,6 +663,7 @@ pub(crate) async fn delete_memory(
     State(state): State<ServerState>,
     _scoped: scope::Scoped<scope::MemoryWrite>,
     AxumPath(name): AxumPath<String>,
+    Query(query): Query<MemoryLookupQuery>,
 ) -> Result<StatusCode, ProblemDetail> {
     crate::memory::validate_memory_lookup(&name).map_err(store_error)?;
     // 404 from the statement's own answer, not from a pre-check. As separate statements a name
@@ -616,9 +672,12 @@ pub(crate) async fn delete_memory(
     if state
         .shared
         .memories
-        .delete(&name)
+        .delete(
+            &name,
+            &crate::store::memory::MemoryView::for_operator(query.project.as_deref()),
+        )
         .await
-        .map_err(memory_failure)?
+        .map_err(memory_refusal)?
         .is_none()
     {
         return Err(not_found("memory", &name));
@@ -773,4 +832,37 @@ pub(crate) async fn profiles(
         .map(|summary| ProfileView::from_summary(summary, Some(summary.name.as_str()) == active))
         .collect();
     Ok(Json(ProfilesResponse { profiles }))
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ProjectsResponse {
+    pub(crate) projects: Vec<crate::view::ProjectView>,
+}
+
+/// `GET /v1/projects`: the projects `config.toml` defines, and any a row still names, with how
+/// many memories and sessions each holds.
+#[utoipa::path(
+    get,
+    path = "/v1/projects",
+    tag = "discovery",
+    responses(
+        (status = 200, description = "Projects, configured or still named by rows", body = ProjectsResponse),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["sessions:r", "mcp:r", "skills:r", "memory:r", "schedule:r"]))
+)]
+pub(crate) async fn projects(
+    State(state): State<ServerState>,
+    _scoped: scope::Scoped<scope::AnyRead>,
+) -> Result<Json<ProjectsResponse>, ProblemDetail> {
+    let projects = crate::cli::project::project_views(
+        &state.shared.store,
+        &state.shared.memories,
+        &state.shared.config.projects,
+    )
+    .await
+    .map_err(|error| ProblemDetail::internal_sanitized("failed to list projects", error))?;
+    Ok(Json(ProjectsResponse { projects }))
 }

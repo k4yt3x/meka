@@ -137,7 +137,8 @@ fn acp_error_for(error: &MekaError, relay_provider_errors: bool) -> agent_client
         | MekaError::EmptyPrompt
         | MekaError::RequestTooLarge(_)
         | MekaError::DisabledLevel { .. }
-        | MekaError::ProfileNotConfigured { .. } => invalid_params_error(error),
+        | MekaError::ProfileNotConfigured { .. }
+        | MekaError::ProjectNotConfigured { .. } => invalid_params_error(error),
         // The operator's `ca_cert_file`, proxy or `base_url`. Its own words are for the terminal
         // `meka acp` was started from, not for the editor on the other end of the pipe, which can
         // do nothing with a path in someone else's configuration file.
@@ -396,6 +397,9 @@ pub(crate) async fn run_acp(
                             None,
                             None,
                             profile,
+                            // No project until the client selects one through the config
+                            // option; the row is moved then.
+                            String::new(),
                         )
                         .await
                     {
@@ -469,6 +473,7 @@ pub(crate) async fn run_acp(
                         title_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         frontend,
                     };
+                    let project_access = entry.agent.project_access();
                     state.sessions.write().await.insert(session_id_str, entry);
 
                     if !request.mcp_servers.is_empty() {
@@ -484,7 +489,13 @@ pub(crate) async fn run_acp(
                     let modes = build_mode_state(&permission);
                     let config_options =
                         build_config_options(&state.shared, &permission, Some(session_uuid)).await;
-                    emit_available_commands(&cx, &session_id, &state.shared.skills).await;
+                    emit_available_commands(
+                        &cx,
+                        &session_id,
+                        &state.shared.skills,
+                        &project_access,
+                    )
+                    .await;
 
                     responder.respond(
                         NewSessionResponse::new(session_id)
@@ -1726,9 +1737,13 @@ mod tests {
     #[tokio::test]
     async fn slash_to_prompt_text_passes_through_non_slash() {
         let cache = SkillCache::for_root(None);
-        let out = slash_to_prompt_text("just a normal prompt".to_string(), &cache)
-            .await
-            .expect("ok");
+        let out = slash_to_prompt_text(
+            "just a normal prompt".to_string(),
+            &cache,
+            &Default::default(),
+        )
+        .await
+        .expect("ok");
         assert_eq!(out, "just a normal prompt");
     }
 
@@ -1737,9 +1752,13 @@ mod tests {
         // A pasted path like `/etc/hosts is a config file` has an invalid skill-name first token
         // (slash inside the name), so the helper must NOT touch it.
         let cache = SkillCache::for_root(None);
-        let out = slash_to_prompt_text("/etc/hosts is the config file".to_string(), &cache)
-            .await
-            .expect("pass-through");
+        let out = slash_to_prompt_text(
+            "/etc/hosts is the config file".to_string(),
+            &cache,
+            &Default::default(),
+        )
+        .await
+        .expect("pass-through");
         assert_eq!(out, "/etc/hosts is the config file");
     }
 
@@ -1747,7 +1766,7 @@ mod tests {
     async fn slash_to_prompt_text_passes_through_double_slash_comment() {
         // `//foo` parses as name="/foo", which is invalid; pass through.
         let cache = SkillCache::for_root(None);
-        let out = slash_to_prompt_text("//comment line".to_string(), &cache)
+        let out = slash_to_prompt_text("//comment line".to_string(), &cache, &Default::default())
             .await
             .expect("pass-through");
         assert_eq!(out, "//comment line");
@@ -1758,7 +1777,7 @@ mod tests {
         // A clean `/<name>` shape with a syntactically valid skill name that isn't installed:
         // error, since the only realistic source of this shape is a typo'd palette pick.
         let cache = SkillCache::for_root(None);
-        let err = slash_to_prompt_text("/nonexistent".to_string(), &cache)
+        let err = slash_to_prompt_text("/nonexistent".to_string(), &cache, &Default::default())
             .await
             .expect_err("should error");
         assert!(
@@ -1784,7 +1803,7 @@ mod tests {
         .expect("write skill");
         let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
 
-        let err = slash_to_prompt_text("/wrecked".to_string(), &cache)
+        let err = slash_to_prompt_text("/wrecked".to_string(), &cache, &Default::default())
             .await
             .expect_err("should error");
         let message = err.to_string();
@@ -1808,9 +1827,13 @@ mod tests {
         .expect("write SKILL.md");
 
         let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
-        let out = slash_to_prompt_text("/demo only fetch UK news".to_string(), &cache)
-            .await
-            .expect("ok");
+        let out = slash_to_prompt_text(
+            "/demo only fetch UK news".to_string(),
+            &cache,
+            &Default::default(),
+        )
+        .await
+        .expect("ok");
         assert!(
             out.starts_with("only fetch UK news\n\n"),
             "extra context must lead: {out}"
@@ -1837,7 +1860,7 @@ mod tests {
         .expect("write");
 
         let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
-        let out = slash_to_prompt_text("/ping".to_string(), &cache)
+        let out = slash_to_prompt_text("/ping".to_string(), &cache, &Default::default())
             .await
             .expect("ok");
         // No `extra\n\n` prefix when the user passed only the skill name; the body stands alone.

@@ -168,6 +168,10 @@ The default is empty. `~/.agents/skills` has emerged as a cross-client conventio
 
 There is deliberately no automatic project-level scan. meka reads nothing from the working directory that config does not name, [instructions](./instructions.md#reading-a-projects-agentsmd) included, because a cloned repository that could silently add instructions to the agent's context is exactly the trust it never extends. Name a project's skills directory in `additional_directories` if you want it read.
 
+## Per-project skills
+
+A [project](./projects.md) can narrow which skills its sessions see, with `allowed_skills` and `disabled_skills` on its `[projects.<name>]` table. A hidden skill is out of the `[Skills]` index a session on the project reads, unknown to `skill_read`, `skill_search`, `skill_edit` and `skill_delete`, absent from the screen's `/skill` picker and an editor's command palette, refused to `--skill` on a run whose session is on the project, and not something `agent_spawn` can hand a sub-agent on that project. `skill_write` creates a skill whatever the project, since a skill file belongs to the installation and whether a project sees it is the operator's `config.toml`; it refuses to overwrite one the project hides. A name the lists carry that no installed skill answers to is warned about when a session opens on the project, not refused.
+
 ## Listing skills
 
 `meka skill list` shows a fixed set of columns, so output stays parseable when piped:

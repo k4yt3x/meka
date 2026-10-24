@@ -1317,7 +1317,7 @@ mod tests {
             .await
             .expect("root");
         let (pinned, _lock) = store
-            .create_child_session(
+            .create_child_session_for_test(
                 root,
                 None,
                 Vec::new(),
@@ -1328,7 +1328,7 @@ mod tests {
             .await
             .expect("pinned child");
         let (following, _lock) = store
-            .create_child_session(
+            .create_child_session_for_test(
                 root,
                 None,
                 Vec::new(),

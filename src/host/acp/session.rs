@@ -402,13 +402,14 @@ pub(super) async fn handle_load_session(
         title_sent,
         frontend,
     };
+    let project_access = entry.agent.project_access();
     state.sessions.write().await.insert(session_id_str, entry);
 
     // Refresh the palette + advertise the current mode set: the editor was reopened, so its UI
     // starts blank.
     let modes = build_mode_state(&permission);
     let config_options = build_config_options(&state.shared, &permission, Some(session_uuid)).await;
-    emit_available_commands(&cx, &session_id, &state.shared.skills).await;
+    emit_available_commands(&cx, &session_id, &state.shared.skills, &project_access).await;
 
     responder.respond(
         LoadSessionResponse::new()
@@ -584,11 +585,12 @@ pub(super) async fn handle_resume_session(
         title_sent,
         frontend,
     };
+    let project_access = entry.agent.project_access();
     state.sessions.write().await.insert(session_id_str, entry);
 
     let modes = build_mode_state(&permission);
     let config_options = build_config_options(&state.shared, &permission, Some(session_uuid)).await;
-    emit_available_commands(&cx, &session_id, &state.shared.skills).await;
+    emit_available_commands(&cx, &session_id, &state.shared.skills, &project_access).await;
 
     responder.respond(
         ResumeSessionResponse::new()
@@ -840,13 +842,14 @@ pub(super) async fn handle_fork_session(
         title_sent,
         frontend,
     };
+    let project_access = entry.agent.project_access();
     state.sessions.write().await.insert(session_id_str, entry);
 
     tracing::info!("session/fork: {source_uuid} forked into {session_uuid}");
 
     let modes = build_mode_state(&permission);
     let config_options = build_config_options(&state.shared, &permission, Some(session_uuid)).await;
-    emit_available_commands(&cx, &session_id, &state.shared.skills).await;
+    emit_available_commands(&cx, &session_id, &state.shared.skills, &project_access).await;
 
     responder.respond(
         ForkSessionResponse::new(session_id)
@@ -1037,7 +1040,7 @@ pub(super) async fn handle_set_session_config_option(
     }
     let Some(value) = request.value.as_value_id() else {
         return responder.respond_with_error(invalid_params_error(
-            "the permission and profile options take a string value",
+            "the permission, profile and project options take a string value",
         ));
     };
     let value = value.0.as_ref().to_string();
@@ -1117,11 +1120,68 @@ pub(super) async fn handle_set_session_config_option(
             }
             entry.agent.set_provider(resolved);
         }
+        PROJECT_CONFIG_ID => {
+            // The empty id is the "No project" entry; a name is checked against the file before
+            // anything moves.
+            let project = if value.is_empty() {
+                None
+            } else {
+                match crate::host::resolve_project_switch(&state.shared, &value) {
+                    Ok(project) => Some(project),
+                    Err(error) => {
+                        return responder.respond_with_error(build_failure_error(
+                            "failed to resolve the project",
+                            &error,
+                            state.shared.relay_provider_errors(),
+                        ));
+                    }
+                }
+            };
+            // Refused under a running turn for the reason the profile is: the memories a turn
+            // sees are read at its start, and moving the tier under it would file what it writes
+            // somewhere its context does not show.
+            let Ok(_turn_exclusive) = entry.conversation.try_lock() else {
+                return responder.respond_with_error(acp_error_for(
+                    &MekaError::TurnInFlight {
+                        doing: "switch project",
+                    },
+                    false,
+                ));
+            };
+            if let Err(error) = crate::host::record_project_switch(
+                &state.shared.store,
+                session_uuid,
+                project.as_deref(),
+            )
+            .await
+            {
+                return responder.respond_with_error(build_failure_error(
+                    "failed to record the project",
+                    &error,
+                    state.shared.relay_provider_errors(),
+                ));
+            }
+            entry.agent.set_project(project);
+            // The skills the new project hides are commands the client must stop offering, and
+            // the ones it shows, commands it must start to; the list goes out as a load sends it.
+            emit_available_commands(
+                &entry.frontend.connection,
+                &entry.frontend.session_id,
+                &state.shared.skills,
+                &entry.agent.project_access(),
+            )
+            .await;
+        }
         unknown => {
             return responder.respond_with_error(invalid_params_error(crate::text::unknown_name(
                 "configuration option",
                 unknown,
-                [PERMISSION_CONFIG_ID, PROFILE_CONFIG_ID, APPROVALS_CONFIG_ID],
+                [
+                    PERMISSION_CONFIG_ID,
+                    PROFILE_CONFIG_ID,
+                    PROJECT_CONFIG_ID,
+                    APPROVALS_CONFIG_ID,
+                ],
             )));
         }
     }
@@ -1215,6 +1275,7 @@ pub(super) async fn build_session_runtime(
             context_tokens: Arc::clone(&context_tokens),
             context_overhead: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             context_window,
+            project: None,
         },
         opening,
         session_lock,

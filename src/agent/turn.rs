@@ -852,10 +852,16 @@ impl Agent {
     /// delivered.
     pub(super) async fn read_world_snapshot(&self, session_id: Uuid) -> prompt::WorldSnapshot {
         let catalog = self.tool_registry.tool_catalog();
-        let skills = self.skills.current().await;
+        let skills = self.skills.current_for(&self.project_access()).await;
         let (memories, memories_readable) = match prompt::memory_index_is_live(&catalog) {
             false => (Vec::new(), true),
-            true => match self.memories.index().await {
+            true => match self
+                .memories
+                .index(&crate::store::memory::MemoryView::for_session(
+                    self.project().as_deref(),
+                ))
+                .await
+            {
                 Ok(memories) => (memories, true),
                 Err(error) => {
                     tracing::warn!("failed to read the memory index: {error}");
@@ -863,6 +869,7 @@ impl Agent {
                 }
             },
         };
+        let tool_scope = self.tool_registry.tool_scope();
         let mcp_instructions = self
             .tool_registry
             .mcp_manager()
@@ -870,7 +877,7 @@ impl Agent {
                 manager
                     .server_instructions()
                     .into_iter()
-                    .filter(|(server, _)| self.tool_registry.tool_scope().admits_server(server))
+                    .filter(|(server, _)| tool_scope.admits_server(server))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -901,7 +908,8 @@ impl Agent {
                 .loading_by_search(
                     self.tool_registry.deferred_tool_delivery()
                         == crate::provider::DeferredToolDelivery::Searched,
-                );
+                )
+                .with_project(self.project());
         // A failed read is not evidence of deletion. Preserve what was known, including across a
         // compaction that removes the messages carrying it.
         if !memories_readable && let Some(previous) = self.last_rendered_world.read().await.as_ref()
@@ -1215,6 +1223,7 @@ impl Agent {
                 None,
                 None,
                 self.profile(),
+                self.project().unwrap_or_default(),
             )
             .await?;
         let id = created.id;
@@ -6747,7 +6756,10 @@ mod tests {
             .execute_batch("DROP TABLE memories;")
             .expect("drop the table");
         assert!(
-            memories.index().await.is_err(),
+            memories
+                .index(&crate::store::memory::MemoryView::All)
+                .await
+                .is_err(),
             "the premise: the store now fails to read"
         );
 

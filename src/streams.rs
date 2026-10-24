@@ -61,3 +61,72 @@ pub(crate) fn write_stderr_line(line: impl std::fmt::Display) {
     writeln!(out, "{line}").ok();
     out.flush().ok();
 }
+
+/// Test support: what the code under test logs on this thread, read back as text.
+#[cfg(test)]
+pub(crate) mod capture {
+    use std::sync::{Arc, Mutex};
+
+    /// Everything `tracing` emits on this thread at the level asked for or above, for as long as
+    /// this lives.
+    pub(crate) struct CapturedLogs {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        _scoped: tracing::subscriber::DefaultGuard,
+        _registered_twice: tracing::Dispatch,
+    }
+
+    impl CapturedLogs {
+        /// The lines captured so far.
+        pub(crate) fn logged(&self) -> String {
+            String::from_utf8_lossy(&crate::sync::lock(&self.bytes)).into_owned()
+        }
+    }
+
+    #[derive(Clone)]
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Writer {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            crate::sync::lock(&self.0).extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Writer {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Capture what this thread logs at `level` or above until the value is dropped.
+    ///
+    /// The subscriber is registered twice for as long as the capture lives. With exactly one
+    /// scoped subscriber registered, `tracing-core` computes a callsite's interest, on whichever
+    /// thread first reaches the callsite, from that thread's own default subscriber: a sibling
+    /// test's thread reaching a callsite first caches `never` on it, and this thread's event at it
+    /// is then dropped before any subscriber sees it. With two registered, every thread computes
+    /// the interest from the registered subscribers instead.
+    pub(crate) fn capture_logs(level: tracing::Level) -> CapturedLogs {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = Arc::new(
+            tracing_subscriber::fmt()
+                .with_writer(Writer(Arc::clone(&bytes)))
+                .with_max_level(level)
+                .with_ansi(false)
+                .finish(),
+        );
+        let registered_twice = tracing::Dispatch::new(Arc::clone(&subscriber));
+        let scoped = tracing::subscriber::set_default(subscriber);
+        CapturedLogs {
+            bytes,
+            _scoped: scoped,
+            _registered_twice: registered_twice,
+        }
+    }
+}

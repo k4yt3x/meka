@@ -203,7 +203,7 @@ pub(crate) trait HostHooks: crate::scheduler::ResidentPermissions {
 
     /// What the host does with the session before a turn, under the conversation lock. The two
     /// servers move the agent onto the profile the row records, through
-    /// `crate::host::apply_recorded_profile`; an error here makes the fire unrunnable rather than
+    /// `crate::host::apply_recorded_bindings`; an error here makes the fire unrunnable rather than
     /// failed.
     async fn prepare(&self, _entry: &Self::Entry) -> anyhow::Result<()> {
         Ok(())

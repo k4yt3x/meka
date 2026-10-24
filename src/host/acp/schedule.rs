@@ -144,7 +144,7 @@ impl crate::host::scheduler::HostHooks for AcpHooks {
     }
 
     async fn prepare(&self, entry: &Self::Entry) -> anyhow::Result<()> {
-        crate::host::apply_recorded_profile(&self.state.shared, &entry.agent, entry.id).await
+        crate::host::apply_recorded_bindings(&self.state.shared, &entry.agent, entry.id).await
     }
 
     /// An out-of-band turn has no `session/prompt` response to carry its outcome, so a failure

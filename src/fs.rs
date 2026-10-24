@@ -552,38 +552,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_failed_permission_restriction_is_warned_about() {
-        #[derive(Clone)]
-        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Capture {
-            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-                crate::sync::lock(&self.0).extend_from_slice(buffer);
-                Ok(buffer.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-            type Writer = Self;
-
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let captured = Capture(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let captured = crate::streams::capture::capture_logs(tracing::Level::WARN);
 
         let temp = tempfile::tempdir().expect("tempdir");
         restrict_permissions(&temp.path().join("absent"), 0o600);
 
-        let logged = String::from_utf8_lossy(&crate::sync::lock(&captured.0)).to_string();
+        let logged = captured.logged();
         assert!(
             logged.contains("failed to stat") && logged.contains("absent"),
             "the failure is warned about by path: {logged:?}"

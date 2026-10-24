@@ -236,7 +236,7 @@ impl crate::host::scheduler::HostHooks for HttpHooks {
     type Entry = crate::host::http::state::SessionEntry;
 
     async fn prepare(&self, entry: &Self::Entry) -> anyhow::Result<()> {
-        crate::host::apply_recorded_profile(&self.state.shared, &entry.agent, entry.id).await
+        crate::host::apply_recorded_bindings(&self.state.shared, &entry.agent, entry.id).await
     }
 
     async fn resident(&self, session_id: uuid::Uuid) -> anyhow::Result<Option<Self::Entry>> {

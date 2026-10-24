@@ -12,6 +12,7 @@ pub(crate) mod instructions;
 pub(crate) mod mcp;
 pub(crate) mod memory;
 pub(crate) mod profile;
+pub(crate) mod project;
 pub(crate) mod schedule;
 pub(crate) mod session;
 pub(crate) mod skills;
@@ -33,6 +34,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: ProfileAction,
     },
+    /// Manage projects
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
     /// Manage stored sessions
     Session {
         #[command(subcommand)]
@@ -48,7 +54,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
-    /// Inspect built-in tool filters
+    /// Inspect built-in tools
     Tool {
         #[command(subcommand)]
         action: ToolAction,
@@ -58,12 +64,12 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: SkillAction,
     },
-    /// Manage the agent's saved memories
+    /// Manage the memories the agent keeps
     Memory {
         #[command(subcommand)]
         action: MemoryAction,
     },
-    /// Show the standing instructions the agent is given
+    /// Show the standing instructions
     Instructions {
         #[command(subcommand)]
         action: InstructionsAction,
@@ -73,16 +79,16 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: ScheduleAction,
     },
-    /// Run meka as an ACP (Agent Client Protocol) agent over stdio
+    /// Run as an ACP agent over stdio
     ///
     /// Speaks newline-framed JSON-RPC on stdin and stdout; diagnostics go to stderr.
     Acp,
-    /// Run meka as a long-lived HTTP service
+    /// Run as an HTTP service
     ///
     /// Exposes the agent over HTTP and JSON; auth, session GC and SSE streaming are configured
     /// under `[serve]` in config.toml.
     Serve {
-        /// Override `[serve].bind`
+        /// Address to bind
         #[arg(long, value_name = "ADDR")]
         bind: Option<String>,
     },
@@ -110,10 +116,9 @@ pub(crate) enum Command {
 
 #[derive(clap::Subcommand, Debug)]
 pub(crate) enum ToolAction {
-    /// List every built-in tool with its effective permission and status
+    /// List built-in tools with their permissions
     List {
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
 }
@@ -125,18 +130,20 @@ pub(crate) enum SessionAction {
         /// Maximum number of sessions to show (0 = all)
         #[arg(short = 'n', long, default_value = "20")]
         limit: u32,
-        /// Include sub-agent sessions in the listing
+        /// Include sub-agent sessions
         ///
         /// Hidden by default, so the view stays on conversations you started.
         #[arg(long)]
         include_children: bool,
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        /// Only sessions on this project
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Export a session as Markdown or JSON
+    /// Export a session
     Export {
-        /// Session id, or any unique prefix of one
+        /// Session id or unique prefix
         session_id: String,
         /// Output file (`-` for stdout)
         ///
@@ -144,16 +151,22 @@ pub(crate) enum SessionAction {
         /// the current directory.
         #[arg(short, long)]
         output: Option<String>,
-        /// Output format: markdown or json
-        ///
-        /// `json` is structured and round-trippable via `meka session import`, and includes any
-        /// sub-agent child sessions. `markdown` is rendered and covers the single session only.
-        #[arg(long, default_value = "markdown")]
+        #[arg(
+            long,
+            default_value = "markdown",
+            help = session_export_format_help(),
+            long_help = format!(
+                "{}\n\n`json` is structured and round-trippable via `meka session import`, and \
+                 includes any sub-agent child sessions. `markdown` is rendered and covers the \
+                 single session only.",
+                session_export_format_help()
+            )
+        )]
         format: SessionExportFormat,
     },
-    /// Remove sessions by id, by age, or all of them
+    /// Remove sessions
     Remove {
-        /// Session ids, or any unique prefix of each
+        /// Session ids or unique prefixes
         session_ids: Vec<String>,
         /// Remove all sessions
         // Conflicts with explicit ids: naming some sessions and then asking for every session is
@@ -170,7 +183,7 @@ pub(crate) enum SessionAction {
         )]
         older_than_days: Option<u64>,
     },
-    /// Import a session from a JSON export
+    /// Import a session
     ///
     /// Recreates the session and any sub-agent children under fresh ids, and prints the new root
     /// session id.
@@ -178,20 +191,19 @@ pub(crate) enum SessionAction {
         /// Export file to read (`-` for stdin)
         input: String,
     },
-    /// Fork a session into an independent copy
+    /// Fork a session
     ///
     /// The copy carries the full conversation; the original is untouched. Prints the new session
     /// id.
     Fork {
-        /// Session id, or any unique prefix of one
+        /// Session id or unique prefix
         session_id: String,
     },
-    /// Show a session's full details
+    /// Show a session
     Show {
-        /// Session id, or any unique prefix of one
+        /// Session id or unique prefix
         session_id: String,
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
     /// Drop the most recent turns from a session
@@ -199,7 +211,7 @@ pub(crate) enum SessionAction {
     /// Cuts at a user boundary, so no tool call is separated from its result, and `meka session
     /// export` still shows the dropped turns. Recovers a session the provider rejects.
     Rewind {
-        /// Session id, or any unique prefix of one
+        /// Session id or unique prefix
         session_id: String,
         /// Number of turns to drop
         #[arg(short = 'n', long, default_value = "1")]
@@ -210,14 +222,14 @@ pub(crate) enum SessionAction {
     /// `title` takes the text, or an empty string to label the session by its first words again;
     /// `pinned` takes `true` or `false`. Neither moves the session in the listing's recency order.
     Set {
-        /// Session id, or any unique prefix of one
+        /// Session id or unique prefix
         session_id: String,
-        /// The field: title or pinned
+        #[arg(help = listed("Field", SessionField::ALL.iter().map(|field| field.name()), ""))]
         field: SessionField,
-        /// The title text, or true/false for pinned
+        /// New value
         value: String,
     },
-    /// Find sessions by the words of their conversations
+    /// Search sessions
     ///
     /// Searches what was said, not what tools were called with or returned, and lists a session
     /// whose title holds every word first.
@@ -230,8 +242,7 @@ pub(crate) enum SessionAction {
         /// Include sub-agent sessions
         #[arg(long)]
         include_children: bool,
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
 }
@@ -288,16 +299,15 @@ impl std::str::FromStr for SessionField {
 
 #[derive(clap::Subcommand, Debug)]
 pub(crate) enum HistoryAction {
-    /// List recorded input history
+    /// List input history
     List {
         /// Maximum number of entries to show (0 = all)
         #[arg(short = 'n', long, default_value = "50")]
         limit: u32,
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Delete all recorded input history
+    /// Clear input history
     Clear,
 }
 
@@ -310,7 +320,7 @@ pub(crate) enum HistoryAction {
 )]
 #[derive(clap::Subcommand, Debug)]
 pub(crate) enum AccountAction {
-    /// Add an account and authenticate it
+    /// Add an account
     ///
     /// Prompts for the backend and base URL when not flagged, then acquires the secret (an OAuth
     /// login for the subscription backends, an API-key prompt for the rest) and saves it to the
@@ -324,51 +334,49 @@ pub(crate) enum AccountAction {
             help = listed("Backend", crate::config::Backend::ALL.iter().map(|backend| backend.name()), "")
         )]
         backend: Option<String>,
-        /// API base URL; any endpoint serving the backend's protocol
+        /// API base URL
         #[arg(long = "base-url", value_name = "URL")]
         base_url: Option<String>,
-        /// OAuth token endpoint override, used for the code exchange and every refresh
+        /// OAuth token endpoint
         #[arg(long = "oauth-token-url", value_name = "URL")]
         oauth_token_url: Option<String>,
-        /// OAuth client id override (subscription backends only)
+        /// OAuth client id
         #[arg(long = "client-id", value_name = "ID")]
         client_id: Option<String>,
-        /// Send the interleaved-thinking beta when thinking is on (anthropic-messages only;
-        /// default: true)
+        /// Send the interleaved-thinking beta (default: true)
         #[arg(
             long = "interleaved-thinking",
             hide_possible_values = true,
             value_name = "BOOL"
         )]
         interleaved_thinking: Option<bool>,
-        /// Read the API key from stdin (API-key backends only); needs `--backend`
+        /// Read the API key from stdin
         #[arg(long = "api-key-stdin")]
         api_key_stdin: bool,
     },
     /// List configured accounts
     List {
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Re-authenticate an account, keeping its settings
+    /// Re-authenticate an account
     Login {
         /// Account name
         name: String,
-        /// Read the API key from stdin (API-key backends only)
+        /// Read the API key from stdin
         #[arg(long = "api-key-stdin")]
         api_key_stdin: bool,
     },
-    /// Remove an account and clear its stored credential
+    /// Remove an account
     ///
     /// Refused while any profile names the account.
     Remove {
         /// Account name
         name: String,
     },
-    /// Rename an account; its credential and every profile on it follow
+    /// Rename an account
     Rename {
-        /// Account name
+        /// Current name
         name: String,
         /// New name
         new_name: String,
@@ -377,31 +385,28 @@ pub(crate) enum AccountAction {
     ///
     /// The session and weekly windows, with their reset times.
     Usage {
-        /// Account name (default: the account the default profile bills, or the one account)
+        /// Account name (default: the default profile's account)
         name: Option<String>,
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Show who the account is and whether it is logged in
+    /// Show who the account is logged in as
     ///
     /// The plan, tier, organization and role the backend reports, and the state of the stored
     /// credential.
     Whoami {
-        /// Account name (default: the account the default profile bills, or the one account)
+        /// Account name (default: the default profile's account)
         name: Option<String>,
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
     /// Show the account's historical usage
     ///
     /// Lifetime tokens, streaks and per-day counts, as the backend reports them.
     Stats {
-        /// Account name (default: the account the default profile bills, or the one account)
+        /// Account name (default: the default profile's account)
         name: Option<String>,
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
 }
@@ -414,7 +419,7 @@ pub(crate) enum AccountAction {
 )]
 #[derive(clap::Subcommand, Debug)]
 pub(crate) enum ProfileAction {
-    /// Add a profile on an account
+    /// Add a profile
     ///
     /// Prompts for the account and model when not flagged, then offers an optional advanced step
     /// (thinking, context window, effort). Does not touch `default_profile`: a sole profile is
@@ -428,20 +433,19 @@ pub(crate) enum ProfileAction {
         /// Model name
         #[arg(long)]
         model: Option<String>,
-        /// Profile to serve a turn from when this one cannot; repeatable, tried in order
+        /// Fallback profile (repeatable, tried in order)
         #[arg(long = "fallback", value_name = "NAME")]
         fallback: Vec<String>,
-        /// Context window in tokens (default: `[session].context_window`, else 1000000)
+        /// Context window in tokens
         #[arg(long = "context-window", value_name = "TOKENS")]
         context_window: Option<u64>,
-        /// Per-request output token cap; unset leaves the backend's default
+        /// Per-request output token cap
         #[arg(long = "max-output-tokens", value_name = "TOKENS")]
         max_output_tokens: Option<u64>,
-        /// Largest request body in bytes before old images are redacted (Anthropic backends
-        /// default to 30 MiB)
+        /// Request body size in bytes above which old images are redacted
         #[arg(long = "max-request-bytes", value_name = "BYTES")]
         max_request_bytes: Option<u64>,
-        /// Reasoning effort; unset leaves the provider's default
+        /// Reasoning effort
         #[arg(long, value_name = "EFFORT")]
         effort: Option<String>,
         /// Accept image input (default: true)
@@ -453,7 +457,7 @@ pub(crate) enum ProfileAction {
             help = listed(
                 "How a request carries deferred tools",
                 crate::config::DeferredTools::ALL.iter().map(|setting| setting.name()),
-                " (default: by endpoint)"
+                ""
             )
         )]
         deferred_tools: Option<crate::config::DeferredTools>,
@@ -465,14 +469,14 @@ pub(crate) enum ProfileAction {
             help = listed(
                 "Thinking mode",
                 crate::config::ThinkingMode::ALL.iter().map(|mode| mode.name()),
-                " (Anthropic Messages backends only; default: adaptive)"
+                " (default: adaptive)"
             )
         )]
         thinking: Option<crate::config::ThinkingMode>,
-        /// Token budget when thinking = budgeted (default: `[thinking].budget`, then 16000)
+        /// Token budget for budgeted thinking
         #[arg(long = "thinking-budget", value_name = "TOKENS")]
         thinking_budget: Option<u64>,
-        /// Send the moving cache breakpoint (anthropic-messages only; default: true)
+        /// Send the moving cache breakpoint (default: true)
         #[arg(
             long = "cache-control",
             hide_possible_values = true,
@@ -487,27 +491,26 @@ pub(crate) enum ProfileAction {
             help = listed(
                 "Thinking display",
                 crate::config::ThinkingDisplay::ALL.iter().map(|display| display.name()),
-                " (claude-subscription only; default: updates)"
+                " (default: summarized)"
             )
         )]
         thinking_display: Option<crate::config::ThinkingDisplay>,
     },
     /// List configured profiles
     List {
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Change one setting on a profile
+    /// Set one of a profile's settings
     #[command(long_about = profile_set_about())]
     Set {
         /// Profile name
         name: String,
         /// Setting to write
         key: String,
-        /// New value; omit it and pass `--unset` to remove the setting
+        /// New value
         value: Option<String>,
-        /// Remove the setting, so the profile falls back to the default
+        /// Remove the setting
         #[arg(long, conflicts_with = "value")]
         unset: bool,
     },
@@ -521,9 +524,67 @@ pub(crate) enum ProfileAction {
         /// Profile name
         name: String,
     },
-    /// Rename a profile; its sessions and `default_profile` follow
+    /// Rename a profile
     Rename {
-        /// Profile name
+        /// Current name
+        name: String,
+        /// New name
+        new_name: String,
+    },
+}
+
+/// Projects: the work contexts a session opens by name, each with a memory tier of its own beside
+/// the global one. Defined in `config.toml` as `[projects.<name>]`; a session is put on one with
+/// `--project`, `/project` or the session's `project` field.
+#[derive(clap::Subcommand, Debug)]
+pub(crate) enum ProjectAction {
+    /// Add a project
+    ///
+    /// The four lists are the project's view of the installed servers and skills: an `allowed`
+    /// list names the whole view, a `disabled` list takes names out of it, and neither means
+    /// everything installed. Change them later with `meka project set`.
+    Add {
+        /// Project name (alphanumerics, `-`, `_` only)
+        name: String,
+        /// MCP server its sessions see (repeatable)
+        #[arg(long = "allowed-server", value_name = "NAME")]
+        allowed_server: Vec<String>,
+        /// MCP server its sessions do not see (repeatable)
+        #[arg(long = "disabled-server", value_name = "NAME")]
+        disabled_server: Vec<String>,
+        /// Skill its sessions see (repeatable)
+        #[arg(long = "allowed-skill", value_name = "NAME")]
+        allowed_skill: Vec<String>,
+        /// Skill its sessions do not see (repeatable)
+        #[arg(long = "disabled-skill", value_name = "NAME")]
+        disabled_skill: Vec<String>,
+    },
+    /// List projects
+    List {
+        #[arg(long, default_value = "plain", help = output_format_help())]
+        format: OutputFormat,
+    },
+    /// Set one of a project's lists
+    #[command(long_about = project_set_about())]
+    Set {
+        /// Project name
+        name: String,
+        /// List to write
+        key: String,
+        /// Comma-separated names
+        value: Option<String>,
+        /// Remove the list
+        #[arg(long, conflicts_with = "value")]
+        unset: bool,
+    },
+    /// Remove a project
+    Remove {
+        /// Project name
+        name: String,
+    },
+    /// Rename a project
+    Rename {
+        /// Current name
         name: String,
         /// New name
         new_name: String,
@@ -538,35 +599,32 @@ pub(crate) enum ProfileAction {
 pub(crate) enum SkillAction {
     /// List installed skills
     List {
-        /// Also show where each skill is on disk
+        /// Show each skill's path
         #[arg(long)]
         paths: bool,
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Print one skill's frontmatter and on-disk paths
+    /// Show a skill's frontmatter
     Get {
         /// Skill name
         name: String,
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Print the rendered skill body
+    /// Show a skill's body
     Show {
         /// Skill name
         name: String,
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Scaffold a new skill at `skills/<name>/SKILL.md` beside config.toml
+    /// Add a skill
     Add {
-        /// Unique skill name (lowercase letters, digits, hyphens)
+        /// Skill name (lowercase letters, digits, hyphens)
         name: String,
 
-        /// One-line description for the system prompt
+        /// One-line description
         #[arg(long)]
         description: Option<String>,
 
@@ -578,19 +636,19 @@ pub(crate) enum SkillAction {
         #[arg(long, value_name = "KEY=VALUE")]
         metadata: Vec<String>,
 
-        /// Copy this file instead of the template
+        /// Read the body from this file
         #[arg(long = "from-file", value_name = "PATH")]
         from_file: Option<std::path::PathBuf>,
 
-        /// Overwrite the skill directory if it exists
+        /// Overwrite an existing skill
         #[arg(long)]
         force: bool,
 
-        /// Open the new SKILL.md afterwards in `$VISUAL`, then `$EDITOR`
+        /// Open the new skill in an editor
         #[arg(long)]
         edit: bool,
     },
-    /// Remove a skill's directory
+    /// Remove a skill
     Remove {
         /// Skill name
         name: String,
@@ -603,38 +661,36 @@ pub(crate) enum SkillAction {
 pub(crate) enum ScheduleAction {
     /// List scheduled jobs
     List {
-        /// One session's jobs, by id or prefix (default: all)
+        /// Only one session's jobs
         #[arg(long)]
         session: Option<String>,
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Show a job's full details
+    /// Show a job
     Show {
-        /// Job id, or any unique prefix of one
+        /// Job id or unique prefix
         id: String,
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Cancel a job by id or unique prefix
+    /// Cancel a job
     Cancel {
-        /// Job id, or any unique prefix of one
+        /// Job id or unique prefix
         id: String,
     },
 }
 
 #[derive(clap::Subcommand, Debug)]
 pub(crate) enum InstructionsAction {
-    /// Print the resolved instructions and where they came from
+    /// Show the resolved instructions
     ///
     /// Resolution order is `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE`, then `instructions.md`
     /// (or `instructions/`) in the config directory; `--instructions` belongs to a run and is not
     /// consulted. The files `[instructions].files` names are read against the current directory
     /// and follow. The text goes to stdout and the sources to stderr.
     Show,
-    /// Print the paths checked for instructions, and whether each exists
+    /// Show where standing instructions are looked for
     ///
     /// The files `[instructions].files` names are listed after the config directory's, resolved
     /// against the current directory.
@@ -647,112 +703,123 @@ pub(crate) enum InstructionsAction {
 pub(crate) enum MemoryAction {
     /// List saved memories
     List {
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
-        format: OutputFormat,
-
-        /// Only memories referencing this name, path, URL or id
+        /// Only this project's memories
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
+        /// Only memories referencing this target
         #[arg(long, value_name = "REFERENCE")]
         referencing: Option<String>,
-
-        /// Only memories not verified within this long, e.g. 90d
+        /// Only memories not verified within this long
         #[arg(long, value_name = "DURATION")]
         unverified: Option<String>,
-
-        /// Only memories whose expiry has passed
+        /// Only expired memories
         #[arg(long)]
         expired: bool,
+        #[arg(long, default_value = "plain", help = output_format_help())]
+        format: OutputFormat,
     },
-    /// Print one memory's stored fields
+    /// Show a memory's fields
     Get {
         /// Memory name
         name: String,
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        /// Project the memory is in
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Print a memory's body
+    /// Show a memory's body
     Show {
         /// Memory name
         name: String,
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        /// Project the memory is in
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Write a memory by hand
+    /// Add a memory
     Add {
-        /// Unique name (alphanumerics, `-`, `_` only)
+        /// Memory name (alphanumerics, `-`, `_` only)
         name: String,
-
-        /// Fact shown in every session's memory index
+        /// One-line description
         #[arg(long)]
         description: String,
-
+        /// Body text
+        #[arg(long)]
+        body: Option<String>,
+        /// Read the body from this file
+        #[arg(long = "from-file", value_name = "PATH")]
+        from_file: Option<std::path::PathBuf>,
+        /// Project to file it in
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
         /// Priority 0-9, lower first (default: 5)
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=9))]
         priority: Option<u8>,
-
-        /// Label for grouping and filtering (repeatable)
-        #[arg(long = "tag", value_name = "TAG")]
-        tags: Vec<String>,
-
-        /// Detail read on `memory_read`, or in context every turn with `--load inline`
-        #[arg(long)]
-        body: Option<String>,
-
-        /// Read the body from this file, not `--body`
-        #[arg(long = "from-file", value_name = "PATH")]
-        from_file: Option<std::path::PathBuf>,
-
-        /// How it reaches the context: inline, index or search (default: index)
-        #[arg(long, value_name = "LOAD")]
+        #[arg(
+            long,
+            value_name = "LOAD",
+            help = listed(
+                "Load policy",
+                crate::memory::Load::ALL.iter().map(|load| load.name()),
+                " (default: index)"
+            )
+        )]
         load: Option<crate::memory::Load>,
-
-        /// What it depends on: a memory name, path, URL or id (repeatable)
-        #[arg(long = "reference", value_name = "REFERENCE")]
-        references: Vec<String>,
-
+        /// Record the fact as verified now
+        #[arg(long)]
+        verified: bool,
+        /// Expiry: RFC 3339 or YYYY-MM-DD
+        #[arg(long, value_name = "WHEN")]
+        expires: Option<String>,
         /// Where the fact came from
         #[arg(long)]
         source: Option<String>,
-
-        /// When it stops applying: RFC 3339 or YYYY-MM-DD; an empty value clears it
-        #[arg(long, value_name = "WHEN")]
-        expires: Option<String>,
-
-        /// Record that the fact was just verified current
-        #[arg(long)]
-        verified: bool,
-
-        /// Update an existing memory instead of refusing
+        /// What it depends on (repeatable)
+        #[arg(long = "reference", value_name = "REFERENCE")]
+        references: Vec<String>,
+        /// Label for grouping and filtering (repeatable)
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+        /// Update an existing memory
         #[arg(long)]
         force: bool,
     },
-    /// Open a memory's body in `$VISUAL`, then `$EDITOR`
+    /// Edit a memory's body in an editor
     ///
     /// The body only; `meka memory add <name> --force` changes the description, priority or tags.
     Edit {
-        /// Name of the memory to edit
+        /// Memory name
         name: String,
+        /// Project the memory is in
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
     },
-    /// Delete a memory permanently
+    /// Remove a memory
     Remove {
         /// Memory name
         name: String,
+        /// Project the memory is in
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
     },
     /// Check the search index against the stored memories
     ///
     /// The index is derived from the memories, so rebuilding it cannot lose a note.
     Verify {
-        /// Regenerate the index instead of only checking it
+        /// Rebuild the index
         #[arg(long)]
         rebuild: bool,
     },
-    /// Write every memory out as Markdown, one file per memory
+    /// Export memories as Markdown files
     Export {
-        /// Directory to write into; must be new or empty (default: ./meka-memory-export)
+        /// Directory to write into (default: ./meka-memory-export)
         #[arg(long, value_name = "DIR")]
         directory: Option<std::path::PathBuf>,
+        /// Only this project's memories
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
     },
 }
 
@@ -821,68 +888,65 @@ impl std::str::FromStr for SessionExportFormat {
 pub(crate) enum McpAction {
     /// List configured MCP servers
     List {
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Print the configuration for one server
+    /// Show a server's configuration
     Get {
-        /// Name of a server in config.toml
+        /// Server name
         name: String,
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Connect once and exit non-zero if the handshake fails
+    /// Check that a server connects
     Reconnect {
-        /// Name of a server in config.toml
+        /// Server name
         name: String,
     },
-    /// List a server's advertised tools with their resolved permissions
+    /// List a server's tools
     Tools {
-        /// Name of a server in config.toml
+        /// Server name
         name: String,
-        /// Output format: plain or json
-        #[arg(long, default_value = "plain")]
+        #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
-    /// Authenticate a server interactively
+    /// Log in to a server
     ///
     /// With neither flag, runs the OAuth authorization-code flow. With one, stores the secret read
     /// from stdin and exits, which is also how an existing one is rotated.
     Login {
-        /// Name of a server in config.toml
+        /// Server name
         name: String,
 
-        /// Store a static bearer token read from stdin
+        /// Read a bearer token from stdin
         #[arg(long = "auth-token-stdin", conflicts_with = "client_secret_stdin")]
         auth_token_stdin: bool,
 
-        /// Store an OAuth client secret read from stdin
+        /// Read the OAuth client secret from stdin
         #[arg(long = "client-secret-stdin")]
         client_secret_stdin: bool,
     },
-    /// Clear every stored credential for a server, revoking OAuth first
+    /// Clear a server's stored credentials
     Logout {
-        /// Name of a server in config.toml
+        /// Server name
         name: String,
     },
-    /// Add a server to config.toml
+    /// Add a server
     Add {
-        /// Unique server name (alphanumerics, `-`, `_` only)
+        /// Server name (alphanumerics, `-`, `_` only)
         name: String,
-        /// URL (HTTP) or executable path (stdio); transport auto-detected
+        /// URL or executable path
         location: Option<String>,
-        /// Arguments to pass to the stdio command
+        /// Arguments for a stdio command
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
 
         #[arg(
             long,
             help = listed(
-                "Force the transport",
+                "Transport",
                 crate::config::McpTransport::ALL.iter().map(|transport| transport.name()),
-                "; auto-detected otherwise"
+                ""
             )
         )]
         transport: Option<crate::config::McpTransport>,
@@ -901,27 +965,27 @@ pub(crate) enum McpAction {
         )]
         auth: Option<McpAuthKind>,
 
-        /// Read a static bearer token from stdin (excludes `--auth`)
+        /// Read a bearer token from stdin
         ///
         /// Kept in the store, never in config.toml.
         #[arg(long = "auth-token-stdin", conflicts_with = "client_secret_stdin")]
         auth_token_stdin: bool,
 
-        /// OAuth or client_credentials client id
+        /// OAuth client id
         #[arg(long, value_name = "ID")]
         client_id: Option<String>,
 
-        /// Read the OAuth client secret from stdin (excludes `--auth-token-stdin`)
+        /// Read the OAuth client secret from stdin
         ///
         /// Kept in the store, never in config.toml.
         #[arg(long = "client-secret-stdin")]
         client_secret_stdin: bool,
 
-        /// JWT signing key path (for client_credentials_jwt)
+        /// JWT signing key path
         #[arg(long, value_name = "KEY")]
         signing_key: Option<String>,
 
-        /// JWT signing algorithm (RS256, RS384, RS512, ES256, ES384)
+        /// JWT signing algorithm: RS256, RS384, RS512, ES256, ES384
         #[arg(long, value_name = "ALGORITHM")]
         signing_algorithm: Option<String>,
 
@@ -929,7 +993,7 @@ pub(crate) enum McpAction {
         #[arg(long = "scope", value_name = "SCOPE")]
         scope: Vec<String>,
 
-        /// Fixed OAuth redirect port (default: ephemeral)
+        /// OAuth redirect port
         #[arg(long, value_name = "PORT")]
         redirect_port: Option<u16>,
 
@@ -939,20 +1003,20 @@ pub(crate) enum McpAction {
             help = listed(
                 "Permission",
                 Permission::ALL.iter().map(|level| level.name()),
-                " (default: read)"
+                ""
             )
         )]
         permission: Option<String>,
 
-        /// Raw tool name to allow (repeatable; restricts which register)
+        /// Tool to allow (repeatable)
         #[arg(long = "allow-tool", value_name = "TOOL")]
         allow_tool: Vec<String>,
 
-        /// Raw tool name to block (repeatable; applied after `--allow-tool`)
+        /// Tool to disable (repeatable)
         #[arg(long = "disable-tool", value_name = "TOOL")]
         disable_tool: Vec<String>,
 
-        /// Raw tool name to eager-load (repeatable; skips `tool_load`)
+        /// Tool to eager-load (repeatable)
         #[arg(long = "eager-load-tool", value_name = "TOOL")]
         eager_load_tool: Vec<String>,
 
@@ -962,7 +1026,7 @@ pub(crate) enum McpAction {
             help = listed(
                 "Tool loading",
                 crate::config::Deferral::ALL.iter().map(|deferral| deferral.name()),
-                " (default: `[mcp].deferral`)"
+                ""
             )
         )]
         deferral: Option<crate::config::Deferral>,
@@ -971,31 +1035,31 @@ pub(crate) enum McpAction {
         #[arg(long = "tool-permission", value_name = "TOOL=LEVEL")]
         tool_permission: Vec<String>,
 
-        /// Skip post-add auto-login; run `meka mcp login <name>` later
+        /// Skip the login after adding
         #[arg(long = "no-login")]
         no_login: bool,
 
-        /// Persist with `disabled = true`; re-enable via `meka mcp enable`
+        /// Add the server disabled
         #[arg(long = "disabled")]
         disabled: bool,
 
-        /// Gate turns on this server: decline the turn if it is not connected
+        /// Decline turns while the server is not connected
         #[arg(long = "required")]
         required: bool,
     },
-    /// Remove a server from config.toml and clear every stored credential
+    /// Remove a server and its credentials
     Remove {
-        /// Name of a server in config.toml
+        /// Server name
         name: String,
     },
-    /// Temporarily turn off a server without removing it from config
+    /// Stop connecting to a server
     Disable {
-        /// Name of a server in config.toml
+        /// Server name
         name: String,
     },
-    /// Turn a disabled server back on
+    /// Connect to a disabled server again
     Enable {
-        /// Name of a server in config.toml
+        /// Server name
         name: String,
     },
 }
@@ -1054,6 +1118,24 @@ impl std::str::FromStr for McpAuthKind {
     }
 }
 
+/// The `--format` summary every listing shares, from the table the parser reads.
+fn output_format_help() -> String {
+    listed(
+        "Output format",
+        OutputFormat::ALL.iter().map(|format| format.name()),
+        "",
+    )
+}
+
+/// The `session export` format summary, from the table the parser reads.
+fn session_export_format_help() -> String {
+    listed(
+        "Output format",
+        SessionExportFormat::ALL.iter().map(|format| format.name()),
+        "",
+    )
+}
+
 /// A help line listing a vocabulary from the table that defines it, so `-h` cannot fall behind a
 /// value added to an `ALL`.
 fn listed(lead: &str, names: impl IntoIterator<Item = &'static str>, tail: &str) -> String {
@@ -1066,9 +1148,17 @@ fn listed(lead: &str, names: impl IntoIterator<Item = &'static str>, tail: &str)
 /// The long help of `profile set`: the settable keys, from the table `profile set` refuses by.
 fn profile_set_about() -> String {
     format!(
-        "Change one setting on a profile\n\nKeys: {}. `account` is not settable; add a profile on the \
+        "Set one of a profile's settings\n\nKeys: {}. `account` is not settable; add a profile on the \
          other account instead.",
         profile::SETTABLE_PROFILE_KEYS.join(", ")
+    )
+}
+
+/// The long help of `project set`: the settable keys, from the table `project set` refuses by.
+fn project_set_about() -> String {
+    format!(
+        "Set one of a project's lists\n\nKeys: {}. The value is a comma-separated list of names.",
+        project::SETTABLE_PROJECT_KEYS.join(", ")
     )
 }
 
@@ -1077,19 +1167,30 @@ fn profile_set_about() -> String {
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
-
     /// Prompt for the first turn; `-` reads it from stdin
     #[arg(short = 'p', long = "prompt", value_name = "TEXT")]
     pub(crate) prompt: Option<String>,
-
+    /// Skill to invoke on the first turn
+    #[arg(long = "skill", value_name = "NAME")]
+    pub(crate) skill: Option<String>,
     /// Continue the most recent session
     #[arg(short = 'c', long = "continue", conflicts_with = "resume")]
     pub(crate) continue_last: bool,
-
     /// Resume a session by id or unique prefix, or pick one from a list
     #[arg(short = 'r', long = "resume", value_name = "SESSION", num_args = 0..=1)]
     pub(crate) resume: Option<Option<String>>,
-
+    /// Profile to use for this session
+    ///
+    /// Selects a whole profile (account, model and every model-tied setting); change a field with
+    /// `meka profile set`.
+    #[arg(long = "profile", value_name = "NAME")]
+    pub(crate) profile: Option<String>,
+    /// Project this session belongs to
+    ///
+    /// With `-c`, continues the latest session on that project, or starts one there. With
+    /// `-r <SESSION>`, moves that session onto the project.
+    #[arg(long = "project", value_name = "NAME")]
+    pub(crate) project: Option<String>,
     #[arg(
         long = "permission",
         value_name = "LEVEL",
@@ -1100,8 +1201,10 @@ pub(crate) struct Cli {
         )
     )]
     pub(crate) permission: Option<Permission>,
-
-    /// More of this run's workspace beside the working directory (repeatable)
+    /// Standing instructions for this run
+    #[arg(long = "instructions", value_name = "STRING")]
+    pub(crate) instructions: Option<String>,
+    /// Directory added to this run's workspace (repeatable)
     ///
     /// Part of the workspace with the working directory's rights: writable at `workspace`,
     /// read-only at `read`, searched with it. An ACP client's folders join the same list.
@@ -1109,21 +1212,12 @@ pub(crate) struct Cli {
     // the working directory itself, not a preference to persist.
     #[arg(long = "additional-workspace-directory", value_name = "DIR")]
     pub(crate) additional_workspace_directory: Vec<std::path::PathBuf>,
-
-    /// Directory this run may read beyond its workspace, never write (repeatable)
+    /// Directory this run may read (repeatable)
     ///
     /// The per-run form of `[shell].additional_readable_directories`; in effect where reads are
     /// confined.
     #[arg(long = "additional-readable-directory", value_name = "DIR")]
     pub(crate) additional_readable_directory: Vec<std::path::PathBuf>,
-
-    /// Profile for this session; on a resume, repins it
-    ///
-    /// Selects a whole profile (account, model and every model-tied setting); change a field with
-    /// `meka profile set`.
-    #[arg(long = "profile", value_name = "NAME")]
-    pub(crate) profile: Option<String>,
-
     #[arg(
         long = "sandbox-backend",
         value_name = "BACKEND",
@@ -1134,31 +1228,17 @@ pub(crate) struct Cli {
         )
     )]
     pub(crate) sandbox_backend: Option<crate::config::SandboxBackend>,
-
-    /// Disable streaming for this run (see `[display] stream`)
-    #[arg(long = "no-stream")]
-    pub(crate) no_stream: bool,
-
-    /// Standing instructions for this run, replacing the discovered ones
-    #[arg(long = "instructions", value_name = "STRING")]
-    pub(crate) instructions: Option<String>,
-
-    /// Invoke a user-invocable skill on the first turn
-    #[arg(long = "skill", value_name = "NAME")]
-    pub(crate) skill: Option<String>,
-
-    /// Exit after the first turn finishes (requires `--prompt` or `--skill`)
-    #[arg(long = "oneshot")]
-    pub(crate) oneshot: bool,
-
-    /// Output format: plain or json
-    #[arg(long = "format", default_value = "plain", value_name = "FORMAT")]
-    pub(crate) format: OutputFormat,
-
-    /// Eager-load an MCP tool this session (repeatable)
+    /// MCP tool to eager-load (repeatable)
     #[arg(long = "eager-load-tool", value_name = "SERVER:TOOL")]
     pub(crate) eager_load_tool: Vec<String>,
-
+    /// Disable streaming for this run
+    #[arg(long = "no-stream")]
+    pub(crate) no_stream: bool,
+    #[arg(long = "format", default_value = "plain", value_name = "FORMAT", help = output_format_help())]
+    pub(crate) format: OutputFormat,
+    /// Exit after the first turn
+    #[arg(long = "oneshot")]
+    pub(crate) oneshot: bool,
     /// Verbosity level (-v, -vv, -vvv)
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     pub(crate) verbosity: u8,
@@ -1188,6 +1268,8 @@ impl Cli {
     pub(crate) fn overrides(&self) -> crate::config::CliOverrides {
         crate::config::CliOverrides {
             profile: self.profile.clone(),
+            project: self.project.clone(),
+            skill: self.skill.clone(),
             eager_load_tools: self.eager_load_tool.clone(),
             instructions: self.instructions.clone(),
             permission: self.permission,
@@ -1592,10 +1674,12 @@ mod tests {
                     SessionAction::List {
                         limit,
                         include_children,
+                        project,
                         format,
                     },
             }) => {
                 assert_eq!(limit, 20);
+                assert!(project.is_none());
                 assert!(!include_children);
                 assert_eq!(format, OutputFormat::Plain);
             }

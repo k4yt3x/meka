@@ -206,9 +206,13 @@ pub(crate) async fn run_oneshot(
         approvals: start_approvals,
         repin,
         permission_to_record,
+        project,
+        project_repin,
         cwd: recorded_cwd,
         announce,
     } = resolve_session_resume(&store, &config).await?;
+    // The opening skill within the session's project, which is known only now.
+    crate::host::refuse_a_hidden_opening_skill(&config, project.as_deref())?;
     // The run's output starts after the resume, so the banner is its first block and what follows
     // is set off from it like every block from the one above.
     if let Some(id) = announce {
@@ -260,7 +264,7 @@ pub(crate) async fn run_oneshot(
 
     // Before the agent, because the agent resolves the row: a repin that has not landed yet would
     // build this run on the binding the session is leaving.
-    commit_resume_repin(&store, &providers, session_id, repin).await?;
+    commit_resume_repin(&store, &providers, session_id, repin, project_repin).await?;
     let agent = build_session_agent(&shared, SessionSpec {
         session_id,
         permission: shared_permission,
@@ -276,6 +280,7 @@ pub(crate) async fn run_oneshot(
         context_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         context_overhead: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         context_window: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        project,
     })
     .await?;
     // After the agent, so a start the builder refused leaves the row at the level it had.

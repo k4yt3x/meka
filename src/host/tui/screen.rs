@@ -142,6 +142,8 @@ pub(crate) struct ScreenLaunch {
     pub(crate) skill_roots: Vec<PathBuf>,
     pub(crate) current_profile: Arc<std::sync::RwLock<String>>,
     pub(crate) configured_profiles: Vec<crate::config::ProfileSummary>,
+    /// What `/project` offers; the session's own project is read off the agent.
+    pub(crate) configured_projects: Vec<crate::config::ProjectSummary>,
     pub(crate) schedule: crate::config::ResolvedScheduleConfig,
     pub(crate) store: crate::store::Store,
     pub(crate) agent: Arc<crate::agent::Agent>,
@@ -155,6 +157,8 @@ pub(crate) struct ScreenLaunch {
     pub(crate) busy: bool,
     /// Open on the session picker: `meka -r` with no session named.
     pub(crate) pick_session: bool,
+    /// `--project` beside a bare `-r`: the picker opens over that project's sessions.
+    pub(crate) pick_project: Option<String>,
 }
 
 /// What a panel's pick does.
@@ -166,6 +170,8 @@ enum PanelKind {
     Approvals,
     /// The profile names offered, in the order drawn.
     Profile(Vec<String>),
+    /// The projects offered, in the order drawn, the first row being "No project".
+    Project(Vec<String>),
     /// A tool call waiting on the answer.
     Approval(ApprovalRequest),
     /// The command line each choice runs, in the order drawn: a skill to run, a memory, a task
@@ -350,6 +356,9 @@ struct Screen {
     composer: Composer,
     overlay: Option<Overlay>,
     skill_watch: crate::skills::SkillNameWatch,
+    /// Every installed skill's name, as the watch last read them; the completer is handed the
+    /// ones the session's project shows.
+    installed_skill_names: Vec<String>,
     /// What was logged lately, at every level the screen's layer keeps, for `/log`.
     log_ring: std::collections::VecDeque<crate::relay::LogLine>,
     /// Whether the host is answering something the screen sent it, and since when.
@@ -410,6 +419,7 @@ impl Screen {
             composer: Composer::new(history),
             overlay: None,
             skill_watch,
+            installed_skill_names: Vec::new(),
             log_ring: std::collections::VecDeque::with_capacity(LOG_RING_LINES),
             busy,
             activity: view::Activity::Working,
@@ -617,8 +627,17 @@ impl Screen {
 
     fn refresh_skill_names(&mut self) {
         if let Some(discovered) = self.skill_watch.refresh() {
-            *crate::sync::write(&self.launch.completer.skill_names) = discovered;
+            self.installed_skill_names = discovered;
         }
+        // Narrowed by the project the session is on now, as `/skill` is, so completion never
+        // offers a name the command then refuses.
+        let access = self.launch.agent.project_access();
+        *crate::sync::write(&self.launch.completer.skill_names) = self
+            .installed_skill_names
+            .iter()
+            .filter(|name| access.sees_skill(name))
+            .cloned()
+            .collect();
     }
 
     /// The list follows the line: open as `/` is typed, narrowed with every key. Skill names are
@@ -658,7 +677,7 @@ impl Screen {
     /// filtered as text is typed; the pick runs `/resume <id>`. A table: the title, then the
     /// directory, the profile and the age in columns of their own at the right edge, sized by
     /// [`SessionColumns::fit`].
-    async fn open_session_picker(&mut self) {
+    async fn open_session_picker(&mut self, project: Option<String>) {
         // Before the first frame the transcript has no width yet, as at `meka -r`; the terminal
         // itself says how wide the picker can be, and so how much of a title a row can hold.
         let width = match self.transcript_area.width {
@@ -671,7 +690,10 @@ impl Screen {
             .list_sessions_titled_within(
                 SESSION_PICKER_ROWS,
                 None,
-                &crate::store::SessionFilter::default(),
+                &crate::store::SessionFilter {
+                    project,
+                    ..Default::default()
+                },
                 width,
             )
             .await
@@ -1205,6 +1227,13 @@ impl Screen {
                     self.run_command_line(format!("/profile {name}")).await;
                 }
             }
+            PanelKind::Project(names) => match (index, names.get(index)) {
+                (0, _) => self.run_command_line("/project close".to_string()).await,
+                (_, Some(name)) => {
+                    self.run_command_line(format!("/project open {name}")).await;
+                }
+                (_, None) => {}
+            },
             PanelKind::Approval(request) => {
                 if let Some((_, _, decision)) = APPROVAL_CHOICES.get(index) {
                     self.decide(request, *decision);
@@ -1830,7 +1859,7 @@ impl Screen {
                     None => "No active session yet.".to_string(),
                 });
             }
-            SlashCommand::Resume(None) => self.open_session_picker().await,
+            SlashCommand::Resume(None) => self.open_session_picker(None).await,
             SlashCommand::Profile(None) => {
                 let current = crate::sync::read(&self.launch.current_profile).clone();
                 let names: Vec<String> = self
@@ -1857,6 +1886,37 @@ impl Screen {
                 self.open_panel(
                     Panel::with_choices(Vec::new(), choices, picked),
                     PanelKind::Profile(names),
+                );
+            }
+            SlashCommand::Project(super::commands::ProjectVerb::Picker) => {
+                let current = self.launch.agent.project();
+                // The first row leaves the project: a row rather than a name, since no project is
+                // named by nothing.
+                let mut names = vec![String::new()];
+                names.extend(
+                    self.launch
+                        .configured_projects
+                        .iter()
+                        .map(|project| project.name.clone()),
+                );
+                let choices = names
+                    .iter()
+                    .map(|name| Choice {
+                        label: if name.is_empty() {
+                            "No project".to_string()
+                        } else {
+                            name.clone()
+                        },
+                        key: None,
+                        description: None,
+                    })
+                    .collect();
+                let picked = current
+                    .and_then(|current| names.iter().position(|name| *name == current))
+                    .unwrap_or(0);
+                self.open_panel(
+                    Panel::with_choices(Vec::new(), choices, picked),
+                    PanelKind::Project(names),
                 );
             }
             SlashCommand::Permission(None) => {
@@ -1935,7 +1995,8 @@ impl Screen {
             // shows it, which is what a person who typed the command is there for. The columns a
             // terminal table carried (priority, age, tags, elapsed) are the show panel's.
             SlashCommand::SkillList => {
-                let index = crate::skills::discover_skills_in_roots(&self.launch.skill_roots);
+                let index = crate::skills::discover_skills_in_roots(&self.launch.skill_roots)
+                    .seen_by(&self.launch.agent.project_access());
                 if index.skills.is_empty() {
                     self.reply("No skills.");
                 } else {
@@ -1955,7 +2016,10 @@ impl Screen {
             }
             SlashCommand::MemoryList => {
                 let store = Arc::clone(self.launch.agent.memories());
-                match store.index().await {
+                let view = crate::store::memory::MemoryView::for_session(
+                    self.launch.agent.project().as_deref(),
+                );
+                match store.index(&view).await {
                     Ok(index) if index.is_empty() => self.reply("No memories."),
                     Ok(index) => {
                         let rows = index
@@ -1975,7 +2039,11 @@ impl Screen {
             }
             SlashCommand::MemoryShow { name } => {
                 let store = Arc::clone(self.launch.agent.memories());
-                let (outcome, printed) = capture(crate::cli::memory::run_show(&store, &name)).await;
+                let view = crate::store::memory::MemoryView::for_session(
+                    self.launch.agent.project().as_deref(),
+                );
+                let (outcome, printed) =
+                    capture(crate::cli::memory::run_show(&store, &name, &view)).await;
                 self.listing_panel(printed, outcome);
             }
             SlashCommand::ScheduleList => match session_id {
@@ -3228,7 +3296,8 @@ pub(crate) async fn run_screen(launch: ScreenLaunch) -> anyhow::Result<()> {
     let mut terminal = enter_terminal(mouse)?;
     // `meka -r` with no session named: the picker is the first thing on the screen.
     if screen.launch.pick_session {
-        screen.run_command_line("/resume".to_string()).await;
+        let project = screen.launch.pick_project.clone();
+        screen.open_session_picker(project).await;
     }
     let mut events = crossterm::event::EventStream::new();
     let mut tick = tokio::time::interval(FRAME_INTERVAL);

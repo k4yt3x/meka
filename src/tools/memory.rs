@@ -26,7 +26,7 @@ use crate::{
     memory,
     permission::Permission,
     provider::ToolDefinition,
-    store::memory::{MemoryStore, SearchResults, Terms, WriteRequest},
+    store::memory::{MemoryStore, MemoryView, SearchResults, Terms, WriteRequest},
 };
 
 /// Turn a store error into the tool's own failure, so the model sees which call failed.
@@ -37,8 +37,17 @@ fn tool_error(tool_name: &str, error: impl std::fmt::Display) -> MekaError {
     }
 }
 
+/// The tiers the session in front of a tool sees: its project's beside the global tier, or the
+/// global tier alone.
+fn view_of(project: &crate::session::SharedProject) -> MemoryView {
+    MemoryView::for_session(project.get().as_deref())
+}
+
 pub(super) struct MemoryWriteTool {
     pub(crate) memories: Arc<MemoryStore>,
+    /// The session's project, read per call so a move mid-session changes what the next call
+    /// sees.
+    pub(crate) project: crate::session::SharedProject,
 }
 
 #[async_trait]
@@ -114,6 +123,13 @@ impl Tool for MemoryWriteTool {
                         "description": "When the memory stops applying: RFC 3339, or YYYY-MM-DD for the whole \
                                         of that day. Past it the memory leaves the index and is found by \
                                         memory_search alone. Omit to keep; pass \"\" to clear."
+                    },
+                    "tier": {
+                        "type": "string",
+                        "enum": ["global", "project"],
+                        "description": "Tier the memory lives in. A new memory takes the session's project, or global \
+                                        when it has none; an existing one keeps its tier unless the other is \
+                                        named, which moves it."
                     }
                 },
                 "required": ["name"]
@@ -327,6 +343,24 @@ impl Tool for MemoryWriteTool {
                 ));
             }
         };
+        // The tier, as the store takes it: `None` keeps a stored memory's tier and creates in
+        // the session's own, an empty project is the global tier. `project` names the session's,
+        // and a session on none has no such tier to name.
+        let view = view_of(&self.project);
+        let tier = parse_tier(&input, "memory_write")?;
+        let project = match tier {
+            None => None,
+            Some(memory::Tier::Global) => Some(String::new()),
+            Some(memory::Tier::Project) => match view.project() {
+                "" => {
+                    return Err(tool_error(
+                        "memory_write",
+                        "this session has no project; omit `tier` or use `global`",
+                    ));
+                }
+                project => Some(project.to_string()),
+            },
+        };
         // The index lists a description every turn, so one that has grown into a paragraph is
         // spending the budget of several entries; said once, on the write that set it, and
         // never refused.
@@ -356,7 +390,7 @@ impl Tool for MemoryWriteTool {
         // reported to the frontend needs what the memory said.
         let existing = self
             .memories
-            .get(name)
+            .get(name, &view_of(&self.project))
             .await
             .map_err(|error| tool_error("memory_write", error))?;
         let kept_existing_body = body.is_none()
@@ -380,6 +414,8 @@ impl Tool for MemoryWriteTool {
             .memories
             .write(WriteRequest {
                 name: name.to_string(),
+                view: view.clone(),
+                project,
                 // Normalized to one line here rather than only at `PUT /v1/memory`, so all three
                 // write doors store what `meka memory export` writes and a round trip is
                 // byte-exact.
@@ -409,7 +445,7 @@ impl Tool for MemoryWriteTool {
         };
         let now = std::time::SystemTime::now();
         let mut text = format!(
-            "Saved memory '{}' (priority {}{}){}.",
+            "Saved memory '{}' (priority {}{}{}){}.",
             written.name,
             // What landed, not what was asked for: an omitted priority is resolved from the
             // stored row, so echoing the argument would report a number the store does not
@@ -420,6 +456,13 @@ impl Tool for MemoryWriteTool {
                 String::new()
             } else {
                 format!(", {}", written.load)
+            },
+            // The tier only when it is not the session's own: a global note from a project
+            // session is one every project now reads.
+            if written.project.is_empty() && !view.project().is_empty() {
+                ", global"
+            } else {
+                ""
             },
             // Stated so the two calls are distinguishable from the result alone: a metadata
             // update and a rewrite otherwise report identically, and the difference is the
@@ -467,11 +510,16 @@ impl MemoryWriteTool {
             return None;
         }
 
+        // Within the session's view: a near-copy in another project is not one this session
+        // can see, read or delete.
         let hits = self
             .memories
             .search(
                 incoming.match_expression(),
-                &crate::store::memory::MemoryFilter::default(),
+                &crate::store::memory::MemoryFilter {
+                    view: view_of(&self.project),
+                    ..Default::default()
+                },
                 5,
             )
             .await
@@ -506,6 +554,9 @@ impl MemoryWriteTool {
 
 pub(super) struct MemoryEditTool {
     pub(crate) memories: Arc<MemoryStore>,
+    /// The session's project, read per call so a move mid-session changes what the next call
+    /// sees.
+    pub(crate) project: crate::session::SharedProject,
 }
 
 #[async_trait]
@@ -585,13 +636,13 @@ impl Tool for MemoryEditTool {
 
         let Some(existing) = self
             .memories
-            .get(name)
+            .get(name, &view_of(&self.project))
             .await
             .map_err(|error| tool_error("memory_edit", error))?
         else {
             let index = self
                 .memories
-                .index()
+                .index(&view_of(&self.project))
                 .await
                 .map_err(|error| tool_error("memory_edit", error))?;
             return Err(tool_error(
@@ -639,13 +690,19 @@ impl Tool for MemoryEditTool {
         // `$EDITOR` round trip takes, for the same reason.
         let written = match self
             .memories
-            .write_body(&existing.name, &body, edited.clone(), verified)
+            .write_body(
+                &existing.name,
+                &view_of(&self.project),
+                &body,
+                edited.clone(),
+                verified,
+            )
             .await
             .map_err(|error| tool_error("memory_edit", error))?
         {
             crate::store::memory::BodyWrite::Saved => self
                 .memories
-                .get(&existing.name)
+                .get(&existing.name, &view_of(&self.project))
                 .await
                 .map_err(|error| tool_error("memory_edit", error))?,
             crate::store::memory::BodyWrite::Gone => None,
@@ -692,6 +749,9 @@ impl Tool for MemoryEditTool {
 
 pub(super) struct MemoryReadTool {
     pub(crate) memories: Arc<MemoryStore>,
+    /// The session's project, read per call so a move mid-session changes what the next call
+    /// sees.
+    pub(crate) project: crate::session::SharedProject,
 }
 
 #[async_trait]
@@ -753,7 +813,7 @@ impl Tool for MemoryReadTool {
         })?;
         let entry = match self
             .memories
-            .get(name)
+            .get(name, &view_of(&self.project))
             .await
             .map_err(|error| tool_error("memory_read", error))?
         {
@@ -764,7 +824,7 @@ impl Tool for MemoryReadTool {
                 // *tool* name already gets.
                 let index = self
                     .memories
-                    .index()
+                    .index(&view_of(&self.project))
                     .await
                     .map_err(|error| tool_error("memory_read", error))?;
                 return Err(tool_error(
@@ -795,7 +855,11 @@ impl Tool for MemoryReadTool {
         // not the note) and an operator reading through the HTTP API is not the agent recalling
         // anything, so neither moves the ranking the agent gets. Best-effort: a counter that fails
         // to increment must not fail the read.
-        if let Err(error) = self.memories.record_read(&entry.name).await {
+        if let Err(error) = self
+            .memories
+            .record_read(&entry.name, &view_of(&self.project))
+            .await
+        {
             let name = &entry.name;
             tracing::warn!("failed to record a read of memory '{name}': {error}");
         }
@@ -806,6 +870,9 @@ impl Tool for MemoryReadTool {
         let now = std::time::SystemTime::now();
         let caption = memory::render_record_caption(&entry, now);
         let mut facts = String::new();
+        if !entry.project.is_empty() {
+            facts.push_str(&format!("\nProject: {}", entry.project));
+        }
         if !entry.source.is_empty() {
             facts.push_str(&format!(
                 "\nSource: {}",
@@ -830,7 +897,7 @@ impl Tool for MemoryReadTool {
                 let shown = memory::render_description_for_model(reference);
                 match self
                     .memories
-                    .get(reference)
+                    .get(reference, &view_of(&self.project))
                     .await
                     .map_err(|error| tool_error("memory_read", error))?
                 {
@@ -847,7 +914,7 @@ impl Tool for MemoryReadTool {
         }
         let backlinks = self
             .memories
-            .referenced_by(&entry.name)
+            .referenced_by(&entry.name, &view_of(&self.project))
             .await
             .map_err(|error| tool_error("memory_read", error))?;
         if !backlinks.is_empty() {
@@ -974,6 +1041,9 @@ impl Tier {
 
 pub(super) struct MemorySearchTool {
     pub(crate) memories: Arc<MemoryStore>,
+    /// The session's project, read per call so a move mid-session changes what the next call
+    /// sees.
+    pub(crate) project: crate::session::SharedProject,
 }
 
 impl MemorySearchTool {
@@ -1064,6 +1134,11 @@ impl Tool for MemorySearchTool {
                         "default": false,
                         "description": "Only memories whose expiry has passed."
                     },
+                    "tier": {
+                        "type": "string",
+                        "enum": ["global", "project"],
+                        "description": "Only one tier: global, or the session's project. Default: both the session sees."
+                    },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
@@ -1102,7 +1177,26 @@ impl Tool for MemorySearchTool {
             ),
             _ => None,
         };
+        let session_view = view_of(&self.project);
+        let tier = parse_tier(&input, "memory_search")?;
+        let view = match tier {
+            None => session_view.clone(),
+            Some(memory::Tier::Global) => MemoryView::Global,
+            Some(memory::Tier::Project) => match session_view.project() {
+                "" => {
+                    return Err(tool_error(
+                        "memory_search",
+                        "this session has no project; omit `tier` or use `global`",
+                    ));
+                }
+                project => MemoryView::Project(project.to_string()),
+            },
+        };
+        // A global memory is marked as such where the session is on a project, since which tier a
+        // hit is in decides where a correction to it goes.
+        let mark_global = !session_view.project().is_empty();
         let filter = crate::store::memory::MemoryFilter {
+            view,
             referencing: match input.get("referencing") {
                 None | Some(serde_json::Value::Null) => None,
                 Some(serde_json::Value::String(target)) if target.trim().is_empty() => None,
@@ -1141,13 +1235,15 @@ impl Tool for MemorySearchTool {
             },
         };
         let queries = queries.unwrap_or_default();
-        if queries.is_empty() && filter.is_empty() {
+        if queries.is_empty() && filter.is_empty() && tier.is_none() {
             return Err(MekaError::ToolExecution {
                 tool_name: "memory_search".to_string(),
-                message: "give 'queries', or one of 'referencing', 'unverified' and 'expired'"
+                message: "give 'queries', or one of 'referencing', 'unverified', 'expired' and \
+                          'tier'"
                     .to_string(),
             });
         }
+        let described = describe_selection(&filter, tier);
         // Coerced rather than ignored: `as_u64` alone answers `None` for `"3"`, `3.0` and `-1`
         // alike, and a silent default would give ten results to a call that asked for three. The
         // same handler accepts a bare string where `queries` declares an array.
@@ -1177,7 +1273,7 @@ impl Tool for MemorySearchTool {
                 .map_err(|error| tool_error("memory_search", error))?;
             if results.hits.is_empty() {
                 return Ok(ToolOutput::text(
-                    format!("No memories {}.", describe_filter(&filter)),
+                    format!("No memories {}.", described.as_deref().unwrap_or_default()),
                     false,
                 ));
             }
@@ -1192,7 +1288,8 @@ impl Tool for MemorySearchTool {
                     &results,
                     limit,
                     now,
-                    Some(&filter),
+                    described.as_deref(),
+                    mark_global,
                 ),
                 false,
             ));
@@ -1230,7 +1327,8 @@ impl Tool for MemorySearchTool {
                     &results,
                     limit,
                     now,
-                    (!filter.is_empty()).then_some(&filter),
+                    described.as_deref(),
+                    mark_global,
                 ),
                 false,
             ));
@@ -1284,6 +1382,45 @@ fn quoted_list(terms: &[String]) -> String {
         .map(|term| format!("'{term}'"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The filter and the tier a search named, as one phrase for its preamble, or `None` when the
+/// call named neither and the hits need no qualifying.
+fn describe_selection(
+    filter: &crate::store::memory::MemoryFilter,
+    tier: Option<memory::Tier>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if !filter.is_empty() {
+        parts.push(describe_filter(filter));
+    }
+    match (tier, &filter.view) {
+        (Some(memory::Tier::Global), _) => parts.push("in the global tier".to_string()),
+        (Some(memory::Tier::Project), MemoryView::Project(project)) => {
+            parts.push(format!("in project '{project}'"));
+        }
+        _ => {}
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// Parse the optional `tier` of a memory tool call.
+fn parse_tier(input: &serde_json::Value, tool: &str) -> Result<Option<memory::Tier>> {
+    match input.get("tier") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(raw)) => raw
+            .trim()
+            .parse::<memory::Tier>()
+            .map(Some)
+            .map_err(|message| tool_error(tool, message)),
+        Some(value) => Err(tool_error(
+            tool,
+            format!(
+                "'tier' must be one of {}, got {value}",
+                memory::Tier::supported()
+            ),
+        )),
+    }
 }
 
 /// What a filter selected, for a header or a "nothing" line: "referencing 'x'", "not verified
@@ -1340,7 +1477,8 @@ fn render_hits(
     results: &SearchResults,
     limit: usize,
     now: std::time::SystemTime,
-    filter: Option<&crate::store::memory::MemoryFilter>,
+    described: Option<&str>,
+    mark_global: bool,
 ) -> String {
     let hits = &results.hits;
     let mut out = String::from(tier.preamble());
@@ -1383,8 +1521,8 @@ fn render_hits(
         } else {
             "memories"
         },
-        match filter {
-            Some(filter) => format!(" {}", describe_filter(filter)),
+        match described {
+            Some(described) => format!(" {described}"),
             None => String::new(),
         },
         if listing {
@@ -1398,9 +1536,14 @@ fn render_hits(
     for hit in hits {
         let mut entry = String::new();
         entry.push_str(&format!(
-            "- **{}** (p{}, created {}{}{}, read {}x)\n",
+            "- **{}** (p{}{}, created {}{}{}, read {}x)\n",
             hit.name,
             hit.priority,
+            if mark_global && hit.project.is_empty() {
+                ", global"
+            } else {
+                ""
+            },
             memory::render_age(hit.created, now),
             // The verification only when there was one, as `memory_read`'s caption says it.
             if hit.verified != hit.created {
@@ -1534,6 +1677,9 @@ fn render_fuzzy(
 
 pub(super) struct MemoryDeleteTool {
     pub(crate) memories: Arc<MemoryStore>,
+    /// The session's project, read per call so a move mid-session changes what the next call
+    /// sees.
+    pub(crate) project: crate::session::SharedProject,
 }
 
 #[async_trait]
@@ -1579,7 +1725,7 @@ impl Tool for MemoryDeleteTool {
         // the references themselves stay where they are, as markers of a fact to revisit.
         let backlinks = self
             .memories
-            .referenced_by(name)
+            .referenced_by(name, &view_of(&self.project))
             .await
             .map_err(|error| tool_error("memory_delete", error))?;
 
@@ -1588,7 +1734,7 @@ impl Tool for MemoryDeleteTool {
         // the others clear, and one refuses a file the others remove.
         let Some(removed) = self
             .memories
-            .delete(name)
+            .delete(name, &view_of(&self.project))
             .await
             .map_err(|error| tool_error("memory_delete", error))?
         else {
@@ -1640,6 +1786,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let context = || crate::tools::ToolContext::detached(CancellationToken::new());
         let change = |output: &ToolOutput| match output.frontend_metadata.clone() {
@@ -1694,7 +1841,10 @@ mod tests {
             "{after}"
         );
 
-        let delete = MemoryDeleteTool { memories };
+        let delete = MemoryDeleteTool {
+            memories,
+            project: Default::default(),
+        };
         let deleted = delete
             .execute(serde_json::json!({"name": "alice-timezone"}), context())
             .await
@@ -1709,6 +1859,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
 
         // Longer than the index elides to, which is the case that made the loss invisible.
@@ -1731,7 +1882,7 @@ mod tests {
             .expect("refine");
 
         let stored = memories
-            .get("retention")
+            .get("retention", &MemoryView::All)
             .await
             .expect("read")
             .expect("still there");
@@ -1773,6 +1924,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         for (name, description) in [("office", "東京 rollout plan"), ("abc-note", "abc rollout")]
         {
@@ -1784,7 +1936,10 @@ mod tests {
                 .await
                 .expect("write");
         }
-        let search = MemorySearchTool { memories };
+        let search = MemorySearchTool {
+            memories,
+            project: Default::default(),
+        };
 
         // The Latin control: one edit, one byte, found before and after.
         let latin = search
@@ -1822,6 +1977,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
 
         let refused = write
@@ -1836,7 +1992,11 @@ mod tests {
             "and the refusal has to name the reason: {refused}"
         );
         assert!(
-            memories.get("invisible").await.expect("get").is_none(),
+            memories
+                .get("invisible", &MemoryView::All)
+                .await
+                .expect("get")
+                .is_none(),
             "nothing was written"
         );
     }
@@ -1850,6 +2010,7 @@ mod tests {
         let memories = store().await;
         let read = MemoryReadTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
 
         // Past the write door's 64-character cap, so nothing can create it.
@@ -1892,6 +2053,7 @@ mod tests {
         assert!(
             MemoryDeleteTool {
                 memories: memories.clone(),
+                project: Default::default(),
             }
             .execute(
                 serde_json::json!({ "name": "hand.edited" }),
@@ -1902,7 +2064,11 @@ mod tests {
             "and one it can remove"
         );
         assert!(
-            memories.get("hand.edited").await.expect("get").is_none(),
+            memories
+                .get("hand.edited", &MemoryView::All)
+                .await
+                .expect("get")
+                .is_none(),
             "the row is really gone, not merely reported gone"
         );
     }
@@ -1914,6 +2080,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         write
             .execute(
@@ -1927,7 +2094,7 @@ mod tests {
             .expect("write");
         assert_eq!(
             memories
-                .get("note")
+                .get("note", &MemoryView::All)
                 .await
                 .expect("get")
                 .expect("present")
@@ -1944,6 +2111,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
 
         // Creating a memory without a body keeps nothing, and must not say it did.
@@ -1990,7 +2158,10 @@ mod tests {
             output.text_content()
         );
 
-        let read = MemoryReadTool { memories };
+        let read = MemoryReadTool {
+            memories,
+            project: Default::default(),
+        };
         let output = read
             .execute(
                 serde_json::json!({"name": "policy"}),
@@ -2039,6 +2210,7 @@ mod tests {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({
@@ -2051,7 +2223,10 @@ mod tests {
         .await
         .expect("write");
 
-        let read = MemoryReadTool { memories };
+        let read = MemoryReadTool {
+            memories,
+            project: Default::default(),
+        };
         let output = read
             .execute(
                 serde_json::json!({"name": "planted"}),
@@ -2076,6 +2251,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         write
             .execute(
@@ -2106,7 +2282,7 @@ mod tests {
             "a rewrite of the same row must not be flagged as a duplicate of itself: {output}"
         );
         assert_eq!(
-            memories.index().await.expect("index").len(),
+            memories.index(&MemoryView::All).await.expect("index").len(),
             1,
             "and it is still one memory"
         );
@@ -2134,6 +2310,7 @@ mod tests {
 
         let search = MemorySearchTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         // The exact tier, then the spelling tier, which renders from a different code path.
         for queries in [
@@ -2156,14 +2333,17 @@ mod tests {
         }
 
         // And `memory_read`, which renders the description alongside the body.
-        let text = MemoryReadTool { memories }
-            .execute(
-                serde_json::json!({"name": "planted"}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
-            )
-            .await
-            .expect("read")
-            .text_content();
+        let text = MemoryReadTool {
+            memories,
+            project: Default::default(),
+        }
+        .execute(
+            serde_json::json!({"name": "planted"}),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
+        )
+        .await
+        .expect("read")
+        .text_content();
         assert!(!text.contains('\u{1b}'), "{text:?}");
     }
 
@@ -2173,6 +2353,7 @@ mod tests {
 
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         write
             .execute(
@@ -2187,7 +2368,10 @@ mod tests {
             .await
             .expect("write");
 
-        let read = MemoryReadTool { memories };
+        let read = MemoryReadTool {
+            memories,
+            project: Default::default(),
+        };
         let output = read
             .execute(
                 serde_json::json!({"name": "alice-timezone"}),
@@ -2209,6 +2393,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
 
         let cases = [
@@ -2228,7 +2413,7 @@ mod tests {
 
         for (name, given, expected) in cases {
             let entry = memories
-                .get(name)
+                .get(name, &MemoryView::All)
                 .await
                 .expect("get")
                 .unwrap_or_else(|| panic!("'{name}' must have been written"));
@@ -2251,6 +2436,7 @@ mod tests {
     async fn write_rejects_path_traversal() {
         let write = MemoryWriteTool {
             memories: store().await,
+            project: Default::default(),
         };
 
         for bad in ["../escape", "a/b", "/abs", ".hidden"] {
@@ -2275,6 +2461,7 @@ mod tests {
         let memories = store().await;
         let delete = MemoryDeleteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
 
         // Both shapes the write door refuses: the character class, and the length.
@@ -2291,7 +2478,11 @@ mod tests {
                 .await
                 .unwrap_or_else(|error| panic!("'{planted}' must be removable: {error}"));
             assert!(
-                memories.get(planted).await.expect("get").is_none(),
+                memories
+                    .get(planted, &MemoryView::All)
+                    .await
+                    .expect("get")
+                    .is_none(),
                 "'{planted}' must be gone from the store"
             );
         }
@@ -2316,6 +2507,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         write
             .execute(
@@ -2330,7 +2522,10 @@ mod tests {
             .await
             .expect("write");
 
-        let search = MemorySearchTool { memories };
+        let search = MemorySearchTool {
+            memories,
+            project: Default::default(),
+        };
         let hit = search
             .execute(
                 serde_json::json!({"queries": ["preference"]}),
@@ -2355,6 +2550,7 @@ mod tests {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({
@@ -2369,6 +2565,7 @@ mod tests {
 
         let search = MemorySearchTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         // "verbosity" is in no file; "terse" is. Supplying both finds it, and supplying only the
         // wrong one does not, which is why the parameter is a list.
@@ -2409,6 +2606,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         for index in 0..(MAX_SEARCH_LIMIT + 5) {
             write
@@ -2422,7 +2620,10 @@ mod tests {
                 .await
                 .expect("write");
         }
-        let search = MemorySearchTool { memories };
+        let search = MemorySearchTool {
+            memories,
+            project: Default::default(),
+        };
 
         // Asking for more than the maximum is clamped, so this caller is at the ceiling without
         // having typed the ceiling.
@@ -2466,6 +2667,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         write
             .execute(
@@ -2487,6 +2689,7 @@ mod tests {
             .expect("write");
         let read = MemoryReadTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
 
         let long = read
@@ -2529,6 +2732,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         for index in 0..25 {
             write
@@ -2543,13 +2747,16 @@ mod tests {
                 .expect("write");
         }
 
-        let hit = MemorySearchTool { memories }
-            .execute(
-                serde_json::json!({"queries": ["deployment"], "limit": 3}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
-            )
-            .await
-            .expect("search");
+        let hit = MemorySearchTool {
+            memories,
+            project: Default::default(),
+        }
+        .execute(
+            serde_json::json!({"queries": ["deployment"], "limit": 3}),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
+        )
+        .await
+        .expect("search");
         let text = hit.text_content();
 
         assert!(
@@ -2570,6 +2777,7 @@ mod tests {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({
@@ -2581,7 +2789,10 @@ mod tests {
         )
         .await
         .expect("write");
-        let search = MemorySearchTool { memories };
+        let search = MemorySearchTool {
+            memories,
+            project: Default::default(),
+        };
 
         // Exact: no caveat.
         let exact = search
@@ -2639,6 +2850,7 @@ mod tests {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({"name": "alice-timezone", "description": "JST"}),
@@ -2647,7 +2859,10 @@ mod tests {
         .await
         .expect("write");
 
-        let read = MemoryReadTool { memories };
+        let read = MemoryReadTool {
+            memories,
+            project: Default::default(),
+        };
         let error = read
             .execute(
                 serde_json::json!({"name": "alice-timezon"}),
@@ -2667,6 +2882,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         for name in ["read-often", "never-read"] {
             write
@@ -2684,6 +2900,7 @@ mod tests {
 
         let read = MemoryReadTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         for _ in 0..5 {
             read.execute(
@@ -2694,13 +2911,16 @@ mod tests {
             .expect("read");
         }
 
-        let hit = MemorySearchTool { memories }
-            .execute(
-                serde_json::json!({"queries": ["deployment"], "limit": 1}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
-            )
-            .await
-            .expect("search");
+        let hit = MemorySearchTool {
+            memories,
+            project: Default::default(),
+        }
+        .execute(
+            serde_json::json!({"queries": ["deployment"], "limit": 1}),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
+        )
+        .await
+        .expect("search");
         let text = hit.text_content();
         assert!(
             text.contains("read-often"),
@@ -2716,6 +2936,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         write
             .execute(
@@ -2748,6 +2969,7 @@ mod tests {
         // itself, which would make the warning fire on every update.
         MemoryDeleteTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({"name": "alice-tz"}),
@@ -2783,6 +3005,7 @@ mod tests {
         let memories = store().await;
         let write = Arc::new(MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         });
 
         let call = |name: &'static str| {
@@ -2823,6 +3046,7 @@ mod tests {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({"name": "transient", "description": "a note"}),
@@ -2832,6 +3056,7 @@ mod tests {
         .expect("write");
         MemoryReadTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({"name": "transient"}),
@@ -2842,7 +3067,7 @@ mod tests {
 
         assert_eq!(
             memories
-                .get("transient")
+                .get("transient", &MemoryView::All)
                 .await
                 .expect("get")
                 .map(|entry| entry.read_count),
@@ -2851,6 +3076,7 @@ mod tests {
 
         MemoryDeleteTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({"name": "transient"}),
@@ -2863,6 +3089,7 @@ mod tests {
         // it; in a second table keyed by name, the new memory would inherit the old one's standing.
         MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({"name": "transient", "description": "a different note"}),
@@ -2872,7 +3099,7 @@ mod tests {
         .expect("rewrite");
         assert_eq!(
             memories
-                .get("transient")
+                .get("transient", &MemoryView::All)
                 .await
                 .expect("get")
                 .map(|entry| entry.read_count),
@@ -2887,27 +3114,34 @@ mod tests {
         // never remember.
         assert_eq!(
             MemoryWriteTool {
-                memories: memories.clone()
+                memories: memories.clone(),
+                project: Default::default(),
             }
             .required_permission(),
             Permission::Read
         );
         assert_eq!(
             MemoryReadTool {
-                memories: memories.clone()
+                memories: memories.clone(),
+                project: Default::default(),
             }
             .required_permission(),
             Permission::Read
         );
         assert_eq!(
             MemorySearchTool {
-                memories: memories.clone()
+                memories: memories.clone(),
+                project: Default::default(),
             }
             .required_permission(),
             Permission::Read
         );
         assert_eq!(
-            MemoryDeleteTool { memories }.required_permission(),
+            MemoryDeleteTool {
+                memories,
+                project: Default::default(),
+            }
+            .required_permission(),
             Permission::Read
         );
     }
@@ -2921,6 +3155,7 @@ mod tests {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({
@@ -2937,6 +3172,7 @@ mod tests {
         for query in ["deployment", "deployments"] {
             let out = MemorySearchTool {
                 memories: memories.clone(),
+                project: Default::default(),
             }
             .execute(
                 serde_json::json!({"queries": [query]}),
@@ -2965,6 +3201,7 @@ mod tests {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({
@@ -2980,6 +3217,7 @@ mod tests {
         for query in ["深圳", "南山区", "科技园"] {
             let out = MemorySearchTool {
                 memories: memories.clone(),
+                project: Default::default(),
             }
             .execute(
                 serde_json::json!({"queries": [query]}),
@@ -3018,6 +3256,7 @@ mod tests {
         ] {
             MemoryWriteTool {
                 memories: memories.clone(),
+                project: Default::default(),
             }
             .execute(
                 serde_json::json!({"name": name, "description": description, "body": body}),
@@ -3027,14 +3266,17 @@ mod tests {
             .expect("write");
         }
         async fn search(memories: Arc<MemoryStore>, queries: &[&str]) -> String {
-            MemorySearchTool { memories }
-                .execute(
-                    serde_json::json!({"queries": queries}),
-                    crate::tools::ToolContext::detached(CancellationToken::new()),
-                )
-                .await
-                .expect("search")
-                .text_content()
+            MemorySearchTool {
+                memories,
+                project: Default::default(),
+            }
+            .execute(
+                serde_json::json!({"queries": queries}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("search")
+            .text_content()
         }
 
         let out = search(memories.clone(), &["Tokyo 深圳"]).await;
@@ -3078,6 +3320,7 @@ mod tests {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({
@@ -3089,14 +3332,17 @@ mod tests {
         )
         .await
         .expect("write");
-        let out = MemorySearchTool { memories }
-            .execute(
-                serde_json::json!({"queries": ["viet"]}),
-                crate::tools::ToolContext::detached(CancellationToken::new()),
-            )
-            .await
-            .expect("search")
-            .text_content();
+        let out = MemorySearchTool {
+            memories,
+            project: Default::default(),
+        }
+        .execute(
+            serde_json::json!({"queries": ["viet"]}),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
+        )
+        .await
+        .expect("search")
+        .text_content();
         assert!(out.contains("trip"), "{out}");
         assert!(
             out.starts_with("1 matching memory"),
@@ -3112,6 +3358,7 @@ mod tests {
         for index in 0..12 {
             MemoryWriteTool {
                 memories: memories.clone(),
+                project: Default::default(),
             }
             .execute(
                 serde_json::json!({
@@ -3127,6 +3374,7 @@ mod tests {
         }
         MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({
@@ -3142,6 +3390,7 @@ mod tests {
 
         let out = MemorySearchTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({"queries": ["Tokyo 深圳"], "limit": 10}),
@@ -3168,6 +3417,7 @@ mod tests {
         for index in 0..8 {
             MemoryWriteTool {
                 memories: memories.clone(),
+                project: Default::default(),
             }
             .execute(
                 serde_json::json!({
@@ -3181,6 +3431,7 @@ mod tests {
         }
         let search = MemorySearchTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         for limit in [
             serde_json::json!(2),
@@ -3219,6 +3470,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         write
             .execute(
@@ -3248,7 +3500,7 @@ mod tests {
         }
 
         let stored = memories
-            .get("note")
+            .get("note", &MemoryView::All)
             .await
             .expect("get")
             .expect("still there");
@@ -3268,6 +3520,7 @@ mod tests {
         for index in 0..MAX_SEARCH_LIMIT {
             MemoryWriteTool {
                 memories: memories.clone(),
+                project: Default::default(),
             }
             .execute(
                 serde_json::json!({
@@ -3282,6 +3535,7 @@ mod tests {
         }
         let out = MemorySearchTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({"queries": ["deployment"], "limit": MAX_SEARCH_LIMIT}),
@@ -3312,6 +3566,7 @@ mod tests {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({
@@ -3327,6 +3582,7 @@ mod tests {
 
         let out = MemorySearchTool {
             memories: memories.clone(),
+            project: Default::default(),
         }
         .execute(
             serde_json::json!({"queries": ["deployment"]}),
@@ -3349,6 +3605,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let body = format!("{}suffix", "é".repeat(READ_BODY_MAX_CHARS));
         write
@@ -3360,6 +3617,7 @@ mod tests {
             .expect("write");
         let read = MemoryReadTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let first = read
             .execute(
@@ -3385,7 +3643,7 @@ mod tests {
             "the offset counts characters, not bytes"
         );
         let reads = memories
-            .get("paged")
+            .get("paged", &MemoryView::All)
             .await
             .expect("get")
             .expect("saved")
@@ -3406,7 +3664,7 @@ mod tests {
         }
         assert_eq!(
             memories
-                .get("paged")
+                .get("paged", &MemoryView::All)
                 .await
                 .expect("get")
                 .expect("saved")
@@ -3423,9 +3681,11 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let read = MemoryReadTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let context = || crate::tools::ToolContext::detached(CancellationToken::new());
         write
@@ -3525,7 +3785,7 @@ mod tests {
         assert!(!cleared.contains("expired"), "{cleared}");
         assert!(
             memories
-                .get("alice-meeting")
+                .get("alice-meeting", &MemoryView::All)
                 .await
                 .expect("get")
                 .expect("row")
@@ -3557,6 +3817,7 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let context = || crate::tools::ToolContext::detached(CancellationToken::new());
         let long = "word ".repeat(50).trim().to_string();
@@ -3610,21 +3871,29 @@ mod tests {
         let definitions = [
             MemoryWriteTool {
                 memories: memories.clone(),
+                project: Default::default(),
             }
             .definition(),
             MemoryEditTool {
                 memories: memories.clone(),
+                project: Default::default(),
             }
             .definition(),
             MemoryReadTool {
                 memories: memories.clone(),
+                project: Default::default(),
             }
             .definition(),
             MemorySearchTool {
                 memories: memories.clone(),
+                project: Default::default(),
             }
             .definition(),
-            MemoryDeleteTool { memories }.definition(),
+            MemoryDeleteTool {
+                memories,
+                project: Default::default(),
+            }
+            .definition(),
         ];
         let names: Vec<&str> = definitions
             .iter()
@@ -3660,12 +3929,15 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let edit = MemoryEditTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let read = MemoryReadTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let context = || crate::tools::ToolContext::detached(CancellationToken::new());
         write
@@ -3735,7 +4007,7 @@ mod tests {
         assert!(!deleted.is_error, "{}", deleted.text_content());
         assert_eq!(
             memories
-                .get("note")
+                .get("note", &MemoryView::All)
                 .await
                 .expect("get")
                 .expect("row")
@@ -3799,9 +4071,11 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let search = MemorySearchTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let context = || crate::tools::ToolContext::detached(CancellationToken::new());
         for (name, extra) in [
@@ -3909,9 +4183,11 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let read = MemoryReadTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let context = || crate::tools::ToolContext::detached(CancellationToken::new());
         write
@@ -3957,9 +4233,11 @@ mod tests {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let delete = MemoryDeleteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let context = || crate::tools::ToolContext::detached(CancellationToken::new());
         write
@@ -3991,7 +4269,7 @@ mod tests {
         );
         assert_eq!(
             memories
-                .get("spoke")
+                .get("spoke", &MemoryView::All)
                 .await
                 .expect("get")
                 .expect("row")
@@ -4008,6 +4286,7 @@ mod tests {
         let memories = store().await.with_inline_max_bytes_for_test(100);
         let write = MemoryWriteTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let context = || crate::tools::ToolContext::detached(CancellationToken::new());
         let schema = write.definition().parameters;
@@ -4050,7 +4329,11 @@ mod tests {
             "{message}"
         );
         assert!(
-            memories.get("deploy").await.expect("get").is_none(),
+            memories
+                .get("deploy", &MemoryView::All)
+                .await
+                .expect("get")
+                .is_none(),
             "nothing lands"
         );
 
@@ -4069,6 +4352,7 @@ mod tests {
             .expect("an index body spends nothing");
         let edit = MemoryEditTool {
             memories: memories.clone(),
+            project: Default::default(),
         };
         let refused = edit
             .execute(
@@ -4089,7 +4373,7 @@ mod tests {
         );
         assert_eq!(
             memories
-                .get("tone")
+                .get("tone", &MemoryView::All)
                 .await
                 .expect("get")
                 .expect("tone")
@@ -4097,5 +4381,294 @@ mod tests {
                 .as_deref(),
             Some("t".repeat(60).as_str())
         );
+    }
+
+    fn on_project(project: &str) -> crate::session::SharedProject {
+        crate::session::SharedProject::new(Some(project.to_string()))
+    }
+
+    async fn written_project(memories: &MemoryStore, name: &str) -> String {
+        memories
+            .get(name, &MemoryView::All)
+            .await
+            .expect("get")
+            .expect("row")
+            .project
+    }
+
+    /// A project session's writes land in its project unless `tier` says global, the result
+    /// says so when they do not land in the session's own tier, and a session on no project has
+    /// no project tier to name.
+    #[tokio::test]
+    async fn memory_write_files_into_the_session_s_project_unless_tier_says_otherwise() {
+        let memories = store().await;
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+            project: on_project("webdev"),
+        };
+        let run = |input: serde_json::Value| {
+            let write = MemoryWriteTool {
+                memories: write.memories.clone(),
+                project: write.project.clone(),
+            };
+            async move {
+                write
+                    .execute(
+                        input,
+                        crate::tools::ToolContext::detached(CancellationToken::new()),
+                    )
+                    .await
+            }
+        };
+        let output = run(serde_json::json!({"name": "stack", "description": "Uses pnpm"}))
+            .await
+            .expect("write");
+        assert_eq!(written_project(&memories, "stack").await, "webdev");
+        assert!(
+            output
+                .text_content()
+                .starts_with("Saved memory 'stack' (priority 5)."),
+            "{}",
+            output.text_content()
+        );
+        let output = run(serde_json::json!({
+            "name": "tone",
+            "description": "Answer briefly",
+            "tier": "global",
+        }))
+        .await
+        .expect("global write");
+        assert_eq!(written_project(&memories, "tone").await, "");
+        assert!(
+            output
+                .text_content()
+                .starts_with("Saved memory 'tone' (priority 5, global)."),
+            "{}",
+            output.text_content()
+        );
+        // Unnamed, an existing global memory stays global; named, it moves into the project.
+        let output = run(serde_json::json!({"name": "tone", "body": "One sentence."}))
+            .await
+            .expect("update");
+        assert_eq!(written_project(&memories, "tone").await, "");
+        assert!(
+            output.text_content().contains(", global)"),
+            "{}",
+            output.text_content()
+        );
+        let output = run(serde_json::json!({"name": "tone", "tier": "project"}))
+            .await
+            .expect("re-file");
+        assert_eq!(written_project(&memories, "tone").await, "webdev");
+        assert!(
+            output
+                .text_content()
+                .starts_with("Saved memory 'tone' (priority 5)")
+                && !output.text_content().contains("global"),
+            "{}",
+            output.text_content()
+        );
+        let refused = run(serde_json::json!({"name": "x", "description": "d", "tier": "session"}))
+            .await
+            .expect_err("an unknown tier");
+        assert!(
+            refused.to_string().contains("unknown tier 'session'"),
+            "{refused}"
+        );
+
+        let no_project = MemoryWriteTool {
+            memories: memories.clone(),
+            project: Default::default(),
+        };
+        let refused = no_project
+            .execute(
+                serde_json::json!({"name": "x", "description": "d", "tier": "project"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("no project to name");
+        assert!(
+            refused
+                .to_string()
+                .contains("this session has no project; omit `tier` or use `global`"),
+            "{refused}"
+        );
+        // And without a tier its writes are global, as they always were.
+        no_project
+            .execute(
+                serde_json::json!({"name": "plain", "description": "d"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("write");
+        assert_eq!(written_project(&memories, "plain").await, "");
+    }
+
+    /// A search answers within the session's view, `tier` narrows it to one tier, and a global
+    /// hit is marked as such for a session on a project.
+    #[tokio::test]
+    async fn memory_search_answers_within_the_view_and_tier_narrows_it() {
+        let memories = store().await;
+        for (name, project) in [("shared", ""), ("mine", "webdev"), ("theirs", "movie")] {
+            memories
+                .write(WriteRequest {
+                    name: name.to_string(),
+                    description: Some(format!("{name} zebra note")),
+                    body: Some("about zebras".to_string()),
+                    view: MemoryView::All,
+                    project: Some(project.to_string()),
+                    ..Default::default()
+                })
+                .await
+                .expect("write");
+        }
+        let search = |input: serde_json::Value, project: crate::session::SharedProject| {
+            let memories = memories.clone();
+            async move {
+                MemorySearchTool { memories, project }
+                    .execute(
+                        input,
+                        crate::tools::ToolContext::detached(CancellationToken::new()),
+                    )
+                    .await
+                    .map(|output| output.text_content())
+            }
+        };
+        let text = search(
+            serde_json::json!({"queries": ["zebra"]}),
+            on_project("webdev"),
+        )
+        .await
+        .expect("search");
+        assert!(text.contains("- **shared** (p5, global, created"), "{text}");
+        assert!(text.contains("- **mine** (p5, created"), "{text}");
+        assert!(!text.contains("theirs"), "{text}");
+        let text = search(
+            serde_json::json!({"queries": ["zebra"], "tier": "global"}),
+            on_project("webdev"),
+        )
+        .await
+        .expect("search");
+        assert!(text.contains("in the global tier"), "{text}");
+        assert!(text.contains("shared") && !text.contains("mine"), "{text}");
+        let text = search(
+            serde_json::json!({"queries": ["zebra"], "tier": "project"}),
+            on_project("webdev"),
+        )
+        .await
+        .expect("search");
+        assert!(text.contains("in project 'webdev'"), "{text}");
+        assert!(text.contains("mine") && !text.contains("shared"), "{text}");
+        // A tier alone lists the tier.
+        let text = search(serde_json::json!({"tier": "project"}), on_project("webdev"))
+            .await
+            .expect("listing");
+        assert!(
+            text.contains("1 memory in project 'webdev', most important first"),
+            "{text}"
+        );
+        // A session on no project sees the global tier, marks nothing and has no project tier.
+        let text = search(
+            serde_json::json!({"queries": ["zebra"]}),
+            Default::default(),
+        )
+        .await
+        .expect("search");
+        assert!(text.contains("- **shared** (p5, created"), "{text}");
+        assert!(
+            !text.contains("mine") && !text.contains("global,"),
+            "{text}"
+        );
+        let refused = search(
+            serde_json::json!({"queries": ["zebra"], "tier": "project"}),
+            Default::default(),
+        )
+        .await
+        .expect_err("no project tier");
+        assert!(
+            refused.to_string().contains("this session has no project"),
+            "{refused}"
+        );
+    }
+
+    /// The near-duplicate note names a memory the session can see, never one in another project,
+    /// and a read of a project memory says which project it is in.
+    #[tokio::test]
+    async fn the_duplicate_note_and_the_read_follow_the_view() {
+        let memories = store().await;
+        memories
+            .write(WriteRequest {
+                name: "elsewhere".to_string(),
+                description: Some("the deploy pipeline runs nightly at two".to_string()),
+                view: MemoryView::All,
+                project: Some("movie".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("another project's note");
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+            project: on_project("webdev"),
+        };
+        let output = write
+            .execute(
+                serde_json::json!({
+                    "name": "pipeline",
+                    "description": "the deploy pipeline runs nightly at two",
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("write");
+        assert!(
+            !output
+                .text_content()
+                .contains("already says something very similar"),
+            "{}",
+            output.text_content()
+        );
+        let output = write
+            .execute(
+                serde_json::json!({
+                    "name": "pipeline-again",
+                    "description": "the deploy pipeline runs nightly at two",
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("write");
+        assert!(
+            output
+                .text_content()
+                .contains("'pipeline' already says something very similar"),
+            "{}",
+            output.text_content()
+        );
+        let read = MemoryReadTool {
+            memories: memories.clone(),
+            project: on_project("webdev"),
+        }
+        .execute(
+            serde_json::json!({"name": "pipeline"}),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
+        )
+        .await
+        .expect("read");
+        assert!(
+            read.text_content().contains("Project: webdev"),
+            "{}",
+            read.text_content()
+        );
+        let refused = MemoryReadTool {
+            memories: memories.clone(),
+            project: on_project("webdev"),
+        }
+        .execute(
+            serde_json::json!({"name": "elsewhere"}),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
+        )
+        .await
+        .expect_err("another project's memory is unknown here");
+        assert!(refused.to_string().contains("elsewhere"), "{refused}");
     }
 }

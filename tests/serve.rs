@@ -18398,3 +18398,458 @@ fn a_canceled_detached_turn_records_the_client_as_its_reason() {
     assert_eq!(ended["status"], "canceled", "{ended}");
     assert_eq!(ended["reason"], "client", "{ended}");
 }
+
+/// A session is created on a project, moved and taken off one by `PATCH`, listed by it, and
+/// refused a project the file does not define; `GET /v1/projects` lists the configured projects
+/// with their counts.
+#[test]
+fn sessions_carry_their_project_over_http() {
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "[projects.webdev]\n[projects.movie]\ndisabled_skills = [\"release\"]\n",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "sessions:w", "memory:r", "memory:w"],
+    );
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+    let created: serde_json::Value = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"working_directory": cwd, "project": "webdev"}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(created["project"], "webdev", "{created}");
+    let id = created["id"].as_str().expect("id").to_string();
+    let plain: serde_json::Value = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"working_directory": cwd}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(plain["project"], "", "{plain}");
+    let refused = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"working_directory": cwd, "project": "ghost"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        refused.status(),
+        422,
+        "{}",
+        refused.text().unwrap_or_default()
+    );
+
+    let listed: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/sessions?project=webdev")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let ids: Vec<&str> = listed["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .filter_map(|session| session["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec![id.as_str()], "{listed}");
+    let none: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/sessions?project=")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(none["sessions"].as_array().map(Vec::len), Some(1), "{none}");
+
+    let moved: serde_json::Value = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"project": "movie"}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(moved["project"], "movie", "{moved}");
+    let cleared: serde_json::Value = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"project": ""}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(cleared["project"], "", "{cleared}");
+    let refused = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"project": "ghost"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        refused.status(),
+        422,
+        "{}",
+        refused.text().unwrap_or_default()
+    );
+
+    let projects: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/projects")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        projects["projects"],
+        serde_json::json!([
+            {"name": "movie", "memories": 0, "sessions": 0, "configured": true, "disabled_skills": ["release"]},
+            {"name": "webdev", "memories": 0, "sessions": 0, "configured": true},
+        ]),
+        "{projects}"
+    );
+}
+
+/// The memory routes file a memory under a project, list one tier, read a name that is in several
+/// projects only when one is named, and refuse a project the file does not define.
+#[test]
+fn memory_routes_file_by_project_and_refuse_a_bare_name_in_several() {
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "[projects.webdev]\n[projects.movie]\n",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["memory:r", "memory:w"],
+    );
+    for project in ["webdev", "movie"] {
+        let written: serde_json::Value = harness
+            .request(reqwest::Method::PUT, "/v1/memory/notes")
+            .json(
+                &serde_json::json!({"description": format!("{project} notes"), "project": project}),
+            )
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        assert_eq!(written["project"], project, "{written}");
+    }
+    let global: serde_json::Value = harness
+        .request(reqwest::Method::PUT, "/v1/memory/shared")
+        .json(&serde_json::json!({"description": "for everyone"}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(global["project"], "", "{global}");
+    let refused = harness
+        .request(reqwest::Method::PUT, "/v1/memory/stray")
+        .json(&serde_json::json!({"description": "d", "project": "ghost"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        refused.status(),
+        422,
+        "{}",
+        refused.text().unwrap_or_default()
+    );
+    // A global name a project holds is refused, and nothing lands.
+    let refused = harness
+        .request(reqwest::Method::PUT, "/v1/memory/notes")
+        .json(&serde_json::json!({"description": "would shadow", "project": ""}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        refused.status(),
+        422,
+        "{}",
+        refused.text().unwrap_or_default()
+    );
+
+    let ambiguous = harness
+        .request(reqwest::Method::GET, "/v1/memory/notes")
+        .send()
+        .expect("send");
+    assert_eq!(
+        ambiguous.status(),
+        422,
+        "{}",
+        ambiguous.text().unwrap_or_default()
+    );
+    let detail: serde_json::Value = ambiguous.json().expect("problem");
+    assert!(
+        detail["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("memory 'notes' exists in projects 'movie' and 'webdev'; name the project"),
+        "{detail}"
+    );
+    let named: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/memory/notes?project=movie")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(named["description"], "movie notes", "{named}");
+    // A citation resolves within the citer's tiers: movie's note cites movie's `notes`, not
+    // webdev's.
+    let cited: serde_json::Value = harness
+        .request(reqwest::Method::PUT, "/v1/memory/cite")
+        .json(&serde_json::json!({"description": "cites the project's own", "references": ["notes"], "project": "movie"}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(cited["project"], "movie", "{cited}");
+    let backlinks = |project: &str| -> serde_json::Value {
+        harness
+            .request(
+                reqwest::Method::GET,
+                &format!("/v1/memory/notes?project={project}"),
+            )
+            .send()
+            .expect("send")
+            .json::<serde_json::Value>()
+            .expect("parse")["referenced_by"]
+            .clone()
+    };
+    assert_eq!(backlinks("movie"), serde_json::json!(["cite"]));
+    assert_eq!(backlinks("webdev"), serde_json::json!([]));
+
+    let tier = |query: &str| -> Vec<String> {
+        harness
+            .request(reqwest::Method::GET, &format!("/v1/memory{query}"))
+            .send()
+            .expect("send")
+            .json::<serde_json::Value>()
+            .expect("parse")["memories"]
+            .as_array()
+            .expect("memories")
+            .iter()
+            .map(|memory| {
+                format!(
+                    "{}:{}",
+                    memory["project"].as_str().unwrap_or_default(),
+                    memory["name"].as_str().unwrap_or_default()
+                )
+            })
+            .collect()
+    };
+    assert_eq!(tier("?project=webdev"), ["webdev:notes"]);
+    assert_eq!(tier("?project="), [":shared"]);
+    assert_eq!(tier("").len(), 4);
+    let searched = tier("?q=notes&project=movie");
+    assert_eq!(searched, ["movie:notes"]);
+
+    let ambiguous = harness
+        .request(reqwest::Method::DELETE, "/v1/memory/notes")
+        .send()
+        .expect("send");
+    assert_eq!(ambiguous.status(), 422);
+    assert_eq!(tier("").len(), 4, "a refused delete removes nothing");
+    let deleted = harness
+        .request(reqwest::Method::DELETE, "/v1/memory/notes?project=webdev")
+        .send()
+        .expect("send");
+    assert_eq!(deleted.status(), 204);
+    assert_eq!(tier("?project=webdev"), Vec::<String>::new());
+}
+
+/// A skill the session's project hides reaches it through no door: `options.skill` refuses it on
+/// a turn, and the first turn after the move announces the skill as gone under the project line.
+#[test]
+fn a_project_move_hides_a_skill_from_the_turn_option_and_announces_it() {
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "[projects.movie]\ndisabled_skills = [\"release\"]\n",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+    );
+    let release = harness.root().join("meka").join("skills").join("release");
+    std::fs::create_dir_all(&release).expect("mkdir");
+    std::fs::write(
+        release.join("SKILL.md"),
+        "---\nname: release\ndescription: how to cut a release\n---\nTag it.\n",
+    )
+    .expect("seed");
+    let id = create_session_id(&harness);
+    let turn = |body: serde_json::Value| {
+        harness
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+            .json(&body)
+            .send()
+            .expect("send")
+    };
+    let shown = turn(serde_json::json!({
+        "message": "go",
+        "options": {"skill": "release"},
+        "stream": false,
+    }));
+    assert_eq!(shown.status(), 200, "{}", shown.text().unwrap_or_default());
+
+    let moved = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"project": "movie"}))
+        .send()
+        .expect("send");
+    assert_eq!(moved.status(), 200, "{}", moved.text().unwrap_or_default());
+    let hidden = turn(serde_json::json!({
+        "message": "go",
+        "options": {"skill": "release"},
+        "stream": false,
+    }));
+    assert_eq!(hidden.status(), 422);
+    let detail: serde_json::Value = hidden.json().expect("problem");
+    assert!(
+        detail["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("project 'movie' hides skill 'release'"),
+        "{detail}"
+    );
+    let after = turn(serde_json::json!({"message": "and now", "stream": false}));
+    assert_eq!(after.status(), 200, "{}", after.text().unwrap_or_default());
+
+    let body: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let user_texts: Vec<String> = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .map(message_text)
+        .collect();
+    // The turn after the move, not the last user message: the mock's empty rounds draw nudges.
+    let moved_turn = user_texts
+        .iter()
+        .find(|text| text.contains("- Project is now 'movie'."))
+        .unwrap_or_else(|| panic!("no turn announced the move: {user_texts:?}"));
+    assert!(
+        moved_turn.contains("Skills no longer available") && moved_turn.contains("release"),
+        "{moved_turn}"
+    );
+}
+
+/// A `PATCH` naming the project while a turn runs is refused as one naming the profile is: the
+/// turn's memories file into the tier its context shows, and its catalog is read through one view.
+#[test]
+fn a_project_patch_during_a_turn_is_refused_like_a_profile_s() {
+    let script = serde_json::json!([
+        [
+            { "type": "sleep", "ms": 1500 },
+            { "type": "text", "text": "first done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness =
+        ServeTestHarness::spawn_with("", "[projects.movie]\n", script, "sk_test_token", &[
+            "sessions:r",
+            "sessions:w",
+        ]);
+    let id = create_session_id(&harness);
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let id_clone = id.clone();
+    let first = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{base_url}/v1/sessions/{id_clone}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"message": "first", "stream": true}))
+            .send()
+            .expect("first send")
+    });
+    harness.wait_until_in_flight(&id);
+    let refused = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"project": "movie"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        refused.status(),
+        409,
+        "{}",
+        refused.text().unwrap_or_default()
+    );
+    let body: serde_json::Value = refused.json().expect("parse");
+    assert_eq!(body["type"], "https://meka.run/errors/turn-in-flight");
+    let _ = first.join().expect("join").text();
+
+    let moved: serde_json::Value = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"project": "movie"}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        moved["project"], "movie",
+        "after the turn, the move lands: {moved}"
+    );
+}
+
+/// A dormant `PATCH` naming a profile and an unknown project writes nothing: both names are
+/// checked before either lands, as the resident path checks every field up front.
+#[test]
+fn a_dormant_patch_with_an_unknown_project_leaves_the_profile_alone() {
+    let harness = ServeTestHarness::spawn_with_prelude(
+        "default_profile = \"mock\"\n",
+        r#"
+[accounts.other]
+backend = "anthropic-messages"
+
+[profiles.other]
+account = "other"
+model = "claude-sonnet-4-5"
+context_window = 32000
+"#,
+        mock_simple_turn(),
+    );
+    // Imported rather than created, so no entry is resident and the dormant path is the one taken.
+    let source = create_session_id(&harness);
+    let envelope: serde_json::Value = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{source}/export?format=json"),
+        )
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let imported: serde_json::Value = harness
+        .request(reqwest::Method::POST, "/v1/sessions/import")
+        .json(&envelope)
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let id = imported["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+    let refused = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"profile": "other", "project": "ghost"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        refused.status(),
+        422,
+        "{}",
+        refused.text().unwrap_or_default()
+    );
+    let fetched: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        fetched["profile"], "mock",
+        "the profile did not move: {fetched}"
+    );
+    assert_eq!(fetched["project"], "", "{fetched}");
+}

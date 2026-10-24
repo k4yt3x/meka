@@ -16,7 +16,7 @@ Sessions persist your conversation so you can resume later. Each session has an 
 meka -c
 ```
 
-This resumes the most recently updated session. `-c` takes no value; give an opening prompt with `-p`: `meka -c -p "and now add tests"`.
+This resumes the most recently updated session. `-c` takes no value; give an opening prompt with `-p`: `meka -c -p "and now add tests"`. With `--project <name>` it is the most recently updated session on that [project](./projects.md), or a new one on it when there is none.
 
 ### From a list
 
@@ -30,7 +30,8 @@ directory is cut from its start so its tail stays, and a narrow terminal drops t
 column, then the profile. `/` then typing filters the
 list, j and k move the pick, Enter resumes the pick, and Esc leaves you in a new session. The same picker opens from a running session with
 `/resume`, and `/resume <id>` switches to a session by id or unique prefix; either way the lock
-moves with you and the session you left stays as it was.
+moves with you and the session you left stays as it was. `meka -r --project <name>` opens the
+picker over that project's sessions alone.
 
 ### By id
 
@@ -38,7 +39,9 @@ moves with you and the session you left stays as it was.
 meka -r 550e8400-e29b-41d4-a716-446655440000
 ```
 
-The agent loads the previous conversation and continues from where you left off.
+The agent loads the previous conversation and continues from where you left off. `--project
+<name>` beside an id moves that session onto the project, rewriting its row, as `--profile` repins
+its profile.
 
 ### By id prefix
 
@@ -422,16 +425,18 @@ meka session list
 ```
 
 This shows a table with each session's id, last update time (local, with its UTC offset), profile,
-and its title: the one you [set](#titling-a-session), else the words of the first message. Pinned
-sessions come first, newest pin on top, marked with `*`; the rest follow most recently updated
-first:
+[project](./projects.md) (`-` for none), and its title: the one you [set](#titling-a-session), else
+the words of the first message. Pinned sessions come first, newest pin on top, marked with `*`; the
+rest follow most recently updated first:
 
 ```
-ID        Updated                  Profile   Title
-7c1d9e02  2026-02-20 18:04 +00:00  work      * Research: LLM security blind spots
-550e8400  2026-03-14 12:00 +00:00  work      How do I implement a binary search tree?
-a1b2c3d4  2026-03-13 09:30 +00:00  personal  Fix the login page CSS
+ID        Updated                  Profile   Project  Title
+7c1d9e02  2026-02-20 18:04 +00:00  work      -        * Research: LLM security blind spots
+550e8400  2026-03-14 12:00 +00:00  work      webdev   How do I implement a binary search tree?
+a1b2c3d4  2026-03-13 09:30 +00:00  personal  -        Fix the login page CSS
 ```
+
+`--project <name>` lists the sessions on one project; `--project ""` those on none.
 
 The `ID` column shows as much of each id as distinguishes it from the others on screen, widening only
 if two would otherwise read the same. Every command that takes a session id (`meka -r`, `export`,
@@ -598,7 +603,7 @@ Pass `--format json` for a structured export instead of rendered Markdown:
 meka session export 550e8400-e29b-41d4-a716-446655440000 --format json
 ```
 
-This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, and scratchpad entries. The archive carries `format_version: 15`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 14), which is brought forward as it is read. Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
+This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, its profile and project, and scratchpad entries. The archive carries `format_version: 15`, and an import refuses any other version rather than guessing at its shape, except an archive written by 0.59 or later (`format_version` 3 to 14), which is brought forward as it is read. Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
 
 ## Importing a session
 

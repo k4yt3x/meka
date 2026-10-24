@@ -343,11 +343,16 @@ pub(crate) fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
             version,
             profile,
             model,
+            project,
             directory,
         } => {
             let profile = match model {
                 Some(model) => format!("{profile} ({model})"),
                 None => profile.clone(),
+            };
+            let profile = match project {
+                Some(project) => format!("{profile}, project '{project}'"),
+                None => profile,
             };
             let lead = BANNER_GAP + display_width(BANNER_MARK[0]) + 2;
             let room = width.saturating_sub(lead).max(1);
@@ -1433,6 +1438,7 @@ mod tests {
                 version: token.clone(),
                 profile: token.clone(),
                 model: Some(address.clone()),
+                project: None,
                 directory: address.clone(),
             },
         ];
@@ -1806,6 +1812,7 @@ mod tests {
             version: "0.72.0".into(),
             profile: "synthetic".into(),
             model: Some("hf:zai-org/GLM-5.3".into()),
+            project: None,
             directory: "~/projects/something".into(),
         };
         let lines = entry_lines(&entry(item, false), 80);
@@ -1853,6 +1860,7 @@ mod tests {
                     version: "0.72.0".into(),
                     profile: "work".into(),
                     model: None,
+                    project: None,
                     directory: "~".into(),
                 },
                 false,

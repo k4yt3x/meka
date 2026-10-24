@@ -1030,6 +1030,21 @@ pub(crate) fn unknown_name(
     }
 }
 
+/// The one sentence for a memory name that lives in more than one project when the caller named
+/// none: `memory 'notes' exists in projects 'a' and 'b'; name the project`.
+pub(crate) fn ambiguous_project_name(noun: &str, given: &str, projects: &[String]) -> String {
+    let quoted: Vec<String> = projects
+        .iter()
+        .map(|project| format!("'{project}'"))
+        .collect();
+    let listed = match quoted.split_last() {
+        None => String::new(),
+        Some((only, [])) => only.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    };
+    format!("{noun} '{given}' exists in projects {listed}; name the project")
+}
+
 /// The `Authorization` value for a bearer token (RFC 6750): one spelling for every backend and
 /// every stored credential that sends one, whether the token is an API key or an OAuth access
 /// token.

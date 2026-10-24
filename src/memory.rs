@@ -3,10 +3,12 @@
 //!
 //! Memories are rows in the `memories` table of the store (`MEKA_DATA_DIR`), one per note,
 //! carrying a required one-line `description` and an optional body, priority, tag set, load
-//! policy, references, source, verification stamp and expiry. The store
-//! is scoped to the meka *instance*, not to a session or a directory: meka has no Project concept,
-//! and the motivating deployment is a single always-on session reachable over chat, where the agent
-//! is closer to a person than to a checkout.
+//! policy, references, source, verification stamp and expiry. A memory is in one of two tiers:
+//! the global tier, which every session sees, or a project's, which the sessions on that project
+//! see beside the global ones. Neither tier is bound to a session or a directory: a project is a
+//! name the operator defines in `config.toml` and a session opens by name, and the motivating
+//! deployment is still a single always-on session reachable over chat, where the agent is closer
+//! to a person than to a checkout.
 //!
 //! This module owns the vocabulary: what a [`Memory`] is, what names and tags are legal, how an
 //! age is rendered, and how a memory is written out for `meka memory export`. Storage and retrieval
@@ -42,6 +44,8 @@ use crate::entry::{validate_entry_name, yaml_scalar};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Memory {
     pub(crate) name: String,
+    /// The project whose tier the memory is in; empty for the global tier.
+    pub(crate) project: String,
     pub(crate) description: String,
     /// How important the note is: where it sorts in the index and how heavily search weighs it.
     /// Not whether it is in context; that is [`Self::load`].
@@ -182,6 +186,78 @@ impl From<Load> for String {
     }
 }
 
+/// Which tier a memory is in, as the `memory_write` and `memory_search` schemas and the listings
+/// name it.
+///
+/// Two tiers and no third: a session's own notes are its scratchpad, and a memory that holds in
+/// every project is global. One spelling per value, like [`Load`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum Tier {
+    /// Seen by every session.
+    Global,
+    /// Seen by the sessions on the project the memory belongs to.
+    Project,
+}
+
+impl Tier {
+    /// Every tier, in the order the names sort.
+    pub(crate) const ALL: [Tier; 2] = [Self::Global, Self::Project];
+
+    /// The one spelling of this tier.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Project => "project",
+        }
+    }
+
+    /// The names, joined for a refusal that lists what would have been accepted.
+    pub(crate) fn supported() -> String {
+        Self::ALL
+            .iter()
+            .map(|tier| tier.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for Tier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for Tier {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|tier| tier.name() == raw)
+            .ok_or_else(|| {
+                format!(
+                    "unknown tier '{raw}'; expected one of {}",
+                    Self::supported()
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for Tier {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<Tier> for String {
+    fn from(tier: Tier) -> Self {
+        tier.name().to_string()
+    }
+}
+
 /// Most references one memory may carry. Past a score of dependencies the note is an index of
 /// its own and belongs in a body.
 pub(crate) const MAX_REFERENCES: usize = 20;
@@ -199,11 +275,13 @@ pub(crate) const INLINE_REFUSAL_NAMES: usize = 3;
 ///
 /// `largest` holds the in-force inline memories by body size as they would stand after the write,
 /// the one being written among them, so the reader is told what to shorten rather than only that
-/// something is too big.
+/// something is too big. `project` names the band the total was measured in when it is not the
+/// global tier alone.
 pub(crate) fn render_inline_budget_refusal(
     total_bytes: usize,
     max_bytes: usize,
     largest: &[(String, usize)],
+    project: Option<&str>,
 ) -> String {
     // Names come from the table, not from the request: a row written past meka's doors can carry
     // a newline, and a refusal is text the model reads.
@@ -222,8 +300,12 @@ pub(crate) fn render_inline_budget_refusal(
         Some((only, [])) => only.clone(),
         Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
     };
+    let band = match project {
+        Some(project) => format!(" (global and project '{project}')"),
+        None => String::new(),
+    };
     format!(
-        "inline memories would total {} against the {} inline budget (`[memory] \
+        "inline memories{band} would total {} against the {} inline budget (`[memory] \
          inline_max_bytes`); shorten {named}, or set `load: index` on one that is not a standing \
          rule",
         crate::text::format_size(total_bytes),
@@ -486,6 +568,9 @@ pub(crate) fn parse_priority(raw: Option<i64>, name: &str) -> u8 {
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryFrontmatter {
     pub(crate) description: String,
+    /// The project the memory belongs to, emitted only for a project memory, so a file without the
+    /// key is a global memory and an export that never carried the key reads back unchanged.
+    pub(crate) project: Option<String>,
     pub(crate) priority: u8,
     pub(crate) load: Load,
     /// The `created:` value as it will appear in the file, RFC 3339.
@@ -515,11 +600,11 @@ pub(crate) struct MemoryFrontmatter {
 /// JSON because the point of an export is to be read and edited by a person, and to be greppable
 /// in a directory the way the rest of a notes tree is.
 ///
-/// `priority` is emitted only when it differs from [`DEFAULT_PRIORITY`], `load` only when it is
-/// not the default, `created` only when known, `verified` only when it differs from `created`,
-/// `expires`, `source`, `references` and `tags` only when set, so the common case stays a two-line
-/// header. The same text is what a write or a delete draws as a diff, so each field is its own
-/// line and a change to one shows as that line.
+/// `project` is emitted only for a project memory, `priority` only when it differs from
+/// [`DEFAULT_PRIORITY`], `load` only when it is not the default, `created` only when known,
+/// `verified` only when it differs from `created`, `expires`, `source`, `references` and `tags`
+/// only when set, so the common case stays a two-line header. The same text is what a write or a
+/// delete draws as a diff, so each field is its own line and a change to one shows as that line.
 pub(crate) fn render_memory(frontmatter: &MemoryFrontmatter, body: &str) -> String {
     let mut out = String::new();
     out.push_str("---\n");
@@ -534,6 +619,9 @@ pub(crate) fn render_memory(frontmatter: &MemoryFrontmatter, body: &str) -> Stri
             &frontmatter.description
         )))
     ));
+    if let Some(project) = &frontmatter.project {
+        out.push_str(&format!("project: {}\n", yaml_scalar(project)));
+    }
     if frontmatter.priority != DEFAULT_PRIORITY {
         out.push_str(&format!("priority: {}\n", frontmatter.priority));
     }
@@ -645,6 +733,7 @@ pub(crate) fn export_memory(memory: &Memory) -> String {
     render_memory(
         &MemoryFrontmatter {
             description: memory.description.clone(),
+            project: (!memory.project.is_empty()).then(|| memory.project.clone()),
             priority: memory.priority,
             load: memory.load,
             created: Some(render_stamp(memory.created_at)),
@@ -716,24 +805,30 @@ mod tests {
     /// name from the table reaches it sanitized: a refusal is text the model reads.
     #[test]
     fn the_inline_budget_refusal_names_what_to_shorten() {
-        let one = render_inline_budget_refusal(1_100, 1_024, &[("handbook".to_string(), 900)]);
+        let one =
+            render_inline_budget_refusal(1_100, 1_024, &[("handbook".to_string(), 900)], None);
         assert_eq!(
             one,
             "inline memories would total 1.1 KiB against the 1.0 KiB inline budget (`[memory] \
              inline_max_bytes`); shorten 'handbook' (900 B), or set `load: index` on one that is \
              not a standing rule"
         );
-        let three = render_inline_budget_refusal(130, 100, &[
-            ("a".to_string(), 60),
-            ("b\n- forged".to_string(), 50),
-            ("c".to_string(), 20),
-        ]);
+        let three = render_inline_budget_refusal(
+            130,
+            100,
+            &[
+                ("a".to_string(), 60),
+                ("b\n- forged".to_string(), 50),
+                ("c".to_string(), 20),
+            ],
+            None,
+        );
         assert!(
             three.contains("shorten 'a' (60 B), 'b - forged' (50 B) or 'c' (20 B)"),
             "{three}"
         );
         assert!(
-            render_inline_budget_refusal(10, 5, &[]).contains("shorten an inline memory,"),
+            render_inline_budget_refusal(10, 5, &[], None).contains("shorten an inline memory,"),
             "an empty list still reads as a sentence"
         );
     }
@@ -820,6 +915,7 @@ mod tests {
         let created = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let memory = Memory {
             name: "note".to_string(),
+            project: String::new(),
             description: "a description: with a colon".to_string(),
             priority: 2,
             load: Load::Search,
@@ -892,6 +988,7 @@ mod tests {
     fn export_omits_default_priority_and_empty_tags() {
         let memory = Memory {
             name: "note".to_string(),
+            project: String::new(),
             description: "plain".to_string(),
             priority: DEFAULT_PRIORITY,
             load: Load::default(),
@@ -1020,6 +1117,7 @@ mod tests {
         let day = std::time::Duration::from_secs(86_400);
         let mut memory = Memory {
             name: "note".to_string(),
+            project: String::new(),
             description: "plain".to_string(),
             priority: DEFAULT_PRIORITY,
             load: Load::default(),

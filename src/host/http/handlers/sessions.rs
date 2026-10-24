@@ -107,6 +107,10 @@ pub(crate) struct CreateSessionRequest {
     /// it. Defaults to the server's own default profile. Must name a profile in `config.toml`;
     /// `GET /v1/profiles` lists them.
     pub(crate) profile: Option<String>,
+    /// Project the session opens on, which decides the memory tier its writes land in and the
+    /// tiers it sees. Absent or empty, the session is on none. Must name a project in
+    /// `config.toml`; `GET /v1/projects` lists them.
+    pub(crate) project: Option<String>,
     /// Per-session capability flags. See the HTTP API docs § "Capabilities".
     #[serde(default)]
     pub(crate) capabilities: CapabilitiesBody,
@@ -226,6 +230,9 @@ pub(crate) struct ListSessionsQuery {
     /// every session records.
     #[serde(default)]
     pub(crate) working_directory: Option<String>,
+    /// Only sessions on this project; an empty value, the sessions on none.
+    #[serde(default)]
+    pub(crate) project: Option<String>,
     /// Only the sub-agents this session spawned, its direct children. A tree view expands one
     /// node with one call and recurses for depth. Names sub-agents by definition, so
     /// `include_children` is moot beside it; a session with none, or an id no session has, is an
@@ -342,6 +349,17 @@ pub(crate) async fn create_session(
             .map_err(|error| ProblemDetail::internal_sanitized("no default profile", error))?
             .to_string(),
     };
+    // The project, checked before the row is written for the reason the profile is; empty is
+    // the one spelling for none, as it is on a `PATCH`.
+    let project = match body.project.filter(|name| !name.is_empty()) {
+        Some(name) => {
+            crate::config::require_project(&name, &state.shared.config.projects).map_err(
+                |error| ProblemDetail::for_error(&error, state.config.relay_provider_errors),
+            )?;
+            name
+        }
+        None => String::new(),
+    };
     // Created and locked in one step, the lock taken *before* the row exists. A row committed
     // ahead of its lock is visible to `meka session remove --all`, which enumerates at delete
     // time, takes the lock nobody holds yet, and cascades the session away underneath this
@@ -356,6 +374,7 @@ pub(crate) async fn create_session(
             capabilities_json,
             Some(principal.token_id.clone()),
             profile.clone(),
+            project.clone(),
         )
         .await
         .map_err(|error| ProblemDetail::internal_sanitized("failed to create session", error))?;
@@ -391,6 +410,7 @@ pub(crate) async fn create_session(
             context_tokens: Arc::clone(&context_used),
             context_overhead: Arc::clone(&context_overhead),
             context_window: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            project: None,
         },
         crate::host::Opening::Fresh,
         session_lock,
@@ -435,6 +455,7 @@ pub(crate) async fn create_session(
             permission: Some(permission),
             approvals,
             profile,
+            project,
             title,
             // A root by construction: `POST /v1/sessions` has no way to name a parent, and
             // a sub-agent session is only ever minted by `agent_spawn` inside a turn.
@@ -714,6 +735,7 @@ pub(crate) async fn fork_session(
             permission: Some(entry.cells().permission.get()),
             approvals: entry.cells().permission.approvals(),
             profile: forked_info.profile,
+            project: forked_info.project,
             title: forked_info.title,
             // Read back rather than assumed: forking a sub-agent session keeps it under the
             // same parent, so the copy is a sibling of the original, not a new root, and a
@@ -783,6 +805,7 @@ pub(crate) async fn list_sessions(
     // paging client on a store full of them.
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let filter = crate::store::SessionFilter {
+        project: query.project,
         include_children: query.include_children.unwrap_or(false),
         cwd: query
             .working_directory
@@ -1119,6 +1142,7 @@ pub(crate) async fn get_session(
                 permission: Some(entry.cells().permission.get()),
                 approvals: entry.cells().permission.approvals(),
                 profile: info.profile,
+                project: info.project,
                 title: info.title,
                 parent_id: info.parent_id,
                 pinned_at: info.pinned_at,
@@ -1184,6 +1208,7 @@ async fn patch_dormant_session(
     state: &ServerState,
     id: Uuid,
     profile: Option<&str>,
+    project: Option<&str>,
     title: Option<Option<String>>,
     pinned: Option<bool>,
 ) -> Result<Option<Json<SessionResponse>>, ProblemDetail> {
@@ -1193,32 +1218,39 @@ async fn patch_dormant_session(
     }
     require_session_exists(state, id).await?;
     let before = dormant_record(state, id).await?;
-    if let Some(profile) = profile {
-        // `session-locked`, the same code `ensure_session_loaded` answers a cross-process conflict
-        // with, and for the same reason: this is another process owning the session, not an
-        // in-process turn. Held for the rest of the body, so nothing can attach between here and
-        // the write.
-        //
-        // Only a held lock, though. The lock directory failing to open is the operator's fault and
-        // names their path, so it goes to the log as a 500 rather than to the caller as a conflict
-        // a retry would never resolve.
-        let _session = state
-            .shared
-            .store
-            .lock_session(id)
-            .map_err(|error| match error {
+    // `session-locked`, the same code `ensure_session_loaded` answers a cross-process conflict
+    // with, and for the same reason: this is another process owning the session, not an
+    // in-process turn. Held for the rest of the body, so nothing can attach between here and the
+    // write. The project takes it as the profile does: a running host caches both.
+    //
+    // Only a held lock, though. The lock directory failing to open is the operator's fault and
+    // names their path, so it goes to the log as a 500 rather than to the caller as a conflict a
+    // retry would never resolve.
+    let _session = if profile.is_some() || project.is_some() {
+        Some(state.shared.store.lock_session(id).map_err(|error| {
+            match error {
                 crate::error::MekaError::SessionLocked(_) => ProblemDetail::new(
                     ErrorKind::SessionLocked,
                     StatusCode::CONFLICT,
-                    "another meka process is running this session, so its profile cannot be \
-                     changed from here",
+                    "another meka process is running this session, so its profile or \
+                         project cannot be changed from here",
                 )
                 .with("session_id", id.to_string()),
                 other => {
                     ProblemDetail::internal_sanitized("failed to lock session for repin", other)
                         .with("session_id", id.to_string())
                 }
-            })?;
+            }
+        })?)
+    } else {
+        None
+    };
+    // Both names checked before either is written, as the resident path checks every field up
+    // front, so a body naming a profile and an unknown project leaves the row where it was.
+    let project = project
+        .map(|project| requested_project_move(state, project))
+        .transpose()?;
+    if let Some(profile) = profile {
         crate::config::require_profile(profile, &state.shared.config.profiles).map_err(
             |error| ProblemDetail::for_error(&error, state.config.relay_provider_errors),
         )?;
@@ -1243,6 +1275,13 @@ async fn patch_dormant_session(
             .await
             .map_err(|error| {
                 agent_build_problem(id, "failed to record the session's profile", error)
+            })?;
+    }
+    if let Some(project) = project {
+        crate::host::record_project_switch(&state.shared.store, id, project.as_deref())
+            .await
+            .map_err(|error| {
+                agent_build_problem(id, "failed to record the session's project", error)
             })?;
     }
     if title.is_some() || pinned.is_some() {
@@ -1273,6 +1312,20 @@ async fn patch_dormant_session(
         );
     }
     Ok(Some(Json(record)))
+}
+
+/// The project a `PATCH` body names as the row takes it: `None` for the empty value that takes the
+/// session off its project, the name otherwise, refused when `config.toml` does not define it.
+fn requested_project_move(
+    state: &ServerState,
+    project: &str,
+) -> Result<Option<String>, ProblemDetail> {
+    if project.is_empty() {
+        return Ok(None);
+    }
+    crate::config::require_project(project, &state.shared.config.projects)
+        .map_err(|error| ProblemDetail::for_error(&error, state.config.relay_provider_errors))?;
+    Ok(Some(project.to_string()))
 }
 
 /// A session's record as its row states it, for a session this process does not hold: not
@@ -1358,12 +1411,16 @@ pub(crate) async fn patch_session(
     if body.permission.is_none()
         && body.approvals.is_none()
         && body.working_directory.is_none()
-        && (body.profile.is_some() || new_title.is_some() || body.pinned.is_some())
+        && (body.profile.is_some()
+            || body.project.is_some()
+            || new_title.is_some()
+            || body.pinned.is_some())
         && !state.sessions.read().await.contains_key(&id)
         && let Some(response) = patch_dormant_session(
             &state,
             id,
             body.profile.as_deref(),
+            body.project.as_deref(),
             new_title.clone(),
             body.pinned,
         )
@@ -1376,8 +1433,10 @@ pub(crate) async fn patch_session(
     // which is what makes the level a brake, and the screen's Shift+Tab and ACP's
     // `session/set_mode` move them mid-turn for that reason. The working directory and the
     // profile are different. The file tools resolve every path against the live cwd cell, so a
-    // directory moved under a running turn moves its write fence, and the profile is a turn's
-    // wire. A body naming either claims the session the way compact and rewind do: `claim_idle`
+    // directory moved under a running turn moves its write fence, the profile is a turn's wire,
+    // and the project is the tier a turn's memories file into and the view its catalog is read
+    // through. A body naming any of the three claims the session the way compact and rewind do:
+    // `claim_idle`
     // under the sessions read-lock, so DELETE's re-check sees it, then the conversation mutex,
     // both held to the end of the handler across the row write, the cell writes and the agent
     // swap. A turn arriving meanwhile finds the mutex held and answers 409, and so does a
@@ -1390,10 +1449,10 @@ pub(crate) async fn patch_session(
     // An entry missing from the map under the lock was evicted or deleted since it was loaded;
     // `ensure_session_loaded` answers 404 for a row that is gone and re-attaches the other, and the
     // next pass finds it.
-    const DOING: &str = "change the session's working directory or profile";
+    const DOING: &str = "change the session's working directory, profile or project";
     let (entry, _turn_exclusive) = loop {
         let entry = ensure_session_loaded(&state, id).await?;
-        if body.working_directory.is_none() && body.profile.is_none() {
+        if body.working_directory.is_none() && body.profile.is_none() && body.project.is_none() {
             break (entry, None);
         }
         let map = state.sessions.read().await;
@@ -1467,6 +1526,12 @@ pub(crate) async fn patch_session(
         }
         None => None,
     };
+    // The project, checked against the file before anything moves; the empty value is the one
+    // spelling for off.
+    let new_project: Option<Option<String>> = match body.project.as_deref() {
+        Some(project) => Some(requested_project_move(&state, project)?),
+        None => None,
+    };
 
     // Filter out no-op fields so a PATCH that doesn't change anything skips the DB write
     // and doesn't advance `updated_at` (used by clients for change detection).
@@ -1495,6 +1560,22 @@ pub(crate) async fn patch_session(
         }
         None => false,
     };
+    // The project likewise: only whether the row already says this, since the live agent is moved
+    // further down regardless.
+    let project_row_write = match new_project.as_ref() {
+        Some(project) => {
+            let current = state
+                .shared
+                .store
+                .recorded_project(id)
+                .await
+                .map_err(|error| {
+                    ProblemDetail::internal_sanitized("failed to read session project", error)
+                })?;
+            current.as_deref() != Some(project.as_deref().unwrap_or_default())
+        }
+        None => false,
+    };
     let patch = crate::store::SessionPatch {
         permission: permission_change,
         approvals: approvals_change,
@@ -1504,6 +1585,13 @@ pub(crate) async fn patch_session(
                 new_profile
                     .as_ref()
                     .map(|resolved| resolved.profile.clone())
+            })
+            .flatten(),
+        project: project_row_write
+            .then(|| {
+                new_project
+                    .as_ref()
+                    .map(|project| project.clone().unwrap_or_default())
             })
             .flatten(),
         roots: None,
@@ -1554,6 +1642,11 @@ pub(crate) async fn patch_session(
         // cell `set_profile` publishes into, so moving the agent moves them.
         entry.agent.set_provider(resolved);
     }
+    // The project moves with the row for the same reason, and the next turn's context restates
+    // the memories the session now sees.
+    if let Some(project) = new_project {
+        entry.agent.set_project(project);
+    }
 
     // Bump `updated_at` only on the changes the row's own rule moves it for, so the live clock
     // agrees with the row; leave the resident's clock alone so the GC scanner's idle timer tracks
@@ -1588,6 +1681,7 @@ pub(crate) async fn patch_session(
             permission: Some(entry.cells().permission.get()),
             approvals: entry.cells().permission.approvals(),
             profile: info.profile,
+            project: info.project,
             title: info.title,
             parent_id: info.parent_id,
             pinned_at: info.pinned_at,
@@ -1634,6 +1728,12 @@ pub(crate) struct PatchSessionRequest {
     /// profile with `vision = false` refuses the next turn while the session holds an image.
     #[serde(default)]
     pub(crate) profile: Option<String>,
+    /// Project to move the session onto, which decides the memory tier its writes land in and the
+    /// tiers it sees. Must name a project in `config.toml`; empty takes the session off its
+    /// project. Absent → keep current. The next turn's context restates the memories the session
+    /// now sees.
+    #[serde(default)]
+    pub(crate) project: Option<String>,
     /// The session's title, as every listing shows it. Empty clears it, so the session is labeled
     /// by its first words again. Absent → keep current. Does not move `updated_at`.
     #[serde(default)]

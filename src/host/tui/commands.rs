@@ -79,6 +79,11 @@ async fn attach_session(value: &str, context: AttachContext<'_>) -> anyhow::Resu
     let hydrated = crate::host::hydrate_conversation(store, id).await?;
     let profile = crate::provider::profile_for_config(store, config, Some(id)).await?;
     let resolved = crate::host::resolve_profile_switch(shared, &profile).await?;
+    // The row's project, refused by name when the file no longer defines it, as the profile is.
+    let project = (!recorded.project.is_empty()).then(|| recorded.project.clone());
+    if let Some(name) = &project {
+        crate::host::resolve_project_switch(shared, name)?;
+    }
     // The row's level, clamped to what the configuration still allows, as every resume reads it.
     let level = config
         .enabled_permissions
@@ -91,6 +96,7 @@ async fn attach_session(value: &str, context: AttachContext<'_>) -> anyhow::Resu
     let cells = agent.cells();
     cells.session_id.set(id);
     agent.set_provider(resolved);
+    agent.set_project(project);
     *crate::sync::write(current_profile) = profile;
     if let Err(error) = cells.permission.try_set(level) {
         tracing::warn!("{error}");
@@ -503,6 +509,39 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             *crate::sync::write(current_profile) = name.clone();
             ui.note(format!("Profile set to: {name}"));
         }
+        // The row moves first, for the reason the profile's does: the row is where every other
+        // process reads which tier this session's memories are in.
+        SlashCommand::Project(ProjectVerb::Open(name)) => 'open: {
+            let project = match crate::host::resolve_project_switch(shared, &name) {
+                Ok(project) => project,
+                Err(error) => {
+                    ui.reply(error.to_string());
+                    break 'open;
+                }
+            };
+            if let Some(id) = session_id
+                && let Err(error) =
+                    crate::host::record_project_switch(store, id, Some(&project)).await
+            {
+                ui.reply(error.to_string());
+                break 'open;
+            }
+            agent.set_project(Some(project.clone()));
+            ui.note(format!("Project set to: {project}"));
+        }
+        SlashCommand::Project(ProjectVerb::Close) => 'close: {
+            if let Some(id) = session_id
+                && let Err(error) = crate::host::record_project_switch(store, id, None).await
+            {
+                ui.reply(error.to_string());
+                break 'close;
+            }
+            agent.set_project(None);
+            ui.note("Project set to: none");
+        }
+        SlashCommand::Project(ProjectVerb::Unknown(_)) => {
+            ui.reply("Usage: /project [open <name>|close]");
+        }
         SlashCommand::Resume(Some(value)) => {
             if let Err(error) = attach_session(&value, AttachContext {
                 store,
@@ -522,12 +561,18 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             }
         }
         SlashCommand::SkillInvoke { name, extra } => 'invoke: {
-            let installed = agent.skills().current().await;
+            let access = agent.project_access();
+            let installed = agent.skills().current_for(&access).await;
             let Some(skill) = installed.find(&name) else {
-                let message = match installed.skip_reason(&name) {
+                let every = agent.skills().current().await;
+                let message = match (access.project(), installed.skip_reason(&name)) {
+                    // Installed and hidden: the one remedy is the project's list.
+                    (Some(project), _) if every.find(&name).is_some() => {
+                        format!("project '{project}' hides skill '{name}'")
+                    }
                     // A file that is there and unreadable is not a missing skill.
-                    Some(_) => installed.unavailable(&name),
-                    None => crate::text::unknown_name(
+                    (_, Some(_)) => installed.unavailable(&name),
+                    (_, None) => crate::text::unknown_name(
                         "skill",
                         &name,
                         installed.skills.iter().map(|skill| skill.name.as_str()),
@@ -588,6 +633,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
         | SlashCommand::Permission(_)
         | SlashCommand::Approvals(_)
         | SlashCommand::Profile(None)
+        | SlashCommand::Project(ProjectVerb::Picker)
         | SlashCommand::Resume(None)
         | SlashCommand::Session
         | SlashCommand::SkillList
@@ -689,6 +735,17 @@ impl mcp::auth::LoginPrompt for ScreenLogin {
     }
 }
 
+/// What `/project` was asked to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProjectVerb {
+    /// Bare `/project`: the picker over the configured projects.
+    Picker,
+    Open(String),
+    Close,
+    /// Anything else after `/project`, answered with the usage line.
+    Unknown(String),
+}
+
 /// One line typed after `/`, parsed; which side answers it is [`Self::answered_by`]'s to say.
 pub(crate) enum SlashCommand {
     Exit,
@@ -702,6 +759,9 @@ pub(crate) enum SlashCommand {
     Approvals(Option<String>),
     /// `/profile [name]`: show which profile this session runs on, or move it to another.
     Profile(Option<String>),
+    /// `/project`, `/project open <name>`, `/project close`: pick the project this session is on,
+    /// move it onto one, or take it off its project.
+    Project(ProjectVerb),
     /// `/resume [session]`: pick a session to switch this screen to, or switch to one by id or
     /// unique prefix.
     Resume(Option<String>),
@@ -794,6 +854,8 @@ impl SlashCommand {
             SlashCommand::Approvals { .. } => Answerer::Screen,
             SlashCommand::Profile(None) => Answerer::Screen,
             SlashCommand::Profile(Some(_)) => Answerer::Host,
+            SlashCommand::Project(ProjectVerb::Picker) => Answerer::Screen,
+            SlashCommand::Project(_) => Answerer::Host,
             SlashCommand::Resume(None) => Answerer::Screen,
             SlashCommand::Resume(Some(_)) => Answerer::Host,
             SlashCommand::Compact { .. } => Answerer::Host,
@@ -854,6 +916,7 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "permission" => Some(SlashCommand::Permission(argument)),
         "approvals" => Some(SlashCommand::Approvals(argument)),
         "profile" => Some(SlashCommand::Profile(argument)),
+        "project" => Some(parse_project_slash(argument.as_deref().unwrap_or(""))),
         "resume" => Some(SlashCommand::Resume(argument)),
         "compact" => Some(SlashCommand::Compact(argument)),
         "rewind" => Some(match argument.as_deref().map(str::trim) {
@@ -872,6 +935,24 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "usage" => Some(SlashCommand::Usage),
         "log" => Some(SlashCommand::Log),
         _ => None,
+    }
+}
+
+/// `/project`: bare opens the picker; `open <name>` moves the session onto a project; `close`
+/// takes it off its project.
+fn parse_project_slash(rest: &str) -> SlashCommand {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return SlashCommand::Project(ProjectVerb::Picker);
+    }
+    if rest == "close" {
+        return SlashCommand::Project(ProjectVerb::Close);
+    }
+    match rest.strip_prefix("open").map(str::trim) {
+        Some(name) if !name.is_empty() && !name.contains(char::is_whitespace) => {
+            SlashCommand::Project(ProjectVerb::Open(name.to_string()))
+        }
+        _ => SlashCommand::Project(ProjectVerb::Unknown(rest.to_string())),
     }
 }
 
@@ -1087,6 +1168,38 @@ mod tests {
             Some(SlashCommand::McpUnknownVerb { verb }) if verb == "frob"
         ));
         assert!(parse_slash_command("/frob").is_none());
+    }
+
+    /// Every shape `/project` takes parses to its verb, and anything else is answered with the
+    /// usage line rather than taken as a name.
+    #[test]
+    fn the_project_grammar_parses_every_shape_to_a_verb() {
+        assert!(matches!(
+            parse_slash_command("/project"),
+            Some(SlashCommand::Project(ProjectVerb::Picker))
+        ));
+        assert!(matches!(
+            parse_slash_command("/project open webdev"),
+            Some(SlashCommand::Project(ProjectVerb::Open(name))) if name == "webdev"
+        ));
+        assert!(matches!(
+            parse_slash_command("/project close"),
+            Some(SlashCommand::Project(ProjectVerb::Close))
+        ));
+        for line in [
+            "/project webdev",
+            "/project open",
+            "/project open a b",
+            "/project drop x",
+        ] {
+            assert!(
+                matches!(
+                    parse_slash_command(line),
+                    Some(SlashCommand::Project(ProjectVerb::Unknown(_)))
+                ),
+                "{line}"
+            );
+        }
     }
 
     /// `/resume` swaps the conversation for another session's, so what it calls is the one reset

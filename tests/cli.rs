@@ -921,7 +921,10 @@ fn an_unresolvable_workspace_directory_warns_without_failing_the_run() {
 fn the_long_lived_hosts_refuse_the_flags_that_name_one_session() {
     let install = Install::new();
     for host in ["acp", "serve"] {
-        for flag in [vec!["--continue"], vec!["--resume", "0e5f"]] {
+        for flag in [vec!["--continue"], vec!["--resume", "0e5f"], vec![
+            "--project",
+            "webdev",
+        ]] {
             // Isolated, like every other CLI test. A regression in the guard would otherwise reach
             // the host's real startup, and `meka serve` would bind the port in the *developer's*
             // `config.toml` and run until the harness gave up -- a hang rather than a failure.
@@ -937,6 +940,26 @@ fn the_long_lived_hosts_refuse_the_flags_that_name_one_session() {
             assert!(
                 stderr.contains(flag[0]) && stderr.contains("does not take"),
                 "meka {} {host} must say why: {stderr}",
+                flag.join(" ")
+            );
+            // One remedy per flag given: a session flag gets the host's resume door, `--project`
+            // the host's project door, and neither is told the other's.
+            let (session_remedy, project_remedy) = if host == "acp" {
+                ("session/load", "`project` config option")
+            } else {
+                ("/v1/sessions/{id}", "`POST /v1/sessions`")
+            };
+            let names_project = flag[0] == "--project";
+            assert_eq!(
+                stderr.contains(project_remedy),
+                names_project,
+                "meka {} {host}: {stderr}",
+                flag.join(" ")
+            );
+            assert_eq!(
+                stderr.contains(session_remedy),
+                !names_project,
+                "meka {} {host}: {stderr}",
                 flag.join(" ")
             );
         }
@@ -3862,5 +3885,723 @@ fn the_account_views_ask_an_account_without_a_profile() {
             && stderr.contains("nope")
             && !stderr.contains("for account 'work'"),
         "a top-level `--profile` that selects nothing is refused, not ignored: {stderr}"
+    );
+}
+
+/// The config a project test starts from: one mock profile, an `[mcp]` block for the new section
+/// to follow, and the sections after it, so the placement is observable.
+fn write_project_config(install: &Install, projects: &[&str]) {
+    let mut config = String::from(
+        "default_profile = \"mock\"\n\n[accounts.mock]\nbackend = \"openai-chat-completions\"\n\
+         base_url = \"http://127.0.0.1:9/\"\n\n[profiles.mock]\naccount = \"mock\"\nmodel = \
+         \"mock-model\"\n\n[mcp]\ndefault_permission = \"read\"\n",
+    );
+    for project in projects {
+        config.push_str(&format!("\n[projects.{project}]\n"));
+    }
+    config.push_str("\n[permissions]\ndefault = \"read\"\nenabled = [\"read\"]\n");
+    install.write_config(&config);
+}
+
+fn config_text(install: &Install) -> String {
+    std::fs::read_to_string(install.config_dir().join("config.toml")).expect("read config.toml")
+}
+
+/// `project add` writes `[projects.<name>]` after the `[mcp]` block, where the reference page puts
+/// it; `list` shows the project with its counts, and marks one the file no longer defines while
+/// rows still name it.
+#[test]
+fn project_add_places_the_table_after_mcp_and_list_marks_an_orphan() {
+    let install = Install::new();
+    write_project_config(&install, &[]);
+    let added = run_isolated(&install, &["project", "add", "webdev"]);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let config = config_text(&install);
+    let position = |needle: &str| {
+        config
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle}: {config}"))
+    };
+    assert!(
+        position("[mcp]") < position("[projects.webdev]"),
+        "{config}"
+    );
+    assert!(
+        position("[projects.webdev]") < position("[permissions]"),
+        "{config}"
+    );
+
+    let again = run_isolated(&install, &["project", "add", "Webdev"]);
+    assert!(!again.status.success());
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("differ only by case"),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+
+    let memory = run_isolated(&install, &[
+        "memory",
+        "add",
+        "stack",
+        "--description",
+        "Uses pnpm",
+        "--project",
+        "webdev",
+    ]);
+    assert!(
+        memory.status.success(),
+        "{}",
+        String::from_utf8_lossy(&memory.stderr)
+    );
+    let unknown = run_isolated(&install, &[
+        "memory",
+        "add",
+        "stray",
+        "--description",
+        "d",
+        "--project",
+        "ghost",
+    ]);
+    assert!(!unknown.status.success());
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("no project named 'ghost'"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+
+    let listed = run_isolated(&install, &["project", "list", "--format", "json"]);
+    let json: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("a json listing");
+    assert_eq!(
+        json["projects"],
+        serde_json::json!([{"name": "webdev", "memories": 1, "sessions": 0, "configured": true}])
+    );
+
+    // The project leaves the file by hand while its memory stays: the listing says so.
+    write_project_config(&install, &[]);
+    let listed = run_isolated(&install, &["project", "list"]);
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(stdout.contains("webdev"), "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .nth(1)
+            .is_some_and(|row| row.trim_end().ends_with("no")),
+        "{stdout}"
+    );
+}
+
+/// `rename` moves the project's memories and sessions with the name; `remove` refuses while
+/// anything is on the project and names the counts, and removes the table once nothing is.
+#[test]
+fn project_rename_moves_its_rows_and_remove_refuses_while_any_remain() {
+    let install = Install::new();
+    write_project_config(&install, &["alpha"]);
+    let output = run_isolated(&install, &[
+        "memory",
+        "add",
+        "note",
+        "--description",
+        "d",
+        "--project",
+        "alpha",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = run_scripted(&install, &["--project", "alpha", "-p", "hi", "--oneshot"]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let renamed = run_isolated(&install, &["project", "rename", "alpha", "beta"]);
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    assert!(config_text(&install).contains("[projects.beta]"));
+    assert!(!config_text(&install).contains("[projects.alpha]"));
+    let got = run_isolated(&install, &["memory", "get", "note", "--format", "json"]);
+    let json: serde_json::Value = serde_json::from_slice(&got.stdout).expect("json");
+    assert_eq!(json["project"], "beta");
+    let listed = run_isolated(&install, &[
+        "session",
+        "list",
+        "--project",
+        "beta",
+        "--format",
+        "json",
+    ]);
+    let json: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("json");
+    assert_eq!(json["sessions"].as_array().map(Vec::len), Some(1), "{json}");
+
+    let refused = run_isolated(&install, &["project", "remove", "beta"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("project 'beta' has 1 memory and 1 session; move or remove them first"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(config_text(&install).contains("[projects.beta]"));
+
+    let removed_memory = run_isolated(&install, &["memory", "remove", "note", "--project", "beta"]);
+    assert!(
+        removed_memory.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed_memory.stderr)
+    );
+    let session_id = only_session(&install);
+    let removed_session = run_isolated(&install, &["session", "remove", &session_id]);
+    assert!(
+        removed_session.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed_session.stderr)
+    );
+    let removed = run_isolated(&install, &["project", "remove", "beta"]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!config_text(&install).contains("[projects.beta]"));
+    let listed = run_isolated(&install, &["project", "list"]);
+    assert!(String::from_utf8_lossy(&listed.stderr).contains("No projects."));
+}
+
+/// `--project` filters the session `-c` continues and opens a new session on the project when none
+/// is there; a name in several projects is refused at the operator's doors until one is named.
+#[test]
+fn the_project_flag_filters_continue_and_a_bare_name_in_two_projects_is_refused() {
+    let install = Install::new();
+    write_project_config(&install, &["alpha", "beta"]);
+    let first = run_scripted(&install, &["-p", "plain", "--oneshot"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    // `-c --project alpha` with no session on alpha starts one there rather than continuing the
+    // session on none.
+    let second = run_scripted(&install, &[
+        "-c",
+        "--project",
+        "alpha",
+        "-p",
+        "on alpha",
+        "--oneshot",
+    ]);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let third = run_scripted(&install, &[
+        "-c",
+        "--project",
+        "alpha",
+        "-p",
+        "again",
+        "--oneshot",
+    ]);
+    assert!(
+        third.status.success(),
+        "{}",
+        String::from_utf8_lossy(&third.stderr)
+    );
+    let (on_alpha, turns_on_alpha): (i64, i64) = store(&install)
+        .query_row(
+            "SELECT count(*), COALESCE(sum(turns), 0) FROM sessions WHERE project = 'alpha'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("count");
+    assert_eq!(
+        (on_alpha, turns_on_alpha),
+        (1, 2),
+        "one session on alpha, continued once"
+    );
+    let on_none: i64 = store(&install)
+        .query_row(
+            "SELECT count(*) FROM sessions WHERE project = ''",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(on_none, 1);
+    let unknown = run_scripted(&install, &["--project", "ghost", "-p", "x", "--oneshot"]);
+    assert!(!unknown.status.success());
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("no project named 'ghost'"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+
+    for project in ["alpha", "beta"] {
+        let output = run_isolated(&install, &[
+            "memory",
+            "add",
+            "notes",
+            "--description",
+            "d",
+            "--project",
+            project,
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let ambiguous = run_isolated(&install, &["memory", "get", "notes"]);
+    assert!(!ambiguous.status.success());
+    assert!(
+        String::from_utf8_lossy(&ambiguous.stderr)
+            .contains("memory 'notes' exists in projects 'alpha' and 'beta'; name the project"),
+        "{}",
+        String::from_utf8_lossy(&ambiguous.stderr)
+    );
+    let named = run_isolated(&install, &[
+        "memory",
+        "get",
+        "notes",
+        "--project",
+        "beta",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        named.status.success(),
+        "{}",
+        String::from_utf8_lossy(&named.stderr)
+    );
+    let listed = run_isolated(&install, &[
+        "memory",
+        "list",
+        "--project",
+        "alpha",
+        "--format",
+        "json",
+    ]);
+    let json: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("json");
+    assert_eq!(json["memories"].as_array().map(Vec::len), Some(1), "{json}");
+}
+
+/// `project add` writes the lists it is given, `project set` replaces or removes one, both refuse
+/// a server the file does not configure, and the listing shows each project's view.
+#[test]
+fn project_lists_are_written_set_and_checked_against_the_configured_servers() {
+    let install = Install::new();
+    install.write_config(
+        "default_profile = \"mock\"\n\n[accounts.mock]\nbackend = \"openai-chat-completions\"\n\
+         base_url = \"http://127.0.0.1:9/\"\n\n[profiles.mock]\naccount = \"mock\"\nmodel = \
+         \"mock-model\"\n\n[mcp]\n\n[[mcp.servers]]\nname = \"fs\"\ntransport = \"stdio\"\n\
+         command = \"true\"\n\n[permissions]\ndefault = \"read\"\nenabled = [\"read\"]\n",
+    );
+    let added = run_isolated(&install, &[
+        "project",
+        "add",
+        "web",
+        "--allowed-server",
+        "fs",
+        "--disabled-skill",
+        "release",
+    ]);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let config = config_text(&install);
+    assert!(
+        config.contains(
+            "[projects.web]\nallowed_servers = [\"fs\"]\ndisabled_skills = [\"release\"]"
+        ),
+        "{config}"
+    );
+
+    let refused = run_isolated(&install, &[
+        "project",
+        "add",
+        "bad",
+        "--allowed-server",
+        "ghost",
+    ]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("`[projects.bad].allowed_servers` names 'ghost'"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        !config_text(&install).contains("[projects.bad]"),
+        "nothing was written"
+    );
+
+    let both = run_isolated(&install, &[
+        "project",
+        "set",
+        "web",
+        "disabled_servers",
+        "fs",
+    ]);
+    assert!(!both.status.success());
+    assert!(
+        String::from_utf8_lossy(&both.stderr)
+            .contains("in both allowed_servers and disabled_servers"),
+        "{}",
+        String::from_utf8_lossy(&both.stderr)
+    );
+    let set = run_isolated(&install, &[
+        "project",
+        "set",
+        "web",
+        "allowed_skills",
+        "deploy, triage",
+    ]);
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let listed = run_isolated(&install, &["project", "list", "--format", "json"]);
+    let json: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("json");
+    assert_eq!(
+        json["projects"][0]["allowed_servers"],
+        serde_json::json!(["fs"])
+    );
+    assert_eq!(
+        json["projects"][0]["allowed_skills"],
+        serde_json::json!(["deploy", "triage"])
+    );
+    assert_eq!(
+        json["projects"][0]["disabled_skills"],
+        serde_json::json!(["release"])
+    );
+    assert!(
+        json["projects"][0].get("disabled_servers").is_none(),
+        "{json}"
+    );
+    let plain = run_isolated(&install, &["project", "list"]);
+    let stdout = String::from_utf8_lossy(&plain.stdout);
+    assert!(
+        stdout.contains("fs") && stdout.contains("deploy, triage"),
+        "{stdout}"
+    );
+
+    let unset = run_isolated(&install, &[
+        "project",
+        "set",
+        "web",
+        "allowed_skills",
+        "--unset",
+    ]);
+    assert!(
+        unset.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unset.stderr)
+    );
+    assert!(!config_text(&install).contains("allowed_skills"));
+    let unknown_key = run_isolated(&install, &["project", "set", "web", "model", "x"]);
+    assert!(!unknown_key.status.success());
+    assert!(
+        String::from_utf8_lossy(&unknown_key.stderr).contains("not a project setting"),
+        "{}",
+        String::from_utf8_lossy(&unknown_key.stderr)
+    );
+}
+
+/// `-r <id> --project <name>` moves the named session onto the project and runs it there.
+#[test]
+fn a_named_resume_with_a_project_moves_the_session_onto_it() {
+    let install = Install::new();
+    write_project_config(&install, &["alpha", "beta"]);
+    let first = run_scripted(&install, &["--project", "alpha", "-p", "hi", "--oneshot"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let id: String = store(&install)
+        .query_row(
+            "SELECT id FROM sessions WHERE project = 'alpha'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the session on alpha");
+    let moved = run_scripted(&install, &[
+        "-r",
+        &id,
+        "--project",
+        "beta",
+        "-p",
+        "again",
+        "--oneshot",
+    ]);
+    assert!(
+        moved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    let (project, turns): (String, i64) = store(&install)
+        .query_row(
+            "SELECT project, turns FROM sessions WHERE id = ?1",
+            [&id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the row");
+    assert_eq!(
+        (project.as_str(), turns),
+        ("beta", 2),
+        "moved, and continued there"
+    );
+}
+
+/// `--skill` on a run follows the project the session is on: a skill the project hides is refused
+/// whether the run opens a session on the project or resumes one there, and runs anywhere else.
+#[test]
+fn the_opening_skill_follows_the_session_s_project() {
+    let install = Install::new();
+    install.write_config(
+        "default_profile = \"mock\"\n\n[accounts.mock]\nbackend = \"openai-chat-completions\"\n\
+         base_url = \"http://127.0.0.1:9/\"\n\n[profiles.mock]\naccount = \"mock\"\nmodel = \
+         \"mock-model\"\n\n[mcp]\ndefault_permission = \"read\"\n\n[projects.movie]\n\
+         disabled_skills = [\"release\"]\n\n[permissions]\ndefault = \"read\"\nenabled = \
+         [\"read\"]\n",
+    );
+    let skill = install.config_dir().join("skills").join("release");
+    std::fs::create_dir_all(&skill).expect("skill dir");
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: release\ndescription: cut a release\n---\n\nTag it.\n",
+    )
+    .expect("write SKILL.md");
+
+    let shown = run_scripted(&install, &["--skill", "release", "--oneshot"]);
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let hidden = run_scripted(&install, &[
+        "--project",
+        "movie",
+        "--skill",
+        "release",
+        "--oneshot",
+    ]);
+    assert!(!hidden.status.success());
+    assert!(
+        String::from_utf8_lossy(&hidden.stderr).contains("project 'movie' hides skill 'release'"),
+        "{}",
+        String::from_utf8_lossy(&hidden.stderr)
+    );
+    let on_movie = run_scripted(&install, &["--project", "movie", "-p", "hi", "--oneshot"]);
+    assert!(on_movie.status.success());
+    let id: String = store(&install)
+        .query_row(
+            "SELECT id FROM sessions WHERE project = 'movie'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the session on movie");
+    let resumed = run_scripted(&install, &["-r", &id, "--skill", "release", "--oneshot"]);
+    assert!(!resumed.status.success());
+    assert!(
+        String::from_utf8_lossy(&resumed.stderr).contains("project 'movie' hides skill 'release'"),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let turns: i64 = store(&install)
+        .query_row("SELECT turns FROM sessions WHERE id = ?1", [&id], |row| {
+            row.get(0)
+        })
+        .expect("the row");
+    assert_eq!(turns, 1, "a refused opening skill runs no turn");
+}
+
+/// `project rename` refuses a new name that rows still carry after the project left the file by
+/// hand, rather than merging two tiers or failing midway on a name both hold.
+#[test]
+fn project_rename_refuses_a_name_rows_still_carry() {
+    let install = Install::new();
+    write_project_config(&install, &["alpha", "beta"]);
+    for project in ["alpha", "beta"] {
+        let added = run_isolated(&install, &[
+            "memory",
+            "add",
+            "note",
+            "--description",
+            "d",
+            "--project",
+            project,
+        ]);
+        assert!(
+            added.status.success(),
+            "{}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+    }
+    // Beta leaves the file by hand; its memory stays.
+    write_project_config(&install, &["alpha"]);
+    let refused = run_isolated(&install, &["project", "rename", "alpha", "beta"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("1 memory and 0 sessions already name project 'beta'"),
+        "{stderr}"
+    );
+    assert!(config_text(&install).contains("[projects.alpha]"));
+    let on_alpha: i64 = store(&install)
+        .query_row(
+            "SELECT count(*) FROM memories WHERE project = 'alpha'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(on_alpha, 1, "nothing moved");
+
+    // Sessions alone stand in the way too, and the file's own checks come first: a name the
+    // file lacks and a name it already has are refused before any row moves.
+    write_project_config(&install, &["alpha", "gamma"]);
+    let on_gamma = run_scripted(&install, &["--project", "gamma", "-p", "hi", "--oneshot"]);
+    assert!(on_gamma.status.success());
+    write_project_config(&install, &["alpha"]);
+    let refused = run_isolated(&install, &["project", "rename", "alpha", "gamma"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("0 memories and 1 session already name project 'gamma'"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    write_project_config(&install, &["alpha", "delta"]);
+    let unknown = run_isolated(&install, &["project", "rename", "ghost", "epsilon"]);
+    assert!(!unknown.status.success());
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("no project named 'ghost'"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+    let taken = run_isolated(&install, &["project", "rename", "alpha", "delta"]);
+    assert!(!taken.status.success());
+    assert!(
+        String::from_utf8_lossy(&taken.stderr).contains("a project named 'delta' already exists"),
+        "{}",
+        String::from_utf8_lossy(&taken.stderr)
+    );
+    let still_alpha: i64 = store(&install)
+        .query_row(
+            "SELECT count(*) FROM memories WHERE project = 'alpha'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(still_alpha, 1, "no refusal moved a row");
+    // `remove` counts the same way, and one kind of row alone is enough to refuse.
+    let occupied = run_isolated(&install, &["project", "remove", "gamma"]);
+    assert!(!occupied.status.success());
+    assert!(
+        String::from_utf8_lossy(&occupied.stderr)
+            .contains("project 'gamma' has 0 memories and 1 session; move or remove them first"),
+        "{}",
+        String::from_utf8_lossy(&occupied.stderr)
+    );
+}
+
+/// `mcp remove` refuses a server a project's list names, before anything is written: the file
+/// would otherwise fail at the next start.
+#[test]
+fn mcp_remove_refuses_a_server_a_project_names() {
+    let install = Install::new();
+    install.write_config(
+        "default_profile = \"mock\"\n\n[accounts.mock]\nbackend = \"openai-chat-completions\"\n\
+         base_url = \"http://127.0.0.1:9/\"\n\n[profiles.mock]\naccount = \"mock\"\nmodel = \
+         \"mock-model\"\n\n[mcp]\ndefault_permission = \"read\"\n\n[[mcp.servers]]\nname = \
+         \"fs\"\ntransport = \"stdio\"\ncommand = \"fs\"\n\n[projects.p]\nallowed_servers = \
+         [\"fs\"]\n\n[permissions]\ndefault = \"read\"\nenabled = [\"read\"]\n",
+    );
+    let refused = run_isolated(&install, &["mcp", "remove", "fs"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("project 'p' names server 'fs' in `allowed_servers`"),
+        "{stderr}"
+    );
+    assert!(
+        config_text(&install).contains("name = \"fs\""),
+        "nothing was written"
+    );
+}
+
+/// `--project` with an empty value is refused with its own sentence, since the docs offer no
+/// value for none; a rename may change only the case of a project's name; and `memory add` says
+/// move, not overwrite, when naming the other tier would move the memory.
+#[test]
+fn project_edges_an_empty_flag_a_case_rename_and_a_force_that_moves() {
+    let install = Install::new();
+    write_project_config(&install, &["alpha"]);
+    let empty = run_scripted(&install, &["--project", "", "-p", "x", "--oneshot"]);
+    assert!(!empty.status.success());
+    assert!(
+        String::from_utf8_lossy(&empty.stderr).contains("`--project` needs a project name"),
+        "{}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
+    let note = run_isolated(&install, &[
+        "memory",
+        "add",
+        "note",
+        "--description",
+        "d",
+        "--project",
+        "alpha",
+    ]);
+    assert!(
+        note.status.success(),
+        "{}",
+        String::from_utf8_lossy(&note.stderr)
+    );
+    let renamed = run_isolated(&install, &["project", "rename", "alpha", "Alpha"]);
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    assert!(config_text(&install).contains("[projects.Alpha]"));
+    let on_alpha: i64 = store(&install)
+        .query_row(
+            "SELECT count(*) FROM memories WHERE project = 'Alpha'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(on_alpha, 1, "the memory followed the case change");
+    let global = run_isolated(&install, &["memory", "add", "tone", "--description", "d"]);
+    assert!(global.status.success());
+    let would_move = run_isolated(&install, &[
+        "memory",
+        "add",
+        "tone",
+        "--description",
+        "d",
+        "--project",
+        "Alpha",
+    ]);
+    assert!(!would_move.status.success());
+    assert!(
+        String::from_utf8_lossy(&would_move.stderr)
+            .contains("exists in the global tier; pass `--force` to move it into project 'Alpha'"),
+        "{}",
+        String::from_utf8_lossy(&would_move.stderr)
     );
 }

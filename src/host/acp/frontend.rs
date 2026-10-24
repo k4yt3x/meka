@@ -1506,6 +1506,8 @@ pub(super) fn build_mode_state(permission: &SharedPermission) -> SessionModeStat
 pub(super) const PERMISSION_CONFIG_ID: &str = "permission";
 /// The `configOptions` id for the profile picker. `modes` has no counterpart for this one.
 pub(super) const PROFILE_CONFIG_ID: &str = "profile";
+/// The project picker, offered only where `config.toml` defines a project.
+pub(super) const PROJECT_CONFIG_ID: &str = "project";
 /// The `configOptions` id for the approvals switch, a boolean beside the two pickers.
 pub(super) const APPROVALS_CONFIG_ID: &str = "approvals";
 /// The permission picker as a `configOptions` entry. The same enabled set [`build_mode_state`]
@@ -1574,6 +1576,30 @@ pub(super) fn profile_config_option(
     .category(SessionConfigOptionCategory::Model)
     .description("The profile this session runs on.")
 }
+/// The project picker as a `configOptions` entry: the configured projects behind a first entry
+/// with the empty id, which is no project. A session can be on a project the file has since
+/// dropped, and then no option matches, which a client renders as nothing selected: the truth, as
+/// for a profile. No category: the protocol's are the model's and the mode's, and a project is
+/// neither.
+pub(super) fn project_config_option(
+    projects: &std::collections::BTreeMap<String, crate::config::ProjectConfig>,
+    current: &str,
+) -> SessionConfigOption {
+    let mut options = vec![SessionConfigSelectOption::new(
+        SessionConfigValueId::from(String::new()),
+        "No project".to_string(),
+    )];
+    options.extend(projects.keys().map(|name| {
+        SessionConfigSelectOption::new(SessionConfigValueId::from(name.clone()), name.clone())
+    }));
+    SessionConfigOption::select(
+        PROJECT_CONFIG_ID,
+        "Project",
+        SessionConfigValueId::from(current.to_string()),
+        options,
+    )
+    .description("The project this session is on, whose memories it sees beside the global ones.")
+}
 /// Build the `configOptions` list advertised on every session-creation response and returned by
 /// `session/set_config_option`.
 ///
@@ -1599,11 +1625,34 @@ pub(super) async fn build_config_options(
             .unwrap_or_default(),
         None => String::new(),
     };
-    vec![
+    let current_project = match session_uuid {
+        Some(session_uuid) => shared
+            .store
+            .recorded_project(session_uuid)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    "failed to read the recorded project for session {session_uuid}: {error}"
+                );
+                None
+            })
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    let mut options = vec![
         permission_config_option(permission),
         profile_config_option(&shared.config.profiles, &current_profile),
-        approvals_config_option(permission),
-    ]
+    ];
+    // Offered only where there is a project to pick, so an installation without any shows the
+    // pickers it always had.
+    if !shared.config.projects.is_empty() {
+        options.push(project_config_option(
+            &shared.config.projects,
+            &current_project,
+        ));
+    }
+    options.push(approvals_config_option(permission));
+    options
 }
 /// Push a `config_option_update` so a client's pickers reflect a change it did not make, whether
 /// that was another surface repinning the session or meka's own `session/set_mode` handler.

@@ -1783,6 +1783,25 @@ async fn purge_server(name: &str, token_store: &TokenStore) -> Result<Purged> {
         return Ok(Purged::CredentialsOnly);
     }
 
+    // A project list naming the server would fail the file at the next start, so the server is
+    // refused the way an account a profile names is: the list changes first.
+    let parsed = super::account::reparse_after_edit(&before, &before)
+        .map_err(|error| MekaError::Config(error.to_string()))?;
+    for (project, config) in &parsed.projects {
+        for (key, servers) in [
+            ("allowed_servers", &config.allowed_servers),
+            ("disabled_servers", &config.disabled_servers),
+        ] {
+            if servers
+                .as_ref()
+                .is_some_and(|servers| servers.iter().any(|server| server == name))
+            {
+                return Err(usage_err(format!(
+                    "project '{project}' names server '{name}' in `{key}`; change that list first"
+                )));
+            }
+        }
+    }
     crate::fs::write_file_atomic(&path, &reparsed_edit(&before, &document)?)
         .map_err(|error| MekaError::io(format!("failed to write config: {error}")))?;
 

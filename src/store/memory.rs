@@ -667,6 +667,8 @@ impl Terms {
 #[derive(Debug, Clone)]
 pub(crate) struct Hit {
     pub(crate) name: String,
+    /// The project whose tier the memory is in; empty for the global tier.
+    pub(crate) project: String,
     pub(crate) description: String,
     pub(crate) body: String,
     /// An excerpt of the body around the match, or its opening when the match was in the
@@ -700,13 +702,102 @@ pub(crate) struct SearchResults {
     pub(crate) pool_exhausted: bool,
 }
 
+/// Which tiers a reader sees, and the predicate every read, update and delete by name carries.
+///
+/// One definition so no door sees a tier another hides: a session on a project sees the global
+/// tier and its own, a session with no project sees the global tier alone, and the operator sees
+/// the tier a flag or query parameter names, or everything. The default is the narrowest view, so
+/// a door that forgets to say which it is hides a tier rather than leaking one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum MemoryView {
+    /// The global tier alone: a session with no project, or the operator asking for it.
+    #[default]
+    Global,
+    /// The global tier and one project's: what a session on that project sees.
+    Session(String),
+    /// One project's tier alone: the operator's project filter.
+    Project(String),
+    /// Every tier: the operator with no filter.
+    All,
+}
+
+impl MemoryView {
+    /// What a session on `project` sees; `None` or empty is a session with no project.
+    pub(crate) fn for_session(project: Option<&str>) -> Self {
+        match project {
+            Some(project) if !project.is_empty() => Self::Session(project.to_string()),
+            _ => Self::Global,
+        }
+    }
+
+    /// The tiers an operator's `--project` flag or `?project=` parameter names: every tier without
+    /// it, the global tier for an empty value, one project's for a name.
+    pub(crate) fn for_operator(project: Option<&str>) -> Self {
+        match project {
+            None => Self::All,
+            Some("") => Self::Global,
+            Some(project) => Self::Project(project.to_string()),
+        }
+    }
+
+    /// The project a write through this view creates a memory in when it names no tier: the
+    /// view's own project, or global for a view on no project.
+    pub(crate) fn project(&self) -> &str {
+        match self {
+            Self::Session(project) | Self::Project(project) => project,
+            Self::Global | Self::All => "",
+        }
+    }
+
+    /// The tiers whose memories can cite the one in `project`: every tier for a global memory,
+    /// the global tier and the project's own for a project's, since a reference is a bare name
+    /// read within the citer's view.
+    pub(crate) fn citing(project: &str) -> Self {
+        if project.is_empty() {
+            Self::All
+        } else {
+            Self::Session(project.to_string())
+        }
+    }
+
+    /// Whether a memory in `project` (empty for the global tier) is within the view.
+    pub(crate) fn sees(&self, project: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Global => project.is_empty(),
+            Self::Session(own) => project.is_empty() || project == own,
+            Self::Project(own) => project == own,
+        }
+    }
+
+    /// The `AND ...` tail selecting the rows within the view and the parameter it binds, numbered
+    /// `position`; `table` as in [`MemoryFilter::clause`]. Empty for [`Self::All`].
+    fn clause(&self, table: &str, position: usize) -> (String, Vec<String>) {
+        match self {
+            Self::All => (String::new(), Vec::new()),
+            Self::Global => (format!(" AND {table}project = ''"), Vec::new()),
+            Self::Session(project) => (
+                format!(" AND ({table}project = '' OR {table}project = ?{position})"),
+                vec![project.clone()],
+            ),
+            Self::Project(project) => (format!(" AND {table}project = ?{position}"), vec![
+                project.clone(),
+            ]),
+        }
+    }
+}
+
 /// What a listing or a search is narrowed to, the same three questions at every door:
-/// `memory_search`'s filters, `meka memory list`'s flags and `GET /v1/memory`'s query parameters.
+/// `memory_search`'s filters, `meka memory list`'s flags and `GET /v1/memory`'s query parameters,
+/// within the tiers the caller sees.
 ///
 /// One definition so the doors cannot disagree about what "referencing" or "unverified" selects,
 /// and so a search with words and a listing without them read the same rows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct MemoryFilter {
+    /// The tiers the caller sees. Not a filter in [`Self::is_empty`]'s sense: a view narrows what
+    /// exists for the caller, where the questions below pick rows out of it.
+    pub(crate) view: MemoryView,
     /// Memories whose references name this, matched whole and without regard to case.
     pub(crate) referencing: Option<String>,
     /// Memories not verified within this long of now.
@@ -729,8 +820,7 @@ impl MemoryFilter {
     /// every stamp meka writes is UTC with the same field widths; the parameters are strings so
     /// the closure that binds them stays `Send`.
     fn clause(&self, table: &str, first: usize, now: SystemTime) -> (String, Vec<String>) {
-        let mut clause = String::new();
-        let mut parameters: Vec<String> = Vec::new();
+        let (mut clause, mut parameters) = self.view.clause(table, first);
         if let Some(target) = &self.referencing {
             clause.push_str(" AND ");
             clause.push_str(&Self::referencing_sql(table, first + parameters.len()));
@@ -861,6 +951,12 @@ impl Ranking {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WriteRequest {
     pub(crate) name: String,
+    /// The tiers the writer sees, which decides what an unnamed tier means and which memory of
+    /// the name it may move; see [`resolve_write_tier`].
+    pub(crate) view: MemoryView,
+    /// The tier the memory is to be in, empty for global. `None` keeps the stored tier, or for a
+    /// creating write takes the view's own project.
+    pub(crate) project: Option<String>,
     /// `None` means "keep what is stored", exactly as it does for the optional fields below.
     ///
     /// Required only when the write creates the memory, which [`MemoryStore::write`] checks inside
@@ -920,6 +1016,7 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
     let expires_at: Option<String> = row.get(12)?;
     Ok(Memory {
         name: row.get(0)?,
+        project: row.get(13)?,
         description: row.get(1)?,
         tags: tags
             .split_whitespace()
@@ -945,7 +1042,7 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
 /// a string or a number that would survive being put in the wrong slot.
 const MEMORY_COLUMNS: &str = "name, description, tags, priority, created_at, updated_at, \
                               read_count, body, load, reference_list, source, verified_at, \
-                              expires_at";
+                              expires_at, project";
 
 /// The references a stored row holds, or none when the column is not the JSON array of one-line
 /// strings every write door stores.
@@ -1072,17 +1169,59 @@ enum Guarded<T> {
     Refused(String),
 }
 
-/// The bytes the in-force inline bodies total, as the band measures them: the UTF-8 bytes of the
-/// stored body of every `inline` row whose expiry has not passed. Stamps compare as text for the
-/// reason [`MemoryFilter::clause`] gives.
-fn inline_bytes_in_force(connection: &rusqlite::Connection, now: &str) -> rusqlite::Result<usize> {
-    let total: i64 = connection.query_row(
-        "SELECT COALESCE(SUM(LENGTH(CAST(body AS BLOB))), 0) FROM memories
-         WHERE load = ?1 AND (expires_at IS NULL OR expires_at > ?2)",
-        rusqlite::params![crate::memory::Load::Inline.name(), now],
-        |row| row.get(0),
-    )?;
+/// The bytes the in-force inline bodies total as the band of a session sees them: the UTF-8 bytes
+/// of the stored body of every `inline` row whose expiry has not passed, in the global tier and
+/// in `project`'s. For the global tier itself the project counted is the one with the most, since
+/// a global memory is in every project's band and the budget holds only if it holds in the
+/// fullest. Stamps compare as text for the reason [`MemoryFilter::clause`] gives.
+fn inline_bytes_in_force(
+    connection: &rusqlite::Connection,
+    now: &str,
+    project: &str,
+) -> rusqlite::Result<usize> {
+    let inline = crate::memory::Load::Inline.name();
+    let total: i64 = if project.is_empty() {
+        connection.query_row(
+            "SELECT (SELECT COALESCE(SUM(LENGTH(CAST(body AS BLOB))), 0) FROM memories
+                     WHERE load = ?1 AND (expires_at IS NULL OR expires_at > ?2)
+                       AND project = '')
+                  + (SELECT COALESCE(MAX(total), 0) FROM
+                        (SELECT SUM(LENGTH(CAST(body AS BLOB))) AS total FROM memories
+                         WHERE load = ?1 AND (expires_at IS NULL OR expires_at > ?2)
+                           AND project != ''
+                         GROUP BY project))",
+            rusqlite::params![inline, now],
+            |row| row.get(0),
+        )?
+    } else {
+        connection.query_row(
+            "SELECT COALESCE(SUM(LENGTH(CAST(body AS BLOB))), 0) FROM memories
+             WHERE load = ?1 AND (expires_at IS NULL OR expires_at > ?2)
+               AND (project = '' OR project = ?3)",
+            rusqlite::params![inline, now, project],
+            |row| row.get(0),
+        )?
+    };
     Ok(usize::try_from(total).unwrap_or(0))
+}
+
+/// The project whose in-force inline bodies total the most, or `None` when no project has one:
+/// the project a global write's budget was measured with.
+fn largest_inline_project(
+    connection: &rusqlite::Connection,
+    now: &str,
+) -> rusqlite::Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT project FROM memories
+             WHERE load = ?1 AND (expires_at IS NULL OR expires_at > ?2) AND project != ''
+             GROUP BY project
+             ORDER BY SUM(LENGTH(CAST(body AS BLOB))) DESC, project ASC
+             LIMIT 1",
+            rusqlite::params![crate::memory::Load::Inline.name(), now],
+            |row| row.get(0),
+        )
+        .optional()
 }
 
 /// Whether the write this transaction holds may commit, or the refusal it gets.
@@ -1095,34 +1234,55 @@ fn inline_budget_refusal(
     now: &str,
     before: usize,
     max_bytes: usize,
+    project: &str,
+    view: &MemoryView,
 ) -> rusqlite::Result<Option<String>> {
-    let after = inline_bytes_in_force(connection, now)?;
+    let after = inline_bytes_in_force(connection, now, project)?;
     if after <= max_bytes || after <= before {
         return Ok(None);
     }
-    let mut statement = connection.prepare(
+    // The band the total was measured for: the project's own, or for a global write the fullest
+    // project's, so the names below are the ones that band shows.
+    let measured = if project.is_empty() {
+        largest_inline_project(connection, now)?
+    } else {
+        Some(project.to_string())
+    };
+    // Named only within the writer's view: a memory it cannot read is not one it can shorten.
+    let (visible, view_parameters) = view.clause("", 5);
+    let mut statement = connection.prepare(&format!(
         "SELECT name, LENGTH(CAST(body AS BLOB)) FROM memories
          WHERE load = ?1 AND (expires_at IS NULL OR expires_at > ?2)
+           AND (project = '' OR project = ?4) {visible}
          ORDER BY LENGTH(CAST(body AS BLOB)) DESC, name ASC
-         LIMIT ?3",
-    )?;
+         LIMIT ?3"
+    ))?;
+    let mut bound: Vec<rusqlite::types::Value> = vec![
+        crate::memory::Load::Inline.name().to_string().into(),
+        now.to_string().into(),
+        i64::try_from(crate::memory::INLINE_REFUSAL_NAMES)
+            .unwrap_or(i64::MAX)
+            .into(),
+        measured.clone().unwrap_or_default().into(),
+    ];
+    bound.extend(
+        view_parameters
+            .into_iter()
+            .map(rusqlite::types::Value::from),
+    );
     let largest = statement
-        .query_map(
-            rusqlite::params![
-                crate::memory::Load::Inline.name(),
-                now,
-                i64::try_from(crate::memory::INLINE_REFUSAL_NAMES).unwrap_or(i64::MAX)
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    usize::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
-                ))
-            },
-        )?
+        .query_map(rusqlite::params_from_iter(bound), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                usize::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+            ))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(Some(crate::memory::render_inline_budget_refusal(
-        after, max_bytes, &largest,
+        after,
+        max_bytes,
+        &largest,
+        measured.as_deref(),
     )))
 }
 
@@ -1265,28 +1425,32 @@ impl MemoryStore {
         })
     }
 
-    /// Every memory, ordered as the `[Memory]` index renders them: priority ascending, then most
-    /// recently created, then by name so the result is total and stable.
+    /// Every memory within the view, ordered as the `[Memory]` index renders them: priority
+    /// ascending, then most recently created, then by name so the result is total and stable.
     ///
     /// Bodies are loaded only for the inline band ([`crate::memory::Load::Inline`]), which is
     /// the only tier that renders one in full. Carrying every body would put the whole
     /// store in resident memory for the sake of a handful of entries, and the rest are reachable
     /// through [`Self::get`] and [`Self::search`].
-    pub(crate) async fn index(&self) -> Result<Vec<Memory>> {
+    pub(crate) async fn index(&self, view: &MemoryView) -> Result<Vec<Memory>> {
         let Some(connection) = self.connection.as_deref() else {
             return Ok(Vec::new());
         };
-        let inline = crate::memory::Load::Inline.name();
+        let inline = crate::memory::Load::Inline.name().to_string();
+        let (clause, view_parameters) = view.clause("", 2);
         connection
             .call(move |connection| -> rusqlite::Result<_> {
-                let mut statement = connection.prepare(
+                let mut statement = connection.prepare(&format!(
                     "SELECT name, description, tags, priority, created_at, updated_at, read_count,
                             CASE WHEN load = ?1 THEN body ELSE NULL END,
-                            load, reference_list, source, verified_at, expires_at
+                            load, reference_list, source, verified_at, expires_at, project
                      FROM memories
-                     ORDER BY priority ASC, created_at DESC, name ASC",
-                )?;
-                let rows = statement.query_map(rusqlite::params![inline], row_to_memory)?;
+                     WHERE 1 {clause}
+                     ORDER BY priority ASC, created_at DESC, name ASC"
+                ))?;
+                let mut bound = vec![inline];
+                bound.extend(view_parameters);
+                let rows = statement.query_map(rusqlite::params_from_iter(bound), row_to_memory)?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })
             .await
@@ -1307,7 +1471,7 @@ impl MemoryStore {
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(&format!(
                     "SELECT name, description, tags, priority, created_at, updated_at, read_count,
-                            NULL, load, reference_list, source, verified_at, expires_at
+                            NULL, load, reference_list, source, verified_at, expires_at, project
                      FROM memories
                      WHERE 1 {clause}
                      ORDER BY priority ASC, created_at DESC, name ASC"
@@ -1320,22 +1484,30 @@ impl MemoryStore {
             .map_err(|error| MekaError::Database(format!("failed to list memories: {error}")))
     }
 
-    /// The memories whose references name `target`, in index order: name and description, which
-    /// is what a reader needs to name them and what a sweep needs to decide which to revisit.
-    pub(crate) async fn referenced_by(&self, target: &str) -> Result<Vec<(String, String)>> {
+    /// The memories within the view whose references name `target`, in index order: name and
+    /// description, which is what a reader needs to name them and what a sweep needs to decide
+    /// which to revisit.
+    pub(crate) async fn referenced_by(
+        &self,
+        target: &str,
+        view: &MemoryView,
+    ) -> Result<Vec<(String, String)>> {
         let Some(connection) = self.connection.as_deref() else {
             return Ok(Vec::new());
         };
         let target = target.to_string();
+        let (clause, view_parameters) = view.clause("", 2);
         connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(&format!(
                     "SELECT name, description FROM memories
-                     WHERE {}
+                     WHERE {} {clause}
                      ORDER BY priority ASC, created_at DESC, name ASC",
                     MemoryFilter::referencing_sql("", 1)
                 ))?;
-                let rows = statement.query_map(rusqlite::params![target], |row| {
+                let mut bound = vec![target];
+                bound.extend(view_parameters);
+                let rows = statement.query_map(rusqlite::params_from_iter(bound), |row| {
                     Ok((row.get(0)?, row.get(1)?))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1370,7 +1542,7 @@ impl MemoryStore {
                 )?;
                 let mut statement = connection.prepare(&format!(
                     "SELECT name, description, body, priority, created_at, read_count,
-                            verified_at, expires_at
+                            verified_at, expires_at, project
                      FROM memories
                      WHERE 1 {clause}
                      ORDER BY priority ASC, created_at DESC, name ASC
@@ -1386,6 +1558,7 @@ impl MemoryStore {
                     let body: String = row.get(2)?;
                     Ok(Hit {
                         name: row.get(0)?,
+                        project: row.get(8)?,
                         description: row.get(1)?,
                         // The opening, since nothing was matched: what a listing's excerpt is.
                         snippet: body.chars().take(SUBSTRING_SNIPPET_CHARS).collect(),
@@ -1490,27 +1663,32 @@ impl MemoryStore {
             .map_err(|error| MekaError::Database(format!("failed to rename: {error}")))
     }
 
-    /// One memory by name, body included. `None` when there is none.
+    /// One memory by name within the view, body included. `None` when there is none.
     ///
     /// The lookup is case-insensitive because the column is: `NOTE` and `note` were never allowed
-    /// to be two memories, and this is the same rule read from the other side.
-    pub(crate) async fn get(&self, name: &str) -> Result<Option<Memory>> {
+    /// to be two memories of one tier, and this is the same rule read from the other side. A
+    /// session's view holds a name at most once, since a global name is never also a project's;
+    /// the operator's whole-store view can hold it in several projects, and then nothing is
+    /// returned but the refusal naming them.
+    pub(crate) async fn get(&self, name: &str, view: &MemoryView) -> Result<Option<Memory>> {
         let Some(connection) = self.connection.as_deref() else {
             return Ok(None);
         };
-        let name = name.to_string();
-        connection
+        let (clause, view_parameters) = view.clause("", 2);
+        let mut bound = vec![name.to_string()];
+        bound.extend(view_parameters);
+        let found = connection
             .call(move |connection| -> rusqlite::Result<_> {
-                connection
-                    .query_row(
-                        &format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE name = ?1"),
-                        rusqlite::params![name],
-                        row_to_memory,
-                    )
-                    .optional()
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {MEMORY_COLUMNS} FROM memories WHERE name = ?1 {clause}
+                     ORDER BY project ASC"
+                ))?;
+                let rows = statement.query_map(rusqlite::params_from_iter(bound), row_to_memory)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to read memory: {error}")))
+            .map_err(|error| MekaError::Database(format!("failed to read memory: {error}")))?;
+        the_one_memory(name, found)
     }
 
     /// Create or update one memory. Returns what landed, so a caller can report it rather than
@@ -1522,8 +1700,14 @@ impl MemoryStore {
     /// is absent from the `DO UPDATE` clause entirely, which is what makes "stamped once at
     /// create" a property of the SQL instead of something every caller has to remember.
     ///
-    /// A write that would leave the in-force inline bodies over `[memory] inline_max_bytes`, and
-    /// larger than they were, is refused inside the same transaction with
+    /// Which tier the write lands in, and whether the name is free there, is
+    /// [`resolve_write_tier`]'s answer over every tier of the store, asked inside the transaction
+    /// so it cannot go stale before the upsert that depends on it; a move it decides is one
+    /// `UPDATE` ahead of the upsert in the same transaction, so a re-filed memory is never in two
+    /// tiers or none.
+    ///
+    /// A write that would leave the in-force inline bodies of the tier over `[memory]
+    /// inline_max_bytes`, and larger than they were, is refused inside the same transaction with
     /// [`MekaError::InvalidRequest`], so nothing of it lands; see [`inline_budget_refusal`].
     ///
     /// Three of this subsystem's defects were omit-to-keep bugs. None of them is expressible here.
@@ -1543,32 +1727,50 @@ impl MemoryStore {
                 // lets the handler wait.
                 let transaction = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                // Asked inside the transaction, so "does this row exist" cannot go stale before
-                // the upsert that depends on the answer. A creating write must carry a
-                // description; an updating one may omit it and keep what is stored.
-                if request.description.is_none() {
-                    let exists: i64 = transaction.query_row(
-                        "SELECT COUNT(*) FROM memories WHERE name = ?1",
-                        rusqlite::params![request.name],
-                        |row| row.get(0),
+                // Every tier, not the view's: whether a name is free is a property of the whole
+                // store, since a global name and a project name may never coincide.
+                let holders: Vec<String> = {
+                    let mut statement = transaction.prepare(
+                        "SELECT project FROM memories WHERE name = ?1 ORDER BY project ASC",
                     )?;
-                    if exists == 0 {
-                        // A sentinel the caller maps back to a plain refusal, not a `rusqlite`
-                        // variant that renders as one.
-                        //
-                        // Not `InvalidParameterName`, whose `Display` is "Invalid parameter name:
-                        // {name}". Wrapped by `tokio_rusqlite` and then by `MekaError::Database`,
-                        // the model would receive `database error: failed to write memory:
-                        // Error("Invalid parameter name: no memory named 'x' exists...")`, a
-                        // user-input mistake dressed as a database fault, with a prefix inviting a
-                        // retry under a different `name`.
-                        return Err(rusqlite::Error::QueryReturnedNoRows);
-                    }
+                    let rows =
+                        statement.query_map(rusqlite::params![request.name], |row| row.get(0))?;
+                    rows.collect::<rusqlite::Result<_>>()?
+                };
+                let tier = match resolve_write_tier(
+                    &request.name,
+                    &request.view,
+                    request.project.as_deref(),
+                    &holders,
+                ) {
+                    Ok(tier) => tier,
+                    Err(refusal) => return Ok(Guarded::Refused(refusal)),
+                };
+                // A creating write must carry a description; an updating one may omit it and
+                // keep what is stored. A move lands on the moved row, so it is an update.
+                let creating = tier.moved_from.is_none() && !holders.contains(&tier.project);
+                if creating && request.description.is_none() {
+                    // A sentinel the caller maps back to a plain refusal, not a `rusqlite`
+                    // variant that renders as one.
+                    //
+                    // Not `InvalidParameterName`, whose `Display` is "Invalid parameter name:
+                    // {name}". Wrapped by `tokio_rusqlite` and then by `MekaError::Database`,
+                    // the model would receive `database error: failed to write memory:
+                    // Error("Invalid parameter name: no memory named 'x' exists...")`, a
+                    // user-input mistake dressed as a database fault, with a prefix inviting a
+                    // retry under a different `name`.
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
                 }
                 // Measured ahead of the upsert and judged after it, inside the one transaction, so
                 // the verdict is about this write alone and a refusal rolls the upsert back with
                 // the transaction.
-                let inline_bytes_before = inline_bytes_in_force(&transaction, &now)?;
+                let inline_bytes_before = inline_bytes_in_force(&transaction, &now, &tier.project)?;
+                if let Some(from) = &tier.moved_from {
+                    transaction.execute(
+                        "UPDATE memories SET project = ?3 WHERE name = ?1 AND project = ?2",
+                        rusqlite::params![request.name, from, tier.project],
+                    )?;
+                }
                 transaction.execute(
                     // `COALESCE(?2, '')` in the VALUES clause, not a bare `?2`: SQLite checks
                     // `NOT NULL` while attempting the insert, before it notices the uniqueness
@@ -1582,12 +1784,12 @@ impl MemoryStore {
                     // value on insert and on update only when one was given, since `NULL` is both
                     // "clear it" and "not mentioned" and the flag tells them apart.
                     "INSERT INTO memories
-                         (name, description, tags, body, priority, created_at, updated_at,
-                          load, reference_list, source, verified_at, expires_at)
-                     VALUES (?1, COALESCE(?2, ''), COALESCE(?3, ''), COALESCE(?4, ''),
+                         (name, project, description, tags, body, priority, created_at,
+                          updated_at, load, reference_list, source, verified_at, expires_at)
+                     VALUES (?1, ?15, COALESCE(?2, ''), COALESCE(?3, ''), COALESCE(?4, ''),
                              COALESCE(?5, ?7), ?6, ?6,
                              COALESCE(?8, ?9), COALESCE(?10, '[]'), COALESCE(?11, ''), ?6, ?12)
-                     ON CONFLICT(name) DO UPDATE SET
+                     ON CONFLICT(project, name) DO UPDATE SET
                          description    = COALESCE(?2, memories.description),
                          tags           = COALESCE(?3, memories.tags),
                          body           = COALESCE(?4, memories.body),
@@ -1617,6 +1819,7 @@ impl MemoryStore {
                             .map(crate::memory::render_stamp),
                         request.expires_at.is_some(),
                         request.verified,
+                        tier.project,
                     ],
                 )?;
                 if let Some(refusal) = inline_budget_refusal(
@@ -1624,12 +1827,16 @@ impl MemoryStore {
                     &now,
                     inline_bytes_before,
                     inline_max_bytes,
+                    &tier.project,
+                    &request.view,
                 )? {
                     return Ok(Guarded::Refused(refusal));
                 }
                 let written = transaction.query_row(
-                    &format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE name = ?1"),
-                    rusqlite::params![request.name],
+                    &format!(
+                        "SELECT {MEMORY_COLUMNS} FROM memories WHERE name = ?1 AND project = ?2"
+                    ),
+                    rusqlite::params![request.name, tier.project],
                     row_to_memory,
                 )?;
                 transaction.commit()?;
@@ -1678,6 +1885,7 @@ impl MemoryStore {
     pub(crate) async fn write_body(
         &self,
         name: &str,
+        view: &MemoryView,
         expected: &str,
         body: String,
         verified: bool,
@@ -1686,6 +1894,7 @@ impl MemoryStore {
         let expected = expected.to_string();
         let now = crate::memory::render_stamp(SystemTime::now());
         let inline_max_bytes = self.inline_max_bytes;
+        let view = view.clone();
         let outcome = self
             .writable()?
             .call(move |connection| -> rusqlite::Result<_> {
@@ -1693,12 +1902,23 @@ impl MemoryStore {
                 // can be judged after the update and the update taken back with it.
                 let transaction = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let inline_bytes_before = inline_bytes_in_force(&transaction, &now)?;
+                // Resolved inside the transaction, so "gone" describes the store this attempt
+                // ran against; the tier decides which band the budget is measured for.
+                let project = match projects_holding(&transaction, &name, &view)?.as_slice() {
+                    [] => return Ok(Guarded::Committed(BodyWrite::Gone)),
+                    [one] => one.clone(),
+                    several => {
+                        return Ok(Guarded::Refused(crate::text::ambiguous_project_name(
+                            "memory", &name, several,
+                        )));
+                    }
+                };
+                let inline_bytes_before = inline_bytes_in_force(&transaction, &now, &project)?;
                 let updated = transaction.execute(
                     "UPDATE memories SET body = ?2, updated_at = ?3,
                          verified_at = CASE WHEN ?5 THEN ?3 ELSE verified_at END
-                     WHERE name = ?1 AND body = ?4",
-                    rusqlite::params![name, body, now, expected, verified],
+                     WHERE name = ?1 AND project = ?6 AND body = ?4",
+                    rusqlite::params![name, body, now, expected, verified, project],
                 )?;
                 if updated > 0 {
                     if let Some(refusal) = inline_budget_refusal(
@@ -1706,25 +1926,16 @@ impl MemoryStore {
                         &now,
                         inline_bytes_before,
                         inline_max_bytes,
+                        &project,
+                        &view,
                     )? {
                         return Ok(Guarded::Refused(refusal));
                     }
                     transaction.commit()?;
                     return Ok(Guarded::Committed(BodyWrite::Saved));
                 }
-                // Zero rows is two different answers, and the caller has to tell them apart: one
-                // says the note is gone, the other says the text moved. Asked after the failed
-                // write rather than before it, so it describes why *this* attempt matched nothing.
-                let still_there: bool = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM memories WHERE name = ?1)",
-                    rusqlite::params![name],
-                    |row| row.get(0),
-                )?;
-                Ok(Guarded::Committed(if still_there {
-                    BodyWrite::ChangedUnderneath
-                } else {
-                    BodyWrite::Gone
-                }))
+                // The row is there and the update matched nothing, so the text moved.
+                Ok(Guarded::Committed(BodyWrite::ChangedUnderneath))
             })
             .await
             .map_err(|error| {
@@ -1736,27 +1947,51 @@ impl MemoryStore {
         }
     }
 
-    /// Delete one memory, returning the row removed. `None` when there was none by that name.
+    /// Delete one memory within the view, returning the row removed. `None` when there was none
+    /// by that name.
     ///
-    /// One statement: the row comes back from the `DELETE` itself, so what a caller reports as
-    /// removed is what the statement removed, with no second read for a sibling writer to slip
-    /// between. The triggers take its FTS rows and the row itself carries its own read counts
-    /// away, so there is nothing else to clean up and no orphan class to prune; a second table
-    /// keyed by name would leave both.
-    pub(crate) async fn delete(&self, name: &str) -> Result<Option<Memory>> {
+    /// The row comes back from the `DELETE` itself, so what a caller reports as removed is what
+    /// the statement removed. The triggers take its FTS rows and the row itself carries its own
+    /// read counts away, so there is nothing else to clean up and no orphan class to prune; a
+    /// second table keyed by name would leave both. A name the operator's view holds in several
+    /// projects is refused ahead of the statement, so nothing is removed on a name no one row
+    /// was meant by.
+    pub(crate) async fn delete(&self, name: &str, view: &MemoryView) -> Result<Option<Memory>> {
         let name = name.to_string();
-        self.writable()?
+        let view = view.clone();
+        let outcome = self
+            .writable()?
             .call(move |connection| -> rusqlite::Result<_> {
-                connection
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let project = match projects_holding(&transaction, &name, &view)?.as_slice() {
+                    [] => return Ok(Guarded::Committed(None)),
+                    [one] => one.clone(),
+                    several => {
+                        return Ok(Guarded::Refused(crate::text::ambiguous_project_name(
+                            "memory", &name, several,
+                        )));
+                    }
+                };
+                let removed = transaction
                     .query_row(
-                        &format!("DELETE FROM memories WHERE name = ?1 RETURNING {MEMORY_COLUMNS}"),
-                        rusqlite::params![name],
+                        &format!(
+                            "DELETE FROM memories WHERE name = ?1 AND project = ?2
+                             RETURNING {MEMORY_COLUMNS}"
+                        ),
+                        rusqlite::params![name, project],
                         row_to_memory,
                     )
-                    .optional()
+                    .optional()?;
+                transaction.commit()?;
+                Ok(Guarded::Committed(removed))
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to delete memory: {error}")))
+            .map_err(|error| MekaError::Database(format!("failed to delete memory: {error}")))?;
+        match outcome {
+            Guarded::Committed(removed) => Ok(removed),
+            Guarded::Refused(refusal) => Err(MekaError::InvalidRequest(refusal)),
+        }
     }
 
     /// Run one `MATCH` expression and return the pool re-ranked by [`Ranking::score`], best first.
@@ -1787,7 +2022,7 @@ impl MemoryStore {
                     "SELECT m.name, m.description, m.body, m.priority, m.created_at,
                             m.read_count, m.verified_at, m.expires_at,
                             snippet(memories_fts, ?2, '', '', '…', 24),
-                            bm25(memories_fts, ?3, ?4, ?5, ?6)
+                            bm25(memories_fts, ?3, ?4, ?5, ?6), m.project
                      FROM memories_fts f
                      JOIN memories m ON m.id = f.rowid
                      WHERE memories_fts MATCH ?1 {clause}
@@ -1814,6 +2049,7 @@ impl MemoryStore {
                 let rows = statement.query_map(bound.as_slice(), |row| {
                     Ok(Hit {
                         name: row.get(0)?,
+                        project: row.get(10)?,
                         description: row.get(1)?,
                         body: row.get(2)?,
                         priority: clamp_priority(row.get(3)?),
@@ -1923,7 +2159,7 @@ impl MemoryStore {
                     // store of filler notes hides the priority-0 standing directive that is the
                     // only real answer behind old p9 rows labeled "most relevant first".
                     "SELECT name, description, body, priority, created_at, read_count,
-                            verified_at, expires_at
+                            verified_at, expires_at, project
                      FROM memories
                      WHERE ({clause}) {filter_clause}
                      ORDER BY priority ASC, created_at DESC, name ASC
@@ -1940,6 +2176,7 @@ impl MemoryStore {
                     let body: String = row.get(2)?;
                     Ok(Hit {
                         name: row.get(0)?,
+                        project: row.get(8)?,
                         description: row.get(1)?,
                         // There is no `snippet()` outside a `MATCH`, so the window is chosen
                         // here. It has to contain the match: the renderer presents this under a
@@ -2002,13 +2239,17 @@ impl MemoryStore {
     /// One statement against the row itself. A second table keyed by name produces two separate
     /// defects: counters outliving the memory they describe, and counters destroyed when a memory
     /// is briefly unreadable. Neither is expressible here.
-    pub(crate) async fn record_read(&self, name: &str) -> Result<()> {
-        let name = name.to_string();
+    pub(crate) async fn record_read(&self, name: &str, view: &MemoryView) -> Result<()> {
+        let (clause, view_parameters) = view.clause("", 2);
+        let mut bound = vec![name.to_string()];
+        bound.extend(view_parameters);
         self.writable()?
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "UPDATE memories SET read_count = read_count + 1 WHERE name = ?1",
-                    rusqlite::params![name],
+                    &format!(
+                        "UPDATE memories SET read_count = read_count + 1 WHERE name = ?1 {clause}"
+                    ),
+                    rusqlite::params_from_iter(bound),
                 )?;
                 Ok(())
             })
@@ -2088,22 +2329,179 @@ impl MemoryStore {
             })
     }
 
-    /// Every memory with its body, for `meka memory export`. Ordered by name, so two exports of an
-    /// unchanged store produce identical files and one is git-able.
-    pub(crate) async fn export_all(&self) -> Result<Vec<Memory>> {
+    /// Every memory within the view with its body, for `meka memory export`. Ordered by project
+    /// and then by name, so two exports of an unchanged store produce identical files and one is
+    /// git-able.
+    pub(crate) async fn export_all(&self, view: &MemoryView) -> Result<Vec<Memory>> {
+        let Some(connection) = self.connection.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let (clause, view_parameters) = view.clause("", 1);
+        connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(&format!(
+                    "SELECT {MEMORY_COLUMNS} FROM memories WHERE 1 {clause}
+                     ORDER BY project ASC, name ASC"
+                ))?;
+                let rows = statement
+                    .query_map(rusqlite::params_from_iter(view_parameters), row_to_memory)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to read memories: {error}")))
+    }
+
+    /// How many memories are in `project`'s tier, for the refusal `meka project remove` gives
+    /// while any are.
+    pub(crate) async fn count_memories_on_project(&self, project: &str) -> Result<u64> {
+        let Some(connection) = self.connection.as_deref() else {
+            return Ok(0);
+        };
+        let project = project.to_string();
+        connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.query_row(
+                    "SELECT count(*) FROM memories WHERE project = ?1",
+                    rusqlite::params![project],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await
+            .map(|count| u64::try_from(count).unwrap_or(0))
+            .map_err(|error| MekaError::Database(format!("failed to count memories: {error}")))
+    }
+
+    /// Every project some memory names, sorted, so a listing can show a project the file no
+    /// longer defines beside the ones it does.
+    pub(crate) async fn project_names(&self) -> Result<Vec<String>> {
         let Some(connection) = self.connection.as_deref() else {
             return Ok(Vec::new());
         };
         connection
             .call(|connection| -> rusqlite::Result<_> {
-                let mut statement = connection.prepare(&format!(
-                    "SELECT {MEMORY_COLUMNS} FROM memories ORDER BY name ASC"
-                ))?;
-                let rows = statement.query_map([], row_to_memory)?;
+                let mut statement = connection.prepare(
+                    "SELECT DISTINCT project FROM memories WHERE project != '' ORDER BY project ASC",
+                )?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to read memories: {error}")))
+    }
+}
+
+/// The one memory `found` holds for `name`, or the refusal when the operator's view holds the
+/// name in several projects.
+fn the_one_memory(name: &str, mut found: Vec<Memory>) -> Result<Option<Memory>> {
+    if found.len() > 1 {
+        let projects: Vec<String> = found.iter().map(|memory| memory.project.clone()).collect();
+        return Err(MekaError::InvalidRequest(
+            crate::text::ambiguous_project_name("memory", name, &projects),
+        ));
+    }
+    Ok(found.pop())
+}
+
+/// The projects whose tier holds `name` within the view, sorted; empty for global.
+fn projects_holding(
+    connection: &rusqlite::Connection,
+    name: &str,
+    view: &MemoryView,
+) -> rusqlite::Result<Vec<String>> {
+    let (clause, view_parameters) = view.clause("", 2);
+    let mut bound = vec![name.to_string()];
+    bound.extend(view_parameters);
+    let mut statement = connection.prepare(&format!(
+        "SELECT project FROM memories WHERE name = ?1 {clause} ORDER BY project ASC"
+    ))?;
+    let rows = statement.query_map(rusqlite::params_from_iter(bound), |row| row.get(0))?;
+    rows.collect()
+}
+
+/// Where a write lands and what it moves first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WriteTier {
+    /// The project of the row the write lands on; empty for the global tier.
+    project: String,
+    /// The project a row of the same name is moved out of ahead of the upsert, when the write
+    /// re-files a visible memory into the tier it named.
+    moved_from: Option<String>,
+}
+
+/// The tier a write lands in, from the view it is made through, the tier it named (`None` keeps
+/// the stored one) and the tiers already holding the name, or the refusal.
+///
+/// The rules, in the order they are asked. A tier the name is already in is an update. An
+/// unnamed tier keeps the tier of the one visible row, and with none creates in the view's own.
+/// A name a global memory and a project memory would then share is refused, since every session
+/// on that project would see the name twice, except that naming the tier moves the one visible
+/// holder into it, which is how a memory is re-filed; another project's copy of the name is no
+/// collision for a project write. A name held in several projects is refused for a global write,
+/// and for an unnamed write through the operator's view, because no one row is meant. A holder
+/// the writer's view cannot see is named only as another project's: a refusal is text the model
+/// reads, and a name outside its view is not one it can act on; the operator's view sees every
+/// tier, so it is told every name.
+fn resolve_write_tier(
+    name: &str,
+    view: &MemoryView,
+    named: Option<&str>,
+    holders: &[String],
+) -> std::result::Result<WriteTier, String> {
+    let visible: Vec<&String> = holders.iter().filter(|holder| view.sees(holder)).collect();
+    let (project, explicit) = match named {
+        Some(project) => (project.to_string(), true),
+        None => match visible.as_slice() {
+            [one] => {
+                return Ok(WriteTier {
+                    project: (*one).clone(),
+                    moved_from: None,
+                });
+            }
+            [] => (view.project().to_string(), false),
+            several => {
+                let several: Vec<String> = several.iter().map(|holder| (*holder).clone()).collect();
+                return Err(crate::text::ambiguous_project_name(
+                    "memory", name, &several,
+                ));
+            }
+        },
+    };
+    if holders.contains(&project) {
+        return Ok(WriteTier {
+            project,
+            moved_from: None,
+        });
+    }
+    let colliding: Vec<&String> = holders
+        .iter()
+        .filter(|holder| project.is_empty() || holder.is_empty())
+        .collect();
+    match colliding.as_slice() {
+        [] => Ok(WriteTier {
+            project,
+            moved_from: None,
+        }),
+        [one] if explicit && view.sees(one) => Ok(WriteTier {
+            project,
+            moved_from: Some((*one).clone()),
+        }),
+        [one] if one.is_empty() => Err(format!("'{name}' is a global memory; choose another name")),
+        // One project holder the view sees was moved by the arm above or kept by the unnamed
+        // branch, so the one left is outside the view.
+        [_] => Err(format!(
+            "'{name}' is a memory of another project; choose another name"
+        )),
+        several if several.iter().all(|holder| view.sees(holder)) => Err(format!(
+            "'{name}' is a memory of projects {}; choose another name",
+            several
+                .iter()
+                .map(|holder| format!("'{holder}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        _ => Err(format!(
+            "'{name}' is a memory of other projects; choose another name"
+        )),
     }
 }
 
@@ -2242,7 +2640,7 @@ mod tests {
             "updated_at must move; `>=` alone passes even with the assignment deleted"
         );
 
-        let index = store.index().await.expect("index");
+        let index = store.index(&MemoryView::All).await.expect("index");
         assert_eq!(index.len(), 1, "case must not create a second memory");
         assert_eq!(index[0].name, "policy", "the original casing is kept");
 
@@ -2272,7 +2670,7 @@ mod tests {
         // And the delete reached it too, taking the body's posting list with it, and handing
         // back the row it took.
         let removed = store
-            .delete("policy")
+            .delete("policy", &MemoryView::All)
             .await
             .expect("delete")
             .expect("the row removed");
@@ -2296,7 +2694,11 @@ mod tests {
         );
         store.integrity_check().await.expect("after a delete");
         assert!(
-            store.delete("policy").await.expect("delete").is_none(),
+            store
+                .delete("policy", &MemoryView::All)
+                .await
+                .expect("delete")
+                .is_none(),
             "already gone"
         );
     }
@@ -2776,6 +3178,7 @@ mod tests {
     fn merged_results_put_a_memory_found_by_both_halves_first() {
         let hit = |name: &str, score: f64| Hit {
             name: name.to_string(),
+            project: String::new(),
             description: String::new(),
             body: String::new(),
             snippet: String::new(),
@@ -2881,7 +3284,10 @@ mod tests {
         let store = store_with(&[("note", 5, "a note", &body)]).await;
         let before = store.index_segment_count().await.expect("size");
         for _ in 0..5 {
-            store.record_read("note").await.expect("record");
+            store
+                .record_read("note", &MemoryView::All)
+                .await
+                .expect("record");
         }
         assert_eq!(
             store.index_segment_count().await.expect("size"),
@@ -2903,11 +3309,16 @@ mod tests {
         );
 
         // And a real edit still reaches the index, which is what the gate must not break.
-        let before = store.get("note").await.expect("get").expect("row");
+        let before = store
+            .get("note", &MemoryView::All)
+            .await
+            .expect("get")
+            .expect("row");
         assert_eq!(
             store
                 .write_body(
                     "note",
+                    &MemoryView::All,
                     before.body.as_deref().unwrap_or_default(),
                     "kazoo".to_string(),
                     false,
@@ -2944,7 +3355,11 @@ mod tests {
     async fn write_body_does_not_carry_a_stale_description_back() {
         let store = store_with(&[("note", 3, "original", "line A")]).await;
         // What `run_edit` read before spawning $EDITOR.
-        let read_before = store.get("note").await.expect("get").expect("row");
+        let read_before = store
+            .get("note", &MemoryView::All)
+            .await
+            .expect("get")
+            .expect("row");
 
         // The agent, meanwhile -- rewording and re-prioritizing, but not touching the body.
         store
@@ -2965,6 +3380,7 @@ mod tests {
             store
                 .write_body(
                     &read_before.name,
+                    &MemoryView::All,
                     read_before.body.as_deref().unwrap_or_default(),
                     "line A\nline B".to_string(),
                     false,
@@ -2974,7 +3390,11 @@ mod tests {
             BodyWrite::Saved
         );
 
-        let after = store.get("note").await.expect("get").expect("row");
+        let after = store
+            .get("note", &MemoryView::All)
+            .await
+            .expect("get")
+            .expect("row");
         assert_eq!(
             after.body.as_deref(),
             Some("line A\nline B"),
@@ -2987,7 +3407,7 @@ mod tests {
         assert_eq!(after.priority, 0, "nor a priority");
         assert_eq!(
             store
-                .write_body("gone", "", String::new(), false)
+                .write_body("gone", &MemoryView::All, "", String::new(), false)
                 .await
                 .expect("absent"),
             BodyWrite::Gone,
@@ -3006,7 +3426,11 @@ mod tests {
     #[tokio::test]
     async fn an_edit_refuses_when_the_body_moved_under_it() {
         let store = store_with(&[("race", 5, "d", "ORIGINAL")]).await;
-        let read_before = store.get("race").await.expect("get").expect("row");
+        let read_before = store
+            .get("race", &MemoryView::All)
+            .await
+            .expect("get")
+            .expect("row");
 
         store
             .write(WriteRequest {
@@ -3024,6 +3448,7 @@ mod tests {
             store
                 .write_body(
                     &read_before.name,
+                    &MemoryView::All,
                     read_before.body.as_deref().unwrap_or_default(),
                     "ORIGINAL, edited by the human".to_string(),
                     false,
@@ -3035,7 +3460,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .get("race")
+                .get("race", &MemoryView::All)
                 .await
                 .expect("get")
                 .expect("row")
@@ -3106,7 +3531,7 @@ mod tests {
         ])
         .await;
 
-        let index = store.index().await.expect("index");
+        let index = store.index(&MemoryView::All).await.expect("index");
         assert_eq!(
             index
                 .iter()
@@ -3122,13 +3547,19 @@ mod tests {
         // `get` always loads one, which is what `memory_read` is.
         assert_eq!(
             store
-                .get("ordinary")
+                .get("ordinary", &MemoryView::All)
                 .await
                 .expect("get")
                 .and_then(|memory| memory.body),
             Some("five".to_string())
         );
-        assert!(store.get("absent").await.expect("get").is_none());
+        assert!(
+            store
+                .get("absent", &MemoryView::All)
+                .await
+                .expect("get")
+                .is_none()
+        );
     }
 
     /// The store hands back what is stored, byte for byte.
@@ -3159,16 +3590,25 @@ mod tests {
         for (door, memory) in [
             (
                 "get",
-                store.get("planted").await.expect("get").expect("row"),
+                store
+                    .get("planted", &MemoryView::All)
+                    .await
+                    .expect("get")
+                    .expect("row"),
             ),
             (
                 "index",
-                store.index().await.expect("index").pop().expect("row"),
+                store
+                    .index(&MemoryView::All)
+                    .await
+                    .expect("index")
+                    .pop()
+                    .expect("row"),
             ),
             (
                 "export_all",
                 store
-                    .export_all()
+                    .export_all(&MemoryView::All)
                     .await
                     .expect("export")
                     .pop()
@@ -3425,7 +3865,7 @@ mod tests {
             .await
             .expect("plant the tags");
 
-        let tags = &store.index().await.expect("index")[0].tags;
+        let tags = &store.index(&MemoryView::All).await.expect("index")[0].tags;
         // Dropped, not repaired. Filtering instead of refusing hands back `in31mfra`, the printable
         // remains of the escape sequence spliced into a tag that reads as real and that nobody
         // wrote, and reduces `dep\u{202e}loy` to `deploy`. Neither is a tag a write door would have
@@ -3551,7 +3991,10 @@ mod tests {
         .await;
 
         for _ in 0..10 {
-            store.record_read("read-often").await.expect("record");
+            store
+                .record_read("read-often", &MemoryView::All)
+                .await
+                .expect("record");
         }
         let terms = Terms::parse(&["deployment".to_string()]);
         let results = store
@@ -3561,14 +4004,17 @@ mod tests {
         assert_eq!(names(&results), ["read-often", "never-read"], "{results:?}");
         assert_eq!(results.hits[0].read_count, 10);
 
-        store.delete("read-often").await.expect("delete");
+        store
+            .delete("read-often", &MemoryView::All)
+            .await
+            .expect("delete");
         store
             .write(full("read-often", 5, "deployment notes", "deploy"))
             .await
             .expect("rewrite");
         assert_eq!(
             store
-                .get("read-often")
+                .get("read-often", &MemoryView::All)
                 .await
                 .expect("get")
                 .map(|memory| memory.read_count),
@@ -3611,8 +4057,20 @@ mod tests {
     async fn a_detached_store_reads_empty_and_refuses_to_write() {
         let store = MemoryStore::detached();
         assert!(store.enabled());
-        assert!(store.index().await.expect("index").is_empty());
-        assert!(store.get("anything").await.expect("get").is_none());
+        assert!(
+            store
+                .index(&MemoryView::All)
+                .await
+                .expect("index")
+                .is_empty()
+        );
+        assert!(
+            store
+                .get("anything", &MemoryView::All)
+                .await
+                .expect("get")
+                .is_none()
+        );
         assert!(
             store
                 .search("\"anything\"".to_string(), &MemoryFilter::default(), 5)
@@ -3678,7 +4136,7 @@ mod tests {
             .expect("write");
 
         let started = std::time::Instant::now();
-        let index = store.index().await.expect("index");
+        let index = store.index(&MemoryView::All).await.expect("index");
         let index_elapsed = started.elapsed();
         assert_eq!(index.len(), 10_001);
 
@@ -3909,7 +4367,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .referenced_by("alice-timezone")
+                .referenced_by("alice-timezone", &MemoryView::All)
                 .await
                 .expect("backlinks"),
             [
@@ -3969,6 +4427,7 @@ mod tests {
             "a and b reference the target but have not expired"
         );
         let all_three = MemoryFilter {
+            view: MemoryView::Global,
             referencing: Some("alice-timezone".to_string()),
             unverified_for: Some(Duration::from_secs(1)),
             expired: false,
@@ -4020,7 +4479,7 @@ mod tests {
                 .await
                 .expect("write");
         }
-        let index = store.index().await.expect("index");
+        let index = store.index(&MemoryView::All).await.expect("index");
         let body_of = |name: &str| {
             index
                 .iter()
@@ -4053,13 +4512,21 @@ mod tests {
             )
             .await
             .expect("planted");
-        let read = store.get("note").await.expect("get").expect("row");
+        let read = store
+            .get("note", &MemoryView::All)
+            .await
+            .expect("get")
+            .expect("row");
         assert_eq!(read.references, ["kept", "also-kept"]);
         store
             .plant_references_for_test("note", "{\"not\": \"a list\"}")
             .await
             .expect("planted");
-        let read = store.get("note").await.expect("get").expect("row");
+        let read = store
+            .get("note", &MemoryView::All)
+            .await
+            .expect("get")
+            .expect("row");
         assert!(read.references.is_empty(), "{:?}", read.references);
     }
 
@@ -4140,19 +4607,31 @@ mod tests {
         );
         assert!(message.contains("`load: index`"), "{message}");
         assert!(
-            store.get("deploy").await.expect("get").is_none(),
+            store
+                .get("deploy", &MemoryView::All)
+                .await
+                .expect("get")
+                .is_none(),
             "the refused row must not exist"
         );
 
         // Growing an existing body past the budget is refused the same way, and the row stays as
         // it was, stamps included.
-        let before = store.get("tone").await.expect("get").expect("tone");
+        let before = store
+            .get("tone", &MemoryView::All)
+            .await
+            .expect("get")
+            .expect("tone");
         let refused = store
             .write(inline("tone", &"t".repeat(101)))
             .await
             .expect_err("101 of 100");
         assert!(refused.to_string().contains("'tone' (101 B)"), "{refused}");
-        let after = store.get("tone").await.expect("get").expect("tone");
+        let after = store
+            .get("tone", &MemoryView::All)
+            .await
+            .expect("get")
+            .expect("tone");
         assert_eq!(after, before, "a refused write leaves the row as it was");
 
         // Exactly the budget is admitted.
@@ -4218,11 +4697,17 @@ mod tests {
         // The body door follows the same rule.
         let shrunk = "x".repeat(240);
         store
-            .write_body("a", &"x".repeat(250), shrunk.clone(), false)
+            .write_body(
+                "a",
+                &MemoryView::All,
+                &"x".repeat(250),
+                shrunk.clone(),
+                false,
+            )
             .await
             .expect("shrinking through the body door lands");
         let refused = store
-            .write_body("a", &shrunk, "x".repeat(241), false)
+            .write_body("a", &MemoryView::All, &shrunk, "x".repeat(241), false)
             .await
             .expect_err("growing through the body door is refused");
         assert!(
@@ -4231,7 +4716,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .get("a")
+                .get("a", &MemoryView::All)
                 .await
                 .expect("get")
                 .expect("a")
@@ -4299,5 +4784,619 @@ mod tests {
             })
             .await
             .expect("90 of 100 again");
+    }
+
+    fn session(project: &str) -> MemoryView {
+        MemoryView::Session(project.to_string())
+    }
+
+    /// Each door spells its view through one constructor: a session's project or its absence,
+    /// the operator's flag, and the tiers that can cite a memory.
+    #[test]
+    fn the_view_constructors_read_each_door_s_spelling() {
+        assert_eq!(MemoryView::for_session(None), MemoryView::Global);
+        assert_eq!(MemoryView::for_session(Some("")), MemoryView::Global);
+        assert_eq!(MemoryView::for_session(Some("p")), session("p"));
+        assert_eq!(MemoryView::for_operator(None), MemoryView::All);
+        assert_eq!(MemoryView::for_operator(Some("")), MemoryView::Global);
+        assert_eq!(
+            MemoryView::for_operator(Some("p")),
+            MemoryView::Project("p".to_string())
+        );
+        assert_eq!(MemoryView::citing(""), MemoryView::All);
+        assert_eq!(MemoryView::citing("p"), session("p"));
+    }
+
+    fn in_project(project: &str, request: WriteRequest) -> WriteRequest {
+        WriteRequest {
+            view: session(project),
+            project: None,
+            ..request
+        }
+    }
+
+    fn names_of(memories: &[crate::memory::Memory]) -> Vec<&str> {
+        memories.iter().map(|memory| memory.name.as_str()).collect()
+    }
+
+    /// Where a write lands, over every combination the doors can present: the stored tier is
+    /// kept unless one is named, naming one moves the one visible holder, a global and a project
+    /// memory never share a name, and a name held in several projects is refused where no one
+    /// row is meant.
+    #[test]
+    fn a_write_s_tier_follows_the_view_the_request_and_the_holders() {
+        let global = String::new();
+        let p = "p".to_string();
+        let q = "q".to_string();
+        let landed = |project: &str| WriteTier {
+            project: project.to_string(),
+            moved_from: None,
+        };
+        let moved = |project: &str, from: &str| WriteTier {
+            project: project.to_string(),
+            moved_from: Some(from.to_string()),
+        };
+        let tier = |view: &MemoryView, named: Option<&str>, holders: &[String]| {
+            resolve_write_tier("n", view, named, holders)
+        };
+
+        // Nothing holds the name: the view's own tier, or the one named.
+        assert_eq!(tier(&MemoryView::Global, None, &[]), Ok(landed("")));
+        assert_eq!(tier(&session("p"), None, &[]), Ok(landed("p")));
+        assert_eq!(tier(&session("p"), Some(""), &[]), Ok(landed("")));
+        assert_eq!(tier(&MemoryView::All, None, &[]), Ok(landed("")));
+        assert_eq!(tier(&MemoryView::All, Some("p"), &[]), Ok(landed("p")));
+        // An unnamed tier keeps the visible holder's.
+        assert_eq!(
+            tier(&session("p"), None, std::slice::from_ref(&global)),
+            Ok(landed(""))
+        );
+        assert_eq!(
+            tier(&session("p"), None, std::slice::from_ref(&p)),
+            Ok(landed("p"))
+        );
+        assert_eq!(
+            tier(&MemoryView::All, None, std::slice::from_ref(&q)),
+            Ok(landed("q"))
+        );
+        // Naming the tier of the one visible holder moves it: the re-file, both ways.
+        assert_eq!(
+            tier(&session("p"), Some("p"), std::slice::from_ref(&global)),
+            Ok(moved("p", ""))
+        );
+        assert_eq!(
+            tier(&session("p"), Some(""), std::slice::from_ref(&p)),
+            Ok(moved("", "p"))
+        );
+        assert_eq!(
+            tier(&MemoryView::All, Some("q"), std::slice::from_ref(&global)),
+            Ok(moved("q", ""))
+        );
+        // Another project's copy of the name is no collision for a project write.
+        assert_eq!(
+            tier(&session("p"), Some("p"), std::slice::from_ref(&q)),
+            Ok(landed("p"))
+        );
+        assert_eq!(
+            tier(&session("p"), None, std::slice::from_ref(&q)),
+            Ok(landed("p"))
+        );
+        // A global and a project memory never share a name, and a holder the view cannot see is
+        // not moved.
+        assert_eq!(
+            tier(&session("p"), Some(""), std::slice::from_ref(&q)),
+            Err("'n' is a memory of another project; choose another name".to_string()),
+            "a holder outside the view is not named"
+        );
+        assert_eq!(
+            tier(&MemoryView::Global, None, std::slice::from_ref(&q)),
+            Err("'n' is a memory of another project; choose another name".to_string())
+        );
+        assert_eq!(
+            tier(&MemoryView::All, None, std::slice::from_ref(&q)),
+            Ok(landed("q"))
+        );
+        assert_eq!(
+            tier(
+                &MemoryView::Project("p".to_string()),
+                Some("p"),
+                std::slice::from_ref(&global)
+            ),
+            Err("'n' is a global memory; choose another name".to_string())
+        );
+        // Several projects hold it: no one row is meant.
+        assert_eq!(
+            tier(&MemoryView::All, None, &[p.clone(), q.clone()]),
+            Err("memory 'n' exists in projects 'p' and 'q'; name the project".to_string())
+        );
+        assert_eq!(
+            tier(&MemoryView::All, Some(""), &[p.clone(), q.clone()]),
+            Err("'n' is a memory of projects 'p', 'q'; choose another name".to_string())
+        );
+        assert_eq!(
+            tier(&session("p"), Some(""), &[p.clone(), q.clone()]),
+            Err("'n' is a memory of other projects; choose another name".to_string()),
+            "a session names only the holders it sees, and here it cannot name them all"
+        );
+        // A named tier the name is already in is an update, whatever else holds it.
+        assert_eq!(
+            tier(&MemoryView::All, Some("p"), &[p.clone(), q.clone()]),
+            Ok(landed("p"))
+        );
+    }
+
+    /// Every read door answers within the view it was given: a session on a project sees the
+    /// global tier and its own, a session with no project sees the global tier alone, and the
+    /// operator's filters see one tier or all of them.
+    #[tokio::test]
+    async fn every_read_door_answers_within_its_view() {
+        let store = MemoryStore::for_test().await.expect("store");
+        store
+            .write(full("shared", 5, "Global note", "zebra body"))
+            .await
+            .expect("global");
+        store
+            .write(in_project("p1", full("first", 5, "P1 note", "zebra body")))
+            .await
+            .expect("p1");
+        store
+            .write(in_project("p2", full("second", 5, "P2 note", "zebra body")))
+            .await
+            .expect("p2");
+        store
+            .write(WriteRequest {
+                references: Some(vec!["shared".to_string()]),
+                ..in_project("p2", full("citing", 5, "P2 citing note", ""))
+            })
+            .await
+            .expect("p2 citing");
+
+        let index = |view: MemoryView| {
+            let store = store.clone();
+            async move {
+                let mut names: Vec<String> = store
+                    .index(&view)
+                    .await
+                    .expect("index")
+                    .iter()
+                    .map(|memory| memory.name.clone())
+                    .collect();
+                names.sort();
+                names
+            }
+        };
+        assert_eq!(index(MemoryView::Global).await, ["shared"]);
+        assert_eq!(index(session("p1")).await, ["first", "shared"]);
+        assert_eq!(index(session("p2")).await, ["citing", "second", "shared"]);
+        assert_eq!(index(MemoryView::Project("p2".to_string())).await, [
+            "citing", "second"
+        ]);
+        assert_eq!(index(MemoryView::All).await, [
+            "citing", "first", "second", "shared"
+        ]);
+
+        let got = store
+            .get("first", &session("p1"))
+            .await
+            .expect("get")
+            .expect("visible");
+        assert_eq!(got.project, "p1");
+        assert!(
+            store
+                .get("first", &MemoryView::Global)
+                .await
+                .expect("get")
+                .is_none()
+        );
+        assert!(
+            store
+                .get("first", &session("p2"))
+                .await
+                .expect("get")
+                .is_none()
+        );
+        assert!(
+            store
+                .get("shared", &session("p2"))
+                .await
+                .expect("get")
+                .is_some()
+        );
+
+        let hits = |view: MemoryView| {
+            let store = store.clone();
+            async move {
+                let filter = MemoryFilter {
+                    view,
+                    ..MemoryFilter::default()
+                };
+                let found = store
+                    .find(&["zebra".to_string()], &filter, 10)
+                    .await
+                    .expect("find")
+                    .expect("words");
+                let mut names: Vec<String> = found
+                    .results
+                    .hits
+                    .iter()
+                    .map(|hit| hit.name.clone())
+                    .collect();
+                names.sort();
+                names
+            }
+        };
+        assert_eq!(hits(MemoryView::Global).await, ["shared"]);
+        assert_eq!(hits(session("p1")).await, ["first", "shared"]);
+        assert_eq!(hits(MemoryView::Project("p2".to_string())).await, [
+            "second"
+        ]);
+        assert_eq!(hits(MemoryView::All).await, ["first", "second", "shared"]);
+        let substring = store
+            .substring_search(
+                &["ebra".to_string()],
+                &MemoryFilter {
+                    view: session("p1"),
+                    ..MemoryFilter::default()
+                },
+                10,
+            )
+            .await
+            .expect("scan");
+        assert_eq!(names(&substring), ["first", "shared"]);
+
+        // Backlinks within the view: the citing memory is p2's, so p1 does not see the citation.
+        assert!(
+            store
+                .referenced_by("shared", &session("p1"))
+                .await
+                .expect("backlinks")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .referenced_by("shared", &session("p2"))
+                .await
+                .expect("backlinks")
+                .len(),
+            1
+        );
+        assert_eq!(
+            names_of(
+                &store
+                    .export_all(&MemoryView::Project("p1".to_string()))
+                    .await
+                    .expect("export")
+            ),
+            ["first"]
+        );
+        assert_eq!(
+            names_of(&store.export_all(&MemoryView::All).await.expect("export")),
+            ["shared", "first", "citing", "second"],
+            "an export orders by project and then by name"
+        );
+        assert_eq!(
+            store.count_memories_on_project("p2").await.expect("count"),
+            2
+        );
+        assert_eq!(store.project_names().await.expect("names"), ["p1", "p2"]);
+
+        // A read counts only within the view: a session with no project never opened p1's note.
+        store
+            .record_read("first", &MemoryView::Global)
+            .await
+            .expect("read");
+        store
+            .record_read("first", &session("p1"))
+            .await
+            .expect("read");
+        assert_eq!(
+            store
+                .get("first", &MemoryView::All)
+                .await
+                .expect("get")
+                .expect("row")
+                .read_count,
+            1
+        );
+    }
+
+    /// Naming the other tier for a memory the session sees moves it, the row keeping its
+    /// identity and its index entry; leaving the tier unnamed keeps the memory where it is; and a
+    /// name a session cannot see is refused with nothing landed.
+    #[tokio::test]
+    async fn a_write_moves_a_visible_memory_between_tiers_and_refuses_an_invisible_name() {
+        let store = MemoryStore::for_test().await.expect("store");
+        store
+            .write(full("rule", 5, "Global rule", "quokka body"))
+            .await
+            .expect("global");
+        // Unnamed: the global row is updated in place.
+        let updated = store
+            .write(in_project("p1", WriteRequest {
+                name: "rule".to_string(),
+                body: Some("quokka body, refined".to_string()),
+                ..WriteRequest::default()
+            }))
+            .await
+            .expect("update");
+        assert_eq!(updated.project, "");
+        // Named: the global row becomes p1's.
+        let moved = store
+            .write(WriteRequest {
+                project: Some("p1".to_string()),
+                ..in_project("p1", WriteRequest {
+                    name: "rule".to_string(),
+                    description: Some("P1 rule".to_string()),
+                    ..WriteRequest::default()
+                })
+            })
+            .await
+            .expect("move");
+        assert_eq!(moved.project, "p1");
+        assert_eq!(moved.description, "P1 rule");
+        assert_eq!(moved.body.as_deref(), Some("quokka body, refined"));
+        assert!(
+            store
+                .get("rule", &MemoryView::Global)
+                .await
+                .expect("get")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get("rule", &MemoryView::All)
+                .await
+                .expect("get")
+                .expect("row")
+                .project,
+            "p1"
+        );
+        let filter = |view: MemoryView| MemoryFilter {
+            view,
+            ..MemoryFilter::default()
+        };
+        assert!(
+            store
+                .find(&["quokka".to_string()], &filter(MemoryView::Global), 10)
+                .await
+                .expect("find")
+                .expect("words")
+                .results
+                .hits
+                .is_empty()
+        );
+        assert_eq!(
+            names(
+                &store
+                    .find(&["quokka".to_string()], &filter(session("p1")), 10)
+                    .await
+                    .expect("find")
+                    .expect("words")
+                    .results
+            ),
+            ["rule"]
+        );
+        // And back to global by naming it.
+        let back = store
+            .write(WriteRequest {
+                project: Some(String::new()),
+                ..in_project("p1", WriteRequest {
+                    name: "rule".to_string(),
+                    ..WriteRequest::default()
+                })
+            })
+            .await
+            .expect("move back");
+        assert_eq!(back.project, "");
+
+        // A global write of a name a project holds is refused, and nothing lands.
+        store
+            .write(in_project("p2", full("secret", 5, "P2 only", "")))
+            .await
+            .expect("p2");
+        let refused = store
+            .write(full("secret", 5, "Would shadow", ""))
+            .await
+            .expect_err("a global name may not equal a project's");
+        // Said without naming p2: the writer is on no project, and a name outside its view is not
+        // one it can act on.
+        assert!(
+            refused
+                .to_string()
+                .ends_with("'secret' is a memory of another project; choose another name"),
+            "{refused}"
+        );
+        assert_eq!(
+            store
+                .get("secret", &MemoryView::All)
+                .await
+                .expect("get")
+                .expect("row")
+                .description,
+            "P2 only"
+        );
+        // From p1, the same name is free: another project's copy is no collision.
+        let own = store
+            .write(in_project("p1", full("secret", 5, "P1's own", "")))
+            .await
+            .expect("p1 may hold the name");
+        assert_eq!(own.project, "p1");
+        // A creating write still needs a description, in a project as everywhere.
+        let refused = store
+            .write(in_project("p1", WriteRequest {
+                name: "absent".to_string(),
+                body: Some("b".to_string()),
+                ..WriteRequest::default()
+            }))
+            .await
+            .expect_err("no description");
+        assert!(
+            refused.to_string().contains("description is required"),
+            "{refused}"
+        );
+    }
+
+    /// The operator's whole-store view can hold a name in several projects; every door that
+    /// takes a bare name then refuses, naming them, and removes or changes nothing.
+    #[tokio::test]
+    async fn an_operator_s_bare_name_in_several_projects_is_refused_at_every_door() {
+        let store = MemoryStore::for_test().await.expect("store");
+        for project in ["a", "b"] {
+            store
+                .write(WriteRequest {
+                    view: MemoryView::All,
+                    project: Some(project.to_string()),
+                    ..full("notes", 5, &format!("{project} notes"), "body")
+                })
+                .await
+                .expect("write");
+        }
+        let expected = "memory 'notes' exists in projects 'a' and 'b'; name the project";
+        let refused = store.get("notes", &MemoryView::All).await.expect_err("get");
+        assert!(refused.to_string().ends_with(expected), "{refused}");
+        let refused = store
+            .delete("notes", &MemoryView::All)
+            .await
+            .expect_err("delete");
+        assert!(refused.to_string().ends_with(expected), "{refused}");
+        let refused = store
+            .write_body(
+                "notes",
+                &MemoryView::All,
+                "body",
+                "changed".to_string(),
+                false,
+            )
+            .await
+            .expect_err("edit");
+        assert!(refused.to_string().ends_with(expected), "{refused}");
+        let refused = store
+            .write(WriteRequest {
+                view: MemoryView::All,
+                project: None,
+                ..full("notes", 5, "which one", "")
+            })
+            .await
+            .expect_err("write");
+        assert!(refused.to_string().ends_with(expected), "{refused}");
+        assert_eq!(
+            store.count_memories_on_project("a").await.expect("count"),
+            1
+        );
+        assert_eq!(
+            store.count_memories_on_project("b").await.expect("count"),
+            1
+        );
+        // Named, each door reaches the one row.
+        let b = MemoryView::Project("b".to_string());
+        assert_eq!(
+            store
+                .get("notes", &b)
+                .await
+                .expect("get")
+                .expect("row")
+                .description,
+            "b notes"
+        );
+        assert_eq!(
+            store
+                .write_body("notes", &b, "body", "changed".to_string(), false)
+                .await
+                .expect("edit"),
+            BodyWrite::Saved
+        );
+        assert_eq!(
+            store
+                .delete("notes", &b)
+                .await
+                .expect("delete")
+                .expect("row")
+                .project,
+            "b"
+        );
+        assert_eq!(
+            store
+                .get("notes", &MemoryView::All)
+                .await
+                .expect("get")
+                .expect("one left")
+                .project,
+            "a"
+        );
+    }
+
+    /// The inline budget is measured as a session's band sees it: a project write counts the
+    /// global bodies and the project's, and a global write counts the global bodies and the
+    /// fullest project's, since a global memory is in every project's band.
+    #[tokio::test]
+    async fn the_inline_budget_is_measured_per_tier() {
+        let store = MemoryStore::for_test()
+            .await
+            .expect("store")
+            .with_inline_max_bytes_for_test(100);
+        store
+            .write(inline("g", &"g".repeat(40)))
+            .await
+            .expect("global 40");
+        store
+            .write(in_project("p1", inline("one", &"1".repeat(50))))
+            .await
+            .expect("p1 sees 90");
+        store
+            .write(in_project("p2", inline("two", &"2".repeat(30))))
+            .await
+            .expect("p2 sees 70");
+        // A global write is judged against the fullest project's band.
+        let refused = store
+            .write(inline("g2", &"h".repeat(15)))
+            .await
+            .expect_err("global 55 + p1 50 = 105");
+        let message = refused.to_string();
+        assert!(
+            message.contains(
+                "inline memories (global and project 'p1') would total 105 B against the 100 B"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("'g' (40 B)") && !message.contains("'one'"),
+            "a writer on no project is told to shorten what it sees, not p1's: {message}"
+        );
+        assert!(
+            store
+                .get("g2", &MemoryView::All)
+                .await
+                .expect("get")
+                .is_none()
+        );
+        // The same bytes fit p2's band.
+        store
+            .write(in_project("p2", inline("three", &"3".repeat(25))))
+            .await
+            .expect("p2 sees 95");
+        // And p1's band refuses what would overfill it, naming itself.
+        let refused = store
+            .write(in_project("p1", inline("four", &"4".repeat(15))))
+            .await
+            .expect_err("p1 sees 105");
+        assert!(
+            refused.to_string().contains("(global and project 'p1')"),
+            "{refused}"
+        );
+        // A body edit is judged in the row's own tier.
+        let refused = store
+            .write_body(
+                "two",
+                &session("p2"),
+                &"2".repeat(30),
+                "2".repeat(40),
+                false,
+            )
+            .await
+            .expect_err("p2 would see 105");
+        assert!(
+            refused.to_string().contains("(global and project 'p2')"),
+            "{refused}"
+        );
     }
 }

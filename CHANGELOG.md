@@ -7,11 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Projects: `[projects.<name>]` in `config.toml` names a work context a session opens by name.
+- `--project`, `/project`, `project` on HTTP sessions and an ACP config option put a session on one.
+- Memory has a global tier and one per project; `memory_write` and `memory_search` take `tier`.
+- `meka project add|list|set|rename|remove`; `--project` on the `memory` commands and `session list`.
+- `GET /v1/projects`; `project` on the memory routes; `memory export` puts each project in a directory.
+- A project narrows the MCP servers and skills its sessions see: four `allowed_`/`disabled_` lists.
+
 ### Changed
 
+- `meka memory list` and `meka session list` show a `Project` column.
+- `clipboard-win` moves to 5.4.3, off a yanked release.
 - Inline memory bodies share a 32 KiB budget, `[memory] inline_max_bytes`; it was 4 KiB and fixed.
 - A memory write that would take the inline bodies past the budget is refused, at every door alike.
 - An inline body is shown whole or listed by description; the memory section says which and why.
+
+### Security
+
+- RUSTSEC-2026-0385 and 0386: `ctutils` moves to 0.4.5 and `tokio` to 1.54.1.
 
 ## [0.83.0] - 2026-10-21
 

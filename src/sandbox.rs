@@ -1098,40 +1098,9 @@ mod tests {
     /// Linux-gated because every caller is, and an unused helper fails the lint gate.
     #[cfg(target_os = "linux")]
     fn startup_warnings(state: &super::SandboxState) -> String {
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone)]
-        struct Capture(Arc<Mutex<Vec<u8>>>);
-
-        impl std::io::Write for Capture {
-            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-                crate::sync::lock(&self.0).extend_from_slice(buffer);
-                Ok(buffer.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-            type Writer = Self;
-
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let capture = Capture(Arc::new(Mutex::new(Vec::new())));
-        let buffer = Arc::clone(&capture.0);
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            super::warn_if_sandbox_issues(state, super::WarnContext::Startup);
-        });
-        String::from_utf8(crate::sync::lock(&buffer).clone()).expect("log output is utf-8")
+        let captured = crate::streams::capture::capture_logs(tracing::Level::WARN);
+        super::warn_if_sandbox_issues(state, super::WarnContext::Startup);
+        captured.logged()
     }
 
     /// A usable Landlock backend at ABI v9, which has every mitigation and so owes no ABI warning.

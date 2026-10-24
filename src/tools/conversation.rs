@@ -974,7 +974,7 @@ mod tests {
             let store = store.clone();
             async move {
                 let (id, _lock) = store
-                    .create_child_session(
+                    .create_child_session_for_test(
                         parent,
                         None,
                         Vec::new(),

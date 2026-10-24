@@ -55,7 +55,7 @@ A confidential OAuth client holds two at once: the long-lived client secret it a
 | `--signing-key <SIGNING_KEY>`, `--signing-algorithm <SIGNING_ALGORITHM>` | JWT signing key path and algorithm (`RS256`, `RS384`, `RS512`, `ES256`, `ES384`), `client_credentials_jwt` only. |
 | `--scope <SCOPE>` | OAuth scope (repeatable). |
 | `--redirect-port <REDIRECT_PORT>` | Fixed OAuth redirect port (default: ephemeral). |
-| `--permission <LEVEL>` | Per-server permission cap, applied to every tool on the server: `none`, `read`, `workspace` or `unrestricted` (default: `read`). |
+| `--permission <LEVEL>` | Per-server permission cap, applied to every tool on the server: `none`, `read`, `workspace` or `unrestricted`. Omitted, the level resolves as for any server without the key. |
 | `--allow-tool <TOOL>` | Raw tool name to allow (repeatable). When set, only listed tools register. |
 | `--disable-tool <TOOL>` | Raw tool name to block (repeatable). Applied after `--allow-tool`. |
 | `--eager-load-tool <TOOL>` | Raw tool name to eager-load (repeatable). Listed tools skip the `tool_load` round-trip and ship in the cacheable tools-array prefix from turn 1. |
@@ -143,6 +143,10 @@ In addition to tools, meka exposes MCP resources and prompts through several bui
 | `mcp_resource_subscribe` | Subscribe to `resources/updated` notifications for a specific URI. Refused when the server will not watch it; otherwise the subscription outlives a reconnect. |
 | `mcp_resource_unsubscribe` | Cancel a prior subscription. |
 | `mcp_resource_updates_list` | List the latest recorded update per resource in the shared, bounded MCP context log; it resets when the host restarts. |
+
+## Per-project servers
+
+A [project](./projects.md) can narrow which servers its sessions see, with `allowed_servers` and `disabled_servers` on its `[projects.<name>]` table. Every configured server still connects at startup; the view decides what a session on the project is shown. A hidden server's tools are out of that session's catalog and out of reach of `tool_load` and `tool_search`, the resource and prompt meta-tools do not list it, and a sub-agent the session spawns cannot name it either. A session on no project sees every server, as before.
 
 ## Startup concurrency
 

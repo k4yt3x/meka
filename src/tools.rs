@@ -1511,6 +1511,7 @@ mod tests {
                     sandbox_backend: crate::config::SandboxBackend::Landlock,
                     backend_probe,
                     builtin_filter: filter,
+                    projects: Default::default(),
                     write_locks: crate::workspace::WriteLocks::default(),
                     running_subagents: Default::default(),
                 },
@@ -1523,6 +1524,7 @@ mod tests {
             },
             &crate::session::SessionCells {
                 session_id: shared_session_id,
+                project: Default::default(),
                 checklist: checklist_for_test(),
                 background_tasks: crate::background::BackgroundTasks::default(),
                 ..crate::session::SessionCells::for_test(

@@ -2945,7 +2945,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -2990,7 +2990,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -3038,7 +3038,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -3082,7 +3082,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -3146,7 +3146,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -3191,7 +3191,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -3252,7 +3252,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -3310,7 +3310,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -3359,7 +3359,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -3412,7 +3412,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -3956,7 +3956,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -4135,7 +4135,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -4347,7 +4347,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -4400,7 +4400,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -4629,7 +4629,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),
@@ -4677,7 +4677,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(
+            .create_child_session_for_test(
                 parent,
                 None,
                 Vec::new(),

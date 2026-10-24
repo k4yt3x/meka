@@ -36,7 +36,7 @@ use crate::{
 /// `format!("{extra}\n\n{body}")` order when the positional `[PROMPT]` is supplied.
 ///
 /// It does *not* mirror the lookup, and the difference is deliberate. This runs before the agent
-/// exists, so it walks the roots itself; the screen reads `agent.skills().current()`, which is the
+/// exists, so it walks the roots itself; the screen reads `agent.skills().current_for(..)`, the
 /// live cache. Both resolve the same name to the same file, but only the screen's sees a skill
 /// added mid-session.
 pub(crate) async fn build_skill_prompt(
@@ -57,6 +57,27 @@ pub(crate) async fn build_skill_prompt(
         _ => body,
     };
     Ok(Some(combined))
+}
+/// Refuse the run's `--skill` where the session's project hides it. Asked by the two terminal
+/// hosts once the resume has said which project the session is on, which `main`, where the name
+/// is checked to exist, cannot know: a session on a project meets a hidden skill through no door.
+pub(crate) fn refuse_a_hidden_opening_skill(
+    config: &crate::config::ResolvedConfig,
+    project: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(name) = config.request.requested_skill.as_deref() else {
+        return Ok(());
+    };
+    // A project the file no longer defines is the refusal to give, not a skill it hides.
+    if let Some(project_name) = project {
+        crate::config::require_project(project_name, &config.projects)?;
+    }
+    let access = crate::config::ProjectAccess::of(&config.projects, project);
+    if access.sees_skill(name) {
+        return Ok(());
+    }
+    let index = crate::skills::discover_skills_in_roots(&config.skill_roots());
+    Err(crate::error::MekaError::Config(index.unavailable_to(name, &access)).into())
 }
 /// Delete the sessions `[session].retention` has expired, sparing any another process holds.
 ///
@@ -273,6 +294,12 @@ pub(crate) const COMMANDS: &[HostCommand] = &[
         for_editors: false,
     },
     HostCommand {
+        name: "project",
+        help: "Pick, open or close the project this session is on",
+        arg_hint: "[open <name>|close]",
+        for_editors: false,
+    },
+    HostCommand {
         name: "resume",
         help: "Pick a session to switch to, or switch to one by id or unique prefix",
         arg_hint: "[session]",
@@ -381,6 +408,7 @@ pub(crate) async fn format_status(
     };
     let effort = agent.resolved_effort();
     let profile = agent.profile();
+    let project = agent.project();
     let settings = providers.settings(&profile);
     crate::render::format_session_status(
         &snap,
@@ -390,6 +418,7 @@ pub(crate) async fn format_status(
                 .ok()
                 .and_then(|settings| settings.model.as_deref()),
             profile: Some(profile.as_str()),
+            project: project.as_deref(),
             account: settings
                 .as_ref()
                 .ok()

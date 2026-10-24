@@ -62,6 +62,7 @@ pub(crate) fn agent_build_problem(
             refusal @ (MekaError::Config(_)
             | MekaError::SessionNotDrivable(_)
             | MekaError::ProfileNotConfigured { .. }
+            | MekaError::ProjectNotConfigured { .. }
             | MekaError::SessionNotFound(_)
             | MekaError::SessionLocked(_)),
         ) => ProblemDetail::for_error(refusal, false),
@@ -415,6 +416,7 @@ pub(crate) async fn ensure_session_loaded_holding(
             context_tokens: Arc::clone(&context_used),
             context_overhead: Arc::clone(&context_overhead),
             context_window: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            project: None,
         },
         crate::host::Opening::Hydrate,
         session_lock,

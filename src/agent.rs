@@ -71,6 +71,9 @@ pub(crate) struct Agent {
     /// Body-only edits take effect even sooner; `load_skill_body` re-reads from disk on every
     /// invocation regardless of cache state.
     skills: Arc<SkillCache>,
+    /// Every configured project, for the view this session's project gives it of the servers and
+    /// skills.
+    projects: Arc<std::collections::BTreeMap<String, crate::config::ProjectConfig>>,
     /// Shared memory cache, same contract as `skills`: re-checked at the top of each turn so a
     /// memory the agent writes mid-turn appears in the very next turn's index.
     memories: Arc<MemoryStore>,
@@ -205,6 +208,7 @@ impl Agent {
             last_rendered_world: tokio::sync::RwLock::new(None),
             current_turn: std::sync::Mutex::new(None),
             skills: materials.skills.clone(),
+            projects: Arc::clone(&materials.core.projects),
             memories: materials.memories.clone(),
             compaction_generation: std::sync::atomic::AtomicU64::new(GENERATION_UNKNOWN),
             scratchpad_hints: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
@@ -327,6 +331,28 @@ impl Agent {
     /// may read if it is to agree with the turn.
     pub(crate) fn profile(&self) -> String {
         self.cells.profile.current().profile
+    }
+
+    /// The project this agent's session is on, or `None`: the memory tier its writes land in and
+    /// the tiers it sees. Read per use rather than held, as the provider is, so a move is one
+    /// store into the cell.
+    pub(crate) fn project(&self) -> Option<String> {
+        self.cells.project.get()
+    }
+
+    /// Move this agent's session onto another project, or off one, mid-conversation.
+    ///
+    /// Every surface that offers the move lands here: `/project`, `PATCH /v1/sessions/{id}` and
+    /// ACP's `session/set_config_option`. The row is the caller's to write, through
+    /// `host::assembly::record_project_switch`; the next turn's context restates the memory
+    /// section for the new view.
+    pub(crate) fn set_project(&self, project: Option<String>) {
+        self.cells.project.set(project);
+    }
+
+    /// What this agent's project lets it see of the servers and skills, as it stands now.
+    pub(crate) fn project_access(&self) -> crate::config::ProjectAccess {
+        self.cells.project_lens(&self.projects).access()
     }
 
     /// The slot holding the lock on a session this agent created, for a host that has to outlive
