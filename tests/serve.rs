@@ -11096,8 +11096,9 @@ fn cancel_with_a_stale_turn_id_is_refused_and_the_live_one_is_honored() {
 /// item still waiting can be taken back, since one in the conversation is already the model's.
 #[test]
 fn inbox_items_replay_on_their_key_and_withdraw_only_while_pending() {
-    // The hold has to outlast seven round trips below, each with a store write, before the
-    // withdraw; Windows CI ran them past a three-second hold once, and the item was taken.
+    // A turn's opening appends every item pending at that moment, followups included, so the
+    // posts below wait for the opening to be saved rather than for admission; the hold then has
+    // to outlast the seven round trips between the first post and the withdraw.
     let script = serde_json::json!([
         [
             { "type": "sleep", "ms": 10000 },
@@ -11131,7 +11132,7 @@ fn inbox_items_replay_on_their_key_and_withdraw_only_while_pending() {
             .text()
             .expect("body")
     });
-    harness.wait_until_in_flight(&id);
+    wait_until_prompt_saved(&harness, &id, "slow");
     let submit = |key: &str, message: &str| -> serde_json::Value {
         harness
             .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/inbox"))
