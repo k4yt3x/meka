@@ -677,6 +677,8 @@ impl MessageAccumulator {
         (&self.tool_id, &self.tool_name)
     }
 
+    /// Close the text in progress as a block, ahead of whatever block comes next, so the message
+    /// holds its blocks in the order the wire sent them and a replay reads as the live turn did.
     fn flush_text(&mut self) {
         if !self.text.is_empty() {
             self.content.push(ContentBlock::Text {
@@ -693,11 +695,15 @@ impl MessageAccumulator {
             StreamEvent::ThinkingDelta(text) => self.thinking.push_str(&text),
             StreamEvent::ThinkingComplete { opaque } => {
                 let thinking = std::mem::take(&mut self.thinking);
+                // Only a block that is kept closes the text: one that is dropped must not split
+                // the text around nothing.
                 if let Some(block) = ContentBlock::replayable_thinking(thinking, opaque) {
+                    self.flush_text();
                     self.content.push(block);
                 }
             }
             StreamEvent::RedactedThinking { data } => {
+                self.flush_text();
                 self.content.push(ContentBlock::RedactedThinking { data });
             }
             StreamEvent::ThinkingProgress { .. } | StreamEvent::Error(_) => {}
@@ -2122,5 +2128,62 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as i64 + 86_400_000)
             .unwrap_or(0)
+    }
+
+    /// A thinking block that completes after text has streamed is stored after that text, with
+    /// the rest of the text behind it, so the message holds the blocks as the wire sent them and
+    /// a replay reads as the live turn did.
+    #[test]
+    fn a_thinking_block_mid_text_keeps_the_text_ahead_of_it() {
+        let mut accumulator = MessageAccumulator::new();
+        for event in [
+            StreamEvent::TextDelta("Short".into()),
+            StreamEvent::ThinkingDelta(" it.".into()),
+            StreamEvent::ThinkingComplete { opaque: None },
+            StreamEvent::TextDelta(" answer".into()),
+            StreamEvent::RedactedThinking {
+                data: "sealed".into(),
+            },
+            StreamEvent::TextDelta(" done".into()),
+        ] {
+            accumulator.push(event);
+        }
+        assert_eq!(accumulator.finish().message.content, vec![
+            ContentBlock::Text {
+                text: "Short".into()
+            },
+            ContentBlock::Thinking {
+                thinking: " it.".into(),
+                opaque: None,
+            },
+            ContentBlock::Text {
+                text: " answer".into()
+            },
+            ContentBlock::RedactedThinking {
+                data: "sealed".into(),
+            },
+            ContentBlock::Text {
+                text: " done".into()
+            },
+        ]);
+    }
+
+    /// A thinking block that is dropped, empty and with nothing to carry, leaves the text around
+    /// it whole.
+    #[test]
+    fn a_dropped_thinking_block_does_not_split_the_text() {
+        let mut accumulator = MessageAccumulator::new();
+        for event in [
+            StreamEvent::TextDelta("one ".into()),
+            StreamEvent::ThinkingComplete { opaque: None },
+            StreamEvent::TextDelta("piece".into()),
+        ] {
+            accumulator.push(event);
+        }
+        assert_eq!(accumulator.finish().message.content, vec![
+            ContentBlock::Text {
+                text: "one piece".into()
+            }
+        ]);
     }
 }

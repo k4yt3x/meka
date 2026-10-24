@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A warning a library logs is shown on the screen without its `log.*` location fields.
+- A thinking block that arrives mid-reply is stored where it arrived, as the live turn showed it.
 
 ### Security
 
