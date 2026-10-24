@@ -536,9 +536,9 @@ impl ToolView {
     }
 }
 
-/// A built-in tool as `meka tool list` prints it: the catalog entry plus the two facts this
-/// listing exists to show and a session's catalog cannot, where the required level came from and
-/// whether the config admits the tool at all.
+/// A built-in tool as `meka tool list` and `meka tool show` print it: the catalog entry plus the
+/// two facts the commands exist to show and a session's catalog cannot, where the required level
+/// came from and whether the config admits the tool at all.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ConfiguredToolView {
     #[serde(flatten)]
@@ -547,6 +547,16 @@ pub(crate) struct ConfiguredToolView {
     pub(crate) permission_source: &'static str,
     /// Whether a session on this config registers the tool; `false` is the plain `disabled`.
     pub(crate) enabled: bool,
+}
+
+/// A built-in tool as `meka tool show` prints it: the configured entry plus the schema the model
+/// receives.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ToolDefinitionView {
+    #[serde(flatten)]
+    pub(crate) tool: ConfiguredToolView,
+    /// The JSON schema of the tool's arguments, as the request carries it.
+    pub(crate) parameters: serde_json::Value,
 }
 
 /// A skill in the palette: what `GET /v1/skills` answers with, and the core of every other skill

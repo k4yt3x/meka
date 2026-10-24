@@ -10,11 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Projects: `[projects.<name>]` in `config.toml` names a work context a session opens by name.
-- `--project`, `/project`, `project` on HTTP sessions and an ACP config option put a session on one.
+- `--project`, `/project`, HTTP `project` and an ACP config option put a session on one.
 - Memory has a global tier and one per project; `memory_write` and `memory_search` take `tier`.
-- `meka project add|list|set|rename|remove`; `--project` on the `memory` commands and `session list`.
-- `GET /v1/projects`; `project` on the memory routes; `memory export` puts each project in a directory.
+- `meka project add|list|set|rename|remove`; `--project` on `memory` commands and `session list`.
+- `GET /v1/projects`; `project` on the memory routes; `memory export` uses a directory per project.
 - A project narrows the MCP servers and skills its sessions see: four `allowed_`/`disabled_` lists.
+- `meka tool show <name>` prints a built-in tool's schema as the model receives it.
 
 ### Changed
 

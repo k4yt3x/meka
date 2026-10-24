@@ -83,7 +83,7 @@ At **none**, no tools are available. The agent can only respond with text.
 
 ## Filtering built-in tools
 
-Any built-in can be allow-listed, blocked, or have its required permission overridden via the `[tools]` table in `config.toml`. See [`[tools]`: built-in tool filters](../configuration/config-file.md#tools-built-in-tool-filters). Run `meka tool list` to see every built-in with its effective permission and current status.
+Any built-in can be allow-listed, blocked, or have its required permission overridden via the `[tools]` table in `config.toml`. See [`[tools]`: built-in tool filters](../configuration/config-file.md#tools-built-in-tool-filters). Run `meka tool list` to see every built-in with its effective permission and current status, and `meka tool show <name>` for one tool's whole description and parameter schema as the model receives them.
 
 ## MCP tools
 

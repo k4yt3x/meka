@@ -117,8 +117,13 @@ a session on this machine would enforce: `shell_execute` is `read` where the she
 and a backend is usable, and `unrestricted` otherwise, so the listing probes the sandbox the way a
 session start does and gives the same warning when none is usable.
 
+`meka tool show <name>` prints one built-in as the model receives it: the same fields, the whole
+description and the parameters schema. Under `json`, the object is the listing's entry plus
+`parameters`.
+
 ```bash
 meka tool list [--format <FORMAT>]
+meka tool show <NAME> [--format <FORMAT>]
 ```
 
 See [Filtering built-in tools](../tools/overview.md#filtering-built-in-tools).
@@ -426,7 +431,7 @@ meka --oneshot -p "what changed?" --format json | jq -r .text
 
 Every listing and `show` command takes the same `--format plain|json`: `session list|show|search`,
 `account list|usage|whoami|stats`, `profile list`, `project list`, `mcp list|get|tools`,
-`schedule list|show`, `memory list|get|show`, `tool list`, `history list` and `skill list|get|show`.
+`schedule list|show`, `memory list|get|show`, `tool list|show`, `history list` and `skill list|get|show`.
 Under `json`, a `show` prints one object and a listing prints `{"<nouns>": [...]}` (`sessions`,
 `accounts`, `profiles`, `projects`, `servers`, `jobs`, `memories`, `tools`, `history`, `skills`), with the field names the
 [HTTP API](../usage/http-api.md) uses for the same object where it has one. An empty listing is the envelope around an empty array

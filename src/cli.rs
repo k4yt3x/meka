@@ -121,6 +121,13 @@ pub(crate) enum ToolAction {
         #[arg(long, default_value = "plain", help = output_format_help())]
         format: OutputFormat,
     },
+    /// Show a built-in tool's schema
+    Show {
+        /// Tool name
+        name: String,
+        #[arg(long, default_value = "plain", help = output_format_help())]
+        format: OutputFormat,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]

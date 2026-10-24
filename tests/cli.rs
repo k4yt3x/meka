@@ -3758,6 +3758,96 @@ fn tool_list_prints_json_with_the_source_and_status_of_each_tool() {
     }
 }
 
+/// The value of a `label:` line as `format_fields` writes it.
+fn field<'a>(stdout: &'a str, label: &str) -> &'a str {
+    let prefix = format!("{label}:");
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("no `{label}:` line in:\n{stdout}"))
+}
+
+/// `tool show` prints a built-in from the catalog `tool list` prints, so the level and its source
+/// are the configured ones, with the whole description and the parameters schema under it; the
+/// JSON document is the listing's entry plus `parameters`.
+#[test]
+fn tool_show_prints_a_builtin_with_the_schema_the_model_receives() {
+    let install = Install::new();
+    std::fs::write(
+        install.config_dir().join("config.toml"),
+        "[tools.tool_permissions]\nfile_read = \"none\"\n\n[shell]\nsandbox = false\n",
+    )
+    .expect("write config.toml");
+
+    let output = run_isolated(&install, &["tool", "show", "file_read"]);
+    assert!(
+        output.status.success(),
+        "exited {:?}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(field(&stdout, "name"), "file_read");
+    assert_eq!(field(&stdout, "permission"), "none");
+    assert_eq!(field(&stdout, "source"), "override");
+    assert_eq!(field(&stdout, "status"), "enabled");
+    let (_, under_heading) = stdout
+        .split_once("description:\n")
+        .expect("a bare `description:` heading");
+    assert!(
+        under_heading
+            .lines()
+            .next()
+            .is_some_and(|line| line.starts_with("  ") && line.trim().len() > 20),
+        "the description is a block under its heading: {stdout}"
+    );
+    assert!(
+        stdout.contains("parameters:\n  {\n") && stdout.contains("\"path\": {"),
+        "the schema is a block under its heading: {stdout}"
+    );
+
+    let shown = json_stdout(run_isolated(&install, &[
+        "tool",
+        "show",
+        "file_read",
+        "--format",
+        "json",
+    ]));
+    assert_eq!(shown["name"], "file_read");
+    assert_eq!(shown["required_permission"], "none");
+    assert_eq!(shown["permission_source"], "override");
+    assert_eq!(shown["enabled"], true);
+    assert!(shown["deferred"].is_boolean(), "{shown}");
+    assert_eq!(shown["parameters"]["type"], "object");
+    assert_eq!(shown["parameters"]["properties"]["path"]["type"], "string");
+    assert!(
+        shown.get("title").is_none(),
+        "a built-in sets no MCP field: {shown}"
+    );
+}
+
+/// A name that matches no tool is refused with the nearest built-in, or with the listing to read
+/// when nothing is near.
+#[test]
+fn tool_show_refuses_a_name_that_matches_nothing() {
+    let install = Install::new();
+    let output = run_isolated(&install, &["tool", "show", "file_reed"]);
+    assert!(!output.status.success(), "{:?}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no tool named 'file_reed'") && stderr.contains("Did you mean `file_read`"),
+        "{stderr}"
+    );
+    let output = run_isolated(&install, &["tool", "show", "nothing_like_it"]);
+    assert!(!output.status.success(), "{:?}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no tool named 'nothing_like_it'; list them with `meka tool list`"),
+        "{stderr}"
+    );
+}
+
 /// `meka confine` is the inside of the Bubblewrap sandbox: it enacts the Landlock ruleset and
 /// becomes the command. Checked on its own here, without bwrap, by what lands on disk. Skips
 /// loudly where the kernel has no usable Landlock, which the verb reports through exit 126.
