@@ -10,6 +10,38 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.83 to 0.84
+
+Nothing is renamed and no key is refused; the store is migrated on first open, and one wire shape
+grows.
+
+**Every compaction records what it was.** The boundary a compaction writes now carries what set it
+going (`reactive`, `proactive`, `manual`, `requested`, `emergency` or `retention`), which strategy
+wrote the summary, the memories the checkpoint wrote and whether the recent turns were kept, so
+the screen's row, the editor's entry and the HTTP marker say the same thing live and on a replay of
+the log. A boundary written before 0.84 recorded none of that, and nothing in the store says, so
+the migration gives every one of them the commonest case: an automatic compaction at the ceiling
+(`reactive`), written by the checkpoint, with no memories written and the recent turns kept. A
+resumed older session therefore replays each earlier compaction as `Autocompacted the conversation
+after context usage crossed the ceiling.`, whatever set it going at the time.
+
+**Session archives are `format_version` 16.** An archive written by 0.79 through 0.83 is brought
+forward on import, its boundaries given the same record.
+
+**`context.compacted` says more, and has company.** The stream event and the `compaction` object
+on `GET /messages` carry `trigger`, `memories_written` and `kept_recent` beside `source`,
+`replaced_count` and `generation`; the event also names its `compaction_id`. `context.compacting`
+opens a compaction under that id before any request is made, and `context.compaction_failed`
+closes one that did not land. The one-shot JSON report lists the turn's compactions under
+`compactions`.
+
+**An ACP client sees the compaction it asked to see.** One that advertised `session.compaction`
+gets `compaction_update`, `in_progress` then `completed` with the summary, in place of the
+`[meka]` chunk; one that did not still gets the chunk, now in the screen's words
+(`The agent compacted the conversation.` rather than `Compacted the conversation: 545 messages
+replaced by a summary (checkpoint, compaction 8)`). A client matching on the old sentence should
+match on `[meka]` alone or advertise the capability.
+
 ## 0.82 to 0.83
 
 Nothing is renamed and no key is refused; one thing changes what a memory does.

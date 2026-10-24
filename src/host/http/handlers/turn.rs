@@ -1753,9 +1753,9 @@ fn assemble_response(
             // ToolCallComposing does reach here -- `stream: false` picks the response shape, not
             // whether meka streams from the provider -- and is dropped: a body assembled after the
             // turn is over has nothing to mark the beginning of a wait on.
-            // Compacted is dropped too: the summary message on `GET /messages` carries the same
-            // `compaction` marker, so a blocking client already has the fact where it will look
-            // for it, and a streaming one gets `context.compacted`.
+            // The compaction events are dropped too: the summary message on `GET /messages`
+            // carries the same `compaction` object, so a blocking client already has the fact
+            // where it will look for it, and a streaming one gets the `context.*` events.
             _ => {}
         }
     }

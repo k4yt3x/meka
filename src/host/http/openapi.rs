@@ -108,7 +108,7 @@ use crate::host::http::{handlers, state::ServerState};
         crate::host::http::handlers::messages::MessageView,
         crate::host::http::handlers::messages::ContentBlockView,
         crate::host::http::handlers::messages::ToolResultContentView,
-        crate::host::http::handlers::messages::CompactionMarker,
+        crate::view::CompactionView,
         crate::host::http::handlers::conversation::CompactRequestBody,
         crate::host::http::handlers::conversation::CompactResponse,
         crate::host::http::handlers::conversation::ContextResponse,

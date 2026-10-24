@@ -79,7 +79,8 @@ meka --oneshot -p "how many files are here?" --format json
   },
   "notices": [
     { "level": "warn", "text": "Approvals are on but nobody can answer here, so 'shell_execute' was refused without asking." }
-  ]
+  ],
+  "compactions": []
 }
 ```
 
@@ -90,7 +91,9 @@ present. `text` is the assistant's text with the rounds joined by a blank line,
 `tool_calls` lists every call in the order it was dispatched, and `usage` sums the rounds. `notices`
 is what meka itself said during the turn (a refused approval, a lost write, a declined MCP
 elicitation), each with
-a `level` of `info` or `warn` and its `text`; it is empty when meka raised none. The flag applies to
+a `level` of `info` or `warn` and its `text`; it is empty when meka raised none. `compactions` lists
+the compactions the turn ran, each in the shape of the HTTP API's
+[`context.compacted`](http-api.md#event-types) event. The flag applies to
 `--oneshot` alone; a run without it is refused. `meka account usage`, `whoami` and `stats` take the
 same flag and values, and `meka session export --format` takes `markdown` or `json`.
 

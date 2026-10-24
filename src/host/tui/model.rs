@@ -1168,8 +1168,13 @@ impl Transcript {
                 }
             }
             // The transcript is a record of what was said, not a view of the model's window, so
-            // a compaction changes nothing on it; `/compact` reports its own outcome.
-            FrontendEvent::Compacted { .. } => {}
+            // a compaction changes nothing already on it; the row says what happened, in the words
+            // a replay of the log's boundary uses, so a resumed session reads as this one did.
+            FrontendEvent::Compacted { record, .. } => {
+                self.close_streams();
+                self.push(Item::note(record.note()));
+            }
+            FrontendEvent::CompactionStarted { .. } | FrontendEvent::CompactionFailed { .. } => {}
         }
     }
 
@@ -1248,8 +1253,8 @@ impl Transcript {
             let event = &row.event;
             let message = match event {
                 Event::Append(message) => message,
-                Event::CompactBoundary { .. } => {
-                    let entry = self.entry(Item::note("Session compacted."));
+                Event::CompactBoundary { record, .. } => {
+                    let entry = self.entry(Item::note(record.note()));
                     out.push(entry);
                     continue;
                 }
@@ -1712,6 +1717,43 @@ mod tests {
         assert_eq!(transcript.drawn_len(), 3);
     }
 
+    /// A compaction landing live is a row in the words a replay of its boundary uses, so a
+    /// resumed session reads as this one did; its opening and a failure draw nothing, since the
+    /// working row says a compaction runs.
+    #[test]
+    fn a_compaction_is_a_row_in_the_words_its_boundary_replays() {
+        let mut transcript = transcript();
+        let record = crate::conversation::CompactionRecord {
+            trigger: crate::conversation::CompactionTrigger::Manual,
+            source: crate::conversation::CompactionSource::Checkpoint,
+            memories_written: vec!["notes".to_string()],
+            kept_recent: true,
+        };
+        transcript.apply(FrontendEvent::CompactionStarted {
+            id: "c1".to_string(),
+            trigger: record.trigger,
+        });
+        assert!(items(&transcript).is_empty(), "{:?}", items(&transcript));
+        transcript.apply(FrontendEvent::Compacted {
+            id: "c1".to_string(),
+            record: record.clone(),
+            replaced_count: 3,
+            generation: 1,
+            summary: "a summary".to_string(),
+        });
+        let shown = items(&transcript);
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert!(
+            matches!(shown[0], Item::Notice { text, .. } if text == &record.note()),
+            "{shown:?}"
+        );
+        assert!(
+            record
+                .note()
+                .starts_with("Compacted the conversation on user request. Wrote 1 memory: notes."),
+        );
+    }
+
     /// A stage direction and an advisory are told apart by the notice's kind, not its words.
     #[test]
     fn a_notice_lands_in_its_register() {
@@ -2034,6 +2076,7 @@ mod tests {
                 Event::CompactBoundary {
                     summary: Message::user("summary"),
                     replaced_count: 4,
+                    record: crate::conversation::CompactionRecord::for_test(),
                     loaded_tools_snapshot: Default::default(),
                     checklist_snapshot: Default::default(),
                 },
@@ -2051,7 +2094,10 @@ mod tests {
         ));
         let shown = items(&transcript);
         assert_eq!(shown.len(), 2, "{shown:?}");
-        assert!(matches!(shown[0], Item::Notice { text, .. } if text == "Session compacted."));
+        assert!(
+            matches!(shown[0], Item::Notice { text, .. } if text == "Autocompacted the conversation after context usage crossed the ceiling."),
+            "{shown:?}"
+        );
         assert!(matches!(shown[1], Item::Notice { text, .. } if text == "Rewound 2 messages."));
     }
 

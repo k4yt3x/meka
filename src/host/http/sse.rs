@@ -27,6 +27,14 @@ pub(crate) struct SseEvent {
     pub(crate) data: serde_json::Value,
 }
 
+/// The `context.compacted` payload: the compaction's view under the id it began with.
+#[derive(serde::Serialize)]
+struct ContextCompacted {
+    compaction_id: String,
+    #[serde(flatten)]
+    compaction: crate::view::CompactionView,
+}
+
 /// Stable event-name strings shipped on the wire. Keep these in lockstep with the HTTP API docs.
 ///
 /// Lifecycle events (`turn.started`, `turn.finished`, `turn.failed`, `turn.canceled`) do not pass
@@ -46,7 +54,9 @@ pub(crate) enum SseEventType {
     Notice,
     FeedGap,
     PermissionRequired,
+    ContextCompacting,
     ContextCompacted,
+    ContextCompactionFailed,
     TurnStarted,
     TurnFinished,
     TurnFailed,
@@ -99,7 +109,9 @@ impl SseEventType {
             Self::Notice => "notice",
             Self::FeedGap => "feed.gap",
             Self::PermissionRequired => "permission_required",
+            Self::ContextCompacting => "context.compacting",
             Self::ContextCompacted => "context.compacted",
+            Self::ContextCompactionFailed => "context.compaction_failed",
             Self::TurnStarted => "turn.started",
             Self::TurnFinished => "turn.finished",
             Self::TurnFailed => "turn.failed",
@@ -356,20 +368,42 @@ pub(crate) fn translate(
             SseEventType::Notice,
             serde_json::json!(NoticeView::from(notice)),
         ),
+        FrontendEvent::CompactionStarted { id, trigger } => (
+            SseEventType::ContextCompacting,
+            serde_json::json!({
+                "compaction_id": id,
+                "trigger": trigger.name(),
+            }),
+        ),
         // The one event a streaming client cannot infer. Everything else on this stream is
         // additive, so a client that misses one still holds a prefix of the truth; a compaction
         // *removes* messages it has already rendered, and without this it would only find out by
         // noticing `total` went down on the next `GET /messages`.
         FrontendEvent::Compacted {
-            source,
+            id,
+            record,
             replaced_count,
             generation,
+            summary: _,
         } => (
             SseEventType::ContextCompacted,
+            serde_json::json!(ContextCompacted {
+                compaction_id: id,
+                compaction: crate::view::CompactionView::new(&record, replaced_count, generation),
+            }),
+        ),
+        FrontendEvent::CompactionFailed {
+            id,
+            trigger,
+            error,
+            interrupted,
+        } => (
+            SseEventType::ContextCompactionFailed,
             serde_json::json!({
-                "source": source,
-                "replaced_count": replaced_count,
-                "generation": generation,
+                "compaction_id": id,
+                "trigger": trigger.name(),
+                "error": error,
+                "interrupted": interrupted,
             }),
         ),
         FrontendEvent::SessionStarted { .. } => return None,
@@ -500,6 +534,68 @@ mod tests {
             crate::store::content_hash(bytes),
             "{data}"
         );
+    }
+
+    /// The three compaction events name one compaction by id, the first with what set it going,
+    /// the second with the whole record, the third with why it did not land.
+    #[test]
+    fn translate_the_compaction_events_under_one_id() {
+        use crate::conversation::{CompactionRecord, CompactionSource, CompactionTrigger};
+        let (kind, data) = translate(
+            FrontendEvent::CompactionStarted {
+                id: "c1".to_string(),
+                trigger: CompactionTrigger::Proactive,
+            },
+            SessionCapabilities::default(),
+        )
+        .expect("an event");
+        assert_eq!(kind.as_str(), "context.compacting");
+        assert_eq!(data["compaction_id"], "c1");
+        assert_eq!(data["trigger"], "proactive");
+
+        let (kind, data) = translate(
+            FrontendEvent::Compacted {
+                id: "c1".to_string(),
+                record: CompactionRecord {
+                    trigger: CompactionTrigger::Proactive,
+                    source: CompactionSource::Checkpoint,
+                    memories_written: vec!["notes".to_string()],
+                    kept_recent: false,
+                },
+                replaced_count: 7,
+                generation: 2,
+                summary: "a summary".to_string(),
+            },
+            SessionCapabilities::default(),
+        )
+        .expect("an event");
+        assert_eq!(kind.as_str(), "context.compacted");
+        assert_eq!(data["compaction_id"], "c1");
+        assert_eq!(data["trigger"], "proactive");
+        assert_eq!(data["source"], "checkpoint");
+        assert_eq!(data["memories_written"], serde_json::json!(["notes"]));
+        assert_eq!(data["kept_recent"], false);
+        assert_eq!(data["replaced_count"], 7);
+        assert_eq!(data["generation"], 2);
+        assert!(
+            data.get("summary").is_none(),
+            "the summary is on `GET /messages`: {data}"
+        );
+
+        let (kind, data) = translate(
+            FrontendEvent::CompactionFailed {
+                id: "c1".to_string(),
+                trigger: CompactionTrigger::Proactive,
+                error: "Interrupted".to_string(),
+                interrupted: true,
+            },
+            SessionCapabilities::default(),
+        )
+        .expect("an event");
+        assert_eq!(kind.as_str(), "context.compaction_failed");
+        assert_eq!(data["compaction_id"], "c1");
+        assert_eq!(data["interrupted"], true);
+        assert_eq!(data["error"], "Interrupted");
     }
 
     #[test]

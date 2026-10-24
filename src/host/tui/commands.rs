@@ -174,7 +174,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
         },
         SlashCommand::Compact(instructions) => {
             let request = crate::session::CompactRequest {
-                origin: crate::session::CompactOrigin::Manual,
+                trigger: crate::conversation::CompactionTrigger::Manual,
                 instructions: instructions
                     .as_deref()
                     .map(str::trim)
@@ -193,7 +193,8 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             )
             .await
             {
-                Ok(outcome) => ui.note(render::compaction_summary(&outcome)),
+                // The row is the compaction's own, drawn from the event every compaction emits.
+                Ok(_) => {}
                 Err(error) => ui.report_failure(&error),
             }
         }

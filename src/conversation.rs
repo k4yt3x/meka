@@ -35,6 +35,247 @@ fn opens_turn(message: &Message) -> bool {
 pub(crate) const THINKING_ONLY_NUDGE: &str = "[Your previous response contained no visible output. Please \
                                    continue and produce a user-visible response.]";
 
+/// Which strategy wrote a compaction's summary. The two differ in fidelity, not just mechanism:
+/// the checkpoint turn is the agent summarizing itself, with its tools, and the standalone
+/// summarizer knows nothing but the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum CompactionSource {
+    /// The checkpoint turn, via `context_replace`. The intended path.
+    Checkpoint,
+    /// The standalone summarizer: the emergency path, a disabled checkpoint, or a checkpoint that
+    /// ended without calling `context_replace`. The last is reachable on every backend, since
+    /// `Provider::complete` carries no `tool_choice` and the call cannot be forced.
+    Summarizer,
+}
+
+impl CompactionSource {
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [CompactionSource; 2] = [Self::Checkpoint, Self::Summarizer];
+
+    /// The value's one spelling, in the log and on every wire.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Checkpoint => "checkpoint",
+            Self::Summarizer => "summarizer",
+        }
+    }
+}
+
+impl std::fmt::Display for CompactionSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for CompactionSource {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|source| source.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a compaction source. Supported: {}",
+                    Self::ALL
+                        .iter()
+                        .map(|source| source.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for CompactionSource {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, String> {
+        value.parse()
+    }
+}
+
+impl From<CompactionSource> for String {
+    fn from(source: CompactionSource) -> Self {
+        source.name().to_string()
+    }
+}
+
+/// What set a compaction going. Selects the summarization strategy, so it is not merely
+/// diagnostic, and is what every surface says about the compaction afterwards.
+///
+/// Every trigger but [`Self::Emergency`] can afford the checkpoint turn. `Emergency` cannot: it
+/// runs *after* the provider rejected the request for exceeding the window, and a checkpoint turn
+/// sends the same conversation again, so it would be refused for the same reason. That path needs
+/// a call that is deliberately smaller than the one that just failed, which is exactly what
+/// `Agent::summarize_via_provider` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum CompactionTrigger {
+    /// A measured occupancy crossed the ceiling, between turns or between two tool rounds.
+    Reactive,
+    /// This turn's projected request would cross it.
+    Proactive,
+    /// A human ran `/compact` or `POST /compact`.
+    Manual,
+    /// The agent asked, via `context_compact`.
+    Requested,
+    /// The provider refused the request as too large.
+    Emergency,
+    /// A turn in the model's view is older than `[session].turn_retention`, so the sweep that
+    /// deletes it needs a summary to stand in for it first.
+    Retention,
+}
+
+impl CompactionTrigger {
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [CompactionTrigger; 6] = [
+        Self::Reactive,
+        Self::Proactive,
+        Self::Manual,
+        Self::Requested,
+        Self::Emergency,
+        Self::Retention,
+    ];
+
+    /// The value's one spelling, in the log and on every wire.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Reactive => "reactive",
+            Self::Proactive => "proactive",
+            Self::Manual => "manual",
+            Self::Requested => "requested",
+            Self::Emergency => "emergency",
+            Self::Retention => "retention",
+        }
+    }
+}
+
+impl std::fmt::Display for CompactionTrigger {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for CompactionTrigger {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|trigger| trigger.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a compaction trigger. Supported: {}",
+                    Self::ALL
+                        .iter()
+                        .map(|trigger| trigger.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for CompactionTrigger {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, String> {
+        value.parse()
+    }
+}
+
+impl From<CompactionTrigger> for String {
+    fn from(trigger: CompactionTrigger) -> Self {
+        trigger.name().to_string()
+    }
+}
+
+/// What a compaction was, as its boundary records it and every surface says it: what set it
+/// going, which strategy wrote the summary, the memories the checkpoint wrote on the way, and
+/// whether the recent turns were kept verbatim after the summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompactionRecord {
+    pub(crate) trigger: CompactionTrigger,
+    pub(crate) source: CompactionSource,
+    /// Observed from the checkpoint's `memory_write` calls rather than self-reported, so this
+    /// cannot disagree with what landed on disk.
+    pub(crate) memories_written: Vec<String>,
+    /// The outcome, not the intent: the split yields an empty tail whenever the snapped boundary
+    /// lands below the minimum worth summarizing, which is routine in a session whose user turns
+    /// are separated by long tool runs.
+    pub(crate) kept_recent: bool,
+}
+
+impl CompactionRecord {
+    /// What the compaction was, in one line: the sentence for what set it going, then what differs
+    /// from the ordinary case. Said on the screen as the compaction lands and again on a replay of
+    /// the log, in an editor as the `[meka]` chunk, on the export's marker and as the one-shot's
+    /// note, all from this record, so a resumed session reads as the live one did.
+    ///
+    /// The memories are named because they are durable and instance-scoped: notes accumulating
+    /// unmentioned under an event whose name suggests it only removes things is the surprise this
+    /// reporting exists to prevent. The summarizer is named because the summary is then not the
+    /// one the agent chose to write, so a user comparing results across compactions has an
+    /// explanation for the difference.
+    pub(crate) fn note(&self) -> String {
+        let mut line = String::from(match self.trigger {
+            CompactionTrigger::Reactive => {
+                "Autocompacted the conversation after context usage crossed the ceiling."
+            }
+            CompactionTrigger::Proactive => {
+                "Autocompacted the conversation ahead of a turn that would have crossed the ceiling."
+            }
+            CompactionTrigger::Manual => "Compacted the conversation on user request.",
+            CompactionTrigger::Requested => "The agent compacted the conversation.",
+            CompactionTrigger::Emergency => {
+                "Compacted the conversation after the provider refused the request as too large."
+            }
+            CompactionTrigger::Retention => {
+                "Autocompacted the conversation to summarize turns older than the retention window."
+            }
+        });
+        if !self.kept_recent {
+            line.push_str(" No recent turns were kept.");
+        }
+        match self.source {
+            CompactionSource::Checkpoint => {}
+            CompactionSource::Summarizer => {
+                line.push_str(" Written by the standalone summarizer.");
+            }
+        }
+        if !self.memories_written.is_empty() {
+            line.push_str(&format!(
+                " Wrote {} {}: {}.",
+                self.memories_written.len(),
+                if self.memories_written.len() == 1 {
+                    "memory"
+                } else {
+                    "memories"
+                },
+                self.memories_written.join(", "),
+            ));
+        }
+        line
+    }
+}
+
+#[cfg(test)]
+impl CompactionRecord {
+    /// A record for a fixture whose test asks nothing about the compaction itself.
+    pub(crate) fn for_test() -> Self {
+        Self {
+            trigger: CompactionTrigger::Reactive,
+            source: CompactionSource::Checkpoint,
+            memories_written: Vec::new(),
+            kept_recent: true,
+        }
+    }
+}
+
 /// One entry in the underlying event log of a [`Conversation`]. Persisted as a single row in the
 /// `messages` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,12 +287,15 @@ pub(crate) enum Event {
     /// the set of deferred tools that were active at compaction time so `extract_loaded_tool_names`
     /// can recover them after the boundary (otherwise compaction would silently un-load them), and
     /// the checklist as it stood, for the same reason: the calls that built it are among the rows
-    /// the boundary replaces, and the replay that recovers the list reads the view.
+    /// the boundary replaces, and the replay that recovers the list reads the view. The record is
+    /// what a replay says about the compaction, in the words the live row used.
     CompactBoundary {
         summary: Message,
         replaced_count: usize,
         loaded_tools_snapshot: HashSet<String>,
         checklist_snapshot: crate::checklist::ChecklistState,
+        #[serde(flatten)]
+        record: CompactionRecord,
     },
     /// Replaces the last `replaced_count` materialized messages with `messages`. An empty
     /// `messages` therefore means "drop them", which is what [`Conversation::rewind`] emits.
@@ -335,6 +579,7 @@ impl Conversation {
         tail: Vec<Message>,
         loaded_tools_snapshot: HashSet<String>,
         checklist_snapshot: crate::checklist::ChecklistState,
+        record: CompactionRecord,
     ) {
         let replaced_count = self.materialized.len();
         self.events.push(Event::CompactBoundary {
@@ -342,6 +587,7 @@ impl Conversation {
             replaced_count,
             loaded_tools_snapshot,
             checklist_snapshot,
+            record,
         });
         for message in tail {
             self.events.push(Event::Append(message));
@@ -563,6 +809,8 @@ pub(crate) struct CompactionMarker {
     pub(crate) replaced_count: usize,
     /// Which compaction produced it, counting from 1.
     pub(crate) generation: u64,
+    /// What the boundary recorded about the compaction.
+    pub(crate) record: CompactionRecord,
 }
 
 /// Replay `events` into the messages the model sees, with each one's origin, and the count of
@@ -588,6 +836,7 @@ fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> (Vec<Placed>, u64) {
             Event::CompactBoundary {
                 summary,
                 replaced_count,
+                record,
                 ..
             } => {
                 revision = revision.saturating_add(1);
@@ -599,6 +848,7 @@ fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> (Vec<Placed>, u64) {
                     marker: Some(CompactionMarker {
                         replaced_count: *replaced_count,
                         generation,
+                        record: record.clone(),
                     }),
                 });
             }
@@ -1560,12 +1810,16 @@ pub(crate) fn format_session_as_markdown(
             Event::Append(message) => {
                 write_message_markdown(&mut output, message, scratchpad_entries);
             }
-            Event::CompactBoundary { summary, .. } => {
+            Event::CompactBoundary {
+                summary, record, ..
+            } => {
                 writeln!(output, "---\n").ok();
                 writeln!(output, "<details>").ok();
                 writeln!(
                     output,
-                    "<summary>Session compaction (summary the model saw in place of the turns above)</summary>\n"
+                    "<summary>Session compaction: {} (the summary the model saw in place of the \
+                     turns above)</summary>\n",
+                    record.note()
                 )
                 .ok();
                 writeln!(output, "{}\n", summary.text_content()).ok();
@@ -1822,6 +2076,7 @@ mod tests {
             Event::CompactBoundary {
                 summary: Message::user("[Conversation summary from session compaction] found them"),
                 replaced_count: 2,
+                record: crate::conversation::CompactionRecord::for_test(),
                 loaded_tools_snapshot: HashSet::new(),
                 checklist_snapshot: Default::default(),
             },
@@ -2076,6 +2331,7 @@ mod tests {
             Vec::new(),
             HashSet::new(),
             Default::default(),
+            CompactionRecord::for_test(),
         );
 
         assert!(
@@ -2112,6 +2368,7 @@ mod tests {
             vec![Message::user("kept"), Message::assistant_text("kept reply")],
             HashSet::new(),
             snapshot.clone(),
+            CompactionRecord::for_test(),
         );
         let (baseline, after) = conversation.checklist_baseline();
         assert_eq!(baseline, snapshot);
@@ -2153,6 +2410,7 @@ mod tests {
             vec![prompt],
             HashSet::new(),
             Default::default(),
+            CompactionRecord::for_test(),
         );
 
         assert!(
@@ -2243,7 +2501,13 @@ mod tests {
 
         let summary = Message::user("[summary]");
         let tail = vec![Message::assistant_text("kept-1"), Message::user("kept-2")];
-        log.replace_for_compaction(summary, tail, HashSet::new(), Default::default());
+        log.replace_for_compaction(
+            summary,
+            tail,
+            HashSet::new(),
+            Default::default(),
+            CompactionRecord::for_test(),
+        );
 
         let view = log.as_slice();
         assert_eq!(view.len(), 3);
@@ -2261,6 +2525,7 @@ mod tests {
             Vec::new(),
             HashSet::new(),
             Default::default(),
+            CompactionRecord::for_test(),
         );
         assert_eq!(log.len(), 1);
         assert_eq!(log.as_slice()[0].text_content(), "[summary]");
@@ -2340,6 +2605,7 @@ mod tests {
             vec![Message::user("three")],
             HashSet::new(),
             Default::default(),
+            CompactionRecord::for_test(),
         );
         assert_ne!(log.len(), before.len(), "compaction must have rewritten it");
 
@@ -2368,6 +2634,7 @@ mod tests {
             Vec::new(),
             HashSet::new(),
             Default::default(),
+            CompactionRecord::for_test(),
         );
         log.append(Message::user("after the first summary"));
         let before: Vec<String> = log.iter().map(|m| format!("{m:?}")).collect();
@@ -2377,6 +2644,7 @@ mod tests {
             vec![Message::user("kept")],
             HashSet::new(),
             Default::default(),
+            CompactionRecord::for_test(),
         );
         assert!(log.pop_compaction());
         assert_eq!(
@@ -2751,6 +3019,7 @@ mod tests {
             Vec::new(),
             HashSet::new(),
             Default::default(),
+            CompactionRecord::for_test(),
         );
         let boundary = resumed
             .events()
@@ -2871,6 +3140,7 @@ mod tests {
             vec![Message::user("tail")],
             HashSet::new(),
             Default::default(),
+            CompactionRecord::for_test(),
         );
 
         let post_event_count = log.events().len();
@@ -2896,6 +3166,7 @@ mod tests {
             vec![Message::assistant_text("kept-1"), Message::user("kept-2")],
             HashSet::new(),
             Default::default(),
+            CompactionRecord::for_test(),
         );
 
         let view = log.as_slice();
@@ -2955,6 +3226,7 @@ mod tests {
             Vec::new(),
             snapshot,
             Default::default(),
+            CompactionRecord::for_test(),
         );
 
         let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(
@@ -2977,6 +3249,7 @@ mod tests {
             vec![Message::user("tail-1")],
             snapshot.clone(),
             Default::default(),
+            CompactionRecord::for_test(),
         );
         log.append(Message::assistant_text("m2"));
         log.replace_for_compaction(
@@ -2984,6 +3257,7 @@ mod tests {
             vec![Message::user("tail-2")],
             snapshot,
             Default::default(),
+            CompactionRecord::for_test(),
         );
 
         let view_before: Vec<String> = log.as_slice().iter().map(|m| m.text_content()).collect();
@@ -3066,6 +3340,7 @@ mod tests {
                 .map(str::to_string)
                 .collect(),
             Default::default(),
+            CompactionRecord::for_test(),
         );
         log.append(Message {
             role: Role::Assistant,
@@ -3115,6 +3390,7 @@ mod tests {
             vec![load_tool_result("u1", false)],
             HashSet::new(),
             Default::default(),
+            CompactionRecord::for_test(),
         );
 
         let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(
@@ -3135,6 +3411,7 @@ mod tests {
             Vec::new(),
             HashSet::new(),
             Default::default(),
+            CompactionRecord::for_test(),
         );
         log.append(Message::user("post-comp"));
 
@@ -3158,6 +3435,120 @@ mod tests {
         assert!(log.events().iter().all(|e| matches!(e, Event::Append(_))));
     }
 
+    fn record(
+        trigger: CompactionTrigger,
+        source: CompactionSource,
+        memories: &[&str],
+        kept_recent: bool,
+    ) -> CompactionRecord {
+        CompactionRecord {
+            trigger,
+            source,
+            memories_written: memories.iter().map(|name| name.to_string()).collect(),
+            kept_recent,
+        }
+    }
+
+    /// The note names what the checkpoint wrote, because a memory is durable and instance-scoped:
+    /// notes accumulating unmentioned under an event called a compaction is the surprise this
+    /// reporting exists to prevent.
+    #[test]
+    fn compaction_note_names_memories_written() {
+        let line = record(
+            CompactionTrigger::Manual,
+            CompactionSource::Checkpoint,
+            &["deploy-quirks", "rate-limits"],
+            true,
+        )
+        .note();
+        assert_eq!(
+            line,
+            "Compacted the conversation on user request. Wrote 2 memories: deploy-quirks, \
+             rate-limits."
+        );
+    }
+
+    /// Each trigger has its own sentence, and the ordinary case adds nothing to it.
+    #[test]
+    fn compaction_note_says_what_set_the_compaction_going() {
+        let note = |trigger| record(trigger, CompactionSource::Checkpoint, &[], true).note();
+        assert_eq!(
+            note(CompactionTrigger::Reactive),
+            "Autocompacted the conversation after context usage crossed the ceiling."
+        );
+        assert_eq!(
+            note(CompactionTrigger::Proactive),
+            "Autocompacted the conversation ahead of a turn that would have crossed the ceiling."
+        );
+        assert_eq!(
+            note(CompactionTrigger::Requested),
+            "The agent compacted the conversation."
+        );
+        assert_eq!(
+            note(CompactionTrigger::Emergency),
+            "Compacted the conversation after the provider refused the request as too large."
+        );
+        assert_eq!(
+            note(CompactionTrigger::Retention),
+            "Autocompacted the conversation to summarize turns older than the retention window."
+        );
+    }
+
+    /// Both departures from the ordinary case are named. A user comparing one compaction against
+    /// another needs to know the summary was not the one the agent chose to write.
+    #[test]
+    fn compaction_note_reports_a_fallback_and_a_discarded_tail() {
+        let line = record(
+            CompactionTrigger::Emergency,
+            CompactionSource::Summarizer,
+            &[],
+            false,
+        )
+        .note();
+        assert_eq!(
+            line,
+            "Compacted the conversation after the provider refused the request as too large. No \
+             recent turns were kept. Written by the standalone summarizer."
+        );
+    }
+
+    /// The record is four keys beside the boundary's own, which is the shape the migration module
+    /// writes onto an older row, and each spelling is the one the value enums name.
+    #[test]
+    fn a_boundary_carries_its_record_as_flat_keys() {
+        let event = Event::CompactBoundary {
+            summary: Message::user("summary"),
+            replaced_count: 2,
+            loaded_tools_snapshot: HashSet::new(),
+            checklist_snapshot: Default::default(),
+            record: CompactionRecord {
+                trigger: CompactionTrigger::Requested,
+                source: CompactionSource::Summarizer,
+                memories_written: vec!["notes".to_string()],
+                kept_recent: false,
+            },
+        };
+        let encoded = serde_json::to_value(&event).expect("encodes");
+        let boundary = &encoded["CompactBoundary"];
+        assert_eq!(boundary["trigger"], "requested");
+        assert_eq!(boundary["source"], "summarizer");
+        assert_eq!(boundary["memories_written"], serde_json::json!(["notes"]));
+        assert_eq!(boundary["kept_recent"], false);
+        let decoded: Event = serde_json::from_value(encoded).expect("decodes");
+        let Event::CompactBoundary { record, .. } = decoded else {
+            panic!("a boundary decodes as one");
+        };
+        assert_eq!(record.trigger, CompactionTrigger::Requested);
+        assert_eq!(record.source, CompactionSource::Summarizer);
+        assert!(
+            serde_json::from_str::<Event>(
+                r#"{"CompactBoundary":{"summary":{"role":"user","content":[]},"replaced_count":1,"loaded_tools_snapshot":[],"checklist_snapshot":{"next_id":1,"items":[]}}}"#
+            )
+            .is_err(),
+            "a boundary without its record is not one this build reads; the migration writes it"
+        );
+    }
+
     #[test]
     fn event_serializes_round_trip() {
         // Serialize one of each event variant and round-trip through JSON.
@@ -3173,6 +3564,7 @@ mod tests {
         let boundary = Event::CompactBoundary {
             summary: Message::user("[summary]"),
             replaced_count: 5,
+            record: crate::conversation::CompactionRecord::for_test(),
             loaded_tools_snapshot: snapshot,
             checklist_snapshot: Default::default(),
         };
@@ -3201,6 +3593,7 @@ mod tests {
             Vec::new(),
             HashSet::new(),
             Default::default(),
+            CompactionRecord::for_test(),
         );
         // Synthetic summary is a plain user message; sanitize must leave it.
         log.sanitize_orphans();

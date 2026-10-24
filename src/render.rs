@@ -308,41 +308,6 @@ fn thinking_preview_runs(thinking: &str) -> Vec<markdown::OwnedCompound> {
     markdown::inline_runs(&sanitize_to_line(&collapse_to_line(thinking), usize::MAX))
 }
 
-/// The `/compact` confirmation line.
-///
-/// Names the memories the checkpoint turn wrote, because they are durable and instance-scoped:
-/// leaving them unmentioned would let notes accumulate invisibly under a command whose name
-/// suggests it only removes things. Derived from the calls that actually ran, never self-reported.
-pub(crate) fn compaction_summary(outcome: &crate::agent::CompactOutcome) -> String {
-    let mut line = String::from("Session compacted");
-    if !outcome.kept_recent {
-        line.push_str(" (recent turns discarded too)");
-    }
-    line.push('.');
-    match outcome.source {
-        crate::agent::CompactSource::Checkpoint => {}
-        // Worth naming: the summary is not the one the agent chose to write, so a user comparing
-        // results across compactions has an explanation for the difference. Said of the summary
-        // and not of the checkpoint, which may have run and written memories without submitting.
-        crate::agent::CompactSource::Summarizer => {
-            line.push_str(" Written by the standalone summarizer.");
-        }
-    }
-    if !outcome.memories_written.is_empty() {
-        line.push_str(&format!(
-            " Wrote {} {}: {}.",
-            outcome.memories_written.len(),
-            if outcome.memories_written.len() == 1 {
-                "memory"
-            } else {
-                "memories"
-            },
-            outcome.memories_written.join(", "),
-        ));
-    }
-    line
-}
-
 /// How much of a scheduled job's prompt the stage direction quotes, in columns: enough to
 /// recognize the job the person wrote, short enough that the line fits a terminal with the
 /// lateness note on.
@@ -454,49 +419,8 @@ mod direction_tests {
 
 #[cfg(test)]
 mod tests {
-    /// The `/compact` line has to name what the checkpoint wrote, because a memory is durable and
-    /// instance-scoped: notes accumulating unmentioned under a command called "compact" is the
-    /// surprise this reporting exists to prevent.
-    #[test]
-    fn compaction_summary_names_memories_written() {
-        let line = super::compaction_summary(&crate::agent::CompactOutcome {
-            source: crate::agent::CompactSource::Checkpoint,
-            memories_written: vec!["deploy-quirks".to_string(), "rate-limits".to_string()],
-            kept_recent: true,
-        });
-        assert_eq!(
-            line,
-            "Session compacted. Wrote 2 memories: deploy-quirks, rate-limits."
-        );
-    }
-
     fn params(input: serde_json::Value) -> String {
         super::render_whole_params(&input, TEST_WIDTH).join("\n")
-    }
-
-    #[test]
-    fn compaction_summary_is_quiet_on_the_ordinary_path() {
-        let line = super::compaction_summary(&crate::agent::CompactOutcome {
-            source: crate::agent::CompactSource::Checkpoint,
-            memories_written: Vec::new(),
-            kept_recent: true,
-        });
-        assert_eq!(line, "Session compacted.");
-    }
-
-    /// Both fallbacks are named. A user comparing one compaction against another needs to know the
-    /// summary was not the one the agent chose to write.
-    #[test]
-    fn compaction_summary_reports_a_fallback_and_a_discarded_tail() {
-        let line = super::compaction_summary(&crate::agent::CompactOutcome {
-            source: crate::agent::CompactSource::Summarizer,
-            memories_written: Vec::new(),
-            kept_recent: false,
-        });
-        assert_eq!(
-            line,
-            "Session compacted (recent turns discarded too). Written by the standalone summarizer."
-        );
     }
 
     use super::*;

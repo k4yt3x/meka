@@ -334,10 +334,10 @@ You can say what to keep:
 /compact keep the auth refactor decisions, drop the debugging
 ```
 
-The confirmation reports what was written, because memories are durable and instance-scoped:
+The row it leaves reports what was written, because memories are durable and instance-scoped:
 
 ```text
-Session compacted. Wrote 2 memories: deploy-pipeline-quirks, api-rate-limits.
+Compacted the conversation on user request. Wrote 2 memories: deploy-pipeline-quirks, api-rate-limits.
 ```
 
 Note that an *automatic* compaction runs a checkpoint too, unattended, and can write memory without anyone watching.

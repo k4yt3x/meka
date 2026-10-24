@@ -898,6 +898,9 @@ pub(crate) enum Activity {
     Waiting,
     /// A `!command` runs beside the screen.
     Shell,
+    /// A compaction runs and nothing more specific has been said: the summarizer, or the
+    /// checkpoint turn between the things it says.
+    Compacting,
 }
 
 impl Activity {
@@ -965,6 +968,7 @@ pub(crate) fn working_line(
         Activity::UsingTool => "Using a tool",
         Activity::Waiting => "Waiting for your answer",
         Activity::Shell => "Running command",
+        Activity::Compacting => "Compacting the conversation",
     };
     spans.push(Span::raw(word.to_string()));
     let mut tail = vec![Span::styled(format!(" · {}s", elapsed.as_secs()), gray())];

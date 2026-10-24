@@ -82,20 +82,7 @@ pub(crate) struct MessageView {
     /// messages the client already rendered stop coming back. The marker is what lets it tell
     /// "the window was summarized" from "the server lost my conversation".
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) compaction: Option<CompactionMarker>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub(crate) struct CompactionMarker {
-    /// How many materialized messages the boundary removed.
-    ///
-    /// The whole pre-compaction window, including the recent tail that compaction then re-appends
-    /// verbatim, so it over-counts what the summary itself stands for. Use it to detect *that* the
-    /// view was rewritten, not to compute how much was lost.
-    pub(crate) replaced_count: usize,
-    /// Which compaction produced it, counting from 1. Fidelity degrades with each pass, so a
-    /// client rendering a transcript can say how far from the original it is.
-    pub(crate) generation: u64,
+    pub(crate) compaction: Option<crate::view::CompactionView>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -300,9 +287,12 @@ pub(crate) async fn list_messages(
             created_at: Some(stamp.created_at.clone()),
             turn_id: stamp.turn_id,
             turn_label: Some(turn_label.clone()),
-            compaction: marker.as_ref().map(|marker| CompactionMarker {
-                replaced_count: marker.replaced_count,
-                generation: marker.generation,
+            compaction: marker.as_ref().map(|marker| {
+                crate::view::CompactionView::new(
+                    &marker.record,
+                    marker.replaced_count,
+                    marker.generation,
+                )
             }),
         })
         .collect();

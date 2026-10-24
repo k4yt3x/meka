@@ -542,25 +542,44 @@ pub(crate) enum FrontendEvent {
     /// `AcpFrontend` logs at `info!` today (no protocol primitive yet). `SilentFrontend` drops
     /// them.
     McpProgress(crate::frontend::ProgressUpdate),
+    /// A compaction began: the checkpoint turn or the summarizer is about to run, which can take
+    /// a while, and the event that next names `id` says how it ended. Emitted for every
+    /// compaction whatever triggered it, including the automatic ones that fire mid-turn without
+    /// anyone asking.
+    CompactionStarted {
+        id: String,
+        trigger: crate::conversation::CompactionTrigger,
+    },
     /// The conversation was just summarized and the window replaced.
     ///
-    /// Emitted for every compaction whatever triggered it, including the automatic ones that fire
-    /// mid-turn without anyone asking. A frontend holding its own view of the transcript needs this
-    /// because compaction is the one event that makes messages it already rendered stop existing:
-    /// the screen and ACP re-read from the agent each turn and so never noticed, but an HTTP client
-    /// polling `GET /messages` sees `total` shrink with no explanation unless it is told.
+    /// A frontend holding its own view of the transcript needs this because compaction is the one
+    /// event that makes messages it already rendered stop existing: an HTTP client polling
+    /// `GET /messages` sees `total` shrink with no explanation unless it is told, and a person at
+    /// the screen or in an editor whose next reply forgets the morning deserves to know why.
     Compacted {
-        /// `checkpoint` or `summarizer`. The two differ in fidelity, not just mechanism.
-        source: &'static str,
+        /// The id the compaction began under.
+        id: String,
+        /// What the boundary recorded, which is what every surface says about the compaction.
+        record: crate::conversation::CompactionRecord,
         /// How many materialized messages the boundary removed.
         ///
         /// The whole pre-compaction window, including the recent tail that is then re-appended
-        /// verbatim -- so this over-counts what the summary actually stands for. It is the figure
+        /// verbatim, so this over-counts what the summary actually stands for. It is the figure
         /// the replay algorithm uses, and the one the `compaction` marker on `GET /messages`
         /// reports, so the two always agree.
         replaced_count: usize,
         /// Which compaction this was, counting from 1.
         generation: u64,
+        /// The summary as the model wrote it, without the sections meka adds around it.
+        summary: String,
+    },
+    /// The compaction that began under `id` ended without replacing the window. `interrupted`
+    /// when the user stopped it; otherwise `error` says what went wrong.
+    CompactionFailed {
+        id: String,
+        trigger: crate::conversation::CompactionTrigger,
+        error: String,
+        interrupted: bool,
     },
 }
 

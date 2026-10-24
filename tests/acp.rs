@@ -6348,11 +6348,81 @@ fn acp_reports_a_compaction_as_a_meka_notice() {
         .collect();
     let notice = chunks
         .iter()
-        .find(|chunk| chunk.starts_with("[meka] Compacted the conversation"))
+        .find(|chunk| chunk.starts_with("[meka] The agent compacted the conversation."))
         .unwrap_or_else(|| panic!("the compaction must reach the editor: {chunks:?}"));
     assert!(
-        notice.contains("compaction 1"),
-        "and say which compaction it was: {notice}"
+        notice.contains("Written by the standalone summarizer."),
+        "and say the summary was not the agent's own: {notice}"
+    );
+    assert!(
+        !updates
+            .iter()
+            .any(|value| value["params"]["update"]["sessionUpdate"] == "compaction_update"),
+        "a client that did not advertise the entry is never sent one: {updates:?}"
+    );
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+}
+
+/// A client that advertised `session.compaction` gets the compaction as an entry of its own: an
+/// `in_progress` update when it begins and a `completed` one carrying the summary when it lands,
+/// under one id, with meka's facts in `_meta`. The `[meka]` chunk is for clients without the
+/// entry, so it is not sent beside it.
+#[test]
+fn acp_renders_a_compaction_entry_for_a_client_that_advertises_it() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "context_compact" },
+            { "type": "tool_use_end", "input": {} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "a summary" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "the reply" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let config = format!("{ACP_INVALID_PARAMS_CONFIG}\n[session]\ncompact_checkpoint = false\n");
+    let mut harness = AcpTestHarness::spawn_with_capabilities(
+        &config,
+        Some(script),
+        serde_json::json!({"session": {"compaction": {}}}),
+    );
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "compact yourself");
+    let (updates, response) = harness.collect_updates(&session_id, id);
+
+    let compactions: Vec<&serde_json::Value> = updates
+        .iter()
+        .map(|value| &value["params"]["update"])
+        .filter(|update| update["sessionUpdate"] == "compaction_update")
+        .collect();
+    assert_eq!(compactions.len(), 2, "opened and closed: {updates:?}");
+    assert_eq!(compactions[0]["status"], "in_progress", "{updates:?}");
+    assert_eq!(
+        compactions[0]["_meta"]["compaction"]["trigger"],
+        "requested"
+    );
+    assert_eq!(compactions[1]["status"], "completed", "{updates:?}");
+    assert_eq!(
+        compactions[1]["compactionId"], compactions[0]["compactionId"],
+        "one id from start to end: {updates:?}"
+    );
+    assert_eq!(compactions[1]["summary"][0]["text"], "a summary");
+    let facts = &compactions[1]["_meta"]["compaction"];
+    assert_eq!(facts["trigger"], "requested");
+    assert_eq!(facts["source"], "summarizer");
+    assert_eq!(facts["generation"], 1);
+    assert!(
+        !updates.iter().any(|value| {
+            value["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+                && value["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("[meka] The agent compacted"))
+        }),
+        "the entry replaces the chunk rather than doubling it: {updates:?}"
     );
     assert_eq!(response["result"]["stopReason"], "end_turn");
 }
@@ -6391,7 +6461,7 @@ fn loading_a_compacted_session_titles_it_by_its_first_prompt() {
                 |value| value["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
                     && value["params"]["update"]["content"]["text"]
                         .as_str()
-                        .is_some_and(|text| text.starts_with("[meka] Compacted"))
+                        .is_some_and(|text| text.starts_with("[meka] The agent compacted"))
             ),
         "the turn must have compacted: {updates:?}"
     );

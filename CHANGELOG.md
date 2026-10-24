@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GET /v1/projects`; `project` on the memory routes; `memory export` uses a directory per project.
 - A project narrows the MCP servers and skills its sessions see: four `allowed_`/`disabled_` lists.
 - `meka tool show <name>` prints a built-in tool's schema as the model receives it.
+- Every compaction is reported as what it was: what set it going, who wrote it, what it wrote.
+- The screen shows a row for every compaction, automatic ones included, and a word while one runs.
+- An ACP client advertising `session.compaction` gets `compaction_update`, opened as work begins.
+- `context.compacting` and `context.compaction_failed` events; `compactions` in the one-shot JSON.
 
 ### Changed
 
@@ -24,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Inline memory bodies share a 32 KiB budget, `[memory] inline_max_bytes`; it was 4 KiB and fixed.
 - A memory write that would take the inline bodies past the budget is refused, at every door alike.
 - An inline body is shown whole or listed by description; the memory section says which and why.
+- `context.compacted` and the `compaction` marker add `trigger`, `memories_written`, `kept_recent`.
+- The ACP `[meka]` chunk for a compaction uses the screen's words; see the upgrade guide.
+- Session archives are `format_version` 16; an older archive is brought forward on import.
+- A compaction from before 0.84 replays as an automatic one at the ceiling; see the upgrade guide.
 
 ### Security
 

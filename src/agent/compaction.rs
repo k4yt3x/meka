@@ -4,12 +4,12 @@
 use super::*;
 use crate::{
     conversation::{
-        COMPACTION_SUMMARY_PREFIX, RETAINED_MESSAGES_END, RETAINED_MESSAGES_HEADER,
-        is_harness_stand_in,
+        COMPACTION_SUMMARY_PREFIX, CompactionRecord, CompactionSource, CompactionTrigger,
+        RETAINED_MESSAGES_END, RETAINED_MESSAGES_HEADER, is_harness_stand_in,
     },
     session::{
-        CompactOrigin, CompactRequest, SUMMARY_SHAPE, compaction_retained_budget,
-        compaction_tail_budget, compaction_verbatim_budget,
+        CompactRequest, SUMMARY_SHAPE, compaction_retained_budget, compaction_tail_budget,
+        compaction_verbatim_budget,
     },
 };
 
@@ -22,11 +22,11 @@ use crate::{
 pub(super) const MAX_REQUESTED_COMPACTIONS: u32 = 1;
 /// Say what a checkpoint durably wrote, on every path out of a compaction that ran one.
 ///
-/// `/compact` reports this to the user directly (`render::compaction_summary`); the four automatic
-/// paths discard the outcome, so without this a reactive, proactive or agent-requested compaction
-/// would write instance-scoped notes with no trace at any verbosity. A function rather than a line
-/// at the end because an interrupt now returns early, and the writes are durable the moment they
-/// run: the report has to leave with the error too, not only with the summary.
+/// A compaction that lands names the memories on its boundary and in the `Compacted` event, so
+/// every surface says them; one that ends in an interrupt or an error says nothing of them, and
+/// the writes are durable the moment they run, so without this line they would leave no trace at
+/// any verbosity. A function rather than a line at the end because the report has to leave with
+/// the error too, not only with the summary.
 ///
 /// `info!` rather than `warn!`: a lifecycle signpost, not a problem.
 pub(super) fn report_checkpoint_memories(memories_written: &[String]) {
@@ -38,21 +38,11 @@ pub(super) fn report_checkpoint_memories(memories_written: &[String]) {
     let names = memories_written.join(", ");
     tracing::info!("checkpoint wrote {count} {noun}: {names}");
 }
-/// Which strategy produced the summary that replaced the window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CompactSource {
-    /// The checkpoint turn, via `context_replace`. The intended path.
-    Checkpoint,
-    /// The standalone summarizer: the emergency path, a disabled checkpoint, or a checkpoint that
-    /// ended without calling `context_replace`. The last is reachable on every backend, since
-    /// `Provider::complete` carries no `tool_choice` and the call cannot be forced.
-    Summarizer,
-}
-/// What a compaction did, for the caller to report. `/compact` is the only consumer today; the
-/// automatic triggers discard it.
+/// What a compaction did, for the caller to report. `POST /compact` answers with it; the screen's
+/// `/compact` and the automatic triggers discard it, since the `Compacted` event carries the facts.
 #[derive(Debug, Clone)]
 pub(crate) struct CompactOutcome {
-    pub(crate) source: CompactSource,
+    pub(crate) source: CompactionSource,
     /// Memories the checkpoint turn wrote, observed from its `memory_write` calls rather than
     /// self-reported, so this cannot disagree with what actually landed on disk.
     pub(crate) memories_written: Vec<String>,
@@ -442,12 +432,53 @@ impl Agent {
                 "no active session to compact".to_string(),
             ));
         };
-        let _serving = super::fallback::RestoreWhenIdle { agent: self };
-
         if messages.is_empty() {
             return Err(MekaError::Config("no messages to compact".to_string()));
         }
-        let compaction_kind = request.origin.kind();
+        // Opened on the frontend before any request is made, since the checkpoint turn is up to
+        // eight round trips long and a client with a compaction entry shows it running; whichever
+        // way this ends, the event that closes it names the same id.
+        let id = uuid::Uuid::new_v4().to_string();
+        let trigger = request.trigger;
+        self.cells
+            .frontend
+            .emit(FrontendEvent::CompactionStarted {
+                id: id.clone(),
+                trigger,
+            })
+            .await;
+        match self
+            .replace_with_summary(session_id, messages, request, cancellation, &id)
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                self.cells
+                    .frontend
+                    .emit(FrontendEvent::CompactionFailed {
+                        id,
+                        trigger,
+                        error: error.sentence(),
+                        interrupted: matches!(error, MekaError::Interrupted),
+                    })
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    /// [`Self::compact_session`] past its opening: everything from the checkpoint turn to the
+    /// persisted boundary, announced on the frontend under `compaction_id`.
+    async fn replace_with_summary(
+        &self,
+        session_id: Uuid,
+        messages: &mut Conversation,
+        request: CompactRequest,
+        cancellation: CancellationToken,
+        compaction_id: &str,
+    ) -> Result<CompactOutcome> {
+        let _serving = super::fallback::RestoreWhenIdle { agent: self };
+        let compaction_kind = crate::provider::CompactionKind::from(request.trigger);
 
         // Owned here rather than returned by the checkpoint, because a `memory_write` is durable
         // the moment it runs and the turn can still fail or be canceled afterwards; returned by
@@ -461,29 +492,30 @@ impl Agent {
             .cells
             .context_reserved
             .load(std::sync::atomic::Ordering::Relaxed);
-        let checkpoint =
-            if request.origin == CompactOrigin::Emergency || !self.options.compact_checkpoint {
-                None
-            } else {
-                match self
-                    .run_checkpoint_turn(
-                        &request,
-                        messages.as_slice(),
-                        cancellation.clone(),
-                        &mut memories_written,
-                    )
-                    .await
-                {
-                    Ok(result) => result,
-                    // Never fatal. Compaction is what keeps a session alive, and the summarizer
-                    // below can always do the job, so a checkpoint that fails costs fidelity and
-                    // nothing else.
-                    Err(error) => {
-                        tracing::warn!("checkpoint turn failed; summarizing instead: {error}");
-                        None
-                    }
+        let checkpoint = if request.trigger == CompactionTrigger::Emergency
+            || !self.options.compact_checkpoint
+        {
+            None
+        } else {
+            match self
+                .run_checkpoint_turn(
+                    &request,
+                    messages.as_slice(),
+                    cancellation.clone(),
+                    &mut memories_written,
+                )
+                .await
+            {
+                Ok(result) => result,
+                // Never fatal. Compaction is what keeps a session alive, and the summarizer
+                // below can always do the job, so a checkpoint that fails costs fidelity and
+                // nothing else.
+                Err(error) => {
+                    tracing::warn!("checkpoint turn failed; summarizing instead: {error}");
+                    None
                 }
-            };
+            }
+        };
         self.cells.context_reserved.store(
             reserved_before_checkpoint,
             std::sync::atomic::Ordering::Relaxed,
@@ -504,10 +536,10 @@ impl Agent {
             None => true,
         };
 
-        // A trailing user message is one nobody has answered yet. `CompactOrigin::Proactive` fires
-        // after `run_turn` appends this turn's prompt and before the first request is sent, so
-        // honoring `keep_recent: false` there would delete the request the model is about to
-        // answer and have it answer the summary instead.
+        // A trailing user message is one nobody has answered yet. `CompactionTrigger::Proactive`
+        // fires after `run_turn` appends this turn's prompt and before the first request is
+        // sent, so honoring `keep_recent: false` there would delete the request the model
+        // is about to answer and have it answer the summary instead.
         //
         // Phrased as a property of the conversation rather than a check on the origin, so a future
         // call site cannot reintroduce it by picking a different one.
@@ -520,7 +552,7 @@ impl Agent {
         // stands in for. A tail kept verbatim is re-appended under this turn's id and dated today,
         // which would carry the oldest rounds past the window for one more cycle, so none is
         // kept, whatever the checkpoint answered; the split still quotes an unanswered prompt.
-        let keep_recent = keep_recent && request.origin != CompactOrigin::Retention;
+        let keep_recent = keep_recent && request.trigger != CompactionTrigger::Retention;
 
         // Split into a head to summarize and a recent tail to keep verbatim, and copy the
         // messages received from the head alone: the tail is carried as it is, so a message there
@@ -531,7 +563,7 @@ impl Agent {
         let (to_summarize, to_keep, retained) = split_and_retain(
             messages.as_slice(),
             keep_recent,
-            request.origin != CompactOrigin::Retention,
+            request.trigger != CompactionTrigger::Retention,
             request.request_in_flight.as_deref(),
             self.context_window(),
         );
@@ -551,7 +583,7 @@ impl Agent {
         // then thrown away by the check below. Same exception for `Manual`, and for the same
         // reason: `/compact` is itself the thing asked for, so an interrupt there ends the
         // checkpoint and falls back rather than abandoning the request.
-        if request.origin != CompactOrigin::Manual && cancellation.is_cancelled() {
+        if request.trigger != CompactionTrigger::Manual && cancellation.is_cancelled() {
             report_checkpoint_memories(&memories_written);
             return Err(MekaError::Interrupted);
         }
@@ -560,11 +592,11 @@ impl Agent {
         // accumulator above holds what actually ran, including on the fallback path where the
         // checkpoint half-completed and then failed.
         let (summary_text, source) = match checkpoint {
-            Some(checkpoint) => (checkpoint.summary, CompactSource::Checkpoint),
+            Some(checkpoint) => (checkpoint.summary, CompactionSource::Checkpoint),
             None => (
                 self.summarize_via_provider(&request, to_summarize, &cancellation)
                     .await?,
-                CompactSource::Summarizer,
+                CompactionSource::Summarizer,
             ),
         };
 
@@ -575,6 +607,7 @@ impl Agent {
         let live_checklist = self.cells.checklist.get();
 
         let mut context_message = format!("{COMPACTION_SUMMARY_PREFIX}\n\n{summary_text}");
+        let summary_as_written = summary_text;
         // Before the request section, so the message reads in the order things happened: what was
         // received and handled, then the request still being answered.
         if !retained.is_empty() {
@@ -663,7 +696,7 @@ impl Agent {
         //
         // Memories the checkpoint already wrote stay written; they are durable the moment they run
         // and are not this call's to undo.
-        if request.origin != CompactOrigin::Manual && cancellation.is_cancelled() {
+        if request.trigger != CompactionTrigger::Manual && cancellation.is_cancelled() {
             // Reported before returning for the same reason the success path reports it: a
             // checkpoint that wrote memories and then hit the interrupt has left durable,
             // instance-scoped notes on disk, and every automatic path discards the outcome. The
@@ -674,11 +707,18 @@ impl Agent {
         }
 
         let summary_user_message = Message::user(&context_message);
+        let record = CompactionRecord {
+            trigger: request.trigger,
+            source,
+            memories_written: memories_written.clone(),
+            kept_recent: !to_keep.is_empty(),
+        };
         messages.replace_for_compaction(
             summary_user_message,
             to_keep.clone(),
             loaded_tools_snapshot,
             checklist_snapshot,
+            record.clone(),
         );
 
         // Persist the new compaction-boundary event and the re-appended tail. Pre-compaction rows
@@ -763,12 +803,11 @@ impl Agent {
         self.cells
             .frontend
             .emit(FrontendEvent::Compacted {
-                source: match source {
-                    CompactSource::Checkpoint => "checkpoint",
-                    CompactSource::Summarizer => "summarizer",
-                },
+                id: compaction_id.to_string(),
+                record: record.clone(),
                 replaced_count,
                 generation: reported_generation,
+                summary: summary_as_written,
             })
             .await;
         if self.role.is_root() {
@@ -809,7 +848,7 @@ impl Agent {
             // carry no `diagnostics` at all.
             previous_message: None,
             session_id: self.cells.session_id.get(),
-            compaction: Some(request.origin.kind()),
+            compaction: Some(crate::provider::CompactionKind::from(request.trigger)),
             ..Default::default()
         }
     }
@@ -871,11 +910,12 @@ impl Agent {
         // Deliver the instruction as a trailing text block on an existing user message when the
         // conversation already ends with one, and only otherwise as a message of its own.
         //
-        // `CompactOrigin::Proactive` is why: it fires after this turn's user message is appended,
-        // so blindly pushing would produce two consecutive user turns. The Messages API merges
-        // those into one today; a provider that did not would reject the request near-silently,
-        // because `compact_session` falls back to the summarizer, and the instruction reads as
-        // part of the message it follows either way.
+        // `CompactionTrigger::Proactive` is why: it fires after this turn's user message is
+        // appended, so blindly pushing would produce two consecutive user turns. The
+        // Messages API merges those into one today; a provider that did not would reject
+        // the request near-silently, because `compact_session` falls back to the
+        // summarizer, and the instruction reads as part of the message it follows either
+        // way.
         let available =
             prompt::AvailableTools::new(definitions.iter().map(|tool| tool.name.clone()));
         let instruction = checkpoint_instruction(request, &available);
@@ -1040,10 +1080,10 @@ impl Agent {
     /// agent's own identity.
     ///
     /// This is the original compaction mechanism, kept for the two cases the checkpoint turn cannot
-    /// serve: [`CompactOrigin::Emergency`], where the provider has already refused a request this
-    /// size, and any checkpoint that fails or comes back empty. Both want the same thing, a call
-    /// deliberately smaller than the conversation, which is what stripping images and truncating
-    /// long blocks buys.
+    /// serve: [`CompactionTrigger::Emergency`], where the provider has already refused a request
+    /// this size, and any checkpoint that fails or comes back empty. Both want the same thing,
+    /// a call deliberately smaller than the conversation, which is what stripping images and
+    /// truncating long blocks buys.
     pub(super) async fn summarize_via_provider(
         &self,
         request: &CompactRequest,
@@ -1184,7 +1224,7 @@ mod tests {
         },
         permission::SharedPermission,
         provider::mock::{MockEvent, MockProvider, MockStopReason, text_round},
-        session::{CompactOrigin, CompactRequest},
+        session::CompactRequest,
     };
 
     /// The attempt cap binds, and the counter that enforces it counts up: the cancellation test
@@ -1550,7 +1590,7 @@ mod tests {
         agent
             .compact_session(
                 &mut messages,
-                CompactRequest::new(CompactOrigin::Manual),
+                CompactRequest::new(CompactionTrigger::Manual),
                 CancellationToken::new(),
             )
             .await
@@ -1656,7 +1696,7 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Reactive).answering(Some(prompt.to_string())),
+            CompactRequest::new(CompactionTrigger::Reactive).answering(Some(prompt.to_string())),
         )
         .await;
 
@@ -1728,7 +1768,7 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Reactive).answering(Some(prompt.to_string())),
+            CompactRequest::new(CompactionTrigger::Reactive).answering(Some(prompt.to_string())),
         )
         .await;
 
@@ -1754,7 +1794,7 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Reactive),
+            CompactRequest::new(CompactionTrigger::Reactive),
         )
         .await;
 
@@ -1822,7 +1862,7 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Reactive),
+            CompactRequest::new(CompactionTrigger::Reactive),
         )
         .await;
 
@@ -1850,7 +1890,7 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Reactive),
+            CompactRequest::new(CompactionTrigger::Reactive),
         )
         .await;
         assert!(
@@ -1932,7 +1972,7 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Reactive),
+            CompactRequest::new(CompactionTrigger::Reactive),
         )
         .await;
 
@@ -1975,7 +2015,7 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Reactive).answering(Some(prompt.to_string())),
+            CompactRequest::new(CompactionTrigger::Reactive).answering(Some(prompt.to_string())),
         )
         .await;
 
@@ -2077,7 +2117,7 @@ mod tests {
         agent
             .compact_session(
                 &mut messages,
-                CompactRequest::new(CompactOrigin::Manual),
+                CompactRequest::new(CompactionTrigger::Manual),
                 CancellationToken::new(),
             )
             .await
@@ -2132,7 +2172,7 @@ mod tests {
         agent
             .compact_session(
                 &mut messages,
-                CompactRequest::new(CompactOrigin::Manual),
+                CompactRequest::new(CompactionTrigger::Manual),
                 CancellationToken::new(),
             )
             .await
@@ -2177,11 +2217,11 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Reactive),
+            CompactRequest::new(CompactionTrigger::Reactive),
         )
         .await;
 
-        assert_eq!(outcome.source, CompactSource::Checkpoint);
+        assert_eq!(outcome.source, CompactionSource::Checkpoint);
         assert!(outcome.kept_recent);
         assert!(
             messages.len() > 1,
@@ -2212,11 +2252,11 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Reactive),
+            CompactRequest::new(CompactionTrigger::Reactive),
         )
         .await;
 
-        assert_eq!(outcome.source, CompactSource::Summarizer);
+        assert_eq!(outcome.source, CompactionSource::Summarizer);
         let summary = messages.as_slice()[0].text_content();
         assert!(summary.contains("the summarizer's account"), "{summary}");
         assert!(
@@ -2242,11 +2282,11 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Reactive),
+            CompactRequest::new(CompactionTrigger::Reactive),
         )
         .await;
 
-        assert_eq!(outcome.source, CompactSource::Summarizer);
+        assert_eq!(outcome.source, CompactionSource::Summarizer);
         assert!(
             messages.as_slice()[0]
                 .text_content()
@@ -2269,21 +2309,21 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Emergency),
+            CompactRequest::new(CompactionTrigger::Emergency),
         )
         .await;
 
-        assert_eq!(outcome.source, CompactSource::Summarizer);
+        assert_eq!(outcome.source, CompactionSource::Summarizer);
     }
 
     #[tokio::test]
     async fn disabled_checkpoint_uses_the_summarizer_on_every_origin() {
         for origin in [
-            CompactOrigin::Reactive,
-            CompactOrigin::Proactive,
-            CompactOrigin::Manual,
-            CompactOrigin::Requested,
-            CompactOrigin::Retention,
+            CompactionTrigger::Reactive,
+            CompactionTrigger::Proactive,
+            CompactionTrigger::Manual,
+            CompactionTrigger::Requested,
+            CompactionTrigger::Retention,
         ] {
             let provider = Arc::new(MockProvider::from_rounds(vec![text_round("plain summary")]));
             let (agent, store) = agent_with_checkpoint(provider, false).await;
@@ -2291,7 +2331,7 @@ mod tests {
 
             let outcome = compact(&agent, &store, &mut messages, CompactRequest::new(origin)).await;
 
-            assert_eq!(outcome.source, CompactSource::Summarizer, "{origin:?}");
+            assert_eq!(outcome.source, CompactionSource::Summarizer, "{origin:?}");
         }
     }
 
@@ -2309,7 +2349,7 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Requested),
+            CompactRequest::new(CompactionTrigger::Requested),
         )
         .await;
 
@@ -2322,7 +2362,7 @@ mod tests {
     #[tokio::test]
     async fn a_retention_compaction_keeps_no_tail_and_no_quotes_whatever_the_checkpoint_says() {
         let mut outcomes = Vec::new();
-        for origin in [CompactOrigin::Retention, CompactOrigin::Requested] {
+        for origin in [CompactionTrigger::Retention, CompactionTrigger::Requested] {
             let provider = Arc::new(MockProvider::from_rounds(vec![replace_round(
                 "the whole day",
                 Some(true),
@@ -2330,13 +2370,13 @@ mod tests {
             let (agent, store) = agent_with_checkpoint(provider, true).await;
             let mut messages = conversation();
             let outcome = compact(&agent, &store, &mut messages, CompactRequest {
-                origin,
+                trigger: origin,
                 instructions: None,
                 keep_recent: Some(true),
                 request_in_flight: None,
             })
             .await;
-            assert_eq!(outcome.source, CompactSource::Checkpoint, "{origin:?}");
+            assert_eq!(outcome.source, CompactionSource::Checkpoint, "{origin:?}");
             let summary = messages.as_slice()[0].text_content();
             outcomes.push((
                 outcome.kept_recent,
@@ -2370,7 +2410,7 @@ mod tests {
         assert_eq!(agent.take_context_compacted(), None);
 
         compact(&agent, &store, &mut messages, CompactRequest {
-            origin: CompactOrigin::Proactive,
+            trigger: CompactionTrigger::Proactive,
             instructions: None,
             keep_recent: None,
             request_in_flight: None,
@@ -2398,7 +2438,7 @@ mod tests {
             let mut messages = conversation();
 
             let outcome = compact(&agent, &store, &mut messages, CompactRequest {
-                origin: CompactOrigin::Manual,
+                trigger: CompactionTrigger::Manual,
                 instructions: None,
                 keep_recent: None,
                 request_in_flight: None,
@@ -2426,7 +2466,7 @@ mod tests {
         let mut messages = conversation();
 
         let outcome = compact(&agent, &store, &mut messages, CompactRequest {
-            origin: CompactOrigin::Requested,
+            trigger: CompactionTrigger::Requested,
             instructions: None,
             keep_recent: Some(false),
             request_in_flight: None,
@@ -2454,7 +2494,7 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Proactive),
+            CompactRequest::new(CompactionTrigger::Proactive),
         )
         .await;
 
@@ -2496,14 +2536,14 @@ mod tests {
         let mut messages = conversation();
 
         let outcome = compact(&agent, &store, &mut messages, CompactRequest {
-            origin: CompactOrigin::Requested,
+            trigger: CompactionTrigger::Requested,
             instructions: None,
             keep_recent: Some(false),
             request_in_flight: None,
         })
         .await;
 
-        assert_eq!(outcome.source, CompactSource::Summarizer);
+        assert_eq!(outcome.source, CompactionSource::Summarizer);
         assert!(
             outcome.kept_recent,
             "a failed checkpoint must not also cost the verbatim tail"
@@ -2556,7 +2596,7 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Manual),
+            CompactRequest::new(CompactionTrigger::Manual),
         )
         .await;
         let after = agent.session_stats.snapshot();
@@ -2586,7 +2626,7 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Proactive),
+            CompactRequest::new(CompactionTrigger::Proactive),
         )
         .await;
 
@@ -2612,14 +2652,14 @@ mod tests {
         let mut messages = conversation();
 
         let outcome = compact(&agent, &store, &mut messages, CompactRequest {
-            origin: CompactOrigin::Requested,
+            trigger: CompactionTrigger::Requested,
             instructions: None,
             keep_recent: Some(false),
             request_in_flight: None,
         })
         .await;
 
-        assert_eq!(outcome.source, CompactSource::Summarizer);
+        assert_eq!(outcome.source, CompactionSource::Summarizer);
         assert!(
             outcome.kept_recent,
             "a stray sentence must not become the whole context"
@@ -2843,11 +2883,11 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Reactive),
+            CompactRequest::new(CompactionTrigger::Reactive),
         )
         .await;
 
-        assert_eq!(outcome.source, CompactSource::Checkpoint);
+        assert_eq!(outcome.source, CompactionSource::Checkpoint);
         let summary = messages.as_slice()[0].text_content();
         assert!(summary.contains(&format!("> {rule}")), "{summary}");
         assert!(
@@ -2885,7 +2925,7 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Reactive),
+            CompactRequest::new(CompactionTrigger::Reactive),
         )
         .await;
         messages.append(Message::user("a question after the first compaction"));
@@ -2895,7 +2935,7 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Reactive),
+            CompactRequest::new(CompactionTrigger::Reactive),
         )
         .await;
 
@@ -2990,7 +3030,7 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Reactive),
+            CompactRequest::new(CompactionTrigger::Reactive),
         )
         .await;
 
@@ -3024,7 +3064,7 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Manual),
+            CompactRequest::new(CompactionTrigger::Manual),
         )
         .await;
 
@@ -3088,13 +3128,13 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Manual),
+            CompactRequest::new(CompactionTrigger::Manual),
         )
         .await;
 
         // The denial is a tool error, not a dead end: the checkpoint carries on and still
         // submits, so a refused write costs a note rather than the whole summary.
-        assert_eq!(outcome.source, CompactSource::Checkpoint);
+        assert_eq!(outcome.source, CompactionSource::Checkpoint);
         assert_eq!(
             frontend.permission_requests(),
             vec!["memory_write".to_string()],
@@ -3149,7 +3189,7 @@ mod tests {
                 &agent,
                 &store,
                 &mut messages,
-                CompactRequest::new(CompactOrigin::Manual),
+                CompactRequest::new(CompactionTrigger::Manual),
             ),
             async {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -3159,7 +3199,7 @@ mod tests {
             }
         );
 
-        assert_eq!(outcome.source, CompactSource::Checkpoint);
+        assert_eq!(outcome.source, CompactionSource::Checkpoint);
         assert!(
             calls.lock().expect("calls").is_empty(),
             "a call admitted at `read` must not run once the level is `none`"
@@ -3243,11 +3283,11 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Manual),
+            CompactRequest::new(CompactionTrigger::Manual),
         )
         .await;
 
-        assert_eq!(outcome.source, CompactSource::Checkpoint);
+        assert_eq!(outcome.source, CompactionSource::Checkpoint);
         assert!(
             frontend.permission_requests().is_empty(),
             "nobody is asked about a call the level refuses anyway: {:?}",
@@ -3275,7 +3315,7 @@ mod tests {
         let outcome = agent
             .compact_session(
                 &mut messages,
-                CompactRequest::new(CompactOrigin::Manual),
+                CompactRequest::new(CompactionTrigger::Manual),
                 cancellation,
             )
             .await
@@ -3283,7 +3323,7 @@ mod tests {
 
         // Interrupting the checkpoint must not fail the compaction: the user asked for the
         // checkpoint to stop, not for the window to stay full.
-        assert_eq!(outcome.source, CompactSource::Summarizer);
+        assert_eq!(outcome.source, CompactionSource::Summarizer);
     }
 
     /// A stop that lands while the checkpoint's reply is still being generated drops that reply
@@ -3324,13 +3364,13 @@ mod tests {
         let outcome = agent
             .compact_session(
                 &mut messages,
-                CompactRequest::new(CompactOrigin::Manual),
+                CompactRequest::new(CompactionTrigger::Manual),
                 cancellation.token().clone(),
             )
             .await
             .expect("compaction still completes");
         stop.await.expect("the stop landed");
-        assert_eq!(outcome.source, CompactSource::Summarizer);
+        assert_eq!(outcome.source, CompactionSource::Summarizer);
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "the stop must drop the checkpoint's reply, not wait for it: {:?}",
@@ -3359,7 +3399,7 @@ mod tests {
         let error = agent
             .compact_session(
                 &mut messages,
-                CompactRequest::new(CompactOrigin::Reactive),
+                CompactRequest::new(CompactionTrigger::Reactive),
                 cancellation,
             )
             .await
@@ -3396,7 +3436,7 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Reactive),
+            CompactRequest::new(CompactionTrigger::Reactive),
         )
         .await;
 
@@ -3439,11 +3479,11 @@ mod tests {
             &agent,
             &store,
             &mut messages,
-            CompactRequest::new(CompactOrigin::Reactive),
+            CompactRequest::new(CompactionTrigger::Reactive),
         )
         .await;
 
-        assert_eq!(outcome.source, CompactSource::Summarizer);
+        assert_eq!(outcome.source, CompactionSource::Summarizer);
         let summary = messages.as_slice()[0].text_content();
         assert!(!summary.contains("thinking 7"), "{summary}");
         // The registry here is empty, so `memory_write` was refused as unavailable and nothing
@@ -3478,7 +3518,7 @@ mod tests {
             agent
                 .compact_session(
                     &mut messages,
-                    CompactRequest::new(CompactOrigin::Manual),
+                    CompactRequest::new(CompactionTrigger::Manual),
                     CancellationToken::new(),
                 )
                 .await
@@ -3504,7 +3544,7 @@ mod tests {
 
     #[test]
     fn a_checkpoint_recommends_only_the_tools_in_its_request() {
-        let request = CompactRequest::new(CompactOrigin::Manual);
+        let request = CompactRequest::new(CompactionTrigger::Manual);
         for names in [vec![], vec!["memory_write"], vec![
             "scratchpad_write",
             "conversation_search",
@@ -3527,11 +3567,11 @@ mod tests {
     #[tokio::test]
     async fn every_compaction_restores_live_state_only_after_its_save_succeeds() {
         for origin in [
-            CompactOrigin::Manual,
-            CompactOrigin::Requested,
-            CompactOrigin::Reactive,
-            CompactOrigin::Proactive,
-            CompactOrigin::Emergency,
+            CompactionTrigger::Manual,
+            CompactionTrigger::Requested,
+            CompactionTrigger::Reactive,
+            CompactionTrigger::Proactive,
+            CompactionTrigger::Emergency,
         ] {
             let temporary = tempfile::tempdir().expect("tempdir");
             let path = temporary.path().join("meka.db");

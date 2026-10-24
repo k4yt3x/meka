@@ -4531,6 +4531,7 @@ mod tests {
             Event::CompactBoundary {
                 summary: Message::user("summary"),
                 replaced_count: 2,
+                record: crate::conversation::CompactionRecord::for_test(),
                 loaded_tools_snapshot: Default::default(),
                 checklist_snapshot: Default::default(),
             },
@@ -6448,6 +6449,7 @@ mod tests {
         let boundary_event = Event::CompactBoundary {
             summary: Message::user("[summary]"),
             replaced_count: 3,
+            record: crate::conversation::CompactionRecord::for_test(),
             loaded_tools_snapshot: snapshot,
             checklist_snapshot: Default::default(),
         };
@@ -6647,6 +6649,7 @@ mod tests {
         let boundary = |summary: &str, tools: &[&str]| Event::CompactBoundary {
             summary: Message::user(summary),
             replaced_count: 2,
+            record: crate::conversation::CompactionRecord::for_test(),
             loaded_tools_snapshot: tools.iter().map(|tool| tool.to_string()).collect(),
             checklist_snapshot: Default::default(),
         };
@@ -6735,6 +6738,7 @@ mod tests {
             Event::CompactBoundary {
                 summary: Message::user("[summary]"),
                 replaced_count: 4,
+                record: crate::conversation::CompactionRecord::for_test(),
                 loaded_tools_snapshot: Default::default(),
                 checklist_snapshot: Default::default(),
             },
@@ -8422,6 +8426,7 @@ mod tests {
             Event::CompactBoundary {
                 summary: Message::user("[Conversation summary from session compaction] nothing"),
                 replaced_count: 2,
+                record: crate::conversation::CompactionRecord::for_test(),
                 loaded_tools_snapshot: std::collections::HashSet::new(),
                 checklist_snapshot: Default::default(),
             },
@@ -9053,6 +9058,7 @@ mod tests {
                 &Event::CompactBoundary {
                     summary: Message::user("summary"),
                     replaced_count: 2,
+                    record: crate::conversation::CompactionRecord::for_test(),
                     loaded_tools_snapshot: Default::default(),
                     checklist_snapshot: Default::default(),
                 },

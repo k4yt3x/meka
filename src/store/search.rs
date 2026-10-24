@@ -1131,6 +1131,7 @@ mod tests {
                         crate::conversation::RETAINED_MESSAGES_END
                     )),
                     replaced_count: 2,
+                    record: crate::conversation::CompactionRecord::for_test(),
                     loaded_tools_snapshot: HashSet::new(),
                     checklist_snapshot: Default::default(),
                 })
@@ -1167,6 +1168,7 @@ mod tests {
                 &Event::CompactBoundary {
                     summary: Message::assistant_text("the summary mentions pelicans"),
                     replaced_count: 0,
+                    record: crate::conversation::CompactionRecord::for_test(),
                     loaded_tools_snapshot: HashSet::new(),
                     checklist_snapshot: Default::default(),
                 },
@@ -1208,6 +1210,7 @@ mod tests {
         let content = serde_json::to_string(&Event::CompactBoundary {
             summary: Message::user(summary),
             replaced_count: 2,
+            record: crate::conversation::CompactionRecord::for_test(),
             loaded_tools_snapshot: HashSet::new(),
             checklist_snapshot: Default::default(),
         })

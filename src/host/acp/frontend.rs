@@ -59,6 +59,16 @@ impl SharedClientState {
         crate::sync::read(&self.inner).capabilities.clone()
     }
 
+    /// Whether the client renders `compaction_update`, which the protocol lets an agent send only
+    /// once the client advertised `session.compaction`.
+    pub(super) fn renders_compactions(&self) -> bool {
+        crate::sync::read(&self.inner)
+            .capabilities
+            .session
+            .as_ref()
+            .is_some_and(|session| session.compaction.is_some())
+    }
+
     /// Whether the client renders agent-owned terminals from meka's `_meta` frames.
     ///
     /// Deliberately not the typed `terminal` capability: that one says the client implements
@@ -150,6 +160,9 @@ pub(super) const META_TERMINAL_INFO: &str = "terminal_info";
 pub(super) const META_TERMINAL_OUTPUT: &str = "terminal_output";
 /// `_meta` key marking an agent-owned terminal as finished, with its exit status.
 pub(super) const META_TERMINAL_EXIT: &str = "terminal_exit";
+/// The `_meta` key under which a `compaction_update` carries meka's facts about the compaction:
+/// what set it going, and once it lands, the fields of the `context.compacted` event.
+pub(super) const META_COMPACTION: &str = "compaction";
 /// Build the `_meta` map for one agent-owned-terminal frame.
 ///
 /// This is an extension, not ACP proper: it originates in codex-acp, claude-agent-acp emits the
@@ -462,17 +475,71 @@ impl Frontend for AcpFrontend {
                 SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(tool_call_id, fields))
             }
             FrontendEvent::Notice(notice) => notice_update(&notice),
+            // A client that advertised `session.compaction` renders a compaction entry of its own,
+            // opened here and closed by the event that next names the id. The protocol lets an
+            // agent send the update to no other client.
+            FrontendEvent::CompactionStarted { id, trigger } => {
+                if !self.client_state.renders_compactions() {
+                    return;
+                }
+                SessionUpdate::CompactionUpdate(
+                    CompactionUpdate::new(id, CompactionStatus::InProgress).meta(terminal_meta(
+                        META_COMPACTION,
+                        serde_json::json!({ "trigger": trigger.name() }),
+                    )),
+                )
+            }
             // An editor holds a transcript, not a mirror of the model's window, so nothing on
             // screen is invalidated; but the automatic compactions happen with nobody asking, and
-            // a user whose next reply forgets the morning deserves to know why.
+            // a user whose next reply forgets the morning deserves to know why. A client without
+            // the entry is told in the words the screen uses.
             FrontendEvent::Compacted {
-                source,
+                id,
+                record,
                 replaced_count,
                 generation,
-            } => notice_update(&crate::frontend::Notice::info(format!(
-                "Compacted the conversation: {replaced_count} messages replaced by a summary \
-                 ({source}, compaction {generation})"
-            ))),
+                summary,
+            } => {
+                if !self.client_state.renders_compactions() {
+                    notice_update(&crate::frontend::Notice::info(record.note()))
+                } else {
+                    let facts = serde_json::json!(crate::view::CompactionView::new(
+                        &record,
+                        replaced_count,
+                        generation
+                    ));
+                    SessionUpdate::CompactionUpdate(
+                        CompactionUpdate::new(id, CompactionStatus::Completed)
+                            .summary(vec![ContentBlock::Text(
+                                agent_client_protocol::schema::v1::TextContent::new(summary),
+                            )])
+                            .meta(terminal_meta(META_COMPACTION, facts)),
+                    )
+                }
+            }
+            FrontendEvent::CompactionFailed {
+                id,
+                trigger,
+                error,
+                interrupted,
+            } => {
+                if !self.client_state.renders_compactions() {
+                    return;
+                }
+                let status = if interrupted {
+                    CompactionStatus::Cancelled
+                } else {
+                    CompactionStatus::Failed
+                };
+                SessionUpdate::CompactionUpdate(
+                    CompactionUpdate::new(id, status)
+                        .error(error)
+                        .meta(terminal_meta(
+                            META_COMPACTION,
+                            serde_json::json!({ "trigger": trigger.name(), "interrupted": interrupted }),
+                        )),
+                )
+            }
             FrontendEvent::McpProgress(update) => {
                 // ACP has no protocol primitive for tool-progress streams. The screen renders these
                 // inline as a carriage-return-overwrite status line; in the ACP world the editor

@@ -160,7 +160,7 @@ scroll near the top, so a resumed session shows its last turns at once and the f
 reaches the ones before, however far back the session goes. What is held is bounded: scrolling far
 up lets the newest pages go, and scrolling back down reads them again; returning to the bottom
 always shows the end of the log with this run's rows after it. Older history shows what the log
-holds, with a row for each compaction (`• context compacted`) and each rewind.
+holds, with a row for each compaction, in the words it was announced with, and each rewind.
 
 The screen captures the mouse so that the wheel, a click and a drag reach it. Dragging over the
 transcript selects the text it covers, and releasing copies it: to the terminal's own clipboard
@@ -333,6 +333,8 @@ This is distinct from `/status`, which reports this session's own token counters
 The `/compact` command asks the LLM to summarize the entire conversation, then replaces the messages the model sees with a single summary message followed by the recent tail. This is useful for long sessions that are approaching the context window limit or becoming expensive.
 
 After compacting, the session continues with the summary as context. The pre-compaction messages are never deleted: they stay in the underlying event log on disk (the model just no longer sees them). `meka session export` walks that full log, so an export always contains the entire conversation including the compacted-away turns, with a marker at each compaction point.
+
+Every compaction, this command's and the automatic ones, leaves a dim row saying what set it going (`Compacted the conversation on user request.`, `Autocompacted the conversation after context usage crossed the ceiling.`, `The agent compacted the conversation.`), followed by what departed from the ordinary case: that no recent turns were kept, that the standalone summarizer wrote the summary rather than the agent, and the memories the checkpoint turn wrote. While one runs, the working row reads `Compacting the conversation`. A resumed session shows the same rows, read back from the log.
 
 ### `/rewind`
 

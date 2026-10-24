@@ -3805,6 +3805,7 @@ mod tests {
             vec![Message::user("question 2")],
             pre_loaded.iter().cloned().collect(),
             Default::default(),
+            crate::conversation::CompactionRecord::for_test(),
         );
 
         // The materialized view shrank, but events are append-only.

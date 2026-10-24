@@ -8282,6 +8282,11 @@ fn compaction_marks_the_summary_in_the_message_history() {
         "exactly the summary carries the marker: {messages}"
     );
     assert_eq!(marked[0]["compaction"]["generation"], 1);
+    assert_eq!(
+        marked[0]["compaction"]["trigger"], "manual",
+        "the marker says what set the compaction going: {}",
+        marked[0]
+    );
     assert!(
         marked[0]["compaction"]["replaced_count"]
             .as_u64()
@@ -14404,10 +14409,25 @@ fn a_compaction_during_a_streaming_turn_emits_context_compacted() {
         names.iter().any(|name| name == "context.compacted"),
         "a compaction inside a streaming turn must reach the client: {body}"
     );
-    assert!(
-        body.contains("\"generation\":1"),
-        "and carry which compaction it was: {body}"
+    let started = sse_event_data(&body, "context.compacting").expect("the compaction opens");
+    assert_eq!(started["trigger"], "requested", "{body}");
+    let compacted = sse_event_data(&body, "context.compacted").expect("and lands");
+    assert_eq!(
+        compacted["compaction_id"], started["compaction_id"],
+        "the two name one compaction: {body}"
     );
+    assert_eq!(compacted["generation"], 1, "{body}");
+    assert_eq!(compacted["trigger"], "requested", "{body}");
+    assert_eq!(
+        compacted["source"], "summarizer",
+        "the checkpoint is off, so the summarizer wrote it: {body}"
+    );
+    assert_eq!(
+        compacted["memories_written"],
+        serde_json::json!([]),
+        "{body}"
+    );
+    assert!(compacted["kept_recent"].is_boolean(), "{body}");
     assert_eq!(
         names.last().map(String::as_str),
         Some("turn.finished"),

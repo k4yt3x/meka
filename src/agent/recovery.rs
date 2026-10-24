@@ -2,7 +2,7 @@
 //! each tier applies, and the retry policy.
 
 use super::*;
-use crate::session::{CompactOrigin, CompactRequest};
+use crate::{conversation::CompactionTrigger, session::CompactRequest};
 
 /// What a turn is willing to destroy of its own content in order to get a request accepted, least
 /// damaging first. A tier that failed is undone before the next is tried, and running off the end
@@ -159,7 +159,7 @@ impl TurnRecovery {
         if let Err(compact_error) = agent
             .compact_session(
                 messages,
-                CompactRequest::new(CompactOrigin::Emergency)
+                CompactRequest::new(CompactionTrigger::Emergency)
                     .answering(self.request_in_flight.clone()),
                 cancellation.clone(),
             )
@@ -959,8 +959,8 @@ mod tests {
     use super::*;
     use crate::{
         agent::tests::{agent_for_test, agent_that_compacts_for_test, image_source},
-        conversation::ToolResultContent,
-        session::{CompactOrigin, CompactRequest},
+        conversation::{CompactionTrigger, ToolResultContent},
+        session::CompactRequest,
     };
 
     /// A provider's rejection text cannot forge meka's own marker inside a degrade note.
@@ -1699,7 +1699,7 @@ mod tests {
             agent
                 .compact_session(
                     &mut messages,
-                    CompactRequest::new(CompactOrigin::Manual),
+                    CompactRequest::new(CompactionTrigger::Manual),
                     CancellationToken::new(),
                 )
                 .await

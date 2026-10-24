@@ -579,7 +579,7 @@ pub(crate) struct AgentOptions {
     /// anything that must outlive the window (see `Agent::run_checkpoint_turn`).
     ///
     /// Off means every compaction uses `Agent::summarize_via_provider`, which is also the
-    /// unconditional path for [`crate::session::CompactOrigin::Emergency`] regardless of
+    /// unconditional path for [`crate::conversation::CompactionTrigger::Emergency`] regardless of
     /// this flag.
     pub(crate) compact_checkpoint: bool,
     /// How long a turn is kept once it has ended (`[session].turn_retention`), or `None` to keep
@@ -653,46 +653,10 @@ pub(crate) const SUMMARY_SHAPE: &str = "Write the summary in four sections. 1. R
 pub(crate) fn context_ceiling(context_window: u64, percent: u64) -> u64 {
     context_window.saturating_mul(percent) / 100
 }
-/// What set a compaction going. Selects the summarization strategy, so it is not merely
-/// diagnostic.
-///
-/// Every origin but [`Self::Emergency`] can afford the checkpoint turn. `Emergency` cannot: it runs
-/// *after* the provider rejected the request for exceeding the window, and a checkpoint turn sends
-/// the same conversation again, so it would be refused for the same reason. That path needs a call
-/// that is deliberately smaller than the one that just failed, which is exactly what
-/// `Agent::summarize_via_provider` is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CompactOrigin {
-    /// A measured occupancy crossed the ceiling, between turns or between two tool rounds.
-    Reactive,
-    /// This turn's projected request would cross it.
-    Proactive,
-    /// A human ran `/compact`.
-    Manual,
-    /// The agent asked, via `context_compact`.
-    Requested,
-    /// The provider refused the request as too large.
-    Emergency,
-    /// A turn in the model's view is older than `[session].turn_retention`, so the sweep that
-    /// deletes it needs a summary to stand in for it first.
-    Retention,
-}
-impl CompactOrigin {
-    /// The kind Claude Code's compaction headers report for this origin.
-    pub(crate) fn kind(self) -> crate::provider::CompactionKind {
-        match self {
-            Self::Manual | Self::Requested => crate::provider::CompactionKind::Manual,
-            Self::Reactive | Self::Proactive | Self::Retention => {
-                crate::provider::CompactionKind::Auto
-            }
-            Self::Emergency => crate::provider::CompactionKind::Reactive,
-        }
-    }
-}
 /// One compaction, and the instructions shaping it.
 #[derive(Debug, Clone)]
 pub(crate) struct CompactRequest {
-    pub(crate) origin: CompactOrigin,
+    pub(crate) trigger: crate::conversation::CompactionTrigger,
     /// Free-text guidance on what to preserve or drop, from `/compact <instructions>` or
     /// `context_compact`. Reaches the checkpoint turn and the fallback summarizer alike, so the
     /// channel works whichever strategy runs.
@@ -708,9 +672,9 @@ pub(crate) struct CompactRequest {
     pub(crate) request_in_flight: Option<String>,
 }
 impl CompactRequest {
-    pub(crate) fn new(origin: CompactOrigin) -> Self {
+    pub(crate) fn new(trigger: crate::conversation::CompactionTrigger) -> Self {
         Self {
-            origin,
+            trigger,
             instructions: None,
             keep_recent: None,
             request_in_flight: None,
@@ -985,6 +949,7 @@ mod tests {
             Event::CompactBoundary {
                 summary: Message::user("[summary]"),
                 replaced_count: 2,
+                record: crate::conversation::CompactionRecord::for_test(),
                 loaded_tools_snapshot: Default::default(),
                 checklist_snapshot: Default::default(),
             },
@@ -1595,6 +1560,7 @@ mod tests {
             vec![assistant_text("kept tail answer")],
             std::collections::HashSet::new(),
             Default::default(),
+            crate::conversation::CompactionRecord::for_test(),
         );
 
         let markdown = format_session_as_markdown(

@@ -2,11 +2,7 @@
 //! settles to. Everything here runs under a held session lock.
 
 use super::*;
-use crate::{
-    conversation::PromptRetention,
-    session::{CompactOrigin, CompactRequest},
-    store::turns::CancelReason,
-};
+use crate::{conversation::PromptRetention, session::CompactRequest, store::turns::CancelReason};
 
 /// Why an [`Agent::run_turn`] invocation finished cleanly. Callers that drive a user-facing
 /// protocol (e.g. the ACP `session/prompt` response) use this to map to a protocol-level stop
@@ -1267,7 +1263,7 @@ impl Agent {
         if let Err(error) = self
             .compact_session(
                 messages,
-                CompactRequest::new(CompactOrigin::Reactive),
+                CompactRequest::new(crate::conversation::CompactionTrigger::Reactive),
                 cancellation.clone(),
             )
             .await
@@ -1309,7 +1305,7 @@ impl Agent {
         let window = crate::text::format_duration_words(window);
         tracing::info!("compacting for turn retention: a turn in context ended over {window} ago");
         let request = CompactRequest {
-            origin: CompactOrigin::Retention,
+            trigger: crate::conversation::CompactionTrigger::Retention,
             instructions: Some(format!(
                 "Turns older than {window} are deleted once this summary stands in for them; \
                  cover what still matters from them."
@@ -1534,7 +1530,7 @@ impl Agent {
         match self
             .compact_session(
                 messages,
-                CompactRequest::new(CompactOrigin::Proactive),
+                CompactRequest::new(crate::conversation::CompactionTrigger::Proactive),
                 cancellation.clone(),
             )
             .await
@@ -2413,7 +2409,7 @@ impl Agent {
                 match self
                     .compact_session(
                         messages,
-                        CompactRequest::new(CompactOrigin::Reactive)
+                        CompactRequest::new(crate::conversation::CompactionTrigger::Reactive)
                             .answering(run.recovery.request_in_flight.clone()),
                         run.cancellation.token().clone(),
                     )
@@ -7410,7 +7406,7 @@ mod tests {
             vec![MockEvent::FailContextOverflow {
                 message: "prompt is too long: 250000 tokens > 200000 maximum".to_string(),
             }],
-            // The summarizer, which `CompactOrigin::Emergency` always runs through `complete`.
+            // The summarizer, which `CompactionTrigger::Emergency` always runs through `complete`.
             vec![
                 MockEvent::Text {
                     text: "the log said everything was fine".to_string(),

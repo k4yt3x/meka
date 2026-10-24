@@ -211,6 +211,20 @@ pub(crate) enum CompactionKind {
     Reactive,
 }
 
+impl From<crate::conversation::CompactionTrigger> for CompactionKind {
+    /// The kind Claude Code's compaction headers report for what set a compaction going.
+    fn from(trigger: crate::conversation::CompactionTrigger) -> Self {
+        use crate::conversation::CompactionTrigger;
+        match trigger {
+            CompactionTrigger::Manual | CompactionTrigger::Requested => Self::Manual,
+            CompactionTrigger::Reactive
+            | CompactionTrigger::Proactive
+            | CompactionTrigger::Retention => Self::Auto,
+            CompactionTrigger::Emergency => Self::Reactive,
+        }
+    }
+}
+
 impl CompactionKind {
     /// The wire spelling.
     pub(crate) const fn name(self) -> &'static str {

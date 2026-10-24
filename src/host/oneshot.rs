@@ -59,6 +59,9 @@ struct TurnReport {
     /// Provider advisories raised during the turn, in order; the same shape the HTTP API's turn
     /// response carries them in.
     notices: Vec<crate::frontend::NoticeView>,
+    /// The compactions the turn ran, in order, in the shape the `context.compacted` event has:
+    /// what set each going, which strategy wrote its summary and what it replaced.
+    compactions: Vec<crate::view::CompactionView>,
 }
 
 /// Fold the recorded events into the report. Usage is summed over the `TokenUsage` events the turn
@@ -79,6 +82,7 @@ fn assemble_report(
     let mut started: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut usage = crate::stats::TokenUsage::default();
     let mut notices: Vec<crate::frontend::NoticeView> = Vec::new();
+    let mut compactions: Vec<crate::view::CompactionView> = Vec::new();
     for event in events {
         match event {
             FrontendEvent::AssistantTextDelta(delta) => {
@@ -118,6 +122,19 @@ fn assemble_report(
                 usage.cache_read_input_tokens += round.cache_read_input_tokens;
             }
             FrontendEvent::Notice(notice) => notices.push(notice.into()),
+            FrontendEvent::Compacted {
+                record,
+                replaced_count,
+                generation,
+                ..
+            } => {
+                round_boundary = true;
+                compactions.push(crate::view::CompactionView::new(
+                    &record,
+                    replaced_count,
+                    generation,
+                ));
+            }
             _ => {}
         }
     }
@@ -138,6 +155,7 @@ fn assemble_report(
         tool_calls,
         usage,
         notices,
+        compactions,
     }
 }
 
@@ -481,8 +499,8 @@ mod tests {
     }
 
     /// The report gathers everything a turn's events say: the text in paragraphs per round, each
-    /// tool call with the error flag its result set, the usage summed over rounds, and the
-    /// notices in order.
+    /// tool call with the error flag its result set, the usage summed over rounds, the notices in
+    /// order and the compactions with their facts.
     #[test]
     fn a_report_gathers_the_turns_calls_usage_and_notices() {
         use crate::frontend::FrontendEvent;
@@ -510,6 +528,18 @@ mod tests {
                 },
                 FrontendEvent::TokenUsage(usage(10, 3)),
                 FrontendEvent::Notice(crate::frontend::Notice::warn("a warning")),
+                FrontendEvent::Compacted {
+                    id: "c1".to_string(),
+                    record: crate::conversation::CompactionRecord {
+                        trigger: crate::conversation::CompactionTrigger::Requested,
+                        source: crate::conversation::CompactionSource::Checkpoint,
+                        memories_written: vec!["notes".to_string()],
+                        kept_recent: true,
+                    },
+                    replaced_count: 4,
+                    generation: 1,
+                    summary: "a summary".to_string(),
+                },
                 FrontendEvent::AssistantTextDelta("Missing.".to_string()),
                 FrontendEvent::TokenUsage(usage(5, 4)),
             ],
@@ -537,6 +567,10 @@ mod tests {
         );
         assert_eq!(report.notices.len(), 1);
         assert_eq!(report.notices[0].text, "a warning");
+        assert_eq!(report.compactions.len(), 1);
+        assert_eq!(report.compactions[0].trigger, "requested");
+        assert_eq!(report.compactions[0].memories_written, vec!["notes"]);
+        assert_eq!(report.compactions[0].replaced_count, 4);
     }
 
     /// A report for a turn that never got a session leaves `session_id` out rather than sending

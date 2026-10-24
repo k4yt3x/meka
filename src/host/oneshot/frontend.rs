@@ -79,6 +79,12 @@ impl Frontend for PlainFrontend {
             }
             FrontendEvent::SessionStarted { id } => tracing::info!("created session {id}"),
             FrontendEvent::Notice(notice) => log_notice(&notice),
+            // Said the way a notice is: a one-shot's stdout is the answer alone, and the row the
+            // screen would draw is a lifecycle signpost here.
+            FrontendEvent::Compacted { record, .. } => {
+                tracing::info!("{}", record.note());
+                crate::sync::lock(&self.answer).boundary();
+            }
             _ => {}
         }
     }

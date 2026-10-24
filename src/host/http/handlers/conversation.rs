@@ -28,7 +28,6 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
-    agent::CompactSource,
     host::http::{
         errors::{ErrorKind, ProblemDetail},
         handlers::{
@@ -40,7 +39,7 @@ use crate::{
         sse::SseEventType,
         state::ServerState,
     },
-    session::{CompactOrigin, CompactRequest},
+    session::CompactRequest,
 };
 
 #[derive(Debug, Deserialize, ToSchema, Default)]
@@ -156,7 +155,7 @@ pub(crate) async fn compact(
     let request = CompactRequest {
         // `Manual` and not `Requested`: the origin distinguishes who asked, and an API caller is
         // standing in for the human at the keyboard, not for the model asking on its own behalf.
-        origin: CompactOrigin::Manual,
+        trigger: crate::conversation::CompactionTrigger::Manual,
         instructions: body.instructions,
         keep_recent: body.keep_recent,
         request_in_flight: None,
@@ -275,11 +274,7 @@ pub(crate) async fn compact(
 
     Ok(Json(CompactResponse {
         session_id: id,
-        source: match outcome.source {
-            CompactSource::Checkpoint => "checkpoint",
-            CompactSource::Summarizer => "summarizer",
-        }
-        .to_string(),
+        source: outcome.source.name().to_string(),
         memories_written: outcome.memories_written,
         kept_recent: outcome.kept_recent,
         messages_before,

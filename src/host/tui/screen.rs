@@ -365,6 +365,10 @@ struct Screen {
     busy: Option<Instant>,
     /// What the agent is doing, as the stream last said; the working row's word.
     activity: view::Activity,
+    /// A compaction is running: the word while the stream says nothing more specific, since the
+    /// checkpoint turn's own thinking and calls say what they are, and the summarizer says
+    /// nothing.
+    compacting: bool,
     /// The seconds and the spinner frame the working row last showed, so a change redraws it.
     shown_working: (u64, usize),
     /// A wake arrived while the host was busy; handed over when it is not.
@@ -423,6 +427,7 @@ impl Screen {
             log_ring: std::collections::VecDeque::with_capacity(LOG_RING_LINES),
             busy,
             activity: view::Activity::Working,
+            compacting: false,
             shown_working: (0, 0),
             wake_pending: false,
             questions: std::collections::VecDeque::new(),
@@ -930,6 +935,16 @@ impl Screen {
         self.dirty = true;
         match event {
             UiEvent::Agent(event) => {
+                match &event {
+                    crate::frontend::FrontendEvent::CompactionStarted { .. } => {
+                        self.compacting = true;
+                    }
+                    crate::frontend::FrontendEvent::Compacted { .. }
+                    | crate::frontend::FrontendEvent::CompactionFailed { .. } => {
+                        self.compacting = false;
+                    }
+                    _ => {}
+                }
                 self.activity.note(&event);
                 self.launch.transcript.apply(event);
             }
@@ -963,6 +978,7 @@ impl Screen {
                 self.launch.transcript.flush_turn_end();
                 self.busy = None;
                 self.activity = view::Activity::Working;
+                self.compacting = false;
                 if self.wake_pending {
                     self.wake_pending = false;
                     self.ask_host(HostEvent::Wake);
@@ -2611,6 +2627,8 @@ impl Screen {
             view::Activity::Shell
         } else if self.overlay_is_question() {
             view::Activity::Waiting
+        } else if self.compacting && self.activity == view::Activity::Working {
+            view::Activity::Compacting
         } else {
             self.activity
         };

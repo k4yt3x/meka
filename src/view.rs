@@ -536,6 +536,51 @@ impl ToolView {
     }
 }
 
+/// One compaction as every JSON surface reports it: the `context.compacted` event, the
+/// `compaction` marker on a summary message, and the one-shot report. `trigger` and `source` are
+/// the spellings of [`crate::conversation::CompactionTrigger`] and
+/// [`crate::conversation::CompactionSource`].
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+pub(crate) struct CompactionView {
+    /// What set the compaction going: `reactive`, `proactive`, `manual`, `requested`, `emergency`
+    /// or `retention`.
+    pub(crate) trigger: String,
+    /// Which strategy wrote the summary: `checkpoint` or `summarizer`. They differ in fidelity,
+    /// not just mechanism.
+    pub(crate) source: String,
+    /// Memories the checkpoint turn wrote, observed from its calls rather than self-reported.
+    pub(crate) memories_written: Vec<String>,
+    /// Whether the recent turns were kept verbatim after the summary.
+    pub(crate) kept_recent: bool,
+    /// How many materialized messages the boundary removed: the whole pre-compaction window,
+    /// including the tail compaction re-appends verbatim, so it over-counts what the summary
+    /// itself stands for. Use it to detect *that* the view was rewritten, not to compute how much
+    /// was lost.
+    pub(crate) replaced_count: usize,
+    /// Which compaction this was, counting from 1. Fidelity degrades with each pass, so a client
+    /// rendering a transcript can say how far from the original it is.
+    pub(crate) generation: u64,
+}
+
+impl CompactionView {
+    /// The view of a boundary's record, with the two counters the replay adds.
+    pub(crate) fn new(
+        record: &crate::conversation::CompactionRecord,
+        replaced_count: usize,
+        generation: u64,
+    ) -> Self {
+        Self {
+            trigger: record.trigger.name().to_string(),
+            source: record.source.name().to_string(),
+            memories_written: record.memories_written.clone(),
+            kept_recent: record.kept_recent,
+            replaced_count,
+            generation,
+        }
+    }
+}
+
 /// A built-in tool as `meka tool list` and `meka tool show` print it: the catalog entry plus the
 /// two facts the commands exist to show and a session's catalog cannot, where the required level
 /// came from and whether the config admits the tool at all.

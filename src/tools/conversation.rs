@@ -884,6 +884,7 @@ mod tests {
         Event::CompactBoundary {
             summary: Message::user("[summary]"),
             replaced_count: replaced,
+            record: crate::conversation::CompactionRecord::for_test(),
             loaded_tools_snapshot: HashSet::new(),
             checklist_snapshot: Default::default(),
         }

@@ -417,6 +417,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "sessions_and_memories_record_their_project",
         step: Step::Rust(sessions_and_memories_record_their_project),
     },
+    // 0.84 records on every compaction boundary what set the compaction going, which strategy
+    // wrote the summary, the memories the checkpoint wrote and whether the recent turns were
+    // kept, so a replay says what the live row said. A boundary written before the record is
+    // given the commonest case, an automatic compaction at the ceiling written by the checkpoint
+    // with no memories and the tail kept, since nothing in the store says otherwise; the upgrade
+    // guide says so.
+    Migration {
+        name: "compact_boundaries_record_their_compaction",
+        step: Step::Rust(compact_boundaries_record_their_compaction),
+    },
 ];
 
 /// The position of the last turn a session opened, beside the eight cumulative counters: `NULL`
@@ -2466,6 +2476,68 @@ fn retag_thinking_block(block: &mut serde_json::Value) -> bool {
     true
 }
 
+/// Give a `CompactBoundary` event the record 0.84 writes, where it has none, and report whether
+/// anything was added. A boundary from before the record takes the commonest case, an automatic
+/// compaction at the ceiling written by the checkpoint with no memories and the tail kept, since
+/// nothing in the store says otherwise; a key already present is left alone, so a replay and a
+/// row in the new shape find nothing to do. The event is the externally tagged value both the
+/// store row and the archive hold.
+fn record_compaction_0_84(event: &mut serde_json::Value) -> bool {
+    let Some(boundary) = event
+        .get_mut("CompactBoundary")
+        .and_then(|boundary| boundary.as_object_mut())
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for (key, value) in [
+        ("trigger", serde_json::Value::String("reactive".to_string())),
+        (
+            "source",
+            serde_json::Value::String("checkpoint".to_string()),
+        ),
+        ("memories_written", serde_json::Value::Array(Vec::new())),
+        ("kept_recent", serde_json::Value::Bool(true)),
+    ] {
+        if !boundary.contains_key(key) {
+            boundary.insert(key.to_string(), value);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Every `compact_boundary` row takes the record 0.84 writes; see [`record_compaction_0_84`].
+fn compact_boundaries_record_their_compaction(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, String)> = {
+        let mut statement = transaction
+            .prepare("SELECT id, content FROM messages WHERE kind = 'compact_boundary'")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, content) in rows {
+        let Ok(mut event) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        if !record_compaction_0_84(&mut event) {
+            continue;
+        }
+        let encoded = match serde_json::to_string(&event) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+            }
+        };
+        transaction.execute(
+            "UPDATE messages SET content = ?1 WHERE id = ?2",
+            rusqlite::params![encoded, id],
+        )?;
+    }
+    Ok(())
+}
+
 /// Every stored call of the meta-tool that loads a deferred schema takes its 0.60 name.
 ///
 /// A call lives in an assistant row's block list or inside a `repair` envelope's messages; the walk
@@ -3056,6 +3128,9 @@ const ARCHIVE_FORMAT_0_78_DEVELOPMENT: u64 = 13;
 /// The archive `format_version` 0.78 wrote, whose sub-agent specs from before 0.76 name no
 /// allow-lists.
 const ARCHIVE_FORMAT_0_78: u64 = 14;
+/// The archive `format_version` 0.79 through 0.83 wrote, whose boundaries record nothing about
+/// their compaction.
+const ARCHIVE_FORMAT_0_83: u64 = 15;
 
 /// How the text meka wrote into a user message on another's behalf began before 0.76 typed it,
 /// as 0.76's own renderers wrote it: the header above an inbox item with a named source and
@@ -3612,7 +3687,8 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
         | Some(ARCHIVE_FORMAT_0_76)
         | Some(ARCHIVE_FORMAT_0_77)
         | Some(ARCHIVE_FORMAT_0_78_DEVELOPMENT)
-        | Some(ARCHIVE_FORMAT_0_78) => {}
+        | Some(ARCHIVE_FORMAT_0_78)
+        | Some(ARCHIVE_FORMAT_0_83) => {}
         _ => return false,
     }
     require_fields_0_65(document);
@@ -3639,8 +3715,31 @@ pub(crate) fn bring_archive_forward(document: &mut serde_json::Value, current: u
     name_allow_lists_0_76(document);
     type_user_events_0_76(document);
     type_repairs_and_name_report_tasks_0_76(document);
+    record_compactions_0_84(document);
     document["format_version"] = current.into();
     true
+}
+
+/// [`record_compaction_0_84`] over every event of every session in an archive.
+fn record_compactions_0_84(document: &mut serde_json::Value) {
+    let Some(sessions) = document
+        .get_mut("sessions")
+        .and_then(|sessions| sessions.as_array_mut())
+    else {
+        return;
+    };
+    for session in sessions {
+        if let Some(events) = session
+            .get_mut("events")
+            .and_then(|events| events.as_array_mut())
+        {
+            for event in events {
+                if let Some(event) = event.get_mut("event") {
+                    record_compaction_0_84(event);
+                }
+            }
+        }
+    }
 }
 
 /// Every 0.70 rename, old name to new: the three todo tools became the checklist tools.
@@ -4803,6 +4902,10 @@ mod tests {
             (
                 "sessions_and_memories_record_their_project",
                 3180749961311918637_u64,
+            ),
+            (
+                "compact_boundaries_record_their_compaction",
+                8832125766036357788_u64,
             ),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
@@ -8618,6 +8721,148 @@ mod tests {
         assert_eq!(turn.profile, None);
     }
 
+    /// A boundary from before 0.84 decodes with the commonest record, the row is rewritten once
+    /// in the shape a 0.84 write produces, a boundary already carrying a record keeps it, and a
+    /// replay rewrites nothing.
+    ///
+    /// Through `Store::open` and `load_events`, because the record is required at decode: a row
+    /// without it would be dropped with a warning and the resume would lose the summary.
+    #[tokio::test]
+    async fn a_boundary_from_before_0_84_takes_the_commonest_record() {
+        use crate::conversation::{CompactionSource, CompactionTrigger, Event};
+
+        let directory = tempfile::tempdir().expect("a directory for the store");
+        let path = directory.path().join("meka.db");
+        let session = uuid::Uuid::new_v4().to_string();
+        let bare = r#"{"CompactBoundary":{"summary":{"role":"user","content":[{"type":"text","text":"s"}]},"replaced_count":2,"loaded_tools_snapshot":[],"checklist_snapshot":{"next_id":1,"items":[]}}}"#;
+        let recorded = r#"{"CompactBoundary":{"summary":{"role":"user","content":[{"type":"text","text":"s"}]},"replaced_count":3,"loaded_tools_snapshot":[],"checklist_snapshot":{"next_id":1,"items":[]},"trigger":"manual","source":"summarizer","memories_written":["notes"],"kept_recent":false}}"#;
+        {
+            let mut connection = rusqlite::Connection::open(&path).expect("open");
+            connection
+                .execute_batch(BASELINE_0_42)
+                .expect("the baseline builds");
+            stopped_before(
+                &mut connection,
+                "compact_boundaries_record_their_compaction",
+            );
+            plant_session(&connection, &session);
+            plant_message_of_kind(&connection, &session, "compact_boundary", bare);
+            plant_message_of_kind(&connection, &session, "compact_boundary", recorded);
+        }
+
+        let store = crate::store::Store::open(Some(&path), &Context::default())
+            .await
+            .expect("the store migrates on open");
+        let events = store
+            .load_events(session.parse().expect("a uuid"))
+            .await
+            .expect("load");
+        let records: Vec<_> = events
+            .iter()
+            .map(|event| match event {
+                Event::CompactBoundary { record, .. } => record.clone(),
+                other => panic!("every row is a boundary: {other:?}"),
+            })
+            .collect();
+        assert_eq!(records.len(), 2, "{events:?}");
+        assert_eq!(records[0].trigger, CompactionTrigger::Reactive);
+        assert_eq!(records[0].source, CompactionSource::Checkpoint);
+        assert!(records[0].memories_written.is_empty());
+        assert!(records[0].kept_recent);
+        assert_eq!(records[1].trigger, CompactionTrigger::Manual);
+        assert_eq!(records[1].source, CompactionSource::Summarizer);
+        assert_eq!(records[1].memories_written, vec!["notes".to_string()]);
+        assert!(!records[1].kept_recent);
+
+        let mut connection = rusqlite::Connection::open(&path).expect("reopen");
+        let after = stored_messages(&connection);
+        assert_eq!(
+            after[1].1, recorded,
+            "a row carrying its record is untouched"
+        );
+        assert_eq!(
+            after[0].1,
+            serde_json::to_string(&events[0]).expect("encodes"),
+            "the rewritten row is byte for byte what a 0.84 write produces"
+        );
+        let transaction = connection.transaction().expect("transaction");
+        compact_boundaries_record_their_compaction(&transaction).expect("replay");
+        transaction.commit().expect("commit");
+        assert_eq!(
+            stored_messages(&connection),
+            after,
+            "a replay finds nothing left in the old shape"
+        );
+    }
+
+    /// A format 15 archive's boundaries record nothing about their compaction, so each takes the
+    /// commonest record on the way in, and a replay over the converted archive is a no-op.
+    #[test]
+    fn a_format_15_archive_takes_the_record_its_boundaries_never_wrote() {
+        let mut document = serde_json::json!({
+            "format_version": 15,
+            "meka_version": "0.83.0",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "blobs": [],
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "working_directory": "/w",
+                "permission": "read",
+                "capabilities_json": null,
+                "approvals": false,
+                "additional_workspace_directories": [],
+                "subagent_spec_json": null,
+                "profile": "work",
+                "project": "",
+                "stats": {
+                    "turns": 1,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "redactions": 0,
+                    "redacted_images": 0,
+                    "redacted_bytes": 0,
+                    "turn_position": {"prompt_index": 1, "turn_index": 1},
+                },
+                "turns": [],
+                "events": [{
+                    "at": "2020-01-01T00:00:00Z",
+                    "event": {"CompactBoundary": {
+                        "summary": {"role": "user", "content": [{"type": "text", "text": "s"}]},
+                        "replaced_count": 2,
+                        "loaded_tools_snapshot": [],
+                        "checklist_snapshot": {"next_id": 1, "items": []},
+                    }},
+                    "turn_id": null,
+                }],
+                "scratchpad_entries": {},
+            }],
+        });
+        let current = u64::from(crate::store::export::SESSION_EXPORT_FORMAT_VERSION);
+        assert!(bring_archive_forward(&mut document, current));
+        let boundary = &document["sessions"][0]["events"][0]["event"]["CompactBoundary"];
+        assert_eq!(boundary["trigger"], "reactive");
+        assert_eq!(boundary["source"], "checkpoint");
+        assert_eq!(boundary["memories_written"], serde_json::json!([]));
+        assert_eq!(boundary["kept_recent"], true);
+        let export = crate::store::export::parse_session_export(document.to_string().as_bytes())
+            .expect("a format 15 archive reads");
+        assert_eq!(export.sessions[0].events.len(), 1);
+
+        let once = document.clone();
+        document["format_version"] = 15.into();
+        assert!(bring_archive_forward(&mut document, current));
+        assert_eq!(
+            document, once,
+            "a replay over a converted archive is a no-op"
+        );
+    }
+
     /// A row written before the memory columns loads by its priority, since priority 0 was the
     /// inline band, and is verified as of its creation; the other three columns take their
     /// empty defaults. A replay leaves a row the user has since moved alone, so the conversion is
@@ -8724,6 +8969,15 @@ mod tests {
 
     /// The shape the project step converts from: a store at head with `sessions.project` gone and
     /// `memories` under its old constraint, stamped one step short.
+    /// Where `name` sits in the ledger, which is the `user_version` a store stopped ahead of it
+    /// carries.
+    fn position_of(name: &str) -> usize {
+        MIGRATIONS
+            .iter()
+            .position(|migration| migration.name == name)
+            .unwrap_or_else(|| panic!("no ledger entry named {name}"))
+    }
+
     fn store_before_projects() -> rusqlite::Connection {
         let mut connection = rusqlite::Connection::open_in_memory().expect("open");
         let to_head = plan(&connection).expect("plan");
@@ -8752,7 +9006,10 @@ mod tests {
             )
             .expect("the shape before the step");
         connection
-            .execute_batch(&format!("PRAGMA user_version = {};", MIGRATIONS.len() - 1))
+            .execute_batch(&format!(
+                "PRAGMA user_version = {};",
+                position_of("sessions_and_memories_record_their_project")
+            ))
             .expect("one step short of head");
         connection
     }
@@ -8834,7 +9091,10 @@ mod tests {
             .expect("rows an older meka wrote");
 
         let pending = plan(&connection).expect("plan");
-        assert_eq!(pending.from as usize, MIGRATIONS.len() - 1);
+        assert_eq!(
+            pending.from as usize,
+            position_of("sessions_and_memories_record_their_project")
+        );
         apply(&mut connection, pending, &Context::default()).expect("the step runs");
 
         let rows = memory_rows(&connection);

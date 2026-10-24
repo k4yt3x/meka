@@ -26,8 +26,8 @@ use crate::{
     permission::Permission,
     provider::ToolDefinition,
     session::{
-        CompactOrigin, CompactRequest, PendingCompaction, SUMMARY_SHAPE,
-        compaction_retained_budget, compaction_verbatim_budget,
+        CompactRequest, PendingCompaction, SUMMARY_SHAPE, compaction_retained_budget,
+        compaction_verbatim_budget,
     },
     store::Store,
 };
@@ -328,7 +328,7 @@ impl Tool for ContextCompactTool {
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let request = CompactRequest {
-            origin: CompactOrigin::Requested,
+            trigger: crate::conversation::CompactionTrigger::Requested,
             instructions: input
                 .get("instructions")
                 .and_then(serde_json::Value::as_str)
@@ -588,7 +588,10 @@ mod tests {
         .expect("context_compact");
 
         let request = pending.lock().expect("lock").take().expect("recorded");
-        assert_eq!(request.origin, CompactOrigin::Requested);
+        assert_eq!(
+            request.trigger,
+            crate::conversation::CompactionTrigger::Requested
+        );
         assert_eq!(request.instructions.as_deref(), Some("keep the decisions"));
         assert_eq!(request.keep_recent, Some(false));
     }

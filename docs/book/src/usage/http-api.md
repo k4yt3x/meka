@@ -544,7 +544,7 @@ curl -s -X POST http://localhost:8080/v1/sessions/$SESSION_ID/turn \
 Two signals cover this:
 
 - **`revision`** on the response increments on every rewrite. If it changed since your last poll, re-fetch rather than diff. This is the one to key on, because it covers all five causes.
-- **`compaction`** on a message identifies a summary and says how many messages it replaced and which compaction it was. Only compaction leaves a message behind to carry it; a rewind removes messages with nothing in their place, which is why `revision` exists.
+- **`compaction`** on a message identifies a summary and says what set the compaction going, which strategy wrote it, the memories the checkpoint wrote, whether the recent turns were kept, how many messages it replaced and which compaction it was. Only compaction leaves a message behind to carry it; a rewind removes messages with nothing in their place, which is why `revision` exists.
 
 `total` alone is not enough: a shrinking `total` is indistinguishable from the server losing your conversation.
 
@@ -768,7 +768,9 @@ Three limits. The event exists only when meka streams from its provider, so a se
 
 | Event | Payload | When |
 |-------|---------|------|
-| `context.compacted` | `source`, `replaced_count`, `generation` | The conversation was summarized and the window replaced |
+| `context.compacting` | `compaction_id`, `trigger` | A compaction began; the checkpoint turn or the summarizer is about to run |
+| `context.compacted` | `compaction_id`, `trigger`, `source`, `memories_written`, `kept_recent`, `replaced_count`, `generation` | The conversation was summarized and the window replaced |
+| `context.compaction_failed` | `compaction_id`, `trigger`, `error`, `interrupted` | The compaction that began under `compaction_id` ended without replacing the window |
 | `conversation.rewound` | `revision`, `total`, `turns_removed` | `POST /rewind` removed turns; emitted outside any turn, so it carries no `turn_id` |
 | `checklist.updated` | `items`, the whole open list as the session record carries it | A `checklist_*` call changed the list; empty once everything is disposed of |
 
@@ -784,9 +786,9 @@ arrives while the model writes the reply that gets nudged rides the nudge as a t
 it, the way one rides a tool round's results, and `inbox.delivered` follows. See
 [Checklist](checklist.md).
 
-`context.compacted` is the one event on this stream that is not additive. Everything else appends, so a client that misses one still holds a prefix of the truth; a compaction *removes* messages the client has already rendered. `source` is `checkpoint` or `summarizer` (they differ in fidelity, not just mechanism), `replaced_count` is how many messages the boundary removed from the view (the whole pre-compaction window, including the tail compaction re-appends verbatim), and `generation` counts compactions from 1.
+`context.compacted` is the one event on this stream that is not additive. Everything else appends, so a client that misses one still holds a prefix of the truth; a compaction *removes* messages the client has already rendered. `trigger` is what set it going: `reactive` (a measured occupancy crossed the ceiling), `proactive` (the turn's projected request would have), `manual` (`/compact` or `POST /compact`), `requested` (the agent's own `context_compact`), `emergency` (the provider refused the request as too large) or `retention` (a turn aged past `turn_retention`). `source` is `checkpoint` or `summarizer` (they differ in fidelity, not just mechanism), `memories_written` names what the checkpoint turn wrote, `kept_recent` says whether the recent turns were kept verbatim after the summary, `replaced_count` is how many messages the boundary removed from the view (the whole pre-compaction window, including the tail compaction re-appends verbatim), and `generation` counts compactions from 1. `context.compacting` opens the compaction under the same `compaction_id` before any request is made, since a checkpoint turn can take a while; `context.compaction_failed` closes one that ended without replacing the window, `interrupted` when the user stopped it.
 
-The same information appears on `GET /messages`: the summary message carries a `compaction` object with `replaced_count` and `generation`, and every other message omits the field. Without it a polling client sees `total` shrink with no explanation, which is indistinguishable from the server losing the conversation.
+The same object appears on `GET /messages`: the summary message carries it as `compaction`, without `compaction_id`, and every other message omits the field. Without it a polling client sees `total` shrink with no explanation, which is indistinguishable from the server losing the conversation.
 
 ### Heartbeats
 
