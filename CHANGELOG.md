@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Every compaction is reported as what it was: what set it going, who wrote it, what it wrote.
 - The screen shows a row for every compaction, automatic ones included, and a word while one runs.
 - An ACP client advertising `session.compaction` gets `compaction_update`, opened as work begins.
+- An ACP client advertising `session.notices` gets meka's advisories as `notice` updates.
 - `context.compacting` and `context.compaction_failed` events; `compactions` in the one-shot JSON.
 
 ### Changed
@@ -28,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The screen's banner names the build and counts the servers, skills, memories and instructions.
 - The screen's status row shows the project the session is on; `[display] status_row` lists it.
 - `clipboard-win` moves to 5.4.3, off a yanked release.
+- The ACP SDK moves to 3.5.0; `initialize` with a protocol version meka lacks is answered with 1.
 - Inline memory bodies share a 32 KiB budget, `[memory] inline_max_bytes`; it was 4 KiB and fixed.
 - A memory write that would take the inline bodies past the budget is refused, at every door alike.
 - An inline body is shown whole or listed by description; the memory section says which and why.

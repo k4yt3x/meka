@@ -38,19 +38,19 @@ use agent_client_protocol::{
         CurrentModeUpdate, Diff, EmbeddedResource, EmbeddedResourceResource, ForkSessionRequest,
         ForkSessionResponse, ImageContent, Implementation, InitializeRequest, InitializeResponse,
         ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-        NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan,
-        PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest,
-        PromptResponse, ReadTextFileRequest, RequestPermissionOutcome, RequestPermissionRequest,
-        ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
-        SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-        SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
-        SessionForkCapabilities, SessionId, SessionInfo, SessionInfoUpdate,
-        SessionListCapabilities, SessionMode, SessionModeId, SessionModeState, SessionNotification,
-        SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
-        SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-        ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-        ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, Usage, UsageUpdate,
-        WriteTextFileRequest,
+        NewSessionRequest, NewSessionResponse, NoticeSeverity, PermissionOption,
+        PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+        PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
+        RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
+        ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+        SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+        SessionConfigSelectOption, SessionConfigValueId, SessionForkCapabilities, SessionId,
+        SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionMode, SessionModeId,
+        SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
+        SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+        SetSessionModeResponse, StopReason, ToolCall, ToolCallContent, ToolCallLocation,
+        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+        Usage, UsageUpdate, WriteTextFileRequest,
     },
 };
 use async_trait::async_trait;
@@ -329,25 +329,10 @@ pub(crate) async fn run_acp(
                                 .audio(false)
                                 .embedded_context(true),
                         );
-                    // Reject the V0 sentinel explicitly. The schema uses V0 as the "couldn't parse
-                    // the requested version" fallback; a clamped `min(V0, LATEST)` would silently
-                    // echo it back and let the handshake proceed against a malformed input.
-                    if request.protocol_version
-                        == agent_client_protocol::schema::ProtocolVersion::V0
-                    {
-                        return responder.respond_with_error(invalid_params_error(
-                            "protocolVersion 0 is the schema's parse-failure sentinel; \
-                             specify a supported version",
-                        ));
-                    }
-                    // The requested version when this build supports it, otherwise the latest it
-                    // knows: a plain echo tells a newer client that meka speaks a version it does
-                    // not.
-                    let negotiated = std::cmp::min(
-                        request.protocol_version,
-                        agent_client_protocol::schema::ProtocolVersion::LATEST,
-                    );
-                    let response = InitializeResponse::new(negotiated)
+                    // The SDK negotiates the version on the wire: a request for one this build
+                    // does not speak arrives rewritten to the one it does, and the response is
+                    // stamped with the same, so the handler echoes what it was handed.
+                    let response = InitializeResponse::new(request.protocol_version)
                         .agent_capabilities(capabilities)
                         .agent_info(Implementation::new("meka", env!("CARGO_PKG_VERSION")));
                     responder.respond(response)
@@ -869,26 +854,48 @@ mod tests {
     }
 
     /// The nudge's stage direction arrives between two replies in one agent message, so it
-    /// carries paragraph breaks; an advisory keeps its `[meka]` line.
+    /// carries paragraph breaks and stays a chunk whatever the client renders; an advisory is a
+    /// `notice` at its level's severity for a client that renders one, else its `[meka]` line.
     #[test]
-    fn a_stage_direction_is_a_paragraph_of_its_own_in_the_editor() {
-        let nudged = serde_json::to_string(&crate::host::acp::frontend::notice_update(
-            &crate::frontend::Notice::checklist_nudged(1, 1, 3),
-        ))
-        .expect("serializes");
-        assert!(
-            nudged.contains("\\n\\n(Checklist: 1 open item, continuing, nudge 1 of 3)\\n\\n"),
-            "{nudged}"
+    fn a_stage_direction_is_a_paragraph_of_its_own_and_an_advisory_a_notice_where_rendered() {
+        let update = |notice: &crate::frontend::Notice, renders_notices: bool| {
+            serde_json::to_value(crate::host::acp::frontend::notice_update(
+                notice,
+                renders_notices,
+            ))
+            .expect("serializes")
+        };
+        let nudged = update(&crate::frontend::Notice::checklist_nudged(1, 1, 3), true);
+        assert_eq!(nudged["sessionUpdate"], "agent_message_chunk", "{nudged}");
+        assert_eq!(
+            nudged["content"]["text"],
+            "\n\n(Checklist: 1 open item, continuing, nudge 1 of 3)\n\n"
         );
-        let advisory = serde_json::to_string(&crate::host::acp::frontend::notice_update(
+        let chunk = update(
             &crate::frontend::Notice::info("context is filling up"),
-        ))
-        .expect("serializes");
-        assert!(
-            advisory.contains("[meka] context is filling up"),
-            "{advisory}"
+            false,
         );
-        assert!(!advisory.contains("\\n"), "{advisory}");
+        assert_eq!(chunk["sessionUpdate"], "agent_message_chunk", "{chunk}");
+        assert_eq!(chunk["content"]["text"], "[meka] context is filling up");
+        let warned = update(
+            &crate::frontend::Notice::warn("the provider retried"),
+            false,
+        );
+        assert_eq!(
+            warned["content"]["text"],
+            "[meka warn] the provider retried"
+        );
+        let notice = update(
+            &crate::frontend::Notice::info("context is filling up"),
+            true,
+        );
+        assert_eq!(notice["sessionUpdate"], "notice", "{notice}");
+        assert_eq!(notice["severity"], "info");
+        assert_eq!(notice["title"], "context is filling up");
+        assert_eq!(notice.get("description"), None, "{notice}");
+        let warning = update(&crate::frontend::Notice::warn("the provider retried"), true);
+        assert_eq!(warning["severity"], "warning", "{warning}");
+        assert_eq!(warning["title"], "the provider retried");
     }
 
     #[test]

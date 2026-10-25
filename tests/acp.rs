@@ -32,8 +32,9 @@
 //!   `acp_session_list_paginates_across_cursor_boundary`) seed a second child process against the
 //!   same on-disk session store the first child wrote to. The harness owns its tempdir and has no
 //!   "respawn against this existing tempdir" hook.
-//! - **Pre-initialize protocol tests** (`acp_initialize_clamps_far_future_version_to_latest`) need
-//!   to send a non-default `protocolVersion`, which the harness bakes in during `build()`.
+//! - **Pre-initialize protocol tests**
+//!   (`acp_initialize_answers_a_version_it_does_not_speak_with_the_latest`) need to send a
+//!   non-default `protocolVersion`, which the harness bakes in during `build()`.
 //! - **Bespoke timing tests** (`acp_session_cancel_interrupts_running_prompt`,
 //!   `acp_multi_session_parallel_prompts_dont_serialize`) rely on precise `Instant::now()`
 //!   measurements outside the harness's per-request window.
@@ -683,8 +684,8 @@ fn acp_first_turn_emits_session_info_update_title() {
 
 /// A provider advisory reaches the editor as an assistant-message chunk prefixed `[meka]`.
 ///
-/// ACP has no notice primitive, so this chunk is the *only* way an advisory reaches a client, and
-/// the prefix is the only thing letting one filter or style it. The degrade-and-retry uses it to
+/// A client that did not advertise `session.notices` has no other door for an advisory, and the
+/// prefix is the only thing letting it filter or style one. The degrade-and-retry uses it to
 /// say that content was removed from the turn, which makes this the difference between an editor
 /// user being told and a tool result quietly changing under them.
 ///
@@ -710,6 +711,43 @@ fn acp_forwards_a_provider_notice_as_a_prefixed_assistant_chunk() {
     assert!(
         chunks.contains(&"[meka] context is filling up"),
         "the advisory must reach the client, prefixed: {chunks:?}"
+    );
+}
+
+/// The same advisory is a `notice` for a client that advertised `session.notices`, at its level's
+/// severity and with nothing in the transcript: the protocol lets an agent send one to no other
+/// client, and the chunk beside it would say the same thing twice.
+#[test]
+fn acp_sends_an_advisory_as_a_notice_to_a_client_that_advertises_it() {
+    let script = serde_json::json!([[
+        { "type": "notice", "message": "context is filling up" },
+        { "type": "text", "text": "ok" },
+        { "type": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn_with_capabilities(
+        ACP_INVALID_PARAMS_CONFIG,
+        Some(script),
+        serde_json::json!({"session": {"notices": {}}}),
+    );
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "hello");
+    let (updates, _response) = harness.collect_updates(&session_id, id);
+
+    let notices: Vec<&serde_json::Value> = updates
+        .iter()
+        .map(|value| &value["params"]["update"])
+        .filter(|update| update["sessionUpdate"] == "notice")
+        .collect();
+    assert_eq!(notices.len(), 1, "{updates:?}");
+    assert_eq!(notices[0]["severity"], "info");
+    assert_eq!(notices[0]["title"], "context is filling up");
+    assert!(
+        !updates.iter().any(|value| {
+            value["params"]["update"]["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("[meka]"))
+        }),
+        "the notice replaces the chunk rather than doubling it: {updates:?}"
     );
 }
 
@@ -3582,10 +3620,6 @@ enabled = ["read", "unrestricted"]
     );
 }
 
-// `acp_initialize_negotiates_unknown_protocol_version` was superseded by
-// `acp_initialize_clamps_far_future_version_to_latest` (below); stricter: asserts the clamp lands
-// on `ProtocolVersion::LATEST`, not just "some number".
-
 /// Two `session/new` calls succeed and produce independent session ids. Each session has its own
 /// conversation; prompts route to the right one via `session/update`'s `sessionId` field.
 #[test]
@@ -4222,14 +4256,29 @@ enabled = ["read"]
     assert_invalid_params(&disabled, "set_mode with disabled mode");
 }
 
-/// Tightens the existing protocol-version test: meka must clamp far-future versions to
-/// `ProtocolVersion::LATEST` (currently V1), not echo the requested value verbatim. A naive echo
-/// would let a future client think we support a version we haven't shipped.
+/// A version meka does not speak is answered with the latest it does: `0`, which no client sends,
+/// and one from the future, which arrives in the newer shape where the client names itself under
+/// `info`. The negotiation is the SDK's, and the number is what a client checks, so it is pinned
+/// here: when a stable V2 ships this test moves with it.
 #[test]
-fn acp_initialize_clamps_far_future_version_to_latest() {
+fn acp_initialize_answers_a_version_it_does_not_speak_with_the_latest() {
+    for params in [
+        serde_json::json!({ "protocolVersion": 0 }),
+        serde_json::json!({ "protocolVersion": 9999, "info": { "name": "future", "version": "0" } }),
+    ] {
+        let response = initialize_by_hand(params.clone());
+        assert_eq!(
+            response["result"]["protocolVersion"], 1,
+            "{params} must be answered with the latest version; got: {response}"
+        );
+    }
+}
+
+/// `initialize` with `params`, sent to a fresh `meka acp` outside the harness, which sends its own
+/// on spawn; the response, parsed.
+fn initialize_by_hand(params: serde_json::Value) -> serde_json::Value {
     let install = Install::new();
     install.write_config(ACP_INVALID_PARAMS_CONFIG);
-
     let mut child = install
         .meka(&["acp"])
         .stdin(Stdio::piped())
@@ -4247,22 +4296,17 @@ fn acp_initialize_clamps_far_future_version_to_latest() {
         while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
         buffer
     });
-
-    // Far-future version, well past anything the schema crate would ever produce. Must come back
-    // clamped to LATEST (V1).
-    let init_request = serde_json::json!({
+    let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
-        "params": { "protocolVersion": 9999 }
+        "params": params,
     });
-    writeln!(stdin, "{init_request}").expect("init");
+    writeln!(stdin, "{request}").expect("init");
     let lines = read_until(&mut reader, window(10), |line| line.contains("\"id\":1"));
-
     drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
-
     let line = lines
         .iter()
         .find(|line| line.contains("\"id\":1"))
@@ -4273,21 +4317,7 @@ fn acp_initialize_clamps_far_future_version_to_latest() {
                 lines.join(""),
             )
         });
-    let response: serde_json::Value = serde_json::from_str(line).expect("parse init");
-    let result = response["result"]
-        .as_object()
-        .unwrap_or_else(|| panic!("initialize must succeed, got: {response}"));
-    let negotiated = result
-        .get("protocolVersion")
-        .and_then(|v| v.as_u64())
-        .unwrap_or_else(|| panic!("missing numeric protocolVersion in: {response}"));
-    // Exactly LATEST, which is V1 today. A `<=` here let an agent that echoed 0, or ignored the
-    // field, pass a test named for clamping. When the SDK ships a stable V2 this line moves with
-    // it, which is the point: the negotiated version is a fact worth pinning.
-    assert_eq!(
-        negotiated, 1,
-        "a far-future protocolVersion must be clamped to LATEST (V1 today)"
-    );
+    serde_json::from_str(line).expect("parse init")
 }
 
 // === Mock-provider-driven coverage ==================================
@@ -5386,53 +5416,6 @@ enabled = ["read", "unrestricted"]
     assert_eq!(
         response["result"]["stopReason"], "cancelled",
         "cancel during request_permission must resolve as Cancelled: {response}",
-    );
-}
-
-/// `protocolVersion: 0` is the schema's parse-failure sentinel and is rejected with
-/// `InvalidParams`, not silently clamped.
-#[test]
-fn acp_initialize_rejects_protocol_version_zero() {
-    let install = Install::new();
-    install.write_config(ACP_INVALID_PARAMS_CONFIG);
-
-    let mut child = install
-        .meka(&["acp"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let stderr_pipe = child.stderr.take().expect("stderr");
-    let mut reader = support::TimedLines::spawn(stdout);
-    let _stderr_handle = std::thread::spawn(move || {
-        let mut buffer = String::new();
-        let mut stderr_reader = BufReader::new(stderr_pipe);
-        while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
-        buffer
-    });
-
-    writeln!(
-        stdin,
-        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":0}}}}"#,
-    )
-    .expect("init");
-    let lines = read_until(&mut reader, window(10), |line| line.contains("\"id\":1"));
-    drop(stdin);
-    let _ = child.kill();
-    let _ = child.wait();
-
-    let line = lines
-        .iter()
-        .find(|line| line.contains("\"id\":1"))
-        .expect("init response");
-    let response: serde_json::Value = serde_json::from_str(line).expect("parse");
-    assert_eq!(
-        response["error"]["code"].as_i64(),
-        Some(-32602),
-        "protocolVersion 0 must be rejected with InvalidParams; got: {response}",
     );
 }
 

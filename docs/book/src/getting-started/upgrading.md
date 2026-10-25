@@ -37,10 +37,10 @@ closes one that did not land. The one-shot JSON report lists the turn's compacti
 
 **An ACP client sees the compaction it asked to see.** One that advertised `session.compaction`
 gets `compaction_update`, `in_progress` then `completed` with the summary, in place of the
-`[meka]` chunk; one that did not still gets the chunk, now in the screen's words
-(`The agent compacted the conversation.` rather than `Compacted the conversation: 545 messages
-replaced by a summary (checkpoint, compaction 8)`). A client matching on the old sentence should
-match on `[meka]` alone or advertise the capability.
+`[meka]` chunk; one that did not gets the advisory, a `notice` if it advertised `session.notices`
+and the chunk otherwise, now in the screen's words (`The agent compacted the conversation.` rather
+than `Compacted the conversation: 545 messages replaced by a summary (checkpoint, compaction 8)`).
+A client matching on the old sentence should match on `[meka]` alone or advertise a capability.
 
 ## 0.82 to 0.83
 

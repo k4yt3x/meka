@@ -69,6 +69,16 @@ impl SharedClientState {
             .is_some_and(|session| session.compaction.is_some())
     }
 
+    /// Whether the client renders `notice`, which the protocol lets an agent send only once the
+    /// client advertised `session.notices`.
+    pub(super) fn renders_notices(&self) -> bool {
+        crate::sync::read(&self.inner)
+            .capabilities
+            .session
+            .as_ref()
+            .is_some_and(|session| session.notices.is_some())
+    }
+
     /// Whether the client renders agent-owned terminals from meka's `_meta` frames.
     ///
     /// Deliberately not the typed `terminal` capability: that one says the client implements
@@ -474,7 +484,9 @@ impl Frontend for AcpFrontend {
                 let fields = ToolCallUpdateFields::new().content(vec![text_content_block(summary)]);
                 SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(tool_call_id, fields))
             }
-            FrontendEvent::Notice(notice) => notice_update(&notice),
+            FrontendEvent::Notice(notice) => {
+                notice_update(&notice, self.client_state.renders_notices())
+            }
             // A client that advertised `session.compaction` renders a compaction entry of its own,
             // opened here and closed by the event that next names the id. The protocol lets an
             // agent send the update to no other client.
@@ -501,7 +513,10 @@ impl Frontend for AcpFrontend {
                 summary,
             } => {
                 if !self.client_state.renders_compactions() {
-                    notice_update(&crate::frontend::Notice::info(record.note()))
+                    notice_update(
+                        &crate::frontend::Notice::info(record.note()),
+                        self.client_state.renders_notices(),
+                    )
                 } else {
                     let facts = serde_json::json!(crate::view::CompactionView::new(
                         &record,
@@ -889,21 +904,35 @@ impl Frontend for AcpFrontend {
         }
     }
 }
-/// An advisory as an assistant-message chunk, since ACP has no primitive for one. The `[meka]`
-/// prefix (`[meka warn]` for a [`crate::frontend::NoticeLevel::Warn`]) is what lets an editor's
-/// transcript record the side-effect and a client filter or style by it.
+/// The update that says a notice: a `notice` for an advisory when the client renders one, else an
+/// assistant-message chunk. The chunk's `[meka]` prefix (`[meka warn]` for a
+/// [`crate::frontend::NoticeLevel::Warn`]) is what lets an editor's transcript record the
+/// side-effect and a client filter or style by it. A stage direction is a chunk whatever the
+/// client renders: it annotates a place in the reply, and a notice has no place.
 ///
 /// Deliberately not [`crate::conversation::HARNESS_NOTE`], despite the resemblance. That marker is
 /// longer because a *model* has to read it and should not have to recall what meka is; this one is
 /// read by a person looking at their own editor, where the product name needs no gloss, and by
 /// clients matching on the prefix, which a rename would break.
-pub(super) fn notice_update(notice: &crate::frontend::Notice) -> SessionUpdate {
+pub(super) fn notice_update(
+    notice: &crate::frontend::Notice,
+    client_renders_notices: bool,
+) -> SessionUpdate {
     // A stage direction lands between the reply it annotates and the reply that follows, in one
     // agent message the editor builds from chunks, so it has to bring its own paragraph breaks or
-    // the two replies read as one sentence with a note in the middle. An advisory is said the way
-    // it always was.
+    // the two replies read as one sentence with a note in the middle.
     let text = match notice.kind {
         crate::frontend::NoticeKind::StageDirection => format!("\n\n({})\n\n", notice.text),
+        crate::frontend::NoticeKind::Advisory if client_renders_notices => {
+            let severity = match notice.level {
+                crate::frontend::NoticeLevel::Info => NoticeSeverity::Info,
+                crate::frontend::NoticeLevel::Warn => NoticeSeverity::Warning,
+            };
+            return SessionUpdate::Notice(agent_client_protocol::schema::v1::Notice::new(
+                severity,
+                notice.text.clone(),
+            ));
+        }
         crate::frontend::NoticeKind::Advisory => {
             let prefix = match notice.level {
                 crate::frontend::NoticeLevel::Info => "[meka]",
