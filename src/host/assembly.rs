@@ -243,7 +243,10 @@ pub(crate) async fn build_shared_deps(
     // can do is fail the *process* before it exists. Otherwise a `ca_cert_file` that is not there
     // or a proxy URL that is not one surfaces on the first turn, per session, as whatever that host
     // reports a registry failure as, which on `serve` hands the operator's path to a remote caller.
-    crate::tools::build_web_client(&config.web_client)?;
+    crate::tools::build_web_client(
+        &config.web_client,
+        crate::tools::web::web_fetch_refuses_own_addresses(config.network),
+    )?;
 
     // Detection, not configuration: which backend this machine can run is probed once here, and
     // the startup warning about an unusable or improvable sandbox is given from the same answer.

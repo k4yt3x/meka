@@ -125,9 +125,11 @@ judged where it leads, as the open would be. `agent_spawn` judges every director
 the same way. A command under Landlock alone and under macOS can still tell a missing path from a
 denied one, as above.
 
-On Windows the shell cannot hold this boundary: neither token mechanism confines reads. The file
-tools keep it, a command does not, the agent is told so in its environment block, and startup logs
-one warning when `confine_reads` is on.
+On Windows the AppContainer backend holds this boundary for the shell as the file tools hold it:
+the readable paths become the environment's read-only grants, and beyond them a command reads only
+what Windows grants every AppContainer, the system directories. The restricted token cannot:
+neither token mechanism confines reads, so there the file tools keep it, a command does not, the
+agent is told so in its environment block, and startup warns once when `confine_reads` is on.
 
 If `[shell].sandbox = false`, `shell_execute` is refused at `workspace` rather than run
 unconfined. Nothing else would be holding the boundary, and half a boundary reported as a whole one
@@ -165,7 +167,8 @@ Four limits, stated plainly because none of them is visible from the inside:
 | Linux | Bubblewrap (preferred) | Yes: read-only root bind, plus a writable bind per workspace directory, with the Landlock ruleset inside where the kernel has one | Yes: an empty root with only the readable paths bound into it, read-only, the roots read-write; what is not bound is absent |
 | Linux | Landlock (fallback) | Yes: one path-beneath rule per workspace directory, or one per sibling where it contains meka's directories | Yes: read and execute rules on the readable paths instead of on `/`; names and sizes outside stay visible to `stat` |
 | macOS | `sandbox-exec` | Yes: writable subpath per workspace directory | Yes: data reads and executable mappings per readable path instead of everywhere; existence and metadata stay global so paths resolve |
-| Windows | `WRITE_RESTRICTED` token + an ACE per workspace directory | Yes: writes are permitted only where a workspace capability has an ACE | No: the file tools hold the boundary, a command reads anywhere, and startup warns once |
+| Windows | AppContainer (preferred) | Yes: a read-write grant per workspace directory in the environment, meka's directories denied | Yes: read-only grants on the readable paths instead of on every drive; a path outside is neither readable nor listable |
+| Windows | restricted token (fallback) | Yes: writes are permitted only where a workspace capability has an ACE | No: the file tools hold the boundary, a command reads anywhere, and the fallback warning says so |
 
 Under Bubblewrap, `/tmp`, `/run` and `/var/tmp` are masked with a tmpfs, so paths there are not
 merely unwritable but invisible. A workspace directory under `/tmp` is bound after the mask and stays
@@ -185,15 +188,19 @@ meka's own environment and an MCP server's credential included; the system-wide 
 rules only add access, so meka hides them there by never covering them: reading files is granted
 per sibling along the path to each, which keeps their names and sizes visible and their bytes
 not, and a workspace directory above them is split the same way, at the cost that a new file under
-such a directory can land only in one of its subdirectories. The Windows token cannot express the
-denial at all: under it a command at `read` can still read the config directory and the store,
-account credentials included, and a workspace directory containing them can write them; see
-[Shell](../tools/shell.md#macos-and-windows). Only `unrestricted` writes there on the other
+such a directory can land only in one of its subdirectories. The Windows AppContainer denies both
+directories outright, listing included, under a read-only grant above them and inside a workspace
+directory alike. The Windows restricted token cannot express the denial at all: under it a command
+at `read` can still read the config directory and the store, account credentials included, and a
+workspace directory containing them can write them; see
+[Shell](../tools/shell.md#windows-pick-a-backend). Only `unrestricted` writes there on the other
 backends.
 
-Windows works differently enough to be worth stating. meka mints a deterministic capability SID per
-workspace directory, adds an inheritable write ACE for it on that directory, and runs the shell under a
-`WRITE_RESTRICTED` token carrying that capability. Three consequences:
+The Windows restricted token works differently enough to be worth stating; none of this applies
+under the AppContainer backend, where the environment grants the workspace directories and nothing
+is written to your ACLs. meka mints a deterministic capability SID per workspace directory, adds an
+inheritable write ACE for it on that directory, and runs the shell under a `WRITE_RESTRICTED` token
+carrying that capability. Three consequences:
 
 - **It writes to your directory's ACL.** The grant is real, standing state, visible in `icacls` as
   an `S-1-4-…` entry. meka takes it back when the process exits, including on Ctrl+C, and logs how
@@ -251,9 +258,11 @@ workspace directory, adds an inheritable write ACE for it on that directory, and
   UTF-8 output preamble is skipped rather than run there, so non-ASCII output at `workspace` is
   decoded with the host's legacy code page and may be mangled.
 
-The mechanism is a port of a community proof-of-concept rather than a vendor-supported sandboxing
-API, unlike Landlock, Bubblewrap and Seatbelt. It is the tightest boundary Windows offers without
-provisioning machine-level identities, which would need an Administrator setup step.
+The restricted token is a port of a community proof-of-concept rather than a vendor-supported
+sandboxing API, unlike Landlock, Bubblewrap and Seatbelt. It is the tightest boundary a Windows
+build without the process security environment API offers short of provisioning machine-level
+identities, which would need an Administrator setup step; a build with the API gets the
+AppContainer backend, which is the OS's own.
 
 ## Default permission
 
@@ -483,10 +492,10 @@ Commands like `ls`, `cat`, `git log`, `df`, `ps`, and `uname` work normally. Com
 
 Two things the sandbox deliberately does **not** restrict, on every backend:
 
-- **Reads**, on a root session unless [`[permissions].confine_reads`](#the-read-boundary) is on. A sandboxed command can otherwise read anything your user can, including `~/.ssh` and `~/.aws/credentials`, and on Windows meka's own store. `read` protects the machine from being *changed*, not from being *read*. A sub-agent's reads are confined to its scope whatever the switch says.
-- **The network**, unless [`[permissions].network = "none"`](../configuration/config-file.md#permissions) cuts it off, which Bubblewrap, Landlock and `sandbox-exec` hold and Windows cannot. Open, a command at `read` can still send what it read. Provider API keys are scrubbed from the child's environment, but that is one vector, not a boundary.
+- **Reads**, on a root session unless [`[permissions].confine_reads`](#the-read-boundary) is on. A sandboxed command can otherwise read anything your user can, including `~/.ssh` and `~/.aws/credentials`, and on Windows under the restricted token meka's own store. `read` protects the machine from being *changed*, not from being *read*. A sub-agent's reads are confined to its scope whatever the switch says.
+- **The network**, unless [`[permissions].network`](../configuration/config-file.md#permissions) narrows it: `none` cuts a command off, which Bubblewrap, Landlock, `sandbox-exec` and the Windows AppContainer hold and the Windows restricted token cannot; `remote` keeps it off this machine alone, which the AppContainer holds and the others hold as `none`, cutting the command off whole. Open, a command at `read` can still send what it read. Provider API keys are scrubbed from the child's environment, but that is one vector, not a boundary.
 
-On Windows, `workspace` extends that first point to meka's own process. Its `WRITE_RESTRICTED` token restricts writes only, and unlike `read` it deliberately leaves the integrity label at the parent's level, so a confined command can open meka with `PROCESS_VM_READ` and read its memory. Measured on Windows 11: `OpenProcess` succeeds and `ReadProcessMemory` returns data. This is the one respect in which `workspace` confines less than `read`, whose Low-integrity token Windows blocks from opening a medium-integrity process at all. It grants nothing that reading `meka.db` would not, which a command at either level can already do, but it is worth knowing if you were treating `workspace` as strictly wider than `read` in every direction. They are not ordered that way; see the ladder note above.
+On Windows under the restricted token, `workspace` extends that first point to meka's own process. Its `WRITE_RESTRICTED` token restricts writes only, and unlike `read` it deliberately leaves the integrity label at the parent's level, so a confined command can open meka with `PROCESS_VM_READ` and read its memory. Measured on Windows 11: `OpenProcess` succeeds and `ReadProcessMemory` returns data. This is the one respect in which `workspace` confines less than `read`, whose Low-integrity token Windows blocks from opening a medium-integrity process at all. It grants nothing that reading `meka.db` would not, which a command at either level can already do, but it is worth knowing if you were treating `workspace` as strictly wider than `read` in every direction. They are not ordered that way; see the ladder note above.
 
 If no sandbox backend is usable, shell commands at `read` **fail** rather than running unconfined. On Linux that means Bubblewrap (preferred whenever `bwrap` is installed) or Landlock at ABI v9 or newer. Landlock below v9 cannot refuse a `connect()` to a Unix socket on disk, so a "read-only" command could still reach D-Bus and `systemd-run --user` and have them act on its behalf, and meka refuses it rather than promise a protection the kernel is not enforcing. Kernels below 7.1 therefore need `bwrap` installed for the shell at `read`; `meka` says so at startup.
 
@@ -522,7 +531,7 @@ For a server you have not audited, either pin its tools explicitly with [`tool_p
 
 So the honest statement of `read`'s filesystem guarantee is: your tree is safe from meka's built-in tools, plus whichever MCP servers you have chosen to trust.
 
-> **Note:** The read-only sandbox uses Bubblewrap or Landlock (ABI v9+, kernel 7.1+) on Linux, `sandbox-exec` on macOS, and a Low-integrity token on Windows. See [Shell](../tools/shell.md#read-only-sandbox) for what each backend covers. Where no backend is usable, shell commands are not available at `read` or `workspace`. You can disable sandboxed shell execution by setting `sandbox = false` under `[shell]` in the config file (see [Config file](../configuration/config-file.md)), which makes `shell_execute` require `unrestricted` instead.
+> **Note:** The read-only sandbox uses Bubblewrap or Landlock (ABI v9+, kernel 7.1+) on Linux, `sandbox-exec` on macOS, and an AppContainer or a restricted token on Windows. See [Shell](../tools/shell.md#read-only-sandbox) for what each backend covers. Where no backend is usable, shell commands are not available at `read` or `workspace`. You can disable sandboxed shell execution by setting `sandbox = false` under `[shell]` in the config file (see [Config file](../configuration/config-file.md)), which makes `shell_execute` require `unrestricted` instead.
 
 ### Workspace
 

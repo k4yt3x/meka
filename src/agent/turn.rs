@@ -957,6 +957,8 @@ impl Agent {
             roots: &roots,
             readable: readable.as_deref(),
             network: self.cells.network,
+            shell_network: self.shell_network,
+            shell_confines_reads: self.shell_confines_reads,
             world_state,
             budget,
             turn_retention: self.options.turn_retention,

@@ -332,11 +332,11 @@ pub(crate) fn agent_spawn_definition(profile_choices: &[String]) -> ToolDefiniti
             },
             "network": {
                 "type": "string",
-                "enum": ["host", "none"],
+                "enum": crate::config::Network::ALL.map(crate::config::Network::name),
                 "description": "What the sub-agent's shell and `web_fetch` may reach. Defaults \
-                                to your own; `none` narrows it and needs a sandboxed level. An \
-                                MCP server keeps its own network: withhold it with \
-                                `allow_servers` or `deny_servers`."
+                                to your own; `remote` (other machines, not this one) and `none` \
+                                narrow it and need a sandboxed level. An MCP server keeps its \
+                                own network: withhold it with `allow_servers` or `deny_servers`."
             },
             "working_directory": {
                 "type": "string",
@@ -766,7 +766,14 @@ impl Tool for AgentSpawnTool {
             .as_ref()
             .map(|scope| scope.additional_workspace_directories.clone())
             .unwrap_or_default();
-        let scope_lines = scope_report(&workspace, sub_perm);
+        let scope_lines = scope_report(
+            &workspace,
+            sub_perm,
+            crate::sandbox::held_network(
+                &self.tool_builder_params.materials.core.sandbox_capability,
+                workspace.network,
+            ),
+        );
 
         let spec = SubagentSpec {
             permission: sub_perm,
@@ -1610,7 +1617,14 @@ impl Tool for AgentFollowupTool {
                 worker_workspace(cells, Some(&accepted), cwd, network)
             }
         };
-        let scope_lines = scope_report(&workspace, effective_permission);
+        let scope_lines = scope_report(
+            &workspace,
+            effective_permission,
+            crate::sandbox::held_network(
+                &self.tool_builder_params.materials.core.sandbox_capability,
+                workspace.network,
+            ),
+        );
 
         // `!=`, not `<`. The derived `Ord` is display order, which the enum doc says must not
         // decide authority. `greatest_within_both` never resolves above the recorded rung, so any
@@ -1935,8 +1949,12 @@ fn worker_workspace(
 
 /// The scope a worker holds, as its parent reads it in the spawn and follow-up result: its level
 /// and the environment block's own scope lines, so the parent reads the worker's scope in the
-/// words it reads its own.
-fn scope_report(workspace: &WorkerWorkspace, level: Permission) -> String {
+/// words it reads its own. `shell_network` is what the worker's shell holds for its setting.
+fn scope_report(
+    workspace: &WorkerWorkspace,
+    level: Permission,
+    shell_network: crate::config::Network,
+) -> String {
     let cwd = workspace.cwd.get();
     let roots = workspace.roots.get();
     let readable = crate::workspace::additional_readable_directories(
@@ -1954,6 +1972,7 @@ fn scope_report(workspace: &WorkerWorkspace, level: Permission) -> String {
             roots: &roots,
             readable: readable.as_deref(),
             network: workspace.network,
+            shell_network,
         })
     )
 }
@@ -2304,10 +2323,10 @@ fn parse_subagent_permission(requested: Option<&str>) -> Result<Option<Permissio
 }
 
 /// What a sub-agent's shell and `web_fetch` may reach: the parent's setting when the call names
-/// none, which at `unrestricted` is what the parent itself holds, `web_fetch` withheld and a
-/// shell nothing sandboxes; `none` when it asks for it; and a refusal for `host` under a parent at
-/// `none`, since a worker never reaches wider than its parent, and for asking `none` beside
-/// `unrestricted`, which would state a cut the shell cannot hold.
+/// none, which at `unrestricted` is what the parent itself holds, `web_fetch` cut and a shell
+/// nothing sandboxes; the named setting when it lies within the parent's; and a refusal for one
+/// above the parent's, since a worker never reaches wider than its parent, and for a cut beside
+/// `unrestricted`, which would state one the shell cannot hold.
 fn resolve_subagent_network(
     requested: Option<&str>,
     parent: crate::config::Network,
@@ -2323,17 +2342,24 @@ fn resolve_subagent_network(
     let requested: crate::config::Network = requested
         .parse()
         .map_err(|error: String| refuse(format!("`network`: {error}")))?;
-    if requested == crate::config::Network::Host && parent == crate::config::Network::None {
-        return Err(refuse(
-            "`network: \"host\"` is above your own `none`; name `none` or leave it out".to_string(),
-        ));
+    if requested.narrowest(parent) != requested {
+        let within: Vec<String> = crate::config::Network::LADDER
+            .iter()
+            .skip_while(|value| **value != parent)
+            .map(|value| format!("`{value}`"))
+            .collect();
+        let separator = if within.len() > 1 { "," } else { "" };
+        return Err(refuse(format!(
+            "`network: \"{requested}\"` is above your own `{parent}`; name {}{separator} or leave \
+             it out",
+            within.join(" or ")
+        )));
     }
-    if requested == crate::config::Network::None && level == Permission::Unrestricted {
-        return Err(refuse(
-            "`network: \"none\"` cannot hold at `unrestricted`, whose shell is not sandboxed; \
-             name a lower level"
-                .to_string(),
-        ));
+    if requested != crate::config::Network::Host && level == Permission::Unrestricted {
+        return Err(refuse(format!(
+            "`network: \"{requested}\"` cannot hold at `unrestricted`, whose shell is not \
+             sandboxed; name a lower level"
+        )));
     }
     Ok(requested)
 }
@@ -8535,11 +8561,67 @@ mod tests {
         assert!(!tools_sent(&provider).iter().any(|name| name == "web_fetch"));
     }
 
-    /// The schema offers `network` with its two spellings.
+    /// A worker's network is an ordering check on the ladder: anything at or below the parent's
+    /// setting is admitted, anything above it is refused naming what would have been, and any cut
+    /// beside `unrestricted` is refused since nothing sandboxes the shell there.
+    #[test]
+    fn a_worker_s_network_is_admitted_at_or_below_its_parent_s() {
+        use crate::config::Network;
+        let resolve = |requested: Option<&str>, parent, level| {
+            resolve_subagent_network(requested, parent, level).map_err(|error| error.to_string())
+        };
+        // Admitted pairs spelled out, so the test does not borrow the ordering it checks.
+        let admitted = |requested, parent| {
+            matches!(
+                (requested, parent),
+                (_, Network::Host)
+                    | (Network::Remote | Network::None, Network::Remote)
+                    | (Network::None, Network::None)
+            )
+        };
+        for parent in Network::ALL {
+            assert_eq!(resolve(None, parent, Permission::Unrestricted), Ok(parent));
+            for requested in Network::ALL {
+                let outcome = resolve(Some(requested.name()), parent, Permission::Workspace);
+                if admitted(requested, parent) {
+                    assert_eq!(outcome, Ok(requested), "{requested} under {parent}");
+                } else {
+                    let refusal = outcome.expect_err("wider than the parent");
+                    assert!(
+                        refusal.contains(&format!("is above your own `{parent}`"))
+                            && refusal.contains(&format!("name `{parent}`")),
+                        "{requested} under {parent}: {refusal}"
+                    );
+                }
+            }
+        }
+        assert!(
+            resolve(Some("host"), Network::Remote, Permission::Workspace)
+                .expect_err("wider")
+                .contains("name `remote` or `none`, or leave it out")
+        );
+        for requested in ["remote", "none"] {
+            let refusal = resolve(Some(requested), Network::Host, Permission::Unrestricted)
+                .expect_err("a cut beside `unrestricted`");
+            assert!(
+                refusal.contains("cannot hold at `unrestricted`"),
+                "{refusal}"
+            );
+        }
+        assert_eq!(
+            resolve(Some("host"), Network::Host, Permission::Unrestricted),
+            Ok(Network::Host)
+        );
+    }
+
+    /// The schema offers `network` with its three spellings.
     #[test]
     fn the_schema_offers_the_network_setting() {
         let property = &agent_spawn_definition(&[]).parameters["properties"]["network"];
-        assert_eq!(property["enum"], serde_json::json!(["host", "none"]));
+        assert_eq!(
+            property["enum"],
+            serde_json::json!(["host", "none", "remote"])
+        );
         assert!(
             property["description"]
                 .as_str()

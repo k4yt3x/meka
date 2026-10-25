@@ -414,11 +414,13 @@ pub(crate) fn run_confined(
     }
     std::os::unix::process::CommandExt::exec(std::process::Command::new(program).args(arguments))
 }
-/// The network rights the ruleset handles: every TCP bind and connect on `none` from ABI v4, the
-/// first with network rights, and granted to no port, which is what refuses them all. UDP has no
-/// Landlock right on any ABI and stays open, as the docs say. Nothing on `host`.
+/// The network rights the ruleset handles: every TCP bind and connect from ABI v4, the first with
+/// network rights, on anything but `host`, and granted to no port, which is what refuses them all.
+/// UDP has no Landlock right on any ABI and stays open, as the docs say. Nothing on `host`. Judged
+/// against `host` rather than `none` so a setting the ruleset cannot express, `remote`, fails
+/// closed here whatever the caller passed.
 pub(super) fn handled_network_for_abi(abi_version: i32, network: crate::config::Network) -> u64 {
-    if network == crate::config::Network::None && abi_version >= 4 {
+    if network != crate::config::Network::Host && abi_version >= 4 {
         LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
     } else {
         0
@@ -950,6 +952,11 @@ mod tests {
         assert_eq!(
             super::handled_network_for_abi(9, crate::config::Network::Host),
             0
+        );
+        assert_eq!(
+            super::handled_network_for_abi(9, crate::config::Network::Remote),
+            both,
+            "`remote` is refused whole rather than let through as `host`"
         );
     }
 

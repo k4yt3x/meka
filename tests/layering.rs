@@ -724,10 +724,15 @@ fn production_code_starts_a_process_only_where_the_ledger_says() {
 }
 
 /// Whether `code` builds a command or creates a process: a `Command::new(` that is not the tail
-/// of a longer name (`AvailableCommand::new(` is ACP's), a `CreateProcess` call, or the `open`
+/// of a longer name (`AvailableCommand::new(` is ACP's), a `CreateProcess` call that is not the
+/// `CreateProcessSecurityEnvironment` export (an environment, not a process), or the `open`
 /// crate's `open::that(`, which starts the platform's opener.
 fn starts_a_process(code: &str) -> bool {
-    if code.contains("CreateProcess") || code.contains("open::that(") {
+    if code.contains("open::that(")
+        || code
+            .match_indices("CreateProcess")
+            .any(|(at, _)| !code[at..].starts_with("CreateProcessSecurityEnvironment"))
+    {
         return true;
     }
     code.match_indices("Command::new(").any(|(at, _)| {
@@ -807,6 +812,9 @@ fn a_longer_name_ending_in_command_is_not_a_process_start() {
     ));
     assert!(starts_a_process("let mut command = Command::new(program);"));
     assert!(starts_a_process("CreateProcessAsUserW(token, ..)"));
+    assert!(!starts_a_process(
+        "export(c\"CreateProcessSecurityEnvironment\")?"
+    ));
     assert!(starts_a_process("open::that(&question.url)"));
     assert!(!starts_a_process(
         "AvailableCommand::new(command.name, command.help)"

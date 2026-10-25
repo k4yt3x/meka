@@ -453,8 +453,8 @@ impl ReadFence {
 /// which Bubblewrap mounts on its own and Landlock alone has to be told about. The macOS list is
 /// Codex's `:minimal` seatbelt defaults widened to the two package prefixes whole and to Apple's
 /// developer tools, since nearly every command a developer runs comes from one of them and the
-/// boundary exists to stop reads of the user's data, not the system's programs. Windows confines
-/// no command's reads, so it lists nothing: the file tools are fenced by the roots alone there.
+/// boundary exists to stop reads of the user's data, not the system's programs. On Windows the
+/// list is [`system_read_paths`]'s four directories, which the environment locates.
 #[cfg(target_os = "linux")]
 pub(crate) const SYSTEM_READ_PATHS: &[&str] = &[
     "/bin",
@@ -488,6 +488,48 @@ pub(crate) const SYSTEM_READ_PATHS: &[&str] = &[
 ];
 #[cfg(windows)]
 pub(crate) const SYSTEM_READ_PATHS: &[&str] = &[];
+
+/// The environment variables that locate the Windows system directories: the Windows directory,
+/// the two Program Files trees and ProgramData, which is what Codex's mxc-based sandbox reads too.
+/// Located by the environment rather than spelled out, since a system may keep them off `C:`.
+#[cfg(any(windows, test))]
+const WINDOWS_SYSTEM_DIRECTORY_VARIABLES: [&str; 4] = [
+    "SystemRoot",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramData",
+];
+
+/// [`SYSTEM_READ_PATHS`] as paths, plus on Windows the directories the environment locates, so
+/// one call answers on every platform.
+pub(crate) fn system_read_paths() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    let located = windows_system_directories_from(|name| std::env::var_os(name));
+    #[cfg(not(windows))]
+    let located: Vec<PathBuf> = Vec::new();
+    SYSTEM_READ_PATHS
+        .iter()
+        .map(PathBuf::from)
+        .chain(located)
+        .collect()
+}
+
+/// The Windows system directories as `lookup` locates them, each once and only where set.
+#[cfg(any(windows, test))]
+fn windows_system_directories_from(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for name in WINDOWS_SYSTEM_DIRECTORY_VARIABLES {
+        if let Some(value) = lookup(name).filter(|value| !value.is_empty()) {
+            let path = PathBuf::from(value);
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
 
 /// Where macOS records the active developer directory: a symlink `xcode-select` maintains,
 /// pointing at the Command Line Tools or at an Xcode's `Contents/Developer`. The developer
@@ -584,8 +626,8 @@ impl ReadBoundary {
                 }
             }
         };
-        for path in SYSTEM_READ_PATHS {
-            take(PathBuf::from(path), None, false);
+        for path in system_read_paths() {
+            take(path, None, false);
         }
         #[cfg(target_os = "macos")]
         if let Ok(target) = std::fs::canonicalize(DEVELOPER_DIRECTORY_LINK) {
@@ -1684,6 +1726,27 @@ pub(crate) fn roots_for_test() -> SharedRoots {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Windows system directories come from the environment, each once and only where set:
+    /// a system that keeps Program Files off `C:` is read where it is, and an unset or empty
+    /// variable names nothing rather than an empty path.
+    #[test]
+    fn the_windows_system_directories_follow_the_environment() {
+        let lookup = |name: &str| -> Option<std::ffi::OsString> {
+            match name {
+                "SystemRoot" => Some("D:\\Windows".into()),
+                "ProgramFiles" | "ProgramFiles(x86)" => Some("C:\\Program Files".into()),
+                "ProgramData" => Some("".into()),
+                _ => None,
+            }
+        };
+        let paths: Vec<String> = windows_system_directories_from(lookup)
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths, ["D:\\Windows", "C:\\Program Files"]);
+        assert!(windows_system_directories_from(|_| None).is_empty());
+    }
 
     /// A holder that panics poisons the lock; the next reader still gets the value, because the
     /// alternative is every later tool call failing for a bug that already reported itself.
@@ -3141,12 +3204,16 @@ mod tests {
             "a masked directory is dropped, or the bind would hand its sockets back: {:?}",
             boundary.base
         );
-        for path in SYSTEM_READ_PATHS {
-            let path = Path::new(path);
+        let system = system_read_paths();
+        assert!(
+            !system.is_empty(),
+            "every platform locates some system directory"
+        );
+        for path in &system {
             // Both spellings of an existing path: the name a bind mount wants and the target a
             // rule wants.
             assert_eq!(
-                boundary.base.contains(&path.to_path_buf()),
+                boundary.base.contains(path),
                 path.exists(),
                 "{}",
                 path.display()

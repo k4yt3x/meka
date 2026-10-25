@@ -337,9 +337,9 @@ pub(crate) struct PermissionsConfig {
     /// command needs to run, the way writes are confined to the roots at `workspace`. Off unless
     /// set: a boundary on reads is the stronger promise, and one the user states.
     pub(crate) confine_reads: Option<bool>,
-    /// What a confined command and `web_fetch` may reach: `"host"`, the default, or `"none"`. A
-    /// boundary like `confine_reads`, reaching the in-process tool and the sandboxed shell alike,
-    /// which is why it is not a `[shell]` key.
+    /// What a confined command and `web_fetch` may reach: `"host"`, the default, `"remote"` or
+    /// `"none"`. A boundary like `confine_reads`, reaching the in-process tool and the sandboxed
+    /// shell alike, which is why it is not a `[shell]` key.
     pub(crate) network: Option<Network>,
 }
 
@@ -892,9 +892,9 @@ const DEFAULT_SUBAGENT_MAX_DEPTH: usize = 3;
 #[serde(deny_unknown_fields)]
 pub(crate) struct ShellConfig {
     pub(crate) sandbox: Option<bool>,
-    /// Linux-only choice between `"landlock"` and `"bubblewrap"`. When omitted, the resolver
-    /// auto-picks bubblewrap if available and falls back to landlock with a one-shot warning (see
-    /// `src/sandbox.rs` and `Warn 2` in `warn_if_sandbox_issues`).
+    /// One of this platform's values in [`SandboxBackend::ON_THIS_PLATFORM`]. When omitted, the
+    /// resolver auto-picks the strongest usable backend and falls back to the weaker one with a
+    /// one-shot warning (see `Warn 2` in `warn_if_sandbox_issues`).
     pub(crate) sandbox_backend: Option<SandboxBackend>,
     /// Directories every confined command may read beyond the system directories, when
     /// `[permissions].confine_reads` is on: where this machine keeps system software that the
@@ -902,8 +902,11 @@ pub(crate) struct ShellConfig {
     pub(crate) additional_readable_directories: Option<Vec<PathBuf>>,
 }
 
-/// Linux sandbox backend. Silently ignored on macOS and Windows (sandbox-exec and Low-integrity
-/// respectively are the only options on those platforms). The absence of a default impl is
+/// The mechanism a confined command runs under. Three values are Linux's and two are Windows's;
+/// macOS has one backend, `sandbox-exec`, and takes no value. Every value parses on every platform,
+/// so a `config.toml` shared across machines loads everywhere, and one from another platform is
+/// refused where it would be used: the probe reports it unsupported, the shell at `read` fails and
+/// the startup warning names the values this platform takes. The absence of a default impl is
 /// intentional: an unset value is meaningful and triggers auto-resolution in
 /// [`ResolvedConfig::resolve`].
 ///
@@ -914,35 +917,59 @@ pub(crate) struct ShellConfig {
 /// `bubblewrap-landlock` is Bubblewrap with the Landlock layer inside required rather than added
 /// where the kernel allows: a pin for a host where the strongest boundary must be certain, which
 /// fails closed on a kernel that cannot supply the layer. Auto-resolution never picks it.
+/// `appcontainer` is the process security environment the OS enforces, `restricted-token` the
+/// token meka derives from its own; auto-resolution prefers the former where the API exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub(crate) enum SandboxBackend {
-    Landlock,
+    AppContainer,
     Bubblewrap,
     BubblewrapLandlock,
+    Landlock,
+    RestrictedToken,
 }
 
 impl SandboxBackend {
     /// Every backend, in the order the names sort.
-    pub(crate) const ALL: [SandboxBackend; 3] =
-        [Self::Bubblewrap, Self::BubblewrapLandlock, Self::Landlock];
+    pub(crate) const ALL: [SandboxBackend; 5] = [
+        Self::AppContainer,
+        Self::Bubblewrap,
+        Self::BubblewrapLandlock,
+        Self::Landlock,
+        Self::RestrictedToken,
+    ];
+    /// The values this platform's probe takes, in the order the names sort: what the refusal of
+    /// any other value, the flag's help and the reference page name. The probe's own match is the
+    /// authority, and a test holds the two in step.
+    pub(crate) const ON_THIS_PLATFORM: &'static [SandboxBackend] = if cfg!(target_os = "linux") {
+        &[Self::Bubblewrap, Self::BubblewrapLandlock, Self::Landlock]
+    } else if cfg!(windows) {
+        &[Self::AppContainer, Self::RestrictedToken]
+    } else {
+        &[]
+    };
 
     /// The one spelling `[shell].sandbox_backend`, `--sandbox-backend` and `MEKA_SANDBOX_BACKEND`
     /// take.
     pub(crate) const fn name(self) -> &'static str {
         match self {
-            Self::Landlock => "landlock",
+            Self::AppContainer => "appcontainer",
             Self::Bubblewrap => "bubblewrap",
             Self::BubblewrapLandlock => "bubblewrap-landlock",
+            Self::Landlock => "landlock",
+            Self::RestrictedToken => "restricted-token",
         }
     }
 
     /// Brand-cased name for user-facing prose (logs, errors). Also the `Display` impl's output.
+    /// The restricted token is a mechanism rather than a product, so its name stays lowercase.
     pub(crate) const fn display_name(self) -> &'static str {
         match self {
-            Self::Landlock => "Landlock",
+            Self::AppContainer => "AppContainer",
             Self::Bubblewrap => "Bubblewrap",
             Self::BubblewrapLandlock => "Bubblewrap with Landlock",
+            Self::Landlock => "Landlock",
+            Self::RestrictedToken => "restricted token",
         }
     }
 
@@ -995,29 +1022,37 @@ impl From<SandboxBackend> for String {
 }
 
 /// What a confined command and the in-process web tool may reach on the network, as
-/// `[permissions].network` and `agent_spawn`'s `network` spell it: the host's network, or none.
+/// `[permissions].network` and `agent_spawn`'s `network` spell it: the host's network, other
+/// machines alone (`remote`), or none.
 ///
-/// `none` is held by the backends that can hold it, Bubblewrap, Landlock and `sandbox-exec`, and
-/// by meka itself for `web_fetch`, which runs in the meka process where no sandbox reaches and is
-/// withheld. Windows has no mechanism for a command and says so at startup. An MCP server is a
-/// separate process outside the sandbox, so the setting never reaches it: a worker that must not
-/// reach the network is also given no server that can.
+/// meka itself holds every value for `web_fetch`, which runs in the meka process where no sandbox
+/// reaches: withheld under `none`, and under `remote` refusing this machine's own addresses. A
+/// command holds what its backend can: `none` under Bubblewrap, Landlock and `sandbox-exec`, and a
+/// value a backend cannot hold as such runs as the next narrower one it can, which the startup
+/// warning says (`sandbox::held_network`). An MCP server is a separate process outside the sandbox,
+/// so the setting never reaches it: a worker that must not reach the network is also given no
+/// server that can.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub(crate) enum Network {
     Host,
     None,
+    Remote,
 }
 
 impl Network {
     /// Every setting, in the order the names sort.
-    pub(crate) const ALL: [Network; 2] = [Self::Host, Self::None];
+    pub(crate) const ALL: [Network; 3] = [Self::Host, Self::None, Self::Remote];
+    /// Every setting from the widest to the narrowest: the one order [`Self::narrowest`] and a
+    /// sub-agent's refusal of a wider ask go by.
+    pub(crate) const LADDER: [Network; 3] = [Self::Host, Self::Remote, Self::None];
 
     /// The one spelling `[permissions].network` and `agent_spawn`'s `network` take.
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Host => "host",
             Self::None => "none",
+            Self::Remote => "remote",
         }
     }
 
@@ -1026,13 +1061,21 @@ impl Network {
         Self::None
     }
 
-    /// The narrower of two settings, which is `none` under either: what a sub-agent holds under
-    /// its parent, and what a replayed spec holds under the parent's setting now.
+    /// How far down [`Self::LADDER`] a setting sits.
+    fn rung(self) -> usize {
+        Self::LADDER
+            .iter()
+            .position(|value| *value == self)
+            .unwrap_or(Self::LADDER.len())
+    }
+
+    /// The narrower of two settings: what a sub-agent holds under its parent, and what a replayed
+    /// spec holds under the parent's setting now.
     pub(crate) fn narrowest(self, other: Network) -> Network {
-        if self == Self::None || other == Self::None {
-            Self::None
+        if self.rung() >= other.rung() {
+            self
         } else {
-            Self::Host
+            other
         }
     }
 
@@ -1734,9 +1777,9 @@ pub(crate) struct ResolvedConfig {
     /// Resolved `[shell].additional_readable_directories`, as written: canonicalized where they
     /// are used.
     pub(crate) shell_additional_readable_directories: Vec<PathBuf>,
-    /// `[shell].sandbox_backend` (or its flag and variable), before any auto-pick. Linux-only;
-    /// the host resolves and probes it at startup ([`crate::sandbox::resolve_backend`]) because
-    /// the pick depends on what the machine has.
+    /// `[shell].sandbox_backend` (or its flag and variable), before any auto-pick. The host
+    /// resolves and probes it at startup ([`crate::sandbox::resolve_backend`]) because the pick
+    /// depends on what the machine has.
     pub(crate) sandbox_backend: Option<SandboxBackend>,
     /// Resolved `[session].retention`. `None`, the default, disables the session sweep.
     pub(crate) retention: Option<std::time::Duration>,
@@ -2379,8 +2422,7 @@ fn parse_mcp_tool_timeout(value: &str) -> Option<std::time::Duration> {
 /// `MEKA_SANDBOX_BACKEND` overrides `[shell].sandbox_backend` for non-interactive / containerized
 /// runs (the `mekabox` wrapper sets it to pin Landlock and silence the auto-resolve warning when
 /// it mounts the host config read-only). Takes the one spelling the file takes; an unrecognized
-/// value is warned about and ignored. Like the config field, this only affects the resolved
-/// backend on Linux.
+/// value is warned about and ignored.
 fn sandbox_backend_override() -> Option<SandboxBackend> {
     parse_sandbox_backend_override(&std::env::var("MEKA_SANDBOX_BACKEND").ok()?)
 }
@@ -5892,8 +5934,16 @@ thinking = "budgeted"
             "one spelling per backend"
         );
         assert_eq!(
+            "restricted-token".parse::<SandboxBackend>(),
+            Ok(SandboxBackend::RestrictedToken)
+        );
+        assert_eq!(
+            "appcontainer".parse::<SandboxBackend>(),
+            Ok(SandboxBackend::AppContainer)
+        );
+        assert_eq!(
             SandboxBackend::supported(),
-            "bubblewrap, bubblewrap-landlock, landlock",
+            "appcontainer, bubblewrap, bubblewrap-landlock, landlock, restricted-token",
             "the refusal lists every spelling, sorted"
         );
         // Unlike the env path, the CLI parse surfaces an error for a bad value.
@@ -6287,13 +6337,21 @@ refuse_private_destinations = true
             .expect_err("an unknown setting is refused")
             .to_string();
         assert!(
-            error.contains("'wifi' is not a network setting") && error.contains("host, none"),
+            error.contains("'wifi' is not a network setting")
+                && error.contains("host, none, remote"),
             "{error}"
         );
         assert_eq!(Network::Host.narrowest(Network::Host), Network::Host);
         assert_eq!(Network::Host.narrowest(Network::None), Network::None);
         assert_eq!(Network::None.narrowest(Network::Host), Network::None);
         assert_eq!(Network::None.narrowest(Network::None), Network::None);
+        // `remote` sits between the two: narrower than `host`, wider than `none`, either way
+        // round.
+        assert_eq!(Network::Host.narrowest(Network::Remote), Network::Remote);
+        assert_eq!(Network::Remote.narrowest(Network::Host), Network::Remote);
+        assert_eq!(Network::Remote.narrowest(Network::None), Network::None);
+        assert_eq!(Network::None.narrowest(Network::Remote), Network::None);
+        assert_eq!(Network::Remote.narrowest(Network::Remote), Network::Remote);
     }
 
     /// `sandbox_backend = "bubblewrap"` and `"landlock"` deserialize cleanly. Any other value,
@@ -6319,15 +6377,14 @@ refuse_private_destinations = true
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_sandbox_backend_explicit_value_is_binding() {
-        let (backend, auto_resolved, _probe) =
-            resolve_sandbox_backend(Some(SandboxBackend::Landlock));
-        assert_eq!(backend, SandboxBackend::Landlock);
-        assert!(!auto_resolved);
+        let resolution = resolve_sandbox_backend(Some(SandboxBackend::Landlock));
+        assert_eq!(resolution.backend, SandboxBackend::Landlock);
+        assert!(!resolution.auto_resolved);
+        assert!(resolution.fallback_from.is_none());
 
-        let (backend, auto_resolved, _probe) =
-            resolve_sandbox_backend(Some(SandboxBackend::Bubblewrap));
-        assert_eq!(backend, SandboxBackend::Bubblewrap);
-        assert!(!auto_resolved);
+        let resolution = resolve_sandbox_backend(Some(SandboxBackend::Bubblewrap));
+        assert_eq!(resolution.backend, SandboxBackend::Bubblewrap);
+        assert!(!resolution.auto_resolved);
     }
 
     /// When the user has not pinned a backend, resolve_sandbox_backend must surface `auto_resolved
@@ -6337,31 +6394,28 @@ refuse_private_destinations = true
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_sandbox_backend_auto_resolves_when_unset() {
-        let (backend, auto_resolved, _probe) = resolve_sandbox_backend(None);
-        assert!(auto_resolved);
+        let resolution = resolve_sandbox_backend(None);
+        assert!(resolution.auto_resolved);
         assert!(matches!(
-            backend,
+            resolution.backend,
             SandboxBackend::Bubblewrap | SandboxBackend::Landlock
         ));
+        assert_eq!(
+            resolution.fallback_from.is_some(),
+            resolution.backend == SandboxBackend::Landlock,
+            "the fallback carries the probe that made it one"
+        );
     }
 
-    /// On macOS / Windows the `sandbox_backend` config field is documented as ignored. The resolver
-    /// must still return a probe that reflects the platform's native sandbox capability rather than
-    /// the never-applicable Linux defaults, so the downstream wiring in `src/main.rs` can map it to
-    /// `SandboxCapability` for `sandbox-exec` / Low-integrity. Guards against the regression that
-    /// surfaces when only the Linux probe paths are wired up.
+    /// An unset value resolves to the platform's own sandbox on macOS and Windows: a probe that
+    /// reflects what this host has, surfaced as `Ok(...)` so the consumer can drop into the
+    /// platform's spawn path, or `Missing` with the reason.
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn resolve_sandbox_backend_uses_platform_sandbox_on_non_linux() {
         use crate::sandbox::{BackendProbe, SandboxCapability};
 
-        // Explicit `Some(...)` is ignored on non-Linux; the field is documented as Linux-only.
-        let (_backend, auto_resolved, probe) =
-            resolve_sandbox_backend(Some(SandboxBackend::Bubblewrap));
-        assert!(!auto_resolved);
-        // The probe should reflect what `detect()` reports for this host, surfaced as `Ok(...)` so
-        // the consumer can drop into the platform's spawn path.
-        match probe {
+        match resolve_sandbox_backend(None).probe {
             BackendProbe::Ok(SandboxCapability::Unavailable) => {
                 panic!("Ok(Unavailable) is incoherent: expected a real capability or Missing")
             }

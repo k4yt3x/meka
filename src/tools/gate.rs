@@ -378,7 +378,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         let usable = crate::sandbox::SandboxCapability::SandboxExec;
         #[cfg(target_os = "windows")]
-        let usable = crate::sandbox::SandboxCapability::LowIntegrity;
+        let usable = crate::sandbox::SandboxCapability::RestrictedToken;
 
         let sandboxed = toolset(true, usable);
         assert_eq!(

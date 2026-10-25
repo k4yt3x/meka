@@ -8023,6 +8023,8 @@ mod tests {
             roots: &[],
             readable: None,
             network: crate::config::Network::Host,
+            shell_network: crate::config::Network::Host,
+            shell_confines_reads: true,
             world_state: "",
             budget: Some(crate::prompt::ContextBudget {
                 used: 42_000,

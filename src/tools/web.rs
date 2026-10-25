@@ -20,11 +20,44 @@ use crate::{
     tools::util::build_image_tool_output,
 };
 
+/// The two switches that keep a fetch from an address, and which of them refuses a given one.
+///
+/// One guard for both because they hold the same three doors: the URL `web_fetch` is given, every
+/// redirect hop the client follows, and every name the client resolves. The private switch is
+/// `[web].refuse_private_destinations`; the own-address switch is `[permissions].network =
+/// "remote"`, under which `web_fetch` reaches other machines alone, as the shell does.
+#[derive(Debug, Clone, Copy)]
+struct DestinationGuard {
+    refuse_private: bool,
+    refuse_own: bool,
+}
+
+impl DestinationGuard {
+    /// Whether either switch is on, which is what decides whether the client's resolver and
+    /// redirect policy judge at all.
+    fn is_on(self) -> bool {
+        self.refuse_private || self.refuse_own
+    }
+
+    /// The switch that refuses `address`, named as the user set it, or `None` where the address
+    /// is admitted. The private switch answers first where both are on, since every own address
+    /// is a private one and that switch is the broader setting.
+    fn refusal(self, address: std::net::IpAddr) -> Option<&'static str> {
+        if self.refuse_private && is_private_destination(address) {
+            return Some("`[web].refuse_private_destinations`");
+        }
+        if self.refuse_own && is_own_address(address) {
+            return Some("`[permissions].network = \"remote\"`");
+        }
+        None
+    }
+}
+
 /// The redirect policy: `0` follows no redirect and returns the 3xx as the response, any other
-/// cap follows that many hops. With the private guard on, a hop naming a private literal address
-/// is refused as well; a hop naming a host is judged by the resolver when it connects.
-fn redirect_policy(max_redirects: usize, refuse_private: bool) -> reqwest::redirect::Policy {
-    if !refuse_private {
+/// cap follows that many hops. With a guard on, a hop naming a refused literal address is refused
+/// as well; a hop naming a host is judged by the resolver when it connects.
+fn redirect_policy(max_redirects: usize, guard: DestinationGuard) -> reqwest::redirect::Policy {
+    if !guard.is_on() {
         return if max_redirects == 0 {
             reqwest::redirect::Policy::none()
         } else {
@@ -38,51 +71,52 @@ fn redirect_policy(max_redirects: usize, refuse_private: bool) -> reqwest::redir
         if attempt.previous().len() > max_redirects {
             return attempt.error("too many redirects");
         }
-        match private_literal_destination(attempt.url().as_str()) {
-            Some(address) => attempt.error(format!(
-                "a redirect to {address}, which `[web].refuse_private_destinations` refuses"
-            )),
+        match refused_literal_destination(attempt.url().as_str(), guard) {
+            Some((address, switch)) => {
+                attempt.error(format!("a redirect to {address}, which {switch} refuses"))
+            }
             None => attempt.follow(),
         }
     })
 }
 
-/// The address a URL names outright, when it names a private one: the door for a literal, which
-/// hyper connects to without resolving. A host name answers `None` here and is judged by
-/// [`PrivateDestinationGuard`] when it is resolved.
-fn private_literal_destination(url: &str) -> Option<std::net::IpAddr> {
+/// The address a URL names outright and the switch that refuses it, when it names a refused one:
+/// the door for a literal, which hyper connects to without resolving. A host name answers `None`
+/// here and is judged by the guard's resolver when it is resolved.
+fn refused_literal_destination(
+    url: &str,
+    guard: DestinationGuard,
+) -> Option<(std::net::IpAddr, &'static str)> {
     let address = match url::Url::parse(url).ok()?.host()? {
         url::Host::Ipv4(address) => std::net::IpAddr::V4(address),
         url::Host::Ipv6(address) => std::net::IpAddr::V6(address),
         url::Host::Domain(_) => return None,
     };
-    is_private_destination(address).then_some(address)
+    guard.refusal(address).map(|switch| (address, switch))
 }
 
-/// The resolver `[web].refuse_private_destinations` installs: every name the client connects to
-/// is looked up here, and one that answers with a loopback, private, link-local or unspecified
-/// address is refused whole.
+/// The resolver a guard installs: every name the client connects to is looked up here, and one
+/// that answers with an address a switch refuses is refused whole.
 ///
 /// On the client's resolver rather than on the URL, so every connection is judged on the
 /// addresses it would actually use: a redirect's target, a literal address, and a name that
 /// answers differently on a second lookup, which a check made on the first would let through. A
-/// name that answers with a public address beside a private one is refused too, since the client
-/// would connect to whichever it tried first. With a proxy configured the proxy resolves the
-/// target and this sees only the proxy's own name, which the config page says.
-struct PrivateDestinationGuard;
-
-impl reqwest::dns::Resolve for PrivateDestinationGuard {
+/// name that answers with an admitted address beside a refused one is refused too, since the
+/// client would connect to whichever it tried first. With a proxy configured the proxy resolves
+/// the target and this sees only the proxy's own name, which the config page says.
+impl reqwest::dns::Resolve for DestinationGuard {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
+        let guard = *self;
         Box::pin(async move {
             let addresses: Vec<std::net::SocketAddr> =
                 tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
-            if let Some(address) = addresses
+            if let Some((address, switch)) = addresses
                 .iter()
-                .find(|address| is_private_destination(address.ip()))
+                .find_map(|address| guard.refusal(address.ip()).map(|switch| (address, switch)))
             {
                 return Err(format!(
-                    "'{host}' resolves to {}, which `[web].refuse_private_destinations` refuses",
+                    "'{host}' resolves to {}, which {switch} refuses",
                     address.ip()
                 )
                 .into());
@@ -91,6 +125,65 @@ impl reqwest::dns::Resolve for PrivateDestinationGuard {
         })
     }
 }
+
+/// Whether an address is this machine's: loopback, unspecified, or one an interface here holds.
+/// What `[permissions].network = "remote"` keeps `web_fetch` from, as a command under it is kept
+/// off this machine; another machine on the LAN stays reachable, which is what sets the switch
+/// apart from `[web].refuse_private_destinations`.
+///
+/// An interface's address is told by routing rather than by binding: connecting a UDP socket
+/// sends nothing and makes the kernel pick the source address for the destination, which is the
+/// destination itself exactly when the destination is local. A bind would say yes to any address
+/// on a host with `ip_nonlocal_bind` on. An address this machine cannot route to, or whose family
+/// it has no stack for, is not one it holds, which keeps a dual-stack name reachable from a host
+/// without IPv6; any other error leaves the question unanswered and is read as "own", since
+/// admitting is the direction that loses the boundary.
+fn is_own_address(address: std::net::IpAddr) -> bool {
+    if address.is_loopback() || address.is_unspecified() {
+        return true;
+    }
+    if let std::net::IpAddr::V6(v6) = address
+        && let Some(v4) = v6.to_ipv4_mapped()
+    {
+        return is_own_address(std::net::IpAddr::V4(v4));
+    }
+    let unspecified: std::net::IpAddr = match address {
+        std::net::IpAddr::V4(_) => std::net::Ipv4Addr::UNSPECIFIED.into(),
+        std::net::IpAddr::V6(_) => std::net::Ipv6Addr::UNSPECIFIED.into(),
+    };
+    let probe = std::net::UdpSocket::bind((unspecified, 0)).and_then(|socket| {
+        socket
+            .connect((address, ROUTE_PROBE_PORT))
+            .and_then(|()| socket.local_addr())
+    });
+    match probe {
+        Ok(local) => local.ip() == address,
+        Err(error) => !is_unreachable_from_here(&error),
+    }
+}
+
+/// The port the route probe in [`is_own_address`] connects to: any nonzero one serves, since a
+/// connected UDP socket sends nothing; the discard port names the intent.
+const ROUTE_PROBE_PORT: u16 = 9;
+
+/// Whether a route probe's error says the address is beyond this machine: no route to it, or no
+/// stack for its family at all. Every address an interface here holds has a route.
+fn is_unreachable_from_here(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::AddrNotAvailable
+    ) || error.raw_os_error() == Some(ADDRESS_FAMILY_UNSUPPORTED)
+}
+
+/// `EAFNOSUPPORT`: the socket for the family cannot be made here, so no address of that family is
+/// this machine's. Not among `std::io::ErrorKind`'s names, so matched by number.
+#[cfg(unix)]
+const ADDRESS_FAMILY_UNSUPPORTED: i32 = libc::EAFNOSUPPORT;
+/// `WSAEAFNOSUPPORT`, Winsock's spelling of the same.
+#[cfg(windows)]
+const ADDRESS_FAMILY_UNSUPPORTED: i32 = 10047;
 
 /// Whether an address is one a fetch must not reach under `[web].refuse_private_destinations`:
 /// loopback, private, link-local, carrier-grade NAT, unspecified and broadcast, and an IPv6
@@ -123,7 +216,14 @@ fn is_private_destination(address: std::net::IpAddr) -> bool {
 /// that is on it. One predicate for the registry and for `meka tool list`, which shows the tool
 /// as disabled rather than dropping its row.
 pub(crate) fn web_fetch_registered(network: crate::config::Network) -> bool {
-    network == crate::config::Network::Host
+    network != crate::config::Network::None
+}
+
+/// Whether `web_fetch` refuses this machine's own addresses under `network`: how the in-process
+/// tool holds `remote`, which keeps a session off this machine while other machines stay in
+/// reach. One predicate for the registry's tool and its client.
+pub(crate) fn web_fetch_refuses_own_addresses(network: crate::config::Network) -> bool {
+    network == crate::config::Network::Remote
 }
 
 /// Build the `reqwest::Client` for `web_fetch` from the resolved
@@ -134,17 +234,25 @@ pub(crate) fn web_fetch_registered(network: crate::config::Network) -> bool {
 /// proxy URL or CA file fail the process with the message at the terminal before any session
 /// exists; each session's registry then builds its own from the same settings. The message names
 /// a path or a URL out of `config.toml`, which is why its class keeps it off the wire on the hosts
-/// a remote caller reaches.
-pub(crate) fn build_web_client(config: &WebClientConfig) -> Result<reqwest::Client> {
+/// a remote caller reaches. `refuse_own_addresses` is what `[permissions].network = "remote"`
+/// asks of the client, beside the `[web]` switch the config carries.
+pub(crate) fn build_web_client(
+    config: &WebClientConfig,
+    refuse_own_addresses: bool,
+) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .user_agent(&config.user_agent)
         .timeout(config.request_timeout);
-    // The guard has two doors, since hyper resolves a name through the client's resolver and
+    // The guard has two doors here, since hyper resolves a name through the client's resolver and
     // connects to a literal address without asking it: the resolver below judges every name, and
     // the redirect policy judges every hop a literal names, as `web_fetch` judges the URL it is
     // given.
-    if config.refuse_private_destinations {
-        builder = builder.dns_resolver(std::sync::Arc::new(PrivateDestinationGuard));
+    let guard = DestinationGuard {
+        refuse_private: config.refuse_private_destinations,
+        refuse_own: refuse_own_addresses,
+    };
+    if guard.is_on() {
+        builder = builder.dns_resolver(std::sync::Arc::new(guard));
     }
 
     if let Some(timeout) = config.connect_timeout {
@@ -154,10 +262,7 @@ pub(crate) fn build_web_client(config: &WebClientConfig) -> Result<reqwest::Clie
         builder = builder.read_timeout(timeout);
     }
 
-    builder = builder.redirect(redirect_policy(
-        config.max_redirects,
-        config.refuse_private_destinations,
-    ));
+    builder = builder.redirect(redirect_policy(config.max_redirects, guard));
 
     match config.proxy.as_deref() {
         None => {}
@@ -312,6 +417,9 @@ pub(super) struct FetchUrlTool {
     /// `[web].refuse_private_destinations`: whether a URL naming a private literal address is
     /// refused before the request, the one door of the guard the client itself cannot hold.
     pub(super) refuse_private_destinations: bool,
+    /// Whether a URL naming one of this machine's addresses is refused at the same door, which is
+    /// how the tool holds `[permissions].network = "remote"`.
+    pub(super) refuse_own_addresses: bool,
     pub(crate) client: reqwest::Client,
 }
 
@@ -371,14 +479,14 @@ impl Tool for FetchUrlTool {
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let url = require_str(&input, "url", "web_fetch")?;
-        if self.refuse_private_destinations
-            && let Some(address) = private_literal_destination(&url)
-        {
+        let guard = DestinationGuard {
+            refuse_private: self.refuse_private_destinations,
+            refuse_own: self.refuse_own_addresses,
+        };
+        if let Some((address, switch)) = refused_literal_destination(&url, guard) {
             return Err(MekaError::ToolExecution {
                 tool_name: "web_fetch".to_string(),
-                message: format!(
-                    "'{url}' names {address}, which `[web].refuse_private_destinations` refuses"
-                ),
+                message: format!("'{url}' names {address}, which {switch} refuses"),
             });
         }
         // Every wait below is raced against the turn's cancellation, as `shell_execute` races
@@ -701,7 +809,7 @@ mod tests {
     #[test]
     fn build_web_client_defaults_succeeds() {
         let config = WebClientConfig::default();
-        assert!(build_web_client(&config).is_ok());
+        assert!(build_web_client(&config, false).is_ok());
     }
 
     #[test]
@@ -711,7 +819,7 @@ mod tests {
             ..WebClientConfig::default()
         };
         // We don't actually connect; we just verify reqwest accepts the proxy URL shape.
-        assert!(build_web_client(&config).is_ok());
+        assert!(build_web_client(&config, false).is_ok());
     }
 
     #[test]
@@ -720,7 +828,7 @@ mod tests {
             proxy: Some("http://proxy.local:8080".to_string()),
             ..WebClientConfig::default()
         };
-        assert!(build_web_client(&config).is_ok());
+        assert!(build_web_client(&config, false).is_ok());
     }
 
     #[test]
@@ -730,7 +838,7 @@ mod tests {
             proxy: Some("none".to_string()),
             ..WebClientConfig::default()
         };
-        assert!(build_web_client(&config).is_ok());
+        assert!(build_web_client(&config, false).is_ok());
     }
 
     #[test]
@@ -739,7 +847,7 @@ mod tests {
             proxy: Some("not-a-url".to_string()),
             ..WebClientConfig::default()
         };
-        let error = build_web_client(&config).expect_err("bad proxy URL should fail");
+        let error = build_web_client(&config, false).expect_err("bad proxy URL should fail");
         let message = format!("{error}");
         assert!(
             message.contains("[web].proxy") && message.contains("not-a-url"),
@@ -761,7 +869,7 @@ mod tests {
             )),
             ..WebClientConfig::default()
         };
-        let error = build_web_client(&config).expect_err("missing CA file should fail");
+        let error = build_web_client(&config, false).expect_err("missing CA file should fail");
         let message = format!("{error}");
         assert!(
             message.contains("[web].ca_cert_file")
@@ -786,7 +894,7 @@ mod tests {
             ca_cert_file: Some(path),
             ..WebClientConfig::default()
         };
-        let error = build_web_client(&config).expect_err("non-PEM CA file should fail");
+        let error = build_web_client(&config, false).expect_err("non-PEM CA file should fail");
         let message = format!("{error}");
         assert!(
             message.contains("[web].ca_cert_file"),
@@ -801,7 +909,7 @@ mod tests {
             max_redirects: 0,
             ..WebClientConfig::default()
         };
-        assert!(build_web_client(&config).is_ok());
+        assert!(build_web_client(&config, false).is_ok());
     }
 
     #[test]
@@ -810,7 +918,7 @@ mod tests {
             https_only: true,
             ..WebClientConfig::default()
         };
-        assert!(build_web_client(&config).is_ok());
+        assert!(build_web_client(&config, false).is_ok());
     }
 
     #[test]
@@ -820,7 +928,7 @@ mod tests {
             ..WebClientConfig::default()
         };
         // rustls (our pinned backend) supports TLS 1.2; must build.
-        assert!(build_web_client(&config).is_ok());
+        assert!(build_web_client(&config, false).is_ok());
     }
 
     #[test]
@@ -832,7 +940,7 @@ mod tests {
             danger_accept_invalid_hostnames: true,
             ..WebClientConfig::default()
         };
-        assert!(build_web_client(&config).is_ok());
+        assert!(build_web_client(&config, false).is_ok());
     }
 
     #[test]
@@ -922,6 +1030,8 @@ mod tests {
     fn fetch_url_definition_has_headers_regex_and_raw() {
         let tool = FetchUrlTool {
             refuse_private_destinations: false,
+
+            refuse_own_addresses: false,
             client: reqwest::Client::new(),
         };
         let def = tool.definition();
@@ -946,7 +1056,9 @@ mod tests {
         });
         let tool = FetchUrlTool {
             refuse_private_destinations: false,
-            client: build_web_client(&WebClientConfig::default()).expect("client"),
+
+            refuse_own_addresses: false,
+            client: build_web_client(&WebClientConfig::default(), false).expect("client"),
         };
         let cancellation = tokio_util::sync::CancellationToken::new();
         let stop = tokio::spawn({
@@ -1045,12 +1157,124 @@ mod tests {
         }
     }
 
+    /// What `[permissions].network = "remote"` keeps a fetch from: this machine's own addresses,
+    /// loopback and unspecified in both families, a mapped loopback, and an address an interface
+    /// here holds; a public address and a private one no interface here holds are admitted, which
+    /// is the difference from the private switch.
+    #[test]
+    fn an_own_address_is_one_this_machine_holds() {
+        use std::net::IpAddr;
+        for refused in [
+            "127.0.0.1",
+            "127.9.9.9",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "::ffff:127.0.0.1",
+        ] {
+            let address: IpAddr = refused.parse().expect("an address");
+            assert!(is_own_address(address), "{refused} must be refused");
+        }
+        for admitted in ["93.184.216.34", "2606:4700:4700::1111", "10.255.255.254"] {
+            let address: IpAddr = admitted.parse().expect("an address");
+            assert!(!is_own_address(address), "{admitted} must be admitted");
+        }
+        // The address this machine would send from, learned without sending: a route is needed
+        // to learn it, and a host without one has nothing further to assert.
+        let outbound = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|socket| socket.connect("1.1.1.1:53").map(|()| socket))
+            .and_then(|socket| socket.local_addr())
+            .map(|address| address.ip());
+        match outbound {
+            Ok(address) if !address.is_unspecified() => {
+                assert!(is_own_address(address), "{address} is this machine's");
+            }
+            _ => eprintln!("skipping the interface leg: no route to learn an address from"),
+        }
+    }
+
+    /// `web_fetch` is withheld under `none` alone; under `remote` it is registered and refuses
+    /// this machine's addresses.
+    #[test]
+    fn web_fetch_is_registered_unless_the_network_is_none() {
+        use crate::config::Network;
+        assert!(web_fetch_registered(Network::Host));
+        assert!(web_fetch_registered(Network::Remote));
+        assert!(!web_fetch_registered(Network::None));
+        assert!(!web_fetch_refuses_own_addresses(Network::Host));
+        assert!(web_fetch_refuses_own_addresses(Network::Remote));
+    }
+
+    /// The own-address guard refuses a loopback literal and `localhost` naming the switch, and
+    /// admits a private address no interface here holds, on both the resolver door and the
+    /// literal door.
+    #[tokio::test]
+    async fn the_own_address_guard_judges_a_name_by_its_addresses() {
+        use reqwest::dns::Resolve;
+        let guard = DestinationGuard {
+            refuse_private: false,
+            refuse_own: true,
+        };
+        for refused in ["127.0.0.1", "localhost"] {
+            let name: reqwest::dns::Name = refused.parse().expect("a name");
+            let error = guard
+                .resolve(name)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{refused} must be refused"))
+                .to_string();
+            assert!(
+                error.contains(refused) && error.contains("`[permissions].network = \"remote\"`"),
+                "{error}"
+            );
+        }
+        let name: reqwest::dns::Name = "10.255.255.254".parse().expect("a name");
+        assert!(
+            guard.resolve(name).await.is_ok(),
+            "a private address this machine does not hold stays reachable under `remote`"
+        );
+        // The address this machine would send from, learned without sending; a host with no route
+        // has nothing further to assert.
+        let outbound = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|socket| socket.connect("1.1.1.1:53").map(|()| socket))
+            .and_then(|socket| socket.local_addr())
+            .map(|address| address.ip());
+        if let Ok(address) = outbound
+            && !address.is_unspecified()
+        {
+            let name: reqwest::dns::Name = address.to_string().parse().expect("a name");
+            let error = guard
+                .resolve(name)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{address}, this machine's own, must be refused"))
+                .to_string();
+            assert!(
+                error.contains("`[permissions].network = \"remote\"`"),
+                "{error}"
+            );
+        }
+        let refused = refused_literal_destination("http://127.0.0.1:1/x", guard);
+        assert_eq!(
+            refused.map(|(address, switch)| (address.to_string(), switch)),
+            Some((
+                "127.0.0.1".to_string(),
+                "`[permissions].network = \"remote\"`"
+            ))
+        );
+        assert!(refused_literal_destination("http://10.255.255.254/x", guard).is_none());
+        assert!(refused_literal_destination("http://example.com/x", guard).is_none());
+    }
+
     /// The guard refuses a name on its addresses, a literal and `localhost` alike, with the
     /// address in the refusal, and admits a public literal.
     #[tokio::test]
     async fn the_private_destination_guard_judges_a_name_by_its_addresses() {
         use reqwest::dns::Resolve;
-        let guard = PrivateDestinationGuard;
+        let guard = DestinationGuard {
+            refuse_private: true,
+            refuse_own: false,
+        };
         for refused in ["127.0.0.1", "localhost", "10.0.0.7"] {
             let name: reqwest::dns::Name = refused.parse().expect("a name");
             let error = guard
@@ -1104,50 +1328,57 @@ mod tests {
                 }
             }
         });
-        let guarded = WebClientConfig {
-            refuse_private_destinations: true,
-            ..WebClientConfig::default()
-        };
-        let tool = FetchUrlTool {
-            refuse_private_destinations: true,
-            client: build_web_client(&guarded).expect("client"),
-        };
-        let error = tool
-            .execute(
-                serde_json::json!({ "url": format!("{origin}/") }),
-                crate::tools::ToolContext::detached(tokio_util::sync::CancellationToken::new()),
-            )
-            .await
-            .expect_err("the tool refuses the literal")
-            .to_string();
-        assert!(
-            error.contains("names 127.0.0.1") && error.contains("refuse_private_destinations"),
-            "{error}"
-        );
-        assert_eq!(
-            accepted.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "nothing may have connected"
-        );
+        // Both switches hold both doors the same way; each is tried on its own.
+        for (refuse_private, refuse_own, switch) in [
+            (true, false, "refuse_private_destinations"),
+            (false, true, "`[permissions].network = \"remote\"`"),
+        ] {
+            let config = WebClientConfig {
+                refuse_private_destinations: refuse_private,
+                ..WebClientConfig::default()
+            };
+            let tool = FetchUrlTool {
+                refuse_private_destinations: refuse_private,
+                refuse_own_addresses: refuse_own,
+                client: build_web_client(&config, refuse_own).expect("client"),
+            };
+            let error = tool
+                .execute(
+                    serde_json::json!({ "url": format!("{origin}/") }),
+                    crate::tools::ToolContext::detached(tokio_util::sync::CancellationToken::new()),
+                )
+                .await
+                .expect_err("the tool refuses the literal")
+                .to_string();
+            assert!(
+                error.contains("names 127.0.0.1") && error.contains(switch),
+                "{error}"
+            );
+            assert_eq!(
+                accepted.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "nothing may have connected"
+            );
 
-        // The client's own door, reached without the tool's: the first hop is accepted, the
-        // redirect to a loopback literal is not.
-        let error = build_web_client(&guarded)
-            .expect("client")
-            .get(format!("{origin}/hop"))
-            .send()
-            .await
-            .expect_err("the hop is refused");
-        let chain = std::iter::successors(Some(&error as &dyn std::error::Error), |error| {
-            error.source()
-        })
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(": ");
-        assert!(chain.contains("refuse_private_destinations"), "{chain}");
-        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+            // The client's own door, reached without the tool's: the first hop is accepted, the
+            // redirect to a loopback literal is not.
+            let error = build_web_client(&config, refuse_own)
+                .expect("client")
+                .get(format!("{origin}/hop"))
+                .send()
+                .await
+                .expect_err("the hop is refused");
+            let chain = std::iter::successors(Some(&error as &dyn std::error::Error), |error| {
+                error.source()
+            })
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(": ");
+            assert!(chain.contains(switch), "{chain}");
+            assert_eq!(accepted.swap(0, std::sync::atomic::Ordering::SeqCst), 1);
+        }
 
-        let open = build_web_client(&WebClientConfig::default()).expect("client");
+        let open = build_web_client(&WebClientConfig::default(), false).expect("client");
         let response = open
             .get(format!("{origin}/"))
             .send()

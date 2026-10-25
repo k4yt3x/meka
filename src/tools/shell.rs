@@ -83,7 +83,9 @@ fn bwrap_args(
         ])
         .map(std::ffi::OsString::from)
         .collect();
-    if network == crate::config::Network::None {
+    // Against `host` rather than `none`: a setting the namespace cannot express, `remote`, is cut
+    // off whole here whatever the caller passed, never let through.
+    if network != crate::config::Network::Host {
         args.push("--unshare-net".into());
     }
 
@@ -240,13 +242,8 @@ pub(crate) struct ExecuteCommandTool {
     /// disagree about where a write may land.
     pub(crate) scope: crate::workspace::WriteScope,
     pub(crate) sandbox_capability: crate::sandbox::SandboxCapability,
-    /// Backend chosen in config (or auto-resolved). Read only by the Linux hard-error message in
-    /// [`Tool::execute`]; on macOS / Windows the field is populated but unused, so suppress the
-    /// "never read" lint there without hiding regressions on Linux.
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "read only on the Linux spawn path")
-    )]
+    /// Backend chosen in config (or auto-resolved), named by the hard-error message in
+    /// [`Tool::execute`].
     pub(crate) sandbox_backend: crate::config::SandboxBackend,
     /// Probe outcome for [`Self::sandbox_backend`]. Drives the hard-error path at `read` when
     /// the backend isn't usable (bwrap missing, user namespaces denied, etc.). When `Ok(_)`,
@@ -295,23 +292,15 @@ impl ExecuteCommandTool {
         let Some(reason) = crate::sandbox::backend_unavailable_reason(&self.backend_probe) else {
             return Ok(());
         };
-        // `sandbox_backend` is Linux-only; on other platforms there's nothing to reconfigure. The
-        // only escape hatch is `unrestricted`, which is also the only level whose confinement is
-        // `Unconfined` and so never reaches this branch.
-        #[cfg(target_os = "linux")]
-        let message = format!(
-            "configured sandbox backend ({}) is unavailable: {}; set `[shell].sandbox_backend` to \
-             a usable one",
-            self.sandbox_backend, reason
-        );
-        #[cfg(not(target_os = "linux"))]
-        let message = format!(
-            "sandbox is unavailable: {reason}. `unrestricted` runs shell commands without a \
-             sandbox."
-        );
+        let named = crate::sandbox::backend_label(self.sandbox_backend, &self.backend_probe)
+            .map(|label| format!(" ({label})"))
+            .unwrap_or_default();
+        let remedy = crate::sandbox::backend_remedy(&self.backend_probe)
+            .map(|remedy| format!("; {remedy}"))
+            .unwrap_or_default();
         Err(MekaError::ToolExecution {
             tool_name: "shell_execute".to_string(),
-            message,
+            message: format!("sandbox backend{named} is unavailable: {reason}{remedy}"),
         })
     }
 }
@@ -426,14 +415,48 @@ impl Tool for ExecuteCommandTool {
         let sandboxed = confinement.is_sandboxed();
         self.admit_confinement(permission, sandboxed)?;
 
-        // Windows + sandboxed: spawn directly via CreateProcessAsUserW with a Low-integrity token.
-        // This path can't go through tokio::process because the stdlib gives no hook for injecting
-        // a custom token.
+        // Windows + AppContainer: the policy is meka's own model of this call, encoded per
+        // command, and the OS enforces it; no ACE is written and no token derived.
+        #[cfg(windows)]
+        if sandboxed
+            && let crate::sandbox::SandboxCapability::AppContainer { minor, .. } =
+                self.sandbox_capability
+        {
+            use crate::sandbox::appcontainer;
+            let drive_roots = appcontainer::drive_roots();
+            let private = crate::workspace::private_directories();
+            let policy = appcontainer::policy_for(&appcontainer::PolicyInputs {
+                version: (appcontainer::SCHEMA_MAJOR, minor),
+                network: crate::sandbox::held_network(
+                    &self.sandbox_capability,
+                    confinement.network(),
+                ),
+                writable: confinement.writable(),
+                readable: confinement.readable(),
+                drive_roots: &drive_roots,
+                private: &private,
+                ui_restrictions: appcontainer::ui_restrictions_here(),
+            });
+            let relay = OutputRelay::for_call(&context);
+            return run_windows_sandboxed(
+                &command,
+                &crate::sandbox::windows::WindowsConfinement::AppContainer(policy),
+                self.site.cwd.get(),
+                timeout,
+                cancellation,
+                relay,
+            )
+            .await;
+        }
+
+        // Windows + restricted token: spawn directly via CreateProcessAsUserW with a derived
+        // token. This path can't go through tokio::process because the stdlib gives no hook for
+        // injecting a custom token.
         #[cfg(windows)]
         if sandboxed
             && matches!(
                 self.sandbox_capability,
-                crate::sandbox::SandboxCapability::LowIntegrity
+                crate::sandbox::SandboxCapability::RestrictedToken
             )
         {
             // Two different mechanisms, picked by what the level promises. A workspace confinement
@@ -522,7 +545,7 @@ impl Tool for ExecuteCommandTool {
                 confinement.writable(),
                 confinement.readable(),
                 &crate::workspace::private_directories(),
-                confinement.network(),
+                crate::sandbox::held_network(&self.sandbox_capability, confinement.network()),
             );
             let mut cmd = tokio::process::Command::new(crate::sandbox::seatbelt::SANDBOX_EXEC_PATH);
             cmd.arg("-p").arg(&profile);
@@ -573,7 +596,7 @@ impl Tool for ExecuteCommandTool {
                 confinement.readable(),
                 &self.site.cwd.get(),
                 &crate::workspace::private_directories(),
-                confinement.network(),
+                crate::sandbox::held_network(&self.sandbox_capability, confinement.network()),
             ));
             cmd.arg("--");
             if let Some(executable) = &inner_executable {
@@ -641,7 +664,8 @@ impl Tool for ExecuteCommandTool {
                 None => Vec::new(),
             };
             #[cfg(target_os = "linux")]
-            let network = confinement.network();
+            let network =
+                crate::sandbox::held_network(&self.sandbox_capability, confinement.network());
 
             move || {
                 // SAFETY: `setsid(2)` is async-signal-safe and has no preconditions beyond "the
@@ -2191,11 +2215,6 @@ mod tests {
         match result {
             Err(MekaError::ToolExecution { tool_name, message }) => {
                 assert_eq!(tool_name, "shell_execute");
-                // The Linux error path splices in the configured backend's display name
-                // (`Bubblewrap`); the non-Linux variant drops the Linux-specific config reference
-                // and reads "sandbox is unavailable: ...". Both must include the probe reason
-                // verbatim.
-                #[cfg(target_os = "linux")]
                 assert!(
                     message.contains("Bubblewrap"),
                     "expected backend display name in error: {message}"
@@ -2203,6 +2222,10 @@ mod tests {
                 assert!(
                     message.contains("bwrap not found on PATH"),
                     "expected probe reason in error: {message}"
+                );
+                assert!(
+                    message.contains("`[shell].sandbox_backend`"),
+                    "expected the key to fix in error: {message}"
                 );
             }
             Err(other) => panic!("expected ToolExecution, got {other:?}"),
@@ -2348,14 +2371,14 @@ mod tests {
             )
         }
 
-        /// Build an `ExecuteCommandTool` for the Low-integrity Windows path. Mirrors
+        /// Build an `ExecuteCommandTool` for the restricted-token Windows path. Mirrors
         /// `super::tool_for_test` (which always calls `sandbox::detect()` and would resolve to
-        /// `LowIntegrity` on Windows anyway) but constructs the fields explicitly so the tests
+        /// `RestrictedToken` on Windows anyway) but constructs the fields explicitly so the tests
         /// document the intended state.
         fn windows_test_tool(
             shared_permission: crate::permission::SharedPermission,
         ) -> ExecuteCommandTool {
-            let sandbox_capability = crate::sandbox::SandboxCapability::LowIntegrity;
+            let sandbox_capability = crate::sandbox::SandboxCapability::RestrictedToken;
             let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
             ExecuteCommandTool {
                 scope: crate::workspace::WriteScope::unconfined(),
@@ -2363,9 +2386,7 @@ mod tests {
                     crate::sandbox::windows::WindowsGrants::default(),
                 ),
                 sandbox_capability,
-                // `sandbox_backend` is Linux-only metadata; on Windows the value is never read but
-                // the field must still be populated. `Landlock` is the conventional placeholder.
-                sandbox_backend: crate::config::SandboxBackend::Landlock,
+                sandbox_backend: crate::config::SandboxBackend::RestrictedToken,
                 backend_probe,
                 sandbox_enabled: true,
                 site: crate::session::ToolSite::for_test()
@@ -3043,6 +3064,26 @@ mod tests {
         /// The bind sits after the masks and before the writable binds, so a cwd under `/tmp` is
         /// restored, and a cwd that is also a writable root is upgraded to read-write by the loop
         /// that follows: last mount wins.
+        /// `--unshare-net` goes with every setting but `host`: `remote`, which the namespace
+        /// cannot express, is cut off whole rather than let through.
+        #[test]
+        #[cfg(target_os = "linux")]
+        fn the_network_is_unshared_on_every_setting_but_host() {
+            let cwd = PathBuf::from("/tmp/session-cwd");
+            for (network, unshared) in [
+                (crate::config::Network::Host, false),
+                (crate::config::Network::Remote, true),
+                (crate::config::Network::None, true),
+            ] {
+                let args = super::bwrap_args(&[], None, &cwd, &[], network);
+                assert_eq!(
+                    args.iter().any(|arg| arg == "--unshare-net"),
+                    unshared,
+                    "{network}"
+                );
+            }
+        }
+
         #[test]
         #[cfg(target_os = "linux")]
         fn the_child_is_given_a_working_directory_it_can_reach() {

@@ -1132,6 +1132,19 @@ fn listed(lead: &str, names: impl IntoIterator<Item = &'static str>, tail: &str)
     )
 }
 
+/// The help of `--sandbox-backend`: this platform's values, from the table the probe refuses by.
+fn sandbox_backend_help() -> String {
+    let values = crate::config::SandboxBackend::ON_THIS_PLATFORM;
+    if values.is_empty() {
+        return "Sandbox backend: this platform takes none".to_string();
+    }
+    listed(
+        "Sandbox backend",
+        values.iter().map(|backend| backend.name()),
+        "",
+    )
+}
+
 /// The long help of `profile set`: the settable keys, from the table `profile set` refuses by.
 fn profile_set_about() -> String {
     format!(
@@ -1200,11 +1213,7 @@ pub(crate) struct Cli {
     #[arg(
         long = "sandbox-backend",
         value_name = "BACKEND",
-        help = listed(
-            "Linux sandbox backend",
-            crate::config::SandboxBackend::ALL.iter().map(|backend| backend.name()),
-            ""
-        )
+        help = sandbox_backend_help()
     )]
     pub(crate) sandbox_backend: Option<crate::config::SandboxBackend>,
     /// MCP tool to eager-load (repeatable)

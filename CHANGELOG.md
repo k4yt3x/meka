@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An ACP client advertising `session.compaction` gets `compaction_update`, opened as work begins.
 - An ACP client advertising `session.notices` gets meka's advisories as `notice` updates.
 - `context.compacting` and `context.compaction_failed` events; `compactions` in the one-shot JSON.
+- `[permissions].network = "remote"`: a command and `web_fetch` reach other machines, not this one.
+- `agent_spawn` takes `network: "remote"`; a sub-agent's setting is any at or below its parent's.
+- Windows gains the `appcontainer` backend: the store is hidden and reads and the network are held.
 
 ### Changed
 
@@ -39,6 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A compaction from before 0.84 replays as an automatic one at the ceiling; see the upgrade guide.
 - Copying from the transcript no longer warns when no clipboard manager takes the text.
 - A value of the wrong type in a string argument is refused by name, on every tool.
+- **Breaking:** `[shell].sandbox_backend` refuses another platform's value; see the upgrade guide.
+- Windows takes `appcontainer` or `restricted-token` as its backend and warns once on the fallback.
+- A backend holds a network setting it cannot as the next narrower one, and startup says so once.
+- The scope lines name what the shell and `web_fetch` each reach where a backend narrows one.
+- A confined command on Windows cannot read or set the clipboard, drive windows or inject input.
 
 ### Fixed
 

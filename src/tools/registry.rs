@@ -1177,9 +1177,11 @@ impl ToolRegistry {
         // A malformed proxy URL or unreadable CA file surfaces as a startup error rather than
         // silently falling back to an unconfigured client (which would ignore the user's intent).
         if web::web_fetch_registered(site.network) {
-            let web_client = web::build_web_client(web_client_config)?;
+            let refuse_own_addresses = web::web_fetch_refuses_own_addresses(site.network);
+            let web_client = web::build_web_client(web_client_config, refuse_own_addresses)?;
             self.register_builtin(Arc::new(web::FetchUrlTool {
                 refuse_private_destinations: web_client_config.refuse_private_destinations,
+                refuse_own_addresses,
                 client: web_client,
             }));
         }

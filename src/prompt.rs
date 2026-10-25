@@ -1221,8 +1221,11 @@ pub(crate) struct ScopeLines<'a> {
     pub(crate) roots: &'a [std::path::PathBuf],
     /// The additional readable directories, or `None` when reads reach everywhere.
     pub(crate) readable: Option<&'a [std::path::PathBuf]>,
-    /// What the shell and `web_fetch` may reach; stated only when it is `none`.
+    /// What `web_fetch` may reach: the configured setting, held in-process.
     pub(crate) network: crate::config::Network,
+    /// What the shell holds, which its backend may narrow from `network`
+    /// (`sandbox::held_network`); stated beside it where the two differ.
+    pub(crate) shell_network: crate::config::Network,
 }
 
 /// The lines that state a scope, in the environment block's own form: a capitalized key with its
@@ -1238,9 +1241,11 @@ pub(crate) struct ScopeLines<'a> {
 /// workspace. The readable line is omitted at `unrestricted`, where nothing confines reads, and
 /// nothing is stated at `none`, where nothing reads. The system directories are stated nowhere
 /// here: they are the same on every turn, and the directories listed are what the model has to keep
-/// to. The network is stated only when it is cut off, since the host's network is what every
-/// session has unless told otherwise; at `unrestricted` the cut holds `web_fetch` alone, since
-/// nothing sandboxes the shell there, and the line says so.
+/// to. The network is stated only where something is cut off, since the host's network is what
+/// every session has unless told otherwise; at `unrestricted` the cut holds `web_fetch` alone,
+/// since nothing sandboxes the shell there, and the line says so. Where the shell's backend holds
+/// the setting as another value, the line names each tool's own, so the model is not told the
+/// shell reaches what it does not.
 pub(crate) fn render_scope_lines(scope: &ScopeLines<'_>) -> String {
     if scope.permission == Permission::None {
         return String::new();
@@ -1258,12 +1263,25 @@ pub(crate) fn render_scope_lines(scope: &ScopeLines<'_>) -> String {
             None => lines.push_str("Additional readable directories: anywhere\n"),
         }
     }
-    if scope.network == crate::config::Network::None {
-        lines.push_str(if scope.permission == Permission::Unrestricted {
-            "Network: none (web_fetch)\n"
-        } else {
-            "Network: none (shell and web_fetch)\n"
-        });
+    let host = crate::config::Network::Host;
+    let (network, shell) = (scope.network, scope.shell_network);
+    if scope.permission == Permission::Unrestricted {
+        if network != host {
+            lines.push_str(&format!("Network: {network} (web_fetch)\n"));
+        }
+    } else if shell == network {
+        if network != host {
+            lines.push_str(&format!("Network: {network} (shell and web_fetch)\n"));
+        }
+    } else {
+        let mut parts = Vec::new();
+        if network != host {
+            parts.push(format!("{network} (web_fetch)"));
+        }
+        if shell != host {
+            parts.push(format!("{shell} (shell)"));
+        }
+        lines.push_str(&format!("Network: {}\n", parts.join(", ")));
     }
     lines
 }
@@ -1296,6 +1314,8 @@ fn build_environment_context(
     roots: &[std::path::PathBuf],
     readable: Option<&[std::path::PathBuf]>,
     network: crate::config::Network,
+    shell_network: crate::config::Network,
+    shell_confines_reads: bool,
 ) -> String {
     if permission == Permission::None {
         return String::new();
@@ -1308,12 +1328,13 @@ fn build_environment_context(
         roots,
         readable,
         network,
+        shell_network,
     }));
-    // The one platform whose shell cannot hold the boundary; the model is told rather than left
-    // to find out from a command that read what a tool refused.
-    if readable.is_some() && cfg!(windows) {
+    // The one backend whose shell cannot hold the boundary; the model is told rather than left to
+    // find out from a command that read what a tool refused.
+    if readable.is_some() && !shell_confines_reads {
         context.push_str(
-            "On this platform the shell's reads are not confined; the file tools' are.\n",
+            "Under this sandbox backend the shell's reads are not confined; the file tools' are.\n",
         );
     }
 
@@ -1474,8 +1495,12 @@ pub(crate) struct TurnContext<'a> {
     /// The directories reads reach beyond the workspace at this level, or `None` when reads reach
     /// everywhere.
     pub(crate) readable: Option<&'a [std::path::PathBuf]>,
-    /// What the shell and `web_fetch` may reach.
+    /// What `web_fetch` may reach: the configured setting.
     pub(crate) network: crate::config::Network,
+    /// What the shell holds; see [`ScopeLines::shell_network`].
+    pub(crate) shell_network: crate::config::Network,
+    /// Whether the shell's reads follow the read boundary (`sandbox::shell_confines_reads`).
+    pub(crate) shell_confines_reads: bool,
     pub(crate) world_state: &'a str,
     pub(crate) budget: Option<ContextBudget>,
     /// `[session].turn_retention`, for the `[Retention]` section that dates where the record
@@ -1502,6 +1527,8 @@ pub(crate) fn build_turn_context(context: TurnContext<'_>) -> String {
         roots,
         readable,
         network,
+        shell_network,
+        shell_confines_reads,
         world_state,
         budget,
         turn_retention,
@@ -1542,7 +1569,15 @@ pub(crate) fn build_turn_context(context: TurnContext<'_>) -> String {
         sections.push(render_background_section(background));
     }
 
-    let environment_context = build_environment_context(permission, cwd, roots, readable, network);
+    let environment_context = build_environment_context(
+        permission,
+        cwd,
+        roots,
+        readable,
+        network,
+        shell_network,
+        shell_confines_reads,
+    );
     if !environment_context.is_empty() {
         sections.push(environment_context);
     }
@@ -4725,6 +4760,8 @@ mod tests {
             roots: &[],
             readable: None,
             network: crate::config::Network::Host,
+            shell_network: crate::config::Network::Host,
+            shell_confines_reads: true,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -4747,6 +4784,8 @@ mod tests {
             roots: &[],
             readable: None,
             network: crate::config::Network::Host,
+            shell_network: crate::config::Network::Host,
+            shell_confines_reads: true,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -4772,6 +4811,8 @@ mod tests {
             roots: &[],
             readable: None,
             network: crate::config::Network::Host,
+            shell_network: crate::config::Network::Host,
+            shell_confines_reads: true,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -5049,6 +5090,8 @@ mod tests {
             roots: &[],
             readable: None,
             network: crate::config::Network::Host,
+            shell_network: crate::config::Network::Host,
+            shell_confines_reads: true,
             world_state: "",
             budget: None,
             turn_retention: Some(window),
@@ -5068,6 +5111,8 @@ mod tests {
                 roots: &[],
                 readable: None,
                 network: crate::config::Network::Host,
+                shell_network: crate::config::Network::Host,
+                shell_confines_reads: true,
                 world_state: "",
                 budget: None,
                 turn_retention: None,
@@ -5080,7 +5125,8 @@ mod tests {
 
     /// The block names the additional readable directories at every level that confines reads:
     /// the list when there is one, `none` when nothing beyond the workspace resolves, `anywhere`
-    /// when reads are not confined, and no line at all at `unrestricted`.
+    /// when reads are not confined, and no line at all at `unrestricted`. The sentence that the
+    /// shell's reads are not confined follows the backend, and only where reads are confined.
     #[test]
     fn the_environment_block_names_the_additional_readable_directories() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -5089,25 +5135,30 @@ mod tests {
         let roots: Vec<std::path::PathBuf> = vec![];
         let readable = vec![reference.clone()];
         for level in [Permission::Read, Permission::Workspace] {
-            let context = build_environment_context(
-                level,
-                &cwd,
-                &roots,
-                Some(&readable),
-                crate::config::Network::Host,
-            );
-            assert!(
-                context.contains(&format!(
-                    "Additional readable directories:\n  {}\n",
-                    reference.display()
-                )),
-                "{level}: {context}"
-            );
-            assert_eq!(
-                context.contains("the shell's reads are not confined"),
-                cfg!(windows),
-                "{context}"
-            );
+            for shell_confines_reads in [true, false] {
+                let context = build_environment_context(
+                    level,
+                    &cwd,
+                    &roots,
+                    Some(&readable),
+                    crate::config::Network::Host,
+                    crate::config::Network::Host,
+                    shell_confines_reads,
+                );
+                assert!(
+                    context.contains(&format!(
+                        "Additional readable directories:\n  {}\n",
+                        reference.display()
+                    )),
+                    "{level}: {context}"
+                );
+                assert_eq!(
+                    context
+                        .contains("Under this sandbox backend the shell's reads are not confined"),
+                    !shell_confines_reads,
+                    "{level}: {context}"
+                );
+            }
         }
         let open = build_environment_context(
             Permission::Workspace,
@@ -5115,10 +5166,13 @@ mod tests {
             &roots,
             None,
             crate::config::Network::Host,
+            crate::config::Network::Host,
+            false,
         );
         assert!(
-            open.contains("Additional readable directories: anywhere\n"),
-            "{open}"
+            open.contains("Additional readable directories: anywhere\n")
+                && !open.contains("the shell's reads are not confined"),
+            "nothing is confined, so nothing is said about the shell: {open}"
         );
         let none = build_environment_context(
             Permission::Read,
@@ -5126,6 +5180,8 @@ mod tests {
             &roots,
             Some(&[]),
             crate::config::Network::Host,
+            crate::config::Network::Host,
+            true,
         );
         assert!(
             none.contains("Additional readable directories: none\n"),
@@ -5137,6 +5193,8 @@ mod tests {
             &roots,
             None,
             crate::config::Network::Host,
+            crate::config::Network::Host,
+            true,
         );
         assert!(
             !unrestricted.contains("Additional readable directories"),
@@ -5180,6 +5238,8 @@ mod tests {
             &[],
             None,
             crate::config::Network::Host,
+            crate::config::Network::Host,
+            true,
         );
         assert!(context.contains("[Environment context]"));
         assert!(context.contains("Working directory:"));
@@ -5194,6 +5254,8 @@ mod tests {
             &[],
             None,
             crate::config::Network::Host,
+            crate::config::Network::Host,
+            true,
         );
         assert!(context.is_empty());
     }
@@ -5209,6 +5271,8 @@ mod tests {
             &[],
             None,
             crate::config::Network::Host,
+            crate::config::Network::Host,
+            true,
         );
         assert!(context.contains("Working directory: /work\n"));
         assert!(
@@ -5236,6 +5300,8 @@ mod tests {
             &roots,
             None,
             crate::config::Network::Host,
+            crate::config::Network::Host,
+            true,
         );
         assert!(context.contains(&format!("Working directory: {}\n", cwd.display())));
         assert!(
@@ -5267,8 +5333,15 @@ mod tests {
             Permission::Workspace,
             Permission::Unrestricted,
         ] {
-            let context =
-                build_environment_context(level, &cwd, &roots, None, crate::config::Network::Host);
+            let context = build_environment_context(
+                level,
+                &cwd,
+                &roots,
+                None,
+                crate::config::Network::Host,
+                crate::config::Network::Host,
+                true,
+            );
             assert!(
                 !context.contains("Additional workspace directories"),
                 "{level}: a directory that does not resolve must not be listed, and one \
@@ -5293,6 +5366,8 @@ mod tests {
             roots: &[],
             readable: None,
             network: crate::config::Network::Host,
+            shell_network: crate::config::Network::Host,
+            shell_confines_reads: true,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -5321,6 +5396,8 @@ mod tests {
             roots: &[],
             readable: None,
             network: crate::config::Network::Host,
+            shell_network: crate::config::Network::Host,
+            shell_confines_reads: true,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -5440,6 +5517,8 @@ mod tests {
             roots: &[],
             readable: None,
             network: crate::config::Network::Host,
+            shell_network: crate::config::Network::Host,
+            shell_confines_reads: true,
             world_state: "",
             budget: Some(ContextBudget {
                 used: 42_000,
@@ -5465,6 +5544,8 @@ mod tests {
             roots: &[],
             readable: None,
             network: crate::config::Network::Host,
+            shell_network: crate::config::Network::Host,
+            shell_confines_reads: true,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -5486,6 +5567,8 @@ mod tests {
             roots: &[],
             readable: None,
             network: crate::config::Network::Host,
+            shell_network: crate::config::Network::Host,
+            shell_confines_reads: true,
             world_state: "",
             budget: None,
             turn_retention: None,
@@ -5605,30 +5688,51 @@ mod tests {
         );
     }
 
-    /// The network line is stated only when the network is cut off; at `unrestricted`, where
-    /// nothing confines the shell, it names the tool the cut still withholds.
+    /// The network line is stated only where something is cut off; at `unrestricted`, where
+    /// nothing confines the shell, it names the tool the cut still withholds; and where the
+    /// shell's backend holds the setting as another value, each tool's own is named.
     #[test]
     fn the_scope_lines_state_the_network_only_when_it_is_cut_off() {
+        use crate::config::Network;
         let cwd = std::path::Path::new("/work");
-        let lines = |permission, network| {
+        let lines = |permission, network, shell_network| {
             render_scope_lines(&ScopeLines {
                 permission,
                 cwd,
                 roots: &[],
                 readable: None,
                 network,
+                shell_network,
             })
         };
         assert!(
-            lines(Permission::Workspace, crate::config::Network::None)
+            lines(Permission::Workspace, Network::None, Network::None)
                 .ends_with("Network: none (shell and web_fetch)\n")
         );
-        assert!(!lines(Permission::Workspace, crate::config::Network::Host).contains("Network:"));
+        assert!(!lines(Permission::Workspace, Network::Host, Network::Host).contains("Network:"));
         assert!(
-            lines(Permission::Unrestricted, crate::config::Network::None)
+            lines(Permission::Unrestricted, Network::None, Network::Host)
                 .ends_with("Network: none (web_fetch)\n")
         );
-        assert!(lines(Permission::Read, crate::config::Network::None).contains("Network: none"));
+        assert!(lines(Permission::Read, Network::None, Network::None).contains("Network: none"));
+        assert!(
+            lines(Permission::Read, Network::Remote, Network::Remote)
+                .ends_with("Network: remote (shell and web_fetch)\n")
+        );
+        // A backend that holds `remote` as `none`, and the restricted token, which holds `none`
+        // as the host for a command: the line names what each tool reaches.
+        assert!(
+            lines(Permission::Read, Network::Remote, Network::None)
+                .ends_with("Network: remote (web_fetch), none (shell)\n")
+        );
+        assert!(
+            lines(Permission::Read, Network::None, Network::Host)
+                .ends_with("Network: none (web_fetch)\n")
+        );
+        assert!(
+            lines(Permission::Unrestricted, Network::Remote, Network::Host)
+                .ends_with("Network: remote (web_fetch)\n")
+        );
     }
 
     fn memory_in(project: &str, memory: Memory) -> Memory {

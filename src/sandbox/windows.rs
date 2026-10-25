@@ -38,15 +38,19 @@ use windows_sys::Win32::{
             AllocConsole, GetConsoleWindow, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
             STD_OUTPUT_HANDLE, SetStdHandle,
         },
-        JobObjects::{AssignProcessToJobObject, TerminateJobObject},
+        JobObjects::{
+            AssignProcessToJobObject, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+            JobObjectBasicUIRestrictions, SetInformationJobObject, TerminateJobObject,
+        },
         Pipes::CreatePipe,
         Threading::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
-            CreateProcessWithTokenW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-            GetCurrentProcess, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
-            LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-            PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
-            TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+            CreateProcessW, CreateProcessWithTokenW, DeleteProcThreadAttributeList,
+            EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
+            InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread,
+            STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+            UpdateProcThreadAttribute, WaitForSingleObject,
         },
     },
     UI::WindowsAndMessaging::{SW_HIDE, ShowWindow},
@@ -93,10 +97,10 @@ impl Drop for OwnedHandle {
     }
 }
 
-/// Child process spawned under a Low-integrity token. `stdout`/`stderr` are anonymous pipes
-/// wrapped in [`File`] (convertible to tokio async readers via `tokio::fs::File::from_std`).
-/// `wait_blocking` / `kill` run synchronous Win32 calls; call them from
-/// `tokio::task::spawn_blocking`.
+/// A child process spawned under a confined token or inside a process security environment.
+/// `stdout`/`stderr` are anonymous pipes wrapped in [`File`] (convertible to tokio async readers
+/// via `tokio::fs::File::from_std`). `wait_blocking` / `kill` run synchronous Win32 calls; call
+/// them from `tokio::task::spawn_blocking`.
 ///
 /// The child is wrapped in a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so any
 /// grandchildren spawned by the user command are atomically killed when the job handle drops
@@ -107,6 +111,9 @@ pub(crate) struct SandboxedChild {
     job: std::os::windows::io::OwnedHandle,
     stdout: Option<File>,
     stderr: Option<File>,
+    /// The AppContainer environment the child runs in, held for its drop alone and closed last:
+    /// after the job's kill-on-close has ended the tree, since fields drop in this order.
+    _environment: Option<super::appcontainer::Environment>,
 }
 
 impl SandboxedChild {
@@ -156,27 +163,46 @@ impl SandboxedChild {
     }
 }
 
-/// Spawn `powershell.exe -NoProfile -NonInteractive -Command <command>` under a Low-integrity
-/// token. Stdout and stderr are captured via anonymous pipes; stdin is not connected.
+/// What a sandboxed Windows child runs under.
 ///
-/// PowerShell parses its command line per `CommandLineToArgvW` rules, so the user command is
-/// encoded with the standard argv-escape helper; embedded `"`, `\`, spaces, and shell
-/// metacharacters all pass through unmangled. `-NoProfile` skips user profile scripts (fast
-/// startup, no unrelated side effects); `-NonInteractive` makes the child fail fast on any
-/// prompt instead of hanging on stdin.
-///
-/// Returns [`std::io::Error`] mirroring the underlying Win32 call so the shell tool can surface
-/// a standard error message. Which token a sandboxed Windows child should run under.
-///
-/// The two are different mechanisms, not two settings of one. `LowIntegrity` drops the token's
-/// integrity label so it cannot touch anything above Low; `WriteRestricted` leaves integrity
-/// alone and instead intersects every *write* access against a restricting-SID list, granting
-/// back exactly the workspace roots. Neither can express the other's boundary.
+/// The token variants are different mechanisms, not two settings of one. `LowIntegrity` drops
+/// the token's integrity label so it cannot touch anything above Low; `WriteRestricted` leaves
+/// integrity alone and instead intersects every *write* access against a restricting-SID list,
+/// granting back exactly the workspace roots. Neither can express the other's boundary.
+/// `AppContainer` is the other backend: no token of meka's making, a policy the OS enforces.
 pub(crate) enum WindowsConfinement {
     /// Reads everywhere, writes nowhere outside the Low-integrity surface.
     LowIntegrity,
     /// Reads everywhere, writes only beneath these canonical roots.
     WriteRestricted(Vec<std::path::PathBuf>),
+    /// Reads, writes, denials and the network as the policy says, inside a process security
+    /// environment created for this one command.
+    AppContainer(super::appcontainer::Policy),
+}
+
+/// Put the UI restrictions on a confined command's job. Without them a Low-integrity or
+/// write-restricted child reads and sets the user's clipboard, posts to other windows and reads
+/// their titles, and at `workspace` injects input: integrity and the restricting SIDs govern
+/// securable objects, and the desktop's USER objects are not among them. On the confined spawn's
+/// job alone, never inside `process::open_job`, which also serves the unconfined doors, whose
+/// children may drive the desktop. Part of the boundary, so a failure fails the spawn.
+fn restrict_job_ui(job: HANDLE, restrictions: u32) -> std::io::Result<()> {
+    let information = JOBOBJECT_BASIC_UI_RESTRICTIONS {
+        UIRestrictionsClass: restrictions,
+    };
+    // SAFETY: `information` is a complete, correctly sized block that outlives the call.
+    if unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectBasicUIRestrictions,
+            (&raw const information).cast(),
+            mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// `WRITE_RESTRICTED`: the token's restricting SIDs are intersected for write accesses only.
@@ -629,11 +655,22 @@ unsafe fn allocate_hidden_console() {
     }
 }
 
-/// Spawn one sandboxed child under `confinement`.
+/// Spawn `powershell.exe -NoProfile -NonInteractive -Command <command>` under `confinement`.
+/// Stdout and stderr are captured via anonymous pipes; stdin is not connected.
 ///
-/// Both variants share every step after the token: the pipe setup with its handle-inheritance
-/// narrowing, the job object, the suspended spawn. Only the token differs, and only the
-/// restricted path needs a console.
+/// Every variant shares every step after the token or the environment: the pipe setup with its
+/// handle-inheritance narrowing, the job object with its UI restrictions, the suspended spawn.
+/// The token variants differ in the token, the AppContainer variant has none and attaches its
+/// environment to the spawn instead, and only the restricted path needs a console.
+///
+/// PowerShell parses its command line per `CommandLineToArgvW` rules, so the user command is
+/// encoded with the standard argv-escape helper; embedded `"`, `\`, spaces, and shell
+/// metacharacters all pass through unmangled. `-NoProfile` skips user profile scripts (fast
+/// startup, no unrelated side effects); `-NonInteractive` makes the child fail fast on any prompt
+/// instead of hanging on stdin.
+///
+/// Returns [`std::io::Error`] mirroring the underlying Win32 call so the shell tool can surface a
+/// standard error message.
 pub(crate) fn spawn_sandboxed_command(
     command: &str,
     confinement: &WindowsConfinement,
@@ -684,194 +721,25 @@ pub(crate) fn spawn_sandboxed_command(
     // wrapped in `OwnedHandle` to close on drop. Pipe handles transfer ownership into the
     // spawned child (for the write ends) or into the returned `File` (for the read ends).
     unsafe {
-        // 1. Open our own process token and duplicate it as a primary token we can modify. The
-        //    duplicate is what we'll confine; we must NOT mutate our own token.
-        let mut self_token: HANDLE = ptr::null_mut();
-        if OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT,
-            &mut self_token,
-        ) == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        let self_token = OwnedHandle(self_token);
-
-        let mut low_token: HANDLE = ptr::null_mut();
-        // `SecurityAnonymous` is the least-capable impersonation level and is the correct "don't
-        // care" value when the target is a primary token; per Win32 docs the parameter is only
-        // consulted for impersonation tokens, but some kernel versions have historically honored
-        // it, so pick the safest constant.
-        if DuplicateTokenEx(
-            self_token.as_raw(),
-            TOKEN_ASSIGN_PRIMARY
-                | TOKEN_DUPLICATE
-                | TOKEN_QUERY
-                | TOKEN_ADJUST_DEFAULT
-                | TOKEN_ADJUST_PRIVILEGES,
-            ptr::null(),
-            SecurityAnonymous,
-            TokenPrimary,
-            &mut low_token,
-        ) == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        let low_token = OwnedHandle(low_token);
-
-        // 2. Strip all privileges from the duplicate before anything else touches it.
-        //    Integrity-level enforcement already makes most privileges inert against Medium+
-        //    resources, but defense-in-depth: a Low-integrity token that still claims (say)
-        //    `SeShutdownPrivilege` is a sharper edge than one that has none at all. Passing
-        //    DisableAllPrivileges=TRUE with a NULL NewState disables every privilege on the token.
-        if AdjustTokenPrivileges(
-            low_token.as_raw(),
-            TRUE,
-            ptr::null(),
-            0,
-            ptr::null_mut(),
-            ptr::null_mut(),
-        ) == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        // 3. Build the Low-integrity SID via ConvertStringSidToSidW and point a
-        //    TOKEN_MANDATORY_LABEL at it. The SID buffer is allocated by the OS and must be
-        //    released via LocalFree.
-        let sid_str: Vec<u16> = "S-1-16-4096\0".encode_utf16().collect();
-        let mut low_sid: *mut core::ffi::c_void = ptr::null_mut();
-        if ConvertStringSidToSidW(sid_str.as_ptr(), &mut low_sid) == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let _sid_guard = LocalFreeGuard(low_sid);
-
-        let label = TOKEN_MANDATORY_LABEL {
-            Label: SID_AND_ATTRIBUTES {
-                Sid: low_sid,
-                Attributes: SE_GROUP_INTEGRITY,
-            },
-        };
-
-        // Applied only for the Low-integrity confinement. The restricted path deliberately
-        // leaves the integrity label alone: dropping to Low there would confine the child to
-        // the Low surface *as well*, which would take away the workspace the ACEs just granted.
-        if matches!(confinement, WindowsConfinement::LowIntegrity)
-            && SetTokenInformation(
-                low_token.as_raw(),
-                TokenIntegrityLevel,
-                &label as *const _ as *const core::ffi::c_void,
-                mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32,
-            ) == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        // 3b. For a workspace confinement, replace the token with a WRITE_RESTRICTED one whose
-        //     restricting SIDs are the logon session, Everyone, and one capability per root.
-        //
-        //     `WRITE_RESTRICTED` intersects the restricting list against the DACL for *write*
-        //     accesses only, so reads and execution are untouched and a write succeeds exactly
-        //     where one of those SIDs has a write ACE. The capability SIDs have one only on
-        //     their own workspace root, which is what makes the boundary.
-        let low_token = match confinement {
-            WindowsConfinement::LowIntegrity => low_token,
+        // 1. The confining object first, before any pipe exists: the AppContainer path makes its
+        //    environment from the policy alone and derives no token; the token paths derive theirs
+        //    and attach no environment. A failure here is reported with nothing open.
+        let (environment, token) = match confinement {
+            WindowsConfinement::AppContainer(policy) => (
+                Some(super::appcontainer::Environment::create(
+                    super::appcontainer::Api::load().map_err(std::io::Error::other)?,
+                    policy,
+                )?),
+                None,
+            ),
+            WindowsConfinement::LowIntegrity => (None, Some(derive_confined_token(None)?)),
             WindowsConfinement::WriteRestricted(roots) => {
-                let mut restricting: Vec<SID_AND_ATTRIBUTES> = Vec::new();
-                let mut sid_guards: Vec<LocalFreeGuard> = Vec::new();
-
-                // Held in this scope so the pointer handed to `CreateRestrictedToken` below
-                // stays valid; it is dropped with the rest of the arm, after the call.
-                let logon_sid = logon_session_sid(low_token.as_raw());
-                if let Some(bytes) = logon_sid.as_ref() {
-                    restricting.push(SID_AND_ATTRIBUTES {
-                        Sid: bytes.as_ptr() as *mut core::ffi::c_void,
-                        Attributes: 0,
-                    });
-                }
-                // Everyone, plus one capability per root.
-                //
-                // Everyone is load-bearing, and not for the reason a filesystem test suggests.
-                // Dropping it still let a child create a file under a granted root, overwrite one
-                // already there, and write to a capture pipe: by that measure it looks free, and
-                // removing it looks like a pure tightening. What it actually costs is the shell
-                // itself. meka spawns `powershell.exe`, and with the restricting list cut to the
-                // logon SID and the capability, PowerShell dies before evaluating anything with
-                // `Starting the CLR failed with HRESULT 80070005` (E_ACCESSDENIED). Not one command
-                // in five ran. Measured both ways on Windows 11 10.0.26200; the .NET runtime
-                // reaches something on startup that only Everyone admits.
-                //
-                // The price is the one hole the docs name: a file carrying an explicit
-                // `Everyone: Write` ACE stays writable from outside the workspace. That is the
-                // only case the two configurations differed on, apart from the shell not
-                // starting. Paying it buys a workspace level that can run commands at all.
-                //
-                // Probe the shell, not just the filesystem, before touching this list. A
-                // `cmd.exe` probe passes every case here and tells you nothing about the
-                // process meka actually spawns.
-                let mut sid_texts: Vec<String> = vec!["S-1-1-0".to_string()];
-                sid_texts.extend(roots.iter().map(|root| workspace_write_sid(root)));
-                for text in &sid_texts {
-                    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-                    let mut sid: *mut core::ffi::c_void = ptr::null_mut();
-                    if ConvertStringSidToSidW(wide.as_ptr(), &mut sid) == 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    sid_guards.push(LocalFreeGuard(sid));
-                    restricting.push(SID_AND_ATTRIBUTES {
-                        Sid: sid,
-                        Attributes: 0,
-                    });
-                }
-
-                let mut restricted: HANDLE = ptr::null_mut();
-                // Derived from our *own* token, not from the privilege-stripped duplicate.
-                //
-                // `CreateProcessAsUserW` normally needs `SE_ASSIGNPRIMARYTOKEN` and
-                // `SE_INCREASE_QUOTA`, and waives them only when the token is recognizably a
-                // restricted version of the caller's. Deriving from the duplicate that step 2 had
-                // already emptied of privileges broke that lineage: the kernel refused with
-                // "SE_INCREASE_QUOTA_NAME not held", fell through to `CreateProcessWithTokenW`, and
-                // that rejected the restricted token outright with ERROR_INVALID_PARAMETER. Both
-                // commands then failed to spawn at all. `DISABLE_MAX_PRIVILEGE` alongside
-                // `WRITE_RESTRICTED`.
-                //
-                // The restricted token is derived from `self_token`, which never went through
-                // the privilege strip that step 2 applies to the Low-integrity duplicate -- so
-                // without this the `read` child ran with zero privileges while the `workspace`
-                // child kept meka's entire set, and the stronger-sounding level was the less
-                // hardened one. Restricting SIDs bound *write access checks*; they do nothing
-                // about privileges, which are checked separately and several of which exist
-                // precisely to bypass a DACL. Launched from an elevated shell the child kept
-                // `SeImpersonatePrivilege`, enabled by default, which is the whole "Potato"
-                // family and takes the boundary with it; unelevated it still kept
-                // `SeShutdownPrivilege`, so `shutdown /r` worked from inside a sandbox that
-                // promises the command cannot change the machine.
-                //
-                // This does not touch the "restricted version of the caller's token" lineage
-                // that `CreateProcessAsUserW`'s privilege waiver depends on -- the derivation
-                // is still from `self_token` -- so the fallback bug that cost a live debugging
-                // round should not return. It is verified on the box regardless.
-                if CreateRestrictedToken(
-                    self_token.as_raw(),
-                    WRITE_RESTRICTED | DISABLE_MAX_PRIVILEGE,
-                    0,
-                    ptr::null(),
-                    0,
-                    ptr::null(),
-                    restricting.len() as u32,
-                    restricting.as_ptr(),
-                    &mut restricted,
-                ) == 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                OwnedHandle(restricted)
+                (None, Some(derive_confined_token(Some(roots))?))
             }
         };
 
-        // 4. Create two anonymous pipes with **non-inheritable** handles. We use
-        //    `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (step 6) to narrow inheritance to exactly the
+        // 2. Create two anonymous pipes with **non-inheritable** handles. We use
+        //    `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (step 5) to narrow inheritance to exactly the
         //    three handles our child needs; the inherit flag is only flipped to TRUE briefly on
         //    those three handles, not the read ends, which eliminates the classic
         //    CreatePipe→SetHandleInformation→CreateProcess race where a concurrent CreateProcess in
@@ -885,12 +753,12 @@ pub(crate) fn spawn_sandboxed_command(
         let (stdout_read, stdout_write) = create_pipe(&sa_noninherit)?;
         let (stderr_read, stderr_write) = create_pipe(&sa_noninherit)?;
 
-        // 5. Open NUL as the child's stdin. Non-inheritable; inherit flag flipped on just before
+        // 3. Open NUL as the child's stdin. Non-inheritable; inherit flag flipped on just before
         //    CreateProcess.
         let nul_stdin = open_nul_read(&sa_noninherit)?;
 
-        // 6. Promote the three child-bound handles to inheritable. The
-        //    PROC_THREAD_ATTRIBUTE_HANDLE_LIST filter (step 7) requires each listed handle to have
+        // 4. Promote the three child-bound handles to inheritable. The
+        //    PROC_THREAD_ATTRIBUTE_HANDLE_LIST filter (step 5) requires each listed handle to have
         //    HANDLE_FLAG_INHERIT set.
         if SetHandleInformation(
             stdout_write.as_raw(),
@@ -908,7 +776,7 @@ pub(crate) fn spawn_sandboxed_command(
             return Err(std::io::Error::last_os_error());
         }
 
-        // 7. Build a STARTUPINFOEXW with PROC_THREAD_ATTRIBUTE_HANDLE_LIST naming exactly the three
+        // 5. Build a STARTUPINFOEXW with PROC_THREAD_ATTRIBUTE_HANDLE_LIST naming exactly the three
         //    handles we want the child to see. With bInheritHandles=TRUE and
         //    EXTENDED_STARTUPINFO_PRESENT, the child inherits *only* the listed handles even if
         //    other inheritable handles exist in this process.
@@ -917,7 +785,12 @@ pub(crate) fn spawn_sandboxed_command(
             stdout_write.as_raw(),
             stderr_write.as_raw(),
         ];
-        let attr_list = ProcThreadAttributeList::new_with_handle_list(&child_handles)?;
+        let attr_list = ProcThreadAttributeList::new_with_handle_list(
+            &child_handles,
+            environment
+                .as_ref()
+                .map(super::appcontainer::Environment::handle),
+        )?;
 
         let mut startup: STARTUPINFOEXW = mem::zeroed();
         startup.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -929,28 +802,35 @@ pub(crate) fn spawn_sandboxed_command(
 
         let mut proc_info: PROCESS_INFORMATION = mem::zeroed();
 
-        // 8. Create the job BEFORE spawning, so the child can be assigned to it while still
+        // 6. Create the job BEFORE spawning, so the child can be assigned to it while still
         //    suspended. It is the door's job (kill-on-close, capped at the machine's memory): when
         //    `SandboxedChild` drops, the job handle drops too, and that automatic close cascades to
         //    every assigned process, eliminating grandchild leaks on normal exit, kill, or panic.
         //    Unlike the door, this path fails the spawn when the job cannot be made, because the
         //    job is part of the boundary a confined command runs behind.
         let job = crate::process::open_job(crate::process::JobEnd::WithHandle)?;
+        restrict_job_ui(
+            job.as_raw_handle(),
+            crate::sandbox::appcontainer::ui_restrictions_here(),
+        )?;
 
-        // 9. Spawn SUSPENDED. We assign the child to the job before any of its code runs; otherwise
+        // 7. Spawn SUSPENDED. We assign the child to the job before any of its code runs; otherwise
         //    the child could spawn a grandchild outside the job in the gap between create and
         //    assign. With `CREATE_SUSPENDED` set, the main thread is created suspended and we
         //    manually resume it after assignment.
-        let spawn_result = create_process_confined(
-            low_token.as_raw(),
-            &cwd_utf16,
-            &cmd_line,
-            &startup,
-            &mut proc_info,
-            // The restricted token cannot make a console, so it must inherit the one
-            // `ensure_console` guaranteed rather than ask for a fresh one.
-            !matches!(confinement, WindowsConfinement::WriteRestricted(_)),
-        );
+        let spawn_result = match &token {
+            Some(token) => create_process_confined(
+                token.as_raw(),
+                &cwd_utf16,
+                &cmd_line,
+                &startup,
+                &mut proc_info,
+                // The restricted token cannot make a console, so it must inherit the one
+                // `ensure_console` guaranteed rather than ask for a fresh one.
+                !matches!(confinement, WindowsConfinement::WriteRestricted(_)),
+            ),
+            None => create_process_in_environment(&cwd_utf16, &cmd_line, &startup, &mut proc_info),
+        };
 
         // Parent no longer needs the child-side write ends or the NUL stdin handle regardless
         // of success/failure. Dropping the OwnedHandle wrappers closes them. On success,
@@ -963,7 +843,7 @@ pub(crate) fn spawn_sandboxed_command(
 
         spawn_result?;
 
-        // 10. Assign the suspended child to the job, then resume.
+        // 8. Assign the suspended child to the job, then resume.
         if AssignProcessToJobObject(job.as_raw_handle(), proc_info.hProcess) == 0 {
             let error = std::io::Error::last_os_error();
             // Best-effort kill of the suspended child before bailing, so the orphan doesn't sit
@@ -1004,7 +884,160 @@ pub(crate) fn spawn_sandboxed_command(
             job,
             stdout: Some(File::from_raw_handle(stdout_handle as _)),
             stderr: Some(File::from_raw_handle(stderr_handle as _)),
+            _environment: environment,
         })
+    }
+}
+
+/// The primary token a confined child runs under: meka's own token duplicated and stripped of
+/// every privilege, then dropped to Low integrity for the read-only child, or re-derived from
+/// meka's own as a `WRITE_RESTRICTED` token carrying one capability per workspace root for the
+/// writable one. Never meka's own token itself: the duplicate is what is confined.
+///
+/// The two shapes are different mechanisms rather than two settings of one, which is why the
+/// restricted token keeps its integrity label: dropping it to Low as well would confine the child
+/// to the Low surface too and take away the workspace the capability ACEs grant.
+unsafe fn derive_confined_token(
+    write_restricted_roots: Option<&[std::path::PathBuf]>,
+) -> std::io::Result<OwnedHandle> {
+    // SAFETY: every call below is given live handles and buffers that outlive it and has its
+    // return value checked; each handle is wrapped in `OwnedHandle`, so an early return closes it.
+    unsafe {
+        let mut self_token: HANDLE = ptr::null_mut();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT,
+            &mut self_token,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let self_token = OwnedHandle(self_token);
+
+        // `SecurityAnonymous` is the least-capable impersonation level: the parameter is documented
+        // as consulted for impersonation tokens alone, and the safest constant costs nothing on a
+        // kernel that consults it for a primary token anyway.
+        let mut low_token: HANDLE = ptr::null_mut();
+        if DuplicateTokenEx(
+            self_token.as_raw(),
+            TOKEN_ASSIGN_PRIMARY
+                | TOKEN_DUPLICATE
+                | TOKEN_QUERY
+                | TOKEN_ADJUST_DEFAULT
+                | TOKEN_ADJUST_PRIVILEGES,
+            ptr::null(),
+            SecurityAnonymous,
+            TokenPrimary,
+            &mut low_token,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let low_token = OwnedHandle(low_token);
+
+        // Every privilege is disabled on the duplicate before anything else touches it. Integrity
+        // enforcement already makes most privileges inert against Medium resources, and a
+        // Low-integrity token that still claims `SeShutdownPrivilege` is a sharper edge than one
+        // with none. `DisableAllPrivileges` with a null new state disables them all.
+        if AdjustTokenPrivileges(
+            low_token.as_raw(),
+            TRUE,
+            ptr::null(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let Some(roots) = write_restricted_roots else {
+            // The Low-integrity label, through a SID the OS allocates and `LocalFree` releases.
+            let sid_str: Vec<u16> = "S-1-16-4096\0".encode_utf16().collect();
+            let mut low_sid: *mut core::ffi::c_void = ptr::null_mut();
+            if ConvertStringSidToSidW(sid_str.as_ptr(), &mut low_sid) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let _sid_guard = LocalFreeGuard(low_sid);
+            let label = TOKEN_MANDATORY_LABEL {
+                Label: SID_AND_ATTRIBUTES {
+                    Sid: low_sid,
+                    Attributes: SE_GROUP_INTEGRITY,
+                },
+            };
+            if SetTokenInformation(
+                low_token.as_raw(),
+                TokenIntegrityLevel,
+                &label as *const _ as *const core::ffi::c_void,
+                mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32,
+            ) == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            return Ok(low_token);
+        };
+
+        // A `WRITE_RESTRICTED` token intersects its restricting SIDs against the DACL for write
+        // accesses alone, so reads and execution are untouched and a write succeeds exactly where
+        // one of those SIDs has a write ACE. The capability SIDs have one on their own workspace
+        // root alone, which is what makes the boundary. The list is the logon session, Everyone and
+        // one capability per root.
+        let mut restricting: Vec<SID_AND_ATTRIBUTES> = Vec::new();
+        let mut sid_guards: Vec<LocalFreeGuard> = Vec::new();
+        // Held in this scope so the pointer handed to `CreateRestrictedToken` below stays valid
+        // through the call.
+        let logon_sid = logon_session_sid(low_token.as_raw());
+        if let Some(bytes) = logon_sid.as_ref() {
+            restricting.push(SID_AND_ATTRIBUTES {
+                Sid: bytes.as_ptr() as *mut core::ffi::c_void,
+                Attributes: 0,
+            });
+        }
+        // Everyone is load-bearing for the shell itself rather than for any file: with the list cut
+        // to the logon SID and the capability, PowerShell dies before evaluating anything with
+        // `Starting the CLR failed with HRESULT 80070005`, because the .NET runtime reaches
+        // something on startup that only Everyone admits (measured on Windows 11 10.0.26200; a
+        // `cmd.exe` probe passes every case and says nothing about the process meka spawns). The
+        // price is the one hole the docs name: a file carrying an explicit `Everyone: Write` ACE
+        // stays writable from outside the workspace.
+        let mut sid_texts: Vec<String> = vec!["S-1-1-0".to_string()];
+        sid_texts.extend(roots.iter().map(|root| workspace_write_sid(root)));
+        for text in &sid_texts {
+            let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut sid: *mut core::ffi::c_void = ptr::null_mut();
+            if ConvertStringSidToSidW(wide.as_ptr(), &mut sid) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            sid_guards.push(LocalFreeGuard(sid));
+            restricting.push(SID_AND_ATTRIBUTES {
+                Sid: sid,
+                Attributes: 0,
+            });
+        }
+
+        // Derived from meka's own token rather than from the privilege-stripped duplicate:
+        // `CreateProcessAsUserW` waives `SE_ASSIGNPRIMARYTOKEN` and `SE_INCREASE_QUOTA` only for a
+        // token that is recognizably a restricted version of the caller's, and the duplicate is not
+        // one. `DISABLE_MAX_PRIVILEGE` strips the privileges here instead, which restricting SIDs
+        // do nothing about: they bound write access checks, and several privileges exist to bypass
+        // a DACL, `SeImpersonatePrivilege` under an elevated meka and `SeShutdownPrivilege` under
+        // any.
+        let mut restricted: HANDLE = ptr::null_mut();
+        if CreateRestrictedToken(
+            self_token.as_raw(),
+            WRITE_RESTRICTED | DISABLE_MAX_PRIVILEGE,
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            restricting.len() as u32,
+            restricting.as_ptr(),
+            &mut restricted,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(OwnedHandle(restricted))
     }
 }
 
@@ -1186,6 +1219,51 @@ unsafe fn create_process_confined(
     Ok(())
 }
 
+/// Create a process inside the security environment the attribute list names: `CreateProcessW`
+/// with the caller's own token, since the environment is what confines the child, and the OS
+/// makes it an AppContainer at Low integrity on its own. `CREATE_NO_WINDOW` is accepted here,
+/// measured, so no console is inherited.
+unsafe fn create_process_in_environment(
+    cwd_utf16: &[u16],
+    cmd_line_utf8: &str,
+    startup: &STARTUPINFOEXW,
+    proc_info: &mut PROCESS_INFORMATION,
+) -> std::io::Result<()> {
+    let creation_flags = CREATE_NO_WINDOW
+        | EXTENDED_STARTUPINFO_PRESENT
+        | CREATE_UNICODE_ENVIRONMENT
+        | CREATE_SUSPENDED;
+    let startup_ptr = startup as *const STARTUPINFOEXW as *const STARTUPINFOW;
+    // The same scrubbed block as the token paths: the OS redirects `LOCALAPPDATA`, `TEMP` and
+    // `TMP` into the environment's package directory and needs `SYSTEMROOT` and `LOCALAPPDATA`
+    // present to do so (error 203 otherwise, measured), which the deny-list scrub keeps.
+    let env_block = build_scrubbed_env_block_utf16();
+    let mut cmd_line_utf16: Vec<u16> = cmd_line_utf8
+        .encode_utf16()
+        .chain(std::iter::once(0u16))
+        .collect();
+    // SAFETY: every pointer is valid for the call per the caller's obligations; Win32 writes to
+    // `proc_info` on success and copies the environment block before returning.
+    let ok = unsafe {
+        CreateProcessW(
+            ptr::null(),
+            cmd_line_utf16.as_mut_ptr(),
+            ptr::null(),
+            ptr::null(),
+            TRUE,
+            creation_flags,
+            env_block.as_ptr() as *const core::ffi::c_void,
+            cwd_utf16.as_ptr(),
+            startup_ptr,
+            proc_info,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Build a UTF-16 `NAME=VALUE\0NAME=VALUE\0\0` environment block for the sandboxed child.
 /// Delegates to [`super::sandbox_child_env`] for the filter (Windows uses the deny-list arm) so
 /// the Low-integrity spawn path stays in sync with the Unix sandbox paths.
@@ -1214,30 +1292,39 @@ fn append_env_entry(block: &mut Vec<u16>, name: &std::ffi::OsStr, value: &std::f
     block.push(0);
 }
 
-/// RAII wrapper around `PROC_THREAD_ATTRIBUTE_LIST`. Owns both the attribute-list backing
-/// buffer and the HANDLE array it points into; Win32 stores the handle-list address (not a
-/// copy), so the array must outlive any `CreateProcess*` call that consumes the attribute list.
+/// RAII wrapper around `PROC_THREAD_ATTRIBUTE_LIST`. Owns the attribute-list backing buffer and
+/// the HANDLE array and environment handle it points into; Win32 stores each value's address (not
+/// a copy), so both must outlive any `CreateProcess*` call that consumes the attribute list.
 struct ProcThreadAttributeList {
-    // Both fields are kept alive for Drop. The Vec's heap buffer is the attribute-list storage;
-    // `list_ptr` caches a stable mutable pointer to it. The boxed handle slice is referenced (by
-    // pointer) from inside the attribute-list buffer, so it must not move or drop while the list
-    // is alive.
+    // Every field is kept alive for Drop. The Vec's heap buffer is the attribute-list storage;
+    // `list_ptr` caches a stable mutable pointer to it. The boxed handle slice and the boxed
+    // environment handle are referenced (by pointer) from inside the attribute-list buffer, so
+    // they must not move or drop while the list is alive.
     _buffer: Vec<u8>,
     _handles: Box<[HANDLE]>,
+    _environment: Box<HANDLE>,
     list_ptr: LPPROC_THREAD_ATTRIBUTE_LIST,
 }
 
+/// `ProcThreadAttributeSecurityEnvironment` (35) with the input flag, as mxc defines it: the
+/// attribute that puts a child inside a process security environment.
+const PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT: usize = 35 | 0x0002_0000;
+
 impl ProcThreadAttributeList {
-    /// Build a one-attribute list containing a `HANDLE_LIST` attribute referencing the supplied
-    /// handles. `UpdateProcThreadAttribute` stores the pointer to the handle array, not a copy;
-    /// the array is boxed into the returned wrapper so it stays at a fixed address for the
-    /// wrapper's lifetime.
-    unsafe fn new_with_handle_list(handles: &[HANDLE]) -> std::io::Result<Self> {
+    /// Build a list with a `HANDLE_LIST` attribute referencing the supplied handles, and the
+    /// security-environment attribute naming `environment` where there is one.
+    /// `UpdateProcThreadAttribute` stores the pointer to each value, not a copy; both are boxed
+    /// into the returned wrapper so they stay at fixed addresses for the wrapper's lifetime.
+    unsafe fn new_with_handle_list(
+        handles: &[HANDLE],
+        environment: Option<HANDLE>,
+    ) -> std::io::Result<Self> {
+        let count = 1 + u32::from(environment.is_some());
         // First call: buffer=NULL, size=0 → fails with ERROR_INSUFFICIENT_BUFFER but writes the
         // required size.
         let mut size: usize = 0;
         unsafe {
-            InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size);
+            InitializeProcThreadAttributeList(ptr::null_mut(), count, 0, &mut size);
         }
         if size == 0 {
             return Err(std::io::Error::last_os_error());
@@ -1248,7 +1335,7 @@ impl ProcThreadAttributeList {
 
         // SAFETY: `list_ptr` points to a correctly-sized buffer from the previous size query,
         // and `size` is that queried value.
-        if unsafe { InitializeProcThreadAttributeList(list_ptr, 1, 0, &mut size) } == 0 {
+        if unsafe { InitializeProcThreadAttributeList(list_ptr, count, 0, &mut size) } == 0 {
             return Err(std::io::Error::last_os_error());
         }
 
@@ -1276,9 +1363,32 @@ impl ProcThreadAttributeList {
             return Err(error);
         }
 
+        let boxed_environment: Box<HANDLE> = Box::new(environment.unwrap_or(ptr::null_mut()));
+        // SAFETY: as above; the boxed handle lives for 'self and the size is a HANDLE's.
+        if environment.is_some()
+            && unsafe {
+                UpdateProcThreadAttribute(
+                    list_ptr,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT,
+                    (&raw const *boxed_environment).cast(),
+                    std::mem::size_of::<HANDLE>(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                )
+            } == 0
+        {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: Initialize succeeded; must be paired with Delete regardless of subsequent
+            // failures.
+            unsafe { DeleteProcThreadAttributeList(list_ptr) };
+            return Err(error);
+        }
+
         Ok(Self {
             _buffer: buffer,
             _handles: boxed_handles,
+            _environment: boxed_environment,
             list_ptr,
         })
     }
@@ -1299,7 +1409,7 @@ impl Drop for ProcThreadAttributeList {
 }
 
 /// RAII guard for a pointer allocated by the OS and freed via `LocalFree`.
-struct LocalFreeGuard(*mut core::ffi::c_void);
+pub(super) struct LocalFreeGuard(pub(super) *mut core::ffi::c_void);
 
 impl Drop for LocalFreeGuard {
     fn drop(&mut self) {

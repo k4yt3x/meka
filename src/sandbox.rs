@@ -8,24 +8,27 @@
 //! with a right over pathname Unix sockets (see
 //! `MIN_LANDLOCK_ABI`, which is Linux-only and so deliberately not an intra-doc link: the link
 //! would be unresolvable on the two targets where the item does not exist, and CI gates rustdoc on
-//! all three). On macOS, uses `sandbox-exec`. On Windows there are two mechanisms rather than one:
-//! `read` spawns the child with a duplicated primary token dropped to Low integrity via
-//! `SetTokenInformation(TokenIntegrityLevel, …)`, which blocks writes to anything outside the
-//! documented Low-integrity surface, while `workspace` uses a `WRITE_RESTRICTED` token plus a
-//! per-root capability ACE and deliberately leaves the integrity label alone. Where no backend is
-//! usable, sandboxing is unavailable and shell execution at `read` hard-errors rather than running
-//! unconfined.
+//! all three). On macOS, uses `sandbox-exec`. On Windows there are two backends: `appcontainer`,
+//! a process security environment the OS enforces, preferred where the API exists; and
+//! `restricted-token`, under which `read` spawns the child with a duplicated primary token dropped
+//! to Low integrity via `SetTokenInformation(TokenIntegrityLevel, …)`, which blocks writes to
+//! anything outside the documented Low-integrity surface, while `workspace` uses a
+//! `WRITE_RESTRICTED` token plus a per-root capability ACE and deliberately leaves the integrity
+//! label alone. Where no backend is usable, sandboxing is unavailable and shell execution at `read`
+//! hard-errors rather than running unconfined.
 //!
-//! **What every backend leaves open**: the network, unless `[permissions].network` is `none`, which
-//! Bubblewrap holds by unsharing the namespace, Landlock by refusing every TCP port from ABI v4
-//! and `sandbox-exec` by withholding the outbound rule, and which Windows cannot hold; and reads
-//! outside the boundary only where `[permissions].confine_reads` is off and the session is a root
-//! one, since a sub-agent's reads are confined to its scope on every backend but Windows. The
-//! boundary these enforce is "this command cannot change the machine", not "this command cannot
-//! send anything". Landlock alone also cannot stop a command changing a file's mode,
-//! owner, timestamps or extended attributes: no ABI has a right for those, and Bubblewrap's
-//! read-only bind is what refuses them.
+//! **What every backend leaves open**: the network, unless `[permissions].network` narrows it,
+//! which each backend holds as far as it can ([`held_network`]): `none` by Bubblewrap unsharing the
+//! namespace, Landlock refusing every TCP port from ABI v4, `sandbox-exec` withholding the outbound
+//! rule and the AppContainer granting no network capability, `remote` by the AppContainer's ingress
+//! table alone, and nothing by the Windows restricted token; and reads outside the boundary only
+//! where `[permissions].confine_reads` is off and the session is a root one, since a sub-agent's
+//! reads are confined to its scope on every backend but the restricted token. The boundary these
+//! enforce is "this command cannot change the machine", not "this command cannot send anything".
+//! Landlock alone also cannot stop a command changing a file's mode, owner, timestamps or extended
+//! attributes: no ABI has a right for those, and Bubblewrap's read-only bind is what refuses them.
 
+pub(crate) mod appcontainer;
 #[cfg(target_os = "linux")]
 mod bubblewrap;
 #[cfg(target_os = "linux")]
@@ -45,6 +48,54 @@ pub(crate) fn capability_from_probe(probe: &BackendProbe) -> SandboxCapability {
     match probe {
         BackendProbe::Ok(capability) => capability.clone(),
         _ => SandboxCapability::Unavailable,
+    }
+}
+
+/// Whether a confined command's reads follow the read boundary under `capability`: every backend
+/// but the Windows restricted token, which has no say over reads. What the environment block
+/// tells the model, so it is not told the shell reaches what a tool refused.
+pub(crate) fn shell_confines_reads(capability: &SandboxCapability) -> bool {
+    match capability {
+        #[cfg(windows)]
+        SandboxCapability::RestrictedToken => false,
+        _ => true,
+    }
+}
+
+/// What a backend holds for a configured network: the value itself where it can, else the next
+/// narrower one it can, so a command never reaches more than the setting says. One definition for
+/// the spawn, the startup warning and the scope lines, so the three cannot disagree about what a
+/// command reaches; `web_fetch` holds the configured value itself, in-process.
+///
+/// Bubblewrap, Landlock and Seatbelt hold `remote` as `none`: each can cut a command off whole and
+/// none can keep it off this machine alone. The restricted token is the documented exception: it
+/// has no say over a command's network and nothing is narrower than `none`, so a command under it
+/// reaches the host at every setting. An unavailable backend spawns nothing and holds the setting
+/// as stated.
+pub(crate) fn held_network(
+    capability: &SandboxCapability,
+    configured: crate::config::Network,
+) -> crate::config::Network {
+    use crate::config::Network;
+    if matches!(capability, SandboxCapability::Unavailable) {
+        return configured;
+    }
+    #[cfg(windows)]
+    if matches!(capability, SandboxCapability::RestrictedToken) {
+        return Network::Host;
+    }
+    // Schema 1.1 holds all three settings. 1.0 has no ingress table and so no loopback
+    // exemption: a command cannot reach this machine's own addresses, which is `remote`.
+    if let SandboxCapability::AppContainer { minor, .. } = capability {
+        return if *minor >= appcontainer::SCHEMA_MINOR_WITH_INGRESS || configured != Network::Host {
+            configured
+        } else {
+            Network::Remote
+        };
+    }
+    match configured {
+        Network::Host => Network::Host,
+        Network::Remote | Network::None => Network::None,
     }
 }
 
@@ -118,14 +169,6 @@ impl Confinement {
 
     /// What this call may reach on the network. The host's for an unconfined call, since nothing
     /// holds a narrower setting there.
-    #[cfg_attr(
-        windows,
-        allow(
-            dead_code,
-            reason = "the Windows token cannot cut a command off the network, so its spawn path \
-                      never asks"
-        )
-    )]
     pub(crate) fn network(&self) -> crate::config::Network {
         match self {
             Self::Unconfined => crate::config::Network::Host,
@@ -147,13 +190,6 @@ impl Confinement {
     }
 
     /// The roots this call may read beneath, or `None` when it reads everywhere.
-    #[cfg_attr(
-        windows,
-        allow(
-            dead_code,
-            reason = "the Windows spawn cannot confine reads; `warn_if_sandbox_issues` says so"
-        )
-    )]
     pub(crate) fn readable(&self) -> Option<&[std::path::PathBuf]> {
         match self {
             Self::Unconfined => None,
@@ -186,10 +222,19 @@ pub(crate) fn release_process_grants() {
 #[derive(Debug, Clone)]
 pub(crate) struct SandboxResolution {
     pub(crate) backend: crate::config::SandboxBackend,
-    /// True when the backend was auto-resolved (the user pinned nothing). Gates the "stronger
-    /// sandbox available; install bwrap" startup warn, which must not nag a user who chose
-    /// landlock.
+    /// True when the backend was auto-resolved (the user pinned nothing). Gates the fallback
+    /// startup warning, which must not nag a user who chose the fallback.
     pub(crate) auto_resolved: bool,
+    pub(crate) probe: BackendProbe,
+    /// The stronger backend auto-resolution passed over, with its probe, so the warnings can say
+    /// why; `None` for a pin and for the strongest backend.
+    pub(crate) fallback_from: Option<PassedOver>,
+}
+
+/// A backend auto-resolution probed and did not pick, with the probe that decided it.
+#[derive(Debug, Clone)]
+pub(crate) struct PassedOver {
+    pub(crate) backend: SandboxBackend,
     pub(crate) probe: BackendProbe,
 }
 
@@ -206,29 +251,64 @@ pub(crate) fn resolve_backend(
             probe: BackendProbe::Missing {
                 reason: "sandbox disabled in config".to_string(),
             },
+            fallback_from: None,
         };
     }
-    let (backend, auto_resolved, probe) = resolve_sandbox_backend(configured);
-    SandboxResolution {
-        backend,
-        auto_resolved,
-        probe,
-    }
+    resolve_sandbox_backend(configured)
 }
-/// Resolve the active Linux sandbox backend.
+/// Resolve the active sandbox backend.
 ///
 /// When the user pinned `[shell].sandbox_backend = "..."` in `config.toml`, that choice is binding,
 /// no silent fallback at runtime; an unavailable explicit backend surfaces at use time via the
-/// `BackendProbe::Missing` / `UserNamespaceDenied` variants.
+/// `BackendProbe::Missing` / `UserNamespaceDenied` variants, and one from another platform via
+/// `UnsupportedPlatform`, which [`probe_backend`] answers before anything costs.
 ///
-/// When the value is unset (`None`), meka probes bubblewrap and picks it if available, falling back
-/// to landlock otherwise. The `auto_resolved` flag is propagated so the startup warn helper can
-/// nudge the user once toward installing bwrap (without nagging users who explicitly pinned
-/// landlock).
+/// When the value is unset (`None`), each platform with a choice probes its strongest backend and
+/// picks it if usable, falling back to the other otherwise. The `auto_resolved` flag is propagated
+/// so the startup warn helper can nudge the user once toward the stronger one (without nagging
+/// users who explicitly pinned the fallback).
+pub(crate) fn resolve_sandbox_backend(configured: Option<SandboxBackend>) -> SandboxResolution {
+    #[cfg(target_os = "linux")]
+    {
+        resolve_linux_backend(configured)
+    }
+    #[cfg(windows)]
+    {
+        resolve_windows_backend(configured, probe_backend)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        match configured {
+            Some(explicit) => SandboxResolution {
+                backend: explicit,
+                auto_resolved: false,
+                probe: probe_backend(explicit),
+                fallback_from: None,
+            },
+            // `SandboxBackend::Landlock` is a stand-in: this platform has one backend and no value
+            // names it, so the field is never consulted here, and `backend_label` names the
+            // mechanism in its place wherever a message would print it.
+            None => {
+                let probe = match detect() {
+                    SandboxCapability::Unavailable => BackendProbe::Missing {
+                        reason: "no platform sandbox backend available".to_string(),
+                    },
+                    capability => BackendProbe::Ok(capability),
+                };
+                SandboxResolution {
+                    backend: SandboxBackend::Landlock,
+                    auto_resolved: false,
+                    probe,
+                    fallback_from: None,
+                }
+            }
+        }
+    }
+}
+
+/// The Linux resolution: Bubblewrap when it probes usable, Landlock otherwise.
 #[cfg(target_os = "linux")]
-pub(crate) fn resolve_sandbox_backend(
-    configured: Option<SandboxBackend>,
-) -> (SandboxBackend, bool, BackendProbe) {
+fn resolve_linux_backend(configured: Option<SandboxBackend>) -> SandboxResolution {
     // Probe Bubblewrap only when its result is load-bearing for the resolution: either the user
     // pinned it explicitly, or no value was configured (so the probe decides whether to auto-pick
     // it). When the user pinned Landlock, the Bubblewrap smoke test would be pure waste
@@ -244,39 +324,73 @@ pub(crate) fn resolve_sandbox_backend(
             (picked, true, Some(probe))
         }
     };
-    // The Landlock arm discards `cached_bubblewrap_probe` because the auto-resolve path that
-    // populated it landed on Bubblewrap (it only falls through to Landlock when Bubblewrap probes
-    // unavailable, and that probe isn't useful for the chosen backend's status).
-    let backend_probe = match (backend, cached_bubblewrap_probe) {
-        (SandboxBackend::Bubblewrap, Some(probe)) => probe,
-        (SandboxBackend::Bubblewrap, None) => probe_backend(SandboxBackend::Bubblewrap),
+    // The auto-resolve path lands on Landlock only when Bubblewrap probed unusable, and that probe
+    // is then the fallback's cause rather than the chosen backend's status.
+    let (backend_probe, fallback_from) = match (backend, cached_bubblewrap_probe) {
+        (SandboxBackend::Bubblewrap, Some(probe)) => (probe, None),
+        (SandboxBackend::Bubblewrap, None) => (probe_backend(SandboxBackend::Bubblewrap), None),
         (SandboxBackend::BubblewrapLandlock, _) => {
-            probe_backend(SandboxBackend::BubblewrapLandlock)
+            (probe_backend(SandboxBackend::BubblewrapLandlock), None)
         }
-        (SandboxBackend::Landlock, _) => probe_backend(SandboxBackend::Landlock),
+        (other, bubblewrap) => (
+            probe_backend(other),
+            bubblewrap.map(|probe| PassedOver {
+                backend: SandboxBackend::Bubblewrap,
+                probe,
+            }),
+        ),
     };
-    (backend, auto_resolved, backend_probe)
+    SandboxResolution {
+        backend,
+        auto_resolved,
+        probe: backend_probe,
+        fallback_from,
+    }
 }
-/// Non-Linux platforms have a single platform-native sandbox (`sandbox-exec` on macOS,
-/// Low-integrity on Windows, nothing elsewhere). `[shell].sandbox_backend` is documented as
-/// Linux-only and is ignored here: the resolved capability comes from [`detect`] and is surfaced
-/// through the same `BackendProbe::Ok` envelope so the downstream wiring needs no platform branch.
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn resolve_sandbox_backend(
-    _configured: Option<SandboxBackend>,
-) -> (SandboxBackend, bool, BackendProbe) {
-    let probe = match detect() {
-        SandboxCapability::Unavailable => BackendProbe::Missing {
-            reason: "no platform sandbox backend available".to_string(),
-        },
-        #[cfg(target_os = "macos")]
-        capability @ SandboxCapability::SandboxExec => BackendProbe::Ok(capability),
-        #[cfg(target_os = "windows")]
-        capability @ SandboxCapability::LowIntegrity => BackendProbe::Ok(capability),
-    };
-    // `SandboxBackend::Landlock` is a stand-in here; the field exists for Linux config parity but
-    // is never consulted on this platform.
-    (SandboxBackend::Landlock, false, probe)
+
+/// The Windows resolution: AppContainer when it probes usable, the restricted token otherwise.
+///
+/// The probe is a parameter so the resolution can be tested with injected answers on every
+/// platform; production passes [`probe_backend`]. A pin probes that backend alone, since the
+/// AppContainer probe creates and closes an environment and a user who pinned the token did not
+/// ask for that on every start.
+#[cfg(any(windows, test))]
+fn resolve_windows_backend(
+    configured: Option<SandboxBackend>,
+    mut probe: impl FnMut(SandboxBackend) -> BackendProbe,
+) -> SandboxResolution {
+    if let Some(explicit) = configured {
+        return SandboxResolution {
+            backend: explicit,
+            auto_resolved: false,
+            probe: probe(explicit),
+            fallback_from: None,
+        };
+    }
+    // Auto-pick asks for schema 1.1, whose ingress table is what holds `host` as such; a pin
+    // accepts 1.0 and runs `host` as `remote`, which the startup warning says.
+    let appcontainer = probe(SandboxBackend::AppContainer);
+    if matches!(
+        appcontainer,
+        BackendProbe::Ok(SandboxCapability::AppContainer { minor, .. })
+            if minor >= appcontainer::SCHEMA_MINOR_WITH_INGRESS
+    ) {
+        return SandboxResolution {
+            backend: SandboxBackend::AppContainer,
+            auto_resolved: true,
+            probe: appcontainer,
+            fallback_from: None,
+        };
+    }
+    SandboxResolution {
+        backend: SandboxBackend::RestrictedToken,
+        auto_resolved: true,
+        probe: probe(SandboxBackend::RestrictedToken),
+        fallback_from: Some(PassedOver {
+            backend: SandboxBackend::AppContainer,
+            probe: appcontainer,
+        }),
+    }
 }
 /// What kind of `read`-level sandbox is available on this platform. Resolved once at config time
 /// and threaded into `tools::shell::ExecuteCommandTool` so the spawn path knows which argv shape
@@ -309,11 +423,23 @@ pub(crate) enum SandboxCapability {
     /// launchd, pasteboard, LaunchServices, etc.); network is unrestricted.
     #[cfg(target_os = "macos")]
     SandboxExec,
-    /// Windows: child runs with a duplicated primary token dropped to Low integrity. Blocks writes
-    /// outside the Low-integrity surface (user home, AppData, Program Files); IPC mutation is
-    /// constrained but not as tightly as Linux/macOS.
+    /// Windows: the child runs under a token derived from meka's own, dropped to Low integrity at
+    /// `read` and `WRITE_RESTRICTED` to the workspace roots at `workspace`. Blocks writes outside
+    /// those surfaces; it confines neither reads nor the network and cannot hide meka's store,
+    /// which is what the startup warning says when it is the automatic choice.
     #[cfg(target_os = "windows")]
-    LowIntegrity,
+    RestrictedToken,
+    /// Windows: the child runs inside a process security environment the OS enforces from a
+    /// policy meka encodes per command (`appcontainer`): reads and writes where the policy grants
+    /// them, meka's directories denied, the network as the policy's tables say, and the UI
+    /// restrictions in the spec. `minor` is the negotiated schema minor under major 1. Compiled
+    /// everywhere because the policy and `held_network` are judged by it on every platform in
+    /// tests.
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "constructed only by the Windows probe")
+    )]
+    AppContainer { minor: u16 },
     /// No sandbox available on this platform / configuration. Shell commands at `read` hard-error
     /// rather than silently bypass the sandbox.
     Unavailable,
@@ -342,45 +468,25 @@ pub(crate) enum BackendProbe {
     UserNamespaceDenied {
         stderr: String,
     },
-    /// The asked-for backend doesn't apply on this platform.
-    #[allow(
-        dead_code,
-        reason = "constructed only by tests::backend_unavailable_reason_maps_each_variant"
-    )]
+    /// The asked-for backend is another platform's: a `config.toml` shared across machines pins a
+    /// value this one has no mechanism for.
     UnsupportedPlatform,
 }
 
 /// Snapshot of the sandbox-relevant config slice. Carried by components that need to emit the
 /// sandbox warns (`warn_if_sandbox_issues`) without depending on the whole `ResolvedConfig`.
-///
-/// The fields are read only on Linux (`warn_if_sandbox_issues` early-returns on other platforms
-/// because the warnings reference Linux-only config keys), but the struct is constructed
-/// unconditionally so the hosts need no platform branch.
 #[derive(Clone)]
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(
-        dead_code,
-        reason = "the fields are read only on the Linux warning path"
-    )
-)]
 pub(crate) struct SandboxState {
     pub(crate) enabled: bool,
-    /// `[permissions].confine_reads`, for the one platform whose shell cannot hold it.
-    #[cfg_attr(
-        not(windows),
-        allow(dead_code, reason = "read only on the Windows warning path")
-    )]
+    /// `[permissions].confine_reads`, warned about where the backend's shell cannot hold it.
     pub(crate) confine_reads: bool,
-    /// `[permissions].network`, for the one platform whose shell cannot hold `none`.
-    #[cfg_attr(
-        not(windows),
-        allow(dead_code, reason = "read only on the Windows warning path")
-    )]
+    /// `[permissions].network`, warned about where the backend holds it as another value.
     pub(crate) network: crate::config::Network,
     pub(crate) backend: crate::config::SandboxBackend,
     pub(crate) auto_resolved: bool,
     pub(crate) probe: BackendProbe,
+    /// See [`SandboxResolution::fallback_from`].
+    pub(crate) fallback_from: Option<PassedOver>,
 }
 
 impl SandboxState {
@@ -397,6 +503,7 @@ impl SandboxState {
             backend: resolution.backend,
             auto_resolved: resolution.auto_resolved,
             probe: resolution.probe.clone(),
+            fallback_from: resolution.fallback_from.clone(),
         }
     }
 }
@@ -423,77 +530,127 @@ pub(crate) enum WarnContext {
 /// * **Warn 1** (backend unavailable): probe failed and `sandbox = true`. Shell commands at `read`
 ///   will hard-error at use time, so the user is told up front. Re-emitted at every lifecycle
 ///   boundary.
-/// * **Warn 2** (could be stronger): the user has not pinned a backend and the backend
-///   auto-resolved to landlock because bubblewrap was not usable. Nudges them once toward
-///   installing bwrap, names what Landlock gives up, with an explicit escape hatch (pin landlock to
-///   suppress). Startup only.
+/// * **Warn 2** (could be stronger): the user has not pinned a backend and the platform's weaker
+///   one was auto-picked because the stronger was not usable. Names what the weaker one gives up,
+///   with an explicit escape hatch (pin it to suppress). Startup only.
 pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext) {
     if !state.enabled {
         return;
     }
 
-    // `sandbox_backend` is a Linux-only config knob; the warnings below name it directly and would
-    // be misleading on macOS / Windows where the platform has a single fixed backend. On those
-    // hosts an unusable platform sandbox is a near-impossible configuration and surfaces at use
-    // time via the hard-error path in `src/tools/shell.rs` anyway.
-    #[cfg(target_os = "macos")]
-    {
-        let _ = (state, context);
+    let label = backend_label(state.backend, &state.probe);
+    if let Some(reason) = backend_unavailable_reason(&state.probe) {
+        let named = label.map(|label| format!("{label}: ")).unwrap_or_default();
+        // Under auto-resolution the stronger backend was probed too and found unusable, so its
+        // reason is given beside this one and no value is named: neither would work. Under a pin
+        // the other backend was not probed and may well work.
+        let passed_over = state
+            .fallback_from
+            .as_ref()
+            .filter(|_| state.auto_resolved)
+            .and_then(|passed| {
+                backend_unavailable_reason(&passed.probe)
+                    .map(|reason| format!("; {}: {reason}", passed.backend))
+            })
+            .unwrap_or_default();
+        let remedy = if passed_over.is_empty() {
+            backend_remedy(&state.probe)
+                .map(|remedy| format!("; {remedy}"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        tracing::warn!(
+            "no usable `read` sandbox ({named}{reason}{passed_over}); shell commands at `read` \
+             fail{remedy}"
+        );
+        return;
     }
 
-    // Integrity levels stop a Low-integrity process writing up, not reading up, so the one
-    // boundary Windows offers cannot hide meka's own store from a command at `read` the way the
-    // bubblewrap and seatbelt masks do; and a workspace root's inheritable ACE grants writes to
-    // everything under it, meka's directories included, with no way to subtract them afterwards.
-    // A signpost under `-v` rather than a warning: no setting changes it, so a warning at every
-    // launch would be noise with no remedy, and the shell and permissions pages state it.
-    #[cfg(windows)]
-    if context == WarnContext::Startup {
-        tracing::info!("the Windows sandbox cannot hide meka's config and credential store");
-        // A warning, once, because the user asked for a boundary this platform's shell cannot
-        // hold: the file tools keep it, a command does not, and the permissions page says so.
-        if state.confine_reads {
+    if context != WarnContext::Startup {
+        return;
+    }
+
+    // Every usable backend has a name: a platform with values names the value, and one without
+    // names its mechanism.
+    let label = label.unwrap_or("the platform sandbox");
+    let capability = capability_from_probe(&state.probe);
+
+    // A warning, once, where the backend cannot hold the configured value as such: a command runs
+    // under what the backend holds, `web_fetch` under the value itself, and the value to set is
+    // named where one silences the warning. The restricted token holds nothing narrower than the
+    // host, so there the warning says which tool the setting still reaches.
+    let configured = state.network;
+    let held = held_network(&capability, configured);
+    if held != configured {
+        if held.narrowest(configured) == held {
             tracing::warn!(
-                "`[permissions].confine_reads` holds for the file tools only: the Windows sandbox \
-                 cannot confine a command's reads"
+                "`[permissions].network = \"{configured}\"` is held as `{held}` by {label}; set \
+                 `[permissions].network = \"{held}\"` to silence this warning"
             );
-        }
-        if state.network == crate::config::Network::None {
+        } else {
             tracing::warn!(
-                "`[permissions].network = \"none\"` holds for `web_fetch` only: the Windows sandbox \
-                 cannot cut a command off the network"
+                "`[permissions].network = \"{configured}\"` holds for `web_fetch` only: the \
+                 {label} backend cannot cut a command off the network"
             );
         }
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(reason) = backend_unavailable_reason(&state.probe) {
-            // No specific alternative backend is suggested: the other one may also be unavailable
-            // on this host (a kernel without Landlock, bwrap not installed).
-            let backend = state.backend;
-            tracing::warn!(
-                "no usable `read` sandbox ({backend}: {reason}); shell commands at `read` fail \
-                 until `[shell].sandbox_backend` names one"
-            );
-            return;
-        }
+    // The same, once, for the read boundary: the file tools keep it, a command under this backend
+    // does not, and the environment block tells the model so.
+    if state.confine_reads && !shell_confines_reads(&capability) {
+        tracing::warn!(
+            "`[permissions].confine_reads` holds for the file tools only: the {label} backend \
+             cannot confine a command's reads"
+        );
+    }
 
-        // Quiet once the backend is pinned: a user who wrote `landlock` into the config chose it
-        // over Bubblewrap, and the shell page documents what that accepts. Metadata changes are
-        // named because no Landlock ABI mediates them and nothing else would say so: `chmod 777`
-        // on a credential file succeeds at `read`, and Bubblewrap's read-only bind is what
-        // refuses it.
-        if context == WarnContext::Startup
-            && state.auto_resolved
-            && matches!(state.backend, crate::config::SandboxBackend::Landlock)
-        {
-            tracing::warn!(
-                "sandboxing with Landlock because Bubblewrap is unavailable; Landlock cannot stop \
-                 a command changing a file's mode, owner, timestamps or attributes; pin the \
-                 sandbox backend to 'landlock' to silence this warning"
-            );
-        }
+    // Quiet once the backend is pinned: a user who wrote the fallback into the config chose it
+    // over the stronger backend, and the shell page documents what that accepts.
+    if state.auto_resolved
+        && let Some(warning) = fallback_warning(state.backend, state.fallback_from.as_ref())
+    {
+        tracing::warn!("{warning}");
+    }
+}
+
+/// What the platform's automatic fallback gives up and the pin that accepts it, or `None` for a
+/// backend that is the platform's strongest. `fallback_from` is the stronger backend's probe,
+/// which on Windows tells a build without the API from one whose API speaks schema 1.0, where
+/// AppContainer is usable under a pin. Judged by `cfg!` rather than `cfg` so the function has the
+/// same shape on macOS, where no backend is a fallback.
+fn fallback_warning(backend: SandboxBackend, fallback_from: Option<&PassedOver>) -> Option<String> {
+    if cfg!(target_os = "linux") && backend == SandboxBackend::Landlock {
+        // Metadata changes are named because no Landlock ABI mediates them and nothing else would
+        // say so: `chmod 777` on a credential file succeeds at `read`, and Bubblewrap's read-only
+        // bind is what refuses it.
+        Some(
+            "sandboxing with Landlock because Bubblewrap is unavailable; Landlock cannot stop a \
+             command changing a file's mode, owner, timestamps or attributes; pin \
+             `[shell].sandbox_backend` to 'landlock' to silence this warning"
+                .to_string(),
+        )
+    } else if cfg!(windows) && backend == SandboxBackend::RestrictedToken {
+        // Integrity levels stop a Low-integrity process writing up, not reading up, so the token
+        // cannot hide meka's own store from a command at `read` the way the AppContainer deny list
+        // and the Bubblewrap and Seatbelt masks do, and it has no say over reads or the network.
+        let gives_up = "the token cannot hide meka's store, confine a command's reads or cut a \
+                        command off the network";
+        Some(match fallback_from.map(|passed| &passed.probe) {
+            Some(BackendProbe::Ok(SandboxCapability::AppContainer { minor })) => format!(
+                "sandboxing with the restricted token because this build's AppContainer speaks \
+                 schema 1.{minor}, which holds `host` as `remote`; {gives_up}; pin \
+                 `[shell].sandbox_backend` to 'appcontainer' to run under it anyway, or to \
+                 'restricted-token' to silence this warning"
+            ),
+            _ => format!(
+                "sandboxing with the restricted token because AppContainer is unavailable; \
+                 {gives_up}; pin `[shell].sandbox_backend` to 'restricted-token' to silence this \
+                 warning"
+            ),
+        })
+    } else {
+        None
     }
 }
 
@@ -515,22 +672,110 @@ pub(crate) fn backend_unavailable_reason(probe: &BackendProbe) -> Option<String>
             }
         }
         BackendProbe::UnsupportedPlatform => {
-            Some("backend is not supported on this platform".to_string())
+            let takes = SandboxBackend::ON_THIS_PLATFORM
+                .iter()
+                .map(|backend| backend.name())
+                .collect::<Vec<_>>();
+            let takes = if takes.is_empty() {
+                "none".to_string()
+            } else {
+                takes.join(", ")
+            };
+            Some(format!(
+                "not a sandbox backend on {PLATFORM_NAME}, which takes {takes}"
+            ))
         }
     }
 }
 
-/// Probe a specific sandbox backend. Linux-only: the `SandboxBackend` enum represents
-/// Linux-specific backends, and non-Linux platforms route through `detect()` in the non-Linux
-/// `resolve_sandbox_backend` instead.
-#[cfg(target_os = "linux")]
-pub(crate) fn probe_backend(backend: crate::config::SandboxBackend) -> BackendProbe {
-    match backend {
-        crate::config::SandboxBackend::Landlock => probe_landlock(),
-        crate::config::SandboxBackend::Bubblewrap => probe_bubblewrap(),
-        crate::config::SandboxBackend::BubblewrapLandlock => {
-            require_landlock_layer(probe_bubblewrap(), landlock_abi_or_errno())
+/// This platform, as the refusal of another platform's backend names it.
+const PLATFORM_NAME: &str = if cfg!(target_os = "linux") {
+    "Linux"
+} else if cfg!(target_os = "macos") {
+    "macOS"
+} else if cfg!(windows) {
+    "Windows"
+} else {
+    "this platform"
+};
+
+/// The one mechanism a platform without backend values has, named where a message would otherwise
+/// print the resolver's stand-in; `None` where the platform has none.
+const PLATFORM_MECHANISM: Option<&str> = if cfg!(target_os = "macos") {
+    Some("sandbox-exec")
+} else {
+    None
+};
+
+/// What a message calls the backend: the value's own name on a platform that takes values, and
+/// for a value from another platform (a pin the user wrote) everywhere; on a platform that takes
+/// none, its one mechanism, since the resolver carries a stand-in there that no user wrote. `None`
+/// on a platform with neither.
+pub(crate) fn backend_label(backend: SandboxBackend, probe: &BackendProbe) -> Option<&'static str> {
+    if !SandboxBackend::ON_THIS_PLATFORM.is_empty()
+        || matches!(probe, BackendProbe::UnsupportedPlatform)
+    {
+        return Some(backend.display_name());
+    }
+    PLATFORM_MECHANISM
+}
+
+/// What fixes an unusable backend, appended to the startup warning and the shell's hard error, or
+/// `None` where no setting can: macOS has one backend and no value for it, so only a pin from
+/// another platform is fixable there.
+pub(crate) fn backend_remedy(probe: &BackendProbe) -> Option<&'static str> {
+    match probe {
+        BackendProbe::Ok(_) => None,
+        BackendProbe::UnsupportedPlatform if SandboxBackend::ON_THIS_PLATFORM.is_empty() => {
+            Some("unset `[shell].sandbox_backend`")
         }
+        _ if SandboxBackend::ON_THIS_PLATFORM.is_empty() => None,
+        _ => Some("set `[shell].sandbox_backend` to a usable one"),
+    }
+}
+
+/// Probe a specific sandbox backend.
+///
+/// The one function every pin reaches, so this is where a value from another platform is refused,
+/// ahead of anything that costs. The arms are the authority on which values this platform takes;
+/// [`SandboxBackend::ON_THIS_PLATFORM`] names the same set for the messages, and a test holds the
+/// two in step. macOS has no value, so a pin there is always refused and its one backend is reached
+/// by leaving the field unset.
+pub(crate) fn probe_backend(
+    #[cfg_attr(
+        not(any(target_os = "linux", windows)),
+        allow(unused_variables, reason = "no value is this platform's")
+    )]
+    backend: SandboxBackend,
+) -> BackendProbe {
+    #[cfg(target_os = "linux")]
+    {
+        match backend {
+            SandboxBackend::Landlock => probe_landlock(),
+            SandboxBackend::Bubblewrap => probe_bubblewrap(),
+            SandboxBackend::BubblewrapLandlock => {
+                require_landlock_layer(probe_bubblewrap(), landlock_abi_or_errno())
+            }
+            SandboxBackend::AppContainer | SandboxBackend::RestrictedToken => {
+                BackendProbe::UnsupportedPlatform
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        match backend {
+            // Token-integrity APIs are available on every supported Windows version. No runtime
+            // probe is needed.
+            SandboxBackend::RestrictedToken => BackendProbe::Ok(SandboxCapability::RestrictedToken),
+            SandboxBackend::AppContainer => appcontainer::probe(),
+            SandboxBackend::Landlock
+            | SandboxBackend::Bubblewrap
+            | SandboxBackend::BubblewrapLandlock => BackendProbe::UnsupportedPlatform,
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        BackendProbe::UnsupportedPlatform
     }
 }
 
@@ -568,10 +813,11 @@ pub(crate) fn require_landlock_layer(
     }
 }
 
-/// Test-only "what's the strongest sandbox available right now?" entry point. Production code
-/// takes the backend `ResolvedConfig` settled from `[shell].sandbox_backend`, `--sandbox-backend`
-/// and `MEKA_SANDBOX_BACKEND`; tests reach for whatever capability the host happens to support.
-#[cfg(any(test, not(target_os = "linux")))]
+/// The strongest sandbox available right now. The production entry on a platform with one backend
+/// and no value for it; elsewhere production takes the backend `ResolvedConfig` settled from
+/// `[shell].sandbox_backend`, `--sandbox-backend` and `MEKA_SANDBOX_BACKEND`, and only tests reach
+/// for whatever capability the host happens to support.
+#[cfg(any(test, not(any(target_os = "linux", windows))))]
 pub(crate) fn detect() -> SandboxCapability {
     #[cfg(target_os = "linux")]
     {
@@ -591,10 +837,8 @@ pub(crate) fn detect() -> SandboxCapability {
         }
     }
 
-    // Token-integrity APIs are available on every supported Windows version (7+). No runtime probe
-    // is needed.
     #[cfg(target_os = "windows")]
-    let detected = SandboxCapability::LowIntegrity;
+    let detected = SandboxCapability::RestrictedToken;
     #[cfg(not(target_os = "windows"))]
     let detected = SandboxCapability::Unavailable;
     detected
@@ -1094,9 +1338,6 @@ mod tests {
     ///
     /// Driven through a subscriber pinned to `WARN` because that is the default floor, so a caller
     /// also fails if a warning is dropped to `info`, where `-v` would be needed to see it.
-    ///
-    /// Linux-gated because every caller is, and an unused helper fails the lint gate.
-    #[cfg(target_os = "linux")]
     fn startup_warnings(state: &super::SandboxState) -> String {
         let captured = crate::streams::capture::capture_logs(tracing::Level::WARN);
         super::warn_if_sandbox_issues(state, super::WarnContext::Startup);
@@ -1113,6 +1354,7 @@ mod tests {
             backend: crate::config::SandboxBackend::Landlock,
             auto_resolved,
             probe: super::BackendProbe::Ok(super::SandboxCapability::Landlock { abi_version: 9 }),
+            fallback_from: None,
         }
     }
 
@@ -1134,6 +1376,432 @@ mod tests {
             !pinned.contains("Bubblewrap"),
             "a pinned backend is not argued with: {pinned:?}"
         );
+    }
+
+    /// Pinning the restricted token is the escape hatch its fallback warning names, as pinning
+    /// Landlock is on Linux: the warning names what the token gives up, and a user who wrote it
+    /// into the config accepted that.
+    #[cfg(windows)]
+    #[test]
+    fn pinning_the_restricted_token_silences_the_fallback_warning() {
+        let state = |auto_resolved, fallback_from| super::SandboxState {
+            confine_reads: false,
+            network: crate::config::Network::Host,
+            enabled: true,
+            backend: crate::config::SandboxBackend::RestrictedToken,
+            auto_resolved,
+            probe: super::BackendProbe::Ok(super::SandboxCapability::RestrictedToken),
+            fallback_from,
+        };
+        let passed_over = |probe| {
+            Some(super::PassedOver {
+                backend: crate::config::SandboxBackend::AppContainer,
+                probe,
+            })
+        };
+        let missing = passed_over(super::BackendProbe::Missing {
+            reason: "no API".to_string(),
+        });
+        let unpinned = startup_warnings(&state(true, missing.clone()));
+        assert!(
+            unpinned.contains("because AppContainer is unavailable")
+                && unpinned.contains("cannot hide meka's store")
+                && unpinned.contains("to silence this warning"),
+            "an unpinned fallback names the cause, the cost and the remedy: {unpinned:?}"
+        );
+        // A build whose API speaks schema 1.0 has a usable AppContainer under a pin, and the
+        // warning says which pin takes it.
+        let old = startup_warnings(&state(
+            true,
+            passed_over(super::BackendProbe::Ok(
+                super::SandboxCapability::AppContainer { minor: 0 },
+            )),
+        ));
+        assert!(
+            old.contains("speaks schema 1.0, which holds `host` as `remote`")
+                && old.contains("pin `[shell].sandbox_backend` to 'appcontainer' to run under it")
+                && !old.contains("is unavailable"),
+            "schema 1.0 is named as the cause, with the pin that takes it: {old:?}"
+        );
+        let pinned = startup_warnings(&state(false, missing));
+        assert!(
+            !pinned.contains("AppContainer"),
+            "a pinned backend is not argued with: {pinned:?}"
+        );
+    }
+
+    /// Every backend holds `host`; the Unix backends hold `none` and, this release, `remote` as
+    /// `none`, never as `host`; the restricted token holds every setting as `host`; an unavailable
+    /// backend states the setting as configured, since it spawns nothing.
+    #[test]
+    fn a_backend_holds_a_setting_it_cannot_as_the_next_narrower_one() {
+        use super::{SandboxCapability, held_network};
+        use crate::config::Network;
+        for configured in Network::ALL {
+            assert_eq!(
+                held_network(&SandboxCapability::Unavailable, configured),
+                configured
+            );
+        }
+        let usable = a_usable_capability();
+        assert_eq!(held_network(&usable, Network::Host), Network::Host);
+        #[cfg(windows)]
+        {
+            assert_eq!(held_network(&usable, Network::Remote), Network::Host);
+            assert_eq!(held_network(&usable, Network::None), Network::Host);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(held_network(&usable, Network::Remote), Network::None);
+            assert_eq!(held_network(&usable, Network::None), Network::None);
+        }
+        // The AppContainer holds every setting on schema 1.1; on 1.0, which has no loopback
+        // exemption, `host` runs as `remote`.
+        let current = SandboxCapability::AppContainer { minor: 1 };
+        let old = SandboxCapability::AppContainer { minor: 0 };
+        for configured in Network::ALL {
+            assert_eq!(held_network(&current, configured), configured);
+        }
+        assert_eq!(held_network(&old, Network::Host), Network::Remote);
+        assert_eq!(held_network(&old, Network::Remote), Network::Remote);
+        assert_eq!(held_network(&old, Network::None), Network::None);
+    }
+
+    /// A setting the backend holds as a narrower one is said so at startup with the value that
+    /// silences the warning; one it holds as the host, on the restricted token, is said to reach
+    /// `web_fetch` alone; a setting held as such is not warned about.
+    #[test]
+    fn a_setting_the_backend_cannot_hold_is_warned_about_once_with_the_value_to_set() {
+        use crate::config::Network;
+        let state = |network| super::SandboxState {
+            confine_reads: false,
+            network,
+            enabled: true,
+            backend: crate::config::SandboxBackend::ON_THIS_PLATFORM
+                .last()
+                .copied()
+                .unwrap_or(crate::config::SandboxBackend::Landlock),
+            auto_resolved: false,
+            probe: super::BackendProbe::Ok(a_usable_capability()),
+            fallback_from: None,
+        };
+        assert!(
+            !startup_warnings(&state(Network::Host)).contains("[permissions].network"),
+            "`host` is held everywhere"
+        );
+        // A pinned AppContainer at schema 1.0: a state only a platform that takes values can
+        // reach, since a pin anywhere else is refused before it is probed.
+        if !crate::config::SandboxBackend::ON_THIS_PLATFORM.is_empty() {
+            let old_appcontainer = startup_warnings(&super::SandboxState {
+                confine_reads: false,
+                network: Network::Host,
+                enabled: true,
+                backend: crate::config::SandboxBackend::AppContainer,
+                auto_resolved: false,
+                probe: super::BackendProbe::Ok(super::SandboxCapability::AppContainer { minor: 0 }),
+                fallback_from: None,
+            });
+            assert!(
+                old_appcontainer.contains("is held as `remote` by AppContainer")
+                    && old_appcontainer
+                        .contains("set `[permissions].network = \"remote\"` to silence"),
+                "schema 1.0 runs `host` as `remote` and says so: {old_appcontainer:?}"
+            );
+        }
+        let remote = startup_warnings(&state(Network::Remote));
+        let none = startup_warnings(&state(Network::None));
+        if cfg!(windows) {
+            for logged in [&remote, &none] {
+                assert!(
+                    logged.contains("holds for `web_fetch` only")
+                        && logged.contains("cannot cut a command off the network"),
+                    "the token reaches the host at every setting: {logged:?}"
+                );
+            }
+        } else {
+            // The backend is named as this platform calls it: the value on Linux, the one
+            // mechanism on macOS, where the resolver's stand-in value must not surface.
+            let called = if cfg!(target_os = "macos") {
+                "sandbox-exec"
+            } else {
+                "Landlock"
+            };
+            assert!(
+                remote.contains(&format!("is held as `none` by {called}; set"))
+                    && remote.contains("set `[permissions].network = \"none\"` to silence"),
+                "`remote` runs as `none` and says so: {remote:?}"
+            );
+            assert!(
+                cfg!(target_os = "linux") || !remote.contains("Landlock"),
+                "the stand-in value is not a name the user wrote: {remote:?}"
+            );
+            assert!(
+                !none.contains("[permissions].network"),
+                "`none` is held as such: {none:?}"
+            );
+        }
+    }
+
+    /// An unusable backend is named as this platform calls it in the startup warning: the value
+    /// where the platform takes values, its one mechanism where it takes none, and never the
+    /// stand-in value the resolver carries on macOS.
+    #[test]
+    fn an_unusable_backend_is_named_as_this_platform_calls_it() {
+        use crate::config::SandboxBackend;
+        let native = SandboxBackend::ON_THIS_PLATFORM
+            .last()
+            .copied()
+            .unwrap_or(SandboxBackend::Landlock);
+        let logged = startup_warnings(&super::SandboxState {
+            confine_reads: false,
+            network: crate::config::Network::Host,
+            enabled: true,
+            backend: native,
+            auto_resolved: false,
+            probe: super::BackendProbe::Missing {
+                reason: "the probe's own reason".to_string(),
+            },
+            fallback_from: None,
+        });
+        let called = if cfg!(target_os = "macos") {
+            "sandbox-exec".to_string()
+        } else {
+            native.to_string()
+        };
+        assert!(
+            logged.contains(&format!(
+                "no usable `read` sandbox ({called}: the probe's own reason)"
+            )),
+            "{logged:?}"
+        );
+        assert_eq!(
+            super::backend_label(native, &super::BackendProbe::UnsupportedPlatform),
+            Some(native.display_name()),
+            "a pin from another platform is named by the value the user wrote"
+        );
+    }
+
+    /// With nothing pinned and both backends probed unusable, the warning gives both reasons and
+    /// names no value to set, since neither would work; under a pin the other backend was not
+    /// probed, and the remedy stands.
+    #[test]
+    fn an_automatic_fallback_that_is_unusable_too_names_both_reasons_and_no_value() {
+        use crate::config::SandboxBackend;
+        let state = |auto_resolved| super::SandboxState {
+            confine_reads: false,
+            network: crate::config::Network::Host,
+            enabled: true,
+            backend: SandboxBackend::Landlock,
+            auto_resolved,
+            probe: super::BackendProbe::Missing {
+                reason: "the kernel is too old".to_string(),
+            },
+            fallback_from: Some(super::PassedOver {
+                backend: SandboxBackend::Bubblewrap,
+                probe: super::BackendProbe::Missing {
+                    reason: "bwrap not found on PATH".to_string(),
+                },
+            }),
+        };
+        let automatic = startup_warnings(&state(true));
+        assert!(
+            automatic.contains("the kernel is too old; Bubblewrap: bwrap not found on PATH)")
+                && !automatic.contains("`[shell].sandbox_backend`"),
+            "{automatic:?}"
+        );
+        let pinned = startup_warnings(&state(false));
+        assert!(
+            pinned.contains("the kernel is too old)")
+                && !pinned.contains("bwrap")
+                && pinned.contains("`[shell].sandbox_backend`")
+                    == !SandboxBackend::ON_THIS_PLATFORM.is_empty(),
+            "{pinned:?}"
+        );
+    }
+
+    /// `confine_reads` is warned about once, at startup, on the one backend whose shell cannot
+    /// hold it, pinned or not, as the network setting is; nowhere else, and not when it is off.
+    #[test]
+    fn confine_reads_is_warned_about_where_the_shell_cannot_hold_it() {
+        let state = |confine_reads| super::SandboxState {
+            confine_reads,
+            network: crate::config::Network::Host,
+            enabled: true,
+            backend: crate::config::SandboxBackend::ON_THIS_PLATFORM
+                .last()
+                .copied()
+                .unwrap_or(crate::config::SandboxBackend::Landlock),
+            auto_resolved: false,
+            probe: super::BackendProbe::Ok(a_usable_capability()),
+            fallback_from: None,
+        };
+        let on = startup_warnings(&state(true));
+        assert_eq!(
+            on.contains("`[permissions].confine_reads` holds for the file tools only"),
+            cfg!(windows),
+            "{on:?}"
+        );
+        #[cfg(windows)]
+        assert!(
+            on.contains("the restricted token backend cannot confine a command's reads"),
+            "the backend is named: {on:?}"
+        );
+        assert!(
+            !startup_warnings(&state(false)).contains("confine_reads"),
+            "nothing is said about a switch that is off"
+        );
+    }
+
+    /// A capability the resolver under test treats as usable. Which one does not enter the
+    /// resolution, and the variants are per-platform, so the host's own stands in.
+    fn a_usable_capability() -> super::SandboxCapability {
+        #[cfg(target_os = "linux")]
+        {
+            super::SandboxCapability::Landlock { abi_version: 9 }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            super::SandboxCapability::SandboxExec
+        }
+        #[cfg(windows)]
+        {
+            super::SandboxCapability::RestrictedToken
+        }
+    }
+
+    /// The Windows resolution takes the Linux shape: a pin is binding and probes that backend
+    /// alone, and an unset value takes AppContainer when it probes usable and the restricted token
+    /// otherwise, marked automatic either way so the fallback warning can fire.
+    #[test]
+    fn the_windows_resolver_binds_a_pin_and_falls_back_from_appcontainer() {
+        use super::{BackendProbe, SandboxCapability};
+        use crate::config::SandboxBackend;
+
+        let appcontainer = |minor| SandboxCapability::AppContainer { minor };
+        let mut probed = Vec::new();
+        let resolution =
+            super::resolve_windows_backend(Some(SandboxBackend::RestrictedToken), |backend| {
+                probed.push(backend);
+                BackendProbe::Ok(a_usable_capability())
+            });
+        assert_eq!(resolution.backend, SandboxBackend::RestrictedToken);
+        assert!(!resolution.auto_resolved);
+        assert!(matches!(resolution.probe, BackendProbe::Ok(_)));
+        assert!(resolution.fallback_from.is_none());
+        assert_eq!(
+            probed,
+            [SandboxBackend::RestrictedToken],
+            "a pin on the token does not create an AppContainer environment on every start"
+        );
+
+        let resolution = super::resolve_windows_backend(None, |backend| match backend {
+            SandboxBackend::AppContainer => BackendProbe::Ok(appcontainer(1)),
+            other => panic!("{other:?} was probed although AppContainer is usable"),
+        });
+        assert_eq!(resolution.backend, SandboxBackend::AppContainer);
+        assert!(resolution.auto_resolved);
+        assert!(matches!(resolution.probe, BackendProbe::Ok(_)));
+        assert!(resolution.fallback_from.is_none());
+
+        // Schema 1.0 is not auto-picked, since it cannot hold `host`, but a pin accepts it; the
+        // fallback keeps the AppContainer probe, so the warning can say which case it is.
+        for outcome in [BackendProbe::Ok(appcontainer(0)), BackendProbe::Missing {
+            reason: "no API".to_string(),
+        }] {
+            let resolution = super::resolve_windows_backend(None, |backend| match backend {
+                SandboxBackend::AppContainer => outcome.clone(),
+                SandboxBackend::RestrictedToken => BackendProbe::Ok(a_usable_capability()),
+                other => panic!("{other:?} is not a Windows backend"),
+            });
+            assert_eq!(resolution.backend, SandboxBackend::RestrictedToken);
+            assert!(resolution.auto_resolved);
+            assert!(
+                matches!(resolution.probe, BackendProbe::Ok(_)),
+                "the fallback carries its own probe, not AppContainer's: {:?}",
+                resolution.probe
+            );
+            let passed = resolution
+                .fallback_from
+                .as_ref()
+                .expect("the stronger backend's probe rides along as the cause");
+            assert_eq!(passed.backend, SandboxBackend::AppContainer);
+            assert_eq!(format!("{:?}", passed.probe), format!("{outcome:?}"));
+        }
+        let resolution = super::resolve_windows_backend(Some(SandboxBackend::AppContainer), |_| {
+            BackendProbe::Ok(appcontainer(0))
+        });
+        assert_eq!(resolution.backend, SandboxBackend::AppContainer);
+        assert!(!resolution.auto_resolved);
+        assert!(matches!(
+            resolution.probe,
+            BackendProbe::Ok(SandboxCapability::AppContainer { minor: 0, .. })
+        ));
+    }
+
+    /// A pin from another platform's list is refused by the probe, on every platform alike and
+    /// without running anything, and every value on this platform's list reaches a real probe. The
+    /// list and the probe's arms are two statements of one fact; this is what holds them together.
+    #[test]
+    fn the_probe_refuses_exactly_the_values_this_platform_does_not_list() {
+        use crate::config::SandboxBackend;
+        for backend in SandboxBackend::ALL {
+            let resolution = super::resolve_sandbox_backend(Some(backend));
+            assert_eq!(
+                resolution.backend, backend,
+                "a pin is binding even when it is refused"
+            );
+            assert!(!resolution.auto_resolved);
+            assert_eq!(
+                matches!(resolution.probe, super::BackendProbe::UnsupportedPlatform),
+                !SandboxBackend::ON_THIS_PLATFORM.contains(&backend),
+                "{backend:?} on this platform probed as {:?}",
+                resolution.probe
+            );
+        }
+    }
+
+    /// A pin from another platform is reported at startup with the values this platform takes and
+    /// the one remedy, so a config shared across machines fails loudly rather than leaving the
+    /// shell at `read` to fail at first use.
+    #[test]
+    fn a_foreign_pin_is_warned_about_with_this_platform_s_values() {
+        use crate::config::SandboxBackend;
+        let foreign = SandboxBackend::ALL
+            .iter()
+            .copied()
+            .find(|backend| !SandboxBackend::ON_THIS_PLATFORM.contains(backend))
+            .expect("every platform lacks some value");
+        let logged = startup_warnings(&super::SandboxState {
+            confine_reads: false,
+            network: crate::config::Network::Host,
+            enabled: true,
+            backend: foreign,
+            auto_resolved: false,
+            probe: super::BackendProbe::UnsupportedPlatform,
+            fallback_from: None,
+        });
+        assert!(
+            logged.contains(&format!("({foreign}: not a sandbox backend on")),
+            "the warning names the refused value and why: {logged:?}"
+        );
+        assert!(
+            logged.contains("`[shell].sandbox_backend`"),
+            "the warning names the key to fix: {logged:?}"
+        );
+        if SandboxBackend::ON_THIS_PLATFORM.is_empty() {
+            assert!(
+                logged.contains("takes none") && logged.contains("unset"),
+                "a platform with no value says so and asks for the pin to go: {logged:?}"
+            );
+        } else {
+            for backend in SandboxBackend::ON_THIS_PLATFORM {
+                assert!(
+                    logged.contains(backend.name()),
+                    "the warning lists {} among the values this platform takes: {logged:?}",
+                    backend.name()
+                );
+            }
+        }
     }
 
     /// A child that cannot see the machine's proxy or CA configuration reaches nothing, and says so
@@ -1696,7 +2364,7 @@ mod tests {
             backend_unavailable_reason(&BackendProbe::UnsupportedPlatform)
                 .as_deref()
                 .unwrap_or("")
-                .contains("not supported")
+                .contains("not a sandbox backend on")
         );
     }
 
@@ -2048,6 +2716,16 @@ mod tests {
             crate::config::Network::None,
         );
         assert!(!closed.contains("network-outbound"), "{closed}");
+        let (remote, _) = sandbox_profile_for(
+            std::slice::from_ref(&root),
+            None,
+            &[],
+            crate::config::Network::Remote,
+        );
+        assert!(
+            !remote.contains("network-outbound"),
+            "`remote` is held as `none`, never as `host`: {remote}"
+        );
         assert!(
             closed.contains("(deny default)"),
             "the deny is what refuses the sockets the rule no longer allows: {closed}"

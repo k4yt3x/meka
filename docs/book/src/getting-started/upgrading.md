@@ -12,8 +12,32 @@ and `-shm` companions with the file.
 
 ## 0.83 to 0.84
 
-Nothing is renamed and no key is refused; the store is migrated on first open, and one wire shape
-grows.
+Nothing is renamed; one value is refused where it never applied, the store is migrated on first
+open, and one wire shape grows.
+
+**`[shell].sandbox_backend` takes this platform's values only.** A value from another platform was
+ignored on macOS and Windows; it is now refused: `shell_execute` at `read` fails and startup warns,
+naming the values this platform takes. Linux takes `bubblewrap`, `bubblewrap-landlock` and
+`landlock`, Windows takes `appcontainer` and `restricted-token`, and macOS takes none. A
+`config.toml` shared across machines leaves the key unset, or sets it per machine through
+`MEKA_SANDBOX_BACKEND`. Windows now chooses its backend by probe: a build without the AppContainer
+API, or whose API speaks schema 1.0, warns once at startup that the restricted token is in use and
+what it cannot hold; pinning `sandbox_backend = "restricted-token"` accepts that and silences the
+warning, as pinning `landlock` does on Linux, and on a schema 1.0 build pinning
+`sandbox_backend = "appcontainer"` takes the AppContainer with `network = "host"` held as `remote`.
+
+**A Windows 11 build with the process security environment API runs commands in an AppContainer.**
+On 26H2, and on 24H2 and 25H2 from the August 2026 update as Microsoft lists them, `read` and
+`workspace` now confine a command through the OS's own environment: meka's config directory and
+store are unreadable, `confine_reads` and `network` hold for the shell as they do for the file
+tools, and no ACE is written to your directories. Four limits of the mechanism come with it: `cd`
+into a read-only directory fails (git's `-C` and Python's `os.chdir` included; the initial
+directory, PowerShell's `Set-Location` and `cd` into a workspace directory work), msys2 `bash.exe`
+cannot start, a removable FAT32 volume and a mapped network drive are out of reach, and an app
+execution alias such as the Python install manager's `python.exe` does not start, while the real
+executable runs by its path. Pin `sandbox_backend = "restricted-token"` to keep the previous
+mechanism. On both backends a confined command can no longer read or set the clipboard, drive
+other windows or inject input.
 
 **Every compaction records what it was.** The boundary a compaction writes now carries what set it
 going (`reactive`, `proactive`, `manual`, `requested`, `emergency` or `retention`), which strategy

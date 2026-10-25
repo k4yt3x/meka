@@ -46,6 +46,11 @@ pub(crate) struct Agent {
     /// frontend. The agent reads and writes through the cells rather than copies of them, so a
     /// change made anywhere reaches everywhere.
     cells: SessionCells,
+    /// What the shell holds for `cells.network`, which its backend may narrow; fixed with the
+    /// cells, since neither the setting nor the backend changes within a session.
+    shell_network: crate::config::Network,
+    /// Whether the shell's reads follow the read boundary on this backend.
+    shell_confines_reads: bool,
     /// Whether this is the session's own agent or a worker spawned from it.
     role: AgentRole,
     /// The MCP manager, held weakly like the materials hold it; `None` where the process has none.
@@ -194,8 +199,14 @@ impl Agent {
             AgentRole::Root if tool_registry.background_enabled() => materials.background.max_tasks,
             _ => 0,
         };
+        let shell_network =
+            crate::sandbox::held_network(&materials.core.sandbox_capability, cells.network);
+        let shell_confines_reads =
+            crate::sandbox::shell_confines_reads(&materials.core.sandbox_capability);
         Self {
             cells,
+            shell_network,
+            shell_confines_reads,
             role,
             mcp_manager: materials.mcp_manager.clone(),
             options,
