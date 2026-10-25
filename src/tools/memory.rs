@@ -20,7 +20,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{Tool, ToolOutput, util::require_str};
+use super::{
+    Tool, ToolOutput,
+    util::{optional_str, optional_str_allowing_empty, require_str, string_or_list},
+};
 use crate::{
     error::{MekaError, Result},
     memory,
@@ -158,20 +161,9 @@ impl Tool for MemoryWriteTool {
         // body-only refinement rewrite a long description as its elision. The store resolves the
         // absence in SQL, and refuses it when the write would create the memory rather than update
         // one.
-        //
-        // A present-but-not-a-string `description` is refused rather than read as absent, for the
-        // reason given on `body` below.
-        let description = match input.get("description") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(serde_json::Value::String(text)) => {
-                if text.trim().is_empty() {
-                    return Err(MekaError::ToolExecution {
-                        tool_name: "memory_write".to_string(),
-                        message: "'description' cannot be empty; omit it entirely to keep the \
-                                  description a memory already has"
-                            .to_string(),
-                    });
-                }
+        let description = match optional_str(&input, "description", "memory_write")? {
+            None => None,
+            Some(text) => {
                 // Whitespace is not the same question as "renders as nothing": format characters
                 // are not whitespace, so three zero-width spaces would pass and render as blank in
                 // the index the model reads every turn.
@@ -183,63 +175,17 @@ impl Tool for MemoryWriteTool {
                             .to_string(),
                     });
                 }
-                Some(text.clone())
-            }
-            Some(value) => {
-                return Err(MekaError::ToolExecution {
-                    tool_name: "memory_write".to_string(),
-                    message: format!("'description' must be a string, got {value}"),
-                });
+                Some(text.to_string())
             }
         };
         // An absent `body` means "leave it alone", not "make it empty": the schema marks the field
         // optional, so the call that changes only a priority is one the tool invites, and rendering
         // the absence as `""` would silently delete everything the memory said. `Some("")` is still
         // an explicit request to clear it.
-        //
-        // A present-but-not-a-string `body` is refused rather than read as absent: `as_str` would
-        // put `["line one", "line two"]` down the omit-to-keep path and report success while
-        // storing nothing the caller sent.
-        let body = match input.get("body") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(serde_json::Value::String(text)) => Some(text.clone()),
-            Some(value) => {
-                return Err(MekaError::ToolExecution {
-                    tool_name: "memory_write".to_string(),
-                    message: format!("'body' must be a string, got {value}"),
-                });
-            }
-        };
+        let body = optional_str_allowing_empty(&input, "body", "memory_write")?.map(str::to_string);
         // Same omit-to-keep rule as `body`, for the same reason: a call that changes only a
         // description would otherwise strip labels it never mentioned. `[]` still clears them.
-        //
-        // And the same refusal, for a sharper version of the same reason: dropping non-string
-        // elements would collapse `tags: [1, 2]` to `[]`, which is the documented "clear them"
-        // signal.
-        let tags: Option<Vec<String>> = match input.get("tags") {
-            Some(serde_json::Value::Array(values)) => {
-                let mut collected = Vec::with_capacity(values.len());
-                for value in values {
-                    let Some(tag) = value.as_str() else {
-                        return Err(MekaError::ToolExecution {
-                            tool_name: "memory_write".to_string(),
-                            message: format!("every entry in 'tags' must be a string, got {value}"),
-                        });
-                    };
-                    collected.push(tag.to_string());
-                }
-                Some(collected)
-            }
-            // A bare string where an array is declared, as `memory_search` also tolerates.
-            Some(serde_json::Value::String(single)) => Some(vec![single.clone()]),
-            None | Some(serde_json::Value::Null) => None,
-            Some(value) => {
-                return Err(MekaError::ToolExecution {
-                    tool_name: "memory_write".to_string(),
-                    message: format!("'tags' must be a list of strings, got {value}"),
-                });
-            }
-        };
+        let tags: Option<Vec<String>> = string_or_list(&input, "tags", "memory_write")?;
         // Clamped rather than rejected, because this door's caller is a model rather than a
         // person: `meka memory add --priority 99` and `PUT /v1/memory` both refuse out of range,
         // and a human reads the error and retypes, where a model spends a turn on it. Read as
@@ -258,65 +204,29 @@ impl Tool for MemoryWriteTool {
                 Some(memory::parse_priority(Some(raw), name))
             }
         };
-        let load = match input.get("load") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(serde_json::Value::String(raw)) => Some(
+        let load = match optional_str(&input, "load", "memory_write")? {
+            None => None,
+            Some(raw) => Some(
                 raw.trim()
                     .parse::<memory::Load>()
                     .map_err(|message| tool_error("memory_write", message))?,
             ),
-            Some(value) => {
-                return Err(tool_error(
-                    "memory_write",
-                    format!(
-                        "'load' must be one of {}, got {value}",
-                        memory::Load::supported()
-                    ),
-                ));
-            }
         };
         // The same omit-to-keep rule and the same refusal of a malformed list as `tags`.
-        let references: Option<Vec<String>> = match input.get("references") {
-            Some(serde_json::Value::Array(values)) => {
-                let mut collected = Vec::with_capacity(values.len());
-                for value in values {
-                    let Some(reference) = value.as_str() else {
-                        return Err(tool_error(
-                            "memory_write",
-                            format!("every entry in 'references' must be a string, got {value}"),
-                        ));
-                    };
-                    collected.push(reference.to_string());
-                }
-                Some(
-                    memory::normalize_references(&collected)
+        let references: Option<Vec<String>> =
+            match string_or_list(&input, "references", "memory_write")? {
+                None => None,
+                Some(list) => Some(
+                    memory::normalize_references(&list)
                         .map_err(|message| tool_error("memory_write", message))?,
-                )
-            }
-            Some(serde_json::Value::String(single)) => Some(
-                memory::normalize_references(std::slice::from_ref(single))
-                    .map_err(|message| tool_error("memory_write", message))?,
-            ),
-            None | Some(serde_json::Value::Null) => None,
-            Some(value) => {
-                return Err(tool_error(
-                    "memory_write",
-                    format!("'references' must be a list of strings, got {value}"),
-                ));
-            }
-        };
-        let source = match input.get("source") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(serde_json::Value::String(text)) => Some(
+                ),
+            };
+        let source = match optional_str(&input, "source", "memory_write")? {
+            None => None,
+            Some(text) => Some(
                 memory::normalize_source(text)
                     .map_err(|message| tool_error("memory_write", message))?,
             ),
-            Some(value) => {
-                return Err(tool_error(
-                    "memory_write",
-                    format!("'source' must be a string, got {value}"),
-                ));
-            }
         };
         let verified = match input.get("verified") {
             None | Some(serde_json::Value::Null) => false,
@@ -330,18 +240,12 @@ impl Tool for MemoryWriteTool {
         };
         // Three answers, like the store's field: absent keeps, `""` clears, anything else is a
         // moment the parser has to accept.
-        let expires_at = match input.get("expires") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(serde_json::Value::String(raw)) if raw.trim().is_empty() => Some(None),
-            Some(serde_json::Value::String(raw)) => Some(Some(
+        let expires_at = match optional_str_allowing_empty(&input, "expires", "memory_write")? {
+            None => None,
+            Some(raw) if crate::text::is_blank(raw) => Some(None),
+            Some(raw) => Some(Some(
                 memory::parse_expiry(raw).map_err(|message| tool_error("memory_write", message))?,
             )),
-            Some(value) => {
-                return Err(tool_error(
-                    "memory_write",
-                    format!("'expires' must be a timestamp or a date, got {value}"),
-                ));
-            }
         };
         // The tier, as the store takes it: `None` keeps a stored memory's tier and creates in
         // the session's own, an empty project is the global tier. `project` names the session's,
@@ -1162,21 +1066,10 @@ impl Tool for MemorySearchTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        // A bare string where an array is declared is a mistake models make constantly, and the
-        // recovery is free. "Missing" is for a parameter that is not there or is the wrong type; a
-        // parameter that is there but yields nothing searchable is a different mistake with a
-        // different fix, and reporting it as missing sends the caller looking for a bug in how it
-        // built the call.
-        let queries: Option<Vec<String>> = match input.get("queries") {
-            Some(serde_json::Value::String(single)) => Some(vec![single.clone()]),
-            Some(serde_json::Value::Array(values)) => Some(
-                values
-                    .iter()
-                    .filter_map(|value| value.as_str().map(str::to_string))
-                    .collect(),
-            ),
-            _ => None,
-        };
+        // "Missing" is for a parameter that is not there; a parameter that is there but yields
+        // nothing searchable is a different mistake with a different fix, and reporting it as
+        // missing sends the caller looking for a bug in how it built the call.
+        let queries: Option<Vec<String>> = string_or_list(&input, "queries", "memory_search")?;
         let session_view = view_of(&self.project);
         let tier = parse_tier(&input, "memory_search")?;
         let view = match tier {
@@ -1197,30 +1090,14 @@ impl Tool for MemorySearchTool {
         let mark_global = !session_view.project().is_empty();
         let filter = crate::store::memory::MemoryFilter {
             view,
-            referencing: match input.get("referencing") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(serde_json::Value::String(target)) if target.trim().is_empty() => None,
-                Some(serde_json::Value::String(target)) => Some(target.trim().to_string()),
-                Some(value) => {
-                    return Err(tool_error(
-                        "memory_search",
-                        format!("'referencing' must be a string, got {value}"),
-                    ));
-                }
-            },
-            unverified_for: match input.get("unverified") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(serde_json::Value::String(window)) if window.trim().is_empty() => None,
-                Some(serde_json::Value::String(window)) => {
+            referencing: optional_str(&input, "referencing", "memory_search")?
+                .map(|target| target.trim().to_string()),
+            unverified_for: match optional_str(&input, "unverified", "memory_search")? {
+                None => None,
+                Some(window) => {
                     Some(memory::parse_unverified_window(window).map_err(|message| {
                         tool_error("memory_search", format!("'unverified': {message}"))
                     })?)
-                }
-                Some(value) => {
-                    return Err(tool_error(
-                        "memory_search",
-                        format!("'unverified' must be a duration like '90d', got {value}"),
-                    ));
                 }
             },
             expired: match input.get("expired") {
@@ -1406,21 +1283,13 @@ fn describe_selection(
 
 /// Parse the optional `tier` of a memory tool call.
 fn parse_tier(input: &serde_json::Value, tool: &str) -> Result<Option<memory::Tier>> {
-    match input.get("tier") {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(raw)) => raw
-            .trim()
-            .parse::<memory::Tier>()
-            .map(Some)
-            .map_err(|message| tool_error(tool, message)),
-        Some(value) => Err(tool_error(
-            tool,
-            format!(
-                "'tier' must be one of {}, got {value}",
-                memory::Tier::supported()
-            ),
-        )),
-    }
+    optional_str(input, "tier", tool)?
+        .map(|raw| {
+            raw.trim()
+                .parse::<memory::Tier>()
+                .map_err(|message| tool_error(tool, message))
+        })
+        .transpose()
 }
 
 /// What a filter selected, for a header or a "nothing" line: "referencing 'x'", "not verified

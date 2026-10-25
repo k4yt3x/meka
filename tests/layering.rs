@@ -524,6 +524,104 @@ fn production_code_reads_meka_variables_only_where_the_ledger_says() {
     );
 }
 
+/// Where a tool may read a call's arguments without the shared readers in `src/tools/util.rs`:
+/// the file, the one function in it that may, and why. A function that stops reading raw fails
+/// the test too.
+const RAW_ARGUMENT_READERS: &[(&str, &str, &str)] = &[
+    (
+        "src/tools/registry.rs",
+        "requested_tool_names",
+        "reads recorded calls as well as live ones, so what is not a name is dropped rather than \
+         refused; a blank one is dropped by `text::is_blank` on the spot",
+    ),
+    (
+        "src/tools/scratchpad.rs",
+        "save_explicit_scratchpad_results",
+        "reads the carrier's name back from a recorded call; a blank one is excluded by \
+         `text::is_blank` on the spot",
+    ),
+];
+
+/// A string or list argument is read through `require_str`, `optional_str`, their
+/// `_allowing_empty` forms or `string_or_list` everywhere but inside the functions
+/// [`RAW_ARGUMENT_READERS`] names, so blank means "left out" and a wrong type is refused by one
+/// definition rather than one per tool. Matched on the spellings a raw read takes: `.get(...)` of
+/// a field name or a constant chained into `as_str`, a `match` on `input.get(...)` with a
+/// `Value::String` arm, or an `input.get(...)` read into an array.
+#[test]
+fn tool_arguments_are_read_through_the_shared_readers() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    source_files(&root.join("src/tools"), &mut files);
+    files.sort();
+
+    let raw_read = regex::Regex::new(
+        r#"\.get\((?:"[a-z_]+"|[A-Za-z_:]+)\)\)?\s*\.and_then\((?:serde_json::Value::as_str|\|[a-z_]+\|\s*[a-z_]+\.as_str\(\))\)|match\s+input\s*\.get\("[a-z_]+"\)\s*\{[^}]*Value::String\(|input\s*\.get\((?:"[a-z_]+"|[a-z_]+)\)(?s:.){0,160}?(?:as_array\(\)|Value::Array\()"#,
+    )
+    .expect("a valid pattern");
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut violations = Vec::new();
+
+    for path in &files {
+        let relative = path
+            .strip_prefix(root)
+            .expect("a path under the manifest directory")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative == "src/tools/util.rs" {
+            continue;
+        }
+        let source = fs::read_to_string(path).expect("read a source file");
+        let code = strip_test_code(&source)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // A function's body runs from its `fn name(` to the first line that is a lone `}`.
+        let allowed: Vec<(&str, std::ops::Range<usize>)> = RAW_ARGUMENT_READERS
+            .iter()
+            .filter(|(file, ..)| *file == relative)
+            .filter_map(|(_, function, _)| {
+                let start = code.find(&format!("fn {function}("))?;
+                let end = code[start..]
+                    .find("\n}\n")
+                    .map_or(code.len(), |offset| start + offset);
+                Some((*function, start..end))
+            })
+            .collect();
+        for found in raw_read.find_iter(&code) {
+            match allowed
+                .iter()
+                .find(|(_, range)| range.contains(&found.start()))
+            {
+                Some((function, _)) => {
+                    seen.insert((relative.clone(), function.to_string()));
+                }
+                None => {
+                    let line = code[..found.start()].matches('\n').count() + 1;
+                    violations.push(format!(
+                        "{relative}:{line} reads an argument without the shared readers"
+                    ));
+                }
+            }
+        }
+    }
+
+    for (file, function, _) in RAW_ARGUMENT_READERS {
+        if !seen.contains(&(file.to_string(), function.to_string())) {
+            violations.push(format!(
+                "{file}: `{function}` no longer reads an argument raw; remove it from the ledger"
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "raw argument reads outside the ledger:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
 /// Every file that starts a process, with how the door in `src/process.rs` reaches what it
 /// starts. The door is what puts a child behind meka in the line for memory, so a spawn it does
 /// not reach is a command that can take meka down with it.

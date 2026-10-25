@@ -88,6 +88,26 @@ pub(super) fn resolve_session_id(
     })
 }
 
+/// The string a call sent in `field`: `None` when the field is absent or `null`, an error naming
+/// the field when it holds anything but a string. The one reader under the four parameter helpers
+/// below, so a wrong-typed value is refused the same way at every door: `as_str` alone would read
+/// `permission: 0` as "not specified" and run a worker at the parent's own level.
+fn string_field<'a>(
+    input: &'a serde_json::Value,
+    field: &str,
+    tool_name: &str,
+) -> Result<Option<&'a str>> {
+    match input.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) => Ok(Some(text)),
+        Some(_) => Err(MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message: format!("'{field}' must be a string"),
+        }),
+    }
+}
+
+/// A required string parameter, refused when it is missing or blank.
 pub(super) fn require_str(
     input: &serde_json::Value,
     field: &str,
@@ -96,15 +116,87 @@ pub(super) fn require_str(
     // Blank is missing. Every caller names a thing (a path, a pattern, a command, a name), and an
     // empty one is never that thing: `file_edit` with an empty `old_string` and `replace_all`
     // spliced the replacement between every character of the file and reported success.
-    input
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(|s| s.to_string())
+    string_field(input, field, tool_name)?
+        .filter(|value| !crate::text::is_blank(value))
+        .map(str::to_string)
         .ok_or_else(|| MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
             message: format!("missing or blank '{field}' parameter"),
         })
+}
+
+/// An optional string parameter: `None` when it is absent, `null` or blank. Blank is absent for
+/// the reason blank is missing on [`require_str`], and because a model that fills every field it
+/// was shown sends `""` where it has nothing to say, which a strict schema spells `null`. The value
+/// is handed back as sent; a caller that parses a word trims it.
+pub(super) fn optional_str<'a>(
+    input: &'a serde_json::Value,
+    field: &str,
+    tool_name: &str,
+) -> Result<Option<&'a str>> {
+    Ok(string_field(input, field, tool_name)?.filter(|value| !crate::text::is_blank(value)))
+}
+
+/// [`optional_str`] for a field whose blank value is meaningful: the replacement an edit makes,
+/// a body or an entry's content to clear, an expiry to lift.
+pub(super) fn optional_str_allowing_empty<'a>(
+    input: &'a serde_json::Value,
+    field: &str,
+    tool_name: &str,
+) -> Result<Option<&'a str>> {
+    string_field(input, field, tool_name)
+}
+
+/// [`require_str`] for a field whose empty value is meaningful: a file's whole content, the
+/// replacement an edit makes.
+pub(super) fn require_str_allowing_empty(
+    input: &serde_json::Value,
+    field: &str,
+    tool_name: &str,
+) -> Result<String> {
+    string_field(input, field, tool_name)?
+        .map(str::to_string)
+        .ok_or_else(|| MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message: format!("missing '{field}' parameter"),
+        })
+}
+
+/// A field declared as a list of strings, read as the list, as one bare string (a mistake models
+/// make constantly, and the recovery is free), or as nothing: absent, `null` and a blank string
+/// are `None`. A blank entry is no entry, as a blank string is no value. An entry that is not a
+/// string, or a value of another shape, is refused naming the field; dropping entries would turn
+/// `[1, 2]` into `[]`, which for a field like `tags` is the documented "clear them" signal.
+pub(super) fn string_or_list(
+    input: &serde_json::Value,
+    field: &str,
+    tool_name: &str,
+) -> Result<Option<Vec<String>>> {
+    match input.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(single)) => {
+            Ok((!crate::text::is_blank(single)).then(|| vec![single.clone()]))
+        }
+        Some(serde_json::Value::Array(values)) => {
+            let mut entries = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(text) = value.as_str() else {
+                    return Err(MekaError::ToolExecution {
+                        tool_name: tool_name.to_string(),
+                        message: format!("every entry in '{field}' must be a string"),
+                    });
+                };
+                if !crate::text::is_blank(text) {
+                    entries.push(text.to_string());
+                }
+            }
+            Ok(Some(entries))
+        }
+        Some(_) => Err(MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message: format!("'{field}' must be a string or a list of strings"),
+        }),
+    }
 }
 
 /// Why an exact-anchor edit did not apply.
@@ -140,22 +232,6 @@ pub(super) fn replace_anchored(
     } else {
         Ok((text.replacen(old, new, 1), 1, first))
     }
-}
-
-/// [`require_str`] for the one field whose empty value is meaningful: a file's whole content.
-pub(super) fn require_str_allowing_empty(
-    input: &serde_json::Value,
-    field: &str,
-    tool_name: &str,
-) -> Result<String> {
-    input
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .map(|s| s.to_string())
-        .ok_or_else(|| MekaError::ToolExecution {
-            tool_name: tool_name.to_string(),
-            message: format!("missing '{field}' parameter"),
-        })
 }
 
 /// Compile an LLM-supplied regex pattern with bounded compile memory so a pathological pattern like
@@ -377,10 +453,12 @@ pub(super) fn truncate_string(string: &str, max_length: usize) -> &str {
 /// this returns true, because the scratchpad is an overflow buffer and truncation defeats its
 /// purpose.
 pub(super) fn redirects_to_scratchpad(input: &serde_json::Value) -> bool {
-    input
-        .get("scratchpad")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty())
+    // A plain predicate rather than `optional_str`: a `scratchpad` of the wrong type is refused
+    // ahead of dispatch, by `meka_parameter_error`.
+    matches!(
+        input.get(crate::tools::SCRATCHPAD_PARAMETER),
+        Some(serde_json::Value::String(name)) if !crate::text::is_blank(name)
+    )
 }
 
 /// Build a two-block `ToolOutput` (text marker + multimodal Image) from raw image bytes plus a
@@ -504,6 +582,101 @@ mod tests {
         assert_eq!(budget.budget_secs(), 5);
     }
 
+    /// Every string parameter is read by one rule: absent, `null` and blank are "not given",
+    /// which is missing for a required field and omitted for an optional one; a value of another
+    /// type is refused naming the field, never read as absent, since for a restriction absent is
+    /// the dangerous direction (`permission: 0` would inherit the parent's level). The value comes
+    /// back as sent, and only the fields that opt out by name keep a blank.
+    #[test]
+    fn string_parameters_are_read_by_one_rule() {
+        let input = serde_json::json!({
+            "number": 0,
+            "flag": true,
+            "good": " read ",
+            "blank": "   ",
+            "empty": "",
+            "explicit_null": null,
+        });
+        for key in ["number", "flag"] {
+            for error in [
+                optional_str(&input, key, "a_tool").expect_err("a non-string is refused"),
+                optional_str_allowing_empty(&input, key, "a_tool").expect_err("refused"),
+                require_str(&input, key, "a_tool").expect_err("refused"),
+                require_str_allowing_empty(&input, key, "a_tool").expect_err("refused"),
+            ] {
+                assert!(error.to_string().contains(key), "{error}");
+                assert!(error.to_string().contains("must be a string"), "{error}");
+            }
+        }
+        assert_eq!(
+            optional_str(&input, "good", "a_tool").expect("a string"),
+            Some(" read "),
+            "the value is handed back as sent"
+        );
+        assert_eq!(
+            require_str(&input, "good", "a_tool").expect("a string"),
+            " read "
+        );
+        for key in ["missing", "blank", "empty", "explicit_null"] {
+            assert_eq!(
+                optional_str(&input, key, "a_tool").expect("not given"),
+                None
+            );
+            let error = require_str(&input, key, "a_tool").expect_err("missing");
+            assert!(error.to_string().contains("missing or blank"), "{error}");
+        }
+        assert_eq!(
+            optional_str_allowing_empty(&input, "empty", "a_tool").expect("a value"),
+            Some(""),
+            "a field that opts out keeps its blank"
+        );
+        assert_eq!(
+            require_str_allowing_empty(&input, "empty", "a_tool").expect("a value"),
+            ""
+        );
+        assert_eq!(
+            optional_str_allowing_empty(&input, "explicit_null", "a_tool").expect("not given"),
+            None
+        );
+    }
+
+    /// A list field takes a list, one bare string, or nothing, and blank is nothing here too, as
+    /// a field and as an entry; an entry of another type is refused rather than dropped, and an
+    /// empty list stays a list.
+    #[test]
+    fn a_list_field_takes_a_list_a_string_or_nothing() {
+        let input = serde_json::json!({
+            "list": ["a", " ", "b"],
+            "one": "a",
+            "blank": " ",
+            "none": [],
+            "mixed": ["a", 1],
+            "number": 1,
+        });
+        assert_eq!(
+            string_or_list(&input, "list", "a_tool").expect("a list"),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            string_or_list(&input, "one", "a_tool").expect("one"),
+            Some(vec!["a".to_string()])
+        );
+        assert_eq!(
+            string_or_list(&input, "none", "a_tool").expect("an empty list"),
+            Some(Vec::new())
+        );
+        for key in ["blank", "missing"] {
+            assert_eq!(
+                string_or_list(&input, key, "a_tool").expect("nothing"),
+                None
+            );
+        }
+        for key in ["mixed", "number"] {
+            let error = string_or_list(&input, key, "a_tool").expect_err("refused");
+            assert!(error.to_string().contains(key), "{error}");
+        }
+    }
+
     #[test]
     fn redirects_to_scratchpad_needs_a_non_empty_scratchpad_name() {
         assert!(redirects_to_scratchpad(
@@ -511,6 +684,9 @@ mod tests {
         ));
         assert!(!redirects_to_scratchpad(
             &serde_json::json!({ "scratchpad": "" })
+        ));
+        assert!(!redirects_to_scratchpad(
+            &serde_json::json!({ "scratchpad": "  " })
         ));
         assert!(!redirects_to_scratchpad(&serde_json::json!({})));
         assert!(!redirects_to_scratchpad(

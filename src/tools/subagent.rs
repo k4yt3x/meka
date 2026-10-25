@@ -6,7 +6,10 @@ use std::{path::PathBuf, sync::Arc};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use super::{Tool, ToolOutput, ToolRegistry, ToolScope};
+use super::{
+    Tool, ToolOutput, ToolRegistry, ToolScope,
+    util::{optional_str, string_or_list},
+};
 use crate::{
     agent::Agent,
     config::{BuiltinToolFilter, InstructionAccess, MemoryAccess},
@@ -462,18 +465,10 @@ impl Tool for AgentSpawnTool {
         // Both `prompt` and `skill` are optional, but at least one must be present. This mirrors
         // the CLI's `--oneshot` guard in `src/main.rs`. An empty/whitespace `prompt` counts
         // as absent.
-        let prompt = input
-            .get("prompt")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(str::to_string);
-        let skill_name = input
-            .get("skill")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(str::to_string);
+        let prompt =
+            optional_str(&input, "prompt", "agent_spawn")?.map(|text| text.trim().to_string());
+        let skill_name =
+            optional_str(&input, "skill", "agent_spawn")?.map(|text| text.trim().to_string());
         if prompt.is_none() && skill_name.is_none() {
             return Err(MekaError::ToolExecution {
                 tool_name: "agent_spawn".to_string(),
@@ -528,14 +523,15 @@ impl Tool for AgentSpawnTool {
         };
 
         // `inherit_scratchpad`: optional array of parent-scratchpad names.
-        let inherited_scratchpad = string_array(&input, "inherit_scratchpad", "agent_spawn")?;
+        let inherited_scratchpad = name_list(&input, "inherit_scratchpad")?.unwrap_or_default();
 
         // Resolve the sub-agent's permission: an optional `permission` param clamped to the
         // parent's level as a ceiling (restrict-only, never escalate); absent keeps the parent's
         // level. Approval prompts route through `PermissionForwardingFrontend` so they surface in
         // the parent's UI.
-        let requested_permission =
-            parse_subagent_permission(optional_str(&input, "permission", "agent_spawn")?)?;
+        let requested_permission = parse_subagent_permission(
+            optional_str(&input, "permission", "agent_spawn")?.map(str::trim),
+        )?;
         let parent_level = self.parent_permission.get();
 
         // The profile the worker runs on, when the call names one. Judged here, ahead of every side
@@ -566,7 +562,7 @@ impl Tool for AgentSpawnTool {
         let requested_scope = requested_worker_scope(&input)?;
         let sub_perm = resolve_subagent_permission(requested_permission, parent_level)?;
         let network = resolve_subagent_network(
-            optional_str(&input, "network", "agent_spawn")?,
+            optional_str(&input, "network", "agent_spawn")?.map(str::trim),
             self.tool_builder_params.cells.network,
             sub_perm,
         )?;
@@ -601,25 +597,18 @@ impl Tool for AgentSpawnTool {
         // than read as "everything", which is what config reads an empty one as, or as "nothing",
         // which a model emitting `[]` for "nothing to add" never meant.
         let allow_list = |key: &'static str, noun: &str| -> Result<Option<Vec<String>>> {
-            match input.get(key) {
-                None | Some(serde_json::Value::Null) => Ok(None),
-                Some(_) => {
-                    let names = string_array(&input, key, "agent_spawn")?;
-                    if names.is_empty() {
-                        return Err(MekaError::ToolExecution {
-                            tool_name: "agent_spawn".to_string(),
-                            message: format!(
-                                "{key} names no {noun}; leave it out to withhold none"
-                            ),
-                        });
-                    }
-                    Ok(Some(names))
-                }
+            match name_list(&input, key)? {
+                None => Ok(None),
+                Some(names) if names.is_empty() => Err(MekaError::ToolExecution {
+                    tool_name: "agent_spawn".to_string(),
+                    message: format!("{key} names no {noun}; leave it out to withhold none"),
+                }),
+                Some(names) => Ok(Some(names)),
             }
         };
         let call_site_scope = ToolScope::new(
-            string_array(&input, "deny_servers", "agent_spawn")?,
-            string_array(&input, "deny_tools", "agent_spawn")?,
+            name_list(&input, "deny_servers")?.unwrap_or_default(),
+            name_list(&input, "deny_tools")?.unwrap_or_default(),
         )
         .allowing(
             allow_list("allow_servers", "server")?,
@@ -675,7 +664,7 @@ impl Tool for AgentSpawnTool {
         // lists, these are grants rather than restrictions: config cannot meaningfully withhold
         // them (a parent holding the text can copy it into the prompt), so the decision is the
         // parent's, and the safe state is the default.
-        let memory_access = match optional_str(&input, "memory", "agent_spawn")? {
+        let memory_access = match optional_str(&input, "memory", "agent_spawn")?.map(str::trim) {
             Some(text) => {
                 let requested = MemoryAccess::parse_grant(text).map_err(|message| {
                     MekaError::ToolExecution {
@@ -696,7 +685,8 @@ impl Tool for AgentSpawnTool {
             .user_instructions
             .as_deref()
             .is_some_and(|text| !text.trim().is_empty());
-        let instructions = match optional_str(&input, "instructions", "agent_spawn")? {
+        let instructions = match optional_str(&input, "instructions", "agent_spawn")?.map(str::trim)
+        {
             Some(text) => {
                 let requested = InstructionAccess::parse_grant(text).map_err(|message| {
                     MekaError::ToolExecution {
@@ -2240,36 +2230,6 @@ async fn build_subagent(
     ))
 }
 
-/// Read an optional string-valued parameter, refusing a value of the wrong type.
-///
-/// The obvious `input[key].as_str()` treats a non-string as absent, which for a restriction is the
-/// wrong way to fail: `permission: 0` would silently run the worker at the parent's own level
-/// rather than the restricted one the caller was reaching for. Absent and explicitly-null still
-/// mean "not specified"; anything else that is not a string is an error naming the parameter.
-fn optional_str<'a>(
-    input: &'a serde_json::Value,
-    key: &str,
-    tool_name: &'static str,
-) -> Result<Option<&'a str>> {
-    match input.get(key) {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(text)) => {
-            let trimmed = text.trim();
-            Ok(if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            })
-        }
-        Some(other) => Err(MekaError::ToolExecution {
-            tool_name: tool_name.to_string(),
-            message: format!(
-                "'{key}' must be a string, got {other}. Leave it out to use the default."
-            ),
-        }),
-    }
-}
-
 /// The scope a spawn call states, as spelled, or `None` for a bare call, by the one rule the spec
 /// is read by ([`WorkerScope::from_fields`]); a list beside no `working_directory` is refused with
 /// the remedy. An empty list counts as absent, since a model emits `[]` for "nothing to add".
@@ -2287,65 +2247,30 @@ fn requested_worker_scope(input: &serde_json::Value) -> Result<Option<WorkerScop
     })
 }
 
-/// The directories a scope field names. Unlike [`string_array`], an entry that is not a string,
-/// or is blank, refuses the call: the list confines, so an entry dropped from it would widen the
-/// scope the parent meant to state, and beside no `working_directory` a dropped list would read
-/// as a bare spawn with the parent's whole scope. A missing or null field is an empty list.
+/// The directories a scope field names, by the one rule every list is read by. An entry that is
+/// not a string refuses the call rather than being dropped: the list confines, so an entry
+/// dropped from it would widen the scope the parent meant to state, and beside no
+/// `working_directory` a dropped list would read as a bare spawn with the parent's whole scope. A
+/// blank entry names nothing and is dropped; a missing or null field is an empty list.
 fn directory_array(input: &serde_json::Value, key: &str) -> Result<Vec<PathBuf>> {
-    let refuse = |message: String| MekaError::ToolExecution {
-        tool_name: "agent_spawn".to_string(),
-        message,
-    };
-    match input.get(key) {
-        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .map(|item| match item.as_str().map(str::trim) {
-                Some(text) if !text.is_empty() => Ok(PathBuf::from(text)),
-                Some(_) => Err(refuse(format!(
-                    "`{key}` has an empty entry; name a directory or drop the entry"
-                ))),
-                None => Err(refuse(format!(
-                    "`{key}` has an entry that is {} rather than a string; name each directory \
-                     as a string",
-                    json_type_name(item)
-                ))),
-            })
-            .collect(),
-        Some(other) => Err(refuse(format!(
-            "`{key}` must be an array of strings, got {}; leave it out to add nothing",
-            json_type_name(other)
-        ))),
-    }
+    Ok(string_or_list(input, key, "agent_spawn")?
+        .unwrap_or_default()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect())
 }
 
-/// Pull a `Vec<String>` out of an optional array parameter. A missing or null value yields an
-/// empty list, and non-string entries inside an array are skipped so a partially malformed array
-/// does not sink the whole spawn, but anything that is not an array is an error: read as absent, a
-/// bare string in `deny_tools` would spawn an unrestricted worker in place of the restricted one
-/// the caller asked for, with nothing to say so. The same guard `optional_str` gives the strings.
-fn string_array(
-    input: &serde_json::Value,
-    key: &str,
-    tool_name: &'static str,
-) -> Result<Vec<String>> {
-    match input.get(key) {
-        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
-        Some(serde_json::Value::Array(items)) => Ok(items
-            .iter()
-            .filter_map(|item| item.as_str().map(str::trim))
-            .filter(|text| !text.is_empty())
-            .map(str::to_string)
-            .collect()),
-        Some(other) => Err(MekaError::ToolExecution {
-            tool_name: tool_name.to_string(),
-            message: format!(
-                "`{}` must be an array of strings, got {}; leave it out to restrict nothing",
-                key,
-                json_type_name(other)
-            ),
-        }),
-    }
+/// The names a list parameter gives, each trimmed, by the one rule every list is read by:
+/// `None` when the parameter is not given. A bare string is the one name it gives; read as
+/// nothing, `deny_tools: "file_write"` would spawn an unrestricted worker in place of the
+/// restricted one the caller asked for.
+fn name_list(input: &serde_json::Value, key: &str) -> Result<Option<Vec<String>>> {
+    Ok(string_or_list(input, key, "agent_spawn")?.map(|names| {
+        names
+            .into_iter()
+            .map(|name| name.trim().to_string())
+            .collect()
+    }))
 }
 
 /// An unsigned integer parameter, or an error if the model sent something else: `"0"` read as
@@ -2771,54 +2696,27 @@ mod tests {
         );
     }
 
-    /// A restriction passed with the wrong type is refused, not read as absent. Reading it as
-    /// absent is the dangerous direction for `permission`, where "not specified" means "inherit the
-    /// parent's level", so a malformed restriction would hand the worker more than the caller was
-    /// reaching for.
+    /// A list of names drops a blank entry, trims the rest, refuses an entry that is not a name,
+    /// and takes a bare string as the one name it gives: read as nothing, `deny_tools:
+    /// "file_write"` would spawn an unrestricted worker in place of the restricted one asked for.
     #[test]
-    fn optional_str_refuses_a_wrong_typed_value() {
+    fn a_name_list_takes_names_and_refuses_what_is_not_one() {
         let input = serde_json::json!({
-            "permission": 0,
-            "memory": true,
-            "profile": 0,
-            "good": "read",
-            "blank": "   ",
-            "explicit_null": null,
-        });
-        for key in ["permission", "memory", "profile"] {
-            let error = optional_str(&input, key, "agent_spawn")
-                .expect_err("a non-string restriction must be refused");
-            assert!(error.to_string().contains(key), "{error}");
-            assert!(error.to_string().contains("must be a string"), "{error}");
-        }
-        assert_eq!(
-            optional_str(&input, "good", "agent_spawn").expect("string"),
-            Some("read")
-        );
-        // Absent, null, and whitespace all mean "not specified", which is what lets the defaults
-        // apply without the caller having to say so.
-        for key in ["missing", "blank", "explicit_null"] {
-            assert_eq!(optional_str(&input, key, "agent_spawn").expect("ok"), None);
-        }
-    }
-
-    #[test]
-    fn string_array_skips_non_strings_and_blanks() {
-        let input = serde_json::json!({
-            "deny_servers": ["notion", 7, "  ", "  linear  ", null],
+            "deny_servers": ["notion", "  ", "  linear  "],
+            "deny_tools": ["file_write", 7],
+            "bare": "notion",
         });
         assert_eq!(
-            string_array(&input, "deny_servers", "agent_spawn").expect("a list"),
-            vec!["notion".to_string(), "linear".to_string()],
+            name_list(&input, "deny_servers").expect("a list"),
+            Some(vec!["notion".to_string(), "linear".to_string()]),
         );
-        assert!(
-            string_array(&input, "absent", "agent_spawn")
-                .expect("absent is fine")
-                .is_empty()
+        let error = name_list(&input, "deny_tools").expect_err("a number is not a name");
+        assert!(error.to_string().contains("deny_tools"), "{error}");
+        assert_eq!(name_list(&input, "absent").expect("absent is fine"), None);
+        assert_eq!(
+            name_list(&input, "bare").expect("one name"),
+            Some(vec!["notion".to_string()])
         );
-        // A non-array value is not a one-element list. A bare string is a refusal, not an empty
-        // list: read as empty, `deny_tools: "file_write"` would spawn an unrestricted worker.
-        assert!(string_array(&serde_json::json!({"x": "notion"}), "x", "agent_spawn").is_err());
         assert!(
             optional_u64(
                 &serde_json::json!({"max_depth": "0"}),
@@ -7180,7 +7078,7 @@ mod tests {
         )
         .await;
         assert!(
-            refusal.contains("an object rather than a string"),
+            refusal.contains("must be a string"),
             "a malformed list is refused, never read as a bare spawn: {refusal}"
         );
 

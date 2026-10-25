@@ -18,7 +18,10 @@ use uuid::Uuid;
 
 use super::{
     Tool, ToolOutput,
-    util::{MAX_SEARCH_MATCHES, compile_user_regex, require_str, resolve_session_id},
+    util::{
+        MAX_SEARCH_MATCHES, compile_user_regex, optional_str, require_str, resolve_session_id,
+        string_or_list,
+    },
 };
 use crate::{
     conversation::{ContentBlock, Event, Message, Role},
@@ -465,27 +468,8 @@ fn read_messages(
 /// `memory_search` takes a bare phrasing. `None` when it named nothing, which means the caller's
 /// own session.
 fn named_sessions(input: &serde_json::Value) -> Result<Option<Vec<String>>> {
-    let ids: Vec<String> = match input.get("sessions") {
-        None | Some(serde_json::Value::Null) => return Ok(None),
-        Some(serde_json::Value::String(one)) => vec![one.clone()],
-        Some(serde_json::Value::Array(values)) => values
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(str::to_string)
-                    .ok_or_else(|| MekaError::ToolExecution {
-                        tool_name: "conversation_search".to_string(),
-                        message: format!("'sessions' holds {value}, which is not a session id"),
-                    })
-            })
-            .collect::<Result<_>>()?,
-        Some(other) => {
-            return Err(MekaError::ToolExecution {
-                tool_name: "conversation_search".to_string(),
-                message: format!("'sessions' must be a list of session ids, got {other}"),
-            });
-        }
+    let Some(ids) = string_or_list(input, "sessions", "conversation_search")? else {
+        return Ok(None);
     };
     if ids.len() > MAX_SEARCHED_SESSIONS {
         return Err(MekaError::ToolExecution {
@@ -669,15 +653,15 @@ impl Tool for ConversationReadTool {
             .map(|value| value as usize)
             .unwrap_or(1);
 
-        let named = match input.get("session").and_then(serde_json::Value::as_str) {
-            Some(wanted) if !wanted.trim().is_empty() => {
+        let named = match optional_str(&input, "session", "conversation_read")? {
+            Some(wanted) => {
                 let reach = readable_sessions(&self.site, true, "conversation_read")?;
                 Some(
                     resolve_readable_session(&self.store, reach, wanted, "conversation_read")
                         .await?,
                 )
             }
-            _ => None,
+            None => None,
         };
         let session_id = match named {
             Some(session) => session,

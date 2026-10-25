@@ -9,7 +9,7 @@ use html2md::rewrite_html_custom_with_url;
 
 use super::{
     Tool, ToolOutput,
-    util::{compile_user_regex, redirects_to_scratchpad, require_str},
+    util::{compile_user_regex, optional_str, redirects_to_scratchpad, require_str},
 };
 use crate::{
     config::{MinTlsVersion, WebClientConfig},
@@ -487,7 +487,7 @@ impl Tool for FetchUrlTool {
         // The regex runs against the whole document, before any truncation: run after, `limit`
         // would decide which matches existed, and "No matches found" would read as a fact about
         // the page. The cap then applies to the match list.
-        let matched = match input.get("regex").and_then(|value| value.as_str()) {
+        let matched = match optional_str(&input, "regex", "web_fetch")? {
             Some(pattern) => {
                 let re = compile_user_regex(pattern, "web_fetch")?;
                 let matches: Vec<&str> = re.find_iter(&body).map(|found| found.as_str()).collect();

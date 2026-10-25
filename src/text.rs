@@ -7,6 +7,23 @@ use std::sync::LazyLock;
 use chrono::{DateTime, Local, Utc};
 use regex::Regex;
 
+/// Whether `text` says nothing: empty, or whitespace alone.
+pub(crate) fn is_blank(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
+/// Deserialize an optional string a model sent, reading a blank one as absent. A model that fills
+/// every field it was shown sends `""` where it has nothing to say, which a strict schema spells
+/// `null`; both mean the field was left out. For a field whose blank value is meaningful, read the
+/// `Option<String>` plainly instead.
+pub(crate) fn deserialize_blank_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.filter(|text| !is_blank(text)))
+}
+
 /// Whether `character` belongs to a script written without spaces between words, which a word
 /// tokenizer therefore cannot segment: SQLite's `unicode61` makes a run of it between two
 /// punctuation marks one token, and a word inside the run is unfindable by a word match. Han,

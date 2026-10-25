@@ -262,11 +262,11 @@ struct EditInput {
     id: u64,
     #[serde(default)]
     status: Option<StatusWord>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::text::deserialize_blank_as_none")]
     reason: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::text::deserialize_blank_as_none")]
     task: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::text::deserialize_blank_as_none")]
     text: Option<String>,
     #[serde(default, rename = "scratchpad")]
     _scratchpad: Option<String>,
@@ -817,6 +817,35 @@ mod tests {
             serde_json::json!("canceled"),
             "meka writes one spelling"
         );
+    }
+
+    /// A blank `reason`, `task` or `text` is the field left out, by the rule every tool reads a
+    /// string parameter by: a model that fills every field it was shown sends `""` where it has
+    /// nothing to say, and a completion so written must not be refused for a reason it never gave.
+    #[test]
+    fn a_blank_field_on_an_edit_is_the_field_left_out() {
+        let edit = parse_edit(&serde_json::json!({
+            "id": 1, "status": "completed", "reason": "", "task": "  ", "text": ""
+        }))
+        .expect("parses");
+        assert_eq!(edit, ItemEdit {
+            id: 1,
+            status: Some(StatusWord::Completed),
+            reason: None,
+            task: None,
+            text: None,
+        });
+        let mut state = ChecklistState::default();
+        state.add(items(&["one", "two"]));
+        assert_eq!(
+            state.edit(edit),
+            Ok(EditOutcome::Removed(StatusWord::Completed))
+        );
+        // A blank reason on a cancel is still no reason.
+        let edit = parse_edit(&serde_json::json!({"id": 2, "status": "canceled", "reason": " "}))
+            .expect("parses");
+        let refused = state.edit(edit).expect_err("no reason");
+        assert!(refused.contains("reason"), "{refused}");
     }
 
     #[test]

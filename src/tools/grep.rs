@@ -10,7 +10,7 @@ use async_trait::async_trait;
 
 use super::{
     Tool, ToolOutput,
-    util::{WalkBudget, WalkStop, redirects_to_scratchpad, require_str},
+    util::{WalkBudget, WalkStop, optional_str, redirects_to_scratchpad, require_str},
 };
 use crate::{
     error::{MekaError, Result},
@@ -88,14 +88,11 @@ impl Tool for SearchContentsTool {
         // `PathBuf` end to end: a round trip through `to_string_lossy` would replace every
         // non-UTF-8 byte with U+FFFD and report the user's own cwd as missing.
         let search_paths: Vec<std::path::PathBuf> =
-            match input.get("path").and_then(serde_json::Value::as_str) {
+            match optional_str(&input, "path", "file_search")? {
                 Some(raw) => vec![crate::workspace::resolve_against_cwd(&self.site.cwd, raw)],
                 None => crate::workspace::search_roots(&self.site.cwd, &self.site.roots),
             };
-        let file_glob = input
-            .get("glob")
-            .and_then(serde_json::Value::as_str)
-            .map(|s| s.to_string());
+        let file_glob = optional_str(&input, "glob", "file_search")?.map(str::to_string);
         // Cap precedence, as `file_find` has it: an explicit `limit` wins, clamped to the inline
         // cap the way `memory_search` clamps its own; with none, `scratchpad` lifts the cap so the
         // agent can collect an unbounded result set.

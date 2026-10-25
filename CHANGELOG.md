@@ -33,11 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Session archives are `format_version` 16; an older archive is brought forward on import.
 - A compaction from before 0.84 replays as an automatic one at the ceiling; see the upgrade guide.
 - Copying from the transcript no longer warns when no clipboard manager takes the text.
+- A value of the wrong type in a string argument is refused by name, on every tool.
 
 ### Fixed
 
 - A warning a library logs is shown on the screen without its `log.*` location fields.
 - A thinking block that arrives mid-reply is stored where it arrived, as the live turn showed it.
+- Every tool reads a blank optional argument as left out; `checklist_edit` refused one as a value.
+- A list argument takes one bare string as its entry, drops a blank entry and refuses a wrong type.
 
 ### Security
 

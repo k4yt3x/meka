@@ -6,7 +6,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{Tool, ToolOutput, ToolScope, util::require_str};
+use super::{
+    Tool, ToolOutput, ToolScope,
+    util::{optional_str, require_str},
+};
 use crate::{
     error::{MekaError, Result},
     mcp::{MAX_MCP_DESCRIPTION_CHARS, McpClientManager, truncate},
@@ -101,10 +104,7 @@ impl Tool for ListMcpResourcesTool {
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let cancellation = context.cancellation.clone();
-        let server_filter = input
-            .get("server")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let server_filter = optional_str(&input, "server", "mcp_resource_list")?.map(String::from);
 
         let names: Vec<String> = if let Some(name) = &server_filter {
             visible_server_entry(
@@ -341,10 +341,7 @@ impl Tool for ListMcpPromptsTool {
         context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let cancellation = context.cancellation.clone();
-        let server_filter = input
-            .get("server")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let server_filter = optional_str(&input, "server", "mcp_prompt_list")?.map(String::from);
 
         let names: Vec<String> = if let Some(name) = &server_filter {
             visible_server_entry(

@@ -16,7 +16,10 @@ use async_trait::async_trait;
 
 use super::{
     Tool, ToolOutput,
-    util::{MAX_SEARCH_MATCHES, compile_user_regex, require_str},
+    util::{
+        MAX_SEARCH_MATCHES, compile_user_regex, optional_str, optional_str_allowing_empty,
+        require_str,
+    },
 };
 use crate::{
     error::{MekaError, Result},
@@ -333,39 +336,11 @@ impl Tool for SkillWriteTool {
         // Omit-to-keep, like `body` and `priority` below: the only copy of a description the agent
         // can see is the `[Skills]` index's, elided to 500 characters, so requiring it would make a
         // body-only refinement rewrite a long description as its elision.
-        let requested_description = match input.get("description") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(serde_json::Value::String(text)) => {
-                if text.trim().is_empty() {
-                    return Err(MekaError::ToolExecution {
-                        tool_name: "skill_write".to_string(),
-                        message: "'description' cannot be empty; omit it entirely to keep the \
-                                  description a skill already has"
-                            .to_string(),
-                    });
-                }
-                Some(text.clone())
-            }
-            Some(value) => {
-                return Err(MekaError::ToolExecution {
-                    tool_name: "skill_write".to_string(),
-                    message: format!("'description' must be a string, got {value}"),
-                });
-            }
-        };
-        // A present-but-not-a-string `body` is refused rather than read as absent: `as_str` would
-        // put `body: ["line one", "line two"]` down the omit-to-keep path and report success while
-        // storing nothing the caller sent. `memory_write` refuses the same shape.
-        let body: Option<String> = match input.get("body") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(serde_json::Value::String(text)) => Some(text.clone()),
-            Some(value) => {
-                return Err(MekaError::ToolExecution {
-                    tool_name: "skill_write".to_string(),
-                    message: format!("'body' must be a string, got {value}"),
-                });
-            }
-        };
+        let requested_description =
+            optional_str(&input, "description", "skill_write")?.map(str::to_string);
+        // `Some("")` is an explicit request to clear the body, as it is on `memory_write`.
+        let body: Option<String> =
+            optional_str_allowing_empty(&input, "body", "skill_write")?.map(str::to_string);
         let requested_priority = match input.get("priority") {
             Some(serde_json::Value::Null) | None => None,
             Some(value) => {

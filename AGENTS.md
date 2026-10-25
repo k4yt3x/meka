@@ -439,6 +439,32 @@ Designing a tool: separate tight tools beat one polymorphic tool with an `action
 fine when each member's parameters are distinct and self-describing; a single tool whose parameters
 change meaning with `action` is a family that wants splitting.
 
+## Tool arguments
+
+Every tool reads its arguments by two rules, through the readers in `src/tools/util.rs`, never a
+raw `input.get(...)`. A model that fills every field it was shown sends `""` where it has nothing
+to say, which a strict schema spells `null`; both mean the field was left out, and no standard
+defines a blank, so meka does, once.
+
+- **A string.** Absent, `null` and blank (empty or whitespace alone) are "not given": omitted for an
+  optional field (`optional_str`), missing for a required one (`require_str`, which refuses by
+  name). A value of another type is refused naming the field, never read as absent: for a
+  restriction, absent is the dangerous direction. The value comes back as sent; a parser of a word
+  trims it. A field whose blank is itself a value (a replacement that deletes, a body or content
+  to clear, an expiry to lift) opts out by name through the `_allowing_empty` reader, and is listed
+  in the "How a built-in reads its arguments" section of `docs/book/src/tools/overview.md`.
+- **A list.** `string_or_list`: a list, or one bare string as a one-entry list (a mistake models
+  make constantly, and the recovery is free), or nothing. A blank entry is dropped, an entry of
+  another type is refused, and `[]` stays `[]`, since an empty list is a value (the documented
+  "clear" for `tags`).
+
+A tool that parses through a serde struct carries the string rule with
+`#[serde(default, deserialize_with = "crate::text::deserialize_blank_as_none")]` on each optional
+string. `tests/layering.rs::tool_arguments_are_read_through_the_shared_readers` fails on a raw read
+anywhere in `src/tools` outside the two functions its ledger names, both of which read recorded
+calls and must tolerate what history holds; a new raw read is a new reader to write, not a ledger
+entry to add.
+
 ## Layering
 
 The tree reads top-down. `src/main.rs` dispatches to `host/` and `cli/`; the screen's slash commands

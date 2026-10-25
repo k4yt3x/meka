@@ -20,7 +20,10 @@ use std::sync::{
 
 use async_trait::async_trait;
 
-use super::{Tool, ToolOutput, util::resolve_session_id};
+use super::{
+    Tool, ToolOutput,
+    util::{optional_str, resolve_session_id},
+};
 use crate::{
     error::Result,
     permission::Permission,
@@ -329,12 +332,8 @@ impl Tool for ContextCompactTool {
     ) -> Result<ToolOutput> {
         let request = CompactRequest {
             trigger: crate::conversation::CompactionTrigger::Requested,
-            instructions: input
-                .get("instructions")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|instructions| !instructions.is_empty())
-                .map(str::to_string),
+            instructions: optional_str(&input, "instructions", "context_compact")?
+                .map(|instructions| instructions.trim().to_string()),
             keep_recent: input
                 .get("keep_recent")
                 .and_then(serde_json::Value::as_bool),
@@ -410,14 +409,14 @@ impl Tool for ContextReplaceTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let summary = input
-            .get("summary")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .trim();
+        let summary = match optional_str(&input, "summary", "context_replace") {
+            Ok(Some(summary)) => summary.trim(),
+            // Not given, or not a string: a tool error rather than a hard failure either way, so
+            // the loop gets another iteration to try again; if it never does, the fallback ladder
+            // catches it.
+            Ok(None) | Err(_) => "",
+        };
         if summary.is_empty() {
-            // A tool error rather than a hard failure: the loop gets another iteration to try
-            // again, and if it never does, the fallback ladder catches it.
             return Ok(ToolOutput::text(
                 "The 'summary' parameter is required and cannot be empty. It becomes your entire \
                  context, so an empty one would erase the conversation."

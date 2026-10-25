@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use super::{
     Tool, ToolOutput,
-    util::{WalkBudget, WalkStop, redirects_to_scratchpad, require_str},
+    util::{WalkBudget, WalkStop, optional_str, redirects_to_scratchpad, require_str},
 };
 use crate::{
     error::{MekaError, Result},
@@ -86,7 +86,7 @@ impl Tool for FindFilesTool {
         // the search runs in the right place regardless of where the process was launched. With no
         // `path`, sweep every workspace root: in a multi-root ACP workspace, searching only `cwd`
         // silently misses whole folders the user can see in their editor.
-        let base_paths = match input.get("path").and_then(serde_json::Value::as_str) {
+        let base_paths = match optional_str(&input, "path", "file_find")? {
             Some(raw) => vec![crate::workspace::resolve_against_cwd(&self.site.cwd, raw)],
             None => crate::workspace::glob_roots(&self.site.cwd, &self.site.roots),
         };

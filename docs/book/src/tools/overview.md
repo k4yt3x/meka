@@ -85,6 +85,10 @@ At **none**, no tools are available. The agent can only respond with text.
 
 Any built-in can be allow-listed, blocked, or have its required permission overridden via the `[tools]` table in `config.toml`. See [`[tools]`: built-in tool filters](../configuration/config-file.md#tools-built-in-tool-filters). Run `meka tool list` to see every built-in with its effective permission and current status, and `meka tool show <name>` for one tool's whole description and parameter schema as the model receives them.
 
+## How a built-in reads its arguments
+
+Every string argument is read by one rule. A blank string, empty or whitespace alone, is the argument left out: omitted for an optional one, missing for a required one, which the tool refuses by name. A value of another type where a string is expected is refused the same way. The only fields that keep a blank are the ones where an empty string is itself the value: the replacement an edit makes in `file_edit`, `memory_edit` and `scratchpad_edit`, the content of `file_write`, `scratchpad_write` and `scratchpad_edit`, the `body` of `memory_write` and `skill_write`, and `expires` on `memory_write`, where `""` lifts the expiry. A list argument takes a list, or one bare string as a one-entry list; a blank entry is dropped, an entry of another type is refused, and an empty list is an empty list.
+
 ## MCP tools
 
 When [MCP servers](../configuration/config-file.md#mcpservers) are configured, their tools are registered under a namespaced name of the form `mcp__<server>__<tool>` (e.g. `mcp__notion__notion-search`). The `mcp__` prefix matches [Claude Code](https://github.com/anthropics/claude-code)'s convention and keeps MCP tools from colliding with built-in names. They appear in the per-turn context catalog alongside the built-ins, with their resolved permission level annotated inline, and are called the same way.

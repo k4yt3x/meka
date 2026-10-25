@@ -13,7 +13,8 @@ use super::{
     context::ContextGauge,
     util::{
         LineRange, MAX_SEARCH_MATCHES, line_range, lines_shown_notice, no_lines_notice,
-        resolve_session_id, search_lines,
+        optional_str, optional_str_allowing_empty, resolve_session_id, search_lines,
+        string_or_list,
     },
 };
 use crate::{
@@ -112,8 +113,9 @@ pub(crate) async fn save_explicit_scratchpad_results(
         {
             let scratchpad_name = tool_use_map
                 .get(tool_use_id.as_str())
-                .and_then(|(_, input)| input.get("scratchpad"))
-                .and_then(|v| v.as_str());
+                .and_then(|(_, input)| input.get(crate::tools::SCRATCHPAD_PARAMETER))
+                .and_then(|v| v.as_str())
+                .filter(|name| !crate::text::is_blank(name));
 
             let Some(name) = scratchpad_name else {
                 continue;
@@ -437,7 +439,7 @@ impl Tool for ScratchpadReadTool {
             message: format!("scratchpad entry '{name}' not found"),
         })?;
 
-        if let Some(pattern) = input.get("regex").and_then(|v| v.as_str()) {
+        if let Some(pattern) = optional_str(&input, "regex", "scratchpad_read")? {
             return search_lines(&content, pattern, "scratchpad_read");
         }
 
@@ -610,8 +612,10 @@ impl Tool for ScratchpadEditTool {
 
         let session_id = resolve_session_id(&self.site.session_id, "scratchpad_edit")?;
 
-        // Full overwrite mode
-        if let Some(new_content) = input.get("content").and_then(|v| v.as_str()) {
+        // Full overwrite mode; an empty `content` empties the entry, as `scratchpad_write` would.
+        if let Some(new_content) =
+            optional_str_allowing_empty(&input, "content", "scratchpad_edit")?
+        {
             let updated = self
                 .store
                 .update_scratchpad_entry(session_id, name, new_content)
@@ -635,18 +639,17 @@ impl Tool for ScratchpadEditTool {
         }
 
         // String replacement mode
-        let old_string = input
-            .get("old_string")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "scratchpad_edit".to_string(),
-                message: "provide either 'content' for full overwrite \
+        let old_string =
+            optional_str(&input, "old_string", "scratchpad_edit")?.ok_or_else(|| {
+                MekaError::ToolExecution {
+                    tool_name: "scratchpad_edit".to_string(),
+                    message: "provide either 'content' for full overwrite \
                     or 'old_string'/'new_string' for replacement"
-                    .to_string(),
+                        .to_string(),
+                }
             })?;
-        let new_string = input
-            .get("new_string")
-            .and_then(|v| v.as_str())
+        // Empty is the replacement that deletes `old_string`.
+        let new_string = optional_str_allowing_empty(&input, "new_string", "scratchpad_edit")?
             .ok_or_else(|| MekaError::ToolExecution {
                 tool_name: "scratchpad_edit".to_string(),
                 message: "missing 'new_string' parameter".to_string(),
@@ -845,20 +848,9 @@ impl Tool for ScratchpadMergeTool {
             return inherited_write_error(target);
         }
 
-        let mut sources: Vec<String> = match input.get("sources") {
-            None | Some(serde_json::Value::Null) => Vec::new(),
-            Some(serde_json::Value::Array(items)) => items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_string))
-                .collect(),
-            Some(_) => {
-                return Err(MekaError::ToolExecution {
-                    tool_name: "scratchpad_merge".to_string(),
-                    message: "'sources' must be an array of entry names".to_string(),
-                });
-            }
-        };
-        let prefix = input.get("prefix").and_then(|value| value.as_str());
+        let mut sources: Vec<String> =
+            string_or_list(&input, "sources", "scratchpad_merge")?.unwrap_or_default();
+        let prefix = optional_str(&input, "prefix", "scratchpad_merge")?;
         if sources.is_empty() && prefix.is_none() {
             return Ok(ToolOutput::text(
                 "scratchpad_merge: name at least one entry in 'sources', or give a 'prefix'"
@@ -867,10 +859,8 @@ impl Tool for ScratchpadMergeTool {
             ));
         }
 
-        let format = input
-            .get("format")
-            .and_then(|value| value.as_str())
-            .unwrap_or("concat_with_headers");
+        let format =
+            optional_str(&input, "format", "scratchpad_merge")?.unwrap_or("concat_with_headers");
 
         let session_id = resolve_session_id(&self.site.session_id, "scratchpad_merge")?;
 

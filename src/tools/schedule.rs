@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::{
     Tool, ToolOutput,
-    util::{require_str, resolve_session_id},
+    util::{optional_str, require_str, resolve_session_id},
 };
 use crate::{
     config::ResolvedScheduleConfig,
@@ -275,17 +275,12 @@ fn parse_schedule(
     now: chrono::DateTime<Utc>,
     tool_name: &str,
 ) -> Result<Schedule> {
-    let field = |key: &str| {
-        input
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    };
-    let given: Vec<(&str, &str)> = ["at", "every", "cron"]
-        .into_iter()
-        .filter_map(|key| field(key).map(|value| (key, value)))
-        .collect();
+    let mut given: Vec<(&str, &str)> = Vec::new();
+    for key in ["at", "every", "cron"] {
+        if let Some(value) = optional_str(input, key, tool_name)? {
+            given.push((key, value.trim()));
+        }
+    }
 
     let (kind, value) = match given.as_slice() {
         [single] => *single,

@@ -17,11 +17,11 @@ use super::{
     Admission, LOAD_TOOL_NAME, SEARCH_TOOL_NAME, TOOL_SEARCH_MAX_RESULTS, Tool, ToolOutput,
     admit_tool_call,
     registry::{is_carried_by_wire, not_carried_refusal, wire_delivery},
-    util::require_str,
+    util::{require_str, string_or_list},
 };
 use crate::{
     conversation::{ContentBlock, Event, Message, ToolResultContent},
-    error::Result,
+    error::{MekaError, Result},
     permission::{Permission, SharedPermission},
     provider::{DeferredToolDelivery, ToolDefinition, load_door, search_tool_parameters},
 };
@@ -153,12 +153,21 @@ impl Tool for LoadToolTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let names = crate::tools::load_tool_names(&input);
-        if names.is_empty() {
-            // Re-run the scalar extraction purely to raise its error, so a missing or non-string
-            // `name` reports the same way it always has.
-            require_str(&input, "name", LOAD_TOOL_NAME)?;
+        // The live door reads by the one rule every list is read by, refusing an entry that is
+        // not a name; `load_tool_names` below reads the same call the way it reads a recorded one.
+        let Some(asked) = string_or_list(&input, "name", LOAD_TOOL_NAME)? else {
+            return Err(MekaError::ToolExecution {
+                tool_name: LOAD_TOOL_NAME.to_string(),
+                message: "missing 'name' parameter".to_string(),
+            });
+        };
+        if asked.is_empty() {
+            return Err(MekaError::ToolExecution {
+                tool_name: LOAD_TOOL_NAME.to_string(),
+                message: "'name' names no tool; give a name or a list of names".to_string(),
+            });
         }
+        let names = crate::tools::load_tool_names(&input);
 
         let Some(tools) = self.tools.upgrade() else {
             return Ok(ToolOutput::text(
@@ -335,9 +344,8 @@ impl Tool for ToolSearchTool {
         // Where the endpoint's own search item is the one door that loads, a call naming tools is
         // a load, whatever else it says; elsewhere `names` is not declared and `tool_load` loads.
         if delivery == DeferredToolDelivery::Searched
-            && let Some(names) = input
-                .get("names")
-                .filter(|names| names.as_array().is_some_and(|names| !names.is_empty()))
+            && let Some(names) = string_or_list(&input, "names", SEARCH_TOOL_NAME)?
+            && !names.is_empty()
         {
             return self
                 .loader

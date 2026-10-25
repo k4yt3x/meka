@@ -16,7 +16,8 @@ use super::{
     ReadStamp, ReadTracker, Tool, ToolOutput,
     util::{
         LineRange, MAX_SEARCH_MATCHES, canonicalize_for_tool, line_range, lines_shown_notice,
-        no_lines_notice, require_str, search_lines, truncate_string,
+        no_lines_notice, optional_str, optional_str_allowing_empty, require_str, search_lines,
+        truncate_string,
     },
 };
 use crate::{
@@ -177,7 +178,9 @@ pub(super) fn write_fence_refusal(
     level: Permission,
     input: &serde_json::Value,
 ) -> Option<ToolOutput> {
-    let path = input.get("path").and_then(serde_json::Value::as_str)?;
+    let Ok(Some(path)) = optional_str(input, "path", tool_name) else {
+        return None;
+    };
     let file_path = resolve_for_fence(cwd, path);
     let spelled = crate::workspace::resolve_against_cwd(cwd, path);
     let refusal = scope
@@ -1094,7 +1097,7 @@ impl Tool for ReadFileTool {
         }
 
         let range = line_range(&input, "file_read")?;
-        let regex = input.get("regex").and_then(|v| v.as_str());
+        let regex = optional_str(&input, "regex", "file_read")?;
 
         // Text reads delegate to the editor when it offers `fs.read_text_file`, so the model is
         // shown the document the editor will apply an edit against rather than the bytes under it.
@@ -1331,7 +1334,9 @@ impl Tool for EditFileTool {
         level: Permission,
         input: &serde_json::Value,
     ) -> Option<ToolOutput> {
-        let path = input.get("path").and_then(serde_json::Value::as_str)?;
+        let Ok(Some(path)) = optional_str(input, "path", "file_edit") else {
+            return None;
+        };
         let resolved = crate::workspace::resolve_against_cwd(&self.site.cwd, path);
         let refusal = self
             .scope
@@ -1361,9 +1366,11 @@ impl Tool for EditFileTool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        let new_string_opt = input.get("new_string").and_then(|v| v.as_str());
-        let insert_before_opt = input.get("insert_before").and_then(|v| v.as_str());
-        let insert_after_opt = input.get("insert_after").and_then(|v| v.as_str());
+        // An empty `new_string` is the replacement that deletes `old_string`; an empty insertion
+        // would insert nothing, so it counts as not asked for.
+        let new_string_opt = optional_str_allowing_empty(&input, "new_string", "file_edit")?;
+        let insert_before_opt = optional_str(&input, "insert_before", "file_edit")?;
+        let insert_after_opt = optional_str(&input, "insert_after", "file_edit")?;
 
         let mode_count = [
             new_string_opt.is_some(),

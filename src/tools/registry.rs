@@ -46,6 +46,8 @@ pub(crate) fn load_tool_names(input: &serde_json::Value) -> Vec<String> {
 /// half-honored, which is the same class of silent shortfall this whole advisory machinery exists
 /// to eliminate.
 pub(crate) fn requested_tool_names(input: &serde_json::Value) -> Vec<String> {
+    // Read from recorded calls as well as live ones, so what is not a name is dropped rather
+    // than refused; a blank one is no name either.
     let mut names: Vec<String> = match input.get("name") {
         Some(serde_json::Value::String(name)) => vec![name.clone()],
         Some(serde_json::Value::Array(items)) => items
@@ -54,6 +56,7 @@ pub(crate) fn requested_tool_names(input: &serde_json::Value) -> Vec<String> {
             .collect(),
         _ => Vec::new(),
     };
+    names.retain(|name| !crate::text::is_blank(name));
     let mut seen = HashSet::new();
     names.retain(|name| seen.insert(name.clone()));
     names

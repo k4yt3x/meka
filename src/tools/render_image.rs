@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use base64::Engine;
 
-use super::{Tool, ToolOutput};
+use super::{Tool, ToolOutput, util::optional_str};
 use crate::{
     error::{MekaError, Result},
     image::classify_bytes,
@@ -51,8 +51,8 @@ impl Tool for RenderImageTool {
         input: serde_json::Value,
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let from_scratchpad = input.get("from_scratchpad").and_then(|v| v.as_str());
-        let inline = input.get("base64").and_then(|v| v.as_str());
+        let from_scratchpad = optional_str(&input, "from_scratchpad", "image_render")?;
+        let inline = optional_str(&input, "base64", "image_render")?;
 
         let base64_text = match (from_scratchpad, inline) {
             (Some(_), Some(_)) => {

@@ -53,7 +53,7 @@ The rule is enforced by the `INSERT ... ON CONFLICT DO UPDATE` statement itself,
 
 ### Omitting a field keeps what is there
 
-`memory_write`'s `body`, `tags`, `priority`, `load`, `references`, `source` and `expires` are all optional, and omitting any of them **keeps whatever the memory already had**. That makes a metadata-only update (a reworded description, say) a single call that cannot cost the note its contents, its labels, its rank, its dependencies or its deadline. To clear a string or a list, pass `""` or `[]` explicitly.
+`memory_write`'s `body`, `tags`, `priority`, `load`, `references`, `source` and `expires` are all optional, and omitting any of them **keeps whatever the memory already had**. That makes a metadata-only update (a reworded description, say) a single call that cannot cost the note its contents, its labels, its rank, its dependencies or its deadline. To clear the body or the expiry, pass `""`; to clear a list, pass `[]`. A blank in any other field is the field omitted.
 
 `PUT /v1/memory/{name}` and `meka memory add <name> --force` follow the same rule.
 
